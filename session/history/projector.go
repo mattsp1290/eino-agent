@@ -15,11 +15,13 @@ import (
 type Options struct {
 	IncludeReasoning bool
 	IncludeState     bool
+	Epoch            *session.ContextEpoch
 }
 
 // Project converts durable session messages and parts into provider messages.
 // It never reads runtime events, so live-only deltas are excluded by design.
 func Project(batch session.ReplayBatch, options Options) ([]*einoschema.Message, error) {
+	batch = applyEpoch(batch, options.Epoch)
 	partsByMessage := map[session.MessageID][]session.Part{}
 	for _, part := range batch.Parts {
 		partsByMessage[part.MessageID] = append(partsByMessage[part.MessageID], part)
@@ -63,12 +65,24 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 	switch message.Role {
 	case session.RoleSystem, session.RoleUser, session.RoleAssistant:
 		projected := &einoschema.Message{
-			Role:    role(message.Role),
-			Content: textContent(parts, options),
-			Name:    message.Agent,
+			Role: role(message.Role),
+			Name: message.Agent,
 		}
+		content, err := textContent(parts, options)
+		if err != nil {
+			return nil, err
+		}
+		projected.Content = content
+		result := []*einoschema.Message{projected}
 		for _, part := range parts {
 			if part.Kind != session.PartToolCall {
+				if part.Kind == session.PartToolResult {
+					toolMessages, err := projectToolResults(message, []session.Part{part})
+					if err != nil {
+						return nil, err
+					}
+					result = append(result, toolMessages...)
+				}
 				continue
 			}
 			toolCall, err := decodeToolCall(part.Payload)
@@ -77,7 +91,7 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 			}
 			projected.ToolCalls = append(projected.ToolCalls, toolCall)
 		}
-		return []*einoschema.Message{projected}, nil
+		return result, nil
 	case session.RoleTool:
 		return projectToolResults(message, parts)
 	default:
@@ -91,46 +105,91 @@ func projectToolResults(message session.Message, parts []session.Part) ([]*einos
 		if part.Kind != session.PartToolResult {
 			continue
 		}
-		payload, err := decodeTextPayload(part.Payload)
+		toolCallID, content, err := decodeToolResult(part.Payload)
 		if err != nil {
 			return nil, err
 		}
-		toolCallID := payload.ToolCallID
 		if toolCallID == "" {
 			toolCallID = string(message.ID)
 		}
-		result = append(result, einoschema.ToolMessage(payload.Text, toolCallID))
+		result = append(result, einoschema.ToolMessage(content, toolCallID))
 	}
 	return result, nil
 }
 
-func textContent(parts []session.Part, options Options) string {
+func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) session.ReplayBatch {
+	if epoch == nil {
+		return batch
+	}
+	include := map[session.MessageID]bool{}
+	if epoch.SummaryMessageID != "" {
+		include[epoch.SummaryMessageID] = true
+	}
+	tailStarted := epoch.TailStartID == ""
+	messages := make([]session.Message, 0, len(batch.Messages))
+	for _, message := range batch.Messages {
+		if message.ID == epoch.TailStartID {
+			tailStarted = true
+		}
+		if include[message.ID] || tailStarted {
+			messages = append(messages, message)
+			include[message.ID] = true
+		}
+	}
+	parts := make([]session.Part, 0, len(batch.Parts))
+	for _, part := range batch.Parts {
+		if include[part.MessageID] {
+			parts = append(parts, part)
+		}
+	}
+	batch.Messages = messages
+	batch.Parts = parts
+	return batch
+}
+
+func textContent(parts []session.Part, options Options) (string, error) {
 	content := ""
 	for _, part := range parts {
 		switch part.Kind {
 		case session.PartText:
-			content += mustText(part.Payload)
+			text, err := partText(part)
+			if err != nil {
+				return "", err
+			}
+			content += text
 		case session.PartReasoning:
 			if options.IncludeReasoning {
-				content += mustText(part.Payload)
+				text, err := partText(part)
+				if err != nil {
+					return "", err
+				}
+				content += text
 			}
 		case session.PartState:
 			if options.IncludeState {
-				content += mustText(part.Payload)
+				text, err := partText(part)
+				if err != nil {
+					return "", err
+				}
+				content += text
 			}
 		case session.PartCompaction:
-			content += mustText(part.Payload)
+			text, err := partText(part)
+			if err != nil {
+				return "", err
+			}
+			content += text
 		}
 	}
-	return content
+	return content, nil
 }
 
-func mustText(raw json.RawMessage) string {
-	payload, err := decodeTextPayload(raw)
+func partText(part session.Part) (string, error) {
+	payload, err := decodeTextPayload(part.Payload)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("part %s payload: %w", part.ID, err)
 	}
-	return payload.Text
+	return payload.Text, nil
 }
 
 type textPayload struct {
@@ -138,6 +197,40 @@ type textPayload struct {
 	Content    string          `json:"content"`
 	ToolCallID string          `json:"tool_call_id"`
 	Raw        json.RawMessage `json:"raw"`
+}
+
+type toolResultPayload struct {
+	ToolCallID string          `json:"tool_call_id"`
+	Status     string          `json:"status"`
+	Content    string          `json:"content"`
+	Structured json.RawMessage `json:"structured"`
+	Truncated  bool            `json:"truncated"`
+	Redacted   bool            `json:"redacted"`
+}
+
+func decodeToolResult(raw json.RawMessage) (string, string, error) {
+	var output toolResultPayload
+	if err := json.Unmarshal(raw, &output); err == nil && (output.ToolCallID != "" || output.Status != "" || len(output.Structured) > 0) {
+		content := output.Content
+		if content == "" && len(output.Structured) > 0 {
+			content = string(output.Structured)
+		}
+		if output.Status != "" && output.Status != "completed" {
+			status, _ := json.Marshal(map[string]any{
+				"status":    output.Status,
+				"content":   content,
+				"truncated": output.Truncated,
+				"redacted":  output.Redacted,
+			})
+			content = string(status)
+		}
+		return output.ToolCallID, content, nil
+	}
+	payload, err := decodeTextPayload(raw)
+	if err != nil {
+		return "", "", err
+	}
+	return payload.ToolCallID, payload.Text, nil
 }
 
 func decodeTextPayload(raw json.RawMessage) (textPayload, error) {

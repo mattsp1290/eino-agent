@@ -1,6 +1,7 @@
 package history
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 			part("p2", "assistant-1", session.PartToolCall, 20, `{"id":"call-1","name":"file_read","arguments":{"path":"README.md"}}`),
 			part("p1", "assistant-1", session.PartText, 10, `{"text":"I will read it."}`),
 			part("p0", "user-1", session.PartText, 10, `{"text":"Read README"}`),
-			part("p3", "tool-1", session.PartToolResult, 10, `{"tool_call_id":"call-1","content":"README contents"}`),
+			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","content":"README contents"}`),
 			part("p4", "assistant-2", session.PartText, 10, `{"text":"Summary"}`),
 			part("p5", "assistant-live", session.PartText, 10, `{"text":"settled"}`),
 		},
@@ -48,6 +49,32 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 	}
 	assertMessage(t, projected[3], schema.Assistant, "Summary")
 	assertMessage(t, projected[4], schema.Assistant, "settled")
+}
+
+func TestProjectToolResultStructuredAndExpectedFailurePayloads(t *testing.T) {
+	t.Parallel()
+
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
+		Parts: []session.Part{
+			part("structured", "assistant-1", session.PartToolResult, 10, `{"tool_call_id":"call-1","status":"completed","structured":{"ok":true}}`),
+			part("failure", "assistant-1", session.PartToolResult, 20, `{"tool_call_id":"call-2","status":"expected_failure","content":"denied"}`),
+		},
+	}
+	projected, err := Project(batch, Options{})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if len(projected) != 3 {
+		t.Fatalf("projected len = %d", len(projected))
+	}
+	assertMessage(t, projected[1], schema.Tool, `{"ok":true}`)
+	if projected[1].ToolCallID != "call-1" {
+		t.Fatalf("structured tool call id = %q", projected[1].ToolCallID)
+	}
+	if projected[2].ToolCallID != "call-2" || projected[2].Content == "denied" {
+		t.Fatalf("expected failure projection = %#v", projected[2])
+	}
 }
 
 func TestProjectExcludesReasoningAndIncludesStateWhenEnabled(t *testing.T) {
@@ -93,6 +120,75 @@ func TestProjectCompactionBoundaryIncludesSummary(t *testing.T) {
 	assertMessage(t, projected[0], schema.System, "Earlier context summary. Tail instruction.")
 }
 
+func TestProjectEpochExcludesCompactedRawHistory(t *testing.T) {
+	t.Parallel()
+
+	batch := session.ReplayBatch{
+		Messages: []session.Message{
+			message("old", session.RoleUser),
+			message("summary", session.RoleSystem),
+			message("tail", session.RoleUser),
+		},
+		Parts: []session.Part{
+			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
+			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely."}`),
+			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
+		},
+	}
+	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
+		SummaryMessageID: "summary",
+		SummarizedToID:   "old",
+		TailStartID:      "tail",
+	}})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if len(projected) != 2 {
+		t.Fatalf("projected len = %d", len(projected))
+	}
+	assertMessage(t, projected[0], schema.System, "Summarized safely.")
+	assertMessage(t, projected[1], schema.User, "Continue")
+}
+
+func TestLoadIgnoresLiveOnlyEvents(t *testing.T) {
+	t.Parallel()
+
+	store := historyStore{
+		batch: session.ReplayBatch{
+			Messages: []session.Message{message("assistant", session.RoleAssistant)},
+			Parts: []session.Part{
+				part("settled", "assistant", session.PartText, 10, `{"text":"settled"}`),
+			},
+		},
+		events: []session.EventRecord{{
+			ID:        "live",
+			SessionID: "session-1",
+			Kind:      "message_delta",
+			Payload:   json.RawMessage(`{"text":"LIVE_ONLY_SECRET"}`),
+			LiveOnly:  true,
+		}},
+	}
+	projected, err := Load(t.Context(), store, "session-1", Options{})
+	if err != nil {
+		t.Fatalf("Load error = %v", err)
+	}
+	assertMessage(t, projected[0], schema.Assistant, "settled")
+}
+
+func TestProjectRejectsMalformedIncludedPayload(t *testing.T) {
+	t.Parallel()
+
+	_, err := Project(session.ReplayBatch{
+		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
+		Parts: []session.Part{
+			part("bad", "assistant-1", session.PartText, 10, `{`),
+		},
+	}, Options{})
+	if err == nil {
+		t.Fatal("Project error = nil, want malformed payload error")
+	}
+}
+
 func message(id session.MessageID, role session.Role) session.Message {
 	now := time.Unix(1, 0)
 	return session.Message{
@@ -125,4 +221,18 @@ func assertMessage(t *testing.T, message *schema.Message, role schema.RoleType, 
 	if message.Role != role || message.Content != content {
 		t.Fatalf("message = %#v, want %s/%q", message, role, content)
 	}
+}
+
+type historyStore struct {
+	session.Store
+	batch  session.ReplayBatch
+	events []session.EventRecord
+}
+
+func (s historyStore) ListMessages(context.Context, session.ID, session.ReplayCursor) (session.ReplayBatch, error) {
+	return s.batch, nil
+}
+
+func (s historyStore) ListEvents(context.Context, session.ID, session.EventCursor) (session.EventBatch, error) {
+	return session.EventBatch{Events: s.events}, nil
 }
