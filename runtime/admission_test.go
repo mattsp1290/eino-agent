@@ -1,0 +1,345 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/session"
+)
+
+func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	sink := &capturingSink{}
+	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
+	admitter := Admitter{Store: store, Events: sink, Hooks: []Hook{capturingHook{}}, Clock: func() time.Time { return now }}
+	request := admissionRequest()
+	admitted, err := admitter.Admit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Admit error = %v", err)
+	}
+	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.AssistantMessage.ID != "assistant-1" {
+		t.Fatalf("admitted identity = %+v", admitted)
+	}
+	if _, err := store.GetSession(context.Background(), "session-1"); err != nil {
+		t.Fatalf("session was not durable: %v", err)
+	}
+	if _, err := store.GetRun(context.Background(), "run-1"); err != nil {
+		t.Fatalf("run was not durable: %v", err)
+	}
+	batch, err := store.ListMessages(context.Background(), "session-1", session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(batch.Messages) != 1 || batch.Messages[0].Role != session.RoleAssistant {
+		t.Fatalf("messages = %#v", batch.Messages)
+	}
+	events, err := store.ListEvents(context.Background(), "session-1", session.EventCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	if len(events.Events) != 1 || events.Events[0].Kind != string(EventRunStarted) {
+		t.Fatalf("events = %#v", events.Events)
+	}
+	if len(sink.events) != 1 || sink.events[0].Kind != EventRunStarted {
+		t.Fatalf("emitted events = %#v", sink.events)
+	}
+	request.Config.Agent.Options["temperature"] = "changed"
+	request.Input[0].Content = "changed"
+	if admitted.Snapshot.Config.Agent.Options["temperature"] != "0.2" {
+		t.Fatalf("snapshot config mutated: %#v", admitted.Snapshot.Config.Agent.Options)
+	}
+	if admitted.Snapshot.Messages[0].Content != "hello" {
+		t.Fatalf("snapshot messages mutated: %#v", admitted.Snapshot.Messages[0])
+	}
+}
+
+func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	admitter := Admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
+	request := admissionRequest()
+	if _, err := admitter.Admit(context.Background(), request); err != nil {
+		t.Fatalf("first Admit error = %v", err)
+	}
+	again, err := admitter.Admit(context.Background(), request)
+	if err == nil {
+		if again.Run.ID != "run-1" || again.AssistantMessage.ID != "assistant-1" {
+			t.Fatalf("idempotent duplicate identity = %+v", again)
+		}
+		return
+	}
+	if !errors.Is(err, session.ErrSessionBusy) && !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("duplicate Admit error = %v, want idempotent or explicit busy/conflict", err)
+	}
+}
+
+func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	admitter := Admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
+	admitted, err := admitter.Admit(context.Background(), admissionRequest())
+	if err != nil {
+		t.Fatalf("Admit error = %v", err)
+	}
+	failed := admitted.Run
+	failed.Status = session.RunFailed
+	failed.Error = "provider failed"
+	failed.FinishedAt = failed.CreatedAt.Add(time.Second)
+	if err := store.FinishRun(context.Background(), failed); err != nil {
+		t.Fatalf("FinishRun error = %v", err)
+	}
+	batch, err := store.ListMessages(context.Background(), admitted.Session.ID, session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	if len(batch.Messages) != 1 || batch.Messages[0].ID != admitted.AssistantMessage.ID {
+		t.Fatalf("history after failure = %#v", batch.Messages)
+	}
+	gotRun, err := store.GetRun(context.Background(), admitted.Run.ID)
+	if err != nil {
+		t.Fatalf("GetRun error = %v", err)
+	}
+	if gotRun.Status != session.RunFailed || gotRun.Error != "provider failed" {
+		t.Fatalf("run after failure = %+v", gotRun)
+	}
+}
+
+func admissionRequest() AdmissionRequest {
+	selection := model.Selection{ProviderID: "openai", ModelID: "gpt-4.1"}
+	return AdmissionRequest{
+		IDs: AdmissionIDs{
+			SessionID:          "session-1",
+			RunID:              "run-1",
+			AssistantMessageID: "assistant-1",
+			ContextEpochID:     "epoch-1",
+			EventID:            "event-1",
+		},
+		ParentMessageID: "user-1",
+		Config: config.Snapshot{
+			Agent: config.Agent{
+				Name:         "default",
+				Model:        selection,
+				SystemPrompt: "system",
+				Options:      map[string]string{"temperature": "0.2"},
+			},
+			Model: selection,
+			Metadata: map[string]string{
+				"workspace_id":   "workspace-1",
+				"workspace_root": "/workspace",
+			},
+			Plugins: []config.Plugin{{
+				Name:    "plugin",
+				Version: "1.0.0",
+				Hash:    "abc",
+				Source:  "test",
+			}},
+		},
+		Model: model.Resolved{
+			Provider: model.Provider{ID: "openai"},
+			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
+		},
+		Input:    []*einoschema.Message{{Role: "user", Content: "hello"}},
+		OwnerID:  "owner-1",
+		Metadata: map[string]string{"request": "admission"},
+	}
+}
+
+type capturingSink struct {
+	events []Event
+}
+
+func (s *capturingSink) Emit(_ context.Context, event Event) error {
+	s.events = append(s.events, event)
+	return nil
+}
+
+type capturingHook struct{}
+
+func (capturingHook) BeforeRun(context.Context, session.Run) error { return nil }
+func (capturingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
+	return TurnSnapshot{}, nil
+}
+func (capturingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
+func (capturingHook) AfterRun(context.Context, Result) error                { return nil }
+
+type admissionStore struct {
+	sessions map[session.ID]session.Session
+	runs     map[session.RunID]session.Run
+	messages map[session.MessageID]session.Message
+	events   map[session.EventID]session.EventRecord
+}
+
+func newAdmissionStore() *admissionStore {
+	return &admissionStore{
+		sessions: map[session.ID]session.Session{},
+		runs:     map[session.RunID]session.Run{},
+		messages: map[session.MessageID]session.Message{},
+		events:   map[session.EventID]session.EventRecord{},
+	}
+}
+
+func (s *admissionStore) CreateSession(_ context.Context, record session.Session) (session.Session, error) {
+	if existing, ok := s.sessions[record.ID]; ok {
+		if existing.Title != record.Title || existing.Directory != record.Directory {
+			return session.Session{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.sessions[record.ID] = record
+	return record, nil
+}
+
+func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.Session, error) {
+	record, ok := s.sessions[id]
+	if !ok {
+		return session.Session{}, session.ErrNotFound
+	}
+	return record, nil
+}
+
+func (s *admissionStore) UpdateSession(context.Context, session.Session) error { return nil }
+
+func (s *admissionStore) AdmitRun(_ context.Context, run session.Run) (session.Run, error) {
+	if existing, ok := s.runs[run.ID]; ok {
+		if sameRun(existing, run) {
+			return existing, nil
+		}
+		return session.Run{}, session.ErrConflict
+	}
+	for _, existing := range s.runs {
+		if existing.SessionID == run.SessionID && !existing.Terminal() {
+			return session.Run{}, session.ErrSessionBusy
+		}
+	}
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *admissionStore) GetRun(_ context.Context, id session.RunID) (session.Run, error) {
+	run, ok := s.runs[id]
+	if !ok {
+		return session.Run{}, session.ErrNotFound
+	}
+	return run, nil
+}
+
+func (s *admissionStore) ActiveRun(_ context.Context, sessionID session.ID) (session.Run, error) {
+	for _, run := range s.runs {
+		if run.SessionID == sessionID && !run.Terminal() {
+			return run, nil
+		}
+	}
+	return session.Run{}, session.ErrNotFound
+}
+
+func (s *admissionStore) ListUnfinishedRuns(context.Context) ([]session.Run, error) {
+	var runs []session.Run
+	for _, run := range s.runs {
+		if !run.Terminal() {
+			runs = append(runs, run)
+		}
+	}
+	return runs, nil
+}
+
+func (s *admissionStore) RenewRunLease(context.Context, session.RunID, string, time.Time) error {
+	return nil
+}
+
+func (s *admissionStore) FinishRun(_ context.Context, run session.Run) error {
+	if _, ok := s.runs[run.ID]; !ok {
+		return session.ErrNotFound
+	}
+	s.runs[run.ID] = run
+	return nil
+}
+
+func (s *admissionStore) AppendMessage(_ context.Context, message session.Message) (session.Message, error) {
+	if existing, ok := s.messages[message.ID]; ok {
+		if existing.Role != message.Role {
+			return session.Message{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.messages[message.ID] = message
+	return message, nil
+}
+
+func (s *admissionStore) AppendPart(context.Context, session.Part) (session.Part, error) {
+	return session.Part{}, nil
+}
+
+func (s *admissionStore) UpdatePart(context.Context, session.Part) error { return nil }
+
+func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _ session.ReplayCursor) (session.ReplayBatch, error) {
+	var messages []session.Message
+	for _, message := range s.messages {
+		if message.SessionID == sessionID {
+			messages = append(messages, message)
+		}
+	}
+	return session.ReplayBatch{Messages: messages}, nil
+}
+
+func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecord) (session.EventRecord, error) {
+	if existing, ok := s.events[event.ID]; ok {
+		if existing.Kind != event.Kind {
+			return session.EventRecord{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.events[event.ID] = event
+	return event, nil
+}
+
+func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ session.EventCursor) (session.EventBatch, error) {
+	var events []session.EventRecord
+	for _, event := range s.events {
+		if event.SessionID == sessionID {
+			events = append(events, event)
+		}
+	}
+	return session.EventBatch{Events: events}, nil
+}
+
+func (s *admissionStore) CreateToolCall(context.Context, session.ToolCall) (session.ToolCall, error) {
+	return session.ToolCall{}, nil
+}
+func (s *admissionStore) GetToolCall(context.Context, session.ToolCallID) (session.ToolCall, error) {
+	return session.ToolCall{}, nil
+}
+func (s *admissionStore) ListUnfinishedToolCalls(context.Context, session.RunID) ([]session.ToolCall, error) {
+	return nil, nil
+}
+func (s *admissionStore) ClaimToolCall(context.Context, session.ToolCall) (session.ToolCall, error) {
+	return session.ToolCall{}, nil
+}
+func (s *admissionStore) FinishToolCall(context.Context, session.ToolCall) error { return nil }
+func (s *admissionStore) StartContextEpoch(context.Context, session.ContextEpoch) (session.ContextEpoch, error) {
+	return session.ContextEpoch{}, nil
+}
+func (s *admissionStore) FinishContextEpoch(context.Context, session.ContextEpoch) error {
+	return nil
+}
+
+func sameRun(left session.Run, right session.Run) bool {
+	return left.ID == right.ID &&
+		left.SessionID == right.SessionID &&
+		left.ParentMsgID == right.ParentMsgID &&
+		left.OwnerID == right.OwnerID &&
+		left.Agent == right.Agent &&
+		left.ProviderID == right.ProviderID &&
+		left.ModelID == right.ModelID &&
+		left.ContextEpoch == right.ContextEpoch &&
+		left.Status == right.Status
+}
