@@ -95,6 +95,8 @@ independent from `runtime.Event`.
 Durable events must:
 
 - keep session/run/message/part/tool/epoch IDs when available;
+- keep provider/model IDs, parent/correlation IDs, usage, error, and redaction
+  fields as first-class data;
 - preserve `Kind`, `Correlation`, `LiveOnly`, and `CreatedAt`;
 - be listable in stable event order with `EventCursor`;
 - be usable after restart to explain recovery and replay decisions.
@@ -109,28 +111,34 @@ Tool calls use a create, claim, finish lifecycle:
 1. `CreateToolCall` writes a pending call before execution.
 2. `ClaimToolCall` atomically changes pending to running and records
    `ClaimedBy`, `ClaimToken`, and `LeaseUntil`.
-3. A second claim for the same pending/running call returns `session.ErrConflict`
-   unless the backend has a documented expired-lease takeover policy.
+3. A second claim for the same pending/running call returns
+   `session.ErrConflict`.
 4. `FinishToolCall` records completed, failed, or interrupted state.
-5. `ListUnfinishedToolCalls` returns pending/running calls for a run.
+5. `FinishToolCall` must verify the successful claim owner/token and return
+   `session.ErrConflict` for stale or stolen settlement attempts.
+6. `ListUnfinishedToolCalls` returns pending/running calls for a run.
 
 This prevents double execution and gives recovery enough data to decide whether
 to mark a call interrupted or retry it when `RetrySafe` is true.
 
 ## Idempotency
 
-Stores should make caller-supplied IDs idempotent where possible:
+Stores must make caller-supplied IDs idempotent:
 
-- repeating `CreateSession`, `AdmitRun`, `AppendMessage`, `AppendPart`,
-  `AppendEvent`, or `CreateToolCall` with identical IDs and compatible payloads
-  may return the existing record;
+- repeating `CreateSession`, `AppendMessage`, `AppendPart`, `AppendEvent`, or
+  `CreateToolCall` with identical IDs and compatible payloads returns the
+  existing record;
+- repeating `AdmitRun` with the same run ID and compatible payload returns the
+  existing run when it is already the active owner, or its terminal record after
+  finish;
 - repeating those calls with incompatible payloads must return
   `session.ErrConflict`;
 - finishing an already-terminal run or tool call with the same terminal payload
-  may succeed; changing terminal state must return `session.ErrConflict`.
+  succeeds; changing terminal state or settling with the wrong claim owner/token
+  must return `session.ErrConflict`.
 
-The first concrete backend bead should decide exact idempotent replay behavior
-and encode it in backend-specific tests in addition to `store/storetest`.
+Backend-specific tests may add stronger constraints, but they must not weaken
+this portable duplicate-write behavior.
 
 ## Interrupt and Resume Invariants
 
@@ -150,12 +158,18 @@ journaling for provider responses or tool execution.
 
 `store/storetest.Run` currently describes these required behaviors:
 
-- atomic per-session run ownership and `ErrSessionBusy`;
-- transaction rollback hides writes;
-- stable replay ordering by message and part order;
-- pending tool-call creation, single-owner claim, conflict on second claim, and
-  terminal settlement;
-- unfinished run discovery and durable event listing.
+- atomic per-session run ownership under concurrent admission and
+  `ErrSessionBusy`;
+- transaction commit and rollback behavior when a transactor is exposed;
+- stable replay ordering by message and part order, including paged reads;
+- mandatory compatible duplicate idempotency and incompatible duplicate
+  conflicts;
+- pending tool-call creation, single-owner claim, conflict on second claim,
+  claim-token fencing, and terminal settlement;
+- unfinished run discovery and durable event listing with paged reads.
+
+Transactional backends should also call `storetest.RunTransactional`, which
+requires a non-nil transactor and repeats the transaction-specific contract.
 
 Every backend should run the contract suite in its own package and add
 backend-specific tests for ID generation, migrations, persistence across

@@ -256,12 +256,47 @@ type EventRecord struct {
 	PartID      PartID
 	ToolCallID  ToolCallID
 	EpochID     EpochID
+	ProviderID  string
+	ModelID     string
+	ParentID    string
 	Kind        string
 	Correlation string
+	Usage       Usage
+	Error       EventError
+	Redaction   RedactionClass
 	Payload     json.RawMessage
 	LiveOnly    bool
 	CreatedAt   time.Time
 }
+
+// Usage records provider usage data in a store-level event projection.
+type Usage struct {
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	Cost             float64
+}
+
+// EventError records stable error classification in a durable event.
+type EventError struct {
+	Code      string
+	Message   string
+	Retryable bool
+}
+
+// RedactionClass classifies durable event payload sensitivity.
+type RedactionClass string
+
+const (
+	// RedactionNone marks payloads safe for direct export.
+	RedactionNone RedactionClass = "none"
+	// RedactionMetadata marks payloads where metadata can export but content cannot.
+	RedactionMetadata RedactionClass = "metadata"
+	// RedactionContent marks payloads containing user, model, or tool content.
+	RedactionContent RedactionClass = "content"
+)
 
 // EventCursor selects a stable page of durable events.
 type EventCursor struct {
