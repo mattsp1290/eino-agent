@@ -2,10 +2,12 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 )
 
 var (
@@ -296,9 +298,29 @@ func cloneToolInfos(src []*einoschema.ToolInfo) []*einoschema.ToolInfo {
 		}
 		next := *tool
 		next.Extra = cloneAnyMap(tool.Extra)
+		next.ParamsOneOf = cloneParamsOneOf(tool.ParamsOneOf)
 		dst[i] = &next
 	}
 	return dst
+}
+
+func cloneParamsOneOf(src *einoschema.ParamsOneOf) *einoschema.ParamsOneOf {
+	if src == nil {
+		return nil
+	}
+	schema, err := src.ToJSONSchema()
+	if err != nil || schema == nil {
+		return src
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return src
+	}
+	var cloned jsonschema.Schema
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return src
+	}
+	return einoschema.NewParamsOneOfByJSONSchema(&cloned)
 }
 
 func cloneAnyMap(src map[string]any) map[string]any {

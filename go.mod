@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/cloudwego/eino v0.8.13
+	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/golangci/golangci-lint/v2 v2.12.2
 	github.com/mattsp1290/eino-agui v0.1.1
 	github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b
@@ -78,7 +79,6 @@ require (
 	github.com/denis-tingaikin/go-header v0.5.0 // indirect
 	github.com/dlclark/regexp2 v1.12.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/eino-contrib/jsonschema v1.0.3 // indirect
 	github.com/ettle/strcase v0.2.0 // indirect
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/fatih/structtag v1.2.0 // indirect
