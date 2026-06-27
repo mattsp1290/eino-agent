@@ -13,15 +13,20 @@ No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
 
-Two durable response artifacts are missing in this workspace:
+Three response artifacts are missing in this workspace:
 
 - `~/.agents/projects/eino-agui/responses/**`
 - `~/.agents/projects/eino-obs/responses/**`
+- `~/.agents/projects/ensemble/responses/**`
 
+The `eino-agui` and `eino-obs` gaps affect required library response notes.
 For now, `eino-agent` should treat the checked repo state, tags or commits, and
-the docs named below as the implementation evidence. A follow-up response note
-should still be created in those project inboxes so future agents do not need
-to rediscover this state from local clones.
+the docs named below as the implementation evidence for those libraries. The
+ensemble gap is a future integration planning gap and does not block initial
+runtime API work while `eino-agent` keeps observability behind the `eino-obs`
+contract and does not claim ensemble parity. Follow-up response notes should
+still be created in those project inboxes so future agents do not need to
+rediscover this state from local clones.
 
 ## Pins
 
@@ -133,16 +138,27 @@ adapter/migration design that maps ensemble `dispatcher.RunEvent` semantics to
 AG-UI and decides whether ensemble should expose AG-UI directly or through an
 adapter service.
 
-## Blockers Before Runtime Code
+## Runtime Start Criteria
 
-Required before starting runtime implementation:
+Already satisfied for initial runtime architecture and module setup:
+
+- The dependency baseline is pinned to the versions and commits above.
+- This durable status note preserves the implementation evidence.
+- The checked local repositories passed the validation gates listed above.
+
+Ongoing constraints for runtime implementation:
 
 - Use the exact dependency pins above.
-- Create or preserve a durable status note with this evidence.
 - Keep missing `eino-agui`, `eino-obs`, and ensemble response artifacts visible
-  as follow-up documentation gaps.
+  as follow-up documentation gaps, not code-level blockers. Track that work in
+  the follow-up bead titled "Create missing upstream response artifacts".
 - Do not start runtime code with an upgraded dependency baseline unless a
   separate compatibility bead verifies the change.
+- A dependency-upgrade compatibility bead must record the proposed new pin,
+  upstream release or commit evidence, `go mod tidy -diff`, relevant upstream
+  validation gates, and downstream `eino-agent` compatibility tests.
+- Do not claim ensemble AG-UI parity until an ensemble adapter or direct AG-UI
+  transport exists.
 
 No code-level blocker remains for the initial runtime architecture and module
 setup beads.
