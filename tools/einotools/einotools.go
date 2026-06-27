@@ -96,7 +96,7 @@ func workspaceSpecs(options Options) []workspaceSpec {
 		{name: glob.Name, factory: func(root string) (invokableTool, error) { return glob.New(root) }, locker: options.Locker},
 		{name: search.Name, factory: func(root string) (invokableTool, error) { return search.New(root) }, locker: options.Locker},
 		{name: applypatch.Name, factory: func(root string) (invokableTool, error) { return applypatch.New(root) }, locker: options.Locker},
-		{name: shell.Name, concurrent: true, factory: func(root string) (invokableTool, error) {
+		{name: shell.Name, factory: func(root string) (invokableTool, error) {
 			if shellOptions == nil {
 				return shell.New(root)
 			}

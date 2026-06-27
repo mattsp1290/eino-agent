@@ -170,6 +170,50 @@ func TestWorkspaceToolsAllowDifferentCanonicalRootsInParallel(t *testing.T) {
 	probe.waitDone(t, 2)
 }
 
+func TestWorkspaceToolsSerializeSymlinkAliasRoots(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	parent := t.TempDir()
+	alias := filepath.Join(parent, "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Fatalf("symlink fixture: %v", err)
+	}
+	locker := &workspace.Locker{}
+	probe := newConcurrencyProbe()
+	registry := agenttools.NewRegistry()
+	if _, err := registerWorkspace(context.Background(), registry, workspaceSpec{
+		name:    "probe",
+		factory: probe.factory,
+		locker:  locker,
+	}); err != nil {
+		t.Fatalf("register probe: %v", err)
+	}
+	realTools, err := registry.ResolveTools(context.Background(), snapshot(root, "session-real"))
+	if err != nil {
+		t.Fatalf("ResolveTools real error = %v", err)
+	}
+	aliasTools, err := registry.ResolveTools(context.Background(), snapshot(alias, "session-alias"))
+	if err != nil {
+		t.Fatalf("ResolveTools alias error = %v", err)
+	}
+	if realTools[0].Scope.ConcurrencyKey != aliasTools[0].Scope.ConcurrencyKey {
+		t.Fatalf("alias roots use different concurrency keys: %q != %q",
+			realTools[0].Scope.ConcurrencyKey, aliasTools[0].Scope.ConcurrencyKey)
+	}
+	startTool(t, realTools[0])
+	probe.waitEnter(t)
+	startTool(t, aliasTools[0])
+	probe.assertNoEnter(t)
+	probe.releaseOne()
+	probe.waitEnter(t)
+	probe.releaseOne()
+	probe.waitDone(t, 2)
+	if probe.maxActive() != 1 {
+		t.Fatalf("max active = %d, want 1", probe.maxActive())
+	}
+}
+
 type concurrencyProbe struct {
 	enter   chan struct{}
 	release chan struct{}

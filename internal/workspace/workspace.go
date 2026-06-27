@@ -30,7 +30,7 @@ func CanonicalRoot(root string) (string, error) {
 // roots to proceed concurrently.
 type Locker struct {
 	mu    sync.Mutex
-	locks map[string]*sync.Mutex
+	locks map[string]chan struct{}
 }
 
 // Do runs fn while holding the lock for key.
@@ -39,23 +39,27 @@ func (l *Locker) Do(ctx context.Context, key string, fn func() error) error {
 		return err
 	}
 	lock := l.lockFor(key)
-	lock.Lock()
-	defer lock.Unlock()
+	select {
+	case lock <- struct{}{}:
+		defer func() { <-lock }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return fn()
 }
 
-func (l *Locker) lockFor(key string) *sync.Mutex {
+func (l *Locker) lockFor(key string) chan struct{} {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.locks == nil {
-		l.locks = map[string]*sync.Mutex{}
+		l.locks = map[string]chan struct{}{}
 	}
 	lock := l.locks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
+		lock = make(chan struct{}, 1)
 		l.locks[key] = lock
 	}
 	return lock
