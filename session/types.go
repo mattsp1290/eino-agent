@@ -242,6 +242,74 @@ type ReplayBatch struct {
 	Next     ReplayCursor
 }
 
+// EventID identifies a durable runtime event record.
+type EventID string
+
+// EventRecord is the store-level event shape. Runtime adapters may project
+// richer typed events into this durable envelope without making session depend
+// on the runtime package.
+type EventRecord struct {
+	ID          EventID
+	SessionID   ID
+	RunID       RunID
+	MessageID   MessageID
+	PartID      PartID
+	ToolCallID  ToolCallID
+	EpochID     EpochID
+	ProviderID  string
+	ModelID     string
+	ParentID    string
+	Kind        string
+	Correlation string
+	Usage       Usage
+	Error       EventError
+	Redaction   RedactionClass
+	Payload     json.RawMessage
+	LiveOnly    bool
+	CreatedAt   time.Time
+}
+
+// Usage records provider usage data in a store-level event projection.
+type Usage struct {
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	Cost             float64
+}
+
+// EventError records stable error classification in a durable event.
+type EventError struct {
+	Code      string
+	Message   string
+	Retryable bool
+}
+
+// RedactionClass classifies durable event payload sensitivity.
+type RedactionClass string
+
+const (
+	// RedactionNone marks payloads safe for direct export.
+	RedactionNone RedactionClass = "none"
+	// RedactionMetadata marks payloads where metadata can export but content cannot.
+	RedactionMetadata RedactionClass = "metadata"
+	// RedactionContent marks payloads containing user, model, or tool content.
+	RedactionContent RedactionClass = "content"
+)
+
+// EventCursor selects a stable page of durable events.
+type EventCursor struct {
+	AfterEventID EventID
+	Limit        int
+}
+
+// EventBatch returns ordered durable event records.
+type EventBatch struct {
+	Events []EventRecord
+	Next   EventCursor
+}
+
 // Store is the durable boundary used by runtime orchestration. Implementations
 // provide locking and transactions; callers should not infer durability from
 // live AG-UI transport delivery.
@@ -262,6 +330,8 @@ type Store interface {
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
 	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
+	AppendEvent(ctx context.Context, event EventRecord) (EventRecord, error)
+	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
 	CreateToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
 	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
 	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
