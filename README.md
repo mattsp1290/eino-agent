@@ -52,6 +52,8 @@ make lint
   interruption, tools, hooks, and internal events.
 - `model`: provider/model catalog and Eino model resolution contracts.
 - `config`: immutable runtime config snapshot and validation contracts.
+- `store/storetest`: reusable durable store contract tests for backend
+  implementations.
 - `internal/deps`: temporary dependency anchor that keeps the initial pins
   tidy-stable until runtime packages import the concrete dependencies directly.
 - `docs/`: durable planning and architecture context.
