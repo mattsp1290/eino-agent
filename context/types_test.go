@@ -26,7 +26,7 @@ func TestAssemblerPropagatesIdentityAndBoundsItems(t *testing.T) {
 		},
 	}
 	assembler := Assembler{
-		Bounds: Bounds{MaxItems: 2, MaxBytesPerItem: 16, MaxTotalBytes: 32},
+		Bounds: Bounds{MaxItems: 2, MaxBytesPerItem: 128, MaxTotalBytes: 256},
 		Loaders: []Loader{
 			LoaderFunc(func(_ context.Context, request Request) ([]Item, error) {
 				if request.Identity.SessionID != wantIdentity.SessionID {
@@ -47,8 +47,8 @@ func TestAssemblerPropagatesIdentityAndBoundsItems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadContext error = %v", err)
 	}
-	if bundle.TotalBytes != len("read tests") {
-		t.Fatalf("total bytes = %d, want %d", bundle.TotalBytes, len("read tests"))
+	if bundle.TotalBytes <= len("read tests") {
+		t.Fatalf("total bytes = %d, want more than content bytes", bundle.TotalBytes)
 	}
 	if got := wantIdentity.Trace.Attributes["tenant"]; got != "test" {
 		t.Fatalf("loader mutated request identity attribute to %q", got)
@@ -79,6 +79,25 @@ func TestAssemblerHonorsCancellation(t *testing.T) {
 	}
 }
 
+func TestAssemblerHonorsCancellationAfterLoaderReturns(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	assembler := Assembler{
+		Loaders: []Loader{
+			LoaderFunc(func(context.Context, Request) ([]Item, error) {
+				cancel()
+				return []Item{{Content: "stale"}}, nil
+			}),
+		},
+	}
+
+	_, err := assembler.LoadContext(ctx, Request{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadContext error = %v, want context.Canceled", err)
+	}
+}
+
 func TestAssemblerRejectsOversizedContext(t *testing.T) {
 	t.Parallel()
 
@@ -87,6 +106,31 @@ func TestAssemblerRejectsOversizedContext(t *testing.T) {
 		Loaders: []Loader{
 			LoaderFunc(func(context.Context, Request) ([]Item, error) {
 				return []Item{{Content: "too large"}}, nil
+			}),
+		},
+	}
+
+	_, err := assembler.LoadContext(context.Background(), Request{})
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("LoadContext error = %v, want ErrTooLarge", err)
+	}
+}
+
+func TestAssemblerCountsReferenceMetadataInBounds(t *testing.T) {
+	t.Parallel()
+
+	assembler := Assembler{
+		Bounds: Bounds{MaxItems: 1, MaxBytesPerItem: 32, MaxTotalBytes: 32},
+		Loaders: []Loader{
+			LoaderFunc(func(context.Context, Request) ([]Item, error) {
+				return []Item{{
+					SourceName: "attachment",
+					URI:        "attachment://small",
+					MIMEType:   "text/plain",
+					Metadata: map[string]string{
+						"description": "this metadata is intentionally too large",
+					},
+				}}, nil
 			}),
 		},
 	}
@@ -116,6 +160,56 @@ func TestAssemblerRejectsLocalOnlyReferences(t *testing.T) {
 				t.Fatalf("LoadContext error = %v, want ErrLocalPath", err)
 			}
 		})
+	}
+}
+
+func TestAssemblerRejectsLocalOnlySourceLocationAndOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []Request{
+		{Source: Source{Location: "/Users/matt/project/AGENTS.md"}},
+		{Source: Source{Location: `\\server\share\prompt.md`}},
+		{Source: Source{Options: map[string]string{"path": `C:\Users\matt\file.txt`}}},
+		{Source: Source{Options: map[string]string{"attachment_uri": "file:///tmp/attachment.txt"}}},
+	}
+	for _, request := range tests {
+		t.Run(request.Source.Location+request.Source.Options["path"]+request.Source.Options["attachment_uri"], func(t *testing.T) {
+			t.Parallel()
+			assembler := Assembler{
+				Loaders: []Loader{
+					LoaderFunc(func(context.Context, Request) ([]Item, error) {
+						return []Item{{Content: "unused"}}, nil
+					}),
+				},
+			}
+
+			_, err := assembler.LoadContext(context.Background(), request)
+			if !errors.Is(err, ErrLocalPath) {
+				t.Fatalf("LoadContext error = %v, want ErrLocalPath", err)
+			}
+		})
+	}
+}
+
+func TestAssemblerNormalizesNegativeBoundsToDefaults(t *testing.T) {
+	t.Parallel()
+
+	assembler := Assembler{
+		Bounds: Bounds{MaxItems: -1, MaxBytesPerItem: -1, MaxTotalBytes: -1},
+		Loaders: []Loader{
+			LoaderFunc(func(context.Context, Request) ([]Item, error) {
+				items := make([]Item, DefaultBounds().MaxItems+1)
+				for i := range items {
+					items[i] = Item{Content: "x"}
+				}
+				return items, nil
+			}),
+		},
+	}
+
+	_, err := assembler.LoadContext(context.Background(), Request{})
+	if !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("LoadContext error = %v, want ErrTooLarge", err)
 	}
 }
 

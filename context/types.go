@@ -158,6 +158,9 @@ func (a Assembler) LoadContext(ctx context.Context, request Request) (Bundle, er
 		return Bundle{}, err
 	}
 	bounds := a.Bounds.withDefaults()
+	if err := validatePortableSource(request.Source); err != nil {
+		return Bundle{}, err
+	}
 	var bundle Bundle
 	for _, loader := range a.Loaders {
 		if loader == nil {
@@ -170,9 +173,15 @@ func (a Assembler) LoadContext(ctx context.Context, request Request) (Bundle, er
 		if err != nil {
 			return Bundle{}, err
 		}
+		if err := ctx.Err(); err != nil {
+			return Bundle{}, err
+		}
 		if err := appendBounded(&bundle, items, bounds); err != nil {
 			return Bundle{}, err
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return Bundle{}, err
 	}
 	return cloneBundle(bundle), nil
 }
@@ -189,7 +198,7 @@ func appendBounded(bundle *Bundle, items []Item, bounds Bounds) error {
 		if err := validatePortableURI(next.URI); err != nil {
 			return err
 		}
-		size := len(next.Content)
+		size := itemSize(next)
 		if bounds.MaxItems > 0 && len(bundle.Items)+1 > bounds.MaxItems {
 			return fmt.Errorf("%w: max items %d", ErrTooLarge, bounds.MaxItems)
 		}
@@ -203,6 +212,31 @@ func appendBounded(bundle *Bundle, items []Item, bounds Bounds) error {
 		bundle.TotalBytes += size
 	}
 	return nil
+}
+
+func validatePortableSource(source Source) error {
+	if err := validatePortableURI(source.Location); err != nil {
+		return fmt.Errorf("source location: %w", err)
+	}
+	for key, value := range source.Options {
+		if !isReferenceOption(key) {
+			continue
+		}
+		if err := validatePortableURI(value); err != nil {
+			return fmt.Errorf("source option %q: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func isReferenceOption(key string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(key))
+	return normalized == "path" ||
+		normalized == "uri" ||
+		normalized == "url" ||
+		strings.HasSuffix(normalized, "_path") ||
+		strings.HasSuffix(normalized, "_uri") ||
+		strings.HasSuffix(normalized, "_url")
 }
 
 func validatePortableURI(value string) error {
@@ -223,15 +257,23 @@ func validatePortableURI(value string) error {
 	return nil
 }
 
+func itemSize(item Item) int {
+	size := len(item.Content) + len(item.URI) + len(item.MIMEType) + len(item.SourceName) + len(item.Kind)
+	for key, value := range item.Metadata {
+		size += len(key) + len(value)
+	}
+	return size
+}
+
 func (b Bounds) withDefaults() Bounds {
 	defaults := DefaultBounds()
-	if b.MaxItems == 0 {
+	if b.MaxItems <= 0 {
 		b.MaxItems = defaults.MaxItems
 	}
-	if b.MaxBytesPerItem == 0 {
+	if b.MaxBytesPerItem <= 0 {
 		b.MaxBytesPerItem = defaults.MaxBytesPerItem
 	}
-	if b.MaxTotalBytes == 0 {
+	if b.MaxTotalBytes <= 0 {
 		b.MaxTotalBytes = defaults.MaxTotalBytes
 	}
 	return b
