@@ -36,11 +36,12 @@ func (l Lifecycle) LoadSnapshot(ctx context.Context, scope Scope, agentName stri
 	if err != nil {
 		return Snapshot{}, err
 	}
-	snapshot := loaded.Clone()
+	snapshot := normalizeSnapshot(loaded)
 	if l.Plugins != nil {
 		if _, err := l.Plugins.ApplyAll(ctx, &snapshot); err != nil {
 			return Snapshot{}, err
 		}
+		snapshot = normalizeSnapshot(snapshot)
 	}
 	if agentName != "" && snapshot.Agent.Name != "" && snapshot.Agent.Name != agentName {
 		return Snapshot{}, validationError(ValidationUnknownAgent, "agent", agentName)
@@ -76,6 +77,13 @@ func validateSnapshot(ctx context.Context, snapshot Snapshot, catalog model.Cata
 		return err
 	}
 	return nil
+}
+
+func normalizeSnapshot(snapshot Snapshot) Snapshot {
+	next := snapshot.Clone()
+	next.Tools = next.Tools.WithDefaults()
+	next.Observability = next.Observability.WithDefaults()
+	return next
 }
 
 // SnapshotValidator returns a Validator for callers that already loaded a

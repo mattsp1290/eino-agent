@@ -67,6 +67,53 @@ func TestLifecycleRejectsInvalidSnapshotBeforeExecution(t *testing.T) {
 	}
 }
 
+func TestLifecycleAppliesSnapshotDefaultsBeforeValidation(t *testing.T) {
+	t.Parallel()
+
+	snapshot := validSnapshot()
+	snapshot.Tools.Permissions = []PermissionRule{{Permission: "shell"}}
+	snapshot.Observability = ObservabilityConfig{}
+	lifecycle := Lifecycle{Loader: staticLoader{snapshot: snapshot}}
+	loaded, err := lifecycle.LoadSnapshot(context.Background(), Scope{}, "default")
+	if err != nil {
+		t.Fatalf("LoadSnapshot error = %v", err)
+	}
+	if loaded.Tools.Permissions[0].Action != PermissionActionAsk {
+		t.Fatalf("permission action = %q, want %q", loaded.Tools.Permissions[0].Action, PermissionActionAsk)
+	}
+	fields := map[string]bool{}
+	for _, field := range loaded.Observability.Fields {
+		fields[field.Name] = true
+	}
+	if !fields["raw_prompt"] || !fields["raw_tool_payload"] {
+		t.Fatalf("observability defaults missing safe fields: %#v", loaded.Observability.Fields)
+	}
+}
+
+func TestLifecycleAppliesSnapshotDefaultsAfterPlugins(t *testing.T) {
+	t.Parallel()
+
+	registry := orderedPluginRegistry{plugins: []testPlugin{{name: "permission", apply: func(context.Context, *Snapshot) error {
+		return nil
+	}}}}
+	registry.plugins[0].apply = func(_ context.Context, snapshot *Snapshot) error {
+		snapshot.Tools.Permissions = append(snapshot.Tools.Permissions, PermissionRule{Permission: "apply_patch"})
+		snapshot.Observability = ObservabilityConfig{}
+		return nil
+	}
+	lifecycle := Lifecycle{Loader: staticLoader{snapshot: validSnapshot()}, Plugins: registry}
+	loaded, err := lifecycle.LoadSnapshot(context.Background(), Scope{}, "default")
+	if err != nil {
+		t.Fatalf("LoadSnapshot error = %v", err)
+	}
+	if loaded.Tools.Permissions[0].Action != PermissionActionAsk {
+		t.Fatalf("plugin permission action = %q, want %q", loaded.Tools.Permissions[0].Action, PermissionActionAsk)
+	}
+	if len(loaded.Observability.Fields) == 0 {
+		t.Fatal("plugin observability config was not defaulted")
+	}
+}
+
 func TestLifecycleReturnsImmutableSnapshot(t *testing.T) {
 	t.Parallel()
 

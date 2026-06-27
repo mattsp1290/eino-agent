@@ -37,6 +37,7 @@ func TestFreezeTurnSnapshotClonesConfigAndMessages(t *testing.T) {
 	)
 	cfg.Agent.Options["temperature"] = "changed"
 	cfg.Tools.Enabled[0] = "changed"
+	messages[0].Content = "mutated-before-replace"
 	messages[0] = &einoschema.Message{Role: "user", Content: "changed"}
 	if frozen.Config.Agent.Options["temperature"] != "0.2" {
 		t.Fatalf("frozen config mutated: %#v", frozen.Config.Agent.Options)

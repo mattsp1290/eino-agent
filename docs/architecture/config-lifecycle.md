@@ -8,7 +8,8 @@ run admissions.
 ## Order
 
 1. `config.Loader` returns a candidate `config.Snapshot`.
-2. Optional config plugins mutate that candidate in deterministic name order.
+2. Optional config plugins mutate an admission clone of that candidate in
+   deterministic name order.
 3. The lifecycle validates permissions, observability policy, agent identity,
    and model selection before runtime execution begins.
 4. `runtime.FreezeTurnSnapshot` clones config and message containers for the

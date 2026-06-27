@@ -28,8 +28,43 @@ func FreezeTurnSnapshot(
 		EpochID:      epochID,
 		Config:       snapshot.Clone(),
 		Model:        resolved,
-		Messages:     cloneSlice(messages),
+		Messages:     cloneMessages(messages),
 		SystemPrompt: systemPrompt,
 		CreatedAt:    now,
 	}
+}
+
+func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
+	if src == nil {
+		return nil
+	}
+	dst := make([]*einoschema.Message, len(src))
+	for i, msg := range src {
+		if msg == nil {
+			continue
+		}
+		clone := *msg
+		clone.MultiContent = cloneSlice(msg.MultiContent)
+		clone.UserInputMultiContent = cloneSlice(msg.UserInputMultiContent)
+		clone.AssistantGenMultiContent = cloneSlice(msg.AssistantGenMultiContent)
+		clone.ToolCalls = cloneSlice(msg.ToolCalls)
+		if msg.ResponseMeta != nil {
+			responseMeta := *msg.ResponseMeta
+			clone.ResponseMeta = &responseMeta
+		}
+		clone.Extra = cloneAnyMap(msg.Extra)
+		dst[i] = &clone
+	}
+	return dst
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
