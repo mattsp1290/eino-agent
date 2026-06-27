@@ -2,5 +2,6 @@
 //
 // Runtime packages should import the concrete packages they use directly. This
 // package only keeps the first milestone pins visible and tidy-stable until the
-// runtime implementation lands.
+// runtime implementation lands. Delete this package once production packages
+// import every pinned runtime dependency directly.
 package deps
