@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "eino_agent",
+  "project_id": "0d61305f-7da1-4bea-bfa2-634c04f24af1"
+}
