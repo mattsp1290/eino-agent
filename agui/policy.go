@@ -20,6 +20,18 @@ const (
 	DispositionOmit Disposition = "omit"
 )
 
+// Gate names a host/provider decision that must pass before a rule can be
+// persisted, replayed, or included in snapshots.
+type Gate string
+
+const (
+	// GateProviderReasoningStorage requires provider and host permission to store
+	// non-encrypted reasoning.
+	GateProviderReasoningStorage Gate = "provider_reasoning_storage"
+	// GateHostReplaySafeState requires the host to mark state as replay-safe.
+	GateHostReplaySafeState Gate = "host_replay_safe_state"
+)
+
 // EventFamily groups AG-UI events by durability behavior.
 type EventFamily string
 
@@ -46,9 +58,10 @@ type Rule struct {
 	Replay       Disposition
 	LiveTail     Disposition
 	SessionPart  session.PartKind
-	EventKind    string
+	AuditKind    string
 	Redaction    session.RedactionClass
 	SnapshotSafe bool
+	Gates        []Gate
 	Notes        string
 }
 
@@ -60,7 +73,7 @@ func Rules() []Rule {
 			Persist:   DispositionAudit,
 			Replay:    DispositionOmit,
 			LiveTail:  DispositionLive,
-			EventKind: "run_lifecycle",
+			AuditKind: "run_lifecycle",
 			Redaction: session.RedactionMetadata,
 			Notes:     "RUN_STARTED/RUN_FINISHED are durable audit events and live-tail events; replay reconstructs current run state separately.",
 		},
@@ -70,21 +83,21 @@ func Rules() []Rule {
 			Replay:       DispositionReplay,
 			LiveTail:     DispositionLive,
 			SessionPart:  session.PartText,
-			EventKind:    "message_delta",
+			AuditKind:    "message_delta",
 			Redaction:    session.RedactionContent,
 			SnapshotSafe: true,
 			Notes:        "Live text deltas are emitted immediately; replay uses settled message text parts, not stored SSE frames.",
 		},
 		{
-			Family:       EventReasoning,
-			Persist:      DispositionPersist,
-			Replay:       DispositionReplay,
-			LiveTail:     DispositionLive,
-			SessionPart:  session.PartReasoning,
-			EventKind:    "reasoning_delta",
-			Redaction:    session.RedactionContent,
-			SnapshotSafe: true,
-			Notes:        "Plain reasoning may be stored when provider policy allows it; encrypted reasoning is governed by the encrypted reasoning rule.",
+			Family:      EventReasoning,
+			Persist:     DispositionPersist,
+			Replay:      DispositionReplay,
+			LiveTail:    DispositionLive,
+			SessionPart: session.PartReasoning,
+			AuditKind:   "reasoning_delta",
+			Redaction:   session.RedactionContent,
+			Gates:       []Gate{GateProviderReasoningStorage},
+			Notes:       "Plain reasoning may be stored and replayed only after provider and host policy allow reasoning storage.",
 		},
 		{
 			Family:    EventEncryptedReasoning,
@@ -100,7 +113,7 @@ func Rules() []Rule {
 			Replay:      DispositionReplay,
 			LiveTail:    DispositionLive,
 			SessionPart: session.PartToolCall,
-			EventKind:   "tool_call_updated",
+			AuditKind:   "tool_call_updated",
 			Redaction:   session.RedactionContent,
 			Notes:       "Tool call starts/args/ends settle into durable tool-call records and replayable tool-call parts.",
 		},
@@ -110,27 +123,27 @@ func Rules() []Rule {
 			Replay:      DispositionReplay,
 			LiveTail:    DispositionLive,
 			SessionPart: session.PartToolResult,
-			EventKind:   "tool_result",
+			AuditKind:   "tool_result",
 			Redaction:   session.RedactionContent,
 			Notes:       "Tool results replay from bounded durable tool-result parts; live emission uses eino-agui emitter helpers.",
 		},
 		{
-			Family:       EventStateSnapshot,
-			Persist:      DispositionPersist,
-			Replay:       DispositionReplay,
-			LiveTail:     DispositionLive,
-			SessionPart:  session.PartState,
-			EventKind:    "state_snapshot",
-			Redaction:    session.RedactionContent,
-			SnapshotSafe: true,
-			Notes:        "State snapshots are durable only when host policy marks them replay-safe.",
+			Family:      EventStateSnapshot,
+			Persist:     DispositionPersist,
+			Replay:      DispositionReplay,
+			LiveTail:    DispositionLive,
+			SessionPart: session.PartState,
+			AuditKind:   "state_snapshot",
+			Redaction:   session.RedactionContent,
+			Gates:       []Gate{GateHostReplaySafeState},
+			Notes:       "State snapshots are durable and replayable only after host policy marks them replay-safe.",
 		},
 		{
 			Family:    EventStateDelta,
 			Persist:   DispositionAudit,
 			Replay:    DispositionOmit,
 			LiveTail:  DispositionLive,
-			EventKind: "state_delta",
+			AuditKind: "state_delta",
 			Redaction: session.RedactionContent,
 			Notes:     "State deltas are live-tail events; replay uses the latest durable snapshot or host-projected state.",
 		},
@@ -139,7 +152,7 @@ func Rules() []Rule {
 			Persist:   DispositionOmit,
 			Replay:    DispositionReplay,
 			LiveTail:  DispositionLive,
-			EventKind: "messages_snapshot",
+			AuditKind: "messages_snapshot",
 			Redaction: session.RedactionContent,
 			Notes:     "Message snapshots are projected from durable messages and parts; raw snapshot SSE frames are not stored.",
 		},
@@ -148,7 +161,7 @@ func Rules() []Rule {
 			Persist:   DispositionAudit,
 			Replay:    DispositionOmit,
 			LiveTail:  DispositionLive,
-			EventKind: "activity",
+			AuditKind: "activity",
 			Redaction: session.RedactionMetadata,
 			Notes:     "Activity is live UI state plus optional audit metadata, not replayable conversation content.",
 		},
@@ -158,7 +171,7 @@ func Rules() []Rule {
 			Replay:      DispositionReplay,
 			LiveTail:    DispositionLive,
 			SessionPart: session.PartStep,
-			EventKind:   "step",
+			AuditKind:   "step",
 			Redaction:   session.RedactionMetadata,
 			Notes:       "Step boundaries are durable for audit, replay annotations, and observability correlation.",
 		},
@@ -167,7 +180,7 @@ func Rules() []Rule {
 			Persist:   DispositionAudit,
 			Replay:    DispositionOmit,
 			LiveTail:  DispositionLive,
-			EventKind: "custom",
+			AuditKind: "custom",
 			Redaction: session.RedactionContent,
 			Notes:     "Custom events are live and audit-only unless a future typed custom replay contract is added.",
 		},
@@ -176,7 +189,7 @@ func Rules() []Rule {
 			Persist:   DispositionAudit,
 			Replay:    DispositionReplay,
 			LiveTail:  DispositionLive,
-			EventKind: "error",
+			AuditKind: "error",
 			Redaction: session.RedactionMetadata,
 			Notes:     "Errors are durable audit events and may replay as terminal run/message status rather than raw RUN_ERROR frames.",
 		},

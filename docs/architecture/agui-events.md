@@ -65,12 +65,25 @@ The `agui` package exposes a compileable classification model:
 
 - `agui.EventFamily`: coarse event family names.
 - `agui.Disposition`: `persist`, `replay`, `live`, `audit`, or `omit`.
-- `agui.Rule`: durable part kind, event kind, redaction class, snapshot-safety,
-  and notes for each family.
+- `agui.Gate`: required host/provider decisions for conditional durability.
+- `agui.Rule`: durable part kind, durable audit kind, redaction class,
+  snapshot-safety, required gates, and notes for each family.
 - `agui.Rules()`: default policy used by bridge implementations.
 
 These types are policy definitions only. They do not emit protocol events and
 do not convert messages.
+
+`Rule.AuditKind` is not an AG-UI protocol event name and must not drive
+emission. Protocol emission is always implemented through `eino-agui/emitter`
+and `eino-agui/stream`. `AuditKind` is only a stable label for optional
+`session.EventRecord.Kind` values.
+
+Conditional content remains unsafe until its gate is satisfied:
+
+- `GateProviderReasoningStorage`: required before plain reasoning can be
+  persisted, included in snapshots, or replayed.
+- `GateHostReplaySafeState`: required before host state snapshots can be
+  persisted, included in snapshots, or replayed.
 
 ## Replay Projection
 
@@ -78,10 +91,11 @@ Replay uses this order:
 
 1. Read durable messages and parts with `session.Store.ListMessages`.
 2. Exclude encrypted reasoning and policy-denied content.
-3. Materialize assistant/user/tool messages from durable parts.
-4. Convert replayable messages through `eino-agui/convert`.
-5. Emit a messages snapshot or replay response through the transport adapter.
-6. If a run is active, attach to live tail from the current run cursor.
+3. Apply rule gates before including reasoning or state snapshot content.
+4. Materialize assistant/user/tool messages from durable parts.
+5. Convert replayable messages through `eino-agui/convert`.
+6. Emit a messages snapshot or replay response through the transport adapter.
+7. If a run is active, attach to live tail from the current run cursor.
 
 Replay must preserve durable message/part ordering from `store/storetest`.
 Replay must not infer conversation content from `session.EventRecord.Payload`.
@@ -115,6 +129,8 @@ replay:
 
 - encrypted reasoning is excluded;
 - provider-private reasoning is excluded unless explicitly allowed;
+- plain reasoning is excluded unless `GateProviderReasoningStorage` is
+  satisfied;
 - raw oversized tool output is replaced by bounded output and durable
   attachment references;
 - state snapshots are stored only when host policy marks them replay-safe;
