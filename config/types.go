@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/obs"
 )
 
 // Scope describes where configuration is being loaded.
@@ -22,6 +23,7 @@ type Snapshot struct {
 	ContextSources []ContextSource
 	Hooks          []Hook
 	Plugins        []Plugin
+	Observability  ObservabilityConfig
 	Metadata       map[string]string
 }
 
@@ -37,6 +39,7 @@ func (s Snapshot) Clone() Snapshot {
 	next.Metadata = cloneMap(s.Metadata)
 	next.Agent.Options = cloneMap(s.Agent.Options)
 	next.Tools = s.Tools.Clone()
+	next.Observability = s.Observability.Clone()
 	for i := range next.Providers {
 		next.Providers[i].Options = cloneMap(s.Providers[i].Options)
 	}
@@ -54,7 +57,24 @@ type Agent struct {
 	Name         string
 	SystemPrompt string
 	Mode         string
+	Model        model.Selection
 	Options      map[string]string
+}
+
+// Config is the validated user-facing configuration document. It preserves
+// named agents and catalog choices before admission selects one immutable
+// Snapshot for a run.
+type Config struct {
+	DefaultAgent   string
+	Agents         map[string]Agent
+	Models         []model.Selection
+	Providers      []ProviderConfig
+	Tools          ToolConfig
+	ContextSources []ContextSource
+	Hooks          []Hook
+	Plugins        []Plugin
+	Observability  ObservabilityConfig
+	Metadata       map[string]string
 }
 
 // ProviderConfig contains provider-specific config before model resolution.
@@ -69,6 +89,15 @@ type ToolConfig struct {
 	Disabled    []string
 	Permissions []PermissionRule
 }
+
+const (
+	// PermissionActionAsk requires host approval before a matching operation.
+	PermissionActionAsk = "ask"
+	// PermissionActionAllow permits a matching operation without prompting.
+	PermissionActionAllow = "allow"
+	// PermissionActionDeny rejects a matching operation before execution.
+	PermissionActionDeny = "deny"
+)
 
 // Clone returns a deep copy of the tool config.
 func (c ToolConfig) Clone() ToolConfig {
@@ -85,6 +114,27 @@ type PermissionRule struct {
 	Permission string
 	Pattern    string
 	Action     string
+}
+
+// ObservabilityConfig contains exporter-safe observation defaults. Raw prompt,
+// model output, and tool payload fields stay governed by the redaction policy.
+type ObservabilityConfig struct {
+	Service     string
+	Env         string
+	Version     string
+	Fields      []obs.FieldPolicy
+	Correlation []obs.CorrelationField
+	Summary     obs.SummaryPolicy
+}
+
+// Clone returns a deep copy of the observability config slices.
+func (c ObservabilityConfig) Clone() ObservabilityConfig {
+	next := c
+	next.Fields = cloneSlice(c.Fields)
+	next.Correlation = cloneSlice(c.Correlation)
+	next.Summary.AllowedKinds = cloneSlice(c.Summary.AllowedKinds)
+	next.Summary.ForbiddenInputs = cloneSlice(c.Summary.ForbiddenInputs)
+	return next
 }
 
 // ContextSource describes a configured source of prompt/context material.
