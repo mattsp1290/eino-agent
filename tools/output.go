@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strconv"
+	"time"
 	"unicode/utf8"
 
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -46,14 +48,14 @@ type ModelOutput struct {
 // returns the JSON payload used for replayable model-facing history.
 func EncodeModelOutput(call runtime.ToolCall, result runtime.ToolResult, policy runtime.RetentionPolicy) (json.RawMessage, ModelOutput, error) {
 	output := ModelOutput{
-		ToolCallID:  string(call.ID),
-		Status:      outputStatusFromResult(result, nil),
-		Metadata:    cloneStringMap(result.Metadata),
-		Attachments: cloneAttachments(result.Attachments),
+		ToolCallID: string(call.ID),
+		Status:     outputStatusFromResult(result, nil),
 	}
 	applyBoundedContent(&output, result, policy)
-	if len(result.Structured) > 0 && !output.Redacted && !output.Truncated {
-		output.Structured = cloneRawMessage(result.Structured)
+	applyBoundedStructured(&output, result.Structured, policy)
+	if !output.Redacted && !output.Truncated {
+		output.Metadata = safeModelMetadata(result.Metadata)
+		output.Attachments = safeModelAttachments(result.Attachments)
 	}
 	raw, err := json.Marshal(output)
 	if err != nil {
@@ -85,10 +87,11 @@ func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtim
 		return session.ToolSettlement{}, session.Part{}, err
 	}
 	settlement := session.ToolSettlement{
-		ID:       call.ID,
-		Status:   toolCallStatus(status),
-		Output:   raw,
-		Metadata: settlementMetadata(tool, status, output),
+		ID:          call.ID,
+		Status:      toolCallStatus(status),
+		Output:      raw,
+		Metadata:    settlementMetadata(tool, status, output),
+		CompletedAt: time.Now().UTC(),
 	}
 	if execErr != nil {
 		settlement.Error = execErr.Error()
@@ -149,6 +152,23 @@ func applyBoundedContent(output *ModelOutput, result runtime.ToolResult, policy 
 	output.InlineSize = int64(len(content))
 }
 
+func applyBoundedStructured(output *ModelOutput, structured json.RawMessage, policy runtime.RetentionPolicy) {
+	if len(structured) == 0 || output.Redacted {
+		return
+	}
+	output.OriginalSize += int64(len(structured))
+	if policy.MaxInlineBytes >= 0 {
+		remaining := policy.MaxInlineBytes - output.InlineSize
+		if remaining < int64(len(structured)) {
+			output.Truncated = true
+			output.External = policy.StoreExternal
+			return
+		}
+	}
+	output.Structured = cloneRawMessage(structured)
+	output.InlineSize += int64(len(structured))
+}
+
 func validUTF8Prefix(content string, limit int) string {
 	if limit <= 0 {
 		return ""
@@ -160,6 +180,42 @@ func validUTF8Prefix(content string, limit int) string {
 		limit--
 	}
 	return content[:limit]
+}
+
+func safeModelMetadata(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := map[string]string{}
+	for _, key := range []string{MetadataPermissionStatus, MetadataOutputStatus} {
+		if value, ok := src[key]; ok {
+			dst[key] = value
+		}
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
+}
+
+func safeModelAttachments(src []runtime.Attachment) []runtime.Attachment {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]runtime.Attachment, 0, len(src))
+	for _, attachment := range src {
+		if attachment.ID == "" {
+			continue
+		}
+		dst = append(dst, runtime.Attachment{
+			ID:       attachment.ID,
+			MIMEType: attachment.MIMEType,
+		})
+	}
+	if len(dst) == 0 {
+		return nil
+	}
+	return dst
 }
 
 func settlementMetadata(tool runtime.Tool, status string, output ModelOutput) map[string]string {
@@ -177,19 +233,9 @@ func settlementMetadata(tool runtime.Tool, status string, output ModelOutput) ma
 	if output.Redacted {
 		metadata["output_redacted"] = "true"
 	}
+	metadata["output_original_size"] = strconv.FormatInt(output.OriginalSize, 10)
+	metadata["output_inline_size"] = strconv.FormatInt(output.InlineSize, 10)
 	return metadata
-}
-
-func cloneAttachments(src []runtime.Attachment) []runtime.Attachment {
-	if src == nil {
-		return nil
-	}
-	dst := make([]runtime.Attachment, len(src))
-	for i, attachment := range src {
-		dst[i] = attachment
-		dst[i].Metadata = cloneStringMap(attachment.Metadata)
-	}
-	return dst
 }
 
 func cloneRawMessage(raw json.RawMessage) json.RawMessage {

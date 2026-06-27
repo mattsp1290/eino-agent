@@ -35,10 +35,13 @@ func (s ToolSettlement) Apply(call ToolCall) (ToolCall, error) {
 	if !settlementTerminal(s.Status) {
 		return ToolCall{}, ErrConflict
 	}
+	if s.CompletedAt.IsZero() {
+		s.CompletedAt = time.Now().UTC()
+	}
 	call.Status = s.Status
 	call.Output = cloneRawMessage(s.Output)
 	call.Error = s.Error
-	call.Metadata = mergeStringMaps(call.Metadata, s.Metadata)
+	call.Metadata = cloneStringMap(s.Metadata)
 	call.CompletedAt = s.CompletedAt
 	return call, nil
 }
@@ -63,12 +66,10 @@ func settlementMatches(call ToolCall, settlement ToolSettlement) bool {
 	if !rawMessageEqual(call.Output, settlement.Output) {
 		return false
 	}
-	for key, value := range settlement.Metadata {
-		if call.Metadata[key] != value {
-			return false
-		}
+	if !reflect.DeepEqual(call.Metadata, settlement.Metadata) {
+		return false
 	}
-	if !settlement.CompletedAt.IsZero() && !call.CompletedAt.Equal(settlement.CompletedAt) {
+	if !call.CompletedAt.Equal(settlement.CompletedAt) {
 		return false
 	}
 	return true
@@ -97,16 +98,13 @@ func cloneRawMessage(raw json.RawMessage) json.RawMessage {
 	return clone
 }
 
-func mergeStringMaps(base map[string]string, overlay map[string]string) map[string]string {
-	if len(base) == 0 && len(overlay) == 0 {
+func cloneStringMap(src map[string]string) map[string]string {
+	if src == nil {
 		return nil
 	}
-	merged := make(map[string]string, len(base)+len(overlay))
-	for key, value := range base {
-		merged[key] = value
+	clone := make(map[string]string, len(src))
+	for key, value := range src {
+		clone[key] = value
 	}
-	for key, value := range overlay {
-		merged[key] = value
-	}
-	return merged
+	return clone
 }

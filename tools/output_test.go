@@ -35,6 +35,14 @@ func TestEncodeModelOutputRedactsRawAndStructuredPayload(t *testing.T) {
 	raw, output, err := EncodeModelOutput(runtime.ToolCall{ID: "call-1"}, runtime.ToolResult{
 		Output:     "secret-output",
 		Structured: json.RawMessage(`{"secret":"output"}`),
+		Metadata:   map[string]string{"token": "secret-output"},
+		Attachments: []runtime.Attachment{{
+			ID:       "attachment-1",
+			MIMEType: "text/plain",
+			Name:     "secret-output",
+			URL:      "file:///private/secret-output",
+			Metadata: map[string]string{"token": "secret-output"},
+		}},
 	}, runtime.RetentionPolicy{MaxInlineBytes: 20, StoreExternal: true, Redact: true})
 	if err != nil {
 		t.Fatalf("encode redacted model output: %v", err)
@@ -44,6 +52,48 @@ func TestEncodeModelOutputRedactsRawAndStructuredPayload(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "secret-output") || strings.Contains(string(raw), "secret") {
 		t.Fatalf("redacted payload leaked raw content: %s", raw)
+	}
+}
+
+func TestEncodeModelOutputBoundsStructuredPayload(t *testing.T) {
+	raw, output, err := EncodeModelOutput(runtime.ToolCall{ID: "call-1"}, runtime.ToolResult{
+		Output:     "ok",
+		Structured: json.RawMessage(`{"secret":"oversized-structured-payload"}`),
+	}, runtime.RetentionPolicy{MaxInlineBytes: 10, StoreExternal: true})
+	if err != nil {
+		t.Fatalf("encode model output: %v", err)
+	}
+	if !output.Truncated || !output.External || output.Structured != nil {
+		t.Fatalf("output = %+v", output)
+	}
+	if strings.Contains(string(raw), "oversized-structured-payload") {
+		t.Fatalf("structured payload leaked oversized raw content: %s", raw)
+	}
+}
+
+func TestEncodeModelOutputSuppressesToolControlledFieldsWhenTruncated(t *testing.T) {
+	raw, _, err := EncodeModelOutput(runtime.ToolCall{ID: "call-1"}, runtime.ToolResult{
+		Output: "abcdef",
+		Metadata: map[string]string{
+			MetadataPermissionStatus: "denied",
+			"token":                  "abcdef",
+		},
+		Attachments: []runtime.Attachment{{
+			ID:       "attachment-1",
+			MIMEType: "text/plain",
+			Name:     "abcdef",
+			URL:      "file:///private/abcdef",
+			Metadata: map[string]string{"token": "abcdef"},
+		}},
+	}, runtime.RetentionPolicy{MaxInlineBytes: 3, StoreExternal: true})
+	if err != nil {
+		t.Fatalf("encode model output: %v", err)
+	}
+	payload := string(raw)
+	for _, leaked := range []string{"abcdef", "file:///private", "attachment-1", MetadataPermissionStatus} {
+		if strings.Contains(payload, leaked) {
+			t.Fatalf("truncated payload leaked %q: %s", leaked, payload)
+		}
 	}
 }
 
@@ -59,6 +109,9 @@ func TestBuildToolSettlementClassifiesExpectedFailure(t *testing.T) {
 	}
 	if settlement.Status != session.ToolCallFailed || settlement.Metadata[MetadataOutputStatus] != outputStatusExpectedFailure {
 		t.Fatalf("settlement = %+v", settlement)
+	}
+	if settlement.CompletedAt.IsZero() {
+		t.Fatalf("settlement CompletedAt was not populated")
 	}
 	if part.Kind != session.PartToolResult || !strings.Contains(string(part.Payload), outputStatusExpectedFailure) {
 		t.Fatalf("part = %+v", part)

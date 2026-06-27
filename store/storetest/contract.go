@@ -242,6 +242,26 @@ func Run(t *testing.T, factory Factory) {
 		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("conflicting repeat finish err = %v, want ErrConflict", err)
 		}
+		conflictingFinish = claimed
+		conflictingFinish.Status = session.ToolCallFailed
+		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("conflicting status finish err = %v, want ErrConflict", err)
+		}
+		conflictingFinish = claimed
+		conflictingFinish.Error = "different error"
+		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("conflicting error finish err = %v, want ErrConflict", err)
+		}
+		conflictingFinish = claimed
+		conflictingFinish.Metadata = map[string]string{"output_status": "changed"}
+		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("conflicting metadata finish err = %v, want ErrConflict", err)
+		}
+		conflictingFinish = claimed
+		conflictingFinish.CompletedAt = claimed.CompletedAt.Add(time.Second)
+		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("conflicting completion time finish err = %v, want ErrConflict", err)
+		}
 		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 0 {
 			t.Fatalf("unfinished calls = %d, err = %v; want none", len(unfinished), err)
 		}

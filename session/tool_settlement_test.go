@@ -29,7 +29,7 @@ func TestToolSettlementApplyIsIdempotent(t *testing.T) {
 	if settled.Status != ToolCallCompleted || string(settled.Output) != `{"content":"ok"}` {
 		t.Fatalf("settled call = %+v", settled)
 	}
-	if settled.Metadata["tool"] != "read" || settled.Metadata["output_status"] != "completed" {
+	if _, ok := settled.Metadata["tool"]; ok || settled.Metadata["output_status"] != "completed" {
 		t.Fatalf("metadata = %#v", settled.Metadata)
 	}
 	again, err := settlement.Apply(settled)
@@ -42,18 +42,65 @@ func TestToolSettlementApplyIsIdempotent(t *testing.T) {
 }
 
 func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
+	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
 	call := ToolCall{
-		ID:     "call-1",
-		Status: ToolCallCompleted,
-		Output: json.RawMessage(`{"content":"ok"}`),
+		ID:          "call-1",
+		Status:      ToolCallCompleted,
+		Output:      json.RawMessage(`{"content":"ok"}`),
+		Metadata:    map[string]string{"output_status": "completed"},
+		CompletedAt: now,
 	}
-	conflict := ToolSettlement{
-		ID:     "call-1",
-		Status: ToolCallCompleted,
-		Output: json.RawMessage(`{"content":"different"}`),
+	tests := map[string]ToolSettlement{
+		"output": {
+			ID:          "call-1",
+			Status:      ToolCallCompleted,
+			Output:      json.RawMessage(`{"content":"different"}`),
+			Metadata:    map[string]string{"output_status": "completed"},
+			CompletedAt: now,
+		},
+		"metadata": {
+			ID:          "call-1",
+			Status:      ToolCallCompleted,
+			Output:      json.RawMessage(`{"content":"ok"}`),
+			Metadata:    map[string]string{"output_status": "changed"},
+			CompletedAt: now,
+		},
+		"completed_at": {
+			ID:          "call-1",
+			Status:      ToolCallCompleted,
+			Output:      json.RawMessage(`{"content":"ok"}`),
+			Metadata:    map[string]string{"output_status": "completed"},
+			CompletedAt: now.Add(time.Second),
+		},
+		"missing_completed_at": {
+			ID:       "call-1",
+			Status:   ToolCallCompleted,
+			Output:   json.RawMessage(`{"content":"ok"}`),
+			Metadata: map[string]string{"output_status": "completed"},
+		},
 	}
-	if _, err := conflict.Apply(call); !errors.Is(err, ErrConflict) {
-		t.Fatalf("conflicting settlement err = %v, want ErrConflict", err)
+	for name, conflict := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := conflict.Apply(call); !errors.Is(err, ErrConflict) {
+				t.Fatalf("conflicting settlement err = %v, want ErrConflict", err)
+			}
+		})
+	}
+}
+
+func TestToolSettlementApplyPopulatesMissingCompletionTime(t *testing.T) {
+	settlement := ToolSettlement{
+		ID:       "call-1",
+		Status:   ToolCallCompleted,
+		Output:   json.RawMessage(`{"content":"ok"}`),
+		Metadata: map[string]string{"output_status": "completed"},
+	}
+	settled, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning})
+	if err != nil {
+		t.Fatalf("apply settlement: %v", err)
+	}
+	if settled.CompletedAt.IsZero() {
+		t.Fatalf("CompletedAt was not populated")
 	}
 }
 
