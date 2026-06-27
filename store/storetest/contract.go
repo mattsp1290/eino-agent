@@ -234,6 +234,14 @@ func Run(t *testing.T, factory Factory) {
 		if err := subject.Store.FinishToolCall(ctx, claimed); err != nil {
 			t.Fatalf("finish tool call: %v", err)
 		}
+		if err := subject.Store.FinishToolCall(ctx, claimed); err != nil {
+			t.Fatalf("idempotent finish tool call: %v", err)
+		}
+		conflictingFinish := claimed
+		conflictingFinish.Output = []byte(`{"text":"changed"}`)
+		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("conflicting repeat finish err = %v, want ErrConflict", err)
+		}
 		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 0 {
 			t.Fatalf("unfinished calls = %d, err = %v; want none", len(unfinished), err)
 		}
