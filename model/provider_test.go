@@ -94,6 +94,9 @@ func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
 func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	t.Parallel()
 
+	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+		"text": {Type: einoschema.String, Required: true},
+	})
 	request := Request{
 		Identity: Identity{TraceAttributes: map[string]string{"trace": "value"}},
 		Messages: []*einoschema.Message{{
@@ -101,8 +104,9 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 			Extra:   map[string]any{"key": "value"},
 		}},
 		Tools: []*einoschema.ToolInfo{{
-			Name:  "tool",
-			Extra: map[string]any{"key": "value"},
+			Name:        "tool",
+			ParamsOneOf: params,
+			Extra:       map[string]any{"key": "value"},
 		}},
 		Options: map[string]string{"temperature": "0"},
 	}
@@ -122,6 +126,9 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 		request.Tools[0].Extra["key"] != "value" ||
 		request.Options["temperature"] != "0" {
 		t.Fatalf("request mutated after clone: %#v", request)
+	}
+	if cloned.Tools[0].ParamsOneOf == nil || cloned.Tools[0].ParamsOneOf == params {
+		t.Fatal("tool parameter schema was not cloned")
 	}
 }
 

@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
+
+	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -103,6 +106,25 @@ func TestResolveToolsHonorsEnabledDisabledAndClonesModelInfo(t *testing.T) {
 	}
 }
 
+func TestExplicitEmptyEnabledListMaterializesNoTools(t *testing.T) {
+	t.Parallel()
+
+	registry := NewRegistry()
+	if _, err := registry.Register(testDefinition("echo")); err != nil {
+		t.Fatalf("Register error = %v", err)
+	}
+	snap := snapshot("session")
+	snap.Config.Tools.Enabled = []string{}
+
+	materialized, err := registry.ResolveTools(context.Background(), snap)
+	if err != nil {
+		t.Fatalf("ResolveTools error = %v", err)
+	}
+	if len(materialized) != 0 {
+		t.Fatalf("materialized %d tools, want none", len(materialized))
+	}
+}
+
 func TestDecodeAndExecuteTypedTool(t *testing.T) {
 	t.Parallel()
 
@@ -130,6 +152,53 @@ func TestDecodeAndExecuteTypedTool(t *testing.T) {
 	}
 }
 
+func TestDecodeToolInputDoesNotUseOutputEncoder(t *testing.T) {
+	t.Parallel()
+
+	type input struct {
+		Query string `json:"query"`
+	}
+	type output struct {
+		Results []string `json:"results"`
+	}
+	registry := NewRegistry()
+	if _, err := registry.Register(Definition{
+		Name: "search",
+		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
+			var value input
+			return value, json.Unmarshal(raw, &value)
+		},
+		Encode: func(_ context.Context, value any) (json.RawMessage, error) {
+			result, ok := value.(output)
+			if !ok {
+				return nil, fmt.Errorf("expected output, got %T", value)
+			}
+			return json.Marshal(result)
+		},
+		Execute: func(_ context.Context, execution Execution) (any, error) {
+			value := execution.Input.(input)
+			return output{Results: []string{value.Query}}, nil
+		},
+	}); err != nil {
+		t.Fatalf("Register error = %v", err)
+	}
+	materialized, err := registry.ResolveTools(context.Background(), snapshot("session"))
+	if err != nil {
+		t.Fatalf("ResolveTools error = %v", err)
+	}
+	normalized, err := materialized[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"query":"needle"}`))
+	if err != nil {
+		t.Fatalf("DecodeToolInput error = %v", err)
+	}
+	result, err := materialized[0].Executor.Execute(context.Background(), runtime.ToolCall{Input: normalized})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if string(result.Structured) != `{"results":["needle"]}` {
+		t.Fatalf("result = %s", result.Structured)
+	}
+}
+
 func TestMalformedToolInputReturnsTypedError(t *testing.T) {
 	t.Parallel()
 
@@ -147,6 +216,72 @@ func TestMalformedToolInputReturnsTypedError(t *testing.T) {
 	_, err = materialized[0].Executor.Execute(context.Background(), runtime.ToolCall{Input: json.RawMessage(`{"wrong":true}`)})
 	if !errors.Is(err, ErrMalformedInput) {
 		t.Fatalf("Execute malformed error = %v, want ErrMalformedInput", err)
+	}
+}
+
+func TestScopeResolverCanReplaceWithoutDeadlock(t *testing.T) {
+	t.Parallel()
+
+	registry := NewRegistry()
+	registration, err := registry.Register(testDefinition("echo"))
+	if err != nil {
+		t.Fatalf("Register error = %v", err)
+	}
+	replaced := make(chan error, 1)
+	definition := testDefinition("echo")
+	definition.Scope = func(_ runtime.TurnSnapshot, _ Definition) runtime.ToolScope {
+		next := testDefinition("echo")
+		_, err := registry.Replace(registration, next)
+		replaced <- err
+		return runtime.ToolScope{}
+	}
+	if registration, err = registry.Replace(registration, definition); err != nil {
+		t.Fatalf("Replace scoped definition error = %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := registry.ResolveTools(context.Background(), snapshot("session"))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ResolveTools error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ResolveTools deadlocked while ScopeResolver replaced registration")
+	}
+	if err := <-replaced; err != nil {
+		t.Fatalf("ScopeResolver Replace error = %v", err)
+	}
+}
+
+func TestParameterSchemasAreClonedPerMaterialization(t *testing.T) {
+	t.Parallel()
+
+	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+		"text": {Type: einoschema.String, Required: true},
+	})
+	definition := testDefinition("echo")
+	definition.Parameters = params
+	registry := NewRegistry()
+	if _, err := registry.Register(definition); err != nil {
+		t.Fatalf("Register error = %v", err)
+	}
+	first, err := registry.ResolveTools(context.Background(), snapshot("session-a"))
+	if err != nil {
+		t.Fatalf("ResolveTools first error = %v", err)
+	}
+	second, err := registry.ResolveTools(context.Background(), snapshot("session-b"))
+	if err != nil {
+		t.Fatalf("ResolveTools second error = %v", err)
+	}
+	if first[0].Info.ParamsOneOf == nil || second[0].Info.ParamsOneOf == nil {
+		t.Fatal("expected cloned parameter schemas")
+	}
+	if first[0].Info.ParamsOneOf == params || second[0].Info.ParamsOneOf == params || first[0].Info.ParamsOneOf == second[0].Info.ParamsOneOf {
+		t.Fatal("parameter schema pointer shared across registration or materializations")
 	}
 }
 

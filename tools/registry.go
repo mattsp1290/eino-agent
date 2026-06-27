@@ -9,6 +9,7 @@ import (
 	"sync"
 
 	einoschema "github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 
 	"github.com/mattsp1290/eino-agent/runtime"
 )
@@ -30,6 +31,10 @@ type Decoder func(ctx context.Context, raw json.RawMessage) (any, error)
 // Encoder converts a typed tool result into bounded structured JSON.
 type Encoder func(ctx context.Context, value any) (json.RawMessage, error)
 
+// InputNormalizer converts decoded model input into canonical JSON for durable
+// storage and the later execution pass. If omitted, json.Marshal is used.
+type InputNormalizer func(ctx context.Context, input any) (json.RawMessage, error)
+
 // Executor executes one typed tool invocation.
 type Executor func(ctx context.Context, execution Execution) (any, error)
 
@@ -42,6 +47,7 @@ type Definition struct {
 	Description string
 	Parameters  *einoschema.ParamsOneOf
 	Decode      Decoder
+	Normalize   InputNormalizer
 	Encode      Encoder
 	Execute     Executor
 	RetrySafe   bool
@@ -130,15 +136,19 @@ func (r *Registry) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapsh
 		return nil, err
 	}
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	enabled := enabledSet(snapshot)
 	disabled := disabledSet(snapshot)
-	result := make([]runtime.Tool, 0, len(r.defs))
+	definitions := make([]Definition, 0, len(r.defs))
 	for _, entry := range r.defs {
 		definition := entry.definition.Clone()
 		if !includeTool(definition.Name, enabled, disabled) {
 			continue
 		}
+		definitions = append(definitions, definition)
+	}
+	r.mu.RUnlock()
+	result := make([]runtime.Tool, 0, len(definitions))
+	for _, definition := range definitions {
 		result = append(result, materialize(definition, snapshot.Clone()))
 	}
 	return result, nil
@@ -147,6 +157,7 @@ func (r *Registry) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapsh
 // Clone returns a defensive copy of definition containers.
 func (d Definition) Clone() Definition {
 	next := d
+	next.Parameters = cloneParamsOneOf(d.Parameters)
 	next.Permissions = cloneSlice(d.Permissions)
 	next.Metadata = cloneStringMap(d.Metadata)
 	return next
@@ -164,6 +175,9 @@ func validateDefinition(definition Definition) error {
 	}
 	if definition.Execute == nil {
 		return fmt.Errorf("%w: executor required for %s", ErrInvalidDefinition, definition.Name)
+	}
+	if _, err := cloneParamsOneOfChecked(definition.Parameters); err != nil {
+		return fmt.Errorf("%w: parameters for %s: %v", ErrInvalidDefinition, definition.Name, err)
 	}
 	switch definition.Concurrency {
 	case "", runtime.ToolConcurrencyParallel, runtime.ToolConcurrencySequential:
@@ -200,7 +214,7 @@ func materialize(definition Definition, snapshot runtime.TurnSnapshot) runtime.T
 			Name:        definition.Name,
 			Desc:        definition.Description,
 			Extra:       cloneAnyMap(definition.Metadata),
-			ParamsOneOf: definition.Parameters,
+			ParamsOneOf: cloneParamsOneOf(definition.Parameters),
 		},
 		Executor:     toolExecutor{definition: definition.Clone(), snapshot: snapshot.Clone()},
 		RetrySafe:    definition.RetrySafe,
@@ -224,7 +238,7 @@ func (d toolDecoder) DecodeToolInput(ctx context.Context, raw json.RawMessage) (
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedInput, err)
 	}
-	encoded, err := d.definition.Encode(ctx, decoded)
+	encoded, err := normalizeInput(ctx, d.definition, decoded)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +275,7 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 }
 
 func enabledSet(snapshot runtime.TurnSnapshot) map[string]bool {
-	if len(snapshot.Config.Tools.Enabled) == 0 {
+	if snapshot.Config.Tools.Enabled == nil {
 		return nil
 	}
 	result := make(map[string]bool, len(snapshot.Config.Tools.Enabled))
@@ -290,6 +304,51 @@ func includeTool(name string, enabled map[string]bool, disabled map[string]bool)
 		return true
 	}
 	return enabled[name]
+}
+
+func normalizeInput(ctx context.Context, definition Definition, decoded any) (json.RawMessage, error) {
+	if definition.Normalize != nil {
+		encoded, err := definition.Normalize(ctx, decoded)
+		if err != nil {
+			return nil, err
+		}
+		return cloneRaw(encoded), nil
+	}
+	encoded, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, err
+	}
+	return encoded, nil
+}
+
+func cloneParamsOneOf(src *einoschema.ParamsOneOf) *einoschema.ParamsOneOf {
+	cloned, err := cloneParamsOneOfChecked(src)
+	if err != nil {
+		return src
+	}
+	return cloned
+}
+
+func cloneParamsOneOfChecked(src *einoschema.ParamsOneOf) (*einoschema.ParamsOneOf, error) {
+	if src == nil {
+		return nil, nil
+	}
+	schema, err := src.ToJSONSchema()
+	if err != nil {
+		return nil, err
+	}
+	if schema == nil {
+		return nil, nil
+	}
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return nil, err
+	}
+	var cloned jsonschema.Schema
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return nil, err
+	}
+	return einoschema.NewParamsOneOfByJSONSchema(&cloned), nil
 }
 
 func cloneScope(src runtime.ToolScope) runtime.ToolScope {
