@@ -68,6 +68,7 @@ type Resolved struct {
 	Provider Provider
 	Model    Descriptor
 	Client   einomodel.ToolCallingChatModel
+	Streamer Streamer
 }
 
 // AuthResolver resolves provider credentials at request time so expiring

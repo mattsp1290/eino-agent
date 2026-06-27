@@ -73,8 +73,8 @@ func (i Identity) Clone() Identity {
 func (r Request) Clone() Request {
 	next := r
 	next.Identity = r.Identity.Clone()
-	next.Messages = cloneSlice(r.Messages)
-	next.Tools = cloneSlice(r.Tools)
+	next.Messages = cloneMessages(r.Messages)
+	next.Tools = cloneToolInfos(r.Tools)
 	next.Options = cloneMap(r.Options)
 	return next
 }
@@ -167,6 +167,7 @@ func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runti
 		Provider: provider,
 		Model:    descriptor,
 		Client:   client,
+		Streamer: streamerFor(adapter),
 	}, nil
 }
 
@@ -197,7 +198,11 @@ func (r AdapterResolver) adapterFor(ctx context.Context, providerID ProviderID, 
 
 func (r AdapterResolver) descriptorFor(ctx context.Context, adapter Adapter, selection Selection) (Descriptor, error) {
 	if r.Catalog != nil {
-		return r.Catalog.GetModel(ctx, selection.ProviderID, selection.ModelID)
+		descriptor, err := r.Catalog.GetModel(ctx, selection.ProviderID, selection.ModelID)
+		if err != nil {
+			return Descriptor{}, err
+		}
+		return cloneDescriptor(descriptor), nil
 	}
 	models, err := adapter.Models(ctx)
 	if err != nil {
@@ -213,6 +218,14 @@ func (r AdapterResolver) descriptorFor(ctx context.Context, adapter Adapter, sel
 		Message: "model descriptor not found",
 		Cause:   ErrProviderRejected,
 	}
+}
+
+func streamerFor(adapter Adapter) Streamer {
+	streamer, ok := adapter.(Streamer)
+	if !ok {
+		return nil
+	}
+	return streamer
 }
 
 func cloneRuntime(src Runtime) Runtime {
@@ -246,6 +259,53 @@ func cloneBoolMap(src map[string]bool) map[string]bool {
 		return nil
 	}
 	dst := make(map[string]bool, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
+	if src == nil {
+		return nil
+	}
+	dst := make([]*einoschema.Message, len(src))
+	for i, message := range src {
+		if message == nil {
+			continue
+		}
+		next := *message
+		next.MultiContent = cloneSlice(message.MultiContent)
+		next.UserInputMultiContent = cloneSlice(message.UserInputMultiContent)
+		next.AssistantGenMultiContent = cloneSlice(message.AssistantGenMultiContent)
+		next.ToolCalls = cloneSlice(message.ToolCalls)
+		next.Extra = cloneAnyMap(message.Extra)
+		dst[i] = &next
+	}
+	return dst
+}
+
+func cloneToolInfos(src []*einoschema.ToolInfo) []*einoschema.ToolInfo {
+	if src == nil {
+		return nil
+	}
+	dst := make([]*einoschema.ToolInfo, len(src))
+	for i, tool := range src {
+		if tool == nil {
+			continue
+		}
+		next := *tool
+		next.Extra = cloneAnyMap(tool.Extra)
+		dst[i] = &next
+	}
+	return dst
+}
+
+func cloneAnyMap(src map[string]any) map[string]any {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]any, len(src))
 	for key, value := range src {
 		dst[key] = value
 	}

@@ -76,11 +76,14 @@ func (p *Provider) StreamProvider(ctx context.Context, request model.Request) (*
 	if req.Observer != nil {
 		req.Observer.OnProviderStart(ctx, req)
 	}
-	reader, writer := einoschema.Pipe[*einoschema.Message](len(p.Steps))
+	providerID := p.ID
+	modelID := req.Identity.ModelID
+	steps := cloneSteps(p.Steps)
+	reader, writer := einoschema.Pipe[*einoschema.Message](len(steps))
 	go func() {
 		defer writer.Close()
 		var usage model.Usage
-		for index, step := range cloneSteps(p.Steps) {
+		for index, step := range steps {
 			if err := ctx.Err(); err != nil {
 				notifyError(ctx, req.Observer, err)
 				writer.Send(nil, err)
@@ -93,12 +96,12 @@ func (p *Provider) StreamProvider(ctx context.Context, request model.Request) (*
 				return
 			}
 			usage = addUsage(usage, step.Usage)
-			msg := messageForStep(p.ID, request.Identity.ModelID, step)
+			msg := messageForStep(providerID, modelID, step)
 			delta := model.StreamDelta{
 				Message: msg,
 				Usage:   step.Usage,
 				Index:   int64(index),
-				Done:    index == len(p.Steps)-1,
+				Done:    index == len(steps)-1,
 			}
 			if req.Observer != nil {
 				req.Observer.OnProviderDelta(ctx, delta)
@@ -212,6 +215,28 @@ func normalizeError(err error) error {
 	var providerErr model.Error
 	if errors.As(err, &providerErr) {
 		return providerErr
+	}
+	switch {
+	case errors.Is(err, model.ErrProviderRateLimited):
+		return model.Error{
+			Code:      "provider_rate_limited",
+			Message:   err.Error(),
+			Retryable: true,
+			Cause:     err,
+		}
+	case errors.Is(err, model.ErrProviderUnavailable):
+		return model.Error{
+			Code:      "provider_unavailable",
+			Message:   err.Error(),
+			Retryable: true,
+			Cause:     err,
+		}
+	case errors.Is(err, model.ErrProviderRejected):
+		return model.Error{
+			Code:    "provider_rejected",
+			Message: err.Error(),
+			Cause:   err,
+		}
 	}
 	return model.Error{
 		Code:    "fake_provider_error",

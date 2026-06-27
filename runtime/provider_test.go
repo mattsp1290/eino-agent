@@ -13,6 +13,8 @@ import (
 func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 	t.Parallel()
 
+	originalMessage := einoschema.UserMessage("hello")
+	originalTool := &einoschema.ToolInfo{Name: "search"}
 	snapshot := TurnSnapshot{
 		SessionID: "session-1",
 		RunID:     "run-1",
@@ -27,9 +29,9 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 			Provider: model.Provider{ID: "resolved-provider"},
 			Model:    model.Descriptor{ID: "resolved-model"},
 		},
-		Messages: []*einoschema.Message{einoschema.UserMessage("hello")},
+		Messages: []*einoschema.Message{originalMessage},
 		Tools: []Tool{{
-			Info: &einoschema.ToolInfo{Name: "search"},
+			Info: originalTool,
 		}},
 	}
 
@@ -46,7 +48,12 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 	snapshot.Messages = nil
 	snapshot.Tools = nil
 	snapshot.Config.Agent.Options["temperature"] = "changed"
+	request.Messages[0].Content = "changed"
+	request.Tools[0].Name = "changed"
 	if len(request.Messages) != 1 || len(request.Tools) != 1 || request.Options["temperature"] != "0" {
 		t.Fatalf("request was not cloned: %#v", request)
+	}
+	if originalMessage.Content != "hello" || originalTool.Name != "search" {
+		t.Fatalf("original message/tool mutated: %q/%q", originalMessage.Content, originalTool.Name)
 	}
 }

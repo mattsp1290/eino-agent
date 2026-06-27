@@ -24,7 +24,7 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		Tools:    tools,
 		Options:  cloneStringMap(s.Config.Agent.Options),
 		Observer: observer,
-	}
+	}.Clone()
 }
 
 func modelIdentity(identity agentcontext.Identity) model.Identity {

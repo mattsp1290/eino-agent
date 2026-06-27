@@ -32,6 +32,9 @@ func TestAdapterResolverResolvesAdapterAndClonesRuntime(t *testing.T) {
 	if resolved.Provider.ID != "fake" || resolved.Model.ID != "m1" || resolved.Client == nil {
 		t.Fatalf("resolved = %#v", resolved)
 	}
+	if resolved.Streamer != adapter {
+		t.Fatalf("resolved streamer = %#v, want adapter", resolved.Streamer)
+	}
 }
 
 func TestAdapterResolverReportsUnavailableOptionalAdapter(t *testing.T) {
@@ -61,6 +64,67 @@ func TestAdapterResolverReportsMissingProvider(t *testing.T) {
 	}
 }
 
+func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
+	t.Parallel()
+
+	source := Descriptor{
+		ID:         "m1",
+		ProviderID: "fake",
+		Capabilities: map[string]bool{
+			"tools": true,
+		},
+		Options: map[string]string{
+			"family": "test",
+		},
+	}
+	catalog := testCatalog{descriptor: source}
+	adapter := &testAdapter{provider: Provider{ID: "fake"}}
+
+	resolved, err := (AdapterResolver{Adapters: []Adapter{adapter}, Catalog: catalog}).Resolve(context.Background(), Selection{ProviderID: "fake", ModelID: "m1"}, Runtime{})
+	if err != nil {
+		t.Fatalf("Resolve error = %v", err)
+	}
+	resolved.Model.Capabilities["tools"] = false
+	resolved.Model.Options["family"] = "mutated"
+	if !source.Capabilities["tools"] || source.Options["family"] != "test" {
+		t.Fatalf("source descriptor mutated: %#v", source)
+	}
+}
+
+func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
+	t.Parallel()
+
+	request := Request{
+		Identity: Identity{TraceAttributes: map[string]string{"trace": "value"}},
+		Messages: []*einoschema.Message{{
+			Content: "hello",
+			Extra:   map[string]any{"key": "value"},
+		}},
+		Tools: []*einoschema.ToolInfo{{
+			Name:  "tool",
+			Extra: map[string]any{"key": "value"},
+		}},
+		Options: map[string]string{"temperature": "0"},
+	}
+
+	cloned := request.Clone()
+	cloned.Identity.TraceAttributes["trace"] = "changed"
+	cloned.Messages[0].Content = "changed"
+	cloned.Messages[0].Extra["key"] = "changed"
+	cloned.Tools[0].Name = "changed"
+	cloned.Tools[0].Extra["key"] = "changed"
+	cloned.Options["temperature"] = "1"
+
+	if request.Identity.TraceAttributes["trace"] != "value" ||
+		request.Messages[0].Content != "hello" ||
+		request.Messages[0].Extra["key"] != "value" ||
+		request.Tools[0].Name != "tool" ||
+		request.Tools[0].Extra["key"] != "value" ||
+		request.Options["temperature"] != "0" {
+		t.Fatalf("request mutated after clone: %#v", request)
+	}
+}
+
 type testAdapter struct {
 	provider     Provider
 	models       []Descriptor
@@ -83,6 +147,30 @@ func (a *testAdapter) Build(_ context.Context, _ Selection, runtime Runtime) (ei
 
 func (a *testAdapter) Available(context.Context, Runtime) error {
 	return a.availableErr
+}
+
+func (a *testAdapter) StreamProvider(context.Context, Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+	return einoschema.StreamReaderFromArray([]*einoschema.Message{}), nil
+}
+
+type testCatalog struct {
+	descriptor Descriptor
+}
+
+func (c testCatalog) ListProviders(context.Context) ([]Provider, error) {
+	return []Provider{{ID: c.descriptor.ProviderID}}, nil
+}
+
+func (c testCatalog) ListModels(context.Context, ProviderID) ([]Descriptor, error) {
+	return []Descriptor{c.descriptor}, nil
+}
+
+func (c testCatalog) GetModel(context.Context, ProviderID, ID) (Descriptor, error) {
+	return c.descriptor, nil
+}
+
+func (c testCatalog) DefaultModel(context.Context) (Selection, error) {
+	return Selection{ProviderID: c.descriptor.ProviderID, ModelID: c.descriptor.ID}, nil
 }
 
 type testModel struct{}

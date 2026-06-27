@@ -77,6 +77,67 @@ func TestStreamProviderNormalizesErrors(t *testing.T) {
 	}
 }
 
+func TestStreamProviderSnapshotsProviderState(t *testing.T) {
+	t.Parallel()
+
+	provider := &Provider{
+		ID:    "fake",
+		Steps: []Step{{Content: "original"}},
+	}
+	reader, err := provider.StreamProvider(context.Background(), model.Request{
+		Identity: model.Identity{ModelID: "m1"},
+	})
+	if err != nil {
+		t.Fatalf("StreamProvider error = %v", err)
+	}
+	defer reader.Close()
+	provider.ID = "mutated"
+	provider.Steps = []Step{{Content: "mutated"}}
+
+	msg, err := reader.Recv()
+	if err != nil {
+		t.Fatalf("Recv error = %v", err)
+	}
+	if msg.Content != "original" {
+		t.Fatalf("content = %q, want original", msg.Content)
+	}
+	if msg.Extra["provider_id"] != "fake" {
+		t.Fatalf("provider id = %q, want fake", msg.Extra["provider_id"])
+	}
+}
+
+func TestProviderSentinelErrorsPreserveRetryability(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name      string
+		err       error
+		code      string
+		retryable bool
+	}{
+		{name: "rate limited", err: model.ErrProviderRateLimited, code: "provider_rate_limited", retryable: true},
+		{name: "unavailable", err: model.ErrProviderUnavailable, code: "provider_unavailable", retryable: true},
+		{name: "rejected", err: model.ErrProviderRejected, code: "provider_rejected"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			provider := &Provider{ID: "fake", Steps: []Step{{Err: test.err}}}
+			built, err := provider.Build(context.Background(), model.Selection{ProviderID: "fake", ModelID: "m1"}, model.Runtime{})
+			if err != nil {
+				t.Fatalf("Build error = %v", err)
+			}
+			_, err = built.Generate(context.Background(), nil)
+			var providerErr model.Error
+			if !errors.As(err, &providerErr) {
+				t.Fatalf("Generate error = %T %[1]v, want model.Error", err)
+			}
+			if providerErr.Code != test.code || providerErr.Retryable != test.retryable {
+				t.Fatalf("provider error = %#v", providerErr)
+			}
+		})
+	}
+}
+
 func TestBuildClonesRuntimeAndWithToolsDoesNotMutateBase(t *testing.T) {
 	t.Parallel()
 
