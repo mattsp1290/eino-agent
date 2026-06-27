@@ -62,6 +62,47 @@ func TestValidateRejectsUnknownModel(t *testing.T) {
 	}
 }
 
+func TestValidateUsesCatalogAsAuthoritativeModelSource(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.Models = []model.Selection{{
+		ProviderID: "openai",
+		ModelID:    "not-in-catalog",
+	}}
+	cfg.Agents["default"] = Agent{
+		Name: "default",
+		Model: model.Selection{
+			ProviderID: "openai",
+			ModelID:    "not-in-catalog",
+		},
+	}
+
+	err := cfg.Validate(context.Background(), staticCatalog())
+	if !HasValidationCode(err, ValidationUnknownModel) {
+		t.Fatalf("Validate error = %v, want %s", err, ValidationUnknownModel)
+	}
+}
+
+func TestValidateDistinguishesModelVariant(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.Agents["default"] = Agent{
+		Name: "default",
+		Model: model.Selection{
+			ProviderID: "openai",
+			ModelID:    "gpt-4.1",
+			Variant:    "large-context",
+		},
+	}
+
+	err := cfg.Validate(context.Background(), nil)
+	if !HasValidationCode(err, ValidationUnknownModel) {
+		t.Fatalf("Validate error = %v, want %s", err, ValidationUnknownModel)
+	}
+}
+
 func TestToolPermissionDefaultsToAsk(t *testing.T) {
 	t.Parallel()
 
@@ -103,6 +144,27 @@ func TestObservabilityRedactionDefaultsAreSafe(t *testing.T) {
 		if fields[name].Class != obs.FieldForbidden {
 			t.Fatalf("%s class = %q, want %q", name, fields[name].Class, obs.FieldForbidden)
 		}
+	}
+}
+
+func TestObservabilityPartialSummaryKeepsDefaultRedactionGuardrails(t *testing.T) {
+	t.Parallel()
+
+	cfg := validConfig()
+	cfg.Observability.Summary.EnabledByDefault = true
+	cfg.Observability.Summary.MaxBytesDefault = 256
+
+	snapshot, err := cfg.SnapshotForAgent(context.Background(), "", nil)
+	if err != nil {
+		t.Fatalf("SnapshotForAgent error = %v", err)
+	}
+	for _, name := range []string{"raw_prompt", "raw_output", "raw_tool_payload", "reasoning", "api_keys"} {
+		if !contains(snapshot.Observability.Summary.ForbiddenInputs, name) {
+			t.Fatalf("summary forbidden inputs missing %q: %#v", name, snapshot.Observability.Summary.ForbiddenInputs)
+		}
+	}
+	if len(snapshot.Observability.Summary.AllowedKinds) == 0 {
+		t.Fatal("summary allowed kinds should be defaulted")
 	}
 }
 
@@ -152,4 +214,13 @@ func fieldsByName(fields []obs.FieldPolicy) map[string]obs.FieldPolicy {
 		result[field.Name] = field
 	}
 	return result
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

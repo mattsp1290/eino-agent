@@ -90,6 +90,7 @@ func (c ToolConfig) WithDefaults() ToolConfig {
 // WithDefaults returns exporter-safe observability defaults.
 func (c ObservabilityConfig) WithDefaults() ObservabilityConfig {
 	next := c.Clone()
+	defaultSummary := obs.DefaultSummaryPolicy()
 	if next.Fields == nil {
 		next.Fields = obs.DefaultFields()
 	}
@@ -97,7 +98,14 @@ func (c ObservabilityConfig) WithDefaults() ObservabilityConfig {
 		next.Correlation = obs.DefaultCorrelationFields()
 	}
 	if isZeroSummaryPolicy(next.Summary) {
-		next.Summary = obs.DefaultSummaryPolicy()
+		next.Summary = defaultSummary
+		return next
+	}
+	if next.Summary.AllowedKinds == nil {
+		next.Summary.AllowedKinds = defaultSummary.AllowedKinds
+	}
+	if next.Summary.ForbiddenInputs == nil {
+		next.Summary.ForbiddenInputs = defaultSummary.ForbiddenInputs
 	}
 	return next
 }
@@ -156,14 +164,14 @@ func validateAgentModel(ctx context.Context, agent Agent, selections []model.Sel
 	if agent.Model.ProviderID == "" || agent.Model.ModelID == "" {
 		return validationError(ValidationMissingModel, "model", "must set provider and model")
 	}
-	if selectionConfigured(agent.Model, selections) {
+	if catalog != nil {
+		if _, err := catalog.GetModel(ctx, agent.Model.ProviderID, agent.Model.ModelID); err != nil {
+			return fmt.Errorf("%w: %w", validationError(ValidationUnknownModel, "model", formatSelection(agent.Model)), err)
+		}
 		return nil
 	}
-	if catalog == nil {
+	if !selectionConfigured(agent.Model, selections) {
 		return validationError(ValidationUnknownModel, "model", formatSelection(agent.Model))
-	}
-	if _, err := catalog.GetModel(ctx, agent.Model.ProviderID, agent.Model.ModelID); err != nil {
-		return fmt.Errorf("%w: %w", validationError(ValidationUnknownModel, "model", formatSelection(agent.Model)), err)
 	}
 	return nil
 }
@@ -195,7 +203,9 @@ func validateObservability(config ObservabilityConfig) error {
 
 func selectionConfigured(selection model.Selection, selections []model.Selection) bool {
 	for _, candidate := range selections {
-		if candidate.ProviderID == selection.ProviderID && candidate.ModelID == selection.ModelID {
+		if candidate.ProviderID == selection.ProviderID &&
+			candidate.ModelID == selection.ModelID &&
+			candidate.Variant == selection.Variant {
 			return true
 		}
 	}
