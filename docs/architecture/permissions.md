@@ -1,0 +1,47 @@
+# Permission And Approval Hooks
+
+Date: 2026-06-27
+
+Tool execution is gated by a permission policy before the runtime calls the
+materialized tool executor.
+
+## Decisions
+
+`permissions.Policy` returns one of three decisions:
+
+- `allow`: execute the tool;
+- `deny`: skip execution and return model-visible denial output;
+- `ask`: call the runtime approval hook before execution.
+
+`permissions.StaticPolicy` evaluates `config.PermissionRule` values in order.
+Rules can match a permission name and a simple pattern. Unknown rule actions are
+treated as operational policy failures, not model-visible denials.
+
+## Runtime Behavior
+
+`runtime.ExecuteToolWithPermissions` applies policy and approval hooks around a
+`runtime.ToolExecutor`.
+
+Model-visible outcomes:
+
+- denied by policy;
+- approval required but no approval requester is available;
+- approval rejected with a permission denial;
+- user interruption while waiting for approval.
+
+Operational outcomes:
+
+- policy backend failure;
+- approval backend failure;
+- unknown policy action;
+- actual tool execution failure.
+
+Operational failures are returned as errors so durable settlement can classify
+them separately from ordinary tool denial output.
+
+## Approval Requests
+
+Approval requests include session ID, run ID, tool call ID, permission name,
+matched pattern, and tool metadata. Approval hooks stay host-defined so UI,
+CLI, or service-policy implementations can decide how to ask the user or an
+external policy engine.
