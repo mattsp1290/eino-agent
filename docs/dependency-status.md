@@ -13,20 +13,17 @@ No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
 
-Three response artifacts are missing in this workspace:
+The previously missing response artifacts now exist in this workspace:
 
-- `~/.agents/projects/eino-agui/responses/**`
-- `~/.agents/projects/eino-obs/responses/**`
-- `~/.agents/projects/ensemble/responses/**`
+- `~/.agents/projects/eino-agui/responses/2026-06-26-ag-ui-adapter-surface-for-eino-agent.md`
+- `~/.agents/projects/eino-obs/responses/2026-06-26-datadog-llm-observability-api-for-eino-agent.md`
+- `~/.agents/projects/ensemble/responses/2026-06-26-observability-contract-for-eino-agent.md`
 
-The `eino-agui` and `eino-obs` gaps affect required library response notes.
-For now, `eino-agent` should treat the checked repo state, tags or commits, and
-the docs named below as the implementation evidence for those libraries. The
-ensemble gap is a future integration planning gap and does not block initial
-runtime API work while `eino-agent` keeps observability behind the `eino-obs`
-contract and does not claim ensemble parity. Follow-up response notes should
-still be created in those project inboxes so future agents do not need to
-rediscover this state from local clones.
+The response notes preserve the checked repo state, tags or commits, validation
+evidence, and blocker status so future agents do not need to rediscover this
+state from local clones. The ensemble response remains a planning artifact: it
+does not block initial runtime API work while `eino-agent` keeps observability
+behind the `eino-obs` contract and does not claim ensemble parity.
 
 ## Pins
 
@@ -56,21 +53,13 @@ Required request files inspected:
 
 Response files found:
 
+- `~/.agents/projects/eino-agui/responses/2026-06-26-ag-ui-adapter-surface-for-eino-agent.md`
 - `~/.agents/projects/eino-tools/responses/2026-06-26-coding-agent-tool-parity-for-eino-agent.md`
+- `~/.agents/projects/eino-obs/responses/2026-06-26-datadog-llm-observability-api-for-eino-agent.md`
+- `~/.agents/projects/ensemble/responses/2026-06-26-observability-contract-for-eino-agent.md`
 
-Response files not found:
-
-- No `eino-agui` response file was present under `~/.agents/projects/eino-agui`.
-- No `eino-obs` response file was present under `~/.agents/projects/eino-obs`.
-- No ensemble observability response file was present under
-  `~/.agents/projects/ensemble/responses` in this workspace.
-
-The missing `eino-agui` and `eino-obs` responses are documentation gaps, not
-current implementation blockers, because the pinned repos exist locally and
-their validation gates pass. The missing ensemble observability response remains
-a future integration planning gap; it does not block initial runtime API work as
-long as `eino-agent` keeps observability behind the `eino-obs` contract and does
-not claim ensemble parity.
+No required prerequisite response artifact is missing in the inspected
+workspace.
 
 ## Validation Run
 
@@ -149,9 +138,9 @@ Already satisfied for initial runtime architecture and module setup:
 Ongoing constraints for runtime implementation:
 
 - Use the exact dependency pins above.
-- Keep missing `eino-agui`, `eino-obs`, and ensemble response artifacts visible
-  as follow-up documentation gaps, not code-level blockers. Track that work in
-  the follow-up bead titled "Create missing upstream response artifacts".
+- Preserve the response artifacts listed above when updating prerequisite
+  evidence. If any artifact moves or is superseded, update this note in the
+  same change.
 - Do not start runtime code with an upgraded dependency baseline unless a
   separate compatibility bead verifies the change.
 - A dependency-upgrade compatibility bead must record the proposed new pin,
