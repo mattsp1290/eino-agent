@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sort"
 	"testing"
 	"time"
 
@@ -296,16 +297,20 @@ type admissionStore struct {
 	sessions       map[session.ID]session.Session
 	runs           map[session.RunID]session.Run
 	messages       map[session.MessageID]session.Message
+	parts          map[session.PartID]session.Part
 	events         map[session.EventID]session.EventRecord
+	toolCalls      map[session.ToolCallID]session.ToolCall
 	appendEventErr error
 }
 
 func newAdmissionStore() *admissionStore {
 	return &admissionStore{
-		sessions: map[session.ID]session.Session{},
-		runs:     map[session.RunID]session.Run{},
-		messages: map[session.MessageID]session.Message{},
-		events:   map[session.EventID]session.EventRecord{},
+		sessions:  map[session.ID]session.Session{},
+		runs:      map[session.RunID]session.Run{},
+		messages:  map[session.MessageID]session.Message{},
+		parts:     map[session.PartID]session.Part{},
+		events:    map[session.EventID]session.EventRecord{},
+		toolCalls: map[session.ToolCallID]session.ToolCall{},
 	}
 }
 
@@ -326,7 +331,9 @@ func (s *admissionStore) clone() *admissionStore {
 		sessions:       cloneMap(s.sessions),
 		runs:           cloneMap(s.runs),
 		messages:       cloneMap(s.messages),
+		parts:          cloneMap(s.parts),
 		events:         cloneMap(s.events),
+		toolCalls:      cloneMap(s.toolCalls),
 		appendEventErr: s.appendEventErr,
 	}
 }
@@ -418,11 +425,24 @@ func (s *admissionStore) AppendMessage(_ context.Context, message session.Messag
 	return message, nil
 }
 
-func (s *admissionStore) AppendPart(context.Context, session.Part) (session.Part, error) {
-	return session.Part{}, nil
+func (s *admissionStore) AppendPart(_ context.Context, part session.Part) (session.Part, error) {
+	if existing, ok := s.parts[part.ID]; ok {
+		if existing.Kind != part.Kind {
+			return session.Part{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.parts[part.ID] = part
+	return part, nil
 }
 
-func (s *admissionStore) UpdatePart(context.Context, session.Part) error { return nil }
+func (s *admissionStore) UpdatePart(_ context.Context, part session.Part) error {
+	if _, ok := s.parts[part.ID]; !ok {
+		return session.ErrNotFound
+	}
+	s.parts[part.ID] = part
+	return nil
+}
 
 func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _ session.ReplayCursor) (session.ReplayBatch, error) {
 	var messages []session.Message
@@ -431,7 +451,25 @@ func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _
 			messages = append(messages, message)
 		}
 	}
-	return session.ReplayBatch{Messages: messages}, nil
+	sort.SliceStable(messages, func(i, j int) bool {
+		if !messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
+			return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+		}
+		return messages[i].ID < messages[j].ID
+	})
+	var parts []session.Part
+	for _, part := range s.parts {
+		if part.SessionID == sessionID {
+			parts = append(parts, part)
+		}
+	}
+	sort.SliceStable(parts, func(i, j int) bool {
+		if parts[i].MessageID != parts[j].MessageID {
+			return parts[i].MessageID < parts[j].MessageID
+		}
+		return parts[i].Ordinal < parts[j].Ordinal
+	})
+	return session.ReplayBatch{Messages: messages, Parts: parts}, nil
 }
 
 func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecord) (session.EventRecord, error) {
@@ -466,19 +504,46 @@ func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ s
 	return session.EventBatch{Events: events}, nil
 }
 
-func (s *admissionStore) CreateToolCall(context.Context, session.ToolCall) (session.ToolCall, error) {
-	return session.ToolCall{}, nil
+func (s *admissionStore) CreateToolCall(_ context.Context, call session.ToolCall) (session.ToolCall, error) {
+	if existing, ok := s.toolCalls[call.ID]; ok {
+		if existing.Name != call.Name {
+			return session.ToolCall{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.toolCalls[call.ID] = call
+	return call, nil
 }
-func (s *admissionStore) GetToolCall(context.Context, session.ToolCallID) (session.ToolCall, error) {
-	return session.ToolCall{}, nil
+func (s *admissionStore) GetToolCall(_ context.Context, id session.ToolCallID) (session.ToolCall, error) {
+	call, ok := s.toolCalls[id]
+	if !ok {
+		return session.ToolCall{}, session.ErrNotFound
+	}
+	return call, nil
 }
-func (s *admissionStore) ListUnfinishedToolCalls(context.Context, session.RunID) ([]session.ToolCall, error) {
-	return nil, nil
+func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID session.RunID) ([]session.ToolCall, error) {
+	var calls []session.ToolCall
+	for _, call := range s.toolCalls {
+		if call.RunID == runID && !session.TerminalToolCall(call.Status) {
+			calls = append(calls, call)
+		}
+	}
+	return calls, nil
 }
-func (s *admissionStore) ClaimToolCall(context.Context, session.ToolCall) (session.ToolCall, error) {
-	return session.ToolCall{}, nil
+func (s *admissionStore) ClaimToolCall(_ context.Context, call session.ToolCall) (session.ToolCall, error) {
+	if _, ok := s.toolCalls[call.ID]; !ok {
+		return session.ToolCall{}, session.ErrNotFound
+	}
+	s.toolCalls[call.ID] = call
+	return call, nil
 }
-func (s *admissionStore) FinishToolCall(context.Context, session.ToolCall) error { return nil }
+func (s *admissionStore) FinishToolCall(_ context.Context, call session.ToolCall) error {
+	if _, ok := s.toolCalls[call.ID]; !ok {
+		return session.ErrNotFound
+	}
+	s.toolCalls[call.ID] = call
+	return nil
+}
 func (s *admissionStore) StartContextEpoch(context.Context, session.ContextEpoch) (session.ContextEpoch, error) {
 	return session.ContextEpoch{}, nil
 }
