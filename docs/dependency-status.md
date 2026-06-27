@@ -13,17 +13,25 @@ No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
 
-The previously missing response artifacts now exist in this workspace:
+The previously missing response artifacts now exist in this inspected local
+agent workspace. They are stored outside this repository under
+`~/.agents/projects/*/responses/`, so a clean clone on another machine may not
+contain them:
 
 - `~/.agents/projects/eino-agui/responses/2026-06-26-ag-ui-adapter-surface-for-eino-agent.md`
 - `~/.agents/projects/eino-obs/responses/2026-06-26-datadog-llm-observability-api-for-eino-agent.md`
 - `~/.agents/projects/ensemble/responses/2026-06-26-observability-contract-for-eino-agent.md`
 
 The response notes preserve the checked repo state, tags or commits, validation
-evidence, and blocker status so future agents do not need to rediscover this
-state from local clones. The ensemble response remains a planning artifact: it
-does not block initial runtime API work while `eino-agent` keeps observability
-behind the `eino-obs` contract and does not claim ensemble parity.
+evidence, and blocker status for this local agent workflow. The ensemble
+response remains a planning artifact: it does not block initial runtime API
+work while `eino-agent` keeps observability behind the `eino-obs` contract and
+does not claim ensemble parity.
+
+If a future agent cannot access these external artifacts, it should not infer
+new dependency status from this note alone. Recreate or re-request the response
+evidence before changing pins, validation claims, or ensemble integration
+status.
 
 ## Pins
 
@@ -58,7 +66,7 @@ Response files found:
 - `~/.agents/projects/eino-obs/responses/2026-06-26-datadog-llm-observability-api-for-eino-agent.md`
 - `~/.agents/projects/ensemble/responses/2026-06-26-observability-contract-for-eino-agent.md`
 
-No required prerequisite response artifact is missing in the inspected
+No required prerequisite response artifact is missing in the inspected local
 workspace.
 
 ## Validation Run
@@ -139,8 +147,9 @@ Ongoing constraints for runtime implementation:
 
 - Use the exact dependency pins above.
 - Preserve the response artifacts listed above when updating prerequisite
-  evidence. If any artifact moves or is superseded, update this note in the
-  same change.
+  evidence. Preserve each artifact's pin, validation, and blocker-status
+  evidence; if any artifact moves or is superseded, update this note in the same
+  change.
 - Do not start runtime code with an upgraded dependency baseline unless a
   separate compatibility bead verifies the change.
 - A dependency-upgrade compatibility bead must record the proposed new pin,
