@@ -54,6 +54,8 @@ make lint
 - `config`: immutable runtime config snapshot and validation contracts.
 - `agui`: AG-UI durability and replay policy definitions; protocol mechanics
   stay in `eino-agui`.
+- `obs`: Datadog/eino-obs observability redaction and correlation policy
+  definitions.
 - `store/storetest`: reusable durable store contract tests for backend
   implementations.
 - `internal/deps`: temporary dependency anchor that keeps the initial pins
