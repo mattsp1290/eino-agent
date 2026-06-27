@@ -22,21 +22,35 @@ func TestFreezeTurnSnapshotClonesConfigAndMessages(t *testing.T) {
 		Tools: config.ToolConfig{Enabled: []string{"file_read"}},
 	}
 	messages := []*einoschema.Message{{Role: "user", Content: "hello"}}
+	resolved := model.Resolved{
+		Provider: model.Provider{
+			ID:          "openai",
+			Environment: []string{"OPENAI_API_KEY"},
+			Options:     map[string]string{"region": "us"},
+		},
+		Model: model.Descriptor{
+			ID:           "gpt-4.1",
+			ProviderID:   "openai",
+			Capabilities: map[string]bool{"tools": true},
+			Options:      map[string]string{"tier": "standard"},
+		},
+	}
 	frozen := FreezeTurnSnapshot(
 		"run-1",
 		"session-1",
 		"epoch-1",
 		cfg,
-		model.Resolved{
-			Provider: model.Provider{ID: "openai"},
-			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
-		},
+		resolved,
 		messages,
 		"system",
 		time.Unix(1, 0),
 	)
 	cfg.Agent.Options["temperature"] = "changed"
 	cfg.Tools.Enabled[0] = "changed"
+	resolved.Provider.Environment[0] = "CHANGED"
+	resolved.Provider.Options["region"] = "changed"
+	resolved.Model.Capabilities["tools"] = false
+	resolved.Model.Options["tier"] = "changed"
 	messages[0].Content = "mutated-before-replace"
 	messages[0] = &einoschema.Message{Role: "user", Content: "changed"}
 	if frozen.Config.Agent.Options["temperature"] != "0.2" {
@@ -47,6 +61,12 @@ func TestFreezeTurnSnapshotClonesConfigAndMessages(t *testing.T) {
 	}
 	if frozen.Messages[0].Content != "hello" {
 		t.Fatalf("frozen messages mutated: %#v", frozen.Messages[0])
+	}
+	if frozen.Model.Provider.Environment[0] != "OPENAI_API_KEY" ||
+		frozen.Model.Provider.Options["region"] != "us" ||
+		!frozen.Model.Model.Capabilities["tools"] ||
+		frozen.Model.Model.Options["tier"] != "standard" {
+		t.Fatalf("frozen model mutated: %+v", frozen.Model)
 	}
 	if frozen.RunID != session.RunID("run-1") || frozen.SessionID != session.ID("session-1") {
 		t.Fatalf("frozen identity = %q/%q", frozen.RunID, frozen.SessionID)

@@ -65,7 +65,9 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	admitter := Admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
+	sink := &capturingSink{}
+	hook := &countingHook{}
+	admitter := Admitter{Store: store, Events: sink, Hooks: []Hook{hook}, Clock: func() time.Time { return time.Unix(1, 0) }}
 	request := admissionRequest()
 	if _, err := admitter.Admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
@@ -75,10 +77,38 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 		if again.Run.ID != "run-1" || again.AssistantMessage.ID != "assistant-1" {
 			t.Fatalf("idempotent duplicate identity = %+v", again)
 		}
+		if !again.AlreadyAdmitted {
+			t.Fatal("duplicate admission did not report AlreadyAdmitted")
+		}
+		if hook.calls != 1 || len(sink.events) != 1 {
+			t.Fatalf("duplicate replayed side effects: hook=%d sink=%d", hook.calls, len(sink.events))
+		}
 		return
 	}
 	if !errors.Is(err, session.ErrSessionBusy) && !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("duplicate Admit error = %v, want idempotent or explicit busy/conflict", err)
+	}
+}
+
+func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	store.appendEventErr = errors.New("append event failed")
+	admitter := Admitter{Store: store}
+	_, err := admitter.Admit(context.Background(), admissionRequest())
+	if !errors.Is(err, store.appendEventErr) {
+		t.Fatalf("Admit error = %v, want append event failure", err)
+	}
+	if _, err := store.GetRun(context.Background(), "run-1"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("run leaked after rollback err = %v, want ErrNotFound", err)
+	}
+	batch, err := store.ListMessages(context.Background(), "session-1", session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	if len(batch.Messages) != 0 {
+		t.Fatalf("messages leaked after rollback: %#v", batch.Messages)
 	}
 }
 
@@ -111,6 +141,61 @@ func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
 	}
 	if gotRun.Status != session.RunFailed || gotRun.Error != "provider failed" {
 		t.Fatalf("run after failure = %+v", gotRun)
+	}
+}
+
+func TestAdmitFallsBackToConfigModelIdentity(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	request := admissionRequest()
+	request.Model = model.Resolved{}
+	admitted, err := (Admitter{Store: store}).Admit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Admit error = %v", err)
+	}
+	if admitted.Run.ProviderID != "openai" || admitted.Run.ModelID != "gpt-4.1" {
+		t.Fatalf("run model identity = %q/%q", admitted.Run.ProviderID, admitted.Run.ModelID)
+	}
+}
+
+func TestBeforeRunHookFailureDoesNotEraseAdmission(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	errHook := errors.New("hook failed")
+	admitter := Admitter{
+		Store: store,
+		Hooks: []Hook{failingBeforeRunHook{err: errHook}},
+	}
+	_, err := admitter.Admit(context.Background(), admissionRequest())
+	if !errors.Is(err, errHook) {
+		t.Fatalf("Admit error = %v, want hook error", err)
+	}
+	if _, err := store.GetRun(context.Background(), "run-1"); err != nil {
+		t.Fatalf("run missing after hook failure: %v", err)
+	}
+	batch, err := store.ListMessages(context.Background(), "session-1", session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	if len(batch.Messages) != 1 {
+		t.Fatalf("messages after hook failure = %#v", batch.Messages)
+	}
+}
+
+func TestLiveSinkFailureDoesNotFailAdmission(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	errSink := errors.New("sink failed")
+	admitter := Admitter{Store: store, Events: failingSink{err: errSink}}
+	admitted, err := admitter.Admit(context.Background(), admissionRequest())
+	if err != nil {
+		t.Fatalf("Admit error = %v, want success despite live sink failure", err)
+	}
+	if admitted.Run.ID != "run-1" {
+		t.Fatalf("admitted run = %+v", admitted.Run)
 	}
 }
 
@@ -163,6 +248,14 @@ func (s *capturingSink) Emit(_ context.Context, event Event) error {
 	return nil
 }
 
+type failingSink struct {
+	err error
+}
+
+func (s failingSink) Emit(context.Context, Event) error {
+	return s.err
+}
+
 type capturingHook struct{}
 
 func (capturingHook) BeforeRun(context.Context, session.Run) error { return nil }
@@ -172,11 +265,39 @@ func (capturingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, er
 func (capturingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
 func (capturingHook) AfterRun(context.Context, Result) error                { return nil }
 
+type countingHook struct {
+	calls int
+}
+
+func (h *countingHook) BeforeRun(context.Context, session.Run) error {
+	h.calls++
+	return nil
+}
+func (h *countingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
+	return TurnSnapshot{}, nil
+}
+func (h *countingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
+func (h *countingHook) AfterRun(context.Context, Result) error                { return nil }
+
+type failingBeforeRunHook struct {
+	err error
+}
+
+func (h failingBeforeRunHook) BeforeRun(context.Context, session.Run) error { return h.err }
+func (h failingBeforeRunHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
+	return TurnSnapshot{}, nil
+}
+func (h failingBeforeRunHook) AfterTurn(context.Context, TurnSnapshot, Result) error {
+	return nil
+}
+func (h failingBeforeRunHook) AfterRun(context.Context, Result) error { return nil }
+
 type admissionStore struct {
-	sessions map[session.ID]session.Session
-	runs     map[session.RunID]session.Run
-	messages map[session.MessageID]session.Message
-	events   map[session.EventID]session.EventRecord
+	sessions       map[session.ID]session.Session
+	runs           map[session.RunID]session.Run
+	messages       map[session.MessageID]session.Message
+	events         map[session.EventID]session.EventRecord
+	appendEventErr error
 }
 
 func newAdmissionStore() *admissionStore {
@@ -185,6 +306,28 @@ func newAdmissionStore() *admissionStore {
 		runs:     map[session.RunID]session.Run{},
 		messages: map[session.MessageID]session.Message{},
 		events:   map[session.EventID]session.EventRecord{},
+	}
+}
+
+func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Tx) error) error {
+	tx := s.clone()
+	if err := fn(ctx, tx); err != nil {
+		return err
+	}
+	s.sessions = tx.sessions
+	s.runs = tx.runs
+	s.messages = tx.messages
+	s.events = tx.events
+	return nil
+}
+
+func (s *admissionStore) clone() *admissionStore {
+	return &admissionStore{
+		sessions:       cloneMap(s.sessions),
+		runs:           cloneMap(s.runs),
+		messages:       cloneMap(s.messages),
+		events:         cloneMap(s.events),
+		appendEventErr: s.appendEventErr,
 	}
 }
 
@@ -292,6 +435,9 @@ func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _
 }
 
 func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecord) (session.EventRecord, error) {
+	if s.appendEventErr != nil {
+		return session.EventRecord{}, s.appendEventErr
+	}
 	if existing, ok := s.events[event.ID]; ok {
 		if existing.Kind != event.Kind {
 			return session.EventRecord{}, session.ErrConflict
@@ -300,6 +446,14 @@ func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecor
 	}
 	s.events[event.ID] = event
 	return event, nil
+}
+
+func cloneMap[K comparable, V any](src map[K]V) map[K]V {
+	dst := make(map[K]V, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
 }
 
 func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ session.EventCursor) (session.EventBatch, error) {

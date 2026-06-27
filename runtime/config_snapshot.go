@@ -27,11 +27,20 @@ func FreezeTurnSnapshot(
 		SessionID:    sessionID,
 		EpochID:      epochID,
 		Config:       snapshot.Clone(),
-		Model:        resolved,
+		Model:        cloneResolved(resolved),
 		Messages:     cloneMessages(messages),
 		SystemPrompt: systemPrompt,
 		CreatedAt:    now,
 	}
+}
+
+func cloneResolved(resolved model.Resolved) model.Resolved {
+	next := resolved
+	next.Provider.Environment = cloneSlice(resolved.Provider.Environment)
+	next.Provider.Options = cloneStringMap(resolved.Provider.Options)
+	next.Model.Capabilities = cloneBoolMap(resolved.Model.Capabilities)
+	next.Model.Options = cloneStringMap(resolved.Model.Options)
+	return next
 }
 
 func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
@@ -63,6 +72,17 @@ func cloneAnyMap(src map[string]any) map[string]any {
 		return nil
 	}
 	dst := make(map[string]any, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func cloneBoolMap(src map[string]bool) map[string]bool {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]bool, len(src))
 	for key, value := range src {
 		dst[key] = value
 	}
