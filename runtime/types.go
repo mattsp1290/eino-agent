@@ -60,13 +60,28 @@ type TurnSnapshot struct {
 	CreatedAt    time.Time
 }
 
+// Clone returns a defensive copy of the snapshot container fields. Eino
+// messages are pointer values, so implementations that mutate message contents
+// must still clone the schema.Message values they own before mutation.
+func (s TurnSnapshot) Clone() TurnSnapshot {
+	next := s
+	next.Config = s.Config.Clone()
+	next.Messages = cloneSlice(s.Messages)
+	next.Tools = cloneSlice(s.Tools)
+	return next
+}
+
 // Tool describes one runtime-materialized tool available to a turn.
 type Tool struct {
-	Name      string
-	Info      *einoschema.ToolInfo
-	Executor  ToolExecutor
-	RetrySafe bool
-	Metadata  map[string]string
+	Name         string
+	Info         *einoschema.ToolInfo
+	Executor     ToolExecutor
+	RetrySafe    bool
+	Scope        ToolScope
+	Concurrency  ToolConcurrency
+	InputDecoder InputDecoder
+	Retention    RetentionPolicy
+	Metadata     map[string]string
 }
 
 // ToolExecutor executes one tool call under durable runtime control.
@@ -81,8 +96,39 @@ type ToolCall struct {
 	RunID     session.RunID
 	MessageID session.MessageID
 	Name      string
+	Scope     ToolScope
 	Input     json.RawMessage
 	Approval  ApprovalRequester
+}
+
+// ToolScope describes the authority and serialization scope for a tool.
+type ToolScope struct {
+	WorkspaceID    string
+	Root           string
+	ConcurrencyKey string
+	Permissions    []string
+}
+
+// ToolConcurrency describes whether calls with the same scope may overlap.
+type ToolConcurrency string
+
+const (
+	// ToolConcurrencyParallel allows concurrent calls.
+	ToolConcurrencyParallel ToolConcurrency = "parallel"
+	// ToolConcurrencySequential serializes calls sharing the same concurrency key.
+	ToolConcurrencySequential ToolConcurrency = "sequential"
+)
+
+// InputDecoder validates and normalizes model-provided tool input.
+type InputDecoder interface {
+	DecodeToolInput(ctx context.Context, raw json.RawMessage) (json.RawMessage, error)
+}
+
+// RetentionPolicy describes runtime handling for large tool outputs.
+type RetentionPolicy struct {
+	MaxInlineBytes int64
+	StoreExternal  bool
+	Redact         bool
 }
 
 // ToolResult is the normalized runtime output of a tool call.
@@ -154,15 +200,65 @@ const (
 // Event is the internal event envelope consumed by AG-UI and observability
 // adapters. Durable stores remain authoritative for replay.
 type Event struct {
-	Kind      EventKind
-	SessionID session.ID
-	RunID     session.RunID
-	Payload   json.RawMessage
-	Time      time.Time
-	LiveOnly  bool
+	Kind        EventKind
+	SessionID   session.ID
+	RunID       session.RunID
+	MessageID   session.MessageID
+	PartID      session.PartID
+	ToolCallID  session.ToolCallID
+	EpochID     session.EpochID
+	ProviderID  string
+	ModelID     string
+	ParentID    string
+	Correlation string
+	Usage       Usage
+	Error       EventError
+	Redaction   RedactionClass
+	Payload     json.RawMessage
+	Time        time.Time
+	LiveOnly    bool
 }
 
 // EventSink receives internal runtime events.
 type EventSink interface {
 	Emit(ctx context.Context, event Event) error
 }
+
+func cloneSlice[T any](src []T) []T {
+	if src == nil {
+		return nil
+	}
+	dst := make([]T, len(src))
+	copy(dst, src)
+	return dst
+}
+
+// Usage records provider usage data in a transport-neutral form.
+type Usage struct {
+	InputTokens      int64
+	OutputTokens     int64
+	ReasoningTokens  int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	Cost             float64
+}
+
+// EventError records stable error classification without requiring adapters to
+// parse opaque payload JSON.
+type EventError struct {
+	Code      string
+	Message   string
+	Retryable bool
+}
+
+// RedactionClass classifies event payload sensitivity for observability sinks.
+type RedactionClass string
+
+const (
+	// RedactionNone marks payloads safe for direct export.
+	RedactionNone RedactionClass = "none"
+	// RedactionMetadata marks payloads where metadata can export but content cannot.
+	RedactionMetadata RedactionClass = "metadata"
+	// RedactionContent marks payloads containing user, model, or tool content.
+	RedactionContent RedactionClass = "content"
+)

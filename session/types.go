@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 )
 
@@ -23,6 +24,15 @@ type ToolCallID string
 
 // EpochID identifies a context epoch, including compacted epochs.
 type EpochID string
+
+var (
+	// ErrSessionBusy reports that a session already has a nonterminal owner run.
+	ErrSessionBusy = errors.New("session has active run")
+	// ErrConflict reports a failed conditional update, claim, or settlement.
+	ErrConflict = errors.New("session store conflict")
+	// ErrNotFound reports that a durable session record does not exist.
+	ErrNotFound = errors.New("session record not found")
+)
 
 // Session is durable conversation metadata. Runtime dependencies such as model
 // clients, tool implementations, and hooks are intentionally not serialized.
@@ -68,6 +78,8 @@ type Run struct {
 	SessionID    ID
 	ParentRunID  RunID
 	ParentMsgID  MessageID
+	OwnerID      string
+	LeaseUntil   time.Time
 	Agent        string
 	ProviderID   string
 	ModelID      string
@@ -79,6 +91,11 @@ type Run struct {
 	StartedAt    time.Time
 	FinishedAt   time.Time
 	Error        string
+}
+
+// Terminal reports whether the run no longer owns execution.
+func (r Run) Terminal() bool {
+	return r.Status == RunInterrupted || r.Status == RunFailed || r.Status == RunCompleted
 }
 
 // Role is the durable role of a message in replayable history.
@@ -174,6 +191,8 @@ type ToolCall struct {
 	RetrySafe   bool
 	Metadata    map[string]string
 	ClaimedBy   string
+	ClaimToken  string
+	LeaseUntil  time.Time
 	StartedAt   time.Time
 	CompletedAt time.Time
 	Error       string
@@ -185,12 +204,29 @@ type ContextEpoch struct {
 	SessionID        ID
 	ParentEpochID    EpochID
 	SummaryMessageID MessageID
+	SummarizedFromID MessageID
+	SummarizedToID   MessageID
 	TailStartID      MessageID
 	ModelID          string
 	ProviderID       string
+	Trigger          string
+	Reason           string
+	NextAction       EpochNextAction
 	CreatedAt        time.Time
 	ClosedAt         time.Time
 }
+
+// EpochNextAction records what the runtime should do after compaction.
+type EpochNextAction string
+
+const (
+	// EpochNextStop means compaction ends the active run.
+	EpochNextStop EpochNextAction = "stop"
+	// EpochNextAutoContinue means runtime may continue with a synthetic prompt.
+	EpochNextAutoContinue EpochNextAction = "auto_continue"
+	// EpochNextReplay means runtime may replay the triggering user message.
+	EpochNextReplay EpochNextAction = "replay"
+)
 
 // ReplayCursor selects a stable page of replayable history.
 type ReplayCursor struct {
@@ -213,13 +249,22 @@ type Store interface {
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSession(ctx context.Context, id ID) (Session, error)
 	UpdateSession(ctx context.Context, session Session) error
+	// AdmitRun atomically creates a run and makes it the active owner for its
+	// session. Implementations return ErrSessionBusy when another nonterminal
+	// run owns the session.
 	AdmitRun(ctx context.Context, run Run) (Run, error)
 	GetRun(ctx context.Context, id RunID) (Run, error)
+	ActiveRun(ctx context.Context, sessionID ID) (Run, error)
+	ListUnfinishedRuns(ctx context.Context) ([]Run, error)
+	RenewRunLease(ctx context.Context, runID RunID, ownerID string, until time.Time) error
 	FinishRun(ctx context.Context, run Run) error
 	AppendMessage(ctx context.Context, message Message) (Message, error)
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
 	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
+	CreateToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
+	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
+	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
 	ClaimToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
 	FinishToolCall(ctx context.Context, call ToolCall) error
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)

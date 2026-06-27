@@ -25,6 +25,30 @@ type Snapshot struct {
 	Metadata       map[string]string
 }
 
+// Clone returns a deep copy of the snapshot maps and slices owned by this
+// package. Runtime admission must call Clone, or an equivalent deep-copy path,
+// before retaining a snapshot for an in-flight run.
+func (s Snapshot) Clone() Snapshot {
+	next := s
+	next.Providers = cloneSlice(s.Providers)
+	next.ContextSources = cloneSlice(s.ContextSources)
+	next.Hooks = cloneSlice(s.Hooks)
+	next.Plugins = cloneSlice(s.Plugins)
+	next.Metadata = cloneMap(s.Metadata)
+	next.Agent.Options = cloneMap(s.Agent.Options)
+	next.Tools = s.Tools.Clone()
+	for i := range next.Providers {
+		next.Providers[i].Options = cloneMap(s.Providers[i].Options)
+	}
+	for i := range next.ContextSources {
+		next.ContextSources[i].Options = cloneMap(s.ContextSources[i].Options)
+	}
+	for i := range next.Hooks {
+		next.Hooks[i].Options = cloneMap(s.Hooks[i].Options)
+	}
+	return next
+}
+
 // Agent describes the runtime profile used for a run.
 type Agent struct {
 	Name         string
@@ -44,6 +68,15 @@ type ToolConfig struct {
 	Enabled     []string
 	Disabled    []string
 	Permissions []PermissionRule
+}
+
+// Clone returns a deep copy of the tool config.
+func (c ToolConfig) Clone() ToolConfig {
+	return ToolConfig{
+		Enabled:     cloneSlice(c.Enabled),
+		Disabled:    cloneSlice(c.Disabled),
+		Permissions: cloneSlice(c.Permissions),
+	}
 }
 
 // PermissionRule describes a coarse runtime permission rule. Leaf tools may ask
@@ -87,4 +120,24 @@ type Loader interface {
 // Validator checks a snapshot before run admission.
 type Validator interface {
 	Validate(ctx context.Context, snapshot Snapshot) error
+}
+
+func cloneMap(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneSlice[T any](src []T) []T {
+	if src == nil {
+		return nil
+	}
+	dst := make([]T, len(src))
+	copy(dst, src)
+	return dst
 }

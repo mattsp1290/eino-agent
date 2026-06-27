@@ -49,6 +49,16 @@ thin:
   `eino-obs`.
 - `store/*`: concrete `session.Store` implementations.
 
+Import direction is part of the public contract:
+
+- `session` is independent of `runtime`, `model`, and `config`.
+- `config` may refer to `model` selection types, but not to runtime execution
+  or session storage.
+- `model` is independent of `runtime`, `session`, and `config`.
+- `runtime` coordinates `session`, `config`, and `model`.
+- AG-UI, tool, observability, and store adapters depend on these contracts; the
+  core packages do not depend on concrete adapters.
+
 ## Session and Run Lifecycle
 
 The runtime treats a run as durable before it is executable.
@@ -90,15 +100,25 @@ method around one database.
 Store implementations must provide these invariants:
 
 - an admitted run is visible before provider streaming begins;
-- only one active run owns a session unless a future branch design explicitly
-  allows parallel ownership;
+- `session.Store.AdmitRun` is the atomic per-session ownership operation;
+- only one nonterminal run owns a session unless a future branch design
+  explicitly allows parallel ownership;
+- `ErrSessionBusy` is returned when admission conflicts with an active owner;
+- leases and owner IDs support stale-owner detection without relying on process
+  IDs alone;
 - replay reads come from messages and parts, not from captured SSE frames;
 - unfinished runs and tool calls can be detected after restart;
 - non-idempotent unfinished tool calls are not automatically rerun.
 
+Recovery implementations use `ListUnfinishedRuns`, `ActiveRun`, and
+`ListUnfinishedToolCalls` to conservatively mark unfinished work interrupted,
+or to retry only when an explicit retry-safe contract allows it.
+
 ## Turn Snapshots and Context Epochs
 
-`runtime.TurnSnapshot` is the immutable state for one provider request. It
+`runtime.TurnSnapshot` is the immutable-by-contract state for one provider
+request. Runtime admission must clone `config.Snapshot` and each retained
+snapshot container before exposing it to hooks or provider execution. It
 captures:
 
 - durable run/session/context epoch IDs;
@@ -113,9 +133,11 @@ Runtime setters, config reloads, hook changes, and user follow-ups affect future
 turn snapshots only. They do not mutate an in-flight model call.
 
 Compaction creates a new `session.ContextEpoch`. A context epoch records the
-summary message, retained tail start, provider/model used for the summary, and
-parent epoch. Replay can therefore explain which full history was summarized and
-which tail remained active.
+parent epoch, summarized message range, summary message, retained tail start,
+provider/model used for the summary, trigger/reason, and next-run policy.
+Replay can therefore explain which full history was summarized, which tail
+remained active, and whether runtime stopped, auto-continued, or replayed the
+triggering prompt.
 
 ## Message Replay Versus Live AG-UI
 
@@ -145,7 +167,7 @@ Every tool call follows this durable lifecycle:
 
 1. model requests a tool call;
 2. runtime persists a pending `session.ToolCall`;
-3. runtime claims the call before executing it;
+3. runtime claims the call with an owner and claim token before executing it;
 4. tool receives `context.Context`, session/run/message/call IDs, and an
    approval requester;
 5. runtime records output, attachments, metadata, or error;
@@ -155,6 +177,12 @@ Every tool call follows this durable lifecycle:
 If interruption happens while a call is running, runtime settles the durable
 record as interrupted. Automatic retry is allowed only when the tool declares it
 retry-safe and the store proves the prior call did not settle.
+
+Tool materialization includes scope and scheduling metadata. Filesystem-like
+tools should use a canonical workspace-root concurrency key and sequential
+execution so `file_read`, `file_write`, `file_edit`, search, shell, and patch
+operations do not corrupt shared workspace state. Tool input decoding and output
+retention are runtime policy, not hidden metadata conventions.
 
 ## Provider and Model Resolution
 
@@ -190,7 +218,11 @@ back committed session state.
 ## Observability Boundary
 
 `runtime.Event` is the internal event envelope. It is not a replacement for
-`eino-obs`; it is the runtime's stable source for observability adapters.
+`eino-obs`; it is the runtime's stable source for observability adapters. Common
+correlation fields, provider/model IDs, message/tool/epoch IDs, usage, error
+classification, and redaction class are first-class fields. Adapter-specific
+payload JSON is optional and must not be required for common Datadog or AG-UI
+correlation.
 
 Observability adapters should map:
 
