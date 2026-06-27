@@ -12,8 +12,16 @@ func TestDefaultSummaryPolicyIsOptIn(t *testing.T) {
 	if policy.MaxBytesDefault != 0 {
 		t.Fatalf("MaxBytesDefault = %d, want 0", policy.MaxBytesDefault)
 	}
-	if !contains(policy.ForbiddenInputs, "reasoning") || !contains(policy.ForbiddenInputs, "encrypted_reasoning") {
-		t.Fatalf("summary policy must forbid reasoning fields: %#v", policy.ForbiddenInputs)
+	for _, name := range forbiddenPayloadFamilies() {
+		if !contains(policy.ForbiddenInputs, name) {
+			t.Fatalf("summary policy missing forbidden input %s: %#v", name, policy.ForbiddenInputs)
+		}
+	}
+	wantKinds := []ObservationKind{ObservationModel, ObservationStream, ObservationTool}
+	for _, kind := range wantKinds {
+		if !containsKind(policy.AllowedKinds, kind) {
+			t.Fatalf("summary policy missing allowed kind %s: %#v", kind, policy.AllowedKinds)
+		}
 	}
 }
 
@@ -21,14 +29,7 @@ func TestDefaultFieldsForbidRawContent(t *testing.T) {
 	t.Parallel()
 
 	fields := fieldsByName(DefaultFields())
-	for _, name := range []string{
-		"raw_prompt",
-		"raw_output",
-		"raw_tool_payload",
-		"attachments",
-		"reasoning",
-		"encrypted_reasoning",
-	} {
+	for _, name := range forbiddenPolicyFields() {
 		if fields[name].Class != FieldForbidden {
 			t.Fatalf("%s class = %q, want forbidden", name, fields[name].Class)
 		}
@@ -79,4 +80,43 @@ func contains(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func containsKind(values []ObservationKind, want ObservationKind) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func forbiddenPayloadFamilies() []string {
+	return []string{
+		"raw_prompt",
+		"raw_output",
+		"raw_tool_payload",
+		"attachment_bytes",
+		"attachment_urls",
+		"attachment_paths",
+		"attachment_media_content",
+		"stdout",
+		"stderr",
+		"reasoning",
+		"encrypted_reasoning",
+		"compaction_summary",
+		"state_snapshot_payload",
+		"agui_custom_event_payload",
+		"secrets",
+		"environment_dump",
+		"headers",
+		"tokens",
+		"cookies",
+		"api_keys",
+		"auth_metadata",
+	}
+}
+
+func forbiddenPolicyFields() []string {
+	return append([]string{"attachments"}, forbiddenPayloadFamilies()...)
 }

@@ -49,7 +49,7 @@ default.
 
 | Runtime boundary | `eino-obs` helper | Required correlation |
 | --- | --- | --- |
-| Session start/end/error | `StartSession` / `Session.End` / `Session.Error` | session ID, trace/observation IDs |
+| Session start/end/error | `StartSession` / `Session.End` / `Session.Error` | session ID; trace/observation IDs when available |
 | Run start/end/error | `StartRun` / `Run.End` / `Run.Error` | session ID, run ID, agent ID |
 | Provider model call | `StartModelCall` | provider, model, run ID |
 | Streaming model turn | `StartStream` / chunk / first token / end/error | provider, model, run ID, assistant message ID |
