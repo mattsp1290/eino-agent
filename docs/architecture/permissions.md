@@ -16,6 +16,8 @@ materialized tool executor.
 `permissions.StaticPolicy` evaluates `config.PermissionRule` values in order.
 Rules can match a permission name and a simple pattern. Unknown rule actions are
 treated as operational policy failures, not model-visible denials.
+Malformed rule patterns are also operational policy failures so invalid policy
+configuration cannot silently grant access.
 
 ## Runtime Behavior
 
@@ -31,6 +33,7 @@ Model-visible outcomes:
 
 Operational outcomes:
 
+- runtime context cancellation or deadline expiration;
 - policy backend failure;
 - approval backend failure;
 - unknown policy action;
@@ -42,6 +45,8 @@ them separately from ordinary tool denial output.
 ## Approval Requests
 
 Approval requests include session ID, run ID, tool call ID, permission name,
-matched pattern, and tool metadata. Approval hooks stay host-defined so UI,
+matched operation pattern, and tool metadata. Runtime passes
+`runtime.ToolCall.Pattern` when set; otherwise it falls back to the tool call
+name and then the materialized tool name. Approval hooks stay host-defined so UI,
 CLI, or service-policy implementations can decide how to ask the user or an
 external policy engine.

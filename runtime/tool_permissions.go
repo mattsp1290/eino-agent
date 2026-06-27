@@ -20,7 +20,7 @@ func ExecuteToolWithPermissions(ctx context.Context, tool Tool, call ToolCall, p
 		request := permissionRequest(tool, call, permission)
 		decision, err := policy.Decide(ctx, request)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, permissions.ErrInterrupted) {
+			if errors.Is(err, permissions.ErrInterrupted) {
 				return modelVisiblePermissionResult("interrupted", "tool call interrupted during permission check"), nil
 			}
 			return ToolResult{}, err
@@ -45,10 +45,13 @@ func ExecuteToolWithPermissions(ctx context.Context, tool Tool, call ToolCall, p
 			if err == nil {
 				continue
 			}
-			if errors.Is(err, context.Canceled) || errors.Is(err, permissions.ErrInterrupted) {
+			if errors.Is(err, permissions.ErrInterrupted) {
 				return modelVisiblePermissionResult("interrupted", "tool call interrupted while waiting for approval"), nil
 			}
-			if errors.Is(err, permissions.ErrApprovalRequired) || errors.Is(err, permissions.ErrDenied) {
+			if errors.Is(err, permissions.ErrDenied) {
+				return modelVisiblePermissionResult("denied", err.Error()), nil
+			}
+			if errors.Is(err, permissions.ErrApprovalRequired) {
 				return modelVisiblePermissionResult("approval_required", err.Error()), nil
 			}
 			return ToolResult{}, err
@@ -70,7 +73,10 @@ func toolPermissions(tool Tool, call ToolCall) []string {
 }
 
 func permissionRequest(tool Tool, call ToolCall, permission string) permissions.Request {
-	pattern := call.Name
+	pattern := call.Pattern
+	if pattern == "" {
+		pattern = call.Name
+	}
 	if pattern == "" {
 		pattern = tool.Name
 	}

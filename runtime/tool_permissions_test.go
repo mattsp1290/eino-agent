@@ -6,6 +6,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -63,6 +64,47 @@ func TestExecuteToolWithPermissionsApprovalInterruptionIsModelVisible(t *testing
 		t.Fatalf("ExecuteToolWithPermissions error = %v", err)
 	}
 	assertPermissionResult(t, result, "interrupted", "tool call interrupted while waiting for approval")
+}
+
+func TestExecuteToolWithPermissionsApprovalDenialIsModelVisibleDenied(t *testing.T) {
+	t.Parallel()
+
+	call := toolCall()
+	call.Approval = approvalFunc(func(context.Context, ApprovalRequest) error {
+		return permissions.ErrDenied
+	})
+	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+		return permissions.Decision{Action: permissions.ActionAsk}, nil
+	}))
+	if err != nil {
+		t.Fatalf("ExecuteToolWithPermissions error = %v", err)
+	}
+	assertPermissionResult(t, result, "denied", permissions.ErrDenied.Error())
+}
+
+func TestExecuteToolWithPermissionsContextCancellationIsOperational(t *testing.T) {
+	t.Parallel()
+
+	_, err := ExecuteToolWithPermissions(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+		return permissions.Decision{}, context.Canceled
+	}))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("ExecuteToolWithPermissions error = %v, want context.Canceled", err)
+	}
+}
+
+func TestExecuteToolWithPermissionsUsesOperationPattern(t *testing.T) {
+	t.Parallel()
+
+	call := toolCall()
+	call.Pattern = "rm -rf tmp"
+	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), call, permissions.StaticPolicy{Rules: []config.PermissionRule{
+		{Permission: "shell", Pattern: "rm *", Action: config.PermissionActionDeny},
+	}})
+	if err != nil {
+		t.Fatalf("ExecuteToolWithPermissions error = %v", err)
+	}
+	assertPermissionResult(t, result, "denied", "tool call denied by policy")
 }
 
 func TestExecuteToolWithPermissionsOperationalPolicyError(t *testing.T) {

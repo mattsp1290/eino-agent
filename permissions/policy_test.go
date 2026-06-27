@@ -49,3 +49,13 @@ func TestStaticPolicyUnknownActionIsOperational(t *testing.T) {
 		t.Fatalf("Decide error = %v, want ErrOperational", err)
 	}
 }
+
+func TestStaticPolicyMalformedPatternIsOperational(t *testing.T) {
+	t.Parallel()
+
+	policy := StaticPolicy{Rules: []config.PermissionRule{{Permission: "shell", Pattern: "rm [", Action: config.PermissionActionDeny}}}
+	_, err := policy.Decide(context.Background(), Request{Permission: "shell", Pattern: "rm -rf tmp"})
+	if !errors.Is(err, ErrOperational) {
+		t.Fatalf("Decide error = %v, want ErrOperational", err)
+	}
+}

@@ -97,6 +97,7 @@ type ToolCall struct {
 	MessageID session.MessageID
 	Name      string
 	Scope     ToolScope
+	Pattern   string
 	Input     json.RawMessage
 	Approval  ApprovalRequester
 }

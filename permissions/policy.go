@@ -74,7 +74,11 @@ func (p StaticPolicy) Decide(ctx context.Context, request Request) (Decision, er
 		return Decision{}, err
 	}
 	for _, rule := range p.Rules {
-		if !matches(rule, request) {
+		matched, err := matches(rule, request)
+		if err != nil {
+			return Decision{}, err
+		}
+		if !matched {
 			continue
 		}
 		switch rule.Action {
@@ -91,16 +95,19 @@ func (p StaticPolicy) Decide(ctx context.Context, request Request) (Decision, er
 	return Decision{Action: ActionAllow}, nil
 }
 
-func matches(rule config.PermissionRule, request Request) bool {
+func matches(rule config.PermissionRule, request Request) (bool, error) {
 	if rule.Permission != "" && rule.Permission != request.Permission {
-		return false
+		return false, nil
 	}
 	if rule.Pattern == "" || rule.Pattern == "*" {
-		return true
+		return true, nil
+	}
+	if rule.Pattern == request.Pattern {
+		return true, nil
 	}
 	ok, err := path.Match(rule.Pattern, request.Pattern)
 	if err != nil {
-		return false
+		return false, fmt.Errorf("%w: invalid pattern %q: %v", ErrOperational, rule.Pattern, err)
 	}
-	return ok || rule.Pattern == request.Pattern
+	return ok, nil
 }
