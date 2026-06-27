@@ -1,0 +1,56 @@
+# Tool Registry Boundary
+
+Date: 2026-06-27
+
+The typed tool registry turns host or adapter tool definitions into
+`runtime.Tool` values for a specific `runtime.TurnSnapshot`.
+
+## Responsibilities
+
+The `tools` package owns:
+
+- registration-time validation for tool definitions;
+- stale-registration protection using monotonically increasing generations;
+- typed decoding of model-provided JSON input;
+- typed execution context carrying the durable runtime tool call and turn
+  snapshot;
+- structured output encoding;
+- per-session scope and concurrency metadata;
+- model-facing `schema.ToolInfo` assembly without reusing mutable containers.
+
+Concrete leaf behavior remains outside this package. Future integration beads
+can wrap `eino-tools` implementations as `tools.Definition` values.
+
+## Materialization
+
+Materialization happens per turn snapshot. Enabled and disabled tool names from
+`config.ToolConfig` are applied at resolve time, so a config reload affects
+future turn snapshots without mutating tools already retained by an in-flight
+run.
+
+Default scopes derive from snapshot metadata:
+
+- `workspace_id` becomes `runtime.ToolScope.WorkspaceID`;
+- `workspace_root` becomes `runtime.ToolScope.Root`;
+- the default concurrency key is `session_id:tool_name`.
+
+Definitions can override this with a `ScopeResolver` when a tool needs a
+different serialization domain.
+
+## Input And Output
+
+Every tool definition provides:
+
+- a `Decoder` from raw model JSON into a typed host value;
+- an `Executor` over that typed value and runtime call context;
+- an `Encoder` from typed output into structured JSON.
+
+Malformed model input is returned as `tools.ErrMalformedInput`, allowing runtime
+settlement to distinguish bad tool-call arguments from host execution failures.
+
+## Mutability
+
+The registry defensively copies definition slices/maps and returns fresh
+`runtime.Tool` containers for every materialization. Model-facing tool info
+contains a fresh `Extra` map so one session cannot mutate another session's tool
+metadata through shared `schema.ToolInfo` state.
