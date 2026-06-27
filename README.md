@@ -3,9 +3,9 @@
 Reusable Go runtime for Eino-based agents with AG-UI streaming and Datadog
 AI/LLM observability.
 
-This repository is in the module/bootstrap phase. Runtime APIs will land in
-later beads; the current tree establishes the Go module, dependency baseline,
-quality gates, and CI skeleton.
+This repository is in the early runtime design phase. The current tree
+establishes the Go module, dependency baseline, quality gates, CI skeleton, and
+initial public package contracts for durable agent orchestration.
 
 ## Module Baseline
 
@@ -16,9 +16,10 @@ quality gates, and CI skeleton.
 - Observability: `github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b`
 - Coding tools: `github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b`
 
-See `docs/dependency-status.md` for prerequisite evidence and
+See `docs/dependency-status.md` for prerequisite evidence,
 `docs/architecture/reference-integration-research.md` for integration
-boundaries.
+boundaries, and `docs/architecture/runtime.md` for the runtime package
+architecture.
 
 ## Local Gates
 
@@ -45,6 +46,12 @@ make lint
 ## Current Layout
 
 - `doc.go`: root package documentation.
+- `session`: durable session, run, message, part, tool-call, context-epoch, and
+  replay contracts.
+- `runtime`: orchestration contracts for run admission, turn snapshots,
+  interruption, tools, hooks, and internal events.
+- `model`: provider/model catalog and Eino model resolution contracts.
+- `config`: immutable runtime config snapshot and validation contracts.
 - `internal/deps`: temporary dependency anchor that keeps the initial pins
   tidy-stable until runtime packages import the concrete dependencies directly.
 - `docs/`: durable planning and architecture context.
