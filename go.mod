@@ -3,6 +3,7 @@ module github.com/mattsp1290/eino-agent
 go 1.26.3
 
 require (
+	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9
 	github.com/cloudwego/eino v0.8.13
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/golangci/golangci-lint/v2 v2.12.2
@@ -33,7 +34,6 @@ require (
 	github.com/Masterminds/semver/v3 v3.5.0 // indirect
 	github.com/MirrexOne/unqueryvet v1.5.4 // indirect
 	github.com/OpenPeeDeeP/depguard/v2 v2.2.1 // indirect
-	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9 // indirect
 	github.com/alecthomas/chroma/v2 v2.24.1 // indirect
 	github.com/alecthomas/go-check-sumtype v0.3.1 // indirect
 	github.com/alexkohler/nakedret/v2 v2.0.6 // indirect

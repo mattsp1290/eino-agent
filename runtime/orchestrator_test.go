@@ -241,6 +241,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 
 	var calls int
 	store := newAdmissionStore()
+	sink := &capturingSink{}
 	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		calls++
 		for _, msg := range request.Messages {
@@ -263,6 +264,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 			return ToolResult{Output: "hi"}, nil
 		}),
 	}}}
+	orch.Events = sink
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || calls != 2 {
 		t.Fatalf("result = %+v calls=%d", result, calls)
@@ -291,6 +293,18 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	}
 	if len(toolCallParts) != 1 || string(toolCallParts[0].Payload) != `{"id":"call-1","name":"echo","arguments":{"text":"hi"}}` {
 		t.Fatalf("tool call parts = %#v", toolCallParts)
+	}
+	var toolEvents []Event
+	for _, event := range sink.events {
+		if event.Kind == EventToolCallUpdated {
+			toolEvents = append(toolEvents, event)
+		}
+	}
+	if len(toolEvents) != 3 {
+		t.Fatalf("tool events = %#v, want pending/running/completed", toolEvents)
+	}
+	if !strings.Contains(string(toolEvents[0].Payload), `"arguments":{"text":"hi"}`) {
+		t.Fatalf("tool event payload = %s", toolEvents[0].Payload)
 	}
 }
 

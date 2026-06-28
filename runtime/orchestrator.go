@@ -419,6 +419,11 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 		if err != nil {
 			return nil, err
 		}
+		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{
+			ID:        string(callID),
+			Name:      schemaCall.Function.Name,
+			Arguments: cloneJSON(input),
+		})
 		record.Status = session.ToolCallRunning
 		record.ClaimedBy = o.ownerID()
 		record.ClaimToken = string(o.IDs.NewEventID())
@@ -427,6 +432,11 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 		if _, err := o.Store.ClaimToolCall(ctx, record); err != nil {
 			return nil, err
 		}
+		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallRunning, toolCallPayload{
+			ID:        string(callID),
+			Name:      schemaCall.Function.Name,
+			Arguments: cloneJSON(input),
+		})
 		result, execErr := tool.Executor.Execute(ctx, ToolCall{
 			ID:        callID,
 			SessionID: snapshot.SessionID,
@@ -444,6 +454,7 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 		if err := o.Store.FinishToolCall(ctx, record); err != nil {
 			return nil, err
 		}
+		_ = o.emitToolCall(ctx, snapshot, messageID, callID, status, toolCallEventPayload(output, schemaCall.Function.Name, input))
 		toolMessageID := o.IDs.NewMessageID()
 		if _, err := o.Store.AppendMessage(ctx, session.Message{
 			ID:        toolMessageID,
@@ -482,6 +493,24 @@ func (o *StreamingOrchestrator) appendPart(ctx context.Context, part session.Par
 	return err
 }
 
+func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {
+	if o.Events == nil {
+		return nil
+	}
+	return o.Events.Emit(ctx, Event{
+		Kind:       EventToolCallUpdated,
+		SessionID:  snapshot.SessionID,
+		RunID:      snapshot.RunID,
+		MessageID:  messageID,
+		ToolCallID: callID,
+		EpochID:    snapshot.EpochID,
+		ProviderID: string(snapshot.Model.Provider.ID),
+		ModelID:    string(snapshot.Model.Model.ID),
+		Payload:    mustJSON(withToolStatus(payload, status)),
+		Time:       o.now(),
+	})
+}
+
 func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, result Result) Result {
 	if result.Status == "" {
 		result.Status = session.RunCompleted
@@ -505,9 +534,29 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, res
 			RunID:     run.ID,
 			MessageID: result.MessageID,
 			Error:     eventError(result.Error),
-			Time:      o.now(),
+			Payload: mustJSON(map[string]any{
+				"status":      string(result.Status),
+				"interrupted": result.Interrupted,
+			}),
+			Time: o.now(),
 		})
 	}
+	return result
+}
+
+func toolCallEventPayload(output json.RawMessage, name string, input json.RawMessage) map[string]any {
+	payload := map[string]any{}
+	_ = json.Unmarshal(output, &payload)
+	payload["name"] = name
+	payload["arguments"] = cloneJSON(input)
+	return payload
+}
+
+func withToolStatus(payload any, status session.ToolCallStatus) map[string]any {
+	raw, _ := json.Marshal(payload)
+	result := map[string]any{}
+	_ = json.Unmarshal(raw, &result)
+	result["status"] = string(status)
 	return result
 }
 
