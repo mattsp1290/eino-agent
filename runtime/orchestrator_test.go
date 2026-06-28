@@ -447,7 +447,7 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 			Type: "function",
 			Function: einoschema.FunctionCall{
 				Name:      "echo",
-				Arguments: `{}`,
+				Arguments: `{"permission_pattern":"go"}`,
 			},
 		}})}, nil
 	}))
@@ -462,7 +462,10 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 			return ToolResult{Output: "executed"}, nil
 		}),
 	}}}
-	orch.Permissions = permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+		if request.Pattern != "go" {
+			t.Fatalf("permission pattern = %q, want go", request.Pattern)
+		}
 		return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
 	})
 	result := startAndWait(t, orch)

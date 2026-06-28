@@ -441,6 +441,7 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 			MessageID: messageID,
 			Name:      schemaCall.Function.Name,
 			Scope:     tool.Scope,
+			Pattern:   toolPattern(input, schemaCall.Function.Name),
 			Input:     cloneJSON(input),
 		}
 		result, execErr := o.executeTool(ctx, tool, call)
@@ -563,6 +564,22 @@ func withToolStatus(payload any, status session.ToolCallStatus) map[string]any {
 	_ = json.Unmarshal(raw, &result)
 	result["status"] = string(status)
 	return result
+}
+
+func toolPattern(input json.RawMessage, fallback string) string {
+	var payload struct {
+		PermissionPattern string `json:"permission_pattern"`
+		Pattern           string `json:"pattern"`
+	}
+	if json.Unmarshal(input, &payload) == nil {
+		if payload.PermissionPattern != "" {
+			return payload.PermissionPattern
+		}
+		if payload.Pattern != "" {
+			return payload.Pattern
+		}
+	}
+	return fallback
 }
 
 func (o *StreamingOrchestrator) validate(request Request) error {
