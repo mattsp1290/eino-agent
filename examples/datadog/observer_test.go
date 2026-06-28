@@ -3,11 +3,13 @@ package datadogexample
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	einoobs "github.com/mattsp1290/eino-obs"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/obs"
 	"github.com/mattsp1290/eino-agent/runtime"
 )
 
@@ -54,14 +56,88 @@ func TestNewObserverFromConfigValidatesDatadogEnableFlag(t *testing.T) {
 }
 
 func TestNewObserverFromConfigRequiresAPIKeyWhenDatadogEnabled(t *testing.T) {
-	t.Setenv(EnvDDAPIKey, "")
-
 	_, _, err := NewObserverFromConfig(config.ObservabilityConfig{}, mapLookup(map[string]string{
 		EnvDatadogEnabled: "true",
 		EnvDDService:      "test-agent",
 	}))
 	if !errors.Is(err, ErrInvalidEnvironment) {
 		t.Fatalf("error = %v, want ErrInvalidEnvironment", err)
+	}
+}
+
+func TestNewObserverFromConfigIgnoresAmbientExporterEnvironment(t *testing.T) {
+	t.Setenv(EnvDatadogEndpoint, "not a url")
+	t.Setenv("EINO_OBS_EXPORT_TIMEOUT", "not a duration")
+
+	observer, mode, err := NewObserverFromConfig(config.ObservabilityConfig{}, mapLookup(map[string]string{
+		EnvDatadogEnabled: "true",
+		EnvDDAPIKey:       "dummy-key",
+		EnvDDService:      "test-agent",
+		EnvDDSite:         "datadoghq.com",
+	}))
+	if err != nil {
+		t.Fatalf("NewObserverFromConfig error = %v", err)
+	}
+	if mode != ModeDatadog {
+		t.Fatalf("mode = %q, want %q", mode, ModeDatadog)
+	}
+	if observer == nil {
+		t.Fatal("observer is nil")
+	}
+}
+
+func TestSettingsFromConfigDoesNotReadDatadogSecretsWhenDisabled(t *testing.T) {
+	t.Parallel()
+
+	lookedUp := map[string]bool{}
+	_, err := SettingsFromConfig(config.ObservabilityConfig{}, func(key string) string {
+		lookedUp[key] = true
+		if key == EnvDatadogEnabled {
+			return "false"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("SettingsFromConfig error = %v", err)
+	}
+	for _, key := range []string{EnvDDAPIKey, EnvDDMLApp, EnvDDSite, EnvDatadogEndpoint} {
+		if lookedUp[key] {
+			t.Fatalf("disabled mode looked up %s", key)
+		}
+	}
+}
+
+func TestSettingsFromConfigRejectsInvalidSummaryConfig(t *testing.T) {
+	t.Parallel()
+
+	_, err := SettingsFromConfig(config.ObservabilityConfig{
+		Summary: config.ObservabilityConfig{}.WithDefaults().Summary,
+	}, mapLookup(nil))
+	if err != nil {
+		t.Fatalf("default summary config should be valid: %v", err)
+	}
+	_, err = SettingsFromConfig(config.ObservabilityConfig{
+		Summary: obs.SummaryPolicy{EnabledByDefault: true, MaxBytesDefault: 0},
+	}, mapLookup(nil))
+	if !errors.Is(err, ErrInvalidEnvironment) {
+		t.Fatalf("error = %v, want ErrInvalidEnvironment", err)
+	}
+}
+
+func TestDatadogConstructionErrorRedactsAPIKey(t *testing.T) {
+	t.Parallel()
+
+	secret := "super-secret-token"
+	_, _, err := NewObserverFromConfig(config.ObservabilityConfig{}, mapLookup(map[string]string{
+		EnvDatadogEnabled: "true",
+		EnvDDAPIKey:       secret,
+		EnvDDSite:         "not-a-real-site",
+	}))
+	if !errors.Is(err, ErrInvalidEnvironment) {
+		t.Fatalf("error = %v, want ErrInvalidEnvironment", err)
+	}
+	if err != nil && strings.Contains(err.Error(), secret) {
+		t.Fatalf("error leaked API key: %v", err)
 	}
 }
 
@@ -83,8 +159,8 @@ func TestSettingsFromConfigUsesRuntimeObservabilityDefaults(t *testing.T) {
 	if settings.Service != "runtime-service" || settings.Env != "staging" || settings.Version != "abc123" {
 		t.Fatalf("settings identity = %#v", settings)
 	}
-	if settings.MLApp != "ml-app" {
-		t.Fatalf("MLApp = %q, want ml-app", settings.MLApp)
+	if settings.MLApp != "runtime-service" {
+		t.Fatalf("MLApp = %q, want runtime-service", settings.MLApp)
 	}
 	if settings.DatadogEnabled {
 		t.Fatal("Datadog export should be disabled by default")

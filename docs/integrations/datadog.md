@@ -7,6 +7,8 @@ The buildable example in `examples/datadog` is safe by default:
 - no Datadog exporter is created unless `EINO_AGENT_DATADOG_ENABLED=true`;
 - tests use the no-network recorder and never require live credentials;
 - `DD_API_KEY` is read from the environment only when export is enabled;
+- Datadog transport-only variables such as `DD_LLMOBS_ML_APP`, `DD_SITE`, and
+  `EINO_OBS_DATADOG_ENDPOINT` are not read in no-network mode;
 - docs and errors do not print token values.
 
 ## Runtime Wiring
@@ -46,7 +48,7 @@ export DD_LLMOBS_ML_APP=eino-agent
 # Optional: export DD_SITE=datadoghq.com
 ```
 
-Then create the observer through `NewObserverFromConfig`. The underlying exporter also honors the `eino-obs` Datadog environment variables such as `EINO_OBS_EXPORT_TIMEOUT`, `EINO_OBS_EXPORT_BATCH_SIZE`, and `EINO_OBS_EXPORT_MAX_RETRIES`.
+Then create the observer through `NewObserverFromConfig`. This wrapper keeps the injected environment authoritative: it passes explicit exporter defaults so unrelated ambient `EINO_OBS_*` variables in a developer shell or CI job do not change construction. Customize exporter retry, timeout, or endpoint behavior in code if a host needs settings beyond this no-secret example.
 
 Call `observer.Flush(ctx)` when you need pending observations delivered, and `observer.Shutdown(ctx)` during process shutdown.
 

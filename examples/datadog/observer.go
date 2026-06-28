@@ -9,6 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	einoobs "github.com/mattsp1290/eino-obs"
 	"github.com/mattsp1290/eino-obs/exporter/datadog"
@@ -18,13 +19,14 @@ import (
 )
 
 const (
-	EnvDatadogEnabled = "EINO_AGENT_DATADOG_ENABLED"
-	EnvDDAPIKey       = "DD_API_KEY"
-	EnvDDService      = "DD_SERVICE"
-	EnvDDEnv          = "DD_ENV"
-	EnvDDVersion      = "DD_VERSION"
-	EnvDDMLApp        = "DD_LLMOBS_ML_APP"
-	EnvDDSite         = "DD_SITE"
+	EnvDatadogEnabled  = "EINO_AGENT_DATADOG_ENABLED"
+	EnvDDAPIKey        = "DD_API_KEY"
+	EnvDDService       = "DD_SERVICE"
+	EnvDDEnv           = "DD_ENV"
+	EnvDDVersion       = "DD_VERSION"
+	EnvDDMLApp         = "DD_LLMOBS_ML_APP"
+	EnvDDSite          = "DD_SITE"
+	EnvDatadogEndpoint = "EINO_OBS_DATADOG_ENDPOINT"
 )
 
 type Mode string
@@ -39,14 +41,15 @@ var ErrInvalidEnvironment = errors.New("invalid Datadog observability environmen
 type LookupEnv func(string) string
 
 // Settings is the no-secret runtime/exporter configuration used by this
-// example. APIKey is intentionally not logged or rendered by docs/tests.
+// example. Datadog API keys are read only while creating an enabled exporter
+// and are intentionally not stored on this returned settings value.
 type Settings struct {
 	Service              string
 	Env                  string
 	Version              string
 	MLApp                string
 	Site                 string
-	APIKey               string
+	Endpoint             string
 	DatadogEnabled       bool
 	CaptureInputSummary  bool
 	CaptureOutputSummary bool
@@ -60,6 +63,9 @@ func SettingsFromConfig(observability config.ObservabilityConfig, lookup LookupE
 	if lookup == nil {
 		lookup = os.Getenv
 	}
+	if observability.Summary.EnabledByDefault && observability.Summary.MaxBytesDefault <= 0 {
+		return Settings{}, fmt.Errorf("%w: observability summary max bytes must be positive when summaries are enabled", ErrInvalidEnvironment)
+	}
 	enabled, err := boolEnv(lookup(EnvDatadogEnabled))
 	if err != nil {
 		return Settings{}, fmt.Errorf("%w: %s must be true or false", ErrInvalidEnvironment, EnvDatadogEnabled)
@@ -67,13 +73,21 @@ func SettingsFromConfig(observability config.ObservabilityConfig, lookup LookupE
 	service := first(observability.Service, lookup(EnvDDService), "eino-agent")
 	env := first(observability.Env, lookup(EnvDDEnv), "local")
 	version := first(observability.Version, lookup(EnvDDVersion))
+	mlApp := service
+	site := "datadoghq.com"
+	endpoint := ""
+	if enabled {
+		mlApp = first(lookup(EnvDDMLApp), service)
+		site = first(lookup(EnvDDSite), "datadoghq.com")
+		endpoint = first(lookup(EnvDatadogEndpoint), endpointForSite(site))
+	}
 	return Settings{
 		Service:              service,
 		Env:                  env,
 		Version:              version,
-		MLApp:                first(lookup(EnvDDMLApp), service),
-		Site:                 first(lookup(EnvDDSite), "datadoghq.com"),
-		APIKey:               lookup(EnvDDAPIKey),
+		MLApp:                mlApp,
+		Site:                 site,
+		Endpoint:             endpoint,
 		DatadogEnabled:       enabled,
 		CaptureInputSummary:  observability.Summary.EnabledByDefault,
 		CaptureOutputSummary: observability.Summary.EnabledByDefault,
@@ -102,19 +116,65 @@ func NewObserverFromConfig(observability config.ObservabilityConfig, lookup Look
 	if !settings.DatadogEnabled {
 		return einoobs.New(observerConfig, einoobs.WithNoNetwork()), ModeNoNetwork, nil
 	}
+	apiKey := ""
+	if lookup != nil {
+		apiKey = lookup(EnvDDAPIKey)
+	} else {
+		apiKey = os.Getenv(EnvDDAPIKey)
+	}
+	if strings.TrimSpace(apiKey) == "" {
+		return nil, "", fmt.Errorf("%w: missing %s", ErrInvalidEnvironment, EnvDDAPIKey)
+	}
 	exporter, err := datadog.New(datadog.Config{
-		APIKey:  settings.APIKey,
-		Site:    settings.Site,
-		MLApp:   settings.MLApp,
-		Service: settings.Service,
-		Env:     settings.Env,
-		Version: settings.Version,
+		APIKey:                      apiKey,
+		Site:                        settings.Site,
+		Endpoint:                    settings.Endpoint,
+		MLApp:                       settings.MLApp,
+		Service:                     settings.Service,
+		Env:                         settings.Env,
+		Version:                     settings.Version,
+		TimeoutOverride:             datadog.Duration(10 * time.Second),
+		BatchSizeOverride:           datadog.Int(100),
+		MaxPayloadBytesOverride:     datadog.Int(1024 * 1024),
+		MaxRetriesOverride:          datadog.Int(3),
+		RetryBaseDelayOverride:      datadog.Duration(200 * time.Millisecond),
+		RetryMaxDelayOverride:       datadog.Duration(5 * time.Second),
+		ValidateCredentialsOverride: datadog.Bool(false),
+		DisableCompressionOverride:  datadog.Bool(false),
 	})
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: create Datadog exporter: %v", ErrInvalidEnvironment, err)
+		return nil, "", fmt.Errorf("%w: create Datadog exporter: %s", ErrInvalidEnvironment, scrubSecret(err.Error(), apiKey))
 	}
 	observerConfig.Exporter = exporter
 	return einoobs.New(observerConfig), ModeDatadog, nil
+}
+
+func endpointForSite(site string) string {
+	switch strings.TrimSpace(site) {
+	case "datadoghq.com":
+		return "https://api.datadoghq.com"
+	case "us3.datadoghq.com":
+		return "https://api.us3.datadoghq.com"
+	case "us5.datadoghq.com":
+		return "https://api.us5.datadoghq.com"
+	case "datadoghq.eu":
+		return "https://api.datadoghq.eu"
+	case "ap1.datadoghq.com":
+		return "https://api.ap1.datadoghq.com"
+	case "ap2.datadoghq.com":
+		return "https://api.ap2.datadoghq.com"
+	case "ddog-gov.com":
+		return "https://api.ddog-gov.com"
+	default:
+		return ""
+	}
+}
+
+func scrubSecret(message, secret string) string {
+	if secret == "" {
+		return message
+	}
+	return strings.ReplaceAll(message, secret, "[redacted]")
 }
 
 // AttachRuntimeObserver wires the configured observer into the runtime.
