@@ -1,0 +1,42 @@
+{
+  "event_types": [
+    "RUN_STARTED",
+    "REASONING_START",
+    "REASONING_MESSAGE_START",
+    "REASONING_MESSAGE_CONTENT",
+    "REASONING_MESSAGE_END",
+    "REASONING_END",
+    "TEXT_MESSAGE_START",
+    "TEXT_MESSAGE_CONTENT",
+    "TEXT_MESSAGE_END",
+    "TOOL_CALL_START",
+    "TOOL_CALL_ARGS",
+    "TOOL_CALL_END",
+    "TOOL_CALL_RESULT",
+    "STATE_SNAPSHOT",
+    "STATE_DELTA",
+    "MESSAGES_SNAPSHOT",
+    "ACTIVITY_SNAPSHOT",
+    "ACTIVITY_DELTA",
+    "STEP_STARTED",
+    "STEP_FINISHED",
+    "CUSTOM",
+    "REASONING_ENCRYPTED_VALUE",
+    "RUN_FINISHED"
+  ],
+  "assertions": [
+    {"index": 0, "field": "threadId", "value": "thread-1"},
+    {"index": 0, "field": "runId", "value": "run-1"},
+    {"index": 3, "field": "delta", "value": "thinking"},
+    {"index": 7, "field": "delta", "value": "hello"},
+    {"index": 9, "field": "toolCallId", "value": "tool-1"},
+    {"index": 9, "field": "toolCallName", "value": "search"},
+    {"index": 10, "field": "delta", "value": "{\"q\":\"eino\"}"},
+    {"index": 12, "field": "messageId", "value": "tool-message-1"},
+    {"index": 12, "field": "content", "value": "result"},
+    {"index": 13, "field": "snapshot", "value": {"status": "working"}},
+    {"index": 18, "field": "stepName", "value": "model"},
+    {"index": 21, "field": "encryptedValue", "value": "ciphertext"},
+    {"index": 22, "field": "runId", "value": "run-1"}
+  ]
+}
