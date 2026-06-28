@@ -1,0 +1,33 @@
+[
+  {
+    "kind": "tool.registered",
+    "status": "ok",
+    "tool_name": "echo",
+    "tool_kind": "server",
+    "tool_status": "registered"
+  },
+  {
+    "kind": "tool.materialized",
+    "status": "ok",
+    "tool_name": "echo",
+    "tool_kind": "server",
+    "tool_call_id": "call-1",
+    "tool_status": "materialized"
+  },
+  {
+    "kind": "tool_call",
+    "status": "ok",
+    "tool_name": "echo",
+    "tool_kind": "server",
+    "tool_call_id": "call-1",
+    "tool_status": "succeeded"
+  },
+  {
+    "kind": "tool.settled",
+    "status": "ok",
+    "tool_name": "echo",
+    "tool_kind": "server",
+    "tool_call_id": "call-1",
+    "tool_status": "succeeded"
+  }
+]

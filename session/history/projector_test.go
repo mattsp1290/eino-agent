@@ -3,6 +3,8 @@ package history
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +30,8 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 			part("p1", "assistant-1", session.PartText, 10, `{"text":"I will read it."}`),
 			part("p0", "user-1", session.PartText, 10, `{"text":"Read README"}`),
 			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","content":"README contents"}`),
+			part("reasoning", "assistant-2", session.PartReasoning, 5, `{"text":"LIVE_ONLY_STYLE_REASONING"}`),
+			part("state", "assistant-2", session.PartState, 6, `{"text":"LIVE_ONLY_STYLE_STATE"}`),
 			part("p4", "assistant-2", session.PartText, 10, `{"text":"Summary"}`),
 			part("p5", "assistant-live", session.PartText, 10, `{"text":"settled"}`),
 		},
@@ -36,20 +40,9 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Project error = %v", err)
 	}
-	if len(projected) != 5 {
-		t.Fatalf("projected len = %d", len(projected))
-	}
-	assertMessage(t, projected[0], schema.User, "Read README")
-	assertMessage(t, projected[1], schema.Assistant, "I will read it.")
-	if len(projected[1].ToolCalls) != 1 || projected[1].ToolCalls[0].Function.Name != "file_read" {
-		t.Fatalf("tool calls = %#v", projected[1].ToolCalls)
-	}
-	assertMessage(t, projected[2], schema.Tool, "README contents")
-	if projected[2].ToolCallID != "call-1" {
-		t.Fatalf("tool call id = %q", projected[2].ToolCallID)
-	}
-	assertMessage(t, projected[3], schema.Assistant, "Summary")
-	assertMessage(t, projected[4], schema.Assistant, "settled")
+	got := goldenMessages(projected)
+	want := readHistoryGolden(t, "../../testdata/history/replay_projection.json")
+	requireGoldenEqual(t, got, want)
 }
 
 func TestProjectToolResultStructuredAndExpectedFailurePayloads(t *testing.T) {
@@ -281,6 +274,62 @@ func assertMessage(t *testing.T, message *schema.Message, role schema.RoleType, 
 	if message.Role != role || message.Content != content {
 		t.Fatalf("message = %#v, want %s/%q", message, role, content)
 	}
+}
+
+type goldenMessage struct {
+	Role       string           `json:"role"`
+	Content    string           `json:"content,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []goldenToolCall `json:"tool_calls,omitempty"`
+}
+
+type goldenToolCall struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+func goldenMessages(messages []*schema.Message) []goldenMessage {
+	result := make([]goldenMessage, 0, len(messages))
+	for _, message := range messages {
+		item := goldenMessage{
+			Role:       string(message.Role),
+			Content:    message.Content,
+			ToolCallID: message.ToolCallID,
+		}
+		for _, call := range message.ToolCalls {
+			item.ToolCalls = append(item.ToolCalls, goldenToolCall{
+				ID:        call.ID,
+				Name:      call.Function.Name,
+				Arguments: call.Function.Arguments,
+			})
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func readHistoryGolden(t *testing.T, path string) []goldenMessage {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read history golden: %v", err)
+	}
+	var result []goldenMessage
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode history golden: %v", err)
+	}
+	return result
+}
+
+func requireGoldenEqual[T any](t *testing.T, got, want T) {
+	t.Helper()
+	if reflect.DeepEqual(got, want) {
+		return
+	}
+	gotJSON, _ := json.MarshalIndent(got, "", "  ")
+	wantJSON, _ := json.MarshalIndent(want, "", "  ")
+	t.Fatalf("golden mismatch\n--- got ---\n%s\n--- want ---\n%s", gotJSON, wantJSON)
 }
 
 type historyStore struct {

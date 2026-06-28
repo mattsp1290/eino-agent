@@ -1,0 +1,30 @@
+[
+  {
+    "role": "user",
+    "content": "Read README"
+  },
+  {
+    "role": "assistant",
+    "content": "I will read it.",
+    "tool_calls": [
+      {
+        "id": "call-1",
+        "name": "file_read",
+        "arguments": "{\"path\":\"README.md\"}"
+      }
+    ]
+  },
+  {
+    "role": "tool",
+    "content": "README contents",
+    "tool_call_id": "call-1"
+  },
+  {
+    "role": "assistant",
+    "content": "Summary"
+  },
+  {
+    "role": "assistant",
+    "content": "settled"
+  }
+]
