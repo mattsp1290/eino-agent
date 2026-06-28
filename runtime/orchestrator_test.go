@@ -3,9 +3,11 @@ package runtime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
+	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
@@ -509,6 +512,248 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	if call.Status != session.ToolCallInterrupted {
 		t.Fatalf("tool call = %+v", call)
 	}
+}
+
+func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	defer func() {
+		_ = store.Close()
+	}()
+	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{
+		ID:         "run-resume",
+		SessionID:  "session-resume",
+		OwnerID:    "owner-1",
+		LeaseUntil: now.Add(-time.Minute),
+		Agent:      "agent",
+		ProviderID: "fake",
+		ModelID:    "test",
+		Status:     session.RunPending,
+		Config:     map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
+		CreatedAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	if _, err := store.CreateToolCall(ctx, session.ToolCall{
+		ID:        "call-resume",
+		SessionID: run.SessionID,
+		RunID:     run.ID,
+		MessageID: "assistant-resume",
+		Name:      "echo",
+		Input:     []byte(`{"text":"hi"}`),
+		Status:    session.ToolCallPending,
+	}); err != nil {
+		t.Fatalf("create tool call: %v", err)
+	}
+	var executions atomic.Int64
+	orch := &StreamingOrchestrator{
+		Store: store,
+		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executions.Add(1)
+			time.Sleep(10 * time.Millisecond)
+			return ToolResult{Output: "ok"}, nil
+		})}}},
+		IDs:     &sequenceIDs{},
+		Clock:   func() time.Time { return now },
+		OwnerID: "owner-1",
+	}
+
+	start := make(chan struct{})
+	results := make(chan Result, 2)
+	for range 2 {
+		go func() {
+			<-start
+			handle, err := orch.Resume(context.Background(), run.ID)
+			if err != nil {
+				results <- Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+				return
+			}
+			results <- <-handle.Done()
+		}()
+	}
+	close(start)
+	first := <-results
+	second := <-results
+	if first.Error != nil && second.Error != nil {
+		t.Fatalf("resume results = %+v / %+v", first, second)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("tool executions = %d, want 1", executions.Load())
+	}
+	call, err := store.GetToolCall(ctx, "call-resume")
+	if err != nil {
+		t.Fatalf("get tool call: %v", err)
+	}
+	if call.Status != session.ToolCallCompleted {
+		t.Fatalf("tool call status = %s, want completed", call.Status)
+	}
+	finished, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if finished.Status != session.RunInterrupted {
+		t.Fatalf("run status = %s, want interrupted", finished.Status)
+	}
+	if _, err := store.ActiveRun(ctx, run.SessionID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("active run err = %v, want ErrNotFound", err)
+	}
+	batch, err := store.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	var toolResults int
+	for _, part := range batch.Parts {
+		if part.Kind == session.PartToolResult {
+			toolResults++
+		}
+	}
+	if toolResults != 1 {
+		t.Fatalf("tool result parts = %d, want 1", toolResults)
+	}
+}
+
+func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
+	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	var executions atomic.Int64
+	orch := &StreamingOrchestrator{
+		Store: store,
+		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executions.Add(1)
+			return ToolResult{Output: "ok"}, nil
+		})}}},
+		IDs:     &sequenceIDs{},
+		Clock:   func() time.Time { return now },
+		OwnerID: "owner-1",
+	}
+	handle, err := orch.Resume(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Resume error: %v", err)
+	}
+	result := <-handle.Done()
+	if result.Error != nil {
+		t.Fatalf("resume result = %+v", result)
+	}
+	finished, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if finished.OwnerID != "owner-1" || finished.Status != session.RunInterrupted {
+		t.Fatalf("finished run = %+v, want owner-1 interrupted", finished)
+	}
+	if executions.Load() != 1 {
+		t.Fatalf("tool executions = %d, want 1", executions.Load())
+	}
+}
+
+func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, run := resumeStoreWithTool(t, "owner-1", session.ToolCallRunning)
+	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	var executions atomic.Int64
+	orch := &StreamingOrchestrator{
+		Store: store,
+		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executions.Add(1)
+			return ToolResult{Output: "ok"}, nil
+		})}}},
+		IDs:     &sequenceIDs{},
+		Clock:   func() time.Time { return now },
+		OwnerID: "owner-1",
+	}
+	handle, err := orch.Resume(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Resume error: %v", err)
+	}
+	result := <-handle.Done()
+	if result.Error != nil {
+		t.Fatalf("resume result = %+v", result)
+	}
+	if executions.Load() != 0 {
+		t.Fatalf("tool executions = %d, want 0", executions.Load())
+	}
+	call, err := store.GetToolCall(ctx, "call-resume")
+	if err != nil {
+		t.Fatalf("get tool call: %v", err)
+	}
+	if call.Status != session.ToolCallInterrupted {
+		t.Fatalf("tool status = %s, want interrupted", call.Status)
+	}
+}
+
+func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStatus) (*sqlitestore.Store, session.Run) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{
+		ID:         "run-resume",
+		SessionID:  "session-resume",
+		OwnerID:    owner,
+		LeaseUntil: now.Add(-time.Minute),
+		Agent:      "agent",
+		ProviderID: "fake",
+		ModelID:    "test",
+		Status:     session.RunPending,
+		Config:     map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
+		CreatedAt:  now,
+	})
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	call := session.ToolCall{
+		ID:        "call-resume",
+		SessionID: run.SessionID,
+		RunID:     run.ID,
+		MessageID: "assistant-resume",
+		Name:      "echo",
+		Input:     []byte(`{"text":"hi"}`),
+		Status:    session.ToolCallPending,
+	}
+	created, err := store.CreateToolCall(ctx, call)
+	if err != nil {
+		t.Fatalf("create tool call: %v", err)
+	}
+	if status == session.ToolCallRunning {
+		created.Status = session.ToolCallRunning
+		created.ClaimedBy = owner
+		created.ClaimToken = "claim-resume"
+		created.StartedAt = now
+		if _, err := store.ClaimToolCall(ctx, created); err != nil {
+			t.Fatalf("claim tool call: %v", err)
+		}
+	}
+	return store, run
 }
 
 func TestStreamingOrchestratorFailsWhenToolLoopExceedsLimit(t *testing.T) {
