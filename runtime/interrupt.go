@@ -34,9 +34,10 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
-		runID:  runID,
-		cancel: cancel,
-		done:   make(chan Result, 1),
+		runID:       runID,
+		cancel:      cancel,
+		done:        make(chan Result, 1),
+		onInterrupt: func(reason string) { o.observeInterrupt(context.WithoutCancel(ctx), run, "", reason) },
 	}
 	go o.executeResume(runCtx, run, handle.done)
 	return handle, nil
@@ -47,14 +48,19 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, run session.R
 	done <- o.resumeRun(ctx, run)
 }
 
-func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) Result {
+func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) (result Result) {
 	if run.Terminal() {
 		return Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
 	}
+	o.observeResume(ctx, run, "resume")
 	run.OwnerID = o.ownerID()
 	run.Status = session.RunRunning
 	run.LeaseUntil = o.now().Add(o.lease())
 	run.StartedAt = o.now()
+	observed := o.startObservedRun(ctx, run, "", run.StartedAt)
+	defer func() {
+		o.finishObservedRun(observed, result, o.now())
+	}()
 	if err := o.Store.FinishRun(ctx, run); err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}

@@ -1,0 +1,268 @@
+package runtime
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	einoschema "github.com/cloudwego/eino/schema"
+	einoobs "github.com/mattsp1290/eino-obs"
+
+	agentcontext "github.com/mattsp1290/eino-agent/context"
+	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/session"
+)
+
+func TestStreamingOrchestratorRecordsNoNetworkObservations(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.Message, error) {
+		request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 3, OutputTokens: 2, ReasoningTokens: 1, CacheReadTokens: 4}})
+		return []*einoschema.Message{einoschema.AssistantMessage("hello", nil)}, nil
+	}))
+	orch.Observer = observer
+	orch.Trace = agentcontext.TraceContext{TraceID: "trace-1"}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	observations := observer.Snapshot().Observations
+	stream := assertObservation(t, observations, "stream", "ok", "trace-1")
+	if stream.Attributes["genai.usage.input_tokens"] != int64(3) || stream.Attributes["genai.usage.output_tokens"] != int64(2) {
+		t.Fatalf("stream usage attrs = %#v", stream.Attributes)
+	}
+	run := assertObservation(t, observations, "run", "ok", "trace-1")
+	sessionObs := assertObservation(t, observations, "session", "ok", "trace-1")
+	if run.ParentID != sessionObs.ID {
+		t.Fatalf("run parent = %q, want session %q", run.ParentID, sessionObs.ID)
+	}
+	if observationContains(observations, "hello") {
+		t.Fatalf("observations leaked raw model content: %#v", observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsRetryAndProviderError(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	var calls int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		calls++
+		return nil, model.Error{Code: "rate_limited", Message: "SECRET prompt retry me", Retryable: true, Cause: model.ErrProviderRateLimited}
+	}))
+	orch.Attempts = 2
+	orch.Observer = observer
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || calls != 2 {
+		t.Fatalf("result = %+v calls=%d", result, calls)
+	}
+	observations := observer.Snapshot().Observations
+	retry := assertObservation(t, observations, "retry", "ok", "")
+	if retry.Attributes["error.classification"] != "rate_limited" {
+		t.Fatalf("retry attrs = %#v", retry.Attributes)
+	}
+	failed := assertObservation(t, observations, "run", "error", "")
+	if failed.Error == nil || failed.Error.Classification != "rate_limited" || !failed.Error.Retryable {
+		t.Fatalf("failed run error = %#v", failed.Error)
+	}
+	assertObservation(t, observations, "error", "error", "")
+	streams := observationsByKind(observations, "stream")
+	if len(streams) != 2 || streams[0].ID == streams[1].ID {
+		t.Fatalf("retry streams = %#v", streams)
+	}
+	if streams[0].Attributes["genai.retry.attempt"] != int64(1) || streams[1].Attributes["genai.retry.attempt"] != int64(2) {
+		t.Fatalf("retry stream attrs = %#v / %#v", streams[0].Attributes, streams[1].Attributes)
+	}
+	if observationContains(observations, "SECRET prompt") {
+		t.Fatalf("observations leaked provider error text: %#v", observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsCancellation(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return nil, context.Canceled
+	}))
+	orch.Observer = observer
+	result := startAndWait(t, orch)
+	if result.Status != session.RunInterrupted || !result.Interrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	observations := observer.Snapshot().Observations
+	run := assertObservation(t, observations, "run", "canceled", "")
+	if run.Error == nil || run.Error.Classification != "canceled" {
+		t.Fatalf("run error = %#v", run.Error)
+	}
+	assertObservation(t, observations, "cancellation", "canceled", "")
+}
+
+func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}))
+	orch.Observer = observer
+	handle, err := orch.Start(context.Background(), Request{
+		SessionID: "session-1",
+		ParentID:  "user-1",
+		Input:     []*einoschema.Message{einoschema.UserMessage("SECRET prompt")},
+		Config:    orchestratorConfig(),
+	})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	if err := handle.Interrupt(context.Background(), "disconnect"); err != nil {
+		t.Fatalf("Interrupt error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunInterrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	observations := observer.Snapshot().Observations
+	interrupt := assertObservation(t, observations, "interrupt", "ok", "")
+	if interrupt.Attributes["interrupt.reason"] != "disconnect" {
+		t.Fatalf("interrupt attrs = %#v", interrupt.Attributes)
+	}
+	assertObservation(t, observations, "cancellation", "canceled", "")
+	if observationContains(observations, "SECRET prompt") {
+		t.Fatalf("observations leaked raw prompt: %#v", observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsResume(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
+	defer func() {
+		_ = store.Close()
+	}()
+	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	orch := &StreamingOrchestrator{
+		Store:    store,
+		Tools:    staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}},
+		IDs:      &sequenceIDs{},
+		OwnerID:  "owner-1",
+		Clock:    func() time.Time { return now },
+		Observer: observer,
+	}
+	handle, err := orch.Resume(context.Background(), run.ID)
+	if err != nil {
+		t.Fatalf("Resume error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunInterrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	resume := assertObservation(t, observer.Snapshot().Observations, "resume", "ok", "")
+	if resume.Attributes["resume.status"] != "started" {
+		t.Fatalf("resume attrs = %#v", resume.Attributes)
+	}
+	assertObservation(t, observer.Snapshot().Observations, "run", "canceled", "")
+}
+
+func TestObservabilitySinkRecordsCompactionWithoutPayloadLeak(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	err := (ObservabilitySink{Observer: observer}).Emit(context.Background(), Event{
+		Kind:        EventContextEpochChanged,
+		SessionID:   "session-1",
+		RunID:       "run-1",
+		MessageID:   "summary-1",
+		EpochID:     "epoch-1",
+		Correlation: "trace-1",
+		Payload:     []byte(`{"summary":"SECRET compacted prompt"}`),
+	})
+	if err != nil {
+		t.Fatalf("Emit error = %v", err)
+	}
+	compaction := assertObservation(t, observer.Snapshot().Observations, "compaction", "ok", "trace-1")
+	if compaction.Attributes["metadata.epoch_id"] != "epoch-1" {
+		t.Fatalf("compaction attrs = %#v", compaction.Attributes)
+	}
+	if observationContains(observer.Snapshot().Observations, "SECRET compacted prompt") {
+		t.Fatalf("observations leaked compaction payload: %#v", observer.Snapshot().Observations)
+	}
+}
+
+func assertObservation(t *testing.T, observations []einoobs.Observation, kind string, status string, traceID string) einoobs.Observation {
+	t.Helper()
+	for _, observation := range observations {
+		if observation.Kind != kind || observation.Status != status {
+			continue
+		}
+		if traceID != "" && observation.TraceID != traceID {
+			t.Fatalf("%s trace = %q, want %q", kind, observation.TraceID, traceID)
+		}
+		return observation
+	}
+	t.Fatalf("missing observation kind=%s status=%s in %#v", kind, status, observations)
+	return einoobs.Observation{}
+}
+
+func observationContains(observations []einoobs.Observation, needle string) bool {
+	for _, observation := range observations {
+		if strings.Contains(observation.Name, needle) || attrsContain(observation.Attributes, needle) {
+			return true
+		}
+		if observation.Error != nil && strings.Contains(observation.Error.Error(), needle) {
+			return true
+		}
+		for _, event := range observation.Events {
+			if strings.Contains(event.Name, needle) || attrsContain(event.Attributes, needle) {
+				return true
+			}
+			if event.Error != nil && strings.Contains(event.Error.Error(), needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func observationsByKind(observations []einoobs.Observation, kind string) []einoobs.Observation {
+	var result []einoobs.Observation
+	for _, observation := range observations {
+		if observation.Kind == kind {
+			result = append(result, observation)
+		}
+	}
+	return result
+}
+
+func attrsContain(attrs map[string]any, needle string) bool {
+	for _, value := range attrs {
+		if strings.Contains(valueString(value), needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func valueString(value any) string {
+	switch v := value.(type) {
+	case string:
+		return v
+	case map[string]string:
+		var builder strings.Builder
+		for key, item := range v {
+			builder.WriteString(key)
+			builder.WriteString(item)
+		}
+		return builder.String()
+	default:
+		return ""
+	}
+}

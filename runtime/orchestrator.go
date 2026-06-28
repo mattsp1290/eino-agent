@@ -12,6 +12,7 @@ import (
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
+	einoobs "github.com/mattsp1290/eino-obs"
 
 	agentcontext "github.com/mattsp1290/eino-agent/context"
 	"github.com/mattsp1290/eino-agent/model"
@@ -59,6 +60,7 @@ type StreamingOrchestrator struct {
 	Permissions permissions.Policy
 	Admit       *Admitter
 	Transactor  session.Transactor
+	Observer    *einoobs.Observer
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -104,6 +106,9 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		runID:  admitted.Run.ID,
 		cancel: cancel,
 		done:   make(chan Result, 1),
+		onInterrupt: func(reason string) {
+			o.observeInterrupt(context.WithoutCancel(ctx), admitted.Run, admitted.AssistantMessage.ID, reason)
+		},
 	}
 	go o.execute(runCtx, admitted, handle.done)
 	return handle, nil
@@ -126,15 +131,18 @@ func (o *StreamingOrchestrator) execute(ctx context.Context, admitted AdmittedRu
 func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (result Result) {
 	run := admitted.Run
 	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
+	var observed observedRun
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result.Status = session.RunFailed
 			result.Error = fmt.Errorf("provider stream panic: %v", recovered)
 		}
 		result = o.finish(ctx, run, result)
+		o.finishObservedRun(observed, result, o.now())
 	}()
 	run.Status = session.RunRunning
 	run.StartedAt = o.now()
+	observed = o.startObservedRun(ctx, run, admitted.AssistantMessage.ID, run.StartedAt)
 	if err := o.Store.FinishRun(ctx, run); err != nil {
 		result.Status = session.RunFailed
 		result.Error = err
@@ -186,29 +194,33 @@ func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, snapshot Tu
 	attempts := o.attempts()
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		result, err := o.executeOne(ctx, snapshot, messageID)
+		result, err := o.executeOne(ctx, snapshot, messageID, attempt)
 		if err == nil {
 			return result
 		}
 		if ctx.Err() != nil {
+			o.observeError(ctx, snapshot, messageID, "provider_stream", err)
 			return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: ctx.Err()}
 		}
 		last = err
 		if !retryable(err) || attempt == attempts {
 			break
 		}
+		o.observeRetry(ctx, snapshot, messageID, attempt, attempts, err)
 	}
 	if errors.Is(last, context.Canceled) {
+		o.observeError(ctx, snapshot, messageID, "provider_stream", last)
 		return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: last}
 	}
+	o.observeError(ctx, snapshot, messageID, "provider_stream", last)
 	return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunFailed, Error: last}
 }
 
-func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID) (Result, error) {
+func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int) (Result, error) {
 	messages := cloneMessages(snapshot.Messages)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
-		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages)
+		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages, attempt)
 		if err != nil {
 			return Result{}, err
 		}
@@ -245,23 +257,36 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 	}
 }
 
-func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message) (*einoschema.Message, error) {
+func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt int) (*einoschema.Message, error) {
 	queue := newEventQueue(ctx, o.QueueSize, o.Events)
 	defer queue.close()
-	observer := streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
+	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
+	var streamUsage model.Usage
+	var streamErr error
+	defer func() {
+		if streamErr != nil {
+			o.errorObservedStream(obsStream, streamErr, streamUsage)
+			return
+		}
+		o.endObservedStream(obsStream, streamUsage)
+	}()
+	observer := &streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
 	request := snapshot.ProviderRequest(messageID, o.Trace, observer)
 	request.Messages = cloneMessages(messages)
 	reader, err := openStream(ctx, snapshot.Model, request)
 	if err != nil {
+		streamErr = err
 		return nil, err
 	}
 	if reader == nil {
-		return nil, model.Error{Code: "nil_provider_stream", Message: "provider returned nil stream"}
+		streamErr = model.Error{Code: "nil_provider_stream", Message: "provider returned nil stream"}
+		return nil, streamErr
 	}
 	defer reader.Close()
 	var chunks []*einoschema.Message
 	for {
 		if err := ctx.Err(); err != nil {
+			streamErr = err
 			return nil, err
 		}
 		chunk, err := reader.Recv()
@@ -269,14 +294,18 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 			break
 		}
 		if err != nil {
+			streamErr = err
 			return nil, err
 		}
 		if err := ctx.Err(); err != nil {
+			streamErr = err
 			return nil, err
 		}
 		if chunk == nil {
-			return nil, model.Error{Code: "malformed_provider_stream", Message: "provider returned nil message chunk"}
+			streamErr = model.Error{Code: "malformed_provider_stream", Message: "provider returned nil message chunk"}
+			return nil, streamErr
 		}
+		o.observeStreamChunk(obsStream, int64(len(chunks)))
 		chunks = append(chunks, chunk)
 		if err := queue.emit(Event{
 			Kind:       EventMessageDelta,
@@ -290,16 +319,20 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 			LiveOnly:   true,
 			Time:       o.now(),
 		}); err != nil {
+			streamErr = err
 			return nil, err
 		}
 	}
 	if len(chunks) == 0 {
+		streamUsage = observer.usageSnapshot()
 		return einoschema.AssistantMessage("", nil), nil
 	}
 	msg, err := einoschema.ConcatMessages(chunks)
 	if err != nil {
-		return nil, model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
+		streamErr = model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
+		return nil, streamErr
 	}
+	streamUsage = observer.usageSnapshot()
 	return msg, nil
 }
 
@@ -793,16 +826,22 @@ func mustJSON(value any) json.RawMessage {
 }
 
 type streamingHandle struct {
-	runID  session.RunID
-	cancel context.CancelFunc
-	done   chan Result
-	once   sync.Once
+	runID       session.RunID
+	cancel      context.CancelFunc
+	done        chan Result
+	once        sync.Once
+	onInterrupt func(reason string)
 }
 
 func (h *streamingHandle) RunID() session.RunID { return h.runID }
 func (h *streamingHandle) Done() <-chan Result  { return h.done }
-func (h *streamingHandle) Interrupt(context.Context, string) error {
-	h.once.Do(h.cancel)
+func (h *streamingHandle) Interrupt(_ context.Context, reason string) error {
+	h.once.Do(func() {
+		if h.onInterrupt != nil {
+			h.onInterrupt(reason)
+		}
+		h.cancel()
+	})
 	return nil
 }
 func (h *streamingHandle) FollowUp(context.Context, []*einoschema.Message) error {
@@ -814,12 +853,58 @@ type streamObserver struct {
 	base      TurnSnapshot
 	messageID session.MessageID
 	now       func() time.Time
+	mu        sync.Mutex
+	usage     model.Usage
 }
 
-func (o streamObserver) OnProviderStart(context.Context, model.Request)     {}
-func (o streamObserver) OnProviderDelta(context.Context, model.StreamDelta) {}
-func (o streamObserver) OnProviderError(context.Context, model.Error)       {}
-func (o streamObserver) OnProviderEnd(context.Context, model.Response)      {}
+func (o *streamObserver) OnProviderStart(context.Context, model.Request) {}
+func (o *streamObserver) OnProviderDelta(_ context.Context, delta model.StreamDelta) {
+	o.setUsage(delta.Usage)
+}
+func (o *streamObserver) OnProviderError(context.Context, model.Error) {}
+func (o *streamObserver) OnProviderEnd(_ context.Context, response model.Response) {
+	o.setUsage(response.Usage)
+}
+
+func (o *streamObserver) setUsage(usage model.Usage) {
+	if o == nil {
+		return
+	}
+	o.mu.Lock()
+	o.usage = mergeUsage(o.usage, usage)
+	o.mu.Unlock()
+}
+
+func (o *streamObserver) usageSnapshot() model.Usage {
+	if o == nil {
+		return model.Usage{}
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.usage
+}
+
+func mergeUsage(current model.Usage, next model.Usage) model.Usage {
+	if next.InputTokens != 0 {
+		current.InputTokens = next.InputTokens
+	}
+	if next.OutputTokens != 0 {
+		current.OutputTokens = next.OutputTokens
+	}
+	if next.ReasoningTokens != 0 {
+		current.ReasoningTokens = next.ReasoningTokens
+	}
+	if next.CacheReadTokens != 0 {
+		current.CacheReadTokens = next.CacheReadTokens
+	}
+	if next.CacheWriteTokens != 0 {
+		current.CacheWriteTokens = next.CacheWriteTokens
+	}
+	if next.Cost != 0 {
+		current.Cost = next.Cost
+	}
+	return current
+}
 
 type eventQueue struct {
 	ctx    context.Context
