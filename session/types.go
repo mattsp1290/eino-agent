@@ -341,6 +341,12 @@ type Store interface {
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
 }
 
+// ContextEpochReader replays durable context epoch records for audit and
+// compaction-aware history projection.
+type ContextEpochReader interface {
+	ListContextEpochs(ctx context.Context, sessionID ID) ([]ContextEpoch, error)
+}
+
 // Tx is a store view scoped to one implementation-defined transaction.
 type Tx interface {
 	Store

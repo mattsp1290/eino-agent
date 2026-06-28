@@ -3,6 +3,7 @@ package history
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -145,6 +146,65 @@ func TestProjectEpochExcludesCompactedRawHistory(t *testing.T) {
 	}
 	if len(projected) != 2 {
 		t.Fatalf("projected len = %d", len(projected))
+	}
+	assertMessage(t, projected[0], schema.System, "Summarized safely.")
+	assertMessage(t, projected[1], schema.User, "Continue")
+}
+
+func TestProjectEpochWithNoTailIncludesSummaryOnly(t *testing.T) {
+	t.Parallel()
+
+	batch := session.ReplayBatch{
+		Messages: []session.Message{
+			message("old", session.RoleUser),
+			message("summary", session.RoleSystem),
+		},
+		Parts: []session.Part{
+			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
+			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely."}`),
+		},
+	}
+	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
+		SummaryMessageID: "summary",
+		SummarizedToID:   "old",
+	}})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if len(projected) != 1 {
+		t.Fatalf("projected len = %d, want 1", len(projected))
+	}
+	assertMessage(t, projected[0], schema.System, "Summarized safely.")
+	if strings.Contains(projected[0].Content, "SECRET old raw prompt") {
+		t.Fatal("projected compacted raw prompt")
+	}
+}
+
+func TestProjectEpochPlacesSummaryBeforeRetainedTail(t *testing.T) {
+	t.Parallel()
+
+	batch := session.ReplayBatch{
+		Messages: []session.Message{
+			message("old", session.RoleUser),
+			message("tail", session.RoleUser),
+			message("summary", session.RoleSystem),
+		},
+		Parts: []session.Part{
+			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
+			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
+			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely."}`),
+		},
+	}
+	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
+		SummaryMessageID: "summary",
+		SummarizedToID:   "old",
+		TailStartID:      "tail",
+	}})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if len(projected) != 2 {
+		t.Fatalf("projected len = %d, want 2", len(projected))
 	}
 	assertMessage(t, projected[0], schema.System, "Summarized safely.")
 	assertMessage(t, projected[1], schema.User, "Continue")

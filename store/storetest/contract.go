@@ -323,6 +323,56 @@ func Run(t *testing.T, factory Factory) {
 		if len(first.Events) != 1 || first.Events[0].ID != "evt-1" || len(next.Events) != 1 || next.Events[0].ID != "evt-2" {
 			t.Fatalf("next events = %#v, want evt-2", next.Events)
 		}
+		later := time.Now().UTC()
+		earlier := later.Add(-time.Minute)
+		epoch, err := subject.Store.StartContextEpoch(ctx, session.ContextEpoch{
+			ID:               "epoch-2",
+			SessionID:        s.ID,
+			SummaryMessageID: "summary",
+			SummarizedFromID: "msg-1",
+			SummarizedToID:   "msg-1",
+			TailStartID:      "msg-2",
+			ModelID:          "model",
+			ProviderID:       "provider",
+			Trigger:          "manual",
+			Reason:           "contract",
+			NextAction:       session.EpochNextStop,
+			CreatedAt:        later,
+		})
+		if err != nil {
+			t.Fatalf("start context epoch: %v", err)
+		}
+		duplicate, err := subject.Store.StartContextEpoch(ctx, epoch)
+		if err != nil {
+			t.Fatalf("duplicate start context epoch: %v", err)
+		}
+		if duplicate.ID != epoch.ID {
+			t.Fatalf("duplicate epoch = %#v, want %#v", duplicate, epoch)
+		}
+		if _, err := subject.Store.StartContextEpoch(ctx, session.ContextEpoch{
+			ID:        "epoch-1",
+			SessionID: s.ID,
+			Trigger:   "manual",
+			Reason:    "earlier",
+			CreatedAt: earlier,
+		}); err != nil {
+			t.Fatalf("start earlier context epoch: %v", err)
+		}
+		epoch.ClosedAt = epoch.CreatedAt.Add(time.Minute)
+		if err := subject.Store.FinishContextEpoch(ctx, epoch); err != nil {
+			t.Fatalf("finish context epoch: %v", err)
+		}
+		reader, ok := subject.Store.(session.ContextEpochReader)
+		if !ok {
+			t.Fatal("store does not expose session.ContextEpochReader")
+		}
+		epochs, err := reader.ListContextEpochs(ctx, s.ID)
+		if err != nil {
+			t.Fatalf("list context epochs: %v", err)
+		}
+		if len(epochs) != 2 || epochs[0].ID != "epoch-1" || epochs[1].ID != "epoch-2" || epochs[1].SummaryMessageID != "summary" || epochs[1].ClosedAt.IsZero() {
+			t.Fatalf("epochs = %#v, want chronological epoch-1 then finished epoch-2", epochs)
+		}
 	})
 }
 
