@@ -111,6 +111,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			MessageID: claimed.MessageID,
 			Name:      claimed.Name,
 			Scope:     tool.Scope,
+			Pattern:   toolPattern(claimed.Input, claimed.Name),
 			Input:     cloneJSON(claimed.Input),
 		})
 		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, execErr)
