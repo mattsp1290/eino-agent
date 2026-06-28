@@ -240,6 +240,123 @@ func TestStreamingOrchestratorFailsMalformedStreamWithoutPanic(t *testing.T) {
 	}
 }
 
+func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		msg := einoschema.AssistantMessage("partial text", []einoschema.ToolCall{{
+			ID:   "call-bad-json",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{"text":`,
+			},
+		}})
+		msg.ReasoningContent = "partial reasoning"
+		return []*einoschema.Message{msg}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			t.Fatal("executor should not run for malformed tool arguments")
+			return ToolResult{}, nil
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || result.Error == nil {
+		t.Fatalf("result = %+v", result)
+	}
+	var providerErr model.Error
+	if !errors.As(result.Error, &providerErr) || providerErr.Code != "malformed_provider_tool_call" {
+		t.Fatalf("result error = %#v, want malformed_provider_tool_call", result.Error)
+	}
+	if _, err := store.GetToolCall(context.Background(), "call-bad-json"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
+	}
+	for _, part := range store.parts {
+		switch part.Kind {
+		case session.PartText, session.PartReasoning, session.PartToolCall:
+			t.Fatalf("assistant part persisted despite malformed arguments: kind=%s payload=%s", part.Kind, part.Payload)
+		}
+	}
+}
+
+func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-empty-args",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name: "echo",
+			},
+		}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			if string(call.Input) != `{}` {
+				t.Fatalf("tool input = %s, want {}", call.Input)
+			}
+			return ToolResult{Output: "ok"}, nil
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-empty-args")
+	if err != nil {
+		t.Fatalf("GetToolCall error = %v", err)
+	}
+	if string(call.Input) != `{}` {
+		t.Fatalf("persisted input = %s, want {}", call.Input)
+	}
+}
+
+func TestNormalizedToolArgumentsCompatibilityShapes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty", input: "", want: `{}`},
+		{name: "object", input: `{"text":"hi"}`, want: `{"text":"hi"}`},
+		{name: "null", input: `null`, want: `null`},
+		{name: "array", input: `[]`, want: `[]`},
+		{name: "string", input: `"value"`, want: `"value"`},
+		{name: "malformed", input: `{"text":`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizedToolArguments(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizedToolArguments error = %v", err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("normalizedToolArguments(%q) = %s, want %s", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	t.Parallel()
 

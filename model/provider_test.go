@@ -26,11 +26,19 @@ func TestAdapterResolverResolvesAdapterAndClonesRuntime(t *testing.T) {
 		t.Fatalf("Resolve error = %v", err)
 	}
 	runtime.Env["key"] = "changed"
+	runtime.Auth["token"] = "changed"
+	runtime.Options["temperature"] = "1"
 	if adapter.runtime.Env["key"] != "value" {
 		t.Fatalf("adapter runtime env = %q, want value", adapter.runtime.Env["key"])
 	}
+	if adapter.runtime.Auth["token"] != "secret" || adapter.runtime.Options["temperature"] != "0" {
+		t.Fatalf("adapter runtime leaked caller mutation: %#v", adapter.runtime)
+	}
 	if resolved.Provider.ID != "fake" || resolved.Model.ID != "m1" || resolved.Client == nil {
 		t.Fatalf("resolved = %#v", resolved)
+	}
+	if _, ok := resolved.Provider.Options["token"]; ok {
+		t.Fatalf("resolved provider options exposed auth token: %#v", resolved.Provider.Options)
 	}
 	if resolved.Streamer != adapter {
 		t.Fatalf("resolved streamer = %#v, want adapter", resolved.Streamer)
