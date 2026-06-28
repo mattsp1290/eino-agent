@@ -9,7 +9,9 @@ package agui_go_server_example
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"sync"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -24,20 +26,37 @@ import (
 	"github.com/mattsp1290/eino-agent/transport"
 )
 
+// ErrAGUIResumeRequiresAppAdapter reports AG-UI resume payloads that must stay
+// on the consuming app's existing streamed resume path until it has a runtime
+// tool-call settlement adapter.
+var ErrAGUIResumeRequiresAppAdapter = errors.New("ag-ui resume requires app-owned streamed resume adapter")
+
+// ErrClientToolRegistryRequired reports a client-tool request without the
+// registry needed to materialize those tools into the runtime.
+var ErrClientToolRegistryRequired = errors.New("ag-ui client tool registry required")
+
 // RunInput is the subset of AG-UI RunAgentInput data that eino-agent needs at
 // admission time. The consuming server still owns its exact request body.
 type RunInput struct {
-	ThreadID   string
-	RunID      string
-	Messages   []aguitypes.Message
-	Tools      []aguitypes.Tool
-	Generation uint64
+	ThreadID string
+	RunID    string
+	Messages []aguitypes.Message
+	Tools    []aguitypes.Tool
+	Resume   []aguitypes.ResumeEntry
+
+	// ClientToolGeneration is server-owned monotonic state. AG-UI RunAgentInput
+	// does not provide a generation; consumers should assign this with a
+	// per-session counter before calling SetClientTools.
+	ClientToolGeneration uint64
 }
 
 // StartRequest converts an AG-UI request body into an eino-agent runtime
 // admission request. The application supplies the session ID and immutable
 // runtime config snapshot.
-func StartRequest(sessionID session.ID, input RunInput, snapshot config.Snapshot) runtime.Request {
+func StartRequest(sessionID session.ID, input RunInput, snapshot config.Snapshot) (runtime.Request, error) {
+	if len(input.Resume) > 0 {
+		return runtime.Request{}, ErrAGUIResumeRequiresAppAdapter
+	}
 	return runtime.Request{
 		SessionID: sessionID,
 		Input:     convert.ToEinoMessages(input.Messages),
@@ -46,19 +65,49 @@ func StartRequest(sessionID session.ID, input RunInput, snapshot config.Snapshot
 			"agui_thread_id": input.ThreadID,
 			"agui_run_id":    input.RunID,
 		},
+	}, nil
+}
+
+// SessionIDFromThreadID preserves ag-ui-go-server-example's thread identity as
+// the durable conversation key used for replay and reconnect.
+func SessionIDFromThreadID(threadID string) session.ID {
+	return session.ID(threadID)
+}
+
+// ToolGenerations owns per-session client-tool definition revisions for the
+// consuming server. The first generated value is 1.
+type ToolGenerations struct {
+	mu     sync.Mutex
+	values map[session.ID]uint64
+}
+
+func (g *ToolGenerations) Next(sessionID session.ID) uint64 {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.values == nil {
+		g.values = map[session.ID]uint64{}
 	}
+	g.values[sessionID]++
+	return g.values[sessionID]
 }
 
 // SetClientTools installs per-session AG-UI client tool definitions into the
 // eino-agent tool registry. The registry combines these with any server-side
 // tools when runtime prepares a turn.
 func SetClientTools(registry *toolagui.Registry, sessionID session.ID, input RunInput) error {
-	if registry == nil || len(input.Tools) == 0 {
+	if registry == nil {
+		if len(input.Tools) == 0 {
+			return nil
+		}
+		return ErrClientToolRegistryRequired
+	}
+	if len(input.Tools) == 0 {
+		registry.ClearClientTools(sessionID)
 		return nil
 	}
 	return registry.SetClientTools(agentagui.ClientToolSnapshot{
 		SessionID:  sessionID,
-		Generation: input.Generation,
+		Generation: input.ClientToolGeneration,
 		Tools:      input.Tools,
 	})
 }
@@ -66,7 +115,7 @@ func SetClientTools(registry *toolagui.Registry, sessionID session.ID, input Run
 // ReplayHandler builds the AG-UI SSE endpoint for durable replay plus live
 // tailing. Fiber handlers can delegate to this through an adapter, or mirror
 // these same transport.SSEConfig fields in Fiber's streaming writer.
-func ReplayHandler(store session.Store, tail transport.Tail, sessionFromRequest transport.SessionFunc) http.Handler {
+func ReplayHandler(store session.Store, tail transport.Tail, sessionFromRequest transport.SessionFunc, runIDFromRequest func(*http.Request) string) http.Handler {
 	return transport.SSEHandler(transport.SSEConfig{
 		Store:   store,
 		Tail:    tail,
@@ -78,6 +127,9 @@ func ReplayHandler(store session.Store, tail transport.Tail, sessionFromRequest 
 			return string(id)
 		},
 		RunID: func(r *http.Request) string {
+			if runIDFromRequest != nil {
+				return runIDFromRequest(r)
+			}
 			return r.URL.Query().Get("run_id")
 		},
 	})
