@@ -6,7 +6,6 @@ import (
 	"errors"
 	"os"
 	"reflect"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -256,9 +255,7 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 		t.Fatalf("settled attrs = %#v", settled.Attributes)
 	}
 	want := readObservationGolden(t, "../testdata/obs/tool_lifecycle_observations.json")
-	if got := goldenToolObservations(observations); !reflect.DeepEqual(got, want) {
-		t.Fatalf("tool observations = %#v, want %#v", got, want)
-	}
+	requireGoldenEqual(t, goldenToolObservations(observations), want)
 	if observationContains(observations, "SECRET tool input") || observationContains(observations, "SECRET tool output") {
 		t.Fatalf("observations leaked tool payloads: %#v", observations)
 	}
@@ -511,17 +508,6 @@ func goldenToolObservations(observations []einoobs.Observation) []goldenObservat
 		}
 		result = append(result, item)
 	}
-	sort.SliceStable(result, func(i, j int) bool {
-		left := result[i]
-		right := result[j]
-		if left.Kind != right.Kind {
-			return left.Kind < right.Kind
-		}
-		if left.ToolCallID != right.ToolCallID {
-			return left.ToolCallID < right.ToolCallID
-		}
-		return left.Status < right.Status
-	})
 	return result
 }
 
@@ -548,6 +534,16 @@ func stringAttr(attrs map[string]any, key string) string {
 		return text
 	}
 	return ""
+}
+
+func requireGoldenEqual[T any](t *testing.T, got, want T) {
+	t.Helper()
+	if reflect.DeepEqual(got, want) {
+		return
+	}
+	gotJSON, _ := json.MarshalIndent(got, "", "  ")
+	wantJSON, _ := json.MarshalIndent(want, "", "  ")
+	t.Fatalf("golden mismatch\n--- got ---\n%s\n--- want ---\n%s", gotJSON, wantJSON)
 }
 
 func attrsContain(attrs map[string]any, needle string) bool {

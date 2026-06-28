@@ -30,6 +30,8 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 			part("p1", "assistant-1", session.PartText, 10, `{"text":"I will read it."}`),
 			part("p0", "user-1", session.PartText, 10, `{"text":"Read README"}`),
 			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","content":"README contents"}`),
+			part("reasoning", "assistant-2", session.PartReasoning, 5, `{"text":"LIVE_ONLY_STYLE_REASONING"}`),
+			part("state", "assistant-2", session.PartState, 6, `{"text":"LIVE_ONLY_STYLE_STATE"}`),
 			part("p4", "assistant-2", session.PartText, 10, `{"text":"Summary"}`),
 			part("p5", "assistant-live", session.PartText, 10, `{"text":"settled"}`),
 		},
@@ -40,9 +42,7 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 	}
 	got := goldenMessages(projected)
 	want := readHistoryGolden(t, "../../testdata/history/replay_projection.json")
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("projected history = %#v, want %#v", got, want)
-	}
+	requireGoldenEqual(t, got, want)
 }
 
 func TestProjectToolResultStructuredAndExpectedFailurePayloads(t *testing.T) {
@@ -320,6 +320,16 @@ func readHistoryGolden(t *testing.T, path string) []goldenMessage {
 		t.Fatalf("decode history golden: %v", err)
 	}
 	return result
+}
+
+func requireGoldenEqual[T any](t *testing.T, got, want T) {
+	t.Helper()
+	if reflect.DeepEqual(got, want) {
+		return
+	}
+	gotJSON, _ := json.MarshalIndent(got, "", "  ")
+	wantJSON, _ := json.MarshalIndent(want, "", "  ")
+	t.Fatalf("golden mismatch\n--- got ---\n%s\n--- want ---\n%s", gotJSON, wantJSON)
 }
 
 type historyStore struct {
