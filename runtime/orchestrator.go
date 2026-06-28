@@ -15,6 +15,7 @@ import (
 
 	agentcontext "github.com/mattsp1290/eino-agent/context"
 	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
 )
@@ -40,23 +41,24 @@ type IDGenerator interface {
 
 // StreamingOrchestrator executes admitted runs against Eino model streams.
 type StreamingOrchestrator struct {
-	Store      session.Store
-	Model      model.Resolver
-	Tools      ToolRegistry
-	Context    []ContextSource
-	Events     EventSink
-	Hooks      []Hook
-	IDs        IDGenerator
-	Clock      func() time.Time
-	OwnerID    string
-	Trace      agentcontext.TraceContext
-	Attempts   int
-	ToolTurns  int
-	QueueSize  int
-	Lease      time.Duration
-	History    history.Options
-	Admit      *Admitter
-	Transactor session.Transactor
+	Store       session.Store
+	Model       model.Resolver
+	Tools       ToolRegistry
+	Context     []ContextSource
+	Events      EventSink
+	Hooks       []Hook
+	IDs         IDGenerator
+	Clock       func() time.Time
+	OwnerID     string
+	Trace       agentcontext.TraceContext
+	Attempts    int
+	ToolTurns   int
+	QueueSize   int
+	Lease       time.Duration
+	History     history.Options
+	Permissions permissions.Policy
+	Admit       *Admitter
+	Transactor  session.Transactor
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -437,7 +439,7 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 			Name:      schemaCall.Function.Name,
 			Arguments: cloneJSON(input),
 		})
-		result, execErr := tool.Executor.Execute(ctx, ToolCall{
+		call := ToolCall{
 			ID:        callID,
 			SessionID: snapshot.SessionID,
 			RunID:     snapshot.RunID,
@@ -445,7 +447,8 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 			Name:      schemaCall.Function.Name,
 			Scope:     tool.Scope,
 			Input:     cloneJSON(input),
-		})
+		}
+		result, execErr := o.executeTool(ctx, tool, call)
 		output, status, errText := encodeToolOutput(callID, result, tool.Retention, execErr)
 		record.Status = status
 		record.Output = cloneJSON(output)
@@ -491,6 +494,13 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 func (o *StreamingOrchestrator) appendPart(ctx context.Context, part session.Part) error {
 	_, err := o.Store.AppendPart(ctx, part)
 	return err
+}
+
+func (o *StreamingOrchestrator) executeTool(ctx context.Context, tool Tool, call ToolCall) (ToolResult, error) {
+	if o.Permissions == nil {
+		return tool.Executor.Execute(ctx, call)
+	}
+	return ExecuteToolWithPermissions(ctx, tool, call, o.Permissions)
 }
 
 func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {
