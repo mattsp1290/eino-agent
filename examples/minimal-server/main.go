@@ -62,7 +62,7 @@ type Server struct {
 	config  config.Snapshot
 
 	mu      sync.Mutex
-	handles map[session.RunID]runtime.Handle
+	handles map[session.RunID]activeHandle
 }
 
 // NewServer opens local durable storage and wires the runtime to AG-UI SSE
@@ -83,7 +83,7 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 		store:   store,
 		tail:    tail,
 		config:  snapshot,
-		handles: map[session.RunID]runtime.Handle{},
+		handles: map[session.RunID]activeHandle{},
 		runtime: &runtime.StreamingOrchestrator{
 			Store:      store,
 			Transactor: store,
@@ -99,6 +99,23 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 func (s *Server) Close() error {
 	if s == nil {
 		return nil
+	}
+	s.mu.Lock()
+	handles := make([]activeHandle, 0, len(s.handles))
+	for _, handle := range s.handles {
+		handles = append(handles, handle)
+	}
+	s.mu.Unlock()
+	for _, handle := range handles {
+		_ = handle.handle.Interrupt(context.Background(), "server closing")
+	}
+	deadline := time.After(2 * time.Second)
+	for _, handle := range handles {
+		select {
+		case <-handle.done:
+		case <-deadline:
+			log.Printf("timed out waiting for run %s to stop during close", handle.handle.RunID())
+		}
 	}
 	if s.tail != nil {
 		s.tail.Close()
@@ -178,7 +195,6 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 		return
 	}
 	s.remember(handle)
-	go s.releaseWhenDone(handle)
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"session_id": string(sessionID),
@@ -198,42 +214,40 @@ func (s *Server) serveRunControl(w http.ResponseWriter, r *http.Request) {
 		transport.InterruptHandler(nil, func(context.Context, *http.Request) (transport.Interruptor, error) {
 			return s.lookup(runID)
 		}).ServeHTTP(w, r)
-	case "resume":
-		transport.ResumeHandler(nil, func(ctx context.Context, _ *http.Request) (runtime.Handle, error) {
-			handle, err := s.runtime.Resume(ctx, runID)
-			if err != nil {
-				return nil, err
-			}
-			s.remember(handle)
-			go s.releaseWhenDone(handle)
-			return handle, nil
-		}).ServeHTTP(w, r)
 	default:
 		http.NotFound(w, r)
 	}
 }
 
 func (s *Server) remember(handle runtime.Handle) {
+	active := activeHandle{handle: handle, done: make(chan struct{})}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.handles[handle.RunID()] = handle
+	s.handles[handle.RunID()] = active
+	s.mu.Unlock()
+	go s.releaseWhenDone(active)
 }
 
 func (s *Server) lookup(runID session.RunID) (runtime.Handle, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	handle, ok := s.handles[runID]
+	active, ok := s.handles[runID]
 	if !ok {
 		return nil, fmt.Errorf("run %s not active", runID)
 	}
-	return handle, nil
+	return active.handle, nil
 }
 
-func (s *Server) releaseWhenDone(handle runtime.Handle) {
-	<-handle.Done()
+func (s *Server) releaseWhenDone(active activeHandle) {
+	<-active.handle.Done()
 	s.mu.Lock()
-	delete(s.handles, handle.RunID())
+	delete(s.handles, active.handle.RunID())
 	s.mu.Unlock()
+	close(active.done)
+}
+
+type activeHandle struct {
+	handle runtime.Handle
+	done   chan struct{}
 }
 
 func minimalConfig() config.Snapshot {

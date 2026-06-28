@@ -169,6 +169,7 @@ func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRu
 		event := admissionEvent(request, admitted.Session.ID, admitted.Run.ID, admitted.AssistantMessage.ID, now)
 		_ = a.Events.Emit(ctx, Event{
 			Kind:       EventRunStarted,
+			EventID:    event.ID,
 			SessionID:  admitted.Session.ID,
 			RunID:      admitted.Run.ID,
 			MessageID:  admitted.AssistantMessage.ID,

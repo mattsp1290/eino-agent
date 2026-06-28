@@ -59,6 +59,9 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(sink.events) != 1 || sink.events[0].Kind != EventRunStarted {
 		t.Fatalf("emitted events = %#v", sink.events)
 	}
+	if sink.events[0].EventID != events.Events[0].ID {
+		t.Fatalf("live event id = %q, want durable id %q", sink.events[0].EventID, events.Events[0].ID)
+	}
 	request.Config.Agent.Options["temperature"] = "changed"
 	request.Input[0].Content = "changed"
 	if admitted.Snapshot.Config.Agent.Options["temperature"] != "0.2" {

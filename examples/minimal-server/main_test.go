@@ -46,6 +46,84 @@ func TestMinimalServerStreamsAndReplaysAGUIEvents(t *testing.T) {
 	}
 }
 
+func TestMinimalServerInterruptsActiveRun(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
+	if err != nil {
+		t.Fatalf("NewServer error = %v", err)
+	}
+	server.config.Agent.Options["stream_delay_ms"] = "500"
+	t.Cleanup(func() { _ = server.Close() })
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	runID := startRun(t, httpServer.URL, defaultSessionID, "interrupt me")
+	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/runs/"+string(runID)+"/interrupt?reason=test", nil)
+	if err != nil {
+		t.Fatalf("new interrupt request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post interrupt: %v", err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close interrupt body: %v", err)
+		}
+	}()
+	if resp.StatusCode != http.StatusAccepted {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("interrupt status = %d body=%s", resp.StatusCode, payload)
+	}
+}
+
+func TestMinimalServerRejectsControlRouteMethods(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
+	if err != nil {
+		t.Fatalf("NewServer error = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	for _, target := range []string{
+		"/sessions/" + string(defaultSessionID) + "/runs",
+		"/runs/run-1/interrupt",
+	} {
+		resp, err := http.Get(httpServer.URL + target)
+		if err != nil {
+			t.Fatalf("get %s: %v", target, err)
+		}
+		payload, _ := io.ReadAll(resp.Body)
+		if err := resp.Body.Close(); err != nil {
+			t.Fatalf("close %s body: %v", target, err)
+		}
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("GET %s status = %d body=%s", target, resp.StatusCode, payload)
+		}
+	}
+}
+
+func TestMinimalServerCloseInterruptsActiveRunsBeforeClosingStore(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
+	if err != nil {
+		t.Fatalf("NewServer error = %v", err)
+	}
+	server.config.Agent.Options["stream_delay_ms"] = "500"
+	httpServer := httptest.NewServer(server)
+	defer httpServer.Close()
+
+	_ = startRun(t, httpServer.URL, defaultSessionID, "close while running")
+	if err := server.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+}
+
 func startRun(t *testing.T, baseURL string, sessionID session.ID, message string) session.RunID {
 	t.Helper()
 	body, err := json.Marshal(map[string]string{"message": message})

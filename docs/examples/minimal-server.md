@@ -29,9 +29,3 @@ Interrupt an active run:
 ```bash
 curl -i -X POST 'http://localhost:8080/runs/<run-id>/interrupt?reason=user'
 ```
-
-Resume an interrupted run boundary:
-
-```bash
-curl -i -X POST http://localhost:8080/runs/<run-id>/resume
-```
