@@ -3,9 +3,11 @@
 Reusable Go runtime for Eino-based agents with AG-UI streaming and Datadog
 AI/LLM observability.
 
-This repository is in the early runtime design phase. The current tree
-establishes the Go module, dependency baseline, quality gates, CI skeleton, and
-initial public package contracts for durable agent orchestration.
+This repository provides embeddable Go packages for durable Eino agent
+orchestration. A consuming server supplies auth, routes, provider credentials,
+tool definitions, config loading, and deployment policy; `eino-agent` supplies
+runtime admission, durable session contracts, AG-UI replay/live-tail adapters,
+tool settlement, and observability/redaction policy.
 
 ## Module Baseline
 
@@ -17,9 +19,35 @@ initial public package contracts for durable agent orchestration.
 - Coding tools: `github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b`
 
 See `docs/dependency-status.md` for prerequisite evidence,
-`docs/architecture/reference-integration-research.md` for integration
-boundaries, and `docs/architecture/runtime.md` for the runtime package
-architecture.
+`docs/consumer-guide.md` for the public embedding contract,
+`docs/examples/minimal-server.md` for a runnable server example, and
+`docs/architecture/runtime.md` for the package architecture.
+
+## Quick Embed
+
+The smallest complete embedding is in `examples/minimal-server`:
+
+```bash
+go run ./examples/minimal-server -addr :8080
+```
+
+It wires:
+
+- `store/sqlite` as the durable `session.Store` and `session.Transactor`;
+- `runtime.StreamingOrchestrator` for run admission and interruption;
+- `stream.Tail` for live AG-UI deltas;
+- `transport.SSEHandler` for replay plus live tail;
+- a scripted Eino model resolver so the example runs without provider secrets.
+
+Core route shape:
+
+```text
+GET  /sessions/minimal/events
+POST /sessions/minimal/runs
+POST /runs/{run_id}/interrupt
+```
+
+Use it as a reference for composition, not as an auth or tenancy policy.
 
 ## Local Gates
 
@@ -50,15 +78,41 @@ make lint
   replay contracts.
 - `runtime`: orchestration contracts for run admission, turn snapshots,
   interruption, tools, hooks, and internal events.
+- `transport`: embeddable HTTP adapters for AG-UI SSE replay/live-tail,
+  interrupt, resume, and message decoding.
+- `stream`: bounded live-tail implementation for active runtime events.
 - `model`: provider/model catalog and Eino model resolution contracts.
 - `config`: immutable runtime config snapshot and validation contracts.
+- `tools`: typed tool registry and materialization helpers.
+- `permissions`: tool permission policy primitives.
 - `agui`: AG-UI durability and replay policy definitions; protocol mechanics
   stay in `eino-agui`.
 - `obs`: Datadog/eino-obs observability redaction and correlation policy
   definitions.
+- `store/sqlite`: embedded SQLite store implementation.
 - `store/storetest`: reusable durable store contract tests for backend
   implementations.
-- `internal/deps`: temporary dependency anchor that keeps the initial pins
-  tidy-stable until runtime packages import the concrete dependencies directly.
+- `examples/`: buildable embedding and integration sketches.
 - `docs/`: durable planning and architecture context.
 - `.github/workflows/ci.yml`: CI gate matching the local Makefile targets.
+
+## Durability Model
+
+Replayable conversation state is stored as sessions, runs, messages, ordered
+parts, tool calls, context epochs, and selected event records. Live AG-UI SSE
+frames and model deltas are transport output, not the replay source of truth.
+Reconnects reconstruct snapshots from durable messages/parts and then attach to
+the active live tail.
+
+See `docs/architecture/agui-events.md` and `docs/architecture/storage.md` for
+the detailed rules.
+
+## Integration Guides
+
+- `docs/consumer-guide.md`: public API, storage, tool lifecycle, observability,
+  configuration, and migration guidance.
+- `docs/integrations/datadog.md`: Datadog/eino-obs exporter wiring and safe
+  default redaction.
+- `docs/integrations/ag-ui-go-server-example.md`: AG-UI server migration sketch.
+- `docs/integrations/ensemble.md`: future ensemble adapter options and
+  non-parity caveat.

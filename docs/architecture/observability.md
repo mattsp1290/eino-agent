@@ -201,7 +201,7 @@ records the event family, timing, IDs, status, and redaction classification.
 
 ## Runtime Implementation Requirements
 
-The future instrumentation bead must:
+Runtime instrumentation must:
 
 - create observers through `einoobs.New`;
 - use no-network/fake exporters in tests by default;

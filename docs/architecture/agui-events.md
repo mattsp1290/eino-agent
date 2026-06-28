@@ -4,7 +4,7 @@ Date: 2026-06-27
 
 This document defines how `eino-agent` treats AG-UI-facing events as durable
 history, live-tail transport, replay projections, audit records, or omitted
-data. It supports the future AG-UI streaming bridge bead without replacing
+data. It supports AG-UI streaming bridge implementations without replacing
 `eino-agui`.
 
 ## Boundaries
@@ -148,9 +148,9 @@ Replay should prefer durable status summaries over raw historical `RUN_ERROR`
 frames. Redaction is governed by `session.RedactionClass` and the future Datadog
 policy bead.
 
-## Implementation Requirements for the Bridge
+## Implementation Requirements for Bridges
 
-The future AG-UI bridge implementation must:
+AG-UI bridge implementations must:
 
 - use `eino-agui` for conversion, emission, stream tapping, and client-tool
   binding;
