@@ -109,11 +109,6 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	return handle, nil
 }
 
-// Resume is reserved for the interrupt/resume bead.
-func (o *StreamingOrchestrator) Resume(context.Context, session.RunID) (Handle, error) {
-	return nil, ErrUnsupportedOperation
-}
-
 // Status returns the current active run for a session.
 func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID) (session.Run, error) {
 	if o == nil || o.Store == nil {
