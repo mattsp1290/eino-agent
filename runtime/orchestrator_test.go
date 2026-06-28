@@ -245,14 +245,16 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 
 	store := newAdmissionStore()
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+		msg := einoschema.AssistantMessage("partial text", []einoschema.ToolCall{{
 			ID:   "call-bad-json",
 			Type: "function",
 			Function: einoschema.FunctionCall{
 				Name:      "echo",
 				Arguments: `{"text":`,
 			},
-		}})}, nil
+		}})
+		msg.ReasoningContent = "partial reasoning"
+		return []*einoschema.Message{msg}, nil
 	}))
 	orch.Tools = staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -271,6 +273,12 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 	}
 	if _, err := store.GetToolCall(context.Background(), "call-bad-json"); !errors.Is(err, session.ErrNotFound) {
 		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
+	}
+	for _, part := range store.parts {
+		switch part.Kind {
+		case session.PartText, session.PartReasoning, session.PartToolCall:
+			t.Fatalf("assistant part persisted despite malformed arguments: kind=%s payload=%s", part.Kind, part.Payload)
+		}
 	}
 }
 
@@ -311,6 +319,41 @@ func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
 	}
 	if string(call.Input) != `{}` {
 		t.Fatalf("persisted input = %s, want {}", call.Input)
+	}
+}
+
+func TestNormalizedToolArgumentsCompatibilityShapes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "empty", input: "", want: `{}`},
+		{name: "object", input: `{"text":"hi"}`, want: `{"text":"hi"}`},
+		{name: "null", input: `null`, want: `null`},
+		{name: "array", input: `[]`, want: `[]`},
+		{name: "string", input: `"value"`, want: `"value"`},
+		{name: "malformed", input: `{"text":`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := normalizedToolArguments(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizedToolArguments error = %v", err)
+			}
+			if string(got) != tt.want {
+				t.Fatalf("normalizedToolArguments(%q) = %s, want %s", tt.input, got, tt.want)
+			}
+		})
 	}
 }
 

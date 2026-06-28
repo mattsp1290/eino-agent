@@ -1,6 +1,6 @@
 # Security, Privacy, Cancellation, and Robustness Audit
 
-Date: 2026-06-28
+Date: 2026-06-27
 
 This audit records the runtime safety boundaries that must hold before
 `eino-agent` is embedded in a host application. It focuses on negative behavior:
@@ -49,9 +49,9 @@ Evidence:
 
 ## Redaction and Privacy
 
-Default observability and model-facing tool output must not export raw prompt,
-model output, tool payload, reasoning, compaction summary, attachment, path, URL,
-token, cookie, or API key content.
+Default observability must not export raw prompt, model output, tool payload,
+reasoning, compaction summary, attachment, path, URL, token, cookie, or API key
+content.
 
 Runtime observability emits IDs, stable classifications, bounded usage counts,
 latencies, status, retryability, and cancellation flags. It does not attach raw
@@ -59,10 +59,11 @@ message content, provider error text, tool input/output JSON, permission
 patterns, or compaction summaries. Tool observability metadata is allowlisted to
 stable permission status only.
 
-Model-facing tool output is bounded by `RetentionPolicy.MaxInlineBytes`.
-Redacted policies suppress raw content, structured payloads, unsafe metadata,
-and attachment URLs. Attachments exposed to the model are reduced to stable IDs
-and MIME types.
+Live runtime events and model-facing tool output may contain content that the
+host is authorized to deliver. Model-facing tool output is bounded by
+`RetentionPolicy.MaxInlineBytes`. Redacted policies suppress raw content,
+structured payloads, unsafe metadata, and attachment URLs. Attachments exposed
+to the model are reduced to stable IDs and MIME types.
 
 Evidence:
 
@@ -80,14 +81,15 @@ Evidence:
 
 ## Reasoning Handling
 
-Plain reasoning is a policy-gated AG-UI event family. It may be stored and
-replayed only when provider and host policy allow it. Encrypted reasoning is
-never a durable replay source and is omitted by the AG-UI policy model.
+Plain reasoning is a policy-gated AG-UI event family, but the current runtime
+persists provider `ReasoningContent` when the provider emits it. Hosts and
+provider adapters must suppress provider reasoning before it reaches the
+orchestrator when durable reasoning storage is not allowed for that deployment.
 
 Live provider deltas may contain plain reasoning for clients that are authorized
 to see it, but observability defaults forbid both plain and encrypted reasoning
-content. Encrypted reasoning must not be persisted, replayed from the session
-store, or copied into observation attributes.
+content. Encrypted reasoning is modeled as an omitted AG-UI event family and
+must not be copied into observation attributes.
 
 Evidence:
 
@@ -95,6 +97,7 @@ Evidence:
 - `agui.TestRulesRedactionIsExplicit`
 - `obs.TestDefaultFieldsForbidRawContent`
 - `config.TestObservabilityPartialSummaryKeepsDefaultRedactionGuardrails`
+- `runtime.TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic`
 
 ## Tool Output Bounds
 

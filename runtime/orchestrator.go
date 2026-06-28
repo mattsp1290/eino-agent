@@ -356,6 +356,10 @@ func openStream(ctx context.Context, resolved model.Resolved, request model.Requ
 }
 
 func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message) error {
+	calls, err := normalizeToolCalls(msg.ToolCalls)
+	if err != nil {
+		return err
+	}
 	ordinal := int64(0)
 	if msg.Content != "" {
 		if err := o.appendPart(ctx, session.Part{
@@ -389,15 +393,11 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot T
 		}
 		ordinal++
 	}
-	for _, call := range msg.ToolCalls {
-		arguments, err := normalizedToolArguments(call.Function.Arguments)
-		if err != nil {
-			return err
-		}
+	for _, call := range calls {
 		payload := toolCallPayload{
-			ID:        call.ID,
-			Name:      call.Function.Name,
-			Arguments: arguments,
+			ID:        call.call.ID,
+			Name:      call.call.Function.Name,
+			Arguments: call.arguments,
 		}
 		if err := o.appendPart(ctx, session.Part{
 			ID:        o.IDs.NewPartID(),
@@ -415,6 +415,23 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot T
 		ordinal++
 	}
 	return nil
+}
+
+type normalizedToolCall struct {
+	call      einoschema.ToolCall
+	arguments json.RawMessage
+}
+
+func normalizeToolCalls(calls []einoschema.ToolCall) ([]normalizedToolCall, error) {
+	normalized := make([]normalizedToolCall, 0, len(calls))
+	for _, call := range calls {
+		arguments, err := normalizedToolArguments(call.Function.Arguments)
+		if err != nil {
+			return nil, err
+		}
+		normalized = append(normalized, normalizedToolCall{call: call, arguments: arguments})
+	}
+	return normalized, nil
 }
 
 func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []einoschema.ToolCall) ([]*einoschema.Message, error) {
