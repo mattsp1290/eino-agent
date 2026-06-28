@@ -390,10 +390,14 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot T
 		ordinal++
 	}
 	for _, call := range msg.ToolCalls {
+		arguments, err := normalizedToolArguments(call.Function.Arguments)
+		if err != nil {
+			return err
+		}
 		payload := toolCallPayload{
 			ID:        call.ID,
 			Name:      call.Function.Name,
-			Arguments: json.RawMessage(call.Function.Arguments),
+			Arguments: arguments,
 		}
 		if err := o.appendPart(ctx, session.Part{
 			ID:        o.IDs.NewPartID(),
@@ -436,7 +440,10 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 			}, session.ToolCallFailed, 0, err, nil)
 			return nil, err
 		}
-		input := json.RawMessage(schemaCall.Function.Arguments)
+		input, err := normalizedToolArguments(schemaCall.Function.Arguments)
+		if err != nil {
+			return nil, err
+		}
 		if tool.InputDecoder != nil {
 			decoded, err := tool.InputDecoder.DecodeToolInput(ctx, input)
 			if err != nil {
@@ -772,6 +779,21 @@ type toolCallPayload struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
+}
+
+func normalizedToolArguments(arguments string) (json.RawMessage, error) {
+	if arguments == "" {
+		return json.RawMessage(`{}`), nil
+	}
+	raw := json.RawMessage(arguments)
+	if !json.Valid(raw) {
+		return nil, model.Error{
+			Code:    "malformed_provider_tool_call",
+			Message: "provider returned invalid tool call arguments",
+			Cause:   model.ErrProviderRejected,
+		}
+	}
+	return cloneJSON(raw), nil
 }
 
 func applyToolOutputBounds(output *toolOutputPayload, result ToolResult, policy RetentionPolicy) {

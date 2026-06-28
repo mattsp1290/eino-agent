@@ -240,6 +240,80 @@ func TestStreamingOrchestratorFailsMalformedStreamWithoutPanic(t *testing.T) {
 	}
 }
 
+func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-bad-json",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{"text":`,
+			},
+		}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			t.Fatal("executor should not run for malformed tool arguments")
+			return ToolResult{}, nil
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || result.Error == nil {
+		t.Fatalf("result = %+v", result)
+	}
+	var providerErr model.Error
+	if !errors.As(result.Error, &providerErr) || providerErr.Code != "malformed_provider_tool_call" {
+		t.Fatalf("result error = %#v, want malformed_provider_tool_call", result.Error)
+	}
+	if _, err := store.GetToolCall(context.Background(), "call-bad-json"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
+	}
+}
+
+func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-empty-args",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name: "echo",
+			},
+		}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			if string(call.Input) != `{}` {
+				t.Fatalf("tool input = %s, want {}", call.Input)
+			}
+			return ToolResult{Output: "ok"}, nil
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-empty-args")
+	if err != nil {
+		t.Fatalf("GetToolCall error = %v", err)
+	}
+	if string(call.Input) != `{}` {
+		t.Fatalf("persisted input = %s, want {}", call.Input)
+	}
+}
+
 func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	t.Parallel()
 
