@@ -196,12 +196,16 @@ const (
 	EventContextEpochChanged EventKind = "context_epoch_changed"
 	// EventRunFinished is emitted after durable run settlement.
 	EventRunFinished EventKind = "run_finished"
+	// EventTailOverflow reports that a reconnect live-tail subscriber fell
+	// behind a bounded queue and must reconnect or resync.
+	EventTailOverflow EventKind = "tail_overflow"
 )
 
 // Event is the internal event envelope consumed by AG-UI and observability
 // adapters. Durable stores remain authoritative for replay.
 type Event struct {
 	Kind        EventKind
+	EventID     session.EventID
 	SessionID   session.ID
 	RunID       session.RunID
 	MessageID   session.MessageID
