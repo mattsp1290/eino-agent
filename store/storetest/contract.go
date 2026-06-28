@@ -306,17 +306,21 @@ func Run(t *testing.T, factory Factory) {
 		if err != nil {
 			t.Fatalf("list events: %v", err)
 		}
-		if len(events.Events) != 1 || events.Events[0].ID != event.ID {
-			t.Fatalf("events = %#v, want evt-1", events.Events)
+		if got := eventIDs(events.Events); got != "evt-1,evt-2" {
+			t.Fatalf("events = %s, want evt-1,evt-2", got)
 		}
 		if events.Events[0].ProviderID != "provider" || events.Events[0].Usage.InputTokens != 3 || events.Events[0].Redaction != session.RedactionMetadata {
 			t.Fatalf("event projection lost first-class fields: %#v", events.Events[0])
 		}
-		next, err := subject.Store.ListEvents(ctx, s.ID, events.Next)
+		first, err := subject.Store.ListEvents(ctx, s.ID, session.EventCursor{Limit: 1})
+		if err != nil {
+			t.Fatalf("list first event page: %v", err)
+		}
+		next, err := subject.Store.ListEvents(ctx, s.ID, first.Next)
 		if err != nil {
 			t.Fatalf("list next event page: %v", err)
 		}
-		if len(next.Events) != 1 || next.Events[0].ID != "evt-2" {
+		if len(first.Events) != 1 || first.Events[0].ID != "evt-1" || len(next.Events) != 1 || next.Events[0].ID != "evt-2" {
 			t.Fatalf("next events = %#v, want evt-2", next.Events)
 		}
 	})
@@ -492,6 +496,14 @@ func partIDs(parts []session.Part) string {
 	values := make([]string, 0, len(parts))
 	for _, part := range parts {
 		values = append(values, string(part.ID))
+	}
+	return strings.Join(values, ",")
+}
+
+func eventIDs(events []session.EventRecord) string {
+	values := make([]string, 0, len(events))
+	for _, event := range events {
+		values = append(values, string(event.ID))
 	}
 	return strings.Join(values, ",")
 }
