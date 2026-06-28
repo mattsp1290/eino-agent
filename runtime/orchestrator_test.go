@@ -13,6 +13,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -424,6 +425,56 @@ func TestStreamingOrchestratorContinuesAfterToolFailurePayload(t *testing.T) {
 	}
 	if call.Status != session.ToolCallFailed {
 		t.Fatalf("tool call = %+v", call)
+	}
+}
+
+func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
+	t.Parallel()
+
+	var executed bool
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-1",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{}`,
+			},
+		}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name:      "echo",
+		Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Scope: ToolScope{
+			Permissions: []string{"agui.client_tool"},
+		},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executed = true
+			return ToolResult{Output: "executed"}, nil
+		}),
+	}}}
+	orch.Permissions = permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+		return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
+	})
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	if executed {
+		t.Fatal("tool executor ran despite denial")
+	}
+	call, err := store.GetToolCall(context.Background(), "call-1")
+	if err != nil {
+		t.Fatalf("GetToolCall error = %v", err)
+	}
+	if !strings.Contains(string(call.Output), "blocked") {
+		t.Fatalf("tool output = %s, want denied payload", call.Output)
 	}
 }
 
