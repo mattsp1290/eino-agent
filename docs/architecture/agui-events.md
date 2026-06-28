@@ -145,8 +145,9 @@ Errors have two projections:
 - live transport: AG-UI error events notify connected clients.
 
 Replay should prefer durable status summaries over raw historical `RUN_ERROR`
-frames. Redaction is governed by `session.RedactionClass` and the future Datadog
-policy bead.
+frames. Redaction is governed by `session.RedactionClass`,
+`runtime.RedactionClass`, the `obs` field policy model, and
+`docs/architecture/observability.md`.
 
 ## Implementation Requirements for Bridges
 

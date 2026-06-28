@@ -28,7 +28,12 @@ For a runnable starting point, see `examples/minimal-server` and
 
 ## Minimal Embed
 
-A typical server wires these pieces once at startup:
+A typical server wires these pieces once at startup. This snippet is schematic:
+`newIDGenerator`, `providerResolver`, `toolRegistry`, and `eventSink` are
+application-owned implementations. The required fields for a successful minimal
+start are `Store`, `Model`, `IDs`, and a non-empty request `SessionID`.
+`Transactor`, `Events`, `Tools`, `Permissions`, `OwnerID`, queue sizing, leases,
+hooks, and context sources add production behavior.
 
 ```go
 store, err := sqlite.Open(ctx, "agent.db")
@@ -48,6 +53,28 @@ orchestrator := &runtime.StreamingOrchestrator{
     OwnerID:    "api-server-1",
 }
 ```
+
+The event sink is replay-critical. `stream.Tail` alone is live-only; a server
+that wants reconnect/replay audit records must append durable non-live events
+to `session.Store` before or alongside tail emission:
+
+```go
+func (s eventSink) Emit(ctx context.Context, event runtime.Event) error {
+    if !event.LiveOnly {
+        if event.EventID == "" {
+            event.EventID = s.ids.NewEventID()
+        }
+        if _, err := s.store.AppendEvent(ctx, eventRecord(event)); err != nil {
+            return err
+        }
+    }
+    return s.tail.Emit(ctx, event)
+}
+```
+
+`runtime.EventRunStarted` is already persisted during admission by the current
+orchestrator implementation, so sinks may skip duplicating that event if they
+share the same store.
 
 When admitting a run, the host supplies durable session identity, user input,
 and an immutable `config.Snapshot`:
@@ -71,7 +98,7 @@ run. Use `Done()` for terminal status, `Interrupt()` for cancellation, and
 events from `stream.Tail`:
 
 ```go
-events := transport.SSEHandler(transport.SSEConfig{
+sseHandler := transport.SSEHandler(transport.SSEConfig{
     Store:   store,
     Tail:    tail,
     Auth:    authenticate,
@@ -90,6 +117,19 @@ interrupt, and resume endpoints with product-specific validation.
 `transport.InterruptHandler` and `transport.ResumeHandler` adapt those control
 endpoints to runtime handles, but the application decides how to locate handles
 and who may operate on them.
+
+The minimal server example shows interrupt wiring and omits resume routing to
+keep the example small; production servers that expose resume should wrap
+`transport.ResumeHandler` with the same auth and handle lookup policy used for
+run control.
+
+A simple cursor contract is `after=<event_id>&limit=<n>`, where `after` maps to
+`session.EventCursor.AfterEventID` and `limit` bounds replay. `SSEConfig.OnComplete`
+receives the next durable cursor and any replay/live-tail error; use it to
+persist client cursor state or log that the client needs a fresh snapshot.
+Live-tail overflow means the subscriber fell behind a bounded queue, so the
+client should reconnect and resync from durable replay rather than assuming it
+received every live event.
 
 ## Durable Versus Live-Only
 
@@ -119,8 +159,9 @@ cursor boundaries; they are not a substitute for durable message/part history.
 ## Storage Requirements
 
 Custom stores must implement `session.Store`; transactional stores should also
-implement `session.Transactor`. Run `store/storetest.Run` and
-`store/storetest.RunTransactional` from the backend's tests.
+implement `session.Transactor`. Every backend should run `store/storetest.Run`
+from its tests. Backends that expose `session.Transactor` should also run
+`store/storetest.RunTransactional`.
 
 Required semantics:
 
@@ -136,9 +177,49 @@ Required semantics:
 
 SQLite is available as an embedded implementation. Hosted or multi-region
 backends must preserve the same observable behavior at the `session.Store`
-boundary.
+boundary. SQLite migrations are backend-owned durable state changes: take
+backups before production migrations, test rollback from a copied database, and
+do not change migration order after release.
 
 ## Tool Lifecycle
+
+Register server-side tools with `tools.NewRegistry` and assign the registry to
+`runtime.StreamingOrchestrator.Tools`:
+
+```go
+registry := tools.NewRegistry()
+_, err := registry.Register(tools.Definition{
+    Name:        "lookup_ticket",
+    Description: "Look up a support ticket by ID.",
+    Parameters:  params,
+    Decode:      decodeTicketInput,
+    Encode:      encodeTicketOutput,
+    Execute:     executeTicketLookup,
+    RetrySafe:   true,
+})
+if err != nil {
+    return err
+}
+
+orchestrator.Tools = registry
+```
+
+`tools.Definition` requires `Decode`, `Encode`, and `Execute`. `Register`
+creates a generation; `Replace` updates only the active generation so delayed
+plugin reloads cannot overwrite newer definitions. `config.Snapshot.Tools`
+controls per-run enable/disable filtering during tool materialization:
+
+```go
+snapshot.Tools.Enabled = []string{"lookup_ticket"}
+snapshot.Tools.Disabled = []string{"shell"}
+```
+
+To register the standard coding-agent leaf tools from `eino-tools`, call
+`tools/einotools.RegisterDefaults(ctx, registry, options)`. To compose
+server-side tools with AG-UI client tools, wrap the server registry with
+`tools/agui.NewRegistry(serverRegistry, dispatcher)` and update per-session
+client definitions through `SetClientTools`. The server still owns client-tool
+dispatch authorization and any product-specific approval flow.
 
 Runtime-controlled tools use this lifecycle:
 
@@ -149,6 +230,9 @@ Runtime-controlled tools use this lifecycle:
 5. Settle output, structured output, attachments, metadata, or error.
 6. Append tool-result message/part records for the next provider turn.
 7. Emit observability and audit events.
+
+Tool-call state transitions can also emit runtime/AG-UI events around pending,
+running, and terminal states when the bridge policy enables them.
 
 Non-idempotent tools must not be retried automatically after interruption or
 restart. Retry requires both `runtime.Tool.RetrySafe` and store evidence that
