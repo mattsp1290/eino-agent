@@ -2,7 +2,11 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -251,6 +255,10 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 	if settled.Attributes["tool.status"] != "succeeded" {
 		t.Fatalf("settled attrs = %#v", settled.Attributes)
 	}
+	want := readObservationGolden(t, "../testdata/obs/tool_lifecycle_observations.json")
+	if got := goldenToolObservations(observations); !reflect.DeepEqual(got, want) {
+		t.Fatalf("tool observations = %#v, want %#v", got, want)
+	}
 	if observationContains(observations, "SECRET tool input") || observationContains(observations, "SECRET tool output") {
 		t.Fatalf("observations leaked tool payloads: %#v", observations)
 	}
@@ -468,6 +476,78 @@ func observationsByKind(observations []einoobs.Observation, kind string) []einoo
 		}
 	}
 	return result
+}
+
+type goldenObservation struct {
+	Kind                string `json:"kind"`
+	Status              string `json:"status"`
+	ToolName            string `json:"tool_name,omitempty"`
+	ToolKind            string `json:"tool_kind,omitempty"`
+	ToolCallID          string `json:"tool_call_id,omitempty"`
+	ToolStatus          string `json:"tool_status,omitempty"`
+	ErrorClassification string `json:"error_classification,omitempty"`
+}
+
+func goldenToolObservations(observations []einoobs.Observation) []goldenObservation {
+	kinds := map[string]bool{
+		"tool.registered":   true,
+		"tool.materialized": true,
+		"tool_call":         true,
+		"tool.settled":      true,
+	}
+	result := make([]goldenObservation, 0, len(observations))
+	for _, observation := range observations {
+		if !kinds[observation.Kind] {
+			continue
+		}
+		item := goldenObservation{
+			Kind:                observation.Kind,
+			Status:              observation.Status,
+			ToolName:            stringAttr(observation.Attributes, "tool.name"),
+			ToolKind:            stringAttr(observation.Attributes, "tool.kind"),
+			ToolCallID:          stringAttr(observation.Attributes, "tool.call_id"),
+			ToolStatus:          stringAttr(observation.Attributes, "tool.status"),
+			ErrorClassification: stringAttr(observation.Attributes, "error.classification"),
+		}
+		result = append(result, item)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		left := result[i]
+		right := result[j]
+		if left.Kind != right.Kind {
+			return left.Kind < right.Kind
+		}
+		if left.ToolCallID != right.ToolCallID {
+			return left.ToolCallID < right.ToolCallID
+		}
+		return left.Status < right.Status
+	})
+	return result
+}
+
+func readObservationGolden(t *testing.T, path string) []goldenObservation {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read observation golden: %v", err)
+	}
+	var result []goldenObservation
+	if err := json.Unmarshal(raw, &result); err != nil {
+		t.Fatalf("decode observation golden: %v", err)
+	}
+	return result
+}
+
+func stringAttr(attrs map[string]any, key string) string {
+	value, ok := attrs[key]
+	if !ok {
+		return ""
+	}
+	text, ok := value.(string)
+	if ok {
+		return text
+	}
+	return ""
 }
 
 func attrsContain(attrs map[string]any, needle string) bool {
