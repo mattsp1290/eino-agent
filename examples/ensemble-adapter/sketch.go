@@ -77,7 +77,7 @@ type MappedEvent struct {
 // ID generation, store persistence, and AG-UI bridge wiring around this mapping.
 func MapRunEvent(event RunEvent) MappedEvent {
 	base := runtime.Event{
-		SessionID: session.ID(first(event.SessionID, event.ThreadID)),
+		SessionID: session.ID(first(event.ThreadID, event.SessionID)),
 		RunID:     session.RunID(event.RunAttemptID),
 		Usage: runtime.Usage{
 			InputTokens:  event.InputTokens,
@@ -100,15 +100,17 @@ func MapRunEvent(event RunEvent) MappedEvent {
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionLiveOnly, Observation: "message"}
 	case EventOtherMessage, EventModelFallbackEngaged:
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "forensic"}
-	case EventToolCallStarted, EventToolCallFinished, EventUnsupportedToolCall, EventMalformedToolCall:
+	case EventToolCallStarted, EventToolCallFinished:
+		if event.ToolCallID == "" {
+			return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "tool_uncorrelated"}
+		}
 		base.Kind = runtime.EventToolCallUpdated
-		base.ToolCallID = session.ToolCallID(first(event.ToolCallID, event.ToolName))
+		base.ToolCallID = session.ToolCallID(event.ToolCallID)
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "tool"}
+	case EventUnsupportedToolCall, EventMalformedToolCall:
+		return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "tool_validation"}
 	case EventTurnFailed, EventTurnCancelled:
-		base.Kind = runtime.EventRunFinished
-		base.Error.Message = first(event.Error, string(event.Kind))
-		base.Error.Code = event.ErrorCategory
-		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "error"}
+		return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "turn_error"}
 	case EventRunFinalized:
 		base.Kind = runtime.EventRunFinished
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "run"}
