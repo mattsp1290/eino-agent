@@ -145,6 +145,9 @@ func admitDurable(ctx context.Context, store session.Store, request AdmissionReq
 	if err != nil {
 		return AdmittedRun{}, err
 	}
+	if _, err := store.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
+		return AdmittedRun{}, err
+	}
 	assistantMessage, err := store.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, now))
 	if err != nil {
 		return AdmittedRun{}, err
@@ -224,6 +227,8 @@ func validateAdmissionIDs(ids AdmissionIDs) error {
 		return fmt.Errorf("%w: run id required", ErrInvalidAdmission)
 	case ids.AssistantMessageID == "":
 		return fmt.Errorf("%w: assistant message id required", ErrInvalidAdmission)
+	case ids.ContextEpochID == "":
+		return fmt.Errorf("%w: context epoch id required", ErrInvalidAdmission)
 	case ids.EventID == "":
 		return fmt.Errorf("%w: event id required", ErrInvalidAdmission)
 	default:

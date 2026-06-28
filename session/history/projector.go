@@ -121,17 +121,27 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) session.
 	if epoch == nil {
 		return batch
 	}
-	include := map[session.MessageID]bool{}
-	if epoch.SummaryMessageID != "" {
-		include[epoch.SummaryMessageID] = true
+	if epoch.SummaryMessageID == "" && epoch.TailStartID == "" {
+		return batch
 	}
-	tailStarted := epoch.TailStartID == ""
+	include := map[session.MessageID]bool{}
+	byID := map[session.MessageID]session.Message{}
+	for _, message := range batch.Messages {
+		byID[message.ID] = message
+	}
 	messages := make([]session.Message, 0, len(batch.Messages))
+	if epoch.SummaryMessageID != "" {
+		if summary, ok := byID[epoch.SummaryMessageID]; ok {
+			messages = append(messages, summary)
+			include[summary.ID] = true
+		}
+	}
+	tailStarted := false
 	for _, message := range batch.Messages {
 		if message.ID == epoch.TailStartID {
 			tailStarted = true
 		}
-		if include[message.ID] || tailStarted {
+		if tailStarted && !include[message.ID] {
 			messages = append(messages, message)
 			include[message.ID] = true
 		}

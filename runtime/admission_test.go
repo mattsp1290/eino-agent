@@ -49,6 +49,13 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(events.Events) != 1 || events.Events[0].Kind != string(EventRunStarted) {
 		t.Fatalf("events = %#v", events.Events)
 	}
+	epochs, err := store.ListContextEpochs(context.Background(), "session-1")
+	if err != nil {
+		t.Fatalf("list context epochs: %v", err)
+	}
+	if len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].Trigger != "turn" || epochs[0].Reason != "run_admission" {
+		t.Fatalf("epochs = %#v", epochs)
+	}
 	if len(sink.events) != 1 || sink.events[0].Kind != EventRunStarted {
 		t.Fatalf("emitted events = %#v", sink.events)
 	}
@@ -59,6 +66,17 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	}
 	if admitted.Snapshot.Messages[0].Content != "hello" {
 		t.Fatalf("snapshot messages mutated: %#v", admitted.Snapshot.Messages[0])
+	}
+}
+
+func TestAdmitRequiresContextEpochID(t *testing.T) {
+	t.Parallel()
+
+	request := admissionRequest()
+	request.IDs.ContextEpochID = ""
+	_, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
+	if !errors.Is(err, ErrInvalidAdmission) {
+		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
 }
 
@@ -300,6 +318,7 @@ type admissionStore struct {
 	parts          map[session.PartID]session.Part
 	events         map[session.EventID]session.EventRecord
 	toolCalls      map[session.ToolCallID]session.ToolCall
+	epochs         map[session.EpochID]session.ContextEpoch
 	appendEventErr error
 }
 
@@ -311,6 +330,7 @@ func newAdmissionStore() *admissionStore {
 		parts:     map[session.PartID]session.Part{},
 		events:    map[session.EventID]session.EventRecord{},
 		toolCalls: map[session.ToolCallID]session.ToolCall{},
+		epochs:    map[session.EpochID]session.ContextEpoch{},
 	}
 }
 
@@ -322,7 +342,10 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.sessions = tx.sessions
 	s.runs = tx.runs
 	s.messages = tx.messages
+	s.parts = tx.parts
 	s.events = tx.events
+	s.toolCalls = tx.toolCalls
+	s.epochs = tx.epochs
 	return nil
 }
 
@@ -334,6 +357,7 @@ func (s *admissionStore) clone() *admissionStore {
 		parts:          cloneMap(s.parts),
 		events:         cloneMap(s.events),
 		toolCalls:      cloneMap(s.toolCalls),
+		epochs:         cloneMap(s.epochs),
 		appendEventErr: s.appendEventErr,
 	}
 }
@@ -544,11 +568,34 @@ func (s *admissionStore) FinishToolCall(_ context.Context, call session.ToolCall
 	s.toolCalls[call.ID] = call
 	return nil
 }
-func (s *admissionStore) StartContextEpoch(context.Context, session.ContextEpoch) (session.ContextEpoch, error) {
-	return session.ContextEpoch{}, nil
+func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.ContextEpoch) (session.ContextEpoch, error) {
+	if existing, ok := s.epochs[epoch.ID]; ok {
+		if sameEpoch(existing, epoch) {
+			return existing, nil
+		}
+		return session.ContextEpoch{}, session.ErrConflict
+	}
+	s.epochs[epoch.ID] = epoch
+	return epoch, nil
 }
-func (s *admissionStore) FinishContextEpoch(context.Context, session.ContextEpoch) error {
+func (s *admissionStore) FinishContextEpoch(_ context.Context, epoch session.ContextEpoch) error {
+	if _, ok := s.epochs[epoch.ID]; !ok {
+		return session.ErrNotFound
+	}
+	s.epochs[epoch.ID] = epoch
 	return nil
+}
+func (s *admissionStore) ListContextEpochs(_ context.Context, sessionID session.ID) ([]session.ContextEpoch, error) {
+	var epochs []session.ContextEpoch
+	for _, epoch := range s.epochs {
+		if epoch.SessionID == sessionID {
+			epochs = append(epochs, epoch)
+		}
+	}
+	sort.SliceStable(epochs, func(i, j int) bool {
+		return epochs[i].ID < epochs[j].ID
+	})
+	return epochs, nil
 }
 
 func sameRun(left session.Run, right session.Run) bool {
@@ -561,4 +608,19 @@ func sameRun(left session.Run, right session.Run) bool {
 		left.ModelID == right.ModelID &&
 		left.ContextEpoch == right.ContextEpoch &&
 		left.Status == right.Status
+}
+
+func sameEpoch(left session.ContextEpoch, right session.ContextEpoch) bool {
+	return left.ID == right.ID &&
+		left.SessionID == right.SessionID &&
+		left.ParentEpochID == right.ParentEpochID &&
+		left.SummaryMessageID == right.SummaryMessageID &&
+		left.SummarizedFromID == right.SummarizedFromID &&
+		left.SummarizedToID == right.SummarizedToID &&
+		left.TailStartID == right.TailStartID &&
+		left.ModelID == right.ModelID &&
+		left.ProviderID == right.ProviderID &&
+		left.Trigger == right.Trigger &&
+		left.Reason == right.Reason &&
+		left.NextAction == right.NextAction
 }
