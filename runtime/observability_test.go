@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 
 	agentcontext "github.com/mattsp1290/eino-agent/context"
 	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -169,7 +171,17 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 	if resume.Attributes["resume.status"] != "started" {
 		t.Fatalf("resume attrs = %#v", resume.Attributes)
 	}
-	assertObservation(t, observer.Snapshot().Observations, "run", "canceled", "")
+	observations := observer.Snapshot().Observations
+	assertObservation(t, observations, "tool.materialized", "ok", "")
+	toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
+	if toolSpan.Attributes["tool.call_id"] != "call-resume" || toolSpan.Attributes["tool.status"] != "succeeded" {
+		t.Fatalf("tool span attrs = %#v", toolSpan.Attributes)
+	}
+	settled := assertObservation(t, observations, "tool.settled", "ok", "")
+	if settled.Attributes["tool.call_id"] != "call-resume" || settled.Attributes["tool.status"] != "succeeded" {
+		t.Fatalf("settled attrs = %#v", settled.Attributes)
+	}
+	assertObservation(t, observations, "run", "canceled", "")
 }
 
 func TestObservabilitySinkRecordsCompactionWithoutPayloadLeak(t *testing.T) {
@@ -194,6 +206,222 @@ func TestObservabilitySinkRecordsCompactionWithoutPayloadLeak(t *testing.T) {
 	}
 	if observationContains(observer.Snapshot().Observations, "SECRET compacted prompt") {
 		t.Fatalf("observations leaked compaction payload: %#v", observer.Snapshot().Observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-1",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{"text":"SECRET tool input"}`,
+			},
+		}})}, nil
+	}))
+	orch.Observer = observer
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: "SECRET tool output"}, nil
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	observations := observer.Snapshot().Observations
+	assertObservation(t, observations, "tool.registered", "ok", "")
+	assertObservation(t, observations, "tool.materialized", "ok", "")
+	toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
+	if toolSpan.Attributes["tool.call_id"] != "call-1" || toolSpan.Attributes["tool.status"] != "succeeded" {
+		t.Fatalf("tool span attrs = %#v", toolSpan.Attributes)
+	}
+	settled := assertObservation(t, observations, "tool.settled", "ok", "")
+	if settled.Attributes["tool.status"] != "succeeded" {
+		t.Fatalf("settled attrs = %#v", settled.Attributes)
+	}
+	if observationContains(observations, "SECRET tool input") || observationContains(observations, "SECRET tool output") {
+		t.Fatalf("observations leaked tool payloads: %#v", observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-denied",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{"permission_pattern":"SECRET danger pattern"}`,
+			},
+		}})}, nil
+	}))
+	orch.Observer = observer
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Scope: ToolScope{
+			Permissions: []string{"shell"},
+		},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			t.Fatal("executor should not run")
+			return ToolResult{}, nil
+		}),
+	}}}
+	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+		if request.Pattern != "SECRET danger pattern" {
+			t.Fatalf("permission pattern = %q", request.Pattern)
+		}
+		return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
+	})
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	toolSpan := assertObservation(t, observer.Snapshot().Observations, "tool_call", "error", "")
+	if toolSpan.Error == nil || toolSpan.Error.Classification != "permission_denied" {
+		t.Fatalf("tool span error = %#v attrs=%#v", toolSpan.Error, toolSpan.Attributes)
+	}
+	settled := assertObservation(t, observer.Snapshot().Observations, "tool.settled", "error", "")
+	if settled.Attributes["tool.status"] != "failed" {
+		t.Fatalf("settled attrs = %#v", settled.Attributes)
+	}
+	if observationContains(observer.Snapshot().Observations, "SECRET danger pattern") {
+		t.Fatalf("observations leaked permission pattern: %#v", observer.Snapshot().Observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-fail",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{}`,
+			},
+		}})}, nil
+	}))
+	orch.Observer = observer
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{}, errors.New("SECRET operational detail")
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	toolSpan := assertObservation(t, observer.Snapshot().Observations, "tool_call", "error", "")
+	if toolSpan.Error == nil || toolSpan.Error.Classification != "operational_failure" {
+		t.Fatalf("tool span error = %#v attrs=%#v", toolSpan.Error, toolSpan.Attributes)
+	}
+	if observationContains(observer.Snapshot().Observations, "SECRET operational detail") {
+		t.Fatalf("observations leaked tool error: %#v", observer.Snapshot().Observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-missing",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "missing",
+				Arguments: `{"text":"SECRET missing tool input"}`,
+			},
+		}})}, nil
+	}))
+	orch.Observer = observer
+	orch.Tools = staticToolRegistry{}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed {
+		t.Fatalf("result = %+v", result)
+	}
+	observations := observer.Snapshot().Observations
+	settled := assertObservation(t, observations, "tool.settled", "error", "")
+	if settled.Attributes["tool.call_id"] != "call-missing" || settled.Attributes["tool.status"] != "failed" {
+		t.Fatalf("settled attrs = %#v", settled.Attributes)
+	}
+	if settled.Error == nil || settled.Error.Classification != "operational_failure" {
+		t.Fatalf("settled error = %#v", settled.Error)
+	}
+	if observationContains(observations, "SECRET missing tool input") {
+		t.Fatalf("observations leaked missing tool payload: %#v", observations)
+	}
+}
+
+func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
+	t.Parallel()
+
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store := newAdmissionStore()
+	store.finishToolCallErr = errors.New("SECRET settlement detail")
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-settle",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{}`,
+			},
+		}})}, nil
+	}))
+	orch.Observer = observer
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: "ok"}, nil
+		}),
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed {
+		t.Fatalf("result = %+v", result)
+	}
+	observations := observer.Snapshot().Observations
+	toolSpan := assertObservation(t, observations, "tool_call", "error", "")
+	if toolSpan.Error == nil || toolSpan.Error.Classification != "operational_failure" {
+		t.Fatalf("tool span error = %#v attrs=%#v", toolSpan.Error, toolSpan.Attributes)
+	}
+	settled := assertObservation(t, observations, "tool.settled", "error", "")
+	if settled.Error == nil || settled.Error.Classification != "operational_failure" {
+		t.Fatalf("settled error = %#v attrs=%#v", settled.Error, settled.Attributes)
+	}
+	if observationContains(observations, "SECRET settlement detail") {
+		t.Fatalf("observations leaked settlement error: %#v", observations)
 	}
 }
 

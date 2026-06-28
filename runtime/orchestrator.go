@@ -186,6 +186,7 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 			return TurnSnapshot{}, err
 		}
 	}
+	o.observeToolsResolved(ctx, snapshot.Clone(), snapshot.Tools)
 	_ = messageID
 	return snapshot, nil
 }
@@ -419,13 +420,21 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 	}
 	messages := make([]*einoschema.Message, 0, len(calls))
 	for _, schemaCall := range calls {
-		tool, ok := byName[schemaCall.Function.Name]
-		if !ok || tool.Executor == nil {
-			return nil, fmt.Errorf("tool %q unavailable", schemaCall.Function.Name)
-		}
 		callID := session.ToolCallID(schemaCall.ID)
 		if callID == "" {
 			callID = o.IDs.NewToolCallID()
+		}
+		tool, ok := byName[schemaCall.Function.Name]
+		if !ok || tool.Executor == nil {
+			err := fmt.Errorf("tool %q unavailable", schemaCall.Function.Name)
+			o.observeToolSettled(ctx, snapshot, Tool{Name: schemaCall.Function.Name}, ToolCall{
+				ID:        callID,
+				SessionID: snapshot.SessionID,
+				RunID:     snapshot.RunID,
+				MessageID: messageID,
+				Name:      schemaCall.Function.Name,
+			}, session.ToolCallFailed, 0, err, nil)
+			return nil, err
 		}
 		input := json.RawMessage(schemaCall.Function.Arguments)
 		if tool.InputDecoder != nil {
@@ -477,6 +486,8 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 			Pattern:   toolPattern(input, schemaCall.Function.Name),
 			Input:     cloneJSON(input),
 		}
+		o.observeToolMaterialized(ctx, snapshot, tool, call)
+		observedTool := o.startObservedToolCall(ctx, snapshot, tool, call)
 		result, execErr := o.executeTool(ctx, tool, call)
 		output, status, errText := encodeToolOutput(callID, result, tool.Retention, execErr)
 		record.Status = status
@@ -484,8 +495,12 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 		record.CompletedAt = o.now()
 		record.Error = errText
 		if err := o.Store.FinishToolCall(ctx, record); err != nil {
+			o.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
+			o.observeToolSettled(ctx, snapshot, tool, call, session.ToolCallFailed, o.now().Sub(record.StartedAt), err, nil)
 			return nil, err
 		}
+		o.finishObservedToolCall(observedTool, status, execErr, result.Metadata)
+		o.observeToolSettled(ctx, snapshot, tool, call, status, record.CompletedAt.Sub(record.StartedAt), execErr, result.Metadata)
 		_ = o.emitToolCall(ctx, snapshot, messageID, callID, status, toolCallEventPayload(output, schemaCall.Function.Name, input))
 		toolMessageID := o.IDs.NewMessageID()
 		if _, err := o.Store.AppendMessage(ctx, session.Message{

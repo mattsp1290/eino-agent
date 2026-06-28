@@ -71,6 +71,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 	if len(calls) == 0 {
 		return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true})
 	}
+	snapshot := o.resumeSnapshot(run)
 	tools, err := o.resumeTools(ctx, run)
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
@@ -110,7 +111,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			}
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
-		result, execErr := o.executeTool(ctx, tool, ToolCall{
+		toolCall := ToolCall{
 			ID:        claimed.ID,
 			SessionID: claimed.SessionID,
 			RunID:     claimed.RunID,
@@ -119,15 +120,22 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			Scope:     tool.Scope,
 			Pattern:   toolPattern(claimed.Input, claimed.Name),
 			Input:     cloneJSON(claimed.Input),
-		})
+		}
+		o.observeToolMaterialized(ctx, snapshot, tool, toolCall)
+		observedTool := o.startObservedToolCall(ctx, snapshot, tool, toolCall)
+		result, execErr := o.executeTool(ctx, tool, toolCall)
 		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, execErr)
 		claimed.Status = status
 		claimed.Output = cloneJSON(output)
 		claimed.CompletedAt = o.now()
 		claimed.Error = errText
 		if err := o.Store.FinishToolCall(context.WithoutCancel(ctx), claimed); err != nil {
+			o.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
+			o.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, toolCall, session.ToolCallFailed, o.now().Sub(claimed.StartedAt), err, nil)
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
+		o.finishObservedToolCall(observedTool, status, execErr, result.Metadata)
+		o.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, toolCall, status, claimed.CompletedAt.Sub(claimed.StartedAt), execErr, result.Metadata)
 		if err := o.appendToolResult(context.WithoutCancel(ctx), run, claimed, output); err != nil {
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
@@ -142,7 +150,20 @@ func (o *StreamingOrchestrator) resumeTools(ctx context.Context, run session.Run
 	if o.Tools == nil {
 		return nil, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
 	}
-	snapshot := TurnSnapshot{
+	snapshot := o.resumeSnapshot(run)
+	resolved, err := o.Tools.ResolveTools(ctx, snapshot)
+	if err != nil {
+		return nil, err
+	}
+	tools := make(map[string]Tool, len(resolved))
+	for _, tool := range resolved {
+		tools[tool.Name] = tool
+	}
+	return tools, nil
+}
+
+func (o *StreamingOrchestrator) resumeSnapshot(run session.Run) TurnSnapshot {
+	return TurnSnapshot{
 		RunID:     run.ID,
 		SessionID: run.SessionID,
 		EpochID:   run.ContextEpoch,
@@ -160,15 +181,6 @@ func (o *StreamingOrchestrator) resumeTools(ctx context.Context, run session.Run
 		},
 		CreatedAt: o.now(),
 	}
-	resolved, err := o.Tools.ResolveTools(ctx, snapshot)
-	if err != nil {
-		return nil, err
-	}
-	tools := make(map[string]Tool, len(resolved))
-	for _, tool := range resolved {
-		tools[tool.Name] = tool
-	}
-	return tools, nil
 }
 
 func errorString(value string) error {

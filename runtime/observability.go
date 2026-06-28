@@ -193,6 +193,99 @@ func (o *StreamingOrchestrator) observeResume(ctx context.Context, run session.R
 	})
 }
 
+func (o *StreamingOrchestrator) observeToolsResolved(ctx context.Context, snapshot TurnSnapshot, tools []Tool) {
+	if o == nil || o.Observer == nil {
+		return
+	}
+	for _, tool := range tools {
+		corr := o.snapshotCorrelation(snapshot, "", "tool.registered")
+		corr.ObservationID = observationID("tool.registered", string(snapshot.RunID), tool.Name)
+		o.Observer.ToolRegistered(ctx, einoobs.ToolRegistered{
+			Correlation: corr,
+			ToolName:    tool.Name,
+			ToolKind:    "server",
+			Time:        o.now(),
+			Metadata: einoobs.Metadata{
+				"source": tool.Metadata["source"],
+			},
+		})
+	}
+}
+
+func (o *StreamingOrchestrator) observeToolMaterialized(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall) {
+	if o == nil || o.Observer == nil {
+		return
+	}
+	o.Observer.ToolMaterialized(ctx, einoobs.ToolMaterialized{
+		Correlation: o.toolCorrelation(snapshot, call, "tool.materialized"),
+		ToolCallID:  string(call.ID),
+		ToolName:    tool.Name,
+		ToolKind:    "server",
+		Time:        o.now(),
+	})
+}
+
+func (o *StreamingOrchestrator) startObservedToolCall(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall) *einoobs.ToolCall {
+	if o == nil || o.Observer == nil {
+		return nil
+	}
+	return o.Observer.StartToolCall(ctx, einoobs.ToolCallStart{
+		Correlation: o.toolCorrelation(snapshot, call, "tool.call"),
+		ToolCallID:  string(call.ID),
+		ToolName:    tool.Name,
+		ToolKind:    "server",
+		StartTime:   o.now(),
+	})
+}
+
+func (o *StreamingOrchestrator) finishObservedToolCall(observed *einoobs.ToolCall, status session.ToolCallStatus, err error, metadata map[string]string) {
+	if observed == nil {
+		return
+	}
+	classification := toolClassification(status, err, metadata)
+	if status == session.ToolCallCompleted && classification == "" {
+		observed.End(einoobs.ToolCallEnd{EndTime: o.now(), Metadata: toolMetadata(metadata)})
+		return
+	}
+	observed.Error(einoobs.ToolCallError{
+		Err:            observationErrorFromClassification(firstNonEmpty(classification, string(status), "tool_error")),
+		Classification: firstNonEmpty(classification, string(status), "tool_error"),
+		Canceled:       toolCanceled(status, classification),
+		Retryable:      false,
+		EndTime:        o.now(),
+		Metadata:       toolMetadata(metadata),
+	})
+}
+
+func (o *StreamingOrchestrator) observeToolSettled(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall, status session.ToolCallStatus, latency time.Duration, err error, metadata map[string]string) {
+	if o == nil || o.Observer == nil {
+		return
+	}
+	classification := toolClassification(status, err, metadata)
+	event := einoobs.ToolSettled{
+		Correlation:    o.toolCorrelation(snapshot, call, "tool.settled"),
+		ToolCallID:     string(call.ID),
+		ToolName:       tool.Name,
+		ToolKind:       "server",
+		Status:         settledToolStatus(status, classification),
+		Time:           o.now(),
+		Latency:        latency,
+		LatencyKnown:   latency != 0,
+		Classification: classification,
+		Retryable:      false,
+		Metadata:       toolMetadata(metadata),
+	}
+	if classification != "" {
+		event.Error = einoobs.ObservationError{
+			Operation:      "tool_call",
+			Classification: classification,
+			Err:            observationErrorFromClassification(classification),
+			Retryable:      false,
+		}
+	}
+	o.Observer.ToolSettled(ctx, event)
+}
+
 func (o *StreamingOrchestrator) observeStreamChunk(stream *einoobs.Stream, index int64) {
 	if stream == nil {
 		return
@@ -252,6 +345,13 @@ func (o *StreamingOrchestrator) snapshotCorrelation(snapshot TurnSnapshot, messa
 	}
 }
 
+func (o *StreamingOrchestrator) toolCorrelation(snapshot TurnSnapshot, call ToolCall, kind string) einoobs.Correlation {
+	corr := o.snapshotCorrelation(snapshot, call.MessageID, kind)
+	corr.ToolCallID = string(call.ID)
+	corr.ObservationID = observationID(kind, string(snapshot.RunID), string(call.MessageID), string(call.ID))
+	return corr
+}
+
 func observationID(parts ...string) string {
 	kept := make([]string, 0, len(parts))
 	for _, part := range parts {
@@ -287,6 +387,45 @@ func tokenUsage(usage model.Usage) einoobs.TokenUsage {
 		ReasoningTokensKnown:   usage.ReasoningTokens != 0,
 		CachedInputTokensKnown: usage.CacheReadTokens != 0,
 	}
+}
+
+func toolClassification(status session.ToolCallStatus, err error, metadata map[string]string) string {
+	if value := metadata["permission_status"]; value != "" {
+		if value == "interrupted" {
+			return "interrupted"
+		}
+		return "permission_" + value
+	}
+	if status == session.ToolCallInterrupted || errors.Is(err, context.Canceled) {
+		return "interrupted"
+	}
+	if status == session.ToolCallFailed {
+		return "operational_failure"
+	}
+	return ""
+}
+
+func settledToolStatus(status session.ToolCallStatus, classification string) string {
+	switch {
+	case toolCanceled(status, classification):
+		return "canceled"
+	case status == session.ToolCallFailed || classification != "":
+		return "failed"
+	default:
+		return "succeeded"
+	}
+}
+
+func toolCanceled(status session.ToolCallStatus, classification string) bool {
+	return status == session.ToolCallInterrupted || classification == "interrupted"
+}
+
+func toolMetadata(metadata map[string]string) einoobs.Metadata {
+	result := einoobs.Metadata{}
+	if value := metadata["permission_status"]; value != "" {
+		result["permission_status"] = value
+	}
+	return result
 }
 
 func errorClassification(err error, fallback string) string {

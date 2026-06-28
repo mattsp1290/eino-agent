@@ -312,14 +312,15 @@ func (h failingBeforeRunHook) AfterTurn(context.Context, TurnSnapshot, Result) e
 func (h failingBeforeRunHook) AfterRun(context.Context, Result) error { return nil }
 
 type admissionStore struct {
-	sessions       map[session.ID]session.Session
-	runs           map[session.RunID]session.Run
-	messages       map[session.MessageID]session.Message
-	parts          map[session.PartID]session.Part
-	events         map[session.EventID]session.EventRecord
-	toolCalls      map[session.ToolCallID]session.ToolCall
-	epochs         map[session.EpochID]session.ContextEpoch
-	appendEventErr error
+	sessions          map[session.ID]session.Session
+	runs              map[session.RunID]session.Run
+	messages          map[session.MessageID]session.Message
+	parts             map[session.PartID]session.Part
+	events            map[session.EventID]session.EventRecord
+	toolCalls         map[session.ToolCallID]session.ToolCall
+	epochs            map[session.EpochID]session.ContextEpoch
+	appendEventErr    error
+	finishToolCallErr error
 }
 
 func newAdmissionStore() *admissionStore {
@@ -351,14 +352,15 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 
 func (s *admissionStore) clone() *admissionStore {
 	return &admissionStore{
-		sessions:       cloneMap(s.sessions),
-		runs:           cloneMap(s.runs),
-		messages:       cloneMap(s.messages),
-		parts:          cloneMap(s.parts),
-		events:         cloneMap(s.events),
-		toolCalls:      cloneMap(s.toolCalls),
-		epochs:         cloneMap(s.epochs),
-		appendEventErr: s.appendEventErr,
+		sessions:          cloneMap(s.sessions),
+		runs:              cloneMap(s.runs),
+		messages:          cloneMap(s.messages),
+		parts:             cloneMap(s.parts),
+		events:            cloneMap(s.events),
+		toolCalls:         cloneMap(s.toolCalls),
+		epochs:            cloneMap(s.epochs),
+		appendEventErr:    s.appendEventErr,
+		finishToolCallErr: s.finishToolCallErr,
 	}
 }
 
@@ -562,6 +564,9 @@ func (s *admissionStore) ClaimToolCall(_ context.Context, call session.ToolCall)
 	return call, nil
 }
 func (s *admissionStore) FinishToolCall(_ context.Context, call session.ToolCall) error {
+	if s.finishToolCallErr != nil {
+		return s.finishToolCallErr
+	}
 	if _, ok := s.toolCalls[call.ID]; !ok {
 		return session.ErrNotFound
 	}
