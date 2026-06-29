@@ -46,6 +46,11 @@ type Options struct {
 	UserStderr    io.Writer
 	ShellOptions  *shell.Options
 	TrackerWriter tracker.CloseWriter
+	// URLFetchOptions, when non-nil, is threaded into urlfetch.New for the
+	// url_fetch tool (e.g. to inject a host-allowlist HTTPClient). Nil leaves
+	// the urlfetch default client. Removes the need to Replace the url_fetch
+	// registration after RegisterDefaults.
+	URLFetchOptions *urlfetch.Options
 }
 
 // RegisterDefaults registers the standard eino-tools leaf tool set.
@@ -118,8 +123,14 @@ func staticSpecs(options Options) []staticSpec {
 	if stderr == nil {
 		stderr = os.Stderr
 	}
+	urlFetchOptions := options.URLFetchOptions
 	specs := []staticSpec{
-		{name: urlfetch.Name, factory: func() (invokableTool, error) { return urlfetch.New() }},
+		{name: urlfetch.Name, factory: func() (invokableTool, error) {
+			if urlFetchOptions == nil {
+				return urlfetch.New()
+			}
+			return urlfetch.New(*urlFetchOptions)
+		}},
 		{name: userinteract.Name, factory: func() (invokableTool, error) {
 			return userinteract.New(surface, userinteract.Options{Stdin: stdin, Stderr: stderr})
 		}},
