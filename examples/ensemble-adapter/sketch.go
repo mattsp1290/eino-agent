@@ -98,8 +98,16 @@ func MapRunEvent(event RunEvent) MappedEvent {
 		base.Payload = payload(map[string]string{"content": event.Message})
 		base.LiveOnly = true
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionLiveOnly, Observation: "message"}
-	case EventOtherMessage, EventModelFallbackEngaged:
+	case EventOtherMessage:
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "forensic"}
+	case EventModelFallbackEngaged:
+		base.Kind = runtime.EventModelFallbackEngaged
+		base.ModelID = event.ToModel
+		base.Payload = payload(runtime.ModelFallbackPayload{
+			FromModelID: event.FromModel,
+			ToModelID:   event.ToModel,
+		})
+		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "model"}
 	case EventToolCallStarted, EventToolCallFinished:
 		if event.ToolCallID == "" {
 			return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "tool_uncorrelated"}

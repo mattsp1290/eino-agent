@@ -3,9 +3,13 @@ package einotools
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +19,7 @@ import (
 
 	"github.com/mattsp1290/eino-tools/fileops"
 	"github.com/mattsp1290/eino-tools/result"
+	"github.com/mattsp1290/eino-tools/urlfetch"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/internal/workspace"
@@ -311,6 +316,93 @@ func startTool(t *testing.T, tool runtime.Tool) {
 			t.Errorf("Execute error = %v", err)
 		}
 	}()
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestRegisterDefaultsThreadsURLFetchHTTPClient(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "from-injected-client")
+	}))
+	defer srv.Close()
+
+	hit := false
+	client := srv.Client() // trusts the test server's TLS cert
+	base := client.Transport
+	client.Transport = roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+		hit = true
+		return base.RoundTrip(req)
+	})
+
+	registry := agenttools.NewRegistry()
+	if _, err := RegisterDefaults(context.Background(), registry, Options{
+		URLFetchOptions: &urlfetch.Options{HTTPClient: client},
+	}); err != nil {
+		t.Fatalf("RegisterDefaults error = %v", err)
+	}
+
+	materialized, err := registry.ResolveTools(context.Background(), snapshot(t.TempDir(), "session-urlfetch"))
+	if err != nil {
+		t.Fatalf("ResolveTools error = %v", err)
+	}
+	var fetch *runtime.Tool
+	for i := range materialized {
+		if materialized[i].Name == urlfetch.Name {
+			fetch = &materialized[i]
+			break
+		}
+	}
+	if fetch == nil {
+		t.Fatalf("url_fetch not materialized; got %d tools", len(materialized))
+	}
+
+	input := []byte(`{"url":` + strconv.Quote(srv.URL) + `}`)
+	normalized, err := fetch.InputDecoder.DecodeToolInput(context.Background(), input)
+	if err != nil {
+		t.Fatalf("DecodeToolInput error = %v", err)
+	}
+	out, err := fetch.Executor.Execute(context.Background(), runtime.ToolCall{Input: normalized})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+
+	var decoded urlfetch.Result
+	if err := json.Unmarshal(out.Structured, &decoded); err != nil {
+		t.Fatalf("unmarshal url_fetch result: %v", err)
+	}
+	if decoded.Outcome != result.OutcomeSucceeded {
+		t.Fatalf("url_fetch outcome = %q, want succeeded (error=%+v)", decoded.Outcome, decoded.Error)
+	}
+	if decoded.Content != "from-injected-client" {
+		t.Fatalf("url_fetch content = %q, want body served by injected client", decoded.Content)
+	}
+	if !hit {
+		t.Fatal("injected HTTPClient was not used by url_fetch")
+	}
+}
+
+func TestRegisterDefaultsNilURLFetchOptionsRegisters(t *testing.T) {
+	t.Parallel()
+
+	registry := agenttools.NewRegistry()
+	registrations, err := RegisterDefaults(context.Background(), registry, Options{})
+	if err != nil {
+		t.Fatalf("RegisterDefaults error = %v", err)
+	}
+	found := false
+	for _, reg := range registrations {
+		if reg.Name == urlfetch.Name {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("url_fetch not registered with nil URLFetchOptions")
+	}
 }
 
 func snapshot(root string, id session.ID) runtime.TurnSnapshot {

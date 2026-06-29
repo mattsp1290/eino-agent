@@ -1,6 +1,7 @@
 package ensembleadapter
 
 import (
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -29,6 +30,36 @@ func TestMapRunEventProjectsTerminalFailure(t *testing.T) {
 	}
 	if mapped.RuntimeEvent.Error.Message != "worker failed" {
 		t.Fatalf("Error = %#v", mapped.RuntimeEvent.Error)
+	}
+}
+
+func TestMapRunEventProjectsModelFallbackDurably(t *testing.T) {
+	t.Parallel()
+
+	mapped := MapRunEvent(RunEvent{
+		Kind:         EventModelFallbackEngaged,
+		IssueID:      "ISSUE-1",
+		RunAttemptID: "42",
+		ThreadID:     "thread-1",
+		Time:         time.Unix(1, 0),
+		FromModel:    "primary-model",
+		ToModel:      "fallback-model",
+	})
+	if mapped.Disposition != DispositionDurable {
+		t.Fatalf("Disposition = %q, want durable", mapped.Disposition)
+	}
+	if mapped.RuntimeEvent.Kind != runtime.EventModelFallbackEngaged {
+		t.Fatalf("Kind = %q, want model_fallback_engaged", mapped.RuntimeEvent.Kind)
+	}
+	if mapped.RuntimeEvent.ModelID != "fallback-model" {
+		t.Fatalf("ModelID = %q, want fallback-model", mapped.RuntimeEvent.ModelID)
+	}
+	var payload runtime.ModelFallbackPayload
+	if err := json.Unmarshal(mapped.RuntimeEvent.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if payload.FromModelID != "primary-model" || payload.ToModelID != "fallback-model" {
+		t.Fatalf("payload transition = %+v", payload)
 	}
 }
 

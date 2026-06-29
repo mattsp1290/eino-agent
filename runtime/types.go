@@ -199,7 +199,49 @@ const (
 	// EventTailOverflow reports that a reconnect live-tail subscriber fell
 	// behind a bounded queue and must reconnect or resync.
 	EventTailOverflow EventKind = "tail_overflow"
+	// EventModelFallbackEngaged reports that the host swapped the primary model
+	// for a fallback at a turn boundary (e.g. a circuit-breaker trip). The
+	// from→to transition is carried in Payload as ModelFallbackPayload and
+	// Event.ModelID is set to the now-active (to) model. Selection of the
+	// fallback is owned by the host/consumer, not the eino-agent runtime. The
+	// event is durable (LiveOnly=false) and re-emitted on replay/reconnect.
+	EventModelFallbackEngaged EventKind = "model_fallback_engaged"
 )
+
+// ModelFallbackPayload is the documented JSON shape carried in Event.Payload
+// when Kind == EventModelFallbackEngaged. The field names are the stable wire
+// contract that adapters (e.g. the ensemble local-symphony projector) target:
+// from_model_id → metric label model.from, to_model_id → model.to.
+type ModelFallbackPayload struct {
+	FromModelID string `json:"from_model_id"`
+	ToModelID   string `json:"to_model_id"`
+	// FromProviderID/ToProviderID are optional; populate only when the fallback
+	// crosses providers. The model-centric NewModelFallbackEvent helper leaves
+	// them empty.
+	FromProviderID string `json:"from_provider_id,omitempty"`
+	ToProviderID   string `json:"to_provider_id,omitempty"`
+	// Reason is an optional, host-defined cause (e.g. "circuit_breaker").
+	Reason string `json:"reason,omitempty"`
+}
+
+// NewModelFallbackEvent builds a model_fallback_engaged Event with ModelID set
+// to the to-model and the model transition encoded in Payload. It is
+// model-centric: Event.ProviderID and the optional provider payload fields are
+// left for the caller to set when the fallback crosses providers. Callers fill
+// the remaining envelope fields (IDs, Time) as usual. No error is returned
+// because json.Marshal of a struct of strings cannot fail.
+func NewModelFallbackEvent(from, to, reason string) Event {
+	payload, _ := json.Marshal(ModelFallbackPayload{
+		FromModelID: from,
+		ToModelID:   to,
+		Reason:      reason,
+	})
+	return Event{
+		Kind:    EventModelFallbackEngaged,
+		ModelID: to,
+		Payload: payload,
+	}
+}
 
 // Event is the internal event envelope consumed by AG-UI and observability
 // adapters. Durable stores remain authoritative for replay.

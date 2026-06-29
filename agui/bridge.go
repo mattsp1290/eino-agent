@@ -75,6 +75,15 @@ func (b *Bridge) Emit(_ context.Context, event runtime.Event) error {
 		b.emit.Custom("context_epoch_changed", map[string]any{
 			"epoch_id": string(event.EpochID),
 		})
+	case runtime.EventModelFallbackEngaged:
+		// Re-emit the durable ModelFallbackPayload object verbatim so the live
+		// AG-UI custom event carries the exact same key set as the persisted
+		// payload (omitempty and all) — one wire shape across both surfaces.
+		value := map[string]any{}
+		if len(event.Payload) > 0 {
+			_ = json.Unmarshal(event.Payload, &value)
+		}
+		b.emit.Custom("model_fallback_engaged", value)
 	case runtime.EventRunFinished:
 		b.closeOpen()
 		if event.Error.Message != "" {
