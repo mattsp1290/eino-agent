@@ -132,11 +132,17 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 	run := admitted.Run
 	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
 	var observed observedRun
+	// runUsage accumulates provider usage across every model stream in the run
+	// (all turns and retry attempts), mirroring the per-stream usage reported to
+	// the observability path. It is surfaced on result.Usage in the defer below
+	// so finish() can carry the run total on the EventRunFinished event.
+	var runUsage model.Usage
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			result.Status = session.RunFailed
 			result.Error = fmt.Errorf("provider stream panic: %v", recovered)
 		}
+		result.Usage = runtimeUsage(runUsage)
 		result = o.finish(ctx, run, result)
 		o.finishObservedRun(observed, result, o.now())
 	}()
@@ -154,7 +160,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 		result.Error = err
 		return result
 	}
-	result = o.executeAttempts(ctx, snapshot, admitted.AssistantMessage.ID)
+	result = o.executeAttempts(ctx, snapshot, admitted.AssistantMessage.ID, &runUsage)
 	for _, hook := range o.Hooks {
 		_ = hook.AfterTurn(ctx, snapshot.Clone(), result)
 	}
@@ -191,11 +197,11 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 	return snapshot, nil
 }
 
-func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID) Result {
+func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
 	attempts := o.attempts()
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		result, err := o.executeOne(ctx, snapshot, messageID, attempt)
+		result, err := o.executeOne(ctx, snapshot, messageID, attempt, usage)
 		if err == nil {
 			return result
 		}
@@ -217,11 +223,11 @@ func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, snapshot Tu
 	return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunFailed, Error: last}
 }
 
-func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int) (Result, error) {
+func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int, usage *model.Usage) (Result, error) {
 	messages := cloneMessages(snapshot.Messages)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
-		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages, attempt)
+		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages, attempt, usage)
 		if err != nil {
 			return Result{}, err
 		}
@@ -258,13 +264,20 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 	}
 }
 
-func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt int) (*einoschema.Message, error) {
+func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt int, usage *model.Usage) (*einoschema.Message, error) {
 	queue := newEventQueue(ctx, o.QueueSize, o.Events)
 	defer queue.close()
 	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
 	var streamUsage model.Usage
 	var streamErr error
 	defer func() {
+		// Accumulate this stream's usage into the run total in the same defer
+		// that reports it to observability, so the persisted run total stays
+		// exactly consistent with the run span's summed usage (both include
+		// partial usage from a failed/canceled stream).
+		if usage != nil {
+			*usage = addUsage(*usage, streamUsage)
+		}
 		if streamErr != nil {
 			o.errorObservedStream(obsStream, streamErr, streamUsage)
 			return
@@ -611,6 +624,7 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, res
 			SessionID: run.SessionID,
 			RunID:     run.ID,
 			MessageID: result.MessageID,
+			Usage:     result.Usage,
 			Error:     eventError(result.Error),
 			Payload: mustJSON(map[string]any{
 				"status":      string(result.Status),

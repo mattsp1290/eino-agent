@@ -37,6 +37,12 @@ type Result struct {
 	MessageID   session.MessageID
 	Interrupted bool
 	Error       error
+	// Usage is the run-total provider usage accumulated across every model
+	// stream in the run (all turns and retry attempts), mirroring what the
+	// observability path sums onto the run span. It is surfaced on the
+	// EventRunFinished event so EventSink consumers can persist token totals
+	// without reading the OTel span.
+	Usage Usage
 }
 
 // Orchestrator owns run admission, locking, streaming, interruption, and
