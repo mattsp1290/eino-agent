@@ -429,6 +429,67 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	}
 }
 
+// TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage pins that the
+// EventRunFinished event (and Result.Usage) carries the run-total provider
+// usage summed across every model stream in the run — here a two-stream
+// tool-call loop. This is the EventSink-side token total that lets consumers
+// persist run_attempts.tokens without reading the OTel span; the sum matches
+// what the observability path aggregates onto the run span.
+func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	sink := &capturingSink{}
+	var calls int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.Message, error) {
+		calls++
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				// Second stream (after the tool result): report usage, finish.
+				request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 7, OutputTokens: 3}})
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		// First stream: report usage, emit a tool call to force a second turn.
+		request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 10, OutputTokens: 5}})
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:       "call-1",
+			Type:     "function",
+			Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hi"}`},
+		}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: "hi"}, nil
+		}),
+	}}}
+	orch.Events = sink
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted || calls != 2 {
+		t.Fatalf("result = %+v calls=%d", result, calls)
+	}
+
+	// Run total = sum across both streams: input 10+7=17, output 5+3=8.
+	const wantInput, wantOutput = int64(17), int64(8)
+	if result.Usage.InputTokens != wantInput || result.Usage.OutputTokens != wantOutput {
+		t.Fatalf("result.Usage = %+v, want input=%d output=%d", result.Usage, wantInput, wantOutput)
+	}
+
+	var finished []Event
+	for _, event := range sink.events {
+		if event.Kind == EventRunFinished {
+			finished = append(finished, event)
+		}
+	}
+	if len(finished) != 1 {
+		t.Fatalf("run_finished events = %d, want exactly 1", len(finished))
+	}
+	if finished[0].Usage.InputTokens != wantInput || finished[0].Usage.OutputTokens != wantOutput {
+		t.Fatalf("run_finished Usage = %+v, want input=%d output=%d", finished[0].Usage, wantInput, wantOutput)
+	}
+}
+
 func TestStreamingOrchestratorGeneratesMissingToolCallIDsConsistently(t *testing.T) {
 	t.Parallel()
 

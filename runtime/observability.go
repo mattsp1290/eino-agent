@@ -389,6 +389,34 @@ func tokenUsage(usage model.Usage) einoobs.TokenUsage {
 	}
 }
 
+// addUsage returns the field-wise sum of two provider usages. It is used to
+// accumulate a run-total usage across every model stream in a run so the total
+// can be surfaced on the EventRunFinished event.
+func addUsage(a, b model.Usage) model.Usage {
+	return model.Usage{
+		InputTokens:      a.InputTokens + b.InputTokens,
+		OutputTokens:     a.OutputTokens + b.OutputTokens,
+		ReasoningTokens:  a.ReasoningTokens + b.ReasoningTokens,
+		CacheReadTokens:  a.CacheReadTokens + b.CacheReadTokens,
+		CacheWriteTokens: a.CacheWriteTokens + b.CacheWriteTokens,
+		Cost:             a.Cost + b.Cost,
+	}
+}
+
+// runtimeUsage maps a provider-level model.Usage to the transport-neutral
+// runtime Usage carried on events. The field sets are identical; this is the
+// package boundary conversion.
+func runtimeUsage(u model.Usage) Usage {
+	return Usage{
+		InputTokens:      u.InputTokens,
+		OutputTokens:     u.OutputTokens,
+		ReasoningTokens:  u.ReasoningTokens,
+		CacheReadTokens:  u.CacheReadTokens,
+		CacheWriteTokens: u.CacheWriteTokens,
+		Cost:             u.Cost,
+	}
+}
+
 func toolClassification(status session.ToolCallStatus, err error, metadata map[string]string) string {
 	if value := metadata["permission_status"]; value != "" {
 		if value == "interrupted" {
