@@ -35,3 +35,6 @@ go.work.sum
 .dolt/
 *.db
 .beads-credential-key
+
+# Tool binaries built from internal/tools nested module
+.bin/
