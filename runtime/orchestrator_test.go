@@ -490,6 +490,38 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 	}
 }
 
+// TestResolveStreamUsage covers the client-path usage bridge: when no Streamer
+// adapter reported usage through the observer (the default resolved.Client
+// path), the token usage must be taken from the concatenated message's
+// ResponseMeta.Usage so run consumers still see non-zero tokens. When the
+// observer DID report usage (a Streamer adapter), that wins.
+func TestResolveStreamUsage(t *testing.T) {
+	t.Parallel()
+
+	observed := model.Usage{InputTokens: 11, OutputTokens: 7}
+	msgWithUsage := &einoschema.Message{ResponseMeta: &einoschema.ResponseMeta{
+		Usage: &einoschema.TokenUsage{PromptTokens: 23, CompletionTokens: 18},
+	}}
+	msgNoMeta := &einoschema.Message{}
+
+	// Observer reported usage (Streamer path) → observer wins, message ignored.
+	if got := resolveStreamUsage(observed, msgWithUsage); got != observed {
+		t.Errorf("observer-reported usage should win: got %+v, want %+v", got, observed)
+	}
+	// Client path: observer empty, message carries ResponseMeta.Usage → use it.
+	got := resolveStreamUsage(model.Usage{}, msgWithUsage)
+	if got.InputTokens != 23 || got.OutputTokens != 18 {
+		t.Errorf("client-path usage from ResponseMeta: got %+v, want input=23 output=18", got)
+	}
+	// Empty observer + no usable message metadata → zero.
+	if got := resolveStreamUsage(model.Usage{}, msgNoMeta); got != (model.Usage{}) {
+		t.Errorf("no usage anywhere should be zero: got %+v", got)
+	}
+	if got := resolveStreamUsage(model.Usage{}, nil); got != (model.Usage{}) {
+		t.Errorf("nil message should be zero: got %+v", got)
+	}
+}
+
 func TestStreamingOrchestratorGeneratesMissingToolCallIDsConsistently(t *testing.T) {
 	t.Parallel()
 
