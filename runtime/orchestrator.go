@@ -346,7 +346,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 		streamErr = model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
 		return nil, streamErr
 	}
-	streamUsage = observer.usageSnapshot()
+	streamUsage = resolveStreamUsage(observer.usageSnapshot(), msg)
 	return msg, nil
 }
 
@@ -950,6 +950,29 @@ func (o *streamObserver) usageSnapshot() model.Usage {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return o.usage
+}
+
+// resolveStreamUsage picks the token usage for a completed model stream. A
+// runtime Streamer adapter reports usage through the ProviderObserver (the
+// `observed` snapshot); the default client-streaming path (resolved.Client, no
+// Streamer) has no such adapter, so the provider's usage instead rides on the
+// concatenated message's ResponseMeta.Usage — the standard Eino usage channel.
+// Prefer the observed usage when present, else fall back to the message's
+// ResponseMeta.Usage so token totals flow on the client path too (without this,
+// run consumers on the client path see zero tokens even when the model reports
+// them).
+func resolveStreamUsage(observed model.Usage, msg *einoschema.Message) model.Usage {
+	if observed.InputTokens != 0 || observed.OutputTokens != 0 {
+		return observed
+	}
+	if msg != nil && msg.ResponseMeta != nil && msg.ResponseMeta.Usage != nil {
+		u := msg.ResponseMeta.Usage
+		return model.Usage{
+			InputTokens:  int64(u.PromptTokens),
+			OutputTokens: int64(u.CompletionTokens),
+		}
+	}
+	return observed
 }
 
 func mergeUsage(current model.Usage, next model.Usage) model.Usage {
