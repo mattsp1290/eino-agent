@@ -22,17 +22,17 @@ as the packaging format, and `go.bytecodealliance.org` (the Bytecode Alliance
 package) to generate Go code from the WIT contracts.
 
 The benchmark for configurability is `earendil-works/pi`: an embedder should be
-able to supply custom tools, veto tool calls, inject context before model
-turns, subscribe to the event stream, swap persistence, and register providers
-— programmatically, without forking — the way pi supports `customTools`,
-`tool_call` blocking, `before_agent_start`/`context` injection,
+able to supply custom tools, veto or rewrite tool calls, patch tool results,
+inject context before model turns, subscribe to the event stream, swap
+persistence, and register providers — programmatically, without forking — the
+way pi supports `customTools`, `tool_call` blocking and input mutation,
+`tool_result` patching, `before_agent_start`/`context` injection,
 `subscribe(listener)`, `sessionManager`, and `registerProvider`. `eino-agent`
 is an embeddable runtime, not a TUI, so pi's presentation-layer extension
 points (commands, shortcuts, renderers, themes) are explicitly out of scope.
-pi can also *rewrite* tool-call arguments before execution; `eino-agent`'s
-permission path (`runtime.ExecuteToolWithPermissions`) has no mutation seam,
-so argument rewrite is a disclosed non-goal here, not a promise (see Explicit
-Non-Goals and section 8).
+Tool-call argument rewrite and tool-result patching are delivered by a new
+tool-call middleware seam (section 3); the veto path stays with
+`permissions.Policy`.
 
 ## Relationship To The Previous Draft
 
@@ -90,6 +90,8 @@ least:
 - `WithEventSink(EventSink)`
 - `WithHook(Hook)` — appendable
 - `WithPermissions(permissions.Policy)`
+- `WithToolMiddleware(ToolMiddleware)` — appendable; the new seam from
+  section 3
 - `WithIDGenerator(IDGenerator)`, `WithClock(func() time.Time)`
 - `WithOwnerID(string)`, `WithTrace(agentcontext.TraceContext)`
 - `WithAttempts(int)`, `WithToolTurns(int)`, `WithQueueSize(int)`,
@@ -113,7 +115,8 @@ Rules:
 - A nil value passed to an interface-typed option (`WithStore`,
   `WithTransactor`, `WithModelResolver`, `WithToolRegistry`,
   `WithContextSource`, `WithEventSink`, `WithHook`, `WithPermissions`,
-  `WithIDGenerator`) is a construction error, not a silent no-op. Func-,
+  `WithToolMiddleware`, `WithIDGenerator`) is a construction error, not a
+  silent no-op. Func-,
   struct-, and scalar-typed options (`WithClock`, `WithHistory`,
   `WithAttempts`, `WithToolTurns`, `WithQueueSize`, `WithLease`,
   `WithOwnerID`, `WithTrace`) and the pointer-typed `WithObserver` keep
@@ -143,14 +146,75 @@ them in examples/tests:
 
 Multi-method interfaces (`session.Store`, `model.Adapter`) do not get func
 adapters. For `runtime.Hook`, provide a `HookFuncs` struct with optional
-per-phase function fields whose nil members are no-ops.
+per-phase function fields whose nil members are no-ops; provide the analogous
+`runtime.ToolMiddlewareFuncs` for the two-method middleware seam (a nil
+`Before` or `After` member is an identity pass-through).
 
 `config.Loader`, `config.Validator`, and `config.SnapshotPlugin` do not
 participate in orchestrator options (the orchestrator has no config-lifecycle
 field, and the repo has no production `config.PluginRegistry`/`Lifecycle`
 wiring today), so they get no adapters in this milestone.
 
-### 3. WIT Contracts
+### 3. Tool-Call Middleware Seam
+
+Add a new public seam to `runtime` that closes pi's `tool_call` input-mutation
+and `tool_result` patching parity gaps:
+
+```go
+type ToolMiddleware interface {
+    // BeforeToolCall may rewrite the normalized JSON input of a proposed
+    // tool call. Returning call.Input unchanged is the no-op.
+    BeforeToolCall(ctx context.Context, tool Tool, call ToolCall) (json.RawMessage, error)
+    // AfterToolCall may rewrite the result of an executed tool call before
+    // settlement. execErr is informational and cannot be changed.
+    AfterToolCall(ctx context.Context, tool Tool, call ToolCall, result ToolResult, execErr error) (ToolResult, error)
+}
+```
+
+Wire it as a new `Middleware []ToolMiddleware` field on
+`StreamingOrchestrator` plus the appendable `WithToolMiddleware` option.
+Exact signatures may be adjusted during implementation, but the following
+semantics are binding, grounded in `executeTools`
+(`runtime/orchestrator.go`) and the resume path (`runtime/interrupt.go`):
+
+- **Rewrite point**: the `BeforeToolCall` chain runs after
+  `InputDecoder.DecodeToolInput` and **before** `Store.CreateToolCall`. This
+  is a deliberate resequencing of `executeTools`, not a one-line insertion:
+  today the runtime `ToolCall` value is only assembled after the durable
+  record and both status events; the implementation must assemble the
+  proposed `ToolCall` (identity, name, scope, decoded input) before the
+  chain, with `call.Pattern` computed from the **final** input after the
+  chain. Consequently the durable tool-call record, the
+  pending and running events, the permission `Request` and its pattern,
+  approval prompts, and execution all observe the rewritten input — there is
+  no second copy of the original input in core-owned records. Hosts that
+  want an original-input audit trail record it themselves from their own
+  middleware.
+- **Patch point**: the `AfterToolCall` chain runs after `executeTool`
+  returns and **before** `encodeToolOutput`/`Store.FinishToolCall`. The
+  durable output, the settled tool-call event, the persisted
+  `PartToolResult`, and the model-visible tool message all observe the
+  patched result.
+- **Ordering**: `BeforeToolCall` runs in registration order and
+  `AfterToolCall` in reverse registration order (onion model). Permissions
+  decide after the rewrite chain completes, so policy always evaluates what
+  will actually execute.
+- **Exactly-once**: because rewrite precedes durable admission, resumed
+  pending tool calls re-execute from the recorded (already-rewritten) input
+  and must not re-run `BeforeToolCall`. `AfterToolCall` runs on every path
+  that settles a result from an actual execution — the live path and resume
+  re-execution — and does not run for calls settled as interrupted without
+  re-execution.
+- **Errors and limits**: an error from either method settles that tool call
+  as failed through the same bounded settlement path as an executor error
+  (a `BeforeToolCall` failure still durably admits and settles the call so
+  durability invariants hold). Middleware cannot rename a call, redirect it
+  to a different tool, or bypass permission checks. Status changes are
+  one-directional: a middleware error fails an otherwise-successful call,
+  but middleware can never downgrade an executor failure to success or alter
+  `execErr`.
+
+### 4. WIT Contracts
 
 Create a top-level `wit/` directory containing the versioned contract package
 `eino-agent:extensions@0.1.0`. Define a shared `types` interface plus one
@@ -185,9 +249,18 @@ proven):**
   guest's perspective; maps to `runtime.EventSink` and pi's `subscribe`.
 - `hook` — `before-run`, `before-turn`, `after-turn`, `after-run` receive the
   bounded snapshot DTO below and return only success or a structured error.
+- `tool-middleware` — `before-tool-call` receiving tool name, tool-call ID,
+  the normalized JSON input, and the bounded turn metadata, returning a
+  tagged result of exactly one of unchanged, replacement JSON input, or
+  structured error; and `after-tool-call` receiving the same identity plus
+  the executed input and the result output JSON, returning unchanged,
+  replacement output JSON, or structured error. Maps to
+  `runtime.ToolMiddleware` (section 3), giving Wasm parity with pi's
+  `tool_call` input mutation and `tool_result` patching.
 
 **Bounded turn metadata** (the only snapshot projection that crosses the
-boundary, used by `tool`, `context-source`, and `hook`): run ID, session ID,
+boundary, used by `tool`, `context-source`, `hook`, and `tool-middleware`):
+run ID, session ID,
 epoch ID, agent name/mode, model provider/model IDs, ordered tool names,
 message count and per-role counts, and whether a system prompt is set.
 `TurnSnapshot.Config` (the full `config.Snapshot`) and `TurnSnapshot.Model`
@@ -220,7 +293,7 @@ WIT rules:
   are immutable; breaking changes mean `@0.2.0` worlds living alongside
   `@0.1.0` support.
 
-### 4. Code Generation With go.bytecodealliance.org
+### 5. Code Generation With go.bytecodealliance.org
 
 - Pin `go.bytecodealliance.org` in `go.mod` and drive
   `wit-bindgen-go generate` from a `go:generate` directive behind a
@@ -237,7 +310,7 @@ WIT rules:
   things: (a) the guest SDK — so extension authors writing Go/TinyGo guests
   compile against generated exports for the same WIT worlds — and (b) shared
   DTO types where practical. Host-side lifting/lowering goes through the
-  component runtime's typed API (see section 5); if hand-written host glue is
+  component runtime's typed API (see section 6); if hand-written host glue is
   required, isolate it next to the generated code and cover it with round-trip
   tests against the fixture guests.
 - Ship a buildable example guest for each Phase A world under
@@ -245,7 +318,7 @@ WIT rules:
   bindings, with build instructions. Phase B worlds get example guests when
   their wrappers land.
 
-### 5. Wasm Host Runtime Leaf Package
+### 6. Wasm Host Runtime Leaf Package
 
 Add a leaf package (suggested name `wasmext`) that owns component loading and
 invocation. Runtime selection: use `github.com/bytecodealliance/wasmtime-go`'s
@@ -295,7 +368,7 @@ model):
   proving only `wasmext` and its subpackages import the engine and generated
   bindings.
 
-### 6. Per-Seam Wasm Wrappers
+### 7. Per-Seam Wasm Wrappers
 
 For each implemented world, `wasmext` exposes a constructor returning the
 seam's native Go type (Phase A first, Phase B when its wrappers land):
@@ -306,13 +379,18 @@ func LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.P
 func LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error)
 func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error)
 func LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error)
+func LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error)
 ```
 
 `ModuleConfig` carries path, expected SHA-256, per-call limits, and bounded
 non-secret guest configuration. Wrapper semantics:
 
 - Wrappers translate between runtime types and WIT DTOs at the boundary,
-  applying the bounds from section 3 in host code on both directions.
+  applying the bounds from section 4 in host code on both directions.
+- The Wasm-backed `runtime.ToolMiddleware` validates replacement payloads in
+  host code before substitution: a replacement must parse as JSON and respect
+  the configured output bound; an oversized or malformed replacement is a
+  middleware error, settling the call as failed per section 3.
 - A guest error or resource-limit violation surfaces as an ordinary Go error
   from the wrapped method; the orchestrator's existing failure handling for
   that seam applies unchanged.
@@ -358,7 +436,7 @@ orch, err := runtime.NewStreamingOrchestrator(
 // defer loader.Close(ctx)
 ```
 
-### 7. Host Capability Imports
+### 8. Host Capability Imports
 
 v1 defines exactly one host import interface in WIT, `eino-agent:host/log`,
 letting guests emit leveled, size-bounded log lines that the host routes
@@ -367,17 +445,20 @@ filesystem, network, environment, shell, or credential host functions. The
 WIT contract package structure must make adding a future narrow capability
 (e.g. a fetch broker) an additive, versioned change.
 
-### 8. Parity Map Against pi
+### 9. Parity Map Against pi
 
 Add `docs/architecture/extensibility.md` containing an explicit mapping table:
 pi extension point → eino-agent seam → native path → Wasm path → or "out of
-scope (presentation layer)". Cover at minimum: custom tools, tool-call veto,
-tool-call argument rewrite (record as a gap: no mutation seam exists in
-`runtime.ExecuteToolWithPermissions`), system-prompt/context injection, event
+scope (presentation layer)". Cover at minimum: custom tools, tool-call veto
+(`permissions.Policy`), tool-call argument rewrite and tool-result patching
+(`runtime.ToolMiddleware` via `WithToolMiddleware`; Wasm via the
+`tool-middleware` world, Phase B), system-prompt/context injection, event
 subscription, session persistence, provider registration (native path:
-`model.AdapterResolver` via `WithModelResolver`; no Wasm path by design), and
-model selection. Every "supported" cell must name a real exported symbol;
-every gap must say gap, not hand-wave.
+`model.AdapterResolver` via `WithModelResolver`; no Wasm path by design),
+provider request/header interception (record as a gap by design: adapters own
+transport; see Explicit Non-Goals), and model selection. Every "supported"
+cell must name a real exported symbol; every gap must say gap, not
+hand-wave.
 
 ## Tests And Acceptance Criteria
 
@@ -387,10 +468,20 @@ every gap must say gap, not hand-wave.
   construction still passes the existing suite.
 - Func adapters (new and pre-existing) compile-time-assert their interfaces
   and are exercised in at least one orchestrator-level test.
+- Tool middleware: `BeforeToolCall` chain order and `AfterToolCall` reverse
+  order are verified; a rewritten input is observed in the durable tool-call
+  record, the pending and running events, the computed pattern, the
+  `permissions.Request` seen by a recording policy, and the executor; a
+  patched result is observed in the durable output, the settled event, the
+  persisted part, and the model-visible tool message; resuming a pending
+  tool call does not re-run `BeforeToolCall`; a call settled as interrupted
+  without re-execution skips `AfterToolCall`; a middleware error settles
+  that call as failed without breaking sibling calls' existing semantics.
 - One checked-in fixture component per implemented world (source plus
   reproducible build) proves the wrapper round-trip: tool execute, policy
-  decide (all three decisions); context load, event emit, and hook observe
-  when Phase B lands.
+  decide (all three decisions); context load, event emit, hook observe, and
+  middleware rewrite/patch (unchanged, replacement, and error branches) when
+  Phase B lands.
 - Contract-violation coverage per wrapper: trap, timeout of a deliberately
   hung guest (proving active interruption, including the event-queue drain
   path), oversized output, malformed payload, wrong world/version, hash
@@ -413,16 +504,18 @@ every gap must say gap, not hand-wave.
 ## Documentation
 
 - New: `docs/architecture/extensibility.md` (options pattern, seam table,
-  Wasm trust model, resource bounds, lifecycle and Close ownership, sink
-  latency note, pi parity map including the disclosed rewrite gap).
+  tool middleware contract, Wasm trust model, resource bounds, lifecycle and
+  Close ownership, sink latency note, pi parity map).
 - New: `wit/README.md` (contract versioning and evolution policy).
 - Update `docs/consumer-guide.md` to lead with `NewStreamingOrchestrator` and
   show one native and one Wasm-backed option side by side, including the
   tool-registration path and embedder-owned Close.
 - Update `docs/architecture/security.md` (guest threat model, capability
   defaults, module verification, active-interrupt timeout posture),
-  `runtime.md` (constructor, Admit carve-out, hook contract),
-  `permissions.md`, and `tools.md` where their seams gained a Wasm path.
+  `runtime.md` (constructor, Admit carve-out, hook contract, tool-middleware
+  insertion points and exactly-once semantics), `permissions.md` (policy
+  decides post-rewrite input), and `tools.md` where their seams gained a
+  Wasm path.
 - Update the minimal example only if the constructor changes its wiring;
   Wasm usage belongs in `examples/wasm-extensions/`, not the minimal server.
 
@@ -432,9 +525,15 @@ every gap must say gap, not hand-wave.
   broker — the entire previous catalog scope is dropped, not deferred into
   this milestone.
 - No Wasm model execution, token streaming, or provider adapters in Wasm.
-- No tool-call argument rewrite from any extension path (native or Wasm);
-  `permissions.Decision` carries no replacement input, and adding a mutation
-  seam to tool execution is out of scope. Disclose it in the parity map.
+- No middleware rewriting of tool identity or settlement status:
+  `ToolMiddleware` cannot rename a call, redirect it to a different tool,
+  un-fail an errored execution, or bypass permission checks. Argument and
+  result rewriting happen only through the section 3 seam —
+  `permissions.Decision` itself carries no replacement input.
+- No provider request/header interception hooks (pi's
+  `before_provider_request`/`before_provider_headers`): native adapters own
+  transport and credentials; embedders needing this wrap a `model.Adapter`.
+  Disclose it in the parity map.
 - No `config-plugin` Wasm world, and no config secret-classification work —
   both deferred until the config lifecycle has production wiring and a
   secret/non-secret field model.
