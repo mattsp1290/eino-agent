@@ -1,0 +1,165 @@
+package eino-agent:extensions@0.1.0;
+
+interface types {
+  record structured-error {
+    code: string,
+    message: string,
+    retryable: bool,
+  }
+
+  record role-counts {
+    system: u32,
+    user: u32,
+    assistant: u32,
+    tool: u32,
+  }
+
+  /// A deliberately bounded projection of runtime.TurnSnapshot. It never
+  /// contains config maps, resolved model clients, credentials, endpoints,
+  /// raw provider payloads, or conversation content.
+  record turn-metadata {
+    run-id: string,
+    session-id: string,
+    epoch-id: string,
+    agent-name: string,
+    agent-mode: string,
+    provider-id: string,
+    model-id: string,
+    tool-names: list<string>,
+    message-count: u32,
+    role-counts: role-counts,
+    has-system-prompt: bool,
+  }
+
+  record tool-metadata {
+    name: string,
+    description: string,
+    /// A JSON Schema document. Hosts validate syntax and configured bounds.
+    parameters-json-schema: string,
+    retry-safe: bool,
+    required-permissions: list<string>,
+  }
+
+  enum permission-action {
+    allow,
+    deny,
+    ask,
+  }
+
+  record permission-request {
+    tool-name: string,
+    tool-call-id: string,
+    permission: string,
+    /// A bounded summary derived from the final, rewritten arguments.
+    arguments-summary: string,
+    session-id: string,
+    run-id: string,
+  }
+
+  record permission-decision {
+    action: permission-action,
+    reason: string,
+  }
+
+  enum text-role {
+    system,
+    user,
+    assistant,
+  }
+
+  record text-message {
+    role: text-role,
+    text: string,
+  }
+
+  record bounded-event {
+    kind: string,
+    session-id: string,
+    run-id: string,
+    message-id: string,
+    tool-call-id: string,
+    epoch-id: string,
+    timestamp-unix-millis: s64,
+    /// A host-produced bounded payload summary, never a raw provider payload.
+    payload-summary: string,
+  }
+
+  variant replacement {
+    unchanged,
+    json(string),
+    error(structured-error),
+  }
+}
+
+interface tool-api {
+  use types.{structured-error, tool-metadata, turn-metadata};
+
+  metadata: func() -> result<tool-metadata, structured-error>;
+  /// Input and output are normalized JSON documents whose byte bounds are
+  /// enforced by the host on both sides of this call.
+  execute: func(tool-call-id: string, input-json: string, turn: turn-metadata) -> result<string, structured-error>;
+}
+
+interface permissions-policy-api {
+  use types.{permission-decision, permission-request, structured-error};
+
+  decide: func(request: permission-request) -> result<permission-decision, structured-error>;
+}
+
+interface context-source-api {
+  use types.{structured-error, text-message, turn-metadata};
+
+  load-context: func(turn: turn-metadata) -> result<list<text-message>, structured-error>;
+}
+
+interface event-sink-api {
+  use types.{bounded-event, structured-error};
+
+  emit: func(event: bounded-event) -> result<_, structured-error>;
+}
+
+interface hook-api {
+  use types.{structured-error, turn-metadata};
+
+  before-run: func(snapshot: turn-metadata) -> result<_, structured-error>;
+  before-turn: func(snapshot: turn-metadata) -> result<_, structured-error>;
+  after-turn: func(snapshot: turn-metadata) -> result<_, structured-error>;
+  after-run: func(snapshot: turn-metadata) -> result<_, structured-error>;
+}
+
+interface tool-middleware-api {
+  use types.{replacement, turn-metadata};
+
+  before-tool-call: func(tool-name: string, tool-call-id: string, input-json: string, turn: turn-metadata) -> replacement;
+  after-tool-call: func(tool-name: string, tool-call-id: string, executed-input-json: string, output-json: string, turn: turn-metadata) -> replacement;
+}
+
+world tool {
+  import eino-agent:host/log@0.1.0;
+  export tool-api;
+}
+
+world permissions-policy {
+  import eino-agent:host/log@0.1.0;
+  export permissions-policy-api;
+}
+
+world context-source {
+  import eino-agent:host/log@0.1.0;
+  export context-source-api;
+}
+
+world event-sink {
+  import eino-agent:host/log@0.1.0;
+  export event-sink-api;
+}
+
+world hook {
+  import eino-agent:host/log@0.1.0;
+  export hook-api;
+}
+
+world tool-middleware {
+  import eino-agent:host/log@0.1.0;
+  export tool-middleware-api;
+}

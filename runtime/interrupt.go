@@ -124,6 +124,10 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 		o.observeToolMaterialized(ctx, snapshot, tool, toolCall)
 		observedTool := o.startObservedToolCall(ctx, snapshot, tool, toolCall)
 		result, execErr := o.executeTool(ctx, tool, toolCall)
+		result, middlewareErr := o.afterToolCall(ctx, tool, toolCall, result, execErr)
+		if middlewareErr != nil {
+			execErr = errors.Join(execErr, middlewareErr)
+		}
 		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, execErr)
 		claimed.Status = status
 		claimed.Output = cloneJSON(output)

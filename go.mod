@@ -6,16 +6,20 @@ require (
 	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9
 	github.com/cloudwego/eino v0.8.13
 	github.com/eino-contrib/jsonschema v1.0.3
+	github.com/mattsp1290/eino-agent/wasmext/gen v0.0.0
 	github.com/mattsp1290/eino-agui v0.1.1
 	github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b
 	github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b
 	modernc.org/sqlite v1.53.0
 )
 
+replace github.com/mattsp1290/eino-agent/wasmext/gen => ./wasmext/gen
+
 require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.10.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
+	github.com/bytecodealliance/wasmtime-go/v47 v47.0.0
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic v1.15.0 // indirect
 	github.com/bytedance/sonic/loader v0.5.0 // indirect
@@ -44,6 +48,7 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/yargevad/filepathx v1.0.0 // indirect
+	go.bytecodealliance.org/cm v0.3.0
 	golang.org/x/arch v0.11.0 // indirect
 	golang.org/x/crypto v0.50.0 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect

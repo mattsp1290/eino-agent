@@ -1,0 +1,15 @@
+package eino-agent:host@0.1.0;
+
+/// The only host capability available to v1 extensions.
+interface log {
+  enum level {
+    debug,
+    info,
+    warn,
+    error,
+  }
+
+  /// Emits one host-bounded log line. The host attaches configured module
+  /// identity; guests cannot choose or override that identity.
+  log: func(level: level, message: string);
+}

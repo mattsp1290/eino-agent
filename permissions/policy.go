@@ -58,6 +58,8 @@ type Policy interface {
 // PolicyFunc adapts a function into a Policy.
 type PolicyFunc func(context.Context, Request) (Decision, error)
 
+var _ Policy = PolicyFunc(nil)
+
 // Decide calls fn.
 func (fn PolicyFunc) Decide(ctx context.Context, request Request) (Decision, error) {
 	return fn(ctx, request)

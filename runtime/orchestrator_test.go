@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strconv"
@@ -694,6 +695,182 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 	}
 }
 
+func TestStreamingOrchestratorToolMiddlewareRewritesAndPatchesEverySettlementView(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	var mu sync.Mutex
+	var order []string
+	var events []Event
+	var permissionRequest permissions.Request
+	var executedCall ToolCall
+	var modelVisible string
+	appendOrder := func(value string) {
+		mu.Lock()
+		defer mu.Unlock()
+		order = append(order, value)
+	}
+
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				modelVisible = msg.Content
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID:   "call-middleware",
+			Type: "function",
+			Function: einoschema.FunctionCall{
+				Name:      "echo",
+				Arguments: `{"permission_pattern":"original","value":0}`,
+			},
+		}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{
+		Name:      "echo",
+		Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Scope:     ToolScope{Permissions: []string{"tool.echo"}},
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executedCall = call
+			return ToolResult{Output: "executed"}, nil
+		}),
+	}}}
+	orch.Middleware = []ToolMiddleware{
+		ToolMiddlewareFuncs{
+			Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
+				appendOrder("before-1")
+				var input map[string]any
+				_ = json.Unmarshal(call.Input, &input)
+				input["permission_pattern"] = "rewritten"
+				input["value"] = 1
+				return json.Marshal(input)
+			},
+			After: func(_ context.Context, _ Tool, _ ToolCall, result ToolResult, _ error) (ToolResult, error) {
+				appendOrder("after-1")
+				result.Output += ":after-1"
+				return result, nil
+			},
+		},
+		ToolMiddlewareFuncs{
+			Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
+				appendOrder("before-2")
+				var input map[string]any
+				_ = json.Unmarshal(call.Input, &input)
+				input["value"] = 2
+				return json.Marshal(input)
+			},
+			After: func(_ context.Context, _ Tool, _ ToolCall, result ToolResult, _ error) (ToolResult, error) {
+				appendOrder("after-2")
+				result.Output += ":after-2"
+				return result, nil
+			},
+		},
+	}
+	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+		permissionRequest = request
+		return permissions.Decision{Action: permissions.ActionAllow}, nil
+	})
+	orch.Events = EventSinkFunc(func(_ context.Context, event Event) error {
+		if event.Kind == EventToolCallUpdated {
+			mu.Lock()
+			events = append(events, event)
+			mu.Unlock()
+		}
+		return nil
+	})
+
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	mu.Lock()
+	gotOrder := append([]string(nil), order...)
+	gotEvents := append([]Event(nil), events...)
+	mu.Unlock()
+	if strings.Join(gotOrder, ",") != "before-1,before-2,after-2,after-1" {
+		t.Fatalf("middleware order = %v", gotOrder)
+	}
+	if string(executedCall.Input) != `{"permission_pattern":"rewritten","value":2}` || executedCall.Pattern != "rewritten" {
+		t.Fatalf("executed call = %+v", executedCall)
+	}
+	if permissionRequest.Pattern != "rewritten" {
+		t.Fatalf("permission request = %+v", permissionRequest)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-middleware")
+	if err != nil {
+		t.Fatalf("GetToolCall error = %v", err)
+	}
+	if string(call.Input) != string(executedCall.Input) || !strings.Contains(string(call.Output), "executed:after-2:after-1") {
+		t.Fatalf("durable call = %+v", call)
+	}
+	if len(gotEvents) != 3 {
+		t.Fatalf("tool events = %d, want 3", len(gotEvents))
+	}
+	for _, event := range gotEvents {
+		if !strings.Contains(string(event.Payload), `"permission_pattern":"rewritten"`) || !strings.Contains(string(event.Payload), `"value":2`) {
+			t.Errorf("event payload did not use rewritten input: %s", event.Payload)
+		}
+	}
+	if !strings.Contains(string(gotEvents[2].Payload), "executed:after-2:after-1") {
+		t.Errorf("settled event payload = %s", gotEvents[2].Payload)
+	}
+	var callPartRewritten, resultPartFound bool
+	for _, part := range store.parts {
+		if part.Kind == session.PartToolCall {
+			callPartRewritten = strings.Contains(string(part.Payload), `"permission_pattern":"rewritten"`) && strings.Contains(string(part.Payload), `"value":2`)
+		}
+		if part.Kind == session.PartToolResult {
+			resultPartFound = strings.Contains(string(part.Payload), "executed:after-2:after-1")
+		}
+	}
+	if !callPartRewritten || !resultPartFound || !strings.Contains(modelVisible, "executed:after-2:after-1") {
+		t.Fatalf("rewritten call part=%v patched result part=%v model-visible=%s", callPartRewritten, resultPartFound, modelVisible)
+	}
+}
+
+func TestStreamingOrchestratorToolMiddlewareErrorSettlesFailedAndContinues(t *testing.T) {
+	t.Parallel()
+	store := newAdmissionStore()
+	var executed []string
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{
+			{ID: "call-failed", Type: "function", Function: einoschema.FunctionCall{Name: "fail", Arguments: `{}`}},
+			{ID: "call-sibling", Type: "function", Function: einoschema.FunctionCall{Name: "ok", Arguments: `{}`}},
+		})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{
+		{Name: "fail", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executed = append(executed, "fail")
+			return ToolResult{}, nil
+		})},
+		{Name: "ok", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executed = append(executed, "ok")
+			return ToolResult{Output: "ok"}, nil
+		})},
+	}}
+	orch.Middleware = []ToolMiddleware{ToolMiddlewareFuncs{Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
+		if call.Name == "fail" {
+			return call.Input, errors.New("middleware rejected input")
+		}
+		return call.Input, nil
+	}}}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted || strings.Join(executed, ",") != "ok" {
+		t.Fatalf("result = %+v, executed = %v", result, executed)
+	}
+	failed, _ := store.GetToolCall(context.Background(), "call-failed")
+	sibling, _ := store.GetToolCall(context.Background(), "call-sibling")
+	if failed.Status != session.ToolCallFailed || !strings.Contains(failed.Error, "middleware rejected") || sibling.Status != session.ToolCallCompleted {
+		t.Fatalf("failed=%+v sibling=%+v", failed, sibling)
+	}
+}
+
 func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	t.Parallel()
 
@@ -774,7 +951,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 	var executions atomic.Int64
 	orch := &StreamingOrchestrator{
 		Store: store,
-		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			executions.Add(1)
 			time.Sleep(10 * time.Millisecond)
 			return ToolResult{Output: "ok"}, nil
@@ -872,6 +1049,81 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 	}
 	if executions.Load() != 1 {
 		t.Fatalf("tool executions = %d, want 1", executions.Load())
+	}
+}
+
+func TestStreamingOrchestratorResumeSkipsBeforeAndRunsAfterForPendingExecution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
+	defer func() { _ = store.Close() }()
+	var before, after atomic.Int64
+	orch := &StreamingOrchestrator{
+		Store: store,
+		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: "executed"}, nil
+		})}}},
+		Middleware: []ToolMiddleware{ToolMiddlewareFuncs{
+			Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
+				before.Add(1)
+				return call.Input, nil
+			},
+			After: func(_ context.Context, _ Tool, _ ToolCall, result ToolResult, _ error) (ToolResult, error) {
+				after.Add(1)
+				result.Output = "patched"
+				return result, nil
+			},
+		}},
+		IDs: &sequenceIDs{}, OwnerID: "owner-1",
+	}
+	handle, err := orch.Resume(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Resume error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Error != nil || before.Load() != 0 || after.Load() != 1 {
+		t.Fatalf("result=%+v before=%d after=%d", result, before.Load(), after.Load())
+	}
+	call, err := store.GetToolCall(ctx, "call-resume")
+	if err != nil || !strings.Contains(string(call.Output), "patched") {
+		t.Fatalf("call=%+v error=%v", call, err)
+	}
+}
+
+func TestStreamingOrchestratorResumeInterruptedRunningCallSkipsMiddleware(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	store, run := resumeStoreWithTool(t, "owner-1", session.ToolCallRunning)
+	defer func() { _ = store.Close() }()
+	var before, after atomic.Int64
+	orch := &StreamingOrchestrator{
+		Store: store,
+		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: "must not execute"}, nil
+		})}}},
+		Middleware: []ToolMiddleware{ToolMiddlewareFuncs{
+			Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
+				before.Add(1)
+				return call.Input, nil
+			},
+			After: func(_ context.Context, _ Tool, _ ToolCall, result ToolResult, _ error) (ToolResult, error) {
+				after.Add(1)
+				return result, nil
+			},
+		}},
+		IDs: &sequenceIDs{}, OwnerID: "owner-1",
+	}
+	handle, err := orch.Resume(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("Resume error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Error != nil || before.Load() != 0 || after.Load() != 0 {
+		t.Fatalf("result=%+v before=%d after=%d", result, before.Load(), after.Load())
+	}
+	call, err := store.GetToolCall(ctx, "call-resume")
+	if err != nil || call.Status != session.ToolCallInterrupted {
+		t.Fatalf("call=%+v error=%v", call, err)
 	}
 }
 
