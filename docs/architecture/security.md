@@ -37,7 +37,9 @@ clock, random, credential, endpoint, raw provider payload, complete
 is a size-bounded log function whose module identity is host configured.
 Cross-boundary JSON and text are checked against input/output bounds.
 
-Execution uses instance-per-call semantics behind an internal engine boundary.
+Execution uses a fresh store and instance per call behind an internal engine
+boundary, with calls serialized per compiled module so an epoch increment only
+targets the active call.
 Timeout is active: cancellation increments Wasmtime's epoch so synchronous
 guest code traps instead of merely observing a cooperative Go context. Close
 stops new calls, interrupts in-flight calls, drains for a bounded interval, and
@@ -50,6 +52,10 @@ Evidence:
 - `wasmext.TestModuleTimeoutActivelyInterruptsGuest`
 - `wasmext.TestContractAndPayloadViolationsAreClassifiedAndBounded`
 - `wasmext.TestToolWrapperRoundTripAndBoundedSnapshot`
+- `wasmext.TestCheckedInPhaseAComponentsRoundTrip`
+- `wasmext.TestCheckedInToolFailuresAreBoundedAndClassified`
+- `wasmext.TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls`
+- `wasmext.TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy`
 - `internal/deps.TestCorePackagesDoNotDependOnWasmRuntimeOrBindings`
 
 ## Malformed Input

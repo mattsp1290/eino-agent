@@ -89,7 +89,8 @@ func toolDefinition(module *module, metadata wittypes.ToolMetadata) (tools.Defin
 	definition := tools.Definition{
 		Name: metadata.Name, Description: metadata.Description, Parameters: parameters,
 		RetrySafe: metadata.RetrySafe, Permissions: permissionsList,
-		Metadata: map[string]string{"wasm_module": module.identity.name, "wasm_sha256": module.identity.hash},
+		Metadata:  map[string]string{"wasm_module": module.identity.name, "wasm_sha256": module.identity.hash},
+		Retention: runtime.RetentionPolicy{MaxInlineBytes: module.limits.MaxOutputBytes},
 	}
 	definition.Decode = func(_ context.Context, raw json.RawMessage) (any, error) {
 		if err := validateBoundedJSON(raw, module.limits.MaxInputBytes); err != nil {

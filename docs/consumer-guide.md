@@ -228,6 +228,10 @@ orchestrator, err := runtime.NewStreamingOrchestrator(
 )
 ```
 
+Set `ModuleConfig.Observer` when guest log lines should be exported through an
+`einoobs.Observer`; `wasmext` attaches the configured module name and verified
+digest and enforces a 4 KiB-or-tighter message bound.
+
 `tools.Definition` requires `Decode`, `Encode`, and `Execute`. `Register`
 creates a generation; `Replace` updates only the active generation so delayed
 plugin reloads cannot overwrite newer definitions. `config.Snapshot.Tools`

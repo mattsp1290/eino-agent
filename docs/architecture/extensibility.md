@@ -1,6 +1,6 @@
 # Runtime Extensibility
 
-Date: 2026-08-08
+Date: 2026-08-09
 
 `eino-agent` exposes Go interfaces as its extension contract. Native functions,
 native structs, and Wasm-backed wrappers all enter the orchestrator through the
@@ -68,10 +68,15 @@ fetch, hot reload, or marketplace is involved.
 
 Every call has nonzero time, memory, input, and output defaults. Timeout uses
 Wasmtime epoch interruption through the engine boundary, not context
-cancellation alone. Components receive no filesystem, sockets, environment,
+cancellation alone. Calls for one compiled module are serialized and each call
+gets a fresh store and component instance; this keeps an epoch interrupt from
+collaterally trapping a sibling call. Components receive no filesystem, sockets, environment,
 process, credential, endpoint, full config snapshot, resolved model object, or
 conversation content. The only capability contract is the bounded
-`eino-agent:host/log@0.1.0` import; module identity is attached by the host.
+`eino-agent:host/log@0.1.0` import. When `ModuleConfig.Observer` is set, bounded
+guest log observations flow through its configured exporter with the
+host-configured module name and verified digest attached; otherwise logs are
+dropped.
 
 The embedding host owns shutdown. Prefer `wasmext.NewLoader`, load wrappers
 through it, and call `Loader.Close(ctx)`. Close stops admission, interrupts
@@ -84,21 +89,23 @@ lifecycle emits can add up to three such calls per tool call on the run-loop
 critical path. The Phase B wrapper must therefore keep its per-call timeout
 small; current sink errors are discarded by runtime call sites.
 
-### Current engine limitation
+### Engine implementation note
 
-Wasmtime-go v47 compiles, reflects, links, and instantiates components, but its
-published Go API does not yet expose component-function invocation or canonical
-value lifting/lowering. The engine boundary validates the checked-in Phase A
-components today, while live calls fail closed as `wasmext.ErrorTrap`. Replacing
-that isolated call implementation when upstream exposes `ComponentFunc` does
-not change wrapper or orchestrator APIs.
+Wasmtime-go v47 supplies compilation, reflection, linking, stores, limits, and
+epoch interruption, but its published Go surface does not yet expose dynamic
+component-function calls or nested host-interface definitions. `wasmext`
+therefore keeps a small, Phase-A-specific lifting/lowering and host-linking
+layer over Wasmtime's official v47 C component API beside the engine adapter.
+That layer is internal, round-tripped against the checked-in guests, and does
+not change wrapper or orchestrator APIs. It can be replaced directly when the
+equivalent Go API is released.
 
 ## pi parity map
 
 | pi extension point | eino-agent seam | Native path | Wasm path / status |
 | --- | --- | --- | --- |
-| `customTools` | Tool registry | `tools.Definition`, `tools.Registry.Register`, `runtime.WithToolRegistry` | `wasmext.LoadTool`, `tool` world; engine call gap noted above |
-| `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.LoadPermissionsPolicy`, `permissions-policy` world; engine call gap noted above |
+| `customTools` | Tool registry | `tools.Definition`, `tools.Registry.Register`, `runtime.WithToolRegistry` | `wasmext.LoadTool`, `tool` world |
+| `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.LoadPermissionsPolicy`, `permissions-policy` world |
 | `tool_call` argument rewrite | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world, Phase B wrapper gap |
 | `tool_result` patch | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world, Phase B wrapper gap |
 | `before_agent_start` / context | Context source and hook | `runtime.ContextSource`, `runtime.WithContextSource`, `runtime.Hook` | `context-source` and `hook` worlds, Phase B wrapper gap |

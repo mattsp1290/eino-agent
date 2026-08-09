@@ -3,6 +3,8 @@
 package main
 
 import (
+	"strings"
+
 	"go.bytecodealliance.org/cm"
 
 	_ "github.com/mattsp1290/eino-agent/examples/wasm-extensions/internal/guestabi"
@@ -28,6 +30,17 @@ func metadata() cm.Result[toolapi.ToolMetadataShape, toolapi.ToolMetadata, toola
 
 func execute(_ string, inputJSON string, _ toolapi.TurnMetadata) cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError] {
 	hostlog.Log(hostlog.LevelInfo, "executing example echo tool")
+	switch {
+	case strings.Contains(inputJSON, `"mode":"trap"`):
+		panic("fixture trap")
+	case strings.Contains(inputJSON, `"mode":"hang"`):
+		for {
+		}
+	case strings.Contains(inputJSON, `"mode":"malformed"`):
+		return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]](`{`)
+	case strings.Contains(inputJSON, `"mode":"oversized"`):
+		return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]](`{"value":"` + strings.Repeat("x", 300<<10) + `"}`)
+	}
 	return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]](`{"echo":` + inputJSON + `}`)
 }
 

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	einoobs "github.com/mattsp1290/eino-obs"
 )
 
 const (
@@ -111,6 +113,9 @@ type ModuleConfig struct {
 	AllowedRoot    string
 	ExpectedSHA256 string
 	Limits         Limits
+	// Observer receives bounded guest log observations with the configured
+	// module name and verified digest attached. A nil observer drops guest logs.
+	Observer *einoobs.Observer
 	// GuestConfig is reserved for bounded, non-secret extension configuration.
 	// v0.1 worlds currently expose no configuration import, so these values are
 	// validated and retained by the host but never sent to a guest.

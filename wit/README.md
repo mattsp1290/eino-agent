@@ -18,4 +18,5 @@ All JSON strings and free-form text are subject to host-configured byte limits.
 The host exposes only `eino-agent:host/log@0.1.0`; filesystem, sockets,
 environment variables, process execution, clocks, random sources, credentials,
 provider endpoints, complete configuration snapshots, and resolved model state
-are not imported.
+are not imported. Hosts may attach a `ModuleConfig.Observer`; guest log lines
+are byte-bounded and carry the configured module name plus verified digest.

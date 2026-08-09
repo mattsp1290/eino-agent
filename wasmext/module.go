@@ -22,6 +22,7 @@ type module struct {
 	limits    Limits
 	engine    engine
 	component compiledComponent
+	callGate  chan struct{}
 	mu        sync.Mutex
 	closed    bool
 	inFlight  sync.WaitGroup
@@ -65,12 +66,16 @@ func loadModule(ctx context.Context, cfg ModuleConfig, contract worldContract, f
 	if err != nil {
 		return nil, extensionError(ErrorEngine, identity, "compile", err)
 	}
+	contract.identity = identity
+	contract.observer = cfg.Observer
 	component, err := engine.Compile(ctx, bytes, contract)
 	if err != nil {
 		_ = engine.Close()
 		return nil, extensionError(ErrorContract, identity, "compile", err)
 	}
-	return &module{identity: identity, limits: limits, engine: engine, component: component}, nil
+	callGate := make(chan struct{}, 1)
+	callGate <- struct{}{}
+	return &module{identity: identity, limits: limits, engine: engine, component: component, callGate: callGate}, nil
 }
 
 var errModuleTooLarge = errors.New("module exceeds size bound")
@@ -146,6 +151,18 @@ func (m *module) call(ctx context.Context, operation string, inputBytes int, inp
 	m.inFlight.Add(1)
 	m.mu.Unlock()
 	defer m.inFlight.Done()
+	select {
+	case <-ctx.Done():
+		return extensionError(ErrorTimeout, m.identity, operation, ctx.Err())
+	case <-m.callGate:
+	}
+	defer func() { m.callGate <- struct{}{} }()
+	m.mu.Lock()
+	closed := m.closed
+	m.mu.Unlock()
+	if closed {
+		return extensionError(ErrorClosed, m.identity, operation, nil)
+	}
 	callCtx, cancel := context.WithTimeout(ctx, m.limits.Timeout)
 	defer cancel()
 	done := make(chan error, 1)
@@ -153,7 +170,11 @@ func (m *module) call(ctx context.Context, operation string, inputBytes int, inp
 	select {
 	case err := <-done:
 		if err != nil {
-			return extensionError(ErrorTrap, m.identity, operation, err)
+			kind := ErrorTrap
+			if errors.Is(err, errModuleTooLarge) {
+				kind = ErrorSize
+			}
+			return extensionError(kind, m.identity, operation, err)
 		}
 		return nil
 	case <-callCtx.Done():

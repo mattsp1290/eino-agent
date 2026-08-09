@@ -1,6 +1,10 @@
 package wasmext
 
-import "context"
+import (
+	"context"
+
+	einoobs "github.com/mattsp1290/eino-obs"
+)
 
 type engine interface {
 	Compile(context.Context, []byte, worldContract) (compiledComponent, error)
@@ -21,6 +25,8 @@ type worldContract struct {
 	world      string
 	exportName string
 	functions  []string
+	identity   moduleIdentity
+	observer   *einoobs.Observer
 }
 
 var (

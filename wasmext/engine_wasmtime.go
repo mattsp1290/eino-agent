@@ -11,14 +11,15 @@ import (
 type wasmtimeEngine struct {
 	mu     sync.Mutex
 	engine *wasmtime.Engine
+	limits Limits
 	closed bool
 }
 
-func newWasmtimeEngine(Limits) (engine, error) {
+func newWasmtimeEngine(limits Limits) (engine, error) {
 	config := wasmtime.NewConfig()
 	config.SetWasmComponentModel(true)
 	config.SetEpochInterruption(true)
-	return &wasmtimeEngine{engine: wasmtime.NewEngineWithConfig(config)}, nil
+	return &wasmtimeEngine{engine: wasmtime.NewEngineWithConfig(config), limits: limits}, nil
 }
 
 func (e *wasmtimeEngine) Compile(_ context.Context, wasm []byte, contract worldContract) (compiledComponent, error) {
@@ -45,7 +46,12 @@ func (e *wasmtimeEngine) Compile(_ context.Context, wasm []byte, contract worldC
 		}
 		function.Close()
 	}
-	return &wasmtimeComponent{component: component, engine: e.engine}, nil
+	return &wasmtimeComponent{
+		component: component,
+		engine:    e.engine,
+		limits:    e.limits,
+		contract:  contract,
+	}, nil
 }
 
 func (e *wasmtimeEngine) Close() error {
@@ -62,15 +68,13 @@ func (e *wasmtimeEngine) Close() error {
 type wasmtimeComponent struct {
 	component *wasmtime.Component
 	engine    *wasmtime.Engine
+	limits    Limits
+	contract  worldContract
 	once      sync.Once
 }
 
-func (c *wasmtimeComponent) Call(context.Context, string, any, any) error {
-	// wasmtime-go v47 exposes component compilation, reflection, linking, and
-	// instantiation, but not ComponentFunc/value lifting and lowering yet.
-	// Keep this limitation isolated behind the engine boundary so a later
-	// upstream release can add calls without changing any wrapper API.
-	return errors.New("wasmtime-go component function calls are unavailable")
+func (c *wasmtimeComponent) Call(ctx context.Context, operation string, input, output any) error {
+	return c.callABI(ctx, operation, input, output)
 }
 
 func (c *wasmtimeComponent) Interrupt() { c.engine.IncrementEpoch() }

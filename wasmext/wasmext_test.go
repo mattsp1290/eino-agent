@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,12 +16,15 @@ import (
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
+	einoobs "github.com/mattsp1290/eino-obs"
 	"go.bytecodealliance.org/cm"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
+	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 	"github.com/mattsp1290/eino-agent/tools"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
@@ -242,6 +246,320 @@ func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
 	}, toolContract, newWasmtimeEngine)
 	if !IsKind(err, ErrorContract) {
 		t.Fatalf("wrong world error = %v", err)
+	}
+}
+
+func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	toolConfig := checkedInFixtureConfig(t, root, "tool.wasm")
+	observer := einoobs.New(einoobs.Config{})
+	toolConfig.Observer = observer
+	loadedTool, err := OpenTool(context.Background(), toolConfig)
+	if err != nil {
+		var extensionErr *Error
+		if errors.As(err, &extensionErr) {
+			t.Fatalf("OpenTool error = %v (cause: %v)", err, extensionErr.cause)
+		}
+		t.Fatalf("OpenTool error = %v", err)
+	}
+	defer func() { _ = loadedTool.Close() }()
+	definition := loadedTool.Definition()
+	decoded, err := definition.Decode(context.Background(), json.RawMessage(`{"value":1}`))
+	if err != nil {
+		t.Fatalf("Decode error = %v", err)
+	}
+	output, err := definition.Execute(context.Background(), tools.Execution{
+		Call: runtime.ToolCall{ID: "call-1"}, Input: decoded,
+	})
+	if err != nil {
+		t.Fatalf("Execute error = %v", err)
+	}
+	raw, err := definition.Encode(context.Background(), output)
+	if err != nil || string(raw) != `{"echo":{"value":1}}` {
+		t.Fatalf("Encode = %s, %v", raw, err)
+	}
+	observations := observer.Snapshot().Observations
+	if len(observations) != 1 || observations[0].Attributes["wasm.module.name"] != "tool.wasm" || observations[0].Attributes["log.level"] != "info" {
+		t.Fatalf("guest log observations = %#v", observations)
+	}
+
+	policyConfig := checkedInFixtureConfig(t, root, "permissions-policy.wasm")
+	policy, err := loadPermissionsPolicy(context.Background(), policyConfig, newWasmtimeEngine)
+	if err != nil {
+		t.Fatalf("LoadPermissionsPolicy error = %v", err)
+	}
+	defer func() { _ = policy.Close() }()
+	for pattern, want := range map[string]permissions.Action{
+		"allow": permissions.ActionAllow,
+		"deny":  permissions.ActionDeny,
+		"ask":   permissions.ActionAsk,
+	} {
+		decision, err := policy.Decide(context.Background(), permissions.Request{Pattern: pattern})
+		if err != nil || decision.Action != want {
+			t.Errorf("Decide(%q) = %+v, %v", pattern, decision, err)
+		}
+	}
+}
+
+func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	for _, test := range []struct {
+		name  string
+		input string
+		kind  ErrorKind
+	}{
+		{name: "trap", input: `{"mode":"trap"}`, kind: ErrorTrap},
+		{name: "malformed", input: `{"mode":"malformed"}`, kind: ErrorPayload},
+		{name: "oversized", input: `{"mode":"oversized"}`, kind: ErrorSize},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			loaded, err := OpenTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = loaded.Close() }()
+			_, err = executeLoadedDefinition(context.Background(), loaded.Definition(), test.input)
+			if !IsKind(err, test.kind) {
+				t.Fatalf("Execute error = %v, want %s", err, test.kind)
+			}
+		})
+	}
+
+	t.Run("active timeout", func(t *testing.T) {
+		cfg := checkedInFixtureConfig(t, root, "tool.wasm")
+		cfg.Limits.Timeout = 25 * time.Millisecond
+		cfg.Limits.CloseDrain = time.Second
+		loaded, err := OpenTool(context.Background(), cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = loaded.Close() }()
+		started := time.Now()
+		_, err = executeLoadedDefinition(context.Background(), loaded.Definition(), `{"mode":"hang"}`)
+		if !IsKind(err, ErrorTimeout) || time.Since(started) > time.Second {
+			t.Fatalf("Execute error = %v after %s", err, time.Since(started))
+		}
+		if _, err := executeLoadedDefinition(context.Background(), loaded.Definition(), `{"value":1}`); err != nil {
+			t.Fatalf("call after interrupted guest = %v", err)
+		}
+	})
+}
+
+func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T) {
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	exporter := &signalExporter{entered: make(chan struct{})}
+	cfg := checkedInFixtureConfig(t, root, "tool.wasm")
+	cfg.Limits.Timeout = 5 * time.Second
+	cfg.Limits.CloseDrain = time.Second
+	cfg.Observer = einoobs.New(einoobs.Config{Exporter: exporter})
+	loaded, err := OpenTool(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definition := loaded.Definition()
+	callError := make(chan error, 1)
+	go func() {
+		_, callErr := executeLoadedDefinition(context.Background(), definition, `{"mode":"hang"}`)
+		callError <- callErr
+	}()
+	select {
+	case <-exporter.entered:
+	case <-time.After(time.Second):
+		t.Fatal("guest did not enter execute")
+	}
+	if err := loaded.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+	select {
+	case err := <-callError:
+		if !IsKind(err, ErrorTrap) {
+			t.Fatalf("in-flight call error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("in-flight call did not drain")
+	}
+	_, err = executeLoadedDefinition(context.Background(), definition, `{"value":1}`)
+	if !IsKind(err, ErrorClosed) {
+		t.Fatalf("call after Close error = %v", err)
+	}
+}
+
+func TestCheckedInToolConcurrentUse(t *testing.T) {
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	loaded, err := OpenTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = loaded.Close() }()
+	definition := loaded.Definition()
+	const calls = 12
+	errorsChannel := make(chan error, calls)
+	var wait sync.WaitGroup
+	for index := range calls {
+		wait.Add(1)
+		go func(index int) {
+			defer wait.Done()
+			output, callErr := executeLoadedDefinition(context.Background(), definition, `{"value":1}`)
+			if callErr != nil {
+				errorsChannel <- callErr
+				return
+			}
+			if !strings.Contains(string(output.(json.RawMessage)), `"echo"`) {
+				errorsChannel <- errors.New("missing echo output for call " + strconv.Itoa(index))
+			}
+		}(index)
+	}
+	wait.Wait()
+	close(errorsChannel)
+	for err := range errorsChannel {
+		t.Error(err)
+	}
+}
+
+func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+	definition, err := loader.LoadTool(ctx, checkedInFixtureConfig(t, root, "tool.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := loader.LoadPermissionsPolicy(ctx, checkedInFixtureConfig(t, root, "permissions-policy.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tools.NewRegistry()
+	if _, err := registry.Register(definition); err != nil {
+		t.Fatal(err)
+	}
+	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var modelTurns atomic.Int64
+	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		if modelTurns.Add(1) == 1 {
+			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+				ID: "wasm-call", Type: "function", Function: einoschema.FunctionCall{
+					Name: "wasm_echo", Arguments: `{"permission_pattern":"allow","value":1}`,
+				},
+			}})}, nil
+		}
+		for _, message := range request.Messages {
+			if message.Role == einoschema.Tool && strings.Contains(message.Content, `"echo"`) {
+				return []*einoschema.Message{einoschema.AssistantMessage("complete", nil)}, nil
+			}
+		}
+		return nil, errors.New("Wasm tool result was not model-visible")
+	})
+	selection := model.Selection{ProviderID: "native", ModelID: "scripted"}
+	orch, err := runtime.NewStreamingOrchestrator(
+		runtime.WithStore(store),
+		runtime.WithModelResolver(model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+			return model.Resolved{
+				Provider: model.Provider{ID: "native"},
+				Model:    model.Descriptor{ID: "scripted", ProviderID: "native"},
+				Streamer: streamer,
+			}, nil
+		})),
+		runtime.WithIDGenerator(&wasmTestIDs{}),
+		runtime.WithToolRegistry(registry),
+		runtime.WithPermissions(policy),
+		runtime.WithOwnerID("wasm-blackbox"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := orch.Start(ctx, runtime.Request{
+		SessionID: "wasm-session",
+		Input:     []*einoschema.Message{einoschema.UserMessage("run the Wasm tool")},
+		Config: config.Snapshot{
+			Agent: config.Agent{Name: "agent", Model: selection}, Model: selection,
+			Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": t.TempDir()},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted || result.Error != nil || modelTurns.Load() != 2 {
+		t.Fatalf("result = %+v, model turns = %d", result, modelTurns.Load())
+	}
+	toolCall, err := store.GetToolCall(ctx, "wasm-call")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCall.Status != session.ToolCallCompleted || !strings.Contains(string(toolCall.Input), `"permission_pattern":"allow"`) || !strings.Contains(string(toolCall.Output), `"echo"`) {
+		t.Fatalf("durable tool call = %+v", toolCall)
+	}
+}
+
+func executeLoadedDefinition(ctx context.Context, definition tools.Definition, input string) (any, error) {
+	decoded, err := definition.Decode(ctx, json.RawMessage(input))
+	if err != nil {
+		return nil, err
+	}
+	return definition.Execute(ctx, tools.Execution{Call: runtime.ToolCall{ID: "fixture-call"}, Input: decoded})
+}
+
+type signalExporter struct {
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (e *signalExporter) Export(context.Context, []einoobs.Observation) error {
+	e.once.Do(func() { close(e.entered) })
+	return nil
+}
+
+func (*signalExporter) Flush(context.Context) error    { return nil }
+func (*signalExporter) Shutdown(context.Context) error { return nil }
+
+type wasmScriptedStreamer func(context.Context, model.Request) ([]*einoschema.Message, error)
+
+func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+	messages, err := s(ctx, request)
+	if err != nil {
+		return nil, err
+	}
+	reader, writer := einoschema.Pipe[*einoschema.Message](len(messages))
+	go func() {
+		defer writer.Close()
+		for _, message := range messages {
+			if writer.Send(message, nil) {
+				return
+			}
+		}
+	}()
+	return reader, nil
+}
+
+type wasmTestIDs struct{ next atomic.Uint64 }
+
+func (i *wasmTestIDs) id(prefix string) string {
+	return prefix + "-" + strconv.FormatUint(i.next.Add(1), 10)
+}
+
+func (i *wasmTestIDs) NewRunID() session.RunID         { return session.RunID(i.id("run")) }
+func (i *wasmTestIDs) NewMessageID() session.MessageID { return session.MessageID(i.id("message")) }
+func (i *wasmTestIDs) NewPartID() session.PartID       { return session.PartID(i.id("part")) }
+func (i *wasmTestIDs) NewToolCallID() session.ToolCallID {
+	return session.ToolCallID(i.id("tool-call"))
+}
+func (i *wasmTestIDs) NewEventID() session.EventID { return session.EventID(i.id("event")) }
+func (i *wasmTestIDs) NewEpochID() session.EpochID { return session.EpochID(i.id("epoch")) }
+
+func checkedInFixtureConfig(t *testing.T, root, name string) ModuleConfig {
+	t.Helper()
+	bytes, err := os.ReadFile(filepath.Join(root, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(bytes)
+	return ModuleConfig{
+		Name: name, AllowedRoot: root, Path: name, ExpectedSHA256: hex.EncodeToString(hash[:]),
 	}
 }
 

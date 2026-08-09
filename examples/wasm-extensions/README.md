@@ -21,4 +21,6 @@ shasum -a 256 tool.wasm
 
 Pass that digest as `wasmext.ModuleConfig.ExpectedSHA256`. Prefer
 `wasmext.NewLoader()` and `defer loader.Close(ctx)` so the embedding host, not
-the orchestrator, owns module shutdown.
+the orchestrator, owns module shutdown. Set `ModuleConfig.Observer` to route
+the bounded `eino-agent:host/log@0.1.0` import through that observer's exporter
+with verified module identity attached.
