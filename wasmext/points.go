@@ -2,11 +2,11 @@ package wasmext
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
-	"github.com/mattsp1290/eino-agent/session"
 )
 
 // RegisterContextSource adapts context-source@0.1.0 to the native context
@@ -16,12 +16,12 @@ func RegisterContextSource(registrar extension.Registrar, spec extension.Registr
 		return fmt.Errorf("nil Wasm context source")
 	}
 	return extension.Use(registrar, runtime.ContextAssemblePoint, spec, func(ctx context.Context, assembly runtime.ContextAssembly, next extension.Next[runtime.ContextAssembly, runtime.ContextAssembly]) (runtime.ContextAssembly, error) {
-		messages, err := source.LoadContext(ctx, runtime.TurnSnapshot{RunID: assembly.RunID, SessionID: assembly.SessionID, EpochID: assembly.EpochID, Messages: assembly.Base})
+		messages, err := source.loadBoundedContext(ctx, assembly.Metadata)
 		if err != nil {
 			return runtime.ContextAssembly{}, err
 		}
 		for index, message := range messages {
-			assembly.Contributions = append(assembly.Contributions, runtime.ContextContribution{Source: fmt.Sprintf("%s/%06d", spec.ID, index), Order: spec.Order, Message: message})
+			assembly.Contributions = append(assembly.Contributions, runtime.ContextContribution{Source: contextContributionSource(spec, index), Order: spec.Order, Message: message})
 		}
 		return next(ctx, assembly)
 	})
@@ -45,29 +45,35 @@ func RegisterHook(registrar extension.Registrar, spec extension.Registration, ho
 	admitted := spec
 	admitted.ID += "/before-run"
 	if err := extension.On(registrar, runtime.RunAdmittedPoint, admitted, func(ctx context.Context, notice runtime.RunAdmittedNotice) error {
-		return hook.BeforeRun(ctx, session.Run{ID: notice.RunID, SessionID: notice.SessionID, ContextEpoch: ""})
+		return hook.beforeRunBounded(ctx, notice.Metadata)
 	}); err != nil {
 		return err
 	}
 	turn := spec
 	turn.ID += "/before-turn"
-	if err := extension.Use(registrar, runtime.ContextAssemblePoint, turn, func(ctx context.Context, assembly runtime.ContextAssembly, next extension.Next[runtime.ContextAssembly, runtime.ContextAssembly]) (runtime.ContextAssembly, error) {
-		if _, err := hook.BeforeTurn(ctx, runtime.TurnSnapshot{RunID: assembly.RunID, SessionID: assembly.SessionID, EpochID: assembly.EpochID, Messages: assembly.Base}); err != nil {
-			return runtime.ContextAssembly{}, err
+	if err := extension.Use(registrar, runtime.TurnPreparePoint, turn, func(ctx context.Context, metadata runtime.BoundedTurnMetadata, next extension.Next[runtime.BoundedTurnMetadata, runtime.BoundedTurnMetadata]) (runtime.BoundedTurnMetadata, error) {
+		if err := hook.beforeTurnBounded(ctx, metadata); err != nil {
+			return runtime.BoundedTurnMetadata{}, err
 		}
-		return next(ctx, assembly)
+		return next(ctx, metadata)
 	}); err != nil {
 		return err
 	}
 	settled := spec
 	settled.ID += "/after-run"
 	return extension.On(registrar, runtime.RunSettledPoint, settled, func(ctx context.Context, notice runtime.RunSettledNotice) error {
-		snapshot := runtime.TurnSnapshot{RunID: notice.Result.RunID, SessionID: notice.SessionID}
-		if err := hook.AfterTurn(ctx, snapshot, notice.Result); err != nil {
-			return err
-		}
-		return hook.AfterRun(ctx, notice.Result)
+		return finishRegisteredHook(ctx, hook, notice)
 	})
+}
+
+func contextContributionSource(spec extension.Registration, index int) string {
+	parts := []string{spec.InstanceID, spec.ID, string(spec.Scope.Kind), spec.Scope.Key}
+	return fmt.Sprintf("wasm-context/%d:%s/%d:%s/%d:%s/%d:%s/%06d", len(parts[0]), parts[0], len(parts[1]), parts[1], len(parts[2]), parts[2], len(parts[3]), parts[3], index)
+}
+
+func finishRegisteredHook(ctx context.Context, hook *LoadedHook, notice runtime.RunSettledNotice) error {
+	snapshot := runtime.TurnSnapshot{RunID: notice.Result.RunID, SessionID: notice.SessionID}
+	return errors.Join(hook.AfterTurn(ctx, snapshot, notice.Result), hook.AfterRun(ctx, notice.Result))
 }
 
 // RegisterToolMiddleware maps tool-middleware@0.1.0 only to prepare and result

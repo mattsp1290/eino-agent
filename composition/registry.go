@@ -322,15 +322,27 @@ func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRe
 func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
 	instances := make(map[string]bool)
 	var sessionID session.ID
+	recoverSessionID := func(scope session.ExtensionScope) error {
+		if scope.Kind != string(extension.ScopeSession) || scope.Key == "" {
+			return nil
+		}
+		if sessionID != "" && sessionID != session.ID(scope.Key) {
+			return runtime.ErrExtensionPlanMismatch
+		}
+		sessionID = session.ID(scope.Key)
+		return nil
+	}
 	for _, entry := range persisted.Entries {
 		if entry.Required {
 			instances[entry.InstanceID] = true
 		}
-		if entry.Scope.Kind == string(extension.ScopeSession) && entry.Scope.Key != "" {
-			if sessionID != "" && sessionID != session.ID(entry.Scope.Key) {
-				return nil, runtime.ErrExtensionPlanMismatch
+		if err := recoverSessionID(entry.Scope); err != nil {
+			return nil, err
+		}
+		for _, registration := range entry.Registrations {
+			if err := recoverSessionID(registration.Scope); err != nil {
+				return nil, err
 			}
-			sessionID = session.ID(entry.Scope.Key)
 		}
 	}
 	plan, err := r.acquire(ctx, sessionID, instances, persisted.Mode)

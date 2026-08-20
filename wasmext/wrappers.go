@@ -188,7 +188,14 @@ type LoadedContextSource struct{ module *module }
 func (s *LoadedContextSource) Close() error { return s.module.Close() }
 
 func (s *LoadedContextSource) LoadContext(ctx context.Context, snapshot runtime.TurnSnapshot) ([]*einoschema.Message, error) {
-	turn := turnMetadata(snapshot)
+	return s.loadContextMetadata(ctx, turnMetadata(snapshot))
+}
+
+func (s *LoadedContextSource) loadBoundedContext(ctx context.Context, metadata runtime.BoundedTurnMetadata) ([]*einoschema.Message, error) {
+	return s.loadContextMetadata(ctx, turnMetadataFromBounded(metadata))
+}
+
+func (s *LoadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.Message, error) {
 	var output []wittypes.TextMessage
 	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), turn, &output); err != nil {
 		return nil, err
@@ -267,22 +274,39 @@ func (h *LoadedHook) Close() error {
 }
 
 func (h *LoadedHook) BeforeRun(ctx context.Context, run session.Run) error {
-	turn := partialTurnMetadata(run)
+	return h.beforeRunMetadata(ctx, partialTurnMetadata(run))
+}
+
+func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
+	return h.beforeRunMetadata(ctx, turnMetadataFromBounded(metadata))
+}
+
+func (h *LoadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
 	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), turn, nil)
 }
 
 func (h *LoadedHook) BeforeTurn(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.TurnSnapshot, error) {
-	turn := turnMetadata(snapshot)
-	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), turn, nil); err != nil {
+	if err := h.beforeTurnMetadata(ctx, turnMetadata(snapshot)); err != nil {
 		return runtime.TurnSnapshot{}, err
+	}
+	return snapshot.Clone(), nil
+}
+
+func (h *LoadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
+	return h.beforeTurnMetadata(ctx, turnMetadataFromBounded(metadata))
+}
+
+func (h *LoadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
+	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), turn, nil); err != nil {
+		return err
 	}
 	h.mu.Lock()
 	if h.turns == nil {
 		h.turns = make(map[session.RunID]wittypes.TurnMetadata)
 	}
-	h.turns[snapshot.RunID] = turn
+	h.turns[session.RunID(turn.RunID)] = turn
 	h.mu.Unlock()
-	return snapshot.Clone(), nil
+	return nil
 }
 
 func (h *LoadedHook) AfterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {
@@ -508,6 +532,20 @@ func turnMetadata(snapshot runtime.TurnSnapshot) wittypes.TurnMetadata {
 		ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID),
 		ToolNames: cm.ToList(toolNames), MessageCount: uint32(messageCount), RoleCounts: counts,
 		HasSystemPrompt: snapshot.SystemPrompt != "" || snapshot.Config.Agent.SystemPrompt != "",
+	}
+}
+
+func turnMetadataFromBounded(metadata runtime.BoundedTurnMetadata) wittypes.TurnMetadata {
+	return wittypes.TurnMetadata{
+		RunID: string(metadata.RunID), SessionID: string(metadata.SessionID), EpochID: string(metadata.EpochID),
+		AgentName: metadata.AgentName, AgentMode: metadata.AgentMode,
+		ProviderID: metadata.ProviderID, ModelID: metadata.ModelID,
+		ToolNames: cm.ToList(append([]string(nil), metadata.ToolNames...)), MessageCount: metadata.MessageCount,
+		RoleCounts: wittypes.RoleCounts{
+			System: metadata.RoleCounts.System, User: metadata.RoleCounts.User,
+			Assistant: metadata.RoleCounts.Assistant, Tool: metadata.RoleCounts.Tool,
+		},
+		HasSystemPrompt: metadata.HasSystemPrompt,
 	}
 }
 

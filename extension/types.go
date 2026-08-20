@@ -85,7 +85,9 @@ type Around[I, O any] func(context.Context, I, Next[I, O]) (O, error)
 type Observer[T any] func(context.Context, T) error
 type Cleanup func(context.Context) error
 
-type pointKey struct{}
+// pointKey must be non-zero-sized: Go permits pointers to distinct zero-sized
+// variables to compare equal, which can alias otherwise unrelated points.
+type pointKey [1]byte
 
 type Notification[T any] struct {
 	key      *pointKey

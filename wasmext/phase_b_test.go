@@ -3,6 +3,8 @@ package wasmext
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +102,153 @@ func TestHookCachesFullMetadataUntilAfterRun(t *testing.T) {
 	}
 }
 
+func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]wittypes.TurnMetadata{}
+	component := &fakeComponent{call: func(_ context.Context, operation string, input, _ any) error {
+		mu.Lock()
+		seen[operation] = input.(wittypes.TurnMetadata)
+		mu.Unlock()
+		return nil
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("registered-hook")), hookContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}
+	defer func() { _ = hook.Close() }()
+
+	registry := extension.NewRegistry(nil)
+	extensionComponent := extension.Component{InstanceID: "registered-hook", Artifact: extension.Artifact{Name: "registered-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
+	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return RegisterHook(registrar, extension.Registration{ID: "hook", InstanceID: extensionComponent.InstanceID, Scope: extension.GlobalScope()}, hook)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+
+	metadata := runtime.BoundedTurnMetadata{
+		RunID: "run-1", SessionID: "session-1", EpochID: "epoch-1", AgentName: "agent", AgentMode: "primary",
+		ProviderID: "provider", ModelID: "model", ToolNames: []string{"echo"}, MessageCount: 2,
+		RoleCounts: runtime.MessageRoleCounts{System: 1, User: 1}, HasSystemPrompt: true,
+	}
+	_ = extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
+	if _, err := extension.Invoke(plan, context.Background(), runtime.TurnPreparePoint, metadata, func(_ context.Context, value runtime.BoundedTurnMetadata) (runtime.BoundedTurnMetadata, error) {
+		return value, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_ = extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
+
+	for _, operation := range []string{"hook.before-run", "hook.before-turn", "hook.after-turn", "hook.after-run"} {
+		turn := seen[operation]
+		if turn.EpochID != "epoch-1" || turn.AgentName != "agent" || turn.AgentMode != "primary" || turn.ProviderID != "provider" || turn.ModelID != "model" {
+			t.Fatalf("%s metadata = %#v", operation, turn)
+		}
+	}
+	if seen["hook.before-turn"].ToolNames.Len() != 1 || seen["hook.after-run"].ToolNames.Len() != 1 || seen["hook.before-turn"].MessageCount != 2 || !seen["hook.before-turn"].HasSystemPrompt {
+		t.Fatalf("turn metadata = %#v", seen)
+	}
+}
+
+func TestFinishRegisteredHookRunsCleanupAndJoinsErrors(t *testing.T) {
+	afterTurnErr := errors.New("after turn")
+	afterRunErr := errors.New("after run")
+	var operations []string
+	component := &fakeComponent{call: func(_ context.Context, operation string, _ any, _ any) error {
+		operations = append(operations, operation)
+		switch operation {
+		case "hook.after-turn":
+			return afterTurnErr
+		case "hook.after-run":
+			return afterRunErr
+		default:
+			return nil
+		}
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("hook-cleanup")), hookContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &LoadedHook{module: module, turns: map[session.RunID]wittypes.TurnMetadata{"run-1": {RunID: "run-1"}}}
+	defer func() { _ = hook.Close() }()
+	err = finishRegisteredHook(context.Background(), hook, runtime.RunSettledNotice{SessionID: "session-1", Result: runtime.Result{RunID: "run-1"}})
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok || len(joined.Unwrap()) != 2 || !reflect.DeepEqual(operations, []string{"hook.after-turn", "hook.after-run"}) {
+		t.Fatalf("finishRegisteredHook = %v operations=%v", err, operations)
+	}
+	for index, operation := range []string{"hook.after-turn", "hook.after-run"} {
+		var extensionErr *Error
+		if !errors.As(joined.Unwrap()[index], &extensionErr) || extensionErr.Operation != operation {
+			t.Fatalf("joined error %d = %#v", index, joined.Unwrap()[index])
+		}
+	}
+	hook.mu.RLock()
+	_, cached := hook.turns["run-1"]
+	hook.mu.RUnlock()
+	if cached {
+		t.Fatal("after-run did not remove cached metadata")
+	}
+}
+
+func TestContextContributionSourceIsUnambiguousAcrossInstancesAndScopes(t *testing.T) {
+	specs := []extension.Registration{
+		{ID: "c", InstanceID: "a/b", Scope: extension.GlobalScope()},
+		{ID: "b/c", InstanceID: "a", Scope: extension.GlobalScope()},
+		{ID: "c", InstanceID: "a/b", Scope: extension.SessionScope("session")},
+		{ID: "c", InstanceID: "other", Scope: extension.GlobalScope()},
+	}
+	seen := map[string]bool{}
+	for _, spec := range specs {
+		source := contextContributionSource(spec, 0)
+		if seen[source] {
+			t.Fatalf("duplicate source %q for %#v", source, spec)
+		}
+		seen[source] = true
+	}
+}
+
+func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	for _, instanceID := range []string{"context-one", "context-two"} {
+		instanceID := instanceID
+		component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+			*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleUser, Text: instanceID}}
+			return nil
+		}}
+		module, err := loadModule(context.Background(), fixtureConfig(t, []byte(instanceID)), contextSourceContract, fakeFactory(component))
+		if err != nil {
+			t.Fatal(err)
+		}
+		source := &LoadedContextSource{module: module}
+		t.Cleanup(func() { _ = source.Close() })
+		extensionComponent := extension.Component{InstanceID: instanceID, Artifact: extension.Artifact{Name: instanceID, Version: "1", Hash: instanceID + "-artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
+		_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+			return RegisterContextSource(registrar, extension.Registration{ID: "context", InstanceID: instanceID, Scope: extension.GlobalScope()}, source)
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	assembly := runtime.ContextAssembly{Metadata: runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session"}}
+	assembled, err := extension.Invoke(plan, context.Background(), runtime.ContextAssemblePoint, assembly, func(_ context.Context, value runtime.ContextAssembly) (runtime.ContextAssembly, error) {
+		return value, nil
+	})
+	if err != nil || len(assembled.Contributions) != 2 || assembled.Contributions[0].Source == assembled.Contributions[1].Source {
+		t.Fatalf("assembled contributions = %#v, %v", assembled.Contributions, err)
+	}
+}
+
 func TestToolMiddlewareJSONMappingPreservesProtectedContainers(t *testing.T) {
 	component := &fakeComponent{}
 	component.call = func(_ context.Context, operation string, input, output any) error {
@@ -169,7 +318,9 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 }
 
 func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
-	contextComponent := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+	var contextTurn wittypes.TurnMetadata
+	contextComponent := &fakeComponent{call: func(_ context.Context, _ string, input any, output any) error {
+		contextTurn = input.(wittypes.TurnMetadata)
 		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleUser, Text: "from-wasm"}}
 		return nil
 	}}
@@ -203,12 +354,18 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assembly := runtime.ContextAssembly{RunID: "run", SessionID: "session", Base: []*einoschema.Message{einoschema.UserMessage("base")}}
+	assembly := runtime.ContextAssembly{
+		RunID: "run", SessionID: "session", Base: []*einoschema.Message{einoschema.UserMessage("base")},
+		Metadata: runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", EpochID: "epoch", AgentName: "agent", AgentMode: "primary", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true},
+	}
 	assembly, err = extension.Invoke(plan, context.Background(), runtime.ContextAssemblePoint, assembly, func(_ context.Context, value runtime.ContextAssembly) (runtime.ContextAssembly, error) {
 		return value, nil
 	})
 	if err != nil || len(assembly.Contributions) != 1 || assembly.Contributions[0].Message.Content != "from-wasm" {
 		t.Fatalf("assembly = %#v, %v", assembly, err)
+	}
+	if contextTurn.AgentName != "agent" || contextTurn.AgentMode != "primary" || contextTurn.ProviderID != "provider" || contextTurn.ModelID != "model" || !contextTurn.HasSystemPrompt || contextTurn.RoleCounts.User != 1 {
+		t.Fatalf("registered context metadata = %#v", contextTurn)
 	}
 	_ = extension.Notify(plan, context.Background(), runtime.EventPublishedPoint, runtime.Event{Kind: runtime.EventRunStarted})
 	if eventCalls != 1 {

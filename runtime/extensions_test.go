@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -131,7 +132,7 @@ func TestPublishedExtensionPointsAppearInCatalog(t *testing.T) {
 		RunAdmittedPoint.Contract(), RunStartedPoint.Contract(), RunSettledPoint.Contract(),
 		ModelRequestedPoint.Contract(), ModelCompletedPoint.Contract(), ToolPreparedPoint.Contract(),
 		ToolStartedPoint.Contract(), ToolSettledPoint.Contract(), EventPublishedPoint.Contract(),
-		RunBeforeExecutePoint.Contract(), ContextAssemblePoint.Contract(), ModelStreamPoint.Contract(),
+		RunBeforeExecutePoint.Contract(), ContextAssemblePoint.Contract(), TurnPreparePoint.Contract(), ModelStreamPoint.Contract(),
 		ToolPreparePoint.Contract(), ToolExecutePoint.Contract(), ToolResultTransformPoint.Contract(),
 	}
 	for _, contract := range contracts {
@@ -139,6 +140,124 @@ func TestPublishedExtensionPointsAppearInCatalog(t *testing.T) {
 			t.Errorf("catalog missing %s", contract.ID)
 		}
 	}
+}
+
+func TestToolSettledObserversReceiveDeepClonedAttachmentMetadata(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "settled-copy", Artifact: extension.Artifact{Name: "settled-copy", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var secondValue string
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		if err := extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "first", InstanceID: component.InstanceID, Order: 0, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+			notice.Result.Attachments[0].Metadata["owner"] = "mutated"
+			return nil
+		}); err != nil {
+			return err
+		}
+		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "second", InstanceID: component.InstanceID, Order: 1, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+			secondValue = notice.Result.Attachments[0].Metadata["owner"]
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	source := ToolSettledNotice{Result: ToolResult{Attachments: []Attachment{{Metadata: map[string]string{"owner": "original"}}}}}
+	_ = extension.Notify(plan, context.Background(), ToolSettledPoint, source)
+	if secondValue != "original" || source.Result.Attachments[0].Metadata["owner"] != "original" {
+		t.Fatalf("attachment metadata leaked: second=%q source=%q", secondValue, source.Result.Attachments[0].Metadata["owner"])
+	}
+}
+
+func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "turn-order", Artifact: extension.Artifact{Name: "turn-order", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var seen BoundedTurnMetadata
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.Use(registrar, TurnPreparePoint, extension.Registration{ID: "observe", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, metadata BoundedTurnMetadata, next extension.Next[BoundedTurnMetadata, BoundedTurnMetadata]) (BoundedTurnMetadata, error) {
+			seen = cloneBoundedTurnMetadata(metadata)
+			return next(ctx, metadata)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dispatch.Release()
+	plan := &RunPlan{Dispatch: dispatch, Tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) {
+		return []Tool{{Name: "echo"}}, nil
+	})}
+	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
+	prepared, err := (&StreamingOrchestrator{}).prepareSnapshot(withRunPlan(context.Background(), plan), snapshot, "message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.Tools) != 1 || !reflect.DeepEqual(seen.ToolNames, []string{"echo"}) || seen.MessageCount != 1 || seen.RoleCounts.User != 1 {
+		t.Fatalf("prepared=%#v metadata=%#v", prepared.Tools, seen)
+	}
+}
+
+func TestInterfaceIdentityRejectsNonComparableCallableValuesWithoutPanic(t *testing.T) {
+	callable := runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
+	if sameInterfaceIdentity(callable, callable) {
+		t.Fatal("non-comparable callable value unexpectedly acquired stable identity")
+	}
+	first := &callable
+	other := callable
+	second := &other
+	if !sameInterfaceIdentity(first, first) || sameInterfaceIdentity(first, second) {
+		t.Fatal("pointer-backed callable identity comparison is not exact")
+	}
+}
+
+func TestToolValidationRejectsSameTypeCallableReplacement(t *testing.T) {
+	firstExecutor, secondExecutor := testExecutor("first"), testExecutor("second")
+	firstDecoder, secondDecoder := &testInputDecoder{}, &testInputDecoder{}
+	firstApproval, secondApproval := &testApprovalRequester{}, &testApprovalRequester{}
+	original := PreparedToolCall{
+		Tool: Tool{Name: "echo", Executor: firstExecutor, InputDecoder: firstDecoder},
+		Call: ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`), Approval: firstApproval},
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*PreparedToolCall)
+	}{
+		{name: "executor", mutate: func(value *PreparedToolCall) { value.Tool.Executor = secondExecutor }},
+		{name: "decoder", mutate: func(value *PreparedToolCall) { value.Tool.InputDecoder = secondDecoder }},
+		{name: "approval", mutate: func(value *PreparedToolCall) { value.Call.Approval = secondApproval }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := clonePreparedToolCall(original)
+			test.mutate(&candidate)
+			if err := validatePreparedToolCallInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
+				t.Fatalf("validation = %v", err)
+			}
+		})
+	}
+}
+
+type testInputDecoder [1]byte
+
+func (*testInputDecoder) DecodeToolInput(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	return raw, nil
+}
+
+type testApprovalRequester [1]byte
+
+func (*testApprovalRequester) Ask(context.Context, ApprovalRequest) error { return nil }
+
+func testExecutor(marker string) ToolExecutor {
+	executor := runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		return ToolResult{Output: marker}, nil
+	})
+	return &executor
 }
 
 func TestStrictToolPlanRejectsUnsupportedStoreBeforeAdmission(t *testing.T) {

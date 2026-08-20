@@ -163,7 +163,7 @@ func admitDurable(ctx context.Context, store session.Store, request AdmissionReq
 
 func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRun, request AdmissionRequest, now time.Time) error {
 	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		_ = extension.Notify(plan.Dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor, Time: now})
+		_ = extension.Notify(plan.Dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor, Metadata: boundedTurnMetadata(admitted.Snapshot), Time: now})
 	}
 	for _, hook := range a.Hooks {
 		if err := hook.BeforeRun(ctx, admitted.Run); err != nil {

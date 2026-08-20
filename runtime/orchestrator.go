@@ -220,7 +220,7 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 		snapshot.Messages = append(snapshot.Messages, cloneMessages(messages)...)
 	}
 	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Base: cloneMessages(snapshot.Messages)}
+		assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
 		assembled, err := extension.Invoke(plan.Dispatch, ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
 		if err != nil {
 			return TurnSnapshot{}, err
@@ -251,6 +251,12 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 			snapshot.Tools = append(snapshot.Tools, tool)
 		}
 		sort.Slice(snapshot.Tools, func(i, j int) bool { return snapshot.Tools[i].Name < snapshot.Tools[j].Name })
+	}
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		_, err := extension.Invoke(plan.Dispatch, ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
+		if err != nil {
+			return TurnSnapshot{}, err
+		}
 	}
 	for _, hook := range o.Hooks {
 		var err error

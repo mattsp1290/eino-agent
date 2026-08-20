@@ -47,7 +47,8 @@ Order constants reserve broad bands: `runtime.OrderHostPolicy` (`-1000`),
 | `eino-agent/runtime/tool-settled` | atomic settlement | contained notice | contained | call and result are authoritative; reconciliation included | native |
 | `eino-agent/runtime/event-published` | event publication | contained notice to event observers | contained | after infrastructure sink handoff | event-sink adapter |
 | `eino-agent/runtime/run-before-execute` | post-admission execution gate | around decision | fail run/reject | after admission; fresh runs only | native |
-| `eino-agent/runtime/context-assemble` | snapshot preparation | around contribution waterfall | fail run | fresh preparation; persisted request sees materialized result | context/hook adapters |
+| `eino-agent/runtime/context-assemble` | snapshot preparation | around contribution waterfall | fail run | fresh preparation; persisted request sees materialized result | context-source adapter |
+| `eino-agent/runtime/turn-prepare` | post-tool snapshot preparation | required around observation | fail run | fresh preparation after frozen tools resolve | hook adapter |
 | `eino-agent/runtime/model-stream` | provider boundary | required around stream | fail attempt | every adapter attempt; never replayed on tool resume | native |
 | `eino-agent/runtime/tool-prepare` | normalized tool input | around input waterfall | fail call | fresh only; final input is persisted | tool-middleware adapter |
 | `eino-agent/runtime/tool-execute` | allowed tool body | required around execution | protected failure | fresh or pending-call re-execution | native |
@@ -65,6 +66,7 @@ durable history + admitted input
   -> legacy ContextSource order
   -> runtime/context-assemble contributions
   -> resolve frozen tools
+  -> runtime/turn-prepare bounded metadata
   -> legacy Hook.BeforeTurn
   -> render named prompt sections
   -> derive one AuditedModelInput

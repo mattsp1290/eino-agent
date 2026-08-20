@@ -136,6 +136,52 @@ func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 	}
 }
 
+func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := component("mixed-handlers")
+	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "global", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {
+			return err
+		}
+		return extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "session", InstanceID: component.InstanceID, Scope: extension.SessionScope("session-a")}, func(context.Context, string) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := plan.Descriptor.Clone()
+	plan.Dispatch.Release()
+	if len(persisted.Entries) != 1 || persisted.Entries[0].Scope.Kind != string(extension.ScopeGlobal) || len(persisted.Entries[0].Registrations) != 2 {
+		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Entries)
+	}
+
+	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	if err != nil {
+		t.Fatalf("AcquireResumePlan = %v", err)
+	}
+	resumed.Dispatch.Release()
+}
+
+func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
+	registry := NewRegistry(nil)
+	persisted := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{
+		InstanceID: "mixed", Kind: session.ExtensionHandlers, Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)},
+		Registrations: []session.RegistrationIdentity{
+			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-a"}},
+			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-b"}},
+		},
+	}}}
+	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
+	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("conflicting nested scopes = %v", err)
+	}
+}
+
 func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 	registry := NewRegistry(nil)
 	global, err := registry.Mount(context.Background(), component("cap-global"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {

@@ -294,11 +294,11 @@ func materialize(definition Definition, snapshot runtime.TurnSnapshot) runtime.T
 			Extra:       cloneAnyMap(definition.Metadata),
 			ParamsOneOf: cloneParamsOneOf(definition.Parameters),
 		},
-		Executor:     toolExecutor{definition: definition.Clone(), snapshot: snapshot.Clone()},
+		Executor:     &toolExecutor{definition: definition.Clone(), snapshot: snapshot.Clone()},
 		RetrySafe:    definition.RetrySafe,
 		Scope:        cloneScope(scope),
 		Concurrency:  concurrency,
-		InputDecoder: toolDecoder{definition: definition.Clone()},
+		InputDecoder: &toolDecoder{definition: definition.Clone()},
 		Retention:    definition.Retention,
 		Metadata:     cloneStringMap(definition.Metadata),
 	}

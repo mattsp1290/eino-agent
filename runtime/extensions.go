@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -169,6 +170,7 @@ type ContextAssembly struct {
 	SessionID     session.ID
 	RunID         session.RunID
 	EpochID       session.EpochID
+	Metadata      BoundedTurnMetadata
 	Base          []*einoschema.Message
 	Contributions []ContextContribution
 }
@@ -177,6 +179,30 @@ type ContextContribution struct {
 	Source  string
 	Order   int
 	Message *einoschema.Message
+}
+
+// BoundedTurnMetadata is the content-free turn projection exposed through
+// extension points. It deliberately excludes messages, prompts, config maps,
+// provider clients, tool executors, and every other callable runtime value.
+type BoundedTurnMetadata struct {
+	RunID           session.RunID
+	SessionID       session.ID
+	EpochID         session.EpochID
+	AgentName       string
+	AgentMode       string
+	ProviderID      string
+	ModelID         string
+	ToolNames       []string
+	MessageCount    uint32
+	RoleCounts      MessageRoleCounts
+	HasSystemPrompt bool
+}
+
+type MessageRoleCounts struct {
+	System    uint32
+	User      uint32
+	Assistant uint32
+	Tool      uint32
 }
 
 type ModelStreamInput struct {
@@ -226,6 +252,7 @@ type RunAdmittedNotice struct {
 	SessionID session.ID
 	RunID     session.RunID
 	Plan      session.ExtensionPlanDescriptor
+	Metadata  BoundedTurnMetadata
 	Time      time.Time
 }
 
@@ -297,6 +324,7 @@ type ToolSettledNotice struct {
 var (
 	RunBeforeExecutePoint    = extension.NewInterceptor(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, func(value RunGateInput) RunGateInput { return value }, validateRunGateInput, validateRunDecision)
 	ContextAssemblePoint     = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput, validateContextAssembly, validateContextAssemblyResult)
+	TurnPreparePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, cloneBoundedTurnMetadata, validateBoundedTurnMetadataInput, validateBoundedTurnMetadata, validateBoundedTurnMetadataResult)
 	ModelStreamPoint         = extension.NewRequiredDelegatingInterceptor(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateModelStreamInput, validateStreamReader, validateDelegatedStreamReader)
 	ToolPreparePoint         = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCall, validatePreparedToolCallInput, validatePreparedToolCall, validatePreparedToolCallResult)
 	ToolExecutePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecution, validateToolExecutionInput, validateToolOutcome, validateToolExecutionResult)
@@ -434,6 +462,7 @@ func (s compositeEventSink) Emit(ctx context.Context, event Event) error {
 
 func cloneRunAdmittedNotice(value RunAdmittedNotice) RunAdmittedNotice {
 	value.Plan = value.Plan.Clone()
+	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
 	return value
 }
 
@@ -449,7 +478,7 @@ func cloneToolPreparedNotice(value ToolPreparedNotice) ToolPreparedNotice {
 
 func cloneToolSettledNotice(value ToolSettledNotice) ToolSettledNotice {
 	value.Result.Structured = cloneJSON(value.Result.Structured)
-	value.Result.Attachments = cloneSlice(value.Result.Attachments)
+	value.Result.Attachments = cloneAttachments(value.Result.Attachments)
 	value.Result.Metadata = cloneStringMap(value.Result.Metadata)
 	return value
 }
@@ -581,6 +610,7 @@ func validateRunDecision(decision RunDecision) error {
 }
 
 func cloneContextAssembly(value ContextAssembly) ContextAssembly {
+	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
 	value.Base = cloneMessages(value.Base)
 	contributions := value.Contributions
 	value.Contributions = make([]ContextContribution, len(contributions))
@@ -592,7 +622,7 @@ func cloneContextAssembly(value ContextAssembly) ContextAssembly {
 }
 
 func validateContextAssemblyInput(original, candidate ContextAssembly) error {
-	if original.SessionID != candidate.SessionID || original.RunID != candidate.RunID || original.EpochID != candidate.EpochID || !reflect.DeepEqual(original.Base, candidate.Base) {
+	if original.SessionID != candidate.SessionID || original.RunID != candidate.RunID || original.EpochID != candidate.EpochID || !reflect.DeepEqual(original.Metadata, candidate.Metadata) || !reflect.DeepEqual(original.Base, candidate.Base) {
 		return extension.ErrProtectedMutation
 	}
 	return validateContextAssembly(candidate)
@@ -617,6 +647,65 @@ func validateContextAssembly(value ContextAssembly) error {
 
 func validateContextAssemblyResult(original ContextAssembly, output ContextAssembly) error {
 	return validateContextAssemblyInput(original, output)
+}
+
+func cloneBoundedTurnMetadata(value BoundedTurnMetadata) BoundedTurnMetadata {
+	value.ToolNames = cloneSlice(value.ToolNames)
+	return value
+}
+
+func boundedTurnMetadata(snapshot TurnSnapshot) BoundedTurnMetadata {
+	toolNames := make([]string, 0, len(snapshot.Tools))
+	for _, tool := range snapshot.Tools {
+		toolNames = append(toolNames, tool.Name)
+	}
+	counts := MessageRoleCounts{}
+	for _, message := range snapshot.Messages {
+		if message == nil {
+			continue
+		}
+		switch message.Role {
+		case einoschema.System:
+			counts.System = saturatingUint32Increment(counts.System)
+		case einoschema.User:
+			counts.User = saturatingUint32Increment(counts.User)
+		case einoschema.Assistant:
+			counts.Assistant = saturatingUint32Increment(counts.Assistant)
+		case einoschema.Tool:
+			counts.Tool = saturatingUint32Increment(counts.Tool)
+		}
+	}
+	messageCount := len(snapshot.Messages)
+	if messageCount > math.MaxUint32 {
+		messageCount = math.MaxUint32
+	}
+	return BoundedTurnMetadata{
+		RunID: snapshot.RunID, SessionID: snapshot.SessionID, EpochID: snapshot.EpochID,
+		AgentName: snapshot.Config.Agent.Name, AgentMode: snapshot.Config.Agent.Mode,
+		ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID),
+		ToolNames: toolNames, MessageCount: uint32(messageCount), RoleCounts: counts,
+		HasSystemPrompt: snapshot.SystemPrompt != "" || snapshot.Config.Agent.SystemPrompt != "",
+	}
+}
+
+func saturatingUint32Increment(value uint32) uint32 {
+	if value == math.MaxUint32 {
+		return value
+	}
+	return value + 1
+}
+
+func validateBoundedTurnMetadataInput(original, candidate BoundedTurnMetadata) error {
+	if !reflect.DeepEqual(original, candidate) {
+		return extension.ErrProtectedMutation
+	}
+	return nil
+}
+
+func validateBoundedTurnMetadata(BoundedTurnMetadata) error { return nil }
+
+func validateBoundedTurnMetadataResult(original, output BoundedTurnMetadata) error {
+	return validateBoundedTurnMetadataInput(original, output)
 }
 
 func materializeContextAssembly(value ContextAssembly) []*einoschema.Message {
@@ -676,10 +765,10 @@ func clonePreparedToolCall(value PreparedToolCall) PreparedToolCall {
 }
 
 func validatePreparedToolCallInput(original, candidate PreparedToolCall) error {
-	left, right := clonePreparedToolCall(original), clonePreparedToolCall(candidate)
-	left.Call.Input, right.Call.Input = nil, nil
-	left.Call.Pattern, right.Call.Pattern = "", ""
-	if !reflect.DeepEqual(left, right) || !json.Valid(candidate.Call.Input) {
+	leftCall, rightCall := cloneToolCall(original.Call), cloneToolCall(candidate.Call)
+	leftCall.Input, rightCall.Input = nil, nil
+	leftCall.Pattern, rightCall.Pattern = "", ""
+	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(leftCall, rightCall) || !json.Valid(candidate.Call.Input) {
 		return extension.ErrProtectedMutation
 	}
 	return nil
@@ -703,17 +792,49 @@ func cloneToolExecution(value ToolExecution) ToolExecution {
 }
 
 func validateToolExecutionInput(original, candidate ToolExecution) error {
-	if !reflect.DeepEqual(cloneToolExecution(original), cloneToolExecution(candidate)) {
+	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(original.Call, candidate.Call) {
 		return extension.ErrProtectedMutation
 	}
 	return nil
 }
 
 func validateToolExecutionResult(original ToolExecution, output ToolOutcome) error {
-	if output.seal == nil || !reflect.DeepEqual(original.Call, output.Call) {
+	if output.seal == nil || !sameProtectedToolCall(original.Call, output.Call) {
 		return extension.ErrProtectedMutation
 	}
 	return validateToolOutcome(output)
+}
+
+func sameProtectedTool(left, right Tool) bool {
+	leftExecutor, rightExecutor := left.Executor, right.Executor
+	leftDecoder, rightDecoder := left.InputDecoder, right.InputDecoder
+	left.Executor, right.Executor = nil, nil
+	left.InputDecoder, right.InputDecoder = nil, nil
+	return reflect.DeepEqual(cloneTool(left), cloneTool(right)) &&
+		sameInterfaceIdentity(leftExecutor, rightExecutor) &&
+		sameInterfaceIdentity(leftDecoder, rightDecoder)
+}
+
+func sameProtectedToolCall(left, right ToolCall) bool {
+	leftApproval, rightApproval := left.Approval, right.Approval
+	left.Approval, right.Approval = nil, nil
+	return reflect.DeepEqual(cloneToolCall(left), cloneToolCall(right)) && sameInterfaceIdentity(leftApproval, rightApproval)
+}
+
+func sameInterfaceIdentity(left, right any) (same bool) {
+	defer func() {
+		if recover() != nil {
+			same = false
+		}
+	}()
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
+	if leftValue.Type() != rightValue.Type() || !leftValue.Comparable() || !rightValue.Comparable() {
+		return false
+	}
+	return leftValue.Equal(rightValue)
 }
 
 func cloneToolOutcome(value ToolOutcome) ToolOutcome {
@@ -777,9 +898,17 @@ func cloneToolCall(call ToolCall) ToolCall {
 
 func cloneRuntimeToolResult(result ToolResult) ToolResult {
 	result.Structured = cloneJSON(result.Structured)
-	result.Attachments = cloneSlice(result.Attachments)
+	result.Attachments = cloneAttachments(result.Attachments)
 	result.Metadata = cloneStringMap(result.Metadata)
 	return result
+}
+
+func cloneAttachments(attachments []Attachment) []Attachment {
+	cloned := cloneSlice(attachments)
+	for index := range cloned {
+		cloned[index].Metadata = cloneStringMap(cloned[index].Metadata)
+	}
+	return cloned
 }
 
 func cloneMessageDeep(message *einoschema.Message) *einoschema.Message {
