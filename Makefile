@@ -39,8 +39,24 @@ wasm-fixtures: wit
 	cd examples/wasm-extensions && GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) $(TINYGO) build -target=wasm-unknown -buildmode=c-shared -scheduler=none -panic=trap -o .build/permissions-policy.core.wasm ./permissions-policy
 	$(WASM_TOOLS) component embed --world permissions-policy wit $(WASM_BUILD)/permissions-policy.core.wasm -o $(WASM_BUILD)/permissions-policy.embedded.wasm
 	$(WASM_TOOLS) component new $(WASM_BUILD)/permissions-policy.embedded.wasm -o $(WASM_FIXTURES)/permissions-policy.wasm
+	cd examples/wasm-extensions && GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) $(TINYGO) build -target=wasm-unknown -buildmode=c-shared -scheduler=none -panic=trap -o .build/context-source.core.wasm ./context-source
+	$(WASM_TOOLS) component embed --world context-source wit $(WASM_BUILD)/context-source.core.wasm -o $(WASM_BUILD)/context-source.embedded.wasm
+	$(WASM_TOOLS) component new $(WASM_BUILD)/context-source.embedded.wasm -o $(WASM_FIXTURES)/context-source.wasm
+	cd examples/wasm-extensions && GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) $(TINYGO) build -target=wasm-unknown -buildmode=c-shared -scheduler=none -panic=trap -o .build/event-sink.core.wasm ./event-sink
+	$(WASM_TOOLS) component embed --world event-sink wit $(WASM_BUILD)/event-sink.core.wasm -o $(WASM_BUILD)/event-sink.embedded.wasm
+	$(WASM_TOOLS) component new $(WASM_BUILD)/event-sink.embedded.wasm -o $(WASM_FIXTURES)/event-sink.wasm
+	cd examples/wasm-extensions && GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) $(TINYGO) build -target=wasm-unknown -buildmode=c-shared -scheduler=none -panic=trap -o .build/hook.core.wasm ./hook
+	$(WASM_TOOLS) component embed --world hook wit $(WASM_BUILD)/hook.core.wasm -o $(WASM_BUILD)/hook.embedded.wasm
+	$(WASM_TOOLS) component new $(WASM_BUILD)/hook.embedded.wasm -o $(WASM_FIXTURES)/hook.wasm
+	cd examples/wasm-extensions && GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) $(TINYGO) build -target=wasm-unknown -buildmode=c-shared -scheduler=none -panic=trap -o .build/tool-middleware.core.wasm ./tool-middleware
+	$(WASM_TOOLS) component embed --world tool-middleware wit $(WASM_BUILD)/tool-middleware.core.wasm -o $(WASM_BUILD)/tool-middleware.embedded.wasm
+	$(WASM_TOOLS) component new $(WASM_BUILD)/tool-middleware.embedded.wasm -o $(WASM_FIXTURES)/tool-middleware.wasm
 	$(WASM_TOOLS) validate $(WASM_FIXTURES)/tool.wasm
 	$(WASM_TOOLS) validate $(WASM_FIXTURES)/permissions-policy.wasm
+	$(WASM_TOOLS) validate $(WASM_FIXTURES)/context-source.wasm
+	$(WASM_TOOLS) validate $(WASM_FIXTURES)/event-sink.wasm
+	$(WASM_TOOLS) validate $(WASM_FIXTURES)/hook.wasm
+	$(WASM_TOOLS) validate $(WASM_FIXTURES)/tool-middleware.wasm
 	rm -rf $(WASM_BUILD)
 
 tools: $(GOIMPORTS) $(GOLANGCI_LINT)

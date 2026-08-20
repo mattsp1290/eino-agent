@@ -60,3 +60,17 @@ The registry defensively copies definition slices/maps and returns fresh
 `runtime.Tool` containers for every materialization. Model-facing tool info
 contains a fresh `Extra` map so one session cannot mutate another session's tool
 metadata through shared `schema.ToolInfo` state.
+
+## Reversible and strict-plan tools
+
+`tools.Registry.Snapshot` freezes definitions in deterministic generation
+order. `Unregister` removes only the exact active generation, preventing stale
+reload handles from deleting replacements. `composition.Registry` adds global
+and exact-session layers: a session definition shadows a same-name global
+definition, while restrictions only intersect.
+
+Strict registry-backed calls reserve result message and part IDs at admission
+and require `session.ToolSettlementStore`. SQLite commits terminal tool state
+and the model-visible result atomically and idempotently. The protected stage
+order is documented in
+[`extension-points.md`](extension-points.md#exact-pipelines).

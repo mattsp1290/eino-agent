@@ -42,9 +42,14 @@ type StreamObserver interface {
 type Request struct {
 	Identity Identity
 	Messages []*einoschema.Message
+	System   string
 	Tools    []*einoschema.ToolInfo
 	Options  map[string]string
 	Observer StreamObserver
+	// IdempotencyKey is assigned by a ledger-enabled runtime. It is not part of
+	// the model-visible audited projection and is used only by adapters that
+	// explicitly implement IdempotentStreamer.
+	IdempotencyKey string
 }
 
 // Identity is provider-visible request identity. It intentionally avoids
@@ -143,6 +148,14 @@ type OptionalAdapter interface {
 // provider callbacks in addition to the raw Eino stream.
 type Streamer interface {
 	StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[*einoschema.Message], error)
+}
+
+// IdempotentStreamer is an optional adapter capability. The key identifies the
+// durable prepared request record; adapters decide how (or whether) their
+// provider transport can honor it and must not imply exactly-once delivery.
+type IdempotentStreamer interface {
+	Streamer
+	StreamProviderWithIdempotencyKey(ctx context.Context, request Request, key string) (*einoschema.StreamReader[*einoschema.Message], error)
 }
 
 // AdapterResolver resolves model selections through registered adapters.

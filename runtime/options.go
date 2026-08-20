@@ -46,6 +46,11 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 	if len(missing) != 0 {
 		return nil, fmt.Errorf("%w: missing required dependencies: %s", ErrInvalidOrchestrator, strings.Join(missing, ", "))
 	}
+	if o.ModelRequestLedger {
+		if _, ok := o.Store.(session.ModelRequestStore); !ok {
+			return nil, fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
+		}
+	}
 	return o, nil
 }
 
@@ -90,6 +95,11 @@ func WithModelResolver(value model.Resolver) Option {
 // WithToolRegistry sets the tool registry.
 func WithToolRegistry(value ToolRegistry) Option {
 	return interfaceOption("ToolRegistry", value, func(o *StreamingOrchestrator, value ToolRegistry) { o.Tools = value })
+}
+
+// WithRunPlanProvider configures immutable per-run extension plans.
+func WithRunPlanProvider(value RunPlanProvider) Option {
+	return interfaceOption("RunPlanProvider", value, func(o *StreamingOrchestrator, value RunPlanProvider) { o.Plans = value })
 }
 
 // WithContextSource appends a context source.
@@ -150,6 +160,31 @@ func WithToolTurns(value int) Option {
 // WithQueueSize sets the event queue size.
 func WithQueueSize(value int) Option {
 	return func(o *StreamingOrchestrator) error { o.QueueSize = value; return nil }
+}
+
+// WithSystemPromptMaterialization explicitly enables configured Agent system
+// prompts at the provider boundary. It is disabled by default for compatibility.
+func WithSystemPromptMaterialization(enabled bool) Option {
+	return func(o *StreamingOrchestrator) error { o.SystemPromptMaterialization = enabled; return nil }
+}
+
+// WithModelRequestLedger enables the optional durable provider-attempt ledger.
+func WithModelRequestLedger(enabled bool) Option {
+	return func(o *StreamingOrchestrator) error { o.ModelRequestLedger = enabled; return nil }
+}
+
+// WithModelRequestSafeOptions allowlists model option keys that may be copied
+// into audit records. No options are recorded by default.
+func WithModelRequestSafeOptions(keys ...string) Option {
+	return func(o *StreamingOrchestrator) error {
+		o.ModelRequestSafeOptions = append([]string(nil), keys...)
+		return nil
+	}
+}
+
+// WithModelRequestMaxBytes tightens the default canonical ledger content cap.
+func WithModelRequestMaxBytes(limit int) Option {
+	return func(o *StreamingOrchestrator) error { o.ModelRequestMaxBytes = limit; return nil }
 }
 
 // WithLease sets the durable work lease duration.

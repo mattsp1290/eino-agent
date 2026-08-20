@@ -337,3 +337,19 @@ integration-specific sketches.
 - raw SSE frame persistence as a replay mechanism;
 - completed AG-UI parity for ensemble or any other consumer until that adapter
   exists.
+
+## Consuming extension-aware runs
+
+Use `composition.NewRegistry` when one mount must atomically own typed handlers
+and scoped capabilities. Mount instances need stable artifact and effective
+configuration hashes; these become durable resume identity. Global scope and
+exact session scope route trusted code but do not provide tenant isolation.
+
+Pass the registry via `runtime.WithRunPlanProvider`. Enable
+`WithSystemPromptMaterialization(true)` only when the configured agent prompt
+should reach providers; named mounted prompt sections remain explicit and are
+evaluated per provider step. Enable `WithModelRequestLedger(true)` only with a
+store implementing `session.ModelRequestStore`, set a retention policy, and
+allowlist only non-secret option keys. See the
+[`extension point catalog`](architecture/extension-points.md) and the
+[`native extension example`](../examples/native-extension).

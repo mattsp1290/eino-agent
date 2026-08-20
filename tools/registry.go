@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -56,6 +57,19 @@ type Definition struct {
 	Retention   runtime.RetentionPolicy
 	Permissions []string
 	Metadata    map[string]string
+	// Provenance is the restart-stable identity of the component and executor
+	// supplying this definition. It is copied into frozen run plans.
+	Provenance Provenance
+}
+
+// Provenance identifies the executable artifact behind a tool definition.
+type Provenance struct {
+	InstanceID      string
+	ArtifactName    string
+	ArtifactVersion string
+	ArtifactHash    string
+	ConfigHash      string
+	ExecutorHash    string
 }
 
 // Execution is the decoded input and durable runtime context for one call.
@@ -130,28 +144,92 @@ func (r *Registry) Replace(registration Registration, definition Definition) (Re
 	return next, nil
 }
 
-// ResolveTools materializes enabled tools for a run snapshot.
-func (r *Registry) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
+// Unregister removes only the exact active registration generation.
+func (r *Registry) Unregister(registration Registration) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	current, ok := r.defs[registration.Name]
+	if !ok || current.generation != registration.Generation {
+		return fmt.Errorf("%w: %s", ErrStaleRegistration, registration.Name)
+	}
+	delete(r.defs, registration.Name)
+	return nil
+}
+
+// SnapshotEntry is one exact generation in a deterministic registry snapshot.
+type SnapshotEntry struct {
+	Registration Registration
+	Definition   Definition
+}
+
+// Snapshot is an immutable set of exact tool generations. Materialization
+// applies run enable/disable selection without consulting the live registry.
+type Snapshot struct{ entries []SnapshotEntry }
+
+// Snapshot returns every active definition ordered by registration generation.
+func (r *Registry) Snapshot() Snapshot {
+	if r == nil {
+		return Snapshot{}
+	}
+	r.mu.RLock()
+	entries := make([]SnapshotEntry, 0, len(r.defs))
+	for name, entry := range r.defs {
+		entries = append(entries, SnapshotEntry{Registration: Registration{Name: name, Generation: entry.generation}, Definition: entry.definition.Clone()})
+	}
+	r.mu.RUnlock()
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].Registration.Generation != entries[j].Registration.Generation {
+			return entries[i].Registration.Generation < entries[j].Registration.Generation
+		}
+		return entries[i].Registration.Name < entries[j].Registration.Name
+	})
+	return Snapshot{entries: entries}
+}
+
+// Entries returns a defensive copy of the frozen generations.
+func (s Snapshot) Entries() []SnapshotEntry {
+	result := make([]SnapshotEntry, len(s.entries))
+	for index, entry := range s.entries {
+		result[index] = SnapshotEntry{Registration: entry.Registration, Definition: entry.Definition.Clone()}
+	}
+	return result
+}
+
+// NewSnapshot builds a frozen snapshot from entries supplied by a composition
+// coordinator. Entries are sorted by generation and name.
+func NewSnapshot(entries []SnapshotEntry) Snapshot {
+	next := make([]SnapshotEntry, len(entries))
+	for index, entry := range entries {
+		next[index] = SnapshotEntry{Registration: entry.Registration, Definition: entry.Definition.Clone()}
+	}
+	sort.Slice(next, func(i, j int) bool {
+		if next[i].Registration.Generation != next[j].Registration.Generation {
+			return next[i].Registration.Generation < next[j].Registration.Generation
+		}
+		return next[i].Registration.Name < next[j].Registration.Name
+	})
+	return Snapshot{entries: next}
+}
+
+// ResolveTools materializes from the immutable snapshot.
+func (s Snapshot) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r.mu.RLock()
 	enabled := enabledSet(snapshot)
 	disabled := disabledSet(snapshot)
-	definitions := make([]Definition, 0, len(r.defs))
-	for _, entry := range r.defs {
-		definition := entry.definition.Clone()
-		if !includeTool(definition.Name, enabled, disabled) {
-			continue
+	result := make([]runtime.Tool, 0, len(s.entries))
+	for _, entry := range s.entries {
+		if includeTool(entry.Definition.Name, enabled, disabled) {
+			result = append(result, materialize(entry.Definition.Clone(), snapshot.Clone()))
 		}
-		definitions = append(definitions, definition)
-	}
-	r.mu.RUnlock()
-	result := make([]runtime.Tool, 0, len(definitions))
-	for _, definition := range definitions {
-		result = append(result, materialize(definition, snapshot.Clone()))
 	}
 	return result, nil
+}
+
+// ResolveTools materializes enabled tools for a run snapshot.
+func (r *Registry) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
+	return r.Snapshot().ResolveTools(ctx, snapshot)
 }
 
 // Clone returns a defensive copy of definition containers.

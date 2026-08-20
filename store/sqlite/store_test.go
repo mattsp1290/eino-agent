@@ -3,6 +3,7 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -140,6 +141,42 @@ func TestFinishToolCallRejectsConflictingConcurrentSettlement(t *testing.T) {
 	}
 }
 
+func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing.T) {
+	st, call := setupClaimedToolCall(t)
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+	settlement := session.ToolSettlement{
+		ID: call.ID, Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
+		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
+		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+	}
+	if err := st.SettleToolCall(ctx, settlement); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SettleToolCall(ctx, settlement); err != nil {
+		t.Fatalf("idempotent settlement = %v", err)
+	}
+	settled, err := st.GetToolCall(ctx, call.ID)
+	if err != nil || settled.Status != session.ToolCallCompleted {
+		t.Fatalf("settled call = %#v, %v", settled, err)
+	}
+	if _, err := st.GetMessage(ctx, call.ResultMessageID); err != nil {
+		t.Fatalf("reserved result message = %v", err)
+	}
+	unreconciled, err := st.ListUnreconciledToolSettlements(ctx, call.RunID)
+	if err != nil || len(unreconciled) != 0 {
+		t.Fatalf("unreconciled = %#v, %v", unreconciled, err)
+	}
+	conflict := settlement
+	conflict.Output = json.RawMessage(`{"different":true}`)
+	conflict.ResultPart.Payload = conflict.Output
+	if err := st.SettleToolCall(ctx, conflict); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("conflicting settlement = %v", err)
+	}
+}
+
 func TestFinishRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -199,7 +236,7 @@ func TestOpenRejectsUnsupportedSchemaVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open raw sqlite db: %v", err)
 	}
-	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_version(version, applied_at) VALUES (2, 'now');`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_version(version, applied_at) VALUES (3, 'now');`); err != nil {
 		t.Fatalf("seed schema version: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -213,6 +250,76 @@ func TestOpenRejectsUnsupportedSchemaVersion(t *testing.T) {
 	}
 	if !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("Open err = %v, want ErrConflict", err)
+	}
+}
+
+func TestOpenUpgradesVersionOneDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(migration001); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+	store, err := Open(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var version int
+	if err := store.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil || version != 2 {
+		t.Fatalf("version = %d, %v", version, err)
+	}
+}
+
+func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
+	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: "ledger-session", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AdmitRun(ctx, session.Run{ID: "ledger-run", SessionID: "ledger-session", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= 2; index++ {
+		record := session.ModelRequestRecord{ID: session.ModelRequestID(fmt.Sprintf("request-%d", index)), SessionID: "ledger-session", RunID: "ledger-run", AssistantMessageID: "assistant", Attempt: index, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now.Add(time.Duration(index) * time.Second), UpdatedAt: now}
+		created, err := store.CreateModelRequest(ctx, record)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created.State = session.ModelRequestDispatchStarted
+		created.UpdatedAt = now.Add(time.Minute)
+		if err := store.UpdateModelRequest(ctx, created); err != nil {
+			t.Fatal(err)
+		}
+		created.State = session.ModelRequestCompleted
+		created.UpdatedAt = now.Add(2 * time.Minute)
+		if err := store.UpdateModelRequest(ctx, created); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.UpdateModelRequest(ctx, created); err != nil {
+			t.Fatalf("idempotent terminal update: %v", err)
+		}
+	}
+	first, err := store.ListModelRequests(ctx, "ledger-run", session.ModelRequestCursor{Limit: 1})
+	if err != nil || len(first.Records) != 1 || first.Next.AfterID == "" {
+		t.Fatalf("first page = %#v, %v", first, err)
+	}
+	second, err := store.ListModelRequests(ctx, "ledger-run", first.Next)
+	if err != nil || len(second.Records) != 1 || second.Records[0].State != session.ModelRequestCompleted {
+		t.Fatalf("second page = %#v, %v", second, err)
+	}
+	invalid := second.Records[0]
+	invalid.State = session.ModelRequestPrepared
+	if err := store.UpdateModelRequest(ctx, invalid); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("backward transition = %v", err)
 	}
 }
 
@@ -236,7 +343,7 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
 		_ = st.Close()
 		t.Fatalf("append message: %v", err)
 	}
-	call := session.ToolCall{ID: "call-tool", SessionID: "session-tool", RunID: "run-tool", MessageID: "msg-tool", Name: "tool", Input: []byte(`{"ok":true}`), Status: session.ToolCallPending}
+	call := session.ToolCall{ID: "call-tool", SessionID: "session-tool", RunID: "run-tool", MessageID: "msg-tool", ResultMessageID: "result-tool", ResultPartID: "part-tool", Name: "tool", Input: []byte(`{"ok":true}`), Status: session.ToolCallPending}
 	if _, err := st.CreateToolCall(ctx, call); err != nil {
 		_ = st.Close()
 		t.Fatalf("create tool call: %v", err)

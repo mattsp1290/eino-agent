@@ -177,6 +177,18 @@ static void wasmext_val_u32(wasmtime_component_val_t *out, uint32_t value) {
   out->of.u32 = value;
 }
 
+static void wasmext_val_s64(wasmtime_component_val_t *out, int64_t value) {
+  memset(out, 0, sizeof(*out));
+  out->kind = 7;
+  out->of.s64 = value;
+}
+
+static void wasmext_val_enum(wasmtime_component_val_t *out, const char *data, size_t size) {
+  memset(out, 0, sizeof(*out));
+  out->kind = 17;
+  wasmext_name(&out->of.enumeration, data, size);
+}
+
 static void wasmext_val_record(wasmtime_component_val_t *out, size_t size) {
   memset(out, 0, sizeof(*out));
   out->kind = 14;
@@ -214,6 +226,9 @@ static size_t wasmext_record_size(const wasmtime_component_val_t *value) { retur
 static wasmtime_component_val_t *wasmext_record_value(const wasmtime_component_val_t *value, size_t index) { return &value->of.record.data[index].val; }
 static size_t wasmext_list_size(const wasmtime_component_val_t *value) { return value->of.list.size; }
 static wasmtime_component_val_t *wasmext_list_value(const wasmtime_component_val_t *value, size_t index) { return &value->of.list.data[index]; }
+static const char *wasmext_variant_data(const wasmtime_component_val_t *value) { return value->of.variant.discriminant.data; }
+static size_t wasmext_variant_size(const wasmtime_component_val_t *value) { return value->of.variant.discriminant.size; }
+static wasmtime_component_val_t *wasmext_variant_value(const wasmtime_component_val_t *value) { return value->of.variant.val; }
 
 static wasmtime_error_t *wasmext_add_host_log(
     wasmtime_component_linker_t *linker, uint64_t id) {
@@ -258,13 +273,14 @@ import (
 )
 
 const (
-	maxCInt             = 1<<31 - 1
-	componentKindBool   = 0
-	componentKindString = 12
-	componentKindList   = 13
-	componentKindRecord = 14
-	componentKindEnum   = 17
-	componentKindResult = 19
+	maxCInt              = 1<<31 - 1
+	componentKindBool    = 0
+	componentKindString  = 12
+	componentKindList    = 13
+	componentKindRecord  = 14
+	componentKindEnum    = 17
+	componentKindVariant = 16
+	componentKindResult  = 19
 )
 
 type wasmHostLogState struct {
@@ -463,6 +479,18 @@ func setComponentU32(value *C.wasmtime_component_val_t, input uint32) {
 	C.wasmext_val_u32(value, C.uint32_t(input))
 }
 
+func setComponentS64(value *C.wasmtime_component_val_t, input int64) {
+	C.wasmext_val_s64(value, C.int64_t(input))
+}
+
+func setComponentEnum(value *C.wasmtime_component_val_t, input string) {
+	var data *C.char
+	if input != "" {
+		data = (*C.char)(unsafe.Pointer(unsafe.StringData(input)))
+	}
+	C.wasmext_val_enum(value, data, C.size_t(len(input)))
+}
+
 func newComponentRecord(fieldNames []string) C.wasmtime_component_val_t {
 	var record C.wasmtime_component_val_t
 	C.wasmext_val_record(&record, C.size_t(len(fieldNames)))
@@ -540,6 +568,22 @@ func operationFunction(operation string) (string, error) {
 		return "execute", nil
 	case "permissions-policy.decide":
 		return "decide", nil
+	case "context-source.load-context":
+		return "load-context", nil
+	case "event-sink.emit":
+		return "emit", nil
+	case "hook.before-run":
+		return "before-run", nil
+	case "hook.before-turn":
+		return "before-turn", nil
+	case "hook.after-turn":
+		return "after-turn", nil
+	case "hook.after-run":
+		return "after-run", nil
+	case "tool-middleware.before-tool-call":
+		return "before-tool-call", nil
+	case "tool-middleware.after-tool-call":
+		return "after-tool-call", nil
 	default:
 		return "", errors.New("unsupported component operation")
 	}
@@ -565,6 +609,41 @@ func componentArguments(operation string, input any) ([]C.wasmtime_component_val
 			return nil, errors.New("invalid permission input")
 		}
 		return []C.wasmtime_component_val_t{componentPermissionRequest(request)}, nil
+	case "context-source.load-context", "hook.before-run", "hook.before-turn", "hook.after-turn", "hook.after-run":
+		turn, ok := input.(wittypes.TurnMetadata)
+		if !ok {
+			return nil, errors.New("invalid turn metadata input")
+		}
+		return []C.wasmtime_component_val_t{componentTurnMetadata(turn)}, nil
+	case "event-sink.emit":
+		event, ok := input.(wittypes.BoundedEvent)
+		if !ok {
+			return nil, errors.New("invalid bounded event input")
+		}
+		return []C.wasmtime_component_val_t{componentBoundedEvent(event)}, nil
+	case "tool-middleware.before-tool-call":
+		request, ok := input.(toolMiddlewareBeforeRequest)
+		if !ok {
+			return nil, errors.New("invalid middleware input")
+		}
+		arguments := make([]C.wasmtime_component_val_t, 4)
+		setComponentString(&arguments[0], request.ToolName)
+		setComponentString(&arguments[1], request.ToolCallID)
+		setComponentString(&arguments[2], request.InputJSON)
+		arguments[3] = componentTurnMetadata(request.Turn)
+		return arguments, nil
+	case "tool-middleware.after-tool-call":
+		request, ok := input.(toolMiddlewareAfterRequest)
+		if !ok {
+			return nil, errors.New("invalid middleware input")
+		}
+		arguments := make([]C.wasmtime_component_val_t, 5)
+		setComponentString(&arguments[0], request.ToolName)
+		setComponentString(&arguments[1], request.ToolCallID)
+		setComponentString(&arguments[2], request.InputJSON)
+		setComponentString(&arguments[3], request.OutputJSON)
+		arguments[4] = componentTurnMetadata(request.Turn)
+		return arguments, nil
 	default:
 		return nil, errors.New("unsupported component operation")
 	}
@@ -608,7 +687,27 @@ func componentPermissionRequest(request wittypes.PermissionRequest) C.wasmtime_c
 	return record
 }
 
+func componentBoundedEvent(event wittypes.BoundedEvent) C.wasmtime_component_val_t {
+	record := newComponentRecord([]string{"kind", "session-id", "run-id", "message-id", "tool-call-id", "epoch-id", "timestamp-unix-millis", "payload-summary"})
+	setComponentString(componentRecordFieldForSet(&record, 0), event.Kind)
+	setComponentString(componentRecordFieldForSet(&record, 1), event.SessionID)
+	setComponentString(componentRecordFieldForSet(&record, 2), event.RunID)
+	setComponentString(componentRecordFieldForSet(&record, 3), event.MessageID)
+	setComponentString(componentRecordFieldForSet(&record, 4), event.ToolCallID)
+	setComponentString(componentRecordFieldForSet(&record, 5), event.EpochID)
+	setComponentS64(componentRecordFieldForSet(&record, 6), event.TimestampUnixMillis)
+	setComponentString(componentRecordFieldForSet(&record, 7), event.PayloadSummary)
+	return record
+}
+
 func decodeComponentResult(operation string, result *C.wasmtime_component_val_t, output any, limit int64) error {
+	if operation == "tool-middleware.before-tool-call" || operation == "tool-middleware.after-tool-call" {
+		replacement, ok := output.(*wittypes.Replacement)
+		if !ok {
+			return errors.New("invalid replacement output")
+		}
+		return decodeReplacement(result, replacement, limit)
+	}
 	payload, err := componentResult(result)
 	if err != nil {
 		return err
@@ -637,9 +736,120 @@ func decodeComponentResult(operation string, result *C.wasmtime_component_val_t,
 			return errors.New("invalid permission output")
 		}
 		return decodePermissionDecision(payload, decision, limit)
+	case "context-source.load-context":
+		messages, ok := output.(*[]wittypes.TextMessage)
+		if !ok {
+			return errors.New("invalid context output")
+		}
+		return decodeTextMessages(payload, messages, limit)
+	case "event-sink.emit", "hook.before-run", "hook.before-turn", "hook.after-turn", "hook.after-run":
+		return nil
 	default:
 		return errors.New("unsupported component operation")
 	}
+}
+
+func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.TextMessage, limit int64) error {
+	if value == nil || int(C.wasmext_val_kind(value)) != componentKindList {
+		return errors.New("component returned an unexpected message list")
+	}
+	count := int(C.wasmext_list_size(value))
+	if count > 4096 {
+		return errModuleTooLarge
+	}
+	messages := make([]wittypes.TextMessage, 0, count)
+	var total int64
+	for index := 0; index < count; index++ {
+		item := C.wasmext_list_value(value, C.size_t(index))
+		roleValue, err := componentRecordField(item, 0, 2)
+		if err != nil {
+			return err
+		}
+		textValue, err := componentRecordField(item, 1, 2)
+		if err != nil {
+			return err
+		}
+		role, err := componentEnum(roleValue)
+		if err != nil {
+			return err
+		}
+		text, err := componentString(textValue, limit-total)
+		if err != nil {
+			return err
+		}
+		total += int64(len(text))
+		message := wittypes.TextMessage{Text: text}
+		switch role {
+		case "system":
+			message.Role = wittypes.TextRoleSystem
+		case "user":
+			message.Role = wittypes.TextRoleUser
+		case "assistant":
+			message.Role = wittypes.TextRoleAssistant
+		default:
+			return errors.New("component returned an invalid text role")
+		}
+		messages = append(messages, message)
+	}
+	*output = messages
+	return nil
+}
+
+func decodeReplacement(value *C.wasmtime_component_val_t, output *wittypes.Replacement, limit int64) error {
+	if value == nil || int(C.wasmext_val_kind(value)) != componentKindVariant {
+		return errors.New("component returned an unexpected replacement")
+	}
+	name := C.GoStringN(C.wasmext_variant_data(value), C.int(C.wasmext_variant_size(value)))
+	payload := C.wasmext_variant_value(value)
+	switch name {
+	case "unchanged":
+		*output = wittypes.ReplacementUnchanged()
+		return nil
+	case "json":
+		text, err := componentString(payload, limit)
+		if err != nil {
+			return err
+		}
+		*output = wittypes.ReplacementJSON(text)
+		return nil
+	case "error":
+		guestErr, err := decodeStructuredError(payload, limit)
+		if err != nil {
+			return err
+		}
+		*output = wittypes.ReplacementError(guestErr)
+		return nil
+	default:
+		return errors.New("component returned an invalid replacement case")
+	}
+}
+
+func decodeStructuredError(value *C.wasmtime_component_val_t, limit int64) (wittypes.StructuredError, error) {
+	codeValue, err := componentRecordField(value, 0, 3)
+	if err != nil {
+		return wittypes.StructuredError{}, err
+	}
+	messageValue, err := componentRecordField(value, 1, 3)
+	if err != nil {
+		return wittypes.StructuredError{}, err
+	}
+	retryableValue, err := componentRecordField(value, 2, 3)
+	if err != nil {
+		return wittypes.StructuredError{}, err
+	}
+	code, err := componentString(codeValue, limit)
+	if err != nil {
+		return wittypes.StructuredError{}, err
+	}
+	message, err := componentString(messageValue, limit-int64(len(code)))
+	if err != nil {
+		return wittypes.StructuredError{}, err
+	}
+	retryable, err := componentBool(retryableValue)
+	if err != nil {
+		return wittypes.StructuredError{}, err
+	}
+	return wittypes.StructuredError{Code: code, Message: message, Retryable: retryable}, nil
 }
 
 func decodeToolMetadata(payload *C.wasmtime_component_val_t, metadata *wittypes.ToolMetadata, limit int64) error {

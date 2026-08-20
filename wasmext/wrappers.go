@@ -13,8 +13,10 @@ import (
 	"github.com/eino-contrib/jsonschema"
 	"go.bytecodealliance.org/cm"
 
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
@@ -180,6 +182,301 @@ func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engine
 	return &permissionsPolicy{module: module}, nil
 }
 
+// LoadedContextSource adapts context-source@0.1.0 and owns its component.
+type LoadedContextSource struct{ module *module }
+
+func (s *LoadedContextSource) Close() error { return s.module.Close() }
+
+func (s *LoadedContextSource) LoadContext(ctx context.Context, snapshot runtime.TurnSnapshot) ([]*einoschema.Message, error) {
+	turn := turnMetadata(snapshot)
+	var output []wittypes.TextMessage
+	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), turn, &output); err != nil {
+		return nil, err
+	}
+	messages := make([]*einoschema.Message, 0, len(output))
+	var total int64
+	for _, message := range output {
+		total += int64(len(message.Text))
+		if total > s.module.limits.MaxOutputBytes {
+			return nil, extensionError(ErrorSize, s.module.identity, "context-source.load-context", nil)
+		}
+		switch message.Role {
+		case wittypes.TextRoleSystem:
+			messages = append(messages, einoschema.SystemMessage(message.Text))
+		case wittypes.TextRoleUser:
+			messages = append(messages, einoschema.UserMessage(message.Text))
+		case wittypes.TextRoleAssistant:
+			messages = append(messages, einoschema.AssistantMessage(message.Text, nil))
+		default:
+			return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
+		}
+	}
+	return messages, nil
+}
+
+func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error) {
+	module, err := loadModule(ctx, cfg, contextSourceContract, newEngine)
+	if err != nil {
+		return nil, err
+	}
+	return &LoadedContextSource{module: module}, nil
+}
+
+func LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error) {
+	return OpenContextSource(ctx, cfg)
+}
+
+// LoadedEventSink emits only a bounded, content-free projection.
+type LoadedEventSink struct{ module *module }
+
+func (s *LoadedEventSink) Close() error { return s.module.Close() }
+
+func (s *LoadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
+	input := wittypes.BoundedEvent{
+		Kind: string(event.Kind), SessionID: string(event.SessionID), RunID: string(event.RunID),
+		MessageID: string(event.MessageID), ToolCallID: string(event.ToolCallID), EpochID: string(event.EpochID),
+		TimestampUnixMillis: event.Time.UTC().UnixMilli(), PayloadSummary: boundedEventSummary(event, s.module.limits.MaxOutputBytes),
+	}
+	return s.module.call(ctx, "event-sink.emit", boundedEventSize(input), input, nil)
+}
+
+func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error) {
+	module, err := loadModule(ctx, cfg, eventSinkContract, newEngine)
+	if err != nil {
+		return nil, err
+	}
+	return &LoadedEventSink{module: module}, nil
+}
+
+func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
+	return OpenEventSink(ctx, cfg)
+}
+
+// LoadedHook caches full turn metadata by run for deterministic after hooks.
+type LoadedHook struct {
+	module *module
+	mu     sync.RWMutex
+	turns  map[session.RunID]wittypes.TurnMetadata
+}
+
+func (h *LoadedHook) Close() error {
+	h.mu.Lock()
+	h.turns = nil
+	h.mu.Unlock()
+	return h.module.Close()
+}
+
+func (h *LoadedHook) BeforeRun(ctx context.Context, run session.Run) error {
+	turn := partialTurnMetadata(run)
+	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), turn, nil)
+}
+
+func (h *LoadedHook) BeforeTurn(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.TurnSnapshot, error) {
+	turn := turnMetadata(snapshot)
+	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), turn, nil); err != nil {
+		return runtime.TurnSnapshot{}, err
+	}
+	h.mu.Lock()
+	if h.turns == nil {
+		h.turns = make(map[session.RunID]wittypes.TurnMetadata)
+	}
+	h.turns[snapshot.RunID] = turn
+	h.mu.Unlock()
+	return snapshot.Clone(), nil
+}
+
+func (h *LoadedHook) AfterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {
+	turn := h.cachedTurn(snapshot.RunID, turnMetadata(snapshot))
+	return h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), turn, nil)
+}
+
+func (h *LoadedHook) AfterRun(ctx context.Context, result runtime.Result) error {
+	h.mu.Lock()
+	turn, ok := h.turns[result.RunID]
+	delete(h.turns, result.RunID)
+	h.mu.Unlock()
+	if !ok {
+		turn = wittypes.TurnMetadata{RunID: string(result.RunID)}
+	}
+	return h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), turn, nil)
+}
+
+func (h *LoadedHook) cachedTurn(runID session.RunID, fallback wittypes.TurnMetadata) wittypes.TurnMetadata {
+	h.mu.RLock()
+	turn, ok := h.turns[runID]
+	h.mu.RUnlock()
+	if ok {
+		return turn
+	}
+	return fallback
+}
+
+func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
+	module, err := loadModule(ctx, cfg, hookContract, newEngine)
+	if err != nil {
+		return nil, err
+	}
+	return &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
+}
+
+func LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error) { return OpenHook(ctx, cfg) }
+
+// LoadedToolMiddleware preserves attachments and metadata on replacement.
+type LoadedToolMiddleware struct{ module *module }
+
+func (m *LoadedToolMiddleware) Close() error { return m.module.Close() }
+
+func (m *LoadedToolMiddleware) BeforeToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall) (json.RawMessage, error) {
+	turn := middlewareTurn(call, tool)
+	request := toolMiddlewareBeforeRequest{ToolName: tool.Name, ToolCallID: string(call.ID), InputJSON: string(call.Input), Turn: turn}
+	var replacement wittypes.Replacement
+	if err := m.module.call(ctx, "tool-middleware.before-tool-call", len(request.ToolName)+len(request.ToolCallID)+len(request.InputJSON)+turnMetadataSize(turn), request, &replacement); err != nil {
+		return nil, err
+	}
+	return applyInputReplacement(m.module, "tool-middleware.before-tool-call", call.Input, replacement)
+}
+
+func (m *LoadedToolMiddleware) AfterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, _ error) (runtime.ToolResult, error) {
+	encoded, err := toolResultJSON(result)
+	if err != nil {
+		return runtime.ToolResult{}, extensionError(ErrorPayload, m.module.identity, "tool-middleware.after-tool-call", err)
+	}
+	turn := middlewareTurn(call, tool)
+	request := toolMiddlewareAfterRequest{ToolName: tool.Name, ToolCallID: string(call.ID), InputJSON: string(call.Input), OutputJSON: string(encoded), Turn: turn}
+	var replacement wittypes.Replacement
+	inputSize := len(request.ToolName) + len(request.ToolCallID) + len(request.InputJSON) + len(request.OutputJSON) + turnMetadataSize(turn)
+	if err := m.module.call(ctx, "tool-middleware.after-tool-call", inputSize, request, &replacement); err != nil {
+		return runtime.ToolResult{}, err
+	}
+	return applyResultReplacement(m.module, result, replacement)
+}
+
+type toolMiddlewareBeforeRequest struct {
+	ToolName, ToolCallID, InputJSON string
+	Turn                            wittypes.TurnMetadata
+}
+
+type toolMiddlewareAfterRequest struct {
+	ToolName, ToolCallID, InputJSON, OutputJSON string
+	Turn                                        wittypes.TurnMetadata
+}
+
+func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error) {
+	module, err := loadModule(ctx, cfg, toolMiddlewareContract, newEngine)
+	if err != nil {
+		return nil, err
+	}
+	return &LoadedToolMiddleware{module: module}, nil
+}
+
+func LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error) {
+	return OpenToolMiddleware(ctx, cfg)
+}
+
+func partialTurnMetadata(run session.Run) wittypes.TurnMetadata {
+	return wittypes.TurnMetadata{RunID: string(run.ID), SessionID: string(run.SessionID), EpochID: string(run.ContextEpoch), AgentName: run.Agent, ProviderID: run.ProviderID, ModelID: run.ModelID}
+}
+
+func middlewareTurn(call runtime.ToolCall, tool runtime.Tool) wittypes.TurnMetadata {
+	return wittypes.TurnMetadata{RunID: string(call.RunID), SessionID: string(call.SessionID), ToolNames: cm.ToList([]string{tool.Name})}
+}
+
+func turnMetadataSize(turn wittypes.TurnMetadata) int {
+	size := len(turn.RunID) + len(turn.SessionID) + len(turn.EpochID) + len(turn.AgentName) + len(turn.AgentMode) + len(turn.ProviderID) + len(turn.ModelID)
+	for _, name := range turn.ToolNames.Slice() {
+		size += len(name)
+	}
+	return size
+}
+
+func boundedEventSize(event wittypes.BoundedEvent) int {
+	return len(event.Kind) + len(event.SessionID) + len(event.RunID) + len(event.MessageID) + len(event.ToolCallID) + len(event.EpochID) + len(event.PayloadSummary)
+}
+
+func boundedEventSummary(event runtime.Event, limit int64) string {
+	summary := fmt.Sprintf("payload_bytes=%d redaction=%s live_only=%t", len(event.Payload), event.Redaction, event.LiveOnly)
+	if int64(len(summary)) > limit {
+		return summary[:limit]
+	}
+	return summary
+}
+
+func toolResultJSON(result runtime.ToolResult) (json.RawMessage, error) {
+	if len(result.Structured) != 0 && json.Valid(result.Structured) {
+		return cloneRawMessage(result.Structured), nil
+	}
+	return json.Marshal(result.Output)
+}
+
+func applyInputReplacement(module *module, operation string, original json.RawMessage, replacement wittypes.Replacement) (json.RawMessage, error) {
+	if replacement.Unchanged() {
+		return cloneRawMessage(original), nil
+	}
+	if raw := replacement.JSON(); raw != nil {
+		if err := validateBoundedJSON([]byte(*raw), module.limits.MaxOutputBytes); err != nil {
+			return nil, extensionError(payloadErrorKind(err), module.identity, operation, err)
+		}
+		return json.RawMessage(*raw), nil
+	}
+	if guestErr := replacement.Error(); guestErr != nil {
+		return nil, structuredGuestError(*guestErr)
+	}
+	return nil, extensionError(ErrorContract, module.identity, operation, nil)
+}
+
+func applyResultReplacement(module *module, original runtime.ToolResult, replacement wittypes.Replacement) (runtime.ToolResult, error) {
+	if replacement.Unchanged() {
+		return cloneToolResult(original), nil
+	}
+	if rawText := replacement.JSON(); rawText != nil {
+		raw := json.RawMessage(*rawText)
+		if err := validateBoundedJSON(raw, module.limits.MaxOutputBytes); err != nil {
+			return runtime.ToolResult{}, extensionError(payloadErrorKind(err), module.identity, "tool-middleware.after-tool-call", err)
+		}
+		next := cloneToolResult(original)
+		var text string
+		if json.Unmarshal(raw, &text) == nil {
+			next.Output = text
+			next.Structured = nil
+		} else {
+			next.Output = string(raw)
+			next.Structured = cloneRawMessage(raw)
+		}
+		return next, nil
+	}
+	if guestErr := replacement.Error(); guestErr != nil {
+		return runtime.ToolResult{}, structuredGuestError(*guestErr)
+	}
+	return runtime.ToolResult{}, extensionError(ErrorContract, module.identity, "tool-middleware.after-tool-call", nil)
+}
+
+func cloneToolResult(result runtime.ToolResult) runtime.ToolResult {
+	next := result
+	next.Structured = cloneRawMessage(result.Structured)
+	next.Attachments = append([]runtime.Attachment(nil), result.Attachments...)
+	next.Metadata = make(map[string]string, len(result.Metadata))
+	for key, value := range result.Metadata {
+		next.Metadata[key] = value
+	}
+	return next
+}
+
+func cloneRawMessage(raw json.RawMessage) json.RawMessage {
+	return append(json.RawMessage(nil), raw...)
+}
+
+func structuredGuestError(input wittypes.StructuredError) error {
+	code := strings.TrimSpace(input.Code)
+	if code == "" || len(code) > 128 {
+		code = "wasm_extension_rejected"
+	}
+	message := input.Message
+	if len(message) > 1024 {
+		message = message[:1024]
+	}
+	return model.Error{Code: code, Message: message, Retryable: input.Retryable}
+}
+
 func turnMetadata(snapshot runtime.TurnSnapshot) wittypes.TurnMetadata {
 	toolNames := make([]string, 0, len(snapshot.Tools))
 	for _, tool := range snapshot.Tools {
@@ -269,6 +566,58 @@ func (l *Loader) LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (p
 		return nil, err
 	}
 	return policy, nil
+}
+
+// LoadContextSource loads and tracks a context-source component.
+func (l *Loader) LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error) {
+	module, err := loadModule(ctx, cfg, contextSourceContract, l.engineFactory())
+	if err != nil {
+		return nil, err
+	}
+	if err := l.track(module); err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedContextSource{module: module}, nil
+}
+
+// LoadEventSink loads and tracks an event-sink component.
+func (l *Loader) LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
+	module, err := loadModule(ctx, cfg, eventSinkContract, l.engineFactory())
+	if err != nil {
+		return nil, err
+	}
+	if err := l.track(module); err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedEventSink{module: module}, nil
+}
+
+// LoadHook loads and tracks a hook component.
+func (l *Loader) LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error) {
+	module, err := loadModule(ctx, cfg, hookContract, l.engineFactory())
+	if err != nil {
+		return nil, err
+	}
+	if err := l.track(module); err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
+}
+
+// LoadToolMiddleware loads and tracks a tool-middleware component.
+func (l *Loader) LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error) {
+	module, err := loadModule(ctx, cfg, toolMiddlewareContract, l.engineFactory())
+	if err != nil {
+		return nil, err
+	}
+	if err := l.track(module); err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedToolMiddleware{module: module}, nil
 }
 
 func (l *Loader) engineFactory() engineFactory {

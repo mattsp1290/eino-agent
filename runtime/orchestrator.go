@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -15,6 +16,7 @@ import (
 	einoobs "github.com/mattsp1290/eino-obs"
 
 	agentcontext "github.com/mattsp1290/eino-agent/context"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
@@ -42,26 +44,31 @@ type IDGenerator interface {
 
 // StreamingOrchestrator executes admitted runs against Eino model streams.
 type StreamingOrchestrator struct {
-	Store       session.Store
-	Model       model.Resolver
-	Tools       ToolRegistry
-	Context     []ContextSource
-	Events      EventSink
-	Hooks       []Hook
-	IDs         IDGenerator
-	Clock       func() time.Time
-	OwnerID     string
-	Trace       agentcontext.TraceContext
-	Attempts    int
-	ToolTurns   int
-	QueueSize   int
-	Lease       time.Duration
-	History     history.Options
-	Permissions permissions.Policy
-	Middleware  []ToolMiddleware
-	Admit       *Admitter
-	Transactor  session.Transactor
-	Observer    *einoobs.Observer
+	Store                       session.Store
+	Model                       model.Resolver
+	Tools                       ToolRegistry
+	Plans                       RunPlanProvider
+	Context                     []ContextSource
+	Events                      EventSink
+	Hooks                       []Hook
+	IDs                         IDGenerator
+	Clock                       func() time.Time
+	OwnerID                     string
+	Trace                       agentcontext.TraceContext
+	Attempts                    int
+	ToolTurns                   int
+	QueueSize                   int
+	Lease                       time.Duration
+	History                     history.Options
+	Permissions                 permissions.Policy
+	Middleware                  []ToolMiddleware
+	Admit                       *Admitter
+	Transactor                  session.Transactor
+	Observer                    *einoobs.Observer
+	SystemPromptMaterialization bool
+	ModelRequestLedger          bool
+	ModelRequestSafeOptions     []string
+	ModelRequestMaxBytes        int
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -80,6 +87,11 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
+	plan, err := o.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
+	if err != nil {
+		return nil, err
+	}
+	ctx = withRunPlan(ctx, plan)
 	now := o.now()
 	ids := AdmissionIDs{
 		SessionID:          request.SessionID,
@@ -89,6 +101,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		EventID:            o.IDs.NewEventID(),
 	}
 	admitter := o.admitter()
+	admitter.Events = o.eventSink(ctx)
 	admitted, err := admitter.Admit(ctx, AdmissionRequest{
 		IDs:             ids,
 		ParentMessageID: request.ParentID,
@@ -98,8 +111,10 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		OwnerID:         o.ownerID(),
 		LeaseUntil:      now.Add(o.lease()),
 		Metadata:        request.Metadata,
+		ExtensionPlan:   plan.Descriptor,
 	})
 	if err != nil {
+		plan.release()
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
@@ -111,7 +126,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 			o.observeInterrupt(context.WithoutCancel(ctx), admitted.Run, admitted.AssistantMessage.ID, reason)
 		},
 	}
-	go o.execute(runCtx, admitted, handle.done)
+	go o.execute(withRunPlan(runCtx, plan), admitted, handle.done)
 	return handle, nil
 }
 
@@ -125,7 +140,14 @@ func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID
 
 func (o *StreamingOrchestrator) execute(ctx context.Context, admitted AdmittedRun, done chan<- Result) {
 	defer close(done)
+	plan := runPlanFromContext(ctx)
+	if plan != nil {
+		defer plan.release()
+	}
 	result := o.run(ctx, admitted)
+	if plan != nil && plan.Dispatch != nil {
+		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
+	}
 	done <- result
 }
 
@@ -147,6 +169,21 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 		result = o.finish(ctx, run, result)
 		o.finishObservedRun(observed, result, o.now())
 	}()
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		decision, err := extension.Invoke(plan.Dispatch, ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID}, func(context.Context, RunGateInput) (RunDecision, error) {
+			return RunDecision{Kind: RunContinue}, nil
+		})
+		if err != nil {
+			result.Status = session.RunFailed
+			result.Error = err
+			return result
+		}
+		if decision.Kind == RunReject {
+			result.Status = session.RunFailed
+			result.Error = model.Error{Code: decision.Code, Message: decision.Message, Cause: model.ErrProviderRejected}
+			return result
+		}
+	}
 	run.Status = session.RunRunning
 	run.StartedAt = o.now()
 	observed = o.startObservedRun(ctx, run, admitted.AssistantMessage.ID, run.StartedAt)
@@ -154,6 +191,9 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 		result.Status = session.RunFailed
 		result.Error = err
 		return result
+	}
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		_ = extension.Notify(plan.Dispatch, ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
 	}
 	snapshot, err := o.prepareSnapshot(ctx, admitted.Snapshot, admitted.AssistantMessage.ID)
 	if err != nil {
@@ -179,12 +219,38 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 		}
 		snapshot.Messages = append(snapshot.Messages, cloneMessages(messages)...)
 	}
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Base: cloneMessages(snapshot.Messages)}
+		assembled, err := extension.Invoke(plan.Dispatch, ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
+		if err != nil {
+			return TurnSnapshot{}, err
+		}
+		snapshot.Messages = materializeContextAssembly(assembled)
+	}
 	if o.Tools != nil {
 		tools, err := o.Tools.ResolveTools(ctx, snapshot.Clone())
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
 		snapshot.Tools = cloneSlice(tools)
+	}
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Tools != nil {
+		planned, err := plan.Tools.ResolveTools(ctx, snapshot.Clone())
+		if err != nil {
+			return TurnSnapshot{}, err
+		}
+		seen := make(map[string]bool, len(snapshot.Tools)+len(planned))
+		for _, tool := range snapshot.Tools {
+			seen[tool.Name] = true
+		}
+		for _, tool := range planned {
+			if seen[tool.Name] {
+				return TurnSnapshot{}, fmt.Errorf("duplicate effective tool %q", tool.Name)
+			}
+			seen[tool.Name] = true
+			snapshot.Tools = append(snapshot.Tools, tool)
+		}
+		sort.Slice(snapshot.Tools, func(i, j int) bool { return snapshot.Tools[i].Name < snapshot.Tools[j].Name })
 	}
 	for _, hook := range o.Hooks {
 		var err error
@@ -228,7 +294,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 	messages := cloneMessages(snapshot.Messages)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
-		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages, attempt, usage)
+		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages, attempt, turn+1, usage)
 		if err != nil {
 			return Result{}, err
 		}
@@ -272,12 +338,14 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 	}
 }
 
-func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt int, usage *model.Usage) (*einoschema.Message, error) {
-	queue := newEventQueue(ctx, o.QueueSize, o.Events)
+func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (message *einoschema.Message, err error) {
+	queue := newEventQueue(ctx, o.QueueSize, o.eventSink(ctx))
 	defer queue.close()
 	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
 	var streamUsage model.Usage
 	var streamErr error
+	var requestRecord *session.ModelRequestRecord
+	var requestStore session.ModelRequestStore
 	defer func() {
 		// Accumulate this stream's usage into the run total in the same defer
 		// that reports it to observability, so the persisted run total stays
@@ -286,16 +354,67 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 		if usage != nil {
 			*usage = addUsage(*usage, streamUsage)
 		}
+		ledgerTransitionOK := true
+		if requestRecord != nil {
+			state := session.ModelRequestCompleted
+			if streamErr != nil {
+				state = session.ModelRequestFailed
+			}
+			if transitionErr := updateModelRequest(ctx, requestStore, requestRecord, state, streamErr, o.now()); transitionErr != nil {
+				streamErr = transitionErr
+				err = transitionErr
+				message = nil
+				ledgerTransitionOK = false
+			}
+		}
 		if streamErr != nil {
 			o.errorObservedStream(obsStream, streamErr, streamUsage)
-			return
+		} else {
+			o.endObservedStream(obsStream, streamUsage)
 		}
-		o.endObservedStream(obsStream, streamUsage)
+		if plan := runPlanFromContext(ctx); ledgerTransitionOK && plan != nil && plan.Dispatch != nil {
+			_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
+		}
 	}()
 	observer := &streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
 	request := snapshot.ProviderRequest(messageID, o.Trace, observer)
 	request.Messages = cloneMessages(messages)
-	reader, err := openStream(ctx, snapshot.Model, request)
+	request.System, err = o.renderSystemPrompt(ctx, snapshot, attempt, step)
+	if err != nil {
+		streamErr = err
+		return nil, err
+	}
+	requestRecord, requestStore, err = o.prepareModelRequest(ctx, snapshot, request, messageID, attempt, step)
+	if err != nil {
+		streamErr = err
+		return nil, err
+	}
+	if requestRecord != nil {
+		request.IdempotencyKey = string(requestRecord.ID)
+		if err = updateModelRequest(ctx, requestStore, requestRecord, session.ModelRequestDispatchStarted, nil, o.now()); err != nil {
+			streamErr = err
+			return nil, err
+		}
+	}
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		requestRecordID := session.ModelRequestID("")
+		if requestRecord != nil {
+			requestRecordID = requestRecord.ID
+		}
+		contentHash := modelRequestContentHash(request)
+		if requestRecord != nil {
+			contentHash = requestRecord.ContentSHA256
+		}
+		_ = extension.Notify(plan.Dispatch, ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecordID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
+	}
+	var reader *einoschema.StreamReader[*einoschema.Message]
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		reader, err = extension.Invoke(plan.Dispatch, ctx, ModelStreamPoint, ModelStreamInput{Resolved: snapshot.Model, Request: request}, func(ctx context.Context, input ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+			return openStream(ctx, input.Resolved, input.Request)
+		})
+	} else {
+		reader, err = openStream(ctx, snapshot.Model, request)
+	}
 	if err != nil {
 		streamErr = err
 		return nil, err
@@ -360,6 +479,11 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 
 func openStream(ctx context.Context, resolved model.Resolved, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
 	if resolved.Streamer != nil {
+		if request.IdempotencyKey != "" {
+			if streamer, ok := resolved.Streamer.(model.IdempotentStreamer); ok {
+				return streamer.StreamProviderWithIdempotencyKey(ctx, request, request.IdempotencyKey)
+			}
+		}
 		return resolved.Streamer.StreamProvider(ctx, request)
 	}
 	client := resolved.Client
@@ -373,7 +497,11 @@ func openStream(ctx context.Context, resolved model.Resolved, request model.Requ
 		}
 		client = withTools
 	}
-	return client.Stream(ctx, request.Messages, einomodel.WithTools(request.Tools))
+	messages := cloneMessages(request.Messages)
+	if request.System != "" {
+		messages = append([]*einoschema.Message{einoschema.SystemMessage(request.System)}, messages...)
+	}
+	return client.Stream(ctx, messages, einomodel.WithTools(request.Tools))
 }
 
 func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message) error {
@@ -507,8 +635,21 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, snapshot T
 		}
 		input, middlewareErr := o.beforeToolCall(ctx, tool, call)
 		call.Input = cloneJSON(input)
+		if middlewareErr == nil {
+			if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+				prepared, err := extension.Invoke(plan.Dispatch, ctx, ToolPreparePoint, PreparedToolCall{Tool: tool, Call: call}, func(_ context.Context, value PreparedToolCall) (PreparedToolCall, error) { return value, nil })
+				if err != nil {
+					middlewareErr = err
+				} else {
+					tool, call, input = prepared.Tool, prepared.Call, cloneJSON(prepared.Call.Input)
+				}
+			}
+		}
 		call.Pattern = toolPattern(input, schemaCall.Function.Name)
 		schemaCall.Function.Arguments = string(input)
+		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+			_ = extension.Notify(plan.Dispatch, ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
+		}
 		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: middlewareErr})
 	}
 	return prepared, nil
@@ -516,22 +657,38 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, snapshot T
 
 func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.Message, error) {
 	messages := make([]*einoschema.Message, 0, len(calls))
+	var settlementStore session.ToolSettlementStore
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Descriptor.Mode == session.PlanStrict {
+		var ok bool
+		settlementStore, ok = o.Store.(session.ToolSettlementStore)
+		if !ok {
+			return nil, fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)
+		}
+	}
 	for _, prepared := range calls {
 		schemaCall := prepared.schemaCall
 		tool := prepared.tool
 		call := prepared.call
 		callID := call.ID
 		input := call.Input
+		var resultMessageID session.MessageID
+		var resultPartID session.PartID
+		if settlementStore != nil {
+			resultMessageID = o.IDs.NewMessageID()
+			resultPartID = o.IDs.NewPartID()
+		}
 		record, err := o.Store.CreateToolCall(ctx, session.ToolCall{
-			ID:        callID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			MessageID: messageID,
-			Name:      call.Name,
-			Input:     cloneJSON(input),
-			Status:    session.ToolCallPending,
-			RetrySafe: tool.RetrySafe,
-			Metadata:  cloneStringMap(tool.Metadata),
+			ID:              callID,
+			SessionID:       snapshot.SessionID,
+			RunID:           snapshot.RunID,
+			MessageID:       messageID,
+			ResultMessageID: resultMessageID,
+			ResultPartID:    resultPartID,
+			Name:            call.Name,
+			Input:           cloneJSON(input),
+			Status:          session.ToolCallPending,
+			RetrySafe:       tool.RetrySafe,
+			Metadata:        cloneStringMap(tool.Metadata),
 		})
 		if err != nil {
 			return nil, err
@@ -549,6 +706,9 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapsh
 		if _, err := o.Store.ClaimToolCall(ctx, record); err != nil {
 			return nil, err
 		}
+		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+			_ = extension.Notify(plan.Dispatch, ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
+		}
 		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallRunning, toolCallPayload{
 			ID:        string(callID),
 			Name:      call.Name,
@@ -556,54 +716,55 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapsh
 		})
 		o.observeToolMaterialized(ctx, snapshot, tool, call)
 		observedTool := o.startObservedToolCall(ctx, snapshot, tool, call)
-		var result ToolResult
-		execErr := prepared.middlewareErr
-		if execErr == nil {
-			result, execErr = o.executeTool(ctx, tool, call)
-			var afterErr error
-			result, afterErr = o.afterToolCall(ctx, tool, call, result, execErr)
-			if afterErr != nil {
-				execErr = errors.Join(execErr, afterErr)
-			}
+		outcome := ToolOutcome{Call: cloneToolCall(call), Disposition: ToolFailed, RawError: prepared.middlewareErr, Error: classifyExtensionError(prepared.middlewareErr)}
+		if prepared.middlewareErr == nil {
+			outcome = o.executeToolOutcome(ctx, tool, call)
 		}
+		outcome = o.afterToolOutcome(ctx, tool, outcome)
+		result, execErr := outcome.Result, outcome.RawError
 		output, status, errText := encodeToolOutput(callID, result, tool.Retention, execErr)
 		record.Status = status
 		record.Output = cloneJSON(output)
 		record.CompletedAt = o.now()
 		record.Error = errText
-		if err := o.Store.FinishToolCall(ctx, record); err != nil {
+		toolMessageID := resultMessageID
+		if toolMessageID == "" {
+			toolMessageID = o.IDs.NewMessageID()
+		}
+		toolPartID := resultPartID
+		if toolPartID == "" {
+			toolPartID = o.IDs.NewPartID()
+		}
+		resultMessage := session.Message{
+			ID: toolMessageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, ParentID: messageID,
+			Role: session.RoleTool, ModelID: string(snapshot.Model.Model.ID), CreatedAt: o.now(), UpdatedAt: o.now(),
+		}
+		resultPart := session.Part{
+			ID: toolPartID, MessageID: toolMessageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID,
+			Kind: session.PartToolResult, Payload: cloneJSON(output), CreatedAt: o.now(), UpdatedAt: o.now(),
+		}
+		if settlementStore != nil {
+			err = settlementStore.SettleToolCall(ctx, session.ToolSettlement{ID: callID, Status: status, Output: cloneJSON(output), Error: errText, Metadata: cloneStringMap(record.Metadata), CompletedAt: record.CompletedAt, ResultMessage: resultMessage, ResultPart: resultPart})
+		} else {
+			err = o.Store.FinishToolCall(ctx, record)
+			if err == nil {
+				_, err = o.Store.AppendMessage(ctx, resultMessage)
+			}
+			if err == nil {
+				err = o.appendPart(ctx, resultPart)
+			}
+		}
+		if err != nil {
 			o.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
 			o.observeToolSettled(ctx, snapshot, tool, call, session.ToolCallFailed, o.now().Sub(record.StartedAt), err, nil)
 			return nil, err
 		}
+		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+			_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Status: status, Result: result, Error: classifyExtensionError(execErr)})
+		}
 		o.finishObservedToolCall(observedTool, status, execErr, result.Metadata)
 		o.observeToolSettled(ctx, snapshot, tool, call, status, record.CompletedAt.Sub(record.StartedAt), execErr, result.Metadata)
 		_ = o.emitToolCall(ctx, snapshot, messageID, callID, status, toolCallEventPayload(output, schemaCall.Function.Name, input))
-		toolMessageID := o.IDs.NewMessageID()
-		if _, err := o.Store.AppendMessage(ctx, session.Message{
-			ID:        toolMessageID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			ParentID:  messageID,
-			Role:      session.RoleTool,
-			ModelID:   string(snapshot.Model.Model.ID),
-			CreatedAt: o.now(),
-			UpdatedAt: o.now(),
-		}); err != nil {
-			return nil, err
-		}
-		if err := o.appendPart(ctx, session.Part{
-			ID:        o.IDs.NewPartID(),
-			MessageID: toolMessageID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			Kind:      session.PartToolResult,
-			Payload:   cloneJSON(output),
-			CreatedAt: o.now(),
-			UpdatedAt: o.now(),
-		}); err != nil {
-			return nil, err
-		}
 		messages = append(messages, einoschema.ToolMessage(string(output), string(callID), einoschema.WithToolName(schemaCall.Function.Name)))
 		if errors.Is(execErr, context.Canceled) {
 			return messages, execErr
@@ -617,11 +778,106 @@ func (o *StreamingOrchestrator) appendPart(ctx context.Context, part session.Par
 	return err
 }
 
-func (o *StreamingOrchestrator) executeTool(ctx context.Context, tool Tool, call ToolCall) (ToolResult, error) {
-	if o.Permissions == nil {
-		return tool.Executor.Execute(ctx, call)
+func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, tool Tool, call ToolCall) ToolOutcome {
+	guard, guardErr := evaluateToolGuards(ctx, runPlanFromContext(ctx), tool, call)
+	if guardErr != nil {
+		return ToolOutcome{Call: cloneToolCall(call), Disposition: dispositionForError(guardErr), RawError: guardErr, Error: classifyExtensionError(guardErr)}
 	}
-	return ExecuteToolWithPermissions(ctx, tool, call, o.Permissions)
+	if guard.Decision == ToolGuardDeny {
+		result := modelVisiblePermissionResult("denied", guard.Message)
+		return ToolOutcome{Call: cloneToolCall(call), Disposition: ToolDenied, Result: result, PermissionMetadata: cloneStringMap(result.Metadata)}
+	}
+	wrapped := cloneTool(tool)
+	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
+		plan := runPlanFromContext(ctx)
+		if plan == nil || plan.Dispatch == nil {
+			return tool.Executor.Execute(ctx, call)
+		}
+		outcome, err := extension.Invoke(plan.Dispatch, ctx, ToolExecutePoint, ToolExecution{Tool: tool, Call: call}, func(ctx context.Context, input ToolExecution) (ToolOutcome, error) {
+			result, execErr := input.Tool.Executor.Execute(ctx, input.Call)
+			disposition := ToolExecuted
+			if execErr != nil {
+				disposition = dispositionForError(execErr)
+			}
+			return sealToolOutcome(ToolOutcome{Call: cloneToolCall(input.Call), Disposition: disposition, Result: result, RawError: execErr, Error: classifyExtensionError(execErr)}), nil
+		})
+		if err != nil {
+			return ToolResult{}, err
+		}
+		return outcome.Result, outcome.RawError
+	})
+	var result ToolResult
+	var err error
+	if o.Permissions == nil {
+		result, err = wrapped.Executor.Execute(ctx, call)
+	} else {
+		result, err = ExecuteToolWithPermissions(ctx, wrapped, call, o.Permissions)
+	}
+	disposition := dispositionForResult(result, err)
+	permissionMetadata := map[string]string(nil)
+	if result.Metadata["permission_status"] != "" {
+		permissionMetadata = cloneStringMap(result.Metadata)
+	}
+	return ToolOutcome{Call: cloneToolCall(call), Disposition: disposition, Result: cloneRuntimeToolResult(result), RawError: err, Error: classifyExtensionError(err), PermissionMetadata: permissionMetadata}
+}
+
+func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool, outcome ToolOutcome) ToolOutcome {
+	result, middlewareErr := o.afterToolCall(ctx, tool, outcome.Call, outcome.Result, outcome.RawError)
+	if middlewareErr != nil {
+		outcome.RawError = errors.Join(outcome.RawError, middlewareErr)
+		outcome.Error = classifyExtensionError(outcome.RawError)
+		outcome.Disposition = dispositionForError(outcome.RawError)
+	}
+	if len(outcome.PermissionMetadata) != 0 {
+		if result.Metadata == nil {
+			result.Metadata = make(map[string]string)
+		}
+		for key, value := range outcome.PermissionMetadata {
+			result.Metadata[key] = value
+		}
+	}
+	outcome.Result = cloneRuntimeToolResult(result)
+	outcome = sealToolOutcome(outcome)
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		transformed, err := extension.Invoke(plan.Dispatch, ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
+		if err != nil {
+			outcome.RawError = errors.Join(outcome.RawError, err)
+			outcome.Error = classifyExtensionError(outcome.RawError)
+			outcome.Disposition = dispositionForError(outcome.RawError)
+			return outcome
+		}
+		outcome = transformed
+	}
+	return outcome
+}
+
+func dispositionForResult(result ToolResult, err error) ToolDisposition {
+	if err != nil {
+		return dispositionForError(err)
+	}
+	switch result.Metadata["permission_status"] {
+	case "denied":
+		return ToolDenied
+	case "approval_required":
+		return ToolApprovalRequired
+	case "interrupted":
+		return ToolInterrupted
+	default:
+		return ToolExecuted
+	}
+}
+
+func dispositionForError(err error) ToolDisposition {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ToolInterrupted
+	}
+	return ToolFailed
+}
+
+type runtimeToolExecutorFunc func(context.Context, ToolCall) (ToolResult, error)
+
+func (f runtimeToolExecutorFunc) Execute(ctx context.Context, call ToolCall) (ToolResult, error) {
+	return f(ctx, call)
 }
 
 func (o *StreamingOrchestrator) beforeToolCall(ctx context.Context, tool Tool, call ToolCall) (json.RawMessage, error) {
@@ -659,10 +915,11 @@ func (o *StreamingOrchestrator) afterToolCall(ctx context.Context, tool Tool, ca
 }
 
 func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {
-	if o.Events == nil {
+	sink := o.eventSink(ctx)
+	if sink == nil {
 		return nil
 	}
-	return o.Events.Emit(ctx, Event{
+	return sink.Emit(ctx, Event{
 		Kind:       EventToolCallUpdated,
 		SessionID:  snapshot.SessionID,
 		RunID:      snapshot.RunID,
@@ -692,8 +949,8 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, res
 	for _, hook := range o.Hooks {
 		_ = hook.AfterRun(context.WithoutCancel(ctx), result)
 	}
-	if o.Events != nil {
-		_ = o.Events.Emit(context.WithoutCancel(ctx), Event{
+	if sink := o.eventSink(ctx); sink != nil {
+		_ = sink.Emit(context.WithoutCancel(ctx), Event{
 			Kind:      EventRunFinished,
 			SessionID: run.SessionID,
 			RunID:     run.ID,
@@ -754,6 +1011,11 @@ func (o *StreamingOrchestrator) validate(request Request) error {
 		return fmt.Errorf("%w: id generator required", ErrInvalidOrchestrator)
 	case request.SessionID == "":
 		return fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
+	case o.ModelRequestLedger:
+		if _, ok := o.Store.(session.ModelRequestStore); !ok {
+			return fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
+		}
+		return nil
 	default:
 		return nil
 	}

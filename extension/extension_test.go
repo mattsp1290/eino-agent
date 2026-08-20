@@ -1,0 +1,364 @@
+package extension
+
+import (
+	"context"
+	"errors"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+type testPayload struct {
+	Protected string
+	Values    []string
+}
+
+var (
+	testNotice = NewNotification(Contract{ID: "test/notice", Version: "1"}, NotificationContained, clonePayload)
+	testAround = NewRequiredInterceptor(Contract{ID: "test/around", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
+		if original.Protected != candidate.Protected {
+			return ErrProtectedMutation
+		}
+		return nil
+	}, func(output string) error {
+		if output == "" {
+			return errors.New("empty output")
+		}
+		return nil
+	})
+)
+
+func clonePayload(input testPayload) testPayload {
+	input.Values = append([]string(nil), input.Values...)
+	return input
+}
+
+func testComponent(id string) Component {
+	return Component{InstanceID: id, Artifact: Artifact{Name: "tests", Version: "1", Hash: "artifact-hash", ConfigHash: "config-hash", SourceKind: SourceNative}}
+}
+
+func spec(instance, id string, order int, scope Scope) Registration {
+	return Registration{InstanceID: instance, ID: id, Order: order, Scope: scope}
+}
+
+func TestMountIsAtomicAndRollsBackEffects(t *testing.T) {
+	registry := NewRegistry(nil)
+	var cleanup []int
+	_, err := registry.Mount(context.Background(), testComponent("failed"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		_ = registrar.Defer(func(context.Context) error { cleanup = append(cleanup, 1); return nil })
+		_ = registrar.Defer(func(context.Context) error { cleanup = append(cleanup, 2); return nil })
+		if err := On(registrar, testNotice, spec("failed", "notice", 0, GlobalScope()), func(context.Context, testPayload) error { return nil }); err != nil {
+			return err
+		}
+		return errors.New("install failed")
+	}))
+	if err == nil || !reflect.DeepEqual(cleanup, []int{2, 1}) || len(registry.Diagnostics()) != 0 {
+		t.Fatalf("Mount = %v, cleanup=%v diagnostics=%v", err, cleanup, registry.Diagnostics())
+	}
+}
+
+func TestScopedOrderingDefensiveCopyAndContainedFailures(t *testing.T) {
+	var diagnostics atomic.Int32
+	registry := NewRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))
+	var mu sync.Mutex
+	var sequence []string
+	for _, item := range []struct {
+		instance string
+		id       string
+		order    int
+		scope    Scope
+		fail     bool
+	}{
+		{instance: "session", id: "b", order: 0, scope: SessionScope("session-1")},
+		{instance: "global-z", id: "z", order: 0, scope: GlobalScope(), fail: true},
+		{instance: "global-a", id: "a", order: 0, scope: GlobalScope()},
+	} {
+		item := item
+		_, err := registry.Mount(context.Background(), testComponent(item.instance), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return On(registrar, testNotice, spec(item.instance, item.id, item.order, item.scope), func(_ context.Context, payload testPayload) error {
+				payload.Values[0] = item.id
+				mu.Lock()
+				sequence = append(sequence, item.id)
+				mu.Unlock()
+				if item.fail {
+					return errors.New("SECRET callback detail")
+				}
+				return nil
+			})
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := registry.Snapshot(SessionScope("session-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	payload := testPayload{Protected: "fixed", Values: []string{"original"}}
+	if failures := Notify(plan, context.Background(), testNotice, payload); len(failures) != 0 {
+		t.Fatalf("contained failures = %#v", failures)
+	}
+	if !reflect.DeepEqual(sequence, []string{"a", "z", "b"}) || payload.Values[0] != "original" || diagnostics.Load() != 1 {
+		t.Fatalf("sequence=%v payload=%v diagnostics=%d", sequence, payload, diagnostics.Load())
+	}
+}
+
+func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
+	registry := NewRegistry(nil)
+	var sequence []string
+	for index, id := range []string{"outer", "inner"} {
+		id, order := id, index
+		_, err := registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return Use(registrar, testAround, spec(id, id, order, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+				sequence = append(sequence, id+"-before")
+				output, err := next(ctx, input)
+				sequence = append(sequence, id+"-after")
+				return output, err
+			})
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	output, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		sequence = append(sequence, "terminal")
+		return "ok", nil
+	})
+	if err != nil || output != "ok" || !reflect.DeepEqual(sequence, []string{"outer-before", "inner-before", "terminal", "inner-after", "outer-after"}) {
+		t.Fatalf("Invoke = %q, %v; sequence=%v", output, err, sequence)
+	}
+
+	badRegistry := NewRegistry(nil)
+	_, _ = badRegistry.Mount(context.Background(), testComponent("bad"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return Use(registrar, testAround, spec("bad", "bad", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			if _, err := next(ctx, input); err != nil {
+				return "", err
+			}
+			return next(ctx, input)
+		})
+	}))
+	badPlan, _ := badRegistry.Snapshot(GlobalScope())
+	defer badPlan.Release()
+	if _, err := Invoke(badPlan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil }); !errors.Is(err, ErrNextCalledTwice) {
+		t.Fatalf("double next error = %v", err)
+	}
+}
+
+func TestProtectedMutationAndRequiredDelegation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		fn   Around[testPayload, string]
+		want error
+	}{
+		{name: "mutation", want: ErrProtectedMutation, fn: func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			input.Protected = "changed"
+			return next(ctx, input)
+		}},
+		{name: "no delegation", want: ErrNextNotCalled, fn: func(context.Context, testPayload, Next[testPayload, string]) (string, error) {
+			return "fabricated", nil
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewRegistry(nil)
+			_, _ = registry.Mount(context.Background(), testComponent("instance"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+				return Use(registrar, testAround, spec("instance", "handler", 0, GlobalScope()), test.fn)
+			}))
+			plan, _ := registry.Snapshot(GlobalScope())
+			defer plan.Release()
+			_, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
+			if !errors.Is(err, test.want) {
+				t.Fatalf("error = %v, want %v", err, test.want)
+			}
+		})
+	}
+}
+
+func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := testComponent("context")
+	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return Use(registrar, testAround, spec(component.InstanceID, "deadline", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			tightened, cancel := context.WithCancel(ctx)
+			cancel()
+			return next(tightened, input)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	_, err = Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(ctx context.Context, _ testPayload) (string, error) {
+		return "", ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("terminal context error = %v", err)
+	}
+}
+
+func TestDeactivateSnapshotIsolationAndCloseDrain(t *testing.T) {
+	registry := NewRegistry(nil)
+	cleanup := make(chan struct{})
+	mount, err := registry.Mount(context.Background(), testComponent("lease"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		if err := registrar.Defer(func(context.Context) error { close(cleanup); return nil }); err != nil {
+			return err
+		}
+		return On(registrar, testNotice, spec("lease", "notice", 0, GlobalScope()), func(context.Context, testPayload) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	mount.Deactivate()
+	newPlan, _ := registry.Snapshot(GlobalScope())
+	if len(newPlan.entries) != 0 || len(plan.entries) != 1 {
+		t.Fatalf("snapshot isolation old=%d new=%d", len(plan.entries), len(newPlan.entries))
+	}
+	newPlan.Release()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := mount.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close before release = %v", err)
+	}
+	plan.Release()
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cleanup:
+	default:
+		t.Fatal("cleanup did not run")
+	}
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatalf("idempotent close = %v", err)
+	}
+}
+
+func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
+	registry := NewRegistry(nil)
+	secret := errors.New("credential-sentinel-do-not-persist")
+	component := testComponent("bounded-error")
+	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return Use(registrar, testAround, spec(component.InstanceID, "failure", 0, GlobalScope()), func(context.Context, testPayload, Next[testPayload, string]) (string, error) {
+			return "", secret
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	_, err = Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		return "unused", nil
+	})
+	var callback *CallbackError
+	if !errors.As(err, &callback) || !errors.Is(err, secret) {
+		t.Fatalf("callback error = %v", err)
+	}
+	if strings.Contains(err.Error(), "credential-sentinel") {
+		t.Fatalf("public callback error leaked cause: %q", err)
+	}
+}
+
+func BenchmarkSnapshot(b *testing.B) {
+	registry := NewRegistry(nil)
+	_, _ = registry.Mount(context.Background(), testComponent("bench"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		for index := 0; index < 10; index++ {
+			if err := On(registrar, testNotice, spec("bench", string(rune('a'+index)), index, GlobalScope()), func(context.Context, testPayload) error { return nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	b.ResetTimer()
+	for range b.N {
+		plan, _ := registry.Snapshot(GlobalScope())
+		plan.Release()
+	}
+}
+
+func BenchmarkNotifyZero(b *testing.B) {
+	plan := &Plan{}
+	for range b.N {
+		_ = Notify(plan, context.Background(), testNotice, testPayload{})
+	}
+}
+
+func BenchmarkNotifyTen(b *testing.B) {
+	registry := NewRegistry(nil)
+	_, _ = registry.Mount(context.Background(), testComponent("bench"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		for index := 0; index < 10; index++ {
+			if err := On(registrar, testNotice, spec("bench", string(rune('a'+index)), index, GlobalScope()), func(context.Context, testPayload) error { return nil }); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	b.ResetTimer()
+	for range b.N {
+		_ = Notify(plan, context.Background(), testNotice, testPayload{})
+	}
+}
+
+func BenchmarkInvokeTen(b *testing.B) {
+	registry := NewRegistry(nil)
+	for index := 0; index < 10; index++ {
+		id := string(rune('a' + index))
+		_, _ = registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return Use(registrar, testAround, spec(id, id, index, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+				return next(ctx, input)
+			})
+		}))
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	b.ResetTimer()
+	for range b.N {
+		_, _ = Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
+	}
+}
+
+func BenchmarkConcurrentMountSnapshotClose(b *testing.B) {
+	registry := NewRegistry(nil)
+	b.RunParallel(func(parallel *testing.PB) {
+		var sequence atomic.Uint64
+		for parallel.Next() {
+			id := "bench-" + strconv.FormatUint(sequence.Add(1), 10)
+			mount, err := registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+				return On(registrar, testNotice, spec(id, "notice", 0, GlobalScope()), func(context.Context, testPayload) error { return nil })
+			}))
+			if err != nil {
+				continue
+			}
+			plan, _ := registry.Snapshot(GlobalScope())
+			plan.Release()
+			_ = mount.Close(context.Background())
+		}
+	})
+}
+
+func FuzzSessionScope(f *testing.F) {
+	f.Add("session-1", "session-1")
+	f.Add("session-1", "session-2")
+	f.Fuzz(func(t *testing.T, registered, target string) {
+		if !identifierPattern.MatchString(registered) || !identifierPattern.MatchString(target) {
+			t.Skip()
+		}
+		applies := scopeApplies(SessionScope(registered), SessionScope(target))
+		if applies != (registered == target) {
+			t.Fatalf("scope result = %t", applies)
+		}
+	})
+}

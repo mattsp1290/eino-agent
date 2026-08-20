@@ -10,6 +10,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -35,6 +36,7 @@ type AdmissionRequest struct {
 	OwnerID         string
 	LeaseUntil      time.Time
 	Metadata        map[string]string
+	ExtensionPlan   session.ExtensionPlanDescriptor
 }
 
 // AdmittedRun is the durable state created before model execution begins.
@@ -160,6 +162,9 @@ func admitDurable(ctx context.Context, store session.Store, request AdmissionReq
 }
 
 func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRun, request AdmissionRequest, now time.Time) error {
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+		_ = extension.Notify(plan.Dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor, Time: now})
+	}
 	for _, hook := range a.Hooks {
 		if err := hook.BeforeRun(ctx, admitted.Run); err != nil {
 			return err
@@ -256,19 +261,20 @@ func admissionRun(request AdmissionRequest, sessionID session.ID, now time.Time)
 		leaseUntil = now.Add(time.Minute)
 	}
 	return session.Run{
-		ID:           request.IDs.RunID,
-		SessionID:    sessionID,
-		ParentMsgID:  request.ParentMessageID,
-		OwnerID:      request.OwnerID,
-		LeaseUntil:   leaseUntil,
-		Agent:        request.Config.Agent.Name,
-		ProviderID:   admissionProviderID(request),
-		ModelID:      admissionModelID(request),
-		ContextEpoch: request.IDs.ContextEpochID,
-		Status:       session.RunPending,
-		Config:       admissionConfig(request.Config),
-		Components:   admissionComponents(request.Config),
-		CreatedAt:    now,
+		ID:            request.IDs.RunID,
+		SessionID:     sessionID,
+		ParentMsgID:   request.ParentMessageID,
+		OwnerID:       request.OwnerID,
+		LeaseUntil:    leaseUntil,
+		Agent:         request.Config.Agent.Name,
+		ProviderID:    admissionProviderID(request),
+		ModelID:       admissionModelID(request),
+		ContextEpoch:  request.IDs.ContextEpochID,
+		Status:        session.RunPending,
+		Config:        admissionConfig(request.Config),
+		Components:    admissionComponents(request.Config),
+		ExtensionPlan: request.ExtensionPlan.Clone(),
+		CreatedAt:     now,
 	}
 }
 

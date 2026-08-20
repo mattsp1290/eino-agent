@@ -19,6 +19,9 @@ import (
 //go:embed migrations/001_sqlite_store.sql
 var migration001 string
 
+//go:embed migrations/002_model_requests.sql
+var migration002 string
+
 // Store persists sessions in SQLite.
 type Store struct {
 	db *sql.DB
@@ -39,6 +42,21 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	if _, err := db.ExecContext(ctx, migration001); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	var version int
+	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if version > 2 {
+		_ = db.Close()
+		return nil, fmt.Errorf("%w: unsupported sqlite schema version %d", session.ErrConflict, version)
+	}
+	if version < 2 {
+		if _, err := db.ExecContext(ctx, migration002); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	if err := verifySchema(ctx, db); err != nil {
 		_ = db.Close()
@@ -456,6 +474,81 @@ func (s *Store) FinishToolCall(ctx context.Context, record session.ToolCall) err
 	return nil
 }
 
+// SettleToolCall atomically commits a terminal call and its reserved result
+// message/part. Repeating the identical settlement is idempotent.
+func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettlement) error {
+	if s.tx == nil {
+		return s.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
+			store, ok := tx.(*Store)
+			if !ok {
+				return session.ErrConflict
+			}
+			return store.SettleToolCall(ctx, settlement)
+		})
+	}
+	call, err := s.GetToolCall(ctx, settlement.ID)
+	if err != nil {
+		return err
+	}
+	if call.ResultMessageID == "" || call.ResultPartID == "" || settlement.ResultMessage.ID != call.ResultMessageID || settlement.ResultPart.ID != call.ResultPartID || settlement.ResultPart.MessageID != call.ResultMessageID {
+		return session.ErrConflict
+	}
+	settled, err := settlement.Apply(call)
+	if err != nil {
+		return err
+	}
+	if err := s.FinishToolCall(ctx, settled); err != nil {
+		return err
+	}
+	if _, err := s.AppendMessage(ctx, settlement.ResultMessage); err != nil {
+		return err
+	}
+	if _, err := s.AppendPart(ctx, settlement.ResultPart); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ListUnreconciledToolSettlements returns terminal calls whose reserved result
+// record is absent. SQLite transactions normally make this empty; the method
+// also repairs databases written by non-atomic/legacy paths.
+func (s *Store) ListUnreconciledToolSettlements(ctx context.Context, runID session.RunID) ([]session.ToolSettlement, error) {
+	calls, err := listJSON[session.ToolCall](ctx, s, `SELECT record FROM tool_calls WHERE run_id = ? AND status IN (?, ?, ?) ORDER BY id`, runID, session.ToolCallCompleted, session.ToolCallFailed, session.ToolCallInterrupted)
+	if err != nil {
+		return nil, err
+	}
+	var result []session.ToolSettlement
+	for _, call := range calls {
+		if call.ResultMessageID == "" || call.ResultPartID == "" {
+			continue
+		}
+		if _, err := s.GetMessage(ctx, call.ResultMessageID); err == nil {
+			continue
+		} else if !errors.Is(err, session.ErrNotFound) {
+			return nil, err
+		}
+		createdAt := call.CompletedAt
+		result = append(result, session.ToolSettlement{
+			ID: call.ID, Status: call.Status, Output: append(json.RawMessage(nil), call.Output...), Error: call.Error,
+			Metadata: cloneStrings(call.Metadata), CompletedAt: call.CompletedAt,
+			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: createdAt, UpdatedAt: createdAt},
+			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: append(json.RawMessage(nil), call.Output...), CreatedAt: createdAt, UpdatedAt: createdAt},
+		})
+	}
+	return result, nil
+}
+
+func cloneStrings(input map[string]string) map[string]string {
+	if input == nil {
+		return nil
+	}
+	result := make(map[string]string, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
+}
+
 func (s *Store) StartContextEpoch(ctx context.Context, record session.ContextEpoch) (session.ContextEpoch, error) {
 	var existing session.ContextEpoch
 	if err := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &existing); err == nil {
@@ -506,6 +599,104 @@ func (s *Store) GetMessage(ctx context.Context, id session.MessageID) (session.M
 	return record, err
 }
 
+const maxModelRequestRecordBytes = 4 << 20
+
+func (s *Store) CreateModelRequest(ctx context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
+	if record.ID == "" || record.RunID == "" || record.State != session.ModelRequestPrepared {
+		return session.ModelRequestRecord{}, session.ErrConflict
+	}
+	var existing session.ModelRequestRecord
+	if err := s.getJSON(ctx, "SELECT record FROM model_requests WHERE id = ?", []any{record.ID}, &existing); err == nil {
+		if !sameRecord(existing, record) {
+			return session.ModelRequestRecord{}, session.ErrConflict
+		}
+		return existing, nil
+	} else if !errors.Is(err, session.ErrNotFound) {
+		return session.ModelRequestRecord{}, err
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return session.ModelRequestRecord{}, err
+	}
+	if len(raw) > maxModelRequestRecordBytes {
+		return session.ModelRequestRecord{}, session.ErrModelRequestTooLarge
+	}
+	_, err = s.exec(ctx, `INSERT INTO model_requests(id, run_id, state, attempt, step, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, record.ID, record.RunID, record.State, record.Attempt, record.Step, raw, timeText(record.CreatedAt))
+	return record, mapErr(err)
+}
+
+func (s *Store) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
+	current, err := s.GetModelRequest(ctx, record.ID)
+	if err != nil {
+		return err
+	}
+	if !sameModelRequestIdentity(current, record) {
+		return session.ErrConflict
+	}
+	if current.State == record.State {
+		if sameRecord(current, record) {
+			return nil
+		}
+		return session.ErrConflict
+	}
+	if !session.ValidModelRequestTransition(current.State, record.State) {
+		return session.ErrConflict
+	}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if len(raw) > maxModelRequestRecordBytes {
+		return session.ErrModelRequestTooLarge
+	}
+	result, err := s.exec(ctx, `UPDATE model_requests SET state = ?, record = ? WHERE id = ? AND state = ?`, record.State, raw, record.ID, current.State)
+	if err != nil {
+		return mapErr(err)
+	}
+	return rowsAffected(result)
+}
+
+func sameModelRequestIdentity(left, right session.ModelRequestRecord) bool {
+	left.State, right.State = "", ""
+	left.ErrorCode, right.ErrorCode = "", ""
+	left.UpdatedAt, right.UpdatedAt = time.Time{}, time.Time{}
+	return sameRecord(left, right)
+}
+
+func (s *Store) GetModelRequest(ctx context.Context, id session.ModelRequestID) (session.ModelRequestRecord, error) {
+	var record session.ModelRequestRecord
+	err := s.getJSON(ctx, "SELECT record FROM model_requests WHERE id = ?", []any{id}, &record)
+	return record, err
+}
+
+func (s *Store) ListModelRequests(ctx context.Context, runID session.RunID, cursor session.ModelRequestCursor) (session.ModelRequestBatch, error) {
+	limit := cursor.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	where := "run_id = ?"
+	args := []any{runID}
+	if cursor.AfterID != "" {
+		after, err := s.GetModelRequest(ctx, cursor.AfterID)
+		if err != nil {
+			return session.ModelRequestBatch{}, err
+		}
+		where += " AND (created_at > ? OR (created_at = ? AND id > ?))"
+		args = append(args, timeText(after.CreatedAt), timeText(after.CreatedAt), cursor.AfterID)
+	}
+	args = append(args, limit+1)
+	records, err := listJSON[session.ModelRequestRecord](ctx, s, `SELECT record FROM model_requests WHERE `+where+` ORDER BY created_at, id LIMIT ?`, args...)
+	if err != nil {
+		return session.ModelRequestBatch{}, err
+	}
+	next := session.ModelRequestCursor{}
+	if len(records) > limit {
+		next = session.ModelRequestCursor{AfterID: records[limit-1].ID, Limit: limit}
+		records = records[:limit]
+	}
+	return session.ModelRequestBatch{Records: records, Next: next}, nil
+}
+
 func sameRecord[T any](left, right T) bool {
 	leftRaw, leftErr := json.Marshal(left)
 	rightRaw, rightErr := json.Marshal(right)
@@ -517,7 +708,7 @@ func verifySchema(ctx context.Context, db *sql.DB) error {
 	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
 		return err
 	}
-	if version != 1 {
+	if version != 2 {
 		return fmt.Errorf("%w: unsupported sqlite schema version %d", session.ErrConflict, version)
 	}
 	required := map[string][]string{
@@ -528,6 +719,7 @@ func verifySchema(ctx context.Context, db *sql.DB) error {
 		"events":         {"id", "session_id", "run_id", "kind", "record", "created_at"},
 		"tool_calls":     {"id", "session_id", "run_id", "message_id", "status", "claimed_by", "claim_token", "record"},
 		"context_epochs": {"id", "session_id", "record", "closed_at"},
+		"model_requests": {"id", "run_id", "state", "attempt", "step", "record", "created_at"},
 	}
 	for table, columns := range required {
 		if err := verifyColumns(ctx, db, table, columns); err != nil {

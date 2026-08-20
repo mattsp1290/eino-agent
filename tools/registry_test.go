@@ -52,6 +52,36 @@ func TestReplaceRejectsStaleRegistration(t *testing.T) {
 	}
 }
 
+func TestUnregisterRequiresExactGenerationAndSnapshotIsStable(t *testing.T) {
+	t.Parallel()
+	registry := NewRegistry()
+	first, err := registry.Register(testDefinition("first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := registry.Register(testDefinition("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen := registry.Snapshot()
+	if err := registry.Unregister(Registration{Name: first.Name, Generation: first.Generation + 1}); !errors.Is(err, ErrStaleRegistration) {
+		t.Fatalf("stale Unregister = %v", err)
+	}
+	if err := registry.Unregister(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Unregister(first); !errors.Is(err, ErrStaleRegistration) {
+		t.Fatalf("repeated Unregister = %v", err)
+	}
+	if entries := frozen.Entries(); len(entries) != 2 || entries[0].Registration != first || entries[1].Registration != second {
+		t.Fatalf("frozen entries = %#v", entries)
+	}
+	materialized, err := frozen.ResolveTools(context.Background(), snapshot("session"))
+	if err != nil || len(materialized) != 2 {
+		t.Fatalf("frozen ResolveTools = %#v, %v", materialized, err)
+	}
+}
+
 func TestResolveToolsMaterializesPerSessionScopes(t *testing.T) {
 	t.Parallel()
 

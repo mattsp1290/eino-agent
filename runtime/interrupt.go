@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -32,6 +33,14 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	if state == session.ResumeBusy {
 		return nil, session.ErrSessionBusy
 	}
+	var plan *RunPlan
+	if !run.Terminal() {
+		plan, err = o.acquireResumePlan(ctx, run.ExtensionPlan)
+		if err != nil {
+			return nil, err
+		}
+		ctx = withRunPlan(ctx, plan)
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
 		runID:       runID,
@@ -39,13 +48,21 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 		done:        make(chan Result, 1),
 		onInterrupt: func(reason string) { o.observeInterrupt(context.WithoutCancel(ctx), run, "", reason) },
 	}
-	go o.executeResume(runCtx, run, handle.done)
+	go o.executeResume(withRunPlan(runCtx, plan), run, handle.done)
 	return handle, nil
 }
 
 func (o *StreamingOrchestrator) executeResume(ctx context.Context, run session.Run, done chan<- Result) {
 	defer close(done)
-	done <- o.resumeRun(ctx, run)
+	plan := runPlanFromContext(ctx)
+	if plan != nil {
+		defer plan.release()
+	}
+	result := o.resumeRun(ctx, run)
+	if plan != nil && plan.Dispatch != nil && !run.Terminal() {
+		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(run.StartedAt), Error: classifyExtensionError(result.Error)})
+	}
+	done <- result
 }
 
 func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) (result Result) {
@@ -63,6 +80,23 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 	}()
 	if err := o.Store.FinishRun(ctx, run); err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	var settlementStore session.ToolSettlementStore
+	if plan := runPlanFromContext(ctx); plan != nil && plan.Descriptor.Mode == session.PlanStrict {
+		var ok bool
+		settlementStore, ok = o.Store.(session.ToolSettlementStore)
+		if !ok {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)}
+		}
+		unreconciled, err := settlementStore.ListUnreconciledToolSettlements(ctx, run.ID)
+		if err != nil {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		}
+		for _, settlement := range unreconciled {
+			if err := settlementStore.SettleToolCall(ctx, settlement); err != nil {
+				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			}
+		}
 	}
 	calls, err := o.Store.ListUnfinishedToolCalls(ctx, run.ID)
 	if err != nil {
@@ -88,11 +122,31 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			call.Status = session.ToolCallInterrupted
 			call.CompletedAt = o.now()
 			call.Error = "tool was running during resume and was not re-executed"
-			if err := o.Store.FinishToolCall(context.WithoutCancel(ctx), call); err != nil {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			if len(call.Output) == 0 {
+				call.Output = mustJSON(toolOutputPayload{ToolCallID: string(call.ID), Status: "interrupted", Content: "tool execution interrupted"})
 			}
-			if err := o.appendToolResult(context.WithoutCancel(ctx), run, call, call.Output); err != nil {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			if settlementStore != nil {
+				if call.ResultMessageID == "" || call.ResultPartID == "" {
+					return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrConflict}
+				}
+				err := settlementStore.SettleToolCall(context.WithoutCancel(ctx), session.ToolSettlement{
+					ID: call.ID, Status: call.Status, Output: cloneJSON(call.Output), Error: call.Error, Metadata: cloneStringMap(call.Metadata), CompletedAt: call.CompletedAt,
+					ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, ModelID: run.ModelID, CreatedAt: call.CompletedAt, UpdatedAt: call.CompletedAt},
+					ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: cloneJSON(call.Output), CreatedAt: call.CompletedAt, UpdatedAt: call.CompletedAt},
+				})
+				if err != nil {
+					return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+				}
+			} else {
+				if err := o.Store.FinishToolCall(context.WithoutCancel(ctx), call); err != nil {
+					return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+				}
+				if err := o.appendToolResult(context.WithoutCancel(ctx), run, call, call.Output); err != nil {
+					return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+				}
+			}
+			if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+				_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: call.ID, ToolName: call.Name, Status: call.Status, Error: classifyExtensionError(context.Canceled)})
 			}
 			continue
 		}
@@ -123,25 +177,41 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 		}
 		o.observeToolMaterialized(ctx, snapshot, tool, toolCall)
 		observedTool := o.startObservedToolCall(ctx, snapshot, tool, toolCall)
-		result, execErr := o.executeTool(ctx, tool, toolCall)
-		result, middlewareErr := o.afterToolCall(ctx, tool, toolCall, result, execErr)
-		if middlewareErr != nil {
-			execErr = errors.Join(execErr, middlewareErr)
-		}
+		outcome := o.executeToolOutcome(ctx, tool, toolCall)
+		outcome = o.afterToolOutcome(ctx, tool, outcome)
+		result, execErr := outcome.Result, outcome.RawError
 		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, execErr)
 		claimed.Status = status
 		claimed.Output = cloneJSON(output)
 		claimed.CompletedAt = o.now()
 		claimed.Error = errText
-		if err := o.Store.FinishToolCall(context.WithoutCancel(ctx), claimed); err != nil {
+		if settlementStore != nil {
+			if claimed.ResultMessageID == "" || claimed.ResultPartID == "" {
+				return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrConflict}
+			}
+			settleTime := claimed.CompletedAt
+			err = settlementStore.SettleToolCall(context.WithoutCancel(ctx), session.ToolSettlement{
+				ID: claimed.ID, Status: status, Output: cloneJSON(output), Error: claimed.Error, Metadata: cloneStringMap(claimed.Metadata), CompletedAt: settleTime,
+				ResultMessage: session.Message{ID: claimed.ResultMessageID, SessionID: claimed.SessionID, RunID: claimed.RunID, ParentID: claimed.MessageID, Role: session.RoleTool, ModelID: run.ModelID, CreatedAt: settleTime, UpdatedAt: settleTime},
+				ResultPart:    session.Part{ID: claimed.ResultPartID, MessageID: claimed.ResultMessageID, SessionID: claimed.SessionID, RunID: claimed.RunID, Kind: session.PartToolResult, Payload: cloneJSON(output), CreatedAt: settleTime, UpdatedAt: settleTime},
+			})
+		} else {
+			err = o.Store.FinishToolCall(context.WithoutCancel(ctx), claimed)
+		}
+		if err != nil {
 			o.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
 			o.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, toolCall, session.ToolCallFailed, o.now().Sub(claimed.StartedAt), err, nil)
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
+		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+			_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Status: status, Result: result, Error: classifyExtensionError(execErr)})
+		}
 		o.finishObservedToolCall(observedTool, status, execErr, result.Metadata)
 		o.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, toolCall, status, claimed.CompletedAt.Sub(claimed.StartedAt), execErr, result.Metadata)
-		if err := o.appendToolResult(context.WithoutCancel(ctx), run, claimed, output); err != nil {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		if settlementStore == nil {
+			if err := o.appendToolResult(context.WithoutCancel(ctx), run, claimed, output); err != nil {
+				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			}
 		}
 		if errors.Is(execErr, context.Canceled) {
 			return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: execErr})
@@ -151,16 +221,31 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 }
 
 func (o *StreamingOrchestrator) resumeTools(ctx context.Context, run session.Run) (map[string]Tool, error) {
-	if o.Tools == nil {
+	plan := runPlanFromContext(ctx)
+	if o.Tools == nil && (plan == nil || plan.Tools == nil) {
 		return nil, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
 	}
 	snapshot := o.resumeSnapshot(run)
-	resolved, err := o.Tools.ResolveTools(ctx, snapshot)
-	if err != nil {
-		return nil, err
+	var resolved []Tool
+	if o.Tools != nil {
+		legacy, err := o.Tools.ResolveTools(ctx, snapshot)
+		if err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, legacy...)
+	}
+	if plan != nil && plan.Tools != nil {
+		planned, err := plan.Tools.ResolveTools(ctx, snapshot)
+		if err != nil {
+			return nil, err
+		}
+		resolved = append(resolved, planned...)
 	}
 	tools := make(map[string]Tool, len(resolved))
 	for _, tool := range resolved {
+		if _, exists := tools[tool.Name]; exists {
+			return nil, fmt.Errorf("duplicate effective tool %q", tool.Name)
+		}
 		tools[tool.Name] = tool
 	}
 	return tools, nil

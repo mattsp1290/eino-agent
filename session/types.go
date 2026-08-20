@@ -74,23 +74,24 @@ type ComponentVersion struct {
 
 // Run records one admitted execution attempt before provider streaming starts.
 type Run struct {
-	ID           RunID
-	SessionID    ID
-	ParentRunID  RunID
-	ParentMsgID  MessageID
-	OwnerID      string
-	LeaseUntil   time.Time
-	Agent        string
-	ProviderID   string
-	ModelID      string
-	ContextEpoch EpochID
-	Status       RunStatus
-	Config       map[string]string
-	Components   []ComponentVersion
-	CreatedAt    time.Time
-	StartedAt    time.Time
-	FinishedAt   time.Time
-	Error        string
+	ID            RunID
+	SessionID     ID
+	ParentRunID   RunID
+	ParentMsgID   MessageID
+	OwnerID       string
+	LeaseUntil    time.Time
+	Agent         string
+	ProviderID    string
+	ModelID       string
+	ContextEpoch  EpochID
+	Status        RunStatus
+	Config        map[string]string
+	Components    []ComponentVersion
+	ExtensionPlan ExtensionPlanDescriptor
+	CreatedAt     time.Time
+	StartedAt     time.Time
+	FinishedAt    time.Time
+	Error         string
 }
 
 // Terminal reports whether the run no longer owns execution.
@@ -180,22 +181,24 @@ const (
 
 // ToolCall is the durable execution envelope for one tool invocation.
 type ToolCall struct {
-	ID          ToolCallID
-	SessionID   ID
-	RunID       RunID
-	MessageID   MessageID
-	Name        string
-	Input       json.RawMessage
-	Output      json.RawMessage
-	Status      ToolCallStatus
-	RetrySafe   bool
-	Metadata    map[string]string
-	ClaimedBy   string
-	ClaimToken  string
-	LeaseUntil  time.Time
-	StartedAt   time.Time
-	CompletedAt time.Time
-	Error       string
+	ID              ToolCallID
+	SessionID       ID
+	RunID           RunID
+	MessageID       MessageID
+	ResultMessageID MessageID
+	ResultPartID    PartID
+	Name            string
+	Input           json.RawMessage
+	Output          json.RawMessage
+	Status          ToolCallStatus
+	RetrySafe       bool
+	Metadata        map[string]string
+	ClaimedBy       string
+	ClaimToken      string
+	LeaseUntil      time.Time
+	StartedAt       time.Time
+	CompletedAt     time.Time
+	Error           string
 }
 
 // ContextEpoch records the history segment used to build provider context.

@@ -7,6 +7,10 @@ native structs, and Wasm-backed wrappers all enter the orchestrator through the
 same functional options; the orchestrator does not branch on implementation
 kind.
 
+Typed interception, frozen capability plans, lifecycle, the producer/consumer
+catalog, exact pipelines, and request-ledger privacy are documented in
+[`extension-points.md`](extension-points.md).
+
 ## Construction and seams
 
 `runtime.NewStreamingOrchestrator` is the preferred constructor. It applies
@@ -24,10 +28,10 @@ construction remains supported.
 | --- | --- | --- | --- |
 | Tool | `tools.Definition` via `tools.Registry` and `runtime.WithToolRegistry` | `tool` | Phase A wrapper and fixture |
 | Permission policy | `permissions.Policy` / `PolicyFunc` via `runtime.WithPermissions` | `permissions-policy` | Phase A wrapper and fixture |
-| Context source | `runtime.ContextSource` / `ContextSourceFunc` | `context-source` | Phase B WIT authored |
-| Event sink | `runtime.EventSink` / `EventSinkFunc` | `event-sink` | Phase B WIT authored |
-| Hook | `runtime.Hook` / `HookFuncs` | `hook` | Phase B WIT authored |
-| Tool middleware | `runtime.ToolMiddleware` / `ToolMiddlewareFuncs` | `tool-middleware` | Phase B WIT authored |
+| Context source | `runtime.ContextSource` / `ContextSourceFunc` | `context-source` | Implemented |
+| Event sink | `runtime.EventSink` / `EventSinkFunc` | `event-sink` | Implemented |
+| Hook | `runtime.Hook` / `HookFuncs` | `hook` | Implemented |
+| Tool middleware | `runtime.ToolMiddleware` / `ToolMiddlewareFuncs` | `tool-middleware` | Implemented |
 | Persistence | `session.Store` and `session.Transactor` | none | Native only by design |
 | Models/providers | `model.Resolver`, normally `model.AdapterResolver` | none | Native only by design |
 | Durable IDs | `runtime.IDGenerator` | none | Native only by design |
@@ -106,10 +110,10 @@ equivalent Go API is released.
 | --- | --- | --- | --- |
 | `customTools` | Tool registry | `tools.Definition`, `tools.Registry.Register`, `runtime.WithToolRegistry` | `wasmext.LoadTool`, `tool` world |
 | `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.LoadPermissionsPolicy`, `permissions-policy` world |
-| `tool_call` argument rewrite | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world, Phase B wrapper gap |
-| `tool_result` patch | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world, Phase B wrapper gap |
-| `before_agent_start` / context | Context source and hook | `runtime.ContextSource`, `runtime.WithContextSource`, `runtime.Hook` | `context-source` and `hook` worlds, Phase B wrapper gap |
-| `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world, Phase B wrapper gap |
+| `tool_call` argument rewrite | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world and wrapper |
+| `tool_result` patch | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world and wrapper |
+| `before_agent_start` / context | Context source and hook | `runtime.ContextSource`, `runtime.WithContextSource`, `runtime.Hook` | `context-source` and `hook` worlds and wrappers |
+| `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world and wrapper |
 | `sessionManager` | Session persistence | `session.Store`, `session.Transactor`, `runtime.WithStore`, `runtime.WithTransactor` | No Wasm path by design |
 | `registerProvider` | Model resolver | `model.AdapterResolver`, `runtime.WithModelResolver` | No Wasm path by design; models and credentials stay native |
 | Provider request/header interception | Adapter transport | Wrap `model.Adapter` | Gap by design; adapters own transport and credentials |

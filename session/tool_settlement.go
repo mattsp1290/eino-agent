@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"reflect"
 	"time"
@@ -11,12 +12,22 @@ import (
 // call. Stores can use Apply to make FinishToolCall idempotent while still
 // rejecting conflicting repeated settlements.
 type ToolSettlement struct {
-	ID          ToolCallID
-	Status      ToolCallStatus
-	Output      json.RawMessage
-	Error       string
-	Metadata    map[string]string
-	CompletedAt time.Time
+	ID            ToolCallID
+	Status        ToolCallStatus
+	Output        json.RawMessage
+	Error         string
+	Metadata      map[string]string
+	CompletedAt   time.Time
+	ResultMessage Message
+	ResultPart    Part
+}
+
+// ToolSettlementStore atomically commits terminal tool state and its reserved
+// model-visible result message/part. Implementations must be idempotent by call
+// and reserved result IDs.
+type ToolSettlementStore interface {
+	SettleToolCall(context.Context, ToolSettlement) error
+	ListUnreconciledToolSettlements(context.Context, RunID) ([]ToolSettlement, error)
 }
 
 // Apply returns call with this terminal settlement applied. Applying the same

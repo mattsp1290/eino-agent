@@ -233,3 +233,19 @@ Before production embedding, host applications should verify:
   host policy;
 - external attachment stores enforce access control independently of model-facing
   attachment IDs.
+
+## Extension scope and protected policy
+
+Extension scope is deterministic routing for trusted in-process code, not an
+authorization or sandbox boundary. Only global and exact-session scopes exist.
+Mounted guards are monotonic (`deny`/`abstain`), run on final normalized input,
+and cannot bypass the core permission/approval loop. Tool execution and result
+points protect identity, disposition, permission metadata, and raw/classified
+errors from mutation.
+
+Wasm guests receive curated DTOs only. They cannot select a point by string,
+request global authority, replace provider identity, or receive credentials,
+host clients, callbacks, raw event payloads, or opaque configuration. Native
+callback error text is bounded before persistence; trusted diagnostics retain
+the raw cause locally. See
+[`extension-points.md`](extension-points.md#scope-provenance-and-resume).

@@ -60,3 +60,12 @@ matched operation pattern, and tool metadata. Runtime passes
 name and then the materialized tool name. Approval hooks stay host-defined so UI,
 CLI, or service-policy implementations can decide how to ask the user or an
 external policy engine.
+
+## Mounted guards
+
+Frozen extension plans may add scoped `runtime.ToolGuard` callbacks. Every
+applicable guard runs after input preparation and before the existing policy
+loop. A guard can only deny or abstain; any denial wins, and no guard can grant
+authority or override another denial. If all abstain, legacy permission and
+approval order, callback count, interruption timing, and output remain
+unchanged.

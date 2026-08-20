@@ -218,6 +218,10 @@ func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
 	}{
 		{name: "tool", file: "tool.wasm", contract: toolContract},
 		{name: "permissions-policy", file: "permissions-policy.wasm", contract: permissionsPolicyContract},
+		{name: "context-source", file: "context-source.wasm", contract: contextSourceContract},
+		{name: "event-sink", file: "event-sink.wasm", contract: eventSinkContract},
+		{name: "hook", file: "hook.wasm", contract: hookContract},
+		{name: "tool-middleware", file: "tool-middleware.wasm", contract: toolMiddlewareContract},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			bytes, err := os.ReadFile(filepath.Join(root, test.file))
@@ -246,6 +250,76 @@ func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
 	}, toolContract, newWasmtimeEngine)
 	if !IsKind(err, ErrorContract) {
 		t.Fatalf("wrong world error = %v", err)
+	}
+}
+
+func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	ctx := context.Background()
+
+	source, err := OpenContextSource(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	messages, err := source.LoadContext(ctx, runtime.TurnSnapshot{RunID: "run", SessionID: "session"})
+	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
+		t.Fatalf("context source = %#v, %v", messages, err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	sink, err := OpenEventSink(ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Emit(ctx, runtime.Event{Kind: runtime.EventRunStarted, SessionID: "session", RunID: "run", Payload: json.RawMessage(`{"secret":"credential-sentinel"}`), Time: time.Unix(1, 0)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	hook, err := OpenHook(ctx, checkedInFixtureConfig(t, root, "hook.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.BeforeRun(ctx, session.Run{ID: "run", SessionID: "session"}); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := runtime.TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
+	if _, err := hook.BeforeTurn(ctx, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.AfterTurn(ctx, snapshot, runtime.Result{RunID: "run"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.AfterRun(ctx, runtime.Result{RunID: "run"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := hook.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	middleware, err := OpenToolMiddleware(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := runtime.ToolCall{ID: "call", RunID: "run", SessionID: "session", Input: json.RawMessage(`{"replace":true}`)}
+	input, err := middleware.BeforeToolCall(ctx, runtime.Tool{Name: "echo"}, call)
+	if err != nil || string(input) != `{"from":"wasm"}` {
+		var extensionErr *Error
+		if errors.As(err, &extensionErr) {
+			t.Fatalf("middleware input = %s, %v (cause: %v)", input, err, extensionErr.cause)
+		}
+		t.Fatalf("middleware input = %s, %v", input, err)
+	}
+	result, err := middleware.AfterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}}, nil)
+	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
+		t.Fatalf("middleware result = %#v, %v", result, err)
+	}
+	if err := middleware.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

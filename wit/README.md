@@ -20,3 +20,14 @@ environment variables, process execution, clocks, random sources, credentials,
 provider endpoints, complete configuration snapshots, and resolved model state
 are not imported. Hosts may attach a `ModuleConfig.Observer`; guest log lines
 are byte-bounded and carry the configured module name plus verified digest.
+
+## Native point adapters
+
+The published `@0.1.0` signatures remain immutable. `wasmext` maps
+`context-source` to `runtime/context-assemble`, `event-sink` to
+`runtime/event-published`, `hook` to bounded run/context observations, and
+`tool-middleware` to `runtime/tool-prepare` plus
+`runtime/tool-result-transform`. It does not expose native around execution or
+a generic name-and-JSON event bus. Prompt contribution and around execution do
+not justify a `@0.2.0` package yet; a separate security/design review is
+required before adding either.

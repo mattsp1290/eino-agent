@@ -23,3 +23,10 @@ This package intentionally does not register routes, own cookies or bearer-token
 policy, choose URL layouts, or prescribe product session identifiers. A server
 should compose these adapters inside its existing router and authorization
 middleware.
+
+Hosts that support dynamically mounted capabilities should own one
+`composition.Registry`, pass it with `runtime.WithRunPlanProvider`, and retain
+each returned mount. During shutdown, call `Deactivate` to stop new admission,
+then `Close` with a bounded context; close waits for already admitted frozen
+plans and runs registered effects in reverse order. The complete example is
+[`examples/native-extension`](../../examples/native-extension).
