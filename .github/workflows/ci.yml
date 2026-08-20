@@ -21,6 +21,17 @@ jobs:
           go-version: 1.26.3
           cache: true
 
+      - name: Install pinned wasm-tools
+        env:
+          WASM_TOOLS_VERSION: "1.233.0"
+        run: |
+          curl -fsSL "https://github.com/bytecodealliance/wasm-tools/releases/download/v${WASM_TOOLS_VERSION}/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux.tar.gz" -o "$RUNNER_TEMP/wasm-tools.tar.gz"
+          tar -xzf "$RUNNER_TEMP/wasm-tools.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasm-tools-${WASM_TOOLS_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+
+      - name: Check WIT regeneration
+        run: make wit-check
+
       - name: Check formatting
         run: make fmt-check
 

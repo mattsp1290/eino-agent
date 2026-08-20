@@ -252,6 +252,39 @@ The host remains responsible for HTTP routing, authentication, tenancy,
 deployment-specific config discovery, concrete database selection, and UI
 policy.
 
+### Preferred construction
+
+`runtime.NewStreamingOrchestrator` applies functional options in order and
+validates the complete construction before a run can start. `Store`, `Model`,
+and `IDs` are required and are all named in one construction error when
+missing. Later scalar options override earlier ones; context sources, hooks,
+and tool middleware append deterministically. Nil interface dependencies are
+errors. Existing zero-value fallbacks and struct-literal construction remain
+supported.
+
+`Admit` is deliberately excluded from options. `admitter()` derives it from
+`Store`, `Transactor`, `Events`, `Hooks`, and `Clock`, which prevents a second
+independently configured dependency graph.
+
+### Tool-call middleware save points
+
+The `BeforeToolCall` chain runs in registration order after typed input decode.
+The runtime computes the permission pattern and persists the assistant
+tool-call part, pending/running events, and durable call only from the final
+rewritten JSON. Permission checks and the executor see that same input. A
+before error still admits and settles a failed durable call and does not abort
+unrelated sibling calls.
+
+The `AfterToolCall` chain runs in reverse order after execution and before
+encoding/settlement. Durable output, the terminal event, the tool-result part,
+and model-visible message all use the final patch. The executor error is
+immutable and remains authoritative.
+
+Resume never repeats `BeforeToolCall`: pending records already hold rewritten
+input. A pending call that is reclaimed and executed runs `AfterToolCall`; a
+running call settled interrupted without re-execution skips it. This is the
+exactly-once boundary for argument rewriting.
+
 ## Initial Public Interfaces
 
 This iteration introduces compileable interface packages:

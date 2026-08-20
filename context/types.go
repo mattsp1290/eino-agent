@@ -140,6 +140,8 @@ type Loader interface {
 // LoaderFunc adapts a function into a Loader.
 type LoaderFunc func(ctx context.Context, request Request) ([]Item, error)
 
+var _ Loader = LoaderFunc(nil)
+
 // LoadContext calls fn.
 func (fn LoaderFunc) LoadContext(ctx context.Context, request Request) ([]Item, error) {
 	return fn(ctx, request)

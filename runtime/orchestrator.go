@@ -58,6 +58,7 @@ type StreamingOrchestrator struct {
 	Lease       time.Duration
 	History     history.Options
 	Permissions permissions.Policy
+	Middleware  []ToolMiddleware
 	Admit       *Admitter
 	Transactor  session.Transactor
 	Observer    *einoobs.Observer
@@ -232,6 +233,13 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 			return Result{}, err
 		}
 		normalizeToolCallIDs(msg, o.IDs)
+		preparedCalls, err := o.prepareToolCalls(ctx, snapshot, currentMessageID, msg.ToolCalls)
+		if err != nil {
+			return Result{}, err
+		}
+		for index := range preparedCalls {
+			msg.ToolCalls[index] = preparedCalls[index].schemaCall
+		}
 		if err := o.persistAssistant(ctx, snapshot, currentMessageID, msg); err != nil {
 			return Result{}, err
 		}
@@ -242,7 +250,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 			return Result{}, model.Error{Code: "tool_turn_limit_exceeded", Message: "model exceeded tool turn limit", Cause: model.ErrProviderRejected}
 		}
 		messages = append(messages, msg)
-		toolMessages, err := o.executeTools(ctx, snapshot, currentMessageID, msg.ToolCalls)
+		toolMessages, err := o.executePreparedTools(ctx, snapshot, currentMessageID, preparedCalls)
 		if err != nil {
 			return Result{}, err
 		}
@@ -447,12 +455,19 @@ func normalizeToolCalls(calls []einoschema.ToolCall) ([]normalizedToolCall, erro
 	return normalized, nil
 }
 
-func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []einoschema.ToolCall) ([]*einoschema.Message, error) {
+type preparedToolCall struct {
+	schemaCall    einoschema.ToolCall
+	tool          Tool
+	call          ToolCall
+	middlewareErr error
+}
+
+func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []einoschema.ToolCall) ([]preparedToolCall, error) {
 	byName := map[string]Tool{}
 	for _, tool := range snapshot.Tools {
 		byName[tool.Name] = tool
 	}
-	messages := make([]*einoschema.Message, 0, len(calls))
+	prepared := make([]preparedToolCall, 0, len(calls))
 	for _, schemaCall := range calls {
 		callID := session.ToolCallID(schemaCall.ID)
 		if callID == "" {
@@ -481,12 +496,38 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 			}
 			input = decoded
 		}
-		record, err := o.Store.CreateToolCall(ctx, session.ToolCall{
+		call := ToolCall{
 			ID:        callID,
 			SessionID: snapshot.SessionID,
 			RunID:     snapshot.RunID,
 			MessageID: messageID,
 			Name:      schemaCall.Function.Name,
+			Scope:     tool.Scope,
+			Input:     cloneJSON(input),
+		}
+		input, middlewareErr := o.beforeToolCall(ctx, tool, call)
+		call.Input = cloneJSON(input)
+		call.Pattern = toolPattern(input, schemaCall.Function.Name)
+		schemaCall.Function.Arguments = string(input)
+		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: middlewareErr})
+	}
+	return prepared, nil
+}
+
+func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.Message, error) {
+	messages := make([]*einoschema.Message, 0, len(calls))
+	for _, prepared := range calls {
+		schemaCall := prepared.schemaCall
+		tool := prepared.tool
+		call := prepared.call
+		callID := call.ID
+		input := call.Input
+		record, err := o.Store.CreateToolCall(ctx, session.ToolCall{
+			ID:        callID,
+			SessionID: snapshot.SessionID,
+			RunID:     snapshot.RunID,
+			MessageID: messageID,
+			Name:      call.Name,
 			Input:     cloneJSON(input),
 			Status:    session.ToolCallPending,
 			RetrySafe: tool.RetrySafe,
@@ -497,7 +538,7 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 		}
 		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{
 			ID:        string(callID),
-			Name:      schemaCall.Function.Name,
+			Name:      call.Name,
 			Arguments: cloneJSON(input),
 		})
 		record.Status = session.ToolCallRunning
@@ -510,22 +551,21 @@ func (o *StreamingOrchestrator) executeTools(ctx context.Context, snapshot TurnS
 		}
 		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallRunning, toolCallPayload{
 			ID:        string(callID),
-			Name:      schemaCall.Function.Name,
+			Name:      call.Name,
 			Arguments: cloneJSON(input),
 		})
-		call := ToolCall{
-			ID:        callID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			MessageID: messageID,
-			Name:      schemaCall.Function.Name,
-			Scope:     tool.Scope,
-			Pattern:   toolPattern(input, schemaCall.Function.Name),
-			Input:     cloneJSON(input),
-		}
 		o.observeToolMaterialized(ctx, snapshot, tool, call)
 		observedTool := o.startObservedToolCall(ctx, snapshot, tool, call)
-		result, execErr := o.executeTool(ctx, tool, call)
+		var result ToolResult
+		execErr := prepared.middlewareErr
+		if execErr == nil {
+			result, execErr = o.executeTool(ctx, tool, call)
+			var afterErr error
+			result, afterErr = o.afterToolCall(ctx, tool, call, result, execErr)
+			if afterErr != nil {
+				execErr = errors.Join(execErr, afterErr)
+			}
+		}
 		output, status, errText := encodeToolOutput(callID, result, tool.Retention, execErr)
 		record.Status = status
 		record.Output = cloneJSON(output)
@@ -582,6 +622,40 @@ func (o *StreamingOrchestrator) executeTool(ctx context.Context, tool Tool, call
 		return tool.Executor.Execute(ctx, call)
 	}
 	return ExecuteToolWithPermissions(ctx, tool, call, o.Permissions)
+}
+
+func (o *StreamingOrchestrator) beforeToolCall(ctx context.Context, tool Tool, call ToolCall) (json.RawMessage, error) {
+	input := cloneJSON(call.Input)
+	for _, middleware := range o.Middleware {
+		if middleware == nil {
+			continue
+		}
+		call.Input = cloneJSON(input)
+		next, err := middleware.BeforeToolCall(ctx, tool, call)
+		if err != nil {
+			return input, err
+		}
+		if !json.Valid(next) {
+			return input, fmt.Errorf("tool middleware returned malformed JSON input")
+		}
+		input = cloneJSON(next)
+	}
+	return input, nil
+}
+
+func (o *StreamingOrchestrator) afterToolCall(ctx context.Context, tool Tool, call ToolCall, result ToolResult, execErr error) (ToolResult, error) {
+	for index := len(o.Middleware) - 1; index >= 0; index-- {
+		middleware := o.Middleware[index]
+		if middleware == nil {
+			continue
+		}
+		next, err := middleware.AfterToolCall(ctx, tool, call, result, execErr)
+		if err != nil {
+			return result, err
+		}
+		result = next
+	}
+	return result, nil
 }
 
 func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {

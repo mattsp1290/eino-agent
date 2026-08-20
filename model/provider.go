@@ -151,6 +151,16 @@ type AdapterResolver struct {
 	Catalog  Catalog
 }
 
+// ResolverFunc adapts a function into a Resolver.
+type ResolverFunc func(context.Context, Selection, Runtime) (Resolved, error)
+
+// Resolve calls fn.
+func (fn ResolverFunc) Resolve(ctx context.Context, selection Selection, runtime Runtime) (Resolved, error) {
+	return fn(ctx, selection, runtime)
+}
+
+var _ Resolver = ResolverFunc(nil)
+
 // Resolve builds an immutable model client for the selected provider/model.
 func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runtime Runtime) (Resolved, error) {
 	adapter, provider, err := r.adapterFor(ctx, selection.ProviderID, runtime)

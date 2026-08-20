@@ -28,7 +28,8 @@ For a runnable starting point, see `examples/minimal-server` and
 
 ## Minimal Embed
 
-A typical server wires these pieces once at startup. This snippet is schematic:
+A typical server wires these pieces once at startup through
+`runtime.NewStreamingOrchestrator`. This snippet is schematic:
 `newIDGenerator`, `providerResolver`, `toolRegistry`, and `eventSink` are
 application-owned implementations. The required fields for a successful minimal
 start are `Store`, `Model`, `IDs`, and a non-empty request `SessionID`.
@@ -43,14 +44,17 @@ if err != nil {
 tail := stream.NewTail(128)
 ids := newIDGenerator()
 
-orchestrator := &runtime.StreamingOrchestrator{
-    Store:      store,
-    Transactor: store,
-    Model:      providerResolver,
-    Tools:      toolRegistry,
-    Events:     eventSink{Store: store, Tail: tail, IDs: ids},
-    IDs:        ids,
-    OwnerID:    "api-server-1",
+orchestrator, err := runtime.NewStreamingOrchestrator(
+    runtime.WithStore(store),
+    runtime.WithTransactor(store),
+    runtime.WithModelResolver(providerResolver),
+    runtime.WithToolRegistry(toolRegistry),
+    runtime.WithEventSink(eventSink{Store: store, Tail: tail, IDs: ids}),
+    runtime.WithIDGenerator(ids),
+    runtime.WithOwnerID("api-server-1"),
+)
+if err != nil {
+    return err
 }
 ```
 
@@ -183,8 +187,8 @@ do not change migration order after release.
 
 ## Tool Lifecycle
 
-Register server-side tools with `tools.NewRegistry` and assign the registry to
-`runtime.StreamingOrchestrator.Tools`:
+Register native and Wasm-backed tools through the same `tools.Registry` path.
+The embedding host owns Wasm shutdown:
 
 ```go
 registry := tools.NewRegistry()
@@ -201,8 +205,32 @@ if err != nil {
     return err
 }
 
-orchestrator.Tools = registry
+loader := wasmext.NewLoader()
+defer loader.Close(ctx)
+wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
+    Name:           "review_tool",
+    Path:           "extensions/review-tool.wasm",
+    AllowedRoot:    "extensions",
+    ExpectedSHA256: expectedDigest,
+})
+if err != nil {
+    return err
+}
+if _, err := registry.Register(wasmDefinition); err != nil {
+    return err
+}
+
+orchestrator, err := runtime.NewStreamingOrchestrator(
+    runtime.WithStore(store),
+    runtime.WithModelResolver(resolver),
+    runtime.WithIDGenerator(ids),
+    runtime.WithToolRegistry(registry),
+)
 ```
+
+Set `ModuleConfig.Observer` when guest log lines should be exported through an
+`einoobs.Observer`; `wasmext` attaches the configured module name and verified
+digest and enforces a 4 KiB-or-tighter message bound.
 
 `tools.Definition` requires `Decode`, `Encode`, and `Execute`. `Register`
 creates a generation; `Replace` updates only the active generation so delayed

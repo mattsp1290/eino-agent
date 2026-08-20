@@ -5,6 +5,16 @@ Date: 2026-06-27
 Tool execution is gated by a permission policy before the runtime calls the
 materialized tool executor.
 
+Tool-call middleware runs first. Policy receives the final rewritten input's
+computed `runtime.ToolCall.Pattern`, so it always decides on the operation that
+will actually execute. A policy cannot rewrite arguments or bypass middleware.
+
+Hosts can supply native policies through `runtime.WithPermissions`, including
+plain functions adapted by `permissions.PolicyFunc`. The versioned
+`permissions-policy` WIT world and `wasmext.LoadPermissionsPolicy` provide the
+same Go interface for Wasm-backed policies; model execution and credentials
+remain native.
+
 ## Decisions
 
 `permissions.Policy` returns one of three decisions:

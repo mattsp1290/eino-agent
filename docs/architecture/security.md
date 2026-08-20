@@ -23,6 +23,41 @@ Host applications remain responsible for route-level authorization, tenant
 isolation, durable store encryption, provider-specific credential acquisition,
 and any policy that intentionally allows plain reasoning storage.
 
+## WebAssembly Guests
+
+Wasm extensions are untrusted local components. `wasmext` confines loading to
+an explicitly configured allowed root, resolves symlinks before containment
+checks, rejects URL loads and non-regular files, enforces a pre-compilation size
+limit, reads bytes once, and verifies the configured SHA-256 over those same
+bytes. Wrong worlds and versions fail closed.
+
+WASI is disabled. Guests receive no filesystem, network, environment, process,
+clock, random, credential, endpoint, raw provider payload, complete
+`config.Snapshot`, or resolved model capability. The sole v1 capability import
+is a size-bounded log function whose module identity is host configured.
+Cross-boundary JSON and text are checked against input/output bounds.
+
+Execution uses a fresh store and instance per call behind an internal engine
+boundary, with calls serialized per compiled module so an epoch increment only
+targets the active call.
+Timeout is active: cancellation increments Wasmtime's epoch so synchronous
+guest code traps instead of merely observing a cooperative Go context. Close
+stops new calls, interrupts in-flight calls, drains for a bounded interval, and
+releases compiled state once. Errors expose only a stable class and configured
+module name/hash prefix, never guest diagnostics or paths.
+
+Evidence:
+
+- `wasmext.TestSecureModuleLoadingRejectsHashSizeAndEscapingSymlink`
+- `wasmext.TestModuleTimeoutActivelyInterruptsGuest`
+- `wasmext.TestContractAndPayloadViolationsAreClassifiedAndBounded`
+- `wasmext.TestToolWrapperRoundTripAndBoundedSnapshot`
+- `wasmext.TestCheckedInPhaseAComponentsRoundTrip`
+- `wasmext.TestCheckedInToolFailuresAreBoundedAndClassified`
+- `wasmext.TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls`
+- `wasmext.TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy`
+- `internal/deps.TestCorePackagesDoNotDependOnWasmRuntimeOrBindings`
+
 ## Malformed Input
 
 Runtime provider boundaries fail closed:
