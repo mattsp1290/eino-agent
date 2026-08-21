@@ -82,7 +82,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
 	var settlementStore session.ToolSettlementStore
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Descriptor.Mode == session.PlanStrict {
+	if plan := runPlanFromContext(ctx); plan != nil && descriptorRequiresToolSettlement(plan.Descriptor) {
 		var ok bool
 		settlementStore, ok = o.Store.(session.ToolSettlementStore)
 		if !ok {
@@ -130,7 +130,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 					return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrConflict}
 				}
 				err := settlementStore.SettleToolCall(context.WithoutCancel(ctx), session.ToolSettlement{
-					ID: call.ID, Status: call.Status, Output: cloneJSON(call.Output), Error: call.Error, Metadata: cloneStringMap(call.Metadata), CompletedAt: call.CompletedAt,
+					ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: call.Status, Output: cloneJSON(call.Output), Error: call.Error, Metadata: cloneStringMap(call.Metadata), CompletedAt: call.CompletedAt,
 					ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, ModelID: run.ModelID, CreatedAt: call.CompletedAt, UpdatedAt: call.CompletedAt},
 					ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: cloneJSON(call.Output), CreatedAt: call.CompletedAt, UpdatedAt: call.CompletedAt},
 				})
@@ -191,7 +191,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			}
 			settleTime := claimed.CompletedAt
 			err = settlementStore.SettleToolCall(context.WithoutCancel(ctx), session.ToolSettlement{
-				ID: claimed.ID, Status: status, Output: cloneJSON(output), Error: claimed.Error, Metadata: cloneStringMap(claimed.Metadata), CompletedAt: settleTime,
+				ID: claimed.ID, ClaimedBy: claimed.ClaimedBy, ClaimToken: claimed.ClaimToken, Status: status, Output: cloneJSON(output), Error: claimed.Error, Metadata: cloneStringMap(claimed.Metadata), CompletedAt: settleTime,
 				ResultMessage: session.Message{ID: claimed.ResultMessageID, SessionID: claimed.SessionID, RunID: claimed.RunID, ParentID: claimed.MessageID, Role: session.RoleTool, ModelID: run.ModelID, CreatedAt: settleTime, UpdatedAt: settleTime},
 				ResultPart:    session.Part{ID: claimed.ResultPartID, MessageID: claimed.ResultMessageID, SessionID: claimed.SessionID, RunID: claimed.RunID, Kind: session.PartToolResult, Payload: cloneJSON(output), CreatedAt: settleTime, UpdatedAt: settleTime},
 			})

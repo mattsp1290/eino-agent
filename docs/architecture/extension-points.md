@@ -116,6 +116,11 @@ mode:
 - `legacy`: current callback/tool configuration is used without a provenance
   guarantee.
 
+Descriptor schema v2 records prompt and guard order, including explicit zero,
+so behavior-changing reordering changes the fingerprint. Schema-v1 callback-
+and tool-only plans remain resumable; schema-v1 plans containing prompts or
+guards are rejected because their admitted order cannot be proven.
+
 Resume acquires the persisted instances and fingerprint before changing run or
 tool state. Unrelated mounts added later are ignored. Local tool generations
 prevent in-process ABA but are not durable identity.

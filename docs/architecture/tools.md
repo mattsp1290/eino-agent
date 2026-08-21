@@ -71,6 +71,8 @@ definition, while restrictions only intersect.
 
 Strict registry-backed calls reserve result message and part IDs at admission
 and require `session.ToolSettlementStore`. SQLite commits terminal tool state
-and the model-visible result atomically and idempotently. The protected stage
-order is documented in
+and the model-visible result atomically and idempotently. Each settlement must
+present the owner and token of the durable tool claim whose work it commits;
+missing or stale claim identities conflict before terminal state is applied.
+The protected stage order is documented in
 [`extension-points.md`](extension-points.md#exact-pipelines).

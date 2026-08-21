@@ -180,6 +180,32 @@ func TestProtectedMutationAndRequiredDelegation(t *testing.T) {
 	}
 }
 
+func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
+	delegatedErr := errors.New("delegated failure")
+	registry := NewRegistry(nil)
+	component := testComponent("swallow")
+	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return Use(registrar, testAround, spec(component.InstanceID, "swallow", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			_, _ = next(ctx, input)
+			return "fabricated", nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	output, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		return "", delegatedErr
+	})
+	if output != "" || !errors.Is(err, delegatedErr) {
+		t.Fatalf("Invoke = %q, %v; want delegated failure", output, err)
+	}
+}
+
 func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
 	registry := NewRegistry(nil)
 	component := testComponent("context")

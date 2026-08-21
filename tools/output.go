@@ -65,8 +65,14 @@ func EncodeModelOutput(call runtime.ToolCall, result runtime.ToolResult, policy 
 }
 
 // BuildToolSettlement converts a tool execution outcome into the durable tool
-// call settlement plus the replayable tool-result part payload.
-func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, execErr error) (session.ToolSettlement, session.Part, error) {
+// call settlement plus the replayable tool-result part payload. Exactly one
+// nonempty claim identity is required; the variadic form preserves source
+// compatibility while making legacy calls fail explicitly instead of emitting
+// an unfenced settlement.
+func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, execErr error, claims ...session.ToolClaimIdentity) (session.ToolSettlement, session.Part, error) {
+	if len(claims) != 1 || claims[0].ClaimedBy == "" || claims[0].ClaimToken == "" {
+		return session.ToolSettlement{}, session.Part{}, errors.New("tool settlement claim identity required")
+	}
 	status := outputStatusFromResult(result, execErr)
 	modelResult := result
 	if execErr != nil {
@@ -88,6 +94,8 @@ func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtim
 	}
 	settlement := session.ToolSettlement{
 		ID:          call.ID,
+		ClaimedBy:   claims[0].ClaimedBy,
+		ClaimToken:  claims[0].ClaimToken,
 		Status:      toolCallStatus(status),
 		Output:      raw,
 		Metadata:    settlementMetadata(tool, status, output),

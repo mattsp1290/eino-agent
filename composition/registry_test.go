@@ -231,3 +231,77 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 		}
 	}
 }
+
+func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
+	for _, kind := range []session.ExtensionKind{session.ExtensionPrompt, session.ExtensionGuard} {
+		t.Run(string(kind), func(t *testing.T) {
+			registry := NewRegistry(nil)
+			mountOrdered := func(order int) *Mount {
+				mount, err := registry.Mount(context.Background(), component("ordered"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+					switch kind {
+					case session.ExtensionPrompt:
+						return registrar.Prompt(PromptRegistration{ID: "prompt", InstanceID: "ordered", Name: "policy", Order: order, Scope: extension.GlobalScope(), Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) { return "policy", nil })})
+					default:
+						return registrar.Guard(GuardRegistration{ID: "guard", InstanceID: "ordered", Order: order, Scope: extension.GlobalScope(), Guard: runtime.ToolGuardFunc(func(context.Context, runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
+							return runtime.ToolGuardResult{Decision: runtime.ToolGuardAbstain}, nil
+						})})
+					}
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return mount
+			}
+
+			firstMount := mountOrdered(10)
+			first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted := first.Descriptor.Clone()
+			first.Dispatch.Release()
+			if len(persisted.Entries) != 1 || persisted.Entries[0].Order != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
+				t.Fatalf("ordered descriptor = %#v", persisted)
+			}
+			if err := firstMount.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			secondMount := mountOrdered(20)
+			defer func() { _ = secondMount.Close(context.Background()) }()
+			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+				t.Fatalf("changed order resume = %v, want mismatch", err)
+			}
+		})
+	}
+}
+
+func TestVersionOneCallbackAndToolPlanRemainsResumable(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := component("v1-compatible")
+	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {
+			return err
+		}
+		return registrar.Tool(ToolRegistration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: definition("echo", "v1")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := plan.Descriptor.Clone()
+	plan.Dispatch.Release()
+	persisted.SchemaVersion = 1
+	persisted.Fingerprint, err = session.FingerprintExtensionPlan(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	if err != nil {
+		t.Fatalf("AcquireResumePlan schema v1 callback/tool plan = %v", err)
+	}
+	resumed.Dispatch.Release()
+}

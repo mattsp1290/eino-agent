@@ -103,7 +103,7 @@ func TestBuildToolSettlementClassifiesExpectedFailure(t *testing.T) {
 		Metadata: map[string]string{
 			MetadataPermissionStatus: "denied",
 		},
-	}, nil)
+	}, nil, toolClaim())
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestBuildToolSettlementClassifiesOperationalFailureWithoutLeakingErrorToMod
 	errBoom := errors.New("database password appeared in a lower layer")
 	settlement, part, err := BuildToolSettlement(runtime.Tool{
 		Retention: runtime.RetentionPolicy{MaxInlineBytes: 200},
-	}, toolCall(), runtime.ToolResult{}, errBoom)
+	}, toolCall(), runtime.ToolResult{}, errBoom, toolClaim())
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestBuildToolSettlementClassifiesOperationalFailureWithoutLeakingErrorToMod
 }
 
 func TestBuildToolSettlementClassifiesInterruption(t *testing.T) {
-	settlement, part, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, context.Canceled)
+	settlement, part, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, context.Canceled, toolClaim())
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}
@@ -145,6 +145,19 @@ func TestBuildToolSettlementClassifiesInterruption(t *testing.T) {
 	if !strings.Contains(string(part.Payload), outputStatusInterrupted) {
 		t.Fatalf("part payload = %s", part.Payload)
 	}
+}
+
+func TestBuildToolSettlementRequiresClaimIdentity(t *testing.T) {
+	if _, _, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, nil); err == nil {
+		t.Fatal("BuildToolSettlement accepted missing claim identity")
+	}
+	if _, _, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, nil, session.ToolClaimIdentity{}); err == nil {
+		t.Fatal("BuildToolSettlement accepted empty claim identity")
+	}
+}
+
+func toolClaim() session.ToolClaimIdentity {
+	return session.ToolClaimIdentity{ClaimedBy: "worker", ClaimToken: "token"}
 }
 
 func toolCall() runtime.ToolCall {

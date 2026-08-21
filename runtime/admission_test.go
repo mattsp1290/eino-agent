@@ -10,6 +10,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -80,6 +81,32 @@ func TestAdmitRequiresContextEpochID(t *testing.T) {
 	_, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
+	}
+}
+
+func TestRunAdmittedNotificationWaitsForLegacyBeforeRunSuccess(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "admission-order", Artifact: extension.Artifact{Name: "admission-order", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	called := false
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, RunAdmittedPoint, extension.Registration{ID: "observe", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, RunAdmittedNotice) error {
+			called = true
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	beforeRunErr := errors.New("before run failed")
+	admitter := Admitter{Store: newAdmissionStore(), Hooks: []Hook{failingBeforeRunHook{err: beforeRunErr}}}
+	_, err = admitter.Admit(withRunPlan(context.Background(), &RunPlan{Dispatch: plan}), admissionRequest())
+	if !errors.Is(err, beforeRunErr) || called {
+		t.Fatalf("Admit error = %v, notification called = %t", err, called)
 	}
 }
 

@@ -148,7 +148,7 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	now := time.Now().UTC()
 	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
 	settlement := session.ToolSettlement{
-		ID: call.ID, Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
+		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output,
 		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
 		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
 	}
@@ -174,6 +174,39 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	conflict.ResultPart.Payload = conflict.Output
 	if err := st.SettleToolCall(ctx, conflict); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("conflicting settlement = %v", err)
+	}
+	stale := settlement
+	stale.ClaimToken = "stale"
+	if err := st.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("terminal stale settlement = %v", err)
+	}
+}
+
+func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
+	st, call := setupClaimedToolCall(t)
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+	stale := session.ToolSettlement{
+		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: json.RawMessage(`{"content":"stale"}`),
+		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool},
+		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: json.RawMessage(`{"content":"stale"}`)},
+	}
+
+	current := call
+	current.ClaimedBy = "new-worker"
+	current.ClaimToken = "new-token"
+	raw, err := json.Marshal(current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.exec(ctx, `UPDATE tool_calls SET claimed_by = ?, claim_token = ?, record = ? WHERE id = ?`, current.ClaimedBy, current.ClaimToken, raw, current.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale settlement = %v, want ErrConflict", err)
+	}
+	if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("stale result message error = %v, want ErrNotFound", err)
 	}
 }
 

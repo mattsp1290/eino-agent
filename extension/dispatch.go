@@ -93,6 +93,7 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 		var calls atomic.Int32
 		var delegatedOutput O
 		var delegatedSucceeded bool
+		var delegatedFailure error
 		next := func(nextCtx context.Context, nextInput I) (O, error) {
 			if calls.Add(1) != 1 {
 				return zero, ErrNextCalledTwice
@@ -102,6 +103,7 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			}
 			out, err := invoke(index+1, nextCtx, cloneInput(point.clone, nextInput))
 			if err != nil {
+				delegatedFailure = err
 				return out, &delegatedError{cause: err}
 			}
 			delegatedOutput = out
@@ -113,8 +115,16 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 		if count > 1 {
 			return zero, ErrNextCalledTwice
 		}
-		if err == nil && (point.requireNext || entry.requireNext) && count != 1 {
-			return zero, ErrNextNotCalled
+		if err == nil && (point.requireNext || entry.requireNext) {
+			if count != 1 {
+				return zero, ErrNextNotCalled
+			}
+			if !delegatedSucceeded {
+				if delegatedFailure != nil {
+					return zero, delegatedFailure
+				}
+				return zero, ErrNextNotCalled
+			}
 		}
 		if err == nil && point.validateOut != nil {
 			if validateErr := point.validateOut(out); validateErr != nil {

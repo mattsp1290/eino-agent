@@ -529,7 +529,7 @@ func (s *Store) ListUnreconciledToolSettlements(ctx context.Context, runID sessi
 		}
 		createdAt := call.CompletedAt
 		result = append(result, session.ToolSettlement{
-			ID: call.ID, Status: call.Status, Output: append(json.RawMessage(nil), call.Output...), Error: call.Error,
+			ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: call.Status, Output: append(json.RawMessage(nil), call.Output...), Error: call.Error,
 			Metadata: cloneStrings(call.Metadata), CompletedAt: call.CompletedAt,
 			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: createdAt, UpdatedAt: createdAt},
 			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: append(json.RawMessage(nil), call.Output...), CreatedAt: createdAt, UpdatedAt: createdAt},

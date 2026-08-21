@@ -156,6 +156,45 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 	}
 }
 
+func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.T) {
+	seen := map[string]wittypes.TurnMetadata{}
+	component := &fakeComponent{call: func(_ context.Context, operation string, input, _ any) error {
+		seen[operation] = input.(wittypes.TurnMetadata)
+		return nil
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("early-settlement-hook")), hookContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}
+	defer func() { _ = hook.Close() }()
+	registry := extension.NewRegistry(nil)
+	extensionComponent := extension.Component{InstanceID: "early-hook", Artifact: extension.Artifact{Name: "early-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
+	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return RegisterHook(registrar, extension.Registration{ID: "hook", InstanceID: extensionComponent.InstanceID, Scope: extension.GlobalScope()}, hook)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	metadata := runtime.BoundedTurnMetadata{RunID: "run-early", SessionID: "session-early", EpochID: "epoch-early", AgentName: "agent", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true}
+	_ = extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
+	_ = extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
+	for _, operation := range []string{"hook.after-turn", "hook.after-run"} {
+		turn := seen[operation]
+		if turn.SessionID != "session-early" || turn.EpochID != "epoch-early" || turn.AgentName != "agent" || turn.ProviderID != "provider" || turn.ModelID != "model" || turn.MessageCount != 1 || !turn.HasSystemPrompt {
+			t.Fatalf("%s metadata = %#v", operation, turn)
+		}
+	}
+	if len(hook.turns) != 0 {
+		t.Fatalf("cached turns leaked after settlement: %#v", hook.turns)
+	}
+}
+
 func TestFinishRegisteredHookRunsCleanupAndJoinsErrors(t *testing.T) {
 	afterTurnErr := errors.New("after turn")
 	afterRunErr := errors.New("after run")

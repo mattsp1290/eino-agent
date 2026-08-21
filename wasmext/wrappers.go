@@ -278,7 +278,9 @@ func (h *LoadedHook) BeforeRun(ctx context.Context, run session.Run) error {
 }
 
 func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
-	return h.beforeRunMetadata(ctx, turnMetadataFromBounded(metadata))
+	turn := turnMetadataFromBounded(metadata)
+	h.cacheTurn(turn)
+	return h.beforeRunMetadata(ctx, turn)
 }
 
 func (h *LoadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
@@ -300,13 +302,17 @@ func (h *LoadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnM
 	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), turn, nil); err != nil {
 		return err
 	}
+	h.cacheTurn(turn)
+	return nil
+}
+
+func (h *LoadedHook) cacheTurn(turn wittypes.TurnMetadata) {
 	h.mu.Lock()
 	if h.turns == nil {
 		h.turns = make(map[session.RunID]wittypes.TurnMetadata)
 	}
 	h.turns[session.RunID(turn.RunID)] = turn
 	h.mu.Unlock()
-	return nil
 }
 
 func (h *LoadedHook) AfterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {

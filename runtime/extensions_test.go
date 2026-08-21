@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -120,6 +121,32 @@ func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
 	})
 	if !errors.Is(err, extension.ErrProtectedMutation) {
 		t.Fatalf("fabricated stream error = %v", err)
+	}
+}
+
+func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
+	providerErr := errors.New("provider failure")
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "stream-swallow", Artifact: extension.Artifact{Name: "stream-swallow", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+			_, _ = next(ctx, input)
+			return nil, nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return nil, providerErr
+	})
+	if reader != nil || !errors.Is(err, providerErr) {
+		t.Fatalf("model stream = %#v, %v; want provider failure", reader, err)
 	}
 }
 
@@ -268,6 +295,72 @@ func TestStrictToolPlanRejectsUnsupportedStoreBeforeAdmission(t *testing.T) {
 	_, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"})
 	if !errors.Is(err, ErrInvalidOrchestrator) || !released {
 		t.Fatalf("acquire strict tool plan = %v released=%t", err, released)
+	}
+}
+
+func TestPartialLegacyToolPlanDoesNotRequireSettlementStore(t *testing.T) {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "tool-plugin", Kind: session.ExtensionTool, Required: true}}}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) { return nil, nil }), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}}
+	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"})
+	if err != nil {
+		t.Fatalf("acquire partial-legacy tool plan = %v", err)
+	}
+	if plan.Descriptor.Mode != session.PlanPartialLegacy {
+		t.Fatalf("mode = %s, want partial-legacy", plan.Descriptor.Mode)
+	}
+}
+
+func TestAcquireResumePlanUsesStrictToolSettlementPredicate(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		descriptor session.ExtensionPlanDescriptor
+	}{
+		{name: "strict callbacks only", descriptor: session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}},
+		{name: "partial legacy tool", descriptor: session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanPartialLegacy, Entries: []session.ExtensionPlanEntry{{InstanceID: "tool", Kind: session.ExtensionTool, Required: true}}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(test.descriptor)
+			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: test.descriptor}}}
+			if _, err := orchestrator.acquireResumePlan(context.Background(), test.descriptor); err != nil {
+				t.Fatalf("acquireResumePlan = %v", err)
+			}
+		})
+	}
+}
+
+func TestResumeRunStrictCallbacksOnlyDoesNotRequireSettlementStore(t *testing.T) {
+	store := newAdmissionStore()
+	now := time.Now().UTC()
+	if _, err := store.CreateSession(context.Background(), session.Session{ID: "session", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.AdmitRun(context.Background(), session.Run{ID: "run", SessionID: "session", OwnerID: "old-owner", Status: session.RunPending, CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
+	orchestrator := &StreamingOrchestrator{Store: store, OwnerID: "new-owner", Clock: func() time.Time { return now }}
+	result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: descriptor}), run)
+	if errors.Is(result.Error, ErrInvalidOrchestrator) {
+		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
+	}
+}
+
+func TestVersionOnePromptAndGuardDescriptorsAreUnverifiable(t *testing.T) {
+	for _, kind := range []session.ExtensionKind{session.ExtensionPrompt, session.ExtensionGuard} {
+		descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "ordered", Kind: kind, Required: true}}}
+		descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+		provider := staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}
+		orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: provider}
+		if _, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{}); !errors.Is(err, ErrExtensionPlanMismatch) {
+			t.Fatalf("kind %s fresh error = %v, want mismatch", kind, err)
+		}
+		provider.plan = &RunPlan{Descriptor: descriptor}
+		orchestrator.Plans = provider
+		if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+			t.Fatalf("kind %s resume error = %v, want mismatch", kind, err)
+		}
 	}
 }
 

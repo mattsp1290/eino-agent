@@ -7,6 +7,10 @@ import (
 	"sort"
 )
 
+// ExtensionPlanSchemaVersion is the current durable plan descriptor schema.
+// Version 2 records prompt and guard order explicitly.
+const ExtensionPlanSchemaVersion = 2
+
 // ModelRequestID identifies one durable provider-attempt audit record.
 type ModelRequestID string
 
@@ -57,6 +61,7 @@ type ExtensionPlanEntry struct {
 	Scope         ExtensionScope
 	Registrations []RegistrationIdentity
 	CapabilityID  string
+	Order         int `json:",omitempty"`
 	SchemaHash    string
 	ExecutorHash  string
 }
@@ -94,6 +99,9 @@ func FingerprintExtensionPlan(descriptor ExtensionPlanDescriptor) (string, error
 		return left.CapabilityID < right.CapabilityID
 	})
 	for index := range next.Entries {
+		if next.SchemaVersion < ExtensionPlanSchemaVersion {
+			next.Entries[index].Order = 0
+		}
 		sort.Slice(next.Entries[index].Registrations, func(i, j int) bool {
 			left, right := next.Entries[index].Registrations[i], next.Entries[index].Registrations[j]
 			if left.Order != right.Order {

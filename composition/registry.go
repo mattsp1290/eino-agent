@@ -316,7 +316,7 @@ func (m *Mount) Close(ctx context.Context) error {
 }
 
 func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRequest) (*runtime.RunPlan, error) {
-	return r.acquire(ctx, request.SessionID, nil, session.PlanStrict)
+	return r.acquire(ctx, request.SessionID, nil, session.PlanStrict, session.ExtensionPlanSchemaVersion)
 }
 
 func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
@@ -345,7 +345,7 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 			}
 		}
 	}
-	plan, err := r.acquire(ctx, sessionID, instances, persisted.Mode)
+	plan, err := r.acquire(ctx, sessionID, instances, persisted.Mode, persisted.SchemaVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +356,7 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	return plan, nil
 }
 
-func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, mode session.PlanMode) (*runtime.RunPlan, error) {
+func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, mode session.PlanMode, schemaVersion int) (*runtime.RunPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -384,7 +384,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	prompts := selectPrompts(r.prompts, target, instances)
 	guards := selectGuards(r.guards, target, instances)
 	restrictions := selectRestrictions(r.restrictions, target, instances)
-	descriptor, err := buildDescriptor(dispatch, selected, prompts, guards, restrictions, mode)
+	descriptor, err := buildDescriptor(dispatch, selected, prompts, guards, restrictions, mode, schemaVersion)
 	if err != nil {
 		dispatch.Release()
 		return nil, err
@@ -549,8 +549,8 @@ func capabilityApplies(instanceID string, scope, target extension.Scope, instanc
 	return scope.Kind == extension.ScopeGlobal || scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && scope.Key == target.Key
 }
 
-func buildDescriptor(dispatch *extension.Plan, selected []mountedTool, prompts []mountedPrompt, guards []mountedGuard, restrictions []mountedRestriction, mode session.PlanMode) (session.ExtensionPlanDescriptor, error) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: mode}
+func buildDescriptor(dispatch *extension.Plan, selected []mountedTool, prompts []mountedPrompt, guards []mountedGuard, restrictions []mountedRestriction, mode session.PlanMode, schemaVersion int) (session.ExtensionPlanDescriptor, error) {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: schemaVersion, Mode: mode}
 	byInstance := map[string]int{}
 	for _, diagnostic := range dispatch.Diagnostics() {
 		if diagnostic.Contract == leasePoint.Contract() {
@@ -572,10 +572,10 @@ func buildDescriptor(dispatch *extension.Plan, selected []mountedTool, prompts [
 		})
 	}
 	for _, entry := range prompts {
-		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionPrompt, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Name + "/" + entry.ID})
+		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionPrompt, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Name + "/" + entry.ID, Order: entry.Order})
 	}
 	for _, entry := range guards {
-		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionGuard, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.ID})
+		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionGuard, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.ID, Order: entry.Order})
 	}
 	for _, entry := range restrictions {
 		raw, _ := json.Marshal(struct{ Allowed, Denied []string }{entry.Allowed, entry.Denied})

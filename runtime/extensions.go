@@ -374,6 +374,10 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 	if plan.Descriptor.Mode == "" {
 		plan.Descriptor.Mode = session.PlanStrict
 	}
+	if !descriptorOrderingVerifiable(plan.Descriptor) {
+		plan.release()
+		return nil, fmt.Errorf("%w: descriptor schema does not record prompt/guard order", ErrExtensionPlanMismatch)
+	}
 	providedFingerprint := plan.Descriptor.Fingerprint
 	plan.Descriptor.Fingerprint = ""
 	fingerprint, fingerprintErr := session.FingerprintExtensionPlan(plan.Descriptor)
@@ -394,7 +398,7 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 		return nil, fingerprintErr
 	}
 	plan.Descriptor.Fingerprint = fingerprint
-	if plan.Descriptor.Mode == session.PlanStrict && plan.RequiresToolSettlement {
+	if descriptorRequiresToolSettlement(plan.Descriptor) {
 		if _, ok := o.Store.(session.ToolSettlementStore); !ok {
 			plan.release()
 			return nil, fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)
@@ -406,6 +410,9 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descriptor session.ExtensionPlanDescriptor) (*RunPlan, error) {
 	if descriptor.SchemaVersion == 0 || descriptor.Mode == "" || descriptor.Mode == session.PlanLegacy {
 		return &RunPlan{Descriptor: descriptor.Clone()}, nil
+	}
+	if !descriptorOrderingVerifiable(descriptor) {
+		return nil, fmt.Errorf("%w: descriptor schema does not record prompt/guard order", ErrExtensionPlanMismatch)
 	}
 	if o.Plans == nil {
 		return nil, fmt.Errorf("%w: run requires a plan provider", ErrExtensionPlanMismatch)
@@ -420,7 +427,7 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 		}
 		return nil, ErrExtensionPlanMismatch
 	}
-	if descriptorHasTools(descriptor) {
+	if descriptorRequiresToolSettlement(descriptor) {
 		if _, ok := o.Store.(session.ToolSettlementStore); !ok {
 			plan.release()
 			return nil, fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)
@@ -436,6 +443,22 @@ func descriptorHasTools(descriptor session.ExtensionPlanDescriptor) bool {
 		}
 	}
 	return false
+}
+
+func descriptorRequiresToolSettlement(descriptor session.ExtensionPlanDescriptor) bool {
+	return descriptor.Mode == session.PlanStrict && descriptorHasTools(descriptor)
+}
+
+func descriptorOrderingVerifiable(descriptor session.ExtensionPlanDescriptor) bool {
+	if descriptor.Mode == session.PlanLegacy || descriptor.SchemaVersion >= session.ExtensionPlanSchemaVersion {
+		return true
+	}
+	for _, entry := range descriptor.Entries {
+		if entry.Kind == session.ExtensionPrompt || entry.Kind == session.ExtensionGuard {
+			return false
+		}
+	}
+	return true
 }
 
 func (o *StreamingOrchestrator) eventSink(ctx context.Context) EventSink {

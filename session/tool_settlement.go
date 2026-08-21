@@ -13,6 +13,8 @@ import (
 // rejecting conflicting repeated settlements.
 type ToolSettlement struct {
 	ID            ToolCallID
+	ClaimedBy     string
+	ClaimToken    string
 	Status        ToolCallStatus
 	Output        json.RawMessage
 	Error         string
@@ -22,9 +24,17 @@ type ToolSettlement struct {
 	ResultPart    Part
 }
 
+// ToolClaimIdentity is the fencing identity a settlement must present for the
+// durable claim whose work it is committing.
+type ToolClaimIdentity struct {
+	ClaimedBy  string
+	ClaimToken string
+}
+
 // ToolSettlementStore atomically commits terminal tool state and its reserved
 // model-visible result message/part. Implementations must be idempotent by call
-// and reserved result IDs.
+// and reserved result IDs, and must reject settlements whose claim identity
+// does not exactly match the durable call.
 type ToolSettlementStore interface {
 	SettleToolCall(context.Context, ToolSettlement) error
 	ListUnreconciledToolSettlements(context.Context, RunID) ([]ToolSettlement, error)
@@ -37,7 +47,13 @@ func (s ToolSettlement) Apply(call ToolCall) (ToolCall, error) {
 	if s.ID != "" && call.ID != s.ID {
 		return ToolCall{}, ErrConflict
 	}
+	if s.ClaimedBy == "" || s.ClaimToken == "" || call.ClaimedBy != s.ClaimedBy || call.ClaimToken != s.ClaimToken {
+		return ToolCall{}, ErrConflict
+	}
 	if callTerminal(call.Status) {
+		if s.CompletedAt.IsZero() {
+			s.CompletedAt = call.CompletedAt
+		}
 		if settlementMatches(call, s) {
 			return call, nil
 		}
