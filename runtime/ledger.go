@@ -6,8 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
 	"time"
+
+	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
@@ -43,8 +46,8 @@ func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes 
 		if message == nil {
 			return AuditedModelInput{}, "", fmt.Errorf("nil model message")
 		}
-		if len(message.Extra) != 0 {
-			return AuditedModelInput{}, "", fmt.Errorf("model message Extra is not audit-safe")
+		if err := validateAuditSafeMessage(message); err != nil {
+			return AuditedModelInput{}, "", err
 		}
 		raw, err := json.Marshal(message)
 		if err != nil {
@@ -88,6 +91,60 @@ func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes 
 	}
 	digest := sha256.Sum256(canonical)
 	return input, hex.EncodeToString(digest[:]), nil
+}
+
+func validateAuditSafeMessage(message *einoschema.Message) error {
+	path, unsafe := findNonEmptyExtra(reflect.ValueOf(message), "Message", make(map[uintptr]bool))
+	if !unsafe {
+		return nil
+	}
+	return fmt.Errorf("model message %s is not audit-safe", path)
+}
+
+// findNonEmptyExtra walks the typed Eino message graph. It only treats fields
+// actually named Extra as provider metadata, so user content containing an
+// ordinary JSON key named "extra" is unaffected.
+func findNonEmptyExtra(value reflect.Value, path string, seen map[uintptr]bool) (string, bool) {
+	if !value.IsValid() {
+		return "", false
+	}
+	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return "", false
+		}
+		if value.Kind() == reflect.Pointer {
+			pointer := value.Pointer()
+			if seen[pointer] {
+				return "", false
+			}
+			seen[pointer] = true
+		}
+		value = value.Elem()
+	}
+	switch value.Kind() {
+	case reflect.Struct:
+		for index := range value.NumField() {
+			fieldType := value.Type().Field(index)
+			if !fieldType.IsExported() {
+				continue
+			}
+			fieldPath := path + "." + fieldType.Name
+			field := value.Field(index)
+			if fieldType.Name == "Extra" && field.Kind() == reflect.Map && field.Len() != 0 {
+				return fieldPath, true
+			}
+			if nestedPath, unsafe := findNonEmptyExtra(field, fieldPath, seen); unsafe {
+				return nestedPath, true
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for index := range value.Len() {
+			if nestedPath, unsafe := findNonEmptyExtra(value.Index(index), fmt.Sprintf("%s[%d]", path, index), seen); unsafe {
+				return nestedPath, true
+			}
+		}
+	}
+	return "", false
 }
 
 func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, snapshot TurnSnapshot, request model.Request, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {

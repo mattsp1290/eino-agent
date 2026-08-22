@@ -464,11 +464,15 @@ func descriptorOrderingVerifiable(descriptor session.ExtensionPlanDescriptor) bo
 }
 
 func (o *StreamingOrchestrator) eventSink(ctx context.Context) EventSink {
+	return o.eventSinkFor(ctx, o.Events)
+}
+
+func (o *StreamingOrchestrator) eventSinkFor(ctx context.Context, infrastructure EventSink) EventSink {
 	plan := runPlanFromContext(ctx)
 	if plan == nil || plan.Dispatch == nil {
-		return o.Events
+		return infrastructure
 	}
-	return compositeEventSink{infrastructure: o.Events, plan: plan.Dispatch}
+	return compositeEventSink{infrastructure: infrastructure, plan: plan.Dispatch}
 }
 
 type compositeEventSink struct {

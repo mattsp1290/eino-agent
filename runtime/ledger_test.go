@@ -151,11 +151,51 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := einoschema.UserMessage("hello")
-	message.Extra = map[string]any{"unsafe": func() {}}
+	message := einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "unsafe-call", Extra: map[string]any{"credential": "sentinel"}}})
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "unsafe-session", Input: []*einoschema.Message{message}, Config: orchestratorConfig()})
 	if result.Error == nil || called {
 		t.Fatalf("result=%#v adapter_called=%t", result, called)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 0 {
+		t.Fatalf("unsafe request records=%#v error=%v", batch.Records, err)
+	}
+}
+
+func TestAuditModelRequestRejectsEveryNestedExtraCategory(t *testing.T) {
+	unsafe := map[string]any{"credential": "sentinel"}
+	tests := []struct {
+		name   string
+		mutate func(*einoschema.Message)
+	}{
+		{name: "tool call", mutate: func(message *einoschema.Message) {
+			message.ToolCalls = []einoschema.ToolCall{{Extra: unsafe}}
+		}},
+		{name: "legacy multimodal media", mutate: func(message *einoschema.Message) {
+			//nolint:staticcheck // The audit boundary must remain safe for legacy persisted message shapes.
+			message.MultiContent = []einoschema.ChatMessagePart{{ImageURL: &einoschema.ChatMessageImageURL{Extra: unsafe}}}
+		}},
+		{name: "input part", mutate: func(message *einoschema.Message) {
+			message.UserInputMultiContent = []einoschema.MessageInputPart{{Extra: unsafe}}
+		}},
+		{name: "input media", mutate: func(message *einoschema.Message) {
+			message.UserInputMultiContent = []einoschema.MessageInputPart{{Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{Extra: unsafe}}}}
+		}},
+		{name: "output part", mutate: func(message *einoschema.Message) {
+			message.AssistantGenMultiContent = []einoschema.MessageOutputPart{{Extra: unsafe}}
+		}},
+		{name: "output media", mutate: func(message *einoschema.Message) {
+			message.AssistantGenMultiContent = []einoschema.MessageOutputPart{{Audio: &einoschema.MessageOutputAudio{MessagePartCommon: einoschema.MessagePartCommon{Extra: unsafe}}}}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := einoschema.UserMessage("hello")
+			test.mutate(message)
+			if _, _, err := AuditModelRequest(model.Request{Messages: []*einoschema.Message{message}}, nil, 0); err == nil {
+				t.Fatal("unsafe nested Extra was accepted")
+			}
+		})
 	}
 }
 

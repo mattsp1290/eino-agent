@@ -60,6 +60,62 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	}
 }
 
+func TestStreamingOrchestratorPreservesConfiguredAdmissionEventSink(t *testing.T) {
+	store := newAdmissionStore()
+	admissionSink := &capturingSink{}
+	runtimeSink := &capturingSink{}
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "admission-events", Artifact: extension.Artifact{Name: "admission-events", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var published []EventKind
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+			published = append(published, event.Kind)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	}))
+	orchestrator.Admit = &Admitter{Events: admissionSink}
+	orchestrator.Events = runtimeSink
+	orchestrator.Plans = staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor, Dispatch: dispatch}}
+
+	result := startAndWait(t, orchestrator)
+	if result.Error != nil {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(admissionSink.events) != 1 || admissionSink.events[0].Kind != EventRunStarted {
+		t.Fatalf("admission events = %#v", admissionSink.events)
+	}
+	for _, event := range runtimeSink.events {
+		if event.Kind == EventRunStarted {
+			t.Fatalf("orchestrator sink received custom admission event: %#v", runtimeSink.events)
+		}
+	}
+	if len(runtimeSink.events) == 0 {
+		t.Fatal("orchestrator sink did not receive execution events")
+	}
+	var publishedStarts int
+	for _, kind := range published {
+		if kind == EventRunStarted {
+			publishedStarts++
+		}
+	}
+	if publishedStarts != 1 {
+		t.Fatalf("published admission starts = %d, all events = %v", publishedStarts, published)
+	}
+}
+
 func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T) {
 	t.Parallel()
 
@@ -1005,6 +1061,139 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResumeReconciliationNotifiesAfterDurableSettlement(t *testing.T) {
+	store, run, settlement := resumeStoreWithUnreconciledSettlement(t)
+	reconciling := &reconciliationStore{Store: store, settlements: []session.ToolSettlement{settlement}}
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "resume-reconciliation", Artifact: extension.Artifact{Name: "resume-reconciliation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var notices []ToolSettledNotice
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+			notices = append(notices, notice)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dispatch.Release()
+	descriptor := strictToolDescriptor(t)
+	orchestrator := &StreamingOrchestrator{Store: reconciling, IDs: &sequenceIDs{}, OwnerID: "new-owner"}
+
+	result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: descriptor, Dispatch: dispatch}), run)
+	if result.Error != nil {
+		t.Fatalf("resume result = %+v", result)
+	}
+	if reconciling.settleCalls != 1 || len(notices) != 1 {
+		t.Fatalf("settle calls=%d notices=%#v", reconciling.settleCalls, notices)
+	}
+	notice := notices[0]
+	if notice.SessionID != run.SessionID || notice.RunID != run.ID || notice.ToolCallID != settlement.ID || notice.ToolName != "echo" || notice.Status != session.ToolCallCompleted || notice.Result.Output != "recovered" || string(notice.Result.Structured) != `{"ok":true}` || notice.Error != (ClassifiedError{}) {
+		t.Fatalf("reconciled notice = %#v", notice)
+	}
+	if _, err := store.GetMessage(context.Background(), settlement.ResultMessage.ID); err != nil {
+		t.Fatalf("notification preceded durable settlement: %v", err)
+	}
+}
+
+func TestResumeReconciliationFailureDoesNotRefreshRunLease(t *testing.T) {
+	listErr := errors.New("list reconciliation failed")
+	settleErr := errors.New("apply reconciliation failed")
+	for _, test := range []struct {
+		name      string
+		listErr   error
+		settleErr error
+		wantErr   error
+	}{
+		{name: "list", listErr: listErr, wantErr: listErr},
+		{name: "settle", settleErr: settleErr, wantErr: settleErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, run, settlement := resumeStoreWithUnreconciledSettlement(t)
+			reconciling := &reconciliationStore{Store: store, settlements: []session.ToolSettlement{settlement}, listErr: test.listErr, settleErr: test.settleErr}
+			orchestrator := &StreamingOrchestrator{Store: reconciling, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: func() time.Time { return run.LeaseUntil.Add(time.Hour) }}
+
+			result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: strictToolDescriptor(t)}), run)
+			if !errors.Is(result.Error, test.wantErr) || result.Status != session.RunFailed {
+				t.Fatalf("resume result = %+v", result)
+			}
+			persisted, err := store.GetRun(context.Background(), run.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Status != run.Status || persisted.OwnerID != run.OwnerID || !persisted.LeaseUntil.Equal(run.LeaseUntil) {
+				t.Fatalf("reconciliation failure refreshed durable run: before=%+v after=%+v", run, persisted)
+			}
+		})
+	}
+}
+
+type reconciliationStore struct {
+	*sqlitestore.Store
+	settlements []session.ToolSettlement
+	listErr     error
+	settleErr   error
+	settleCalls int
+}
+
+func (s *reconciliationStore) ListUnreconciledToolSettlements(context.Context, session.RunID) ([]session.ToolSettlement, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return append([]session.ToolSettlement(nil), s.settlements...), nil
+}
+
+func (s *reconciliationStore) SettleToolCall(ctx context.Context, settlement session.ToolSettlement) error {
+	s.settleCalls++
+	if s.settleErr != nil {
+		return s.settleErr
+	}
+	return s.Store.SettleToolCall(ctx, settlement)
+}
+
+func strictToolDescriptor(t *testing.T) session.ExtensionPlanDescriptor {
+	t.Helper()
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "tools", Kind: session.ExtensionTool, Required: true, CapabilityID: "echo/tool"}}}
+	var err error
+	descriptor.Fingerprint, err = session.FingerprintExtensionPlan(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return descriptor
+}
+
+func resumeStoreWithUnreconciledSettlement(t *testing.T) (*sqlitestore.Store, session.Run, session.ToolSettlement) {
+	t.Helper()
+	store, run := resumeStoreWithTool(t, "old-owner", session.ToolCallPending)
+	call, err := store.GetToolCall(context.Background(), "call-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	call.Status = session.ToolCallRunning
+	call.ClaimedBy = "old-owner"
+	call.ClaimToken = "reconcile-token"
+	call.ResultMessageID = "reconciled-message"
+	call.ResultPartID = "reconciled-part"
+	call.StartedAt = run.CreatedAt
+	call, err = store.ClaimToolCall(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completedAt := run.CreatedAt.Add(time.Second)
+	output := mustJSON(toolOutputPayload{ToolCallID: string(call.ID), Status: "completed", Content: "recovered", Structured: json.RawMessage(`{"ok":true}`)})
+	settlement := session.ToolSettlement{
+		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
+		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: completedAt, UpdatedAt: completedAt},
+		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: completedAt, UpdatedAt: completedAt},
+	}
+	return store, run, settlement
 }
 
 func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {

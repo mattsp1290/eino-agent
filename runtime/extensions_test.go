@@ -189,6 +189,40 @@ func TestModelStreamValidationRejectsCallableReplacement(t *testing.T) {
 	}
 }
 
+func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "stream-nested-mutation", Artifact: extension.Artifact{Name: "stream-nested-mutation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+			input.Request.Messages[0].ToolCalls[0].Extra["nested"].(map[string]any)["secret"] = "mutated"
+			return next(ctx, input)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+
+	original := ModelStreamInput{Request: model.Request{Messages: []*einoschema.Message{{
+		ToolCalls: []einoschema.ToolCall{{Extra: map[string]any{"nested": map[string]any{"secret": "original"}}}},
+	}}}}
+	providerCalled := false
+	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, original, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+		providerCalled = true
+		return nil, nil
+	})
+	if reader != nil || !errors.Is(err, extension.ErrProtectedMutation) || providerCalled {
+		t.Fatalf("reader=%v error=%v provider_called=%t", reader, err, providerCalled)
+	}
+	if got := original.Request.Messages[0].ToolCalls[0].Extra["nested"].(map[string]any)["secret"]; got != "original" {
+		t.Fatalf("original request mutated through interceptor alias: %v", got)
+	}
+}
+
 func TestPublishedExtensionPointsAppearInCatalog(t *testing.T) {
 	catalog, err := os.ReadFile(filepath.Join("..", "docs", "architecture", "extension-points.md"))
 	if err != nil {

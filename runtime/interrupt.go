@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -70,18 +71,6 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 	if run.Terminal() {
 		return Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
 	}
-	o.observeResume(ctx, run, "resume")
-	run.OwnerID = o.ownerID()
-	run.Status = session.RunRunning
-	run.LeaseUntil = o.now().Add(o.lease())
-	run.StartedAt = o.now()
-	observed := o.startObservedRun(ctx, run, "", run.StartedAt)
-	defer func() {
-		o.finishObservedRun(observed, result, o.now())
-	}()
-	if err := o.Store.FinishRun(ctx, run); err != nil {
-		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
-	}
 	var settlementStore session.ToolSettlementStore
 	if plan := runPlanFromContext(ctx); plan != nil && descriptorRequiresToolSettlement(plan.Descriptor) {
 		var ok bool
@@ -94,10 +83,32 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
 		for _, settlement := range unreconciled {
+			call, err := o.Store.GetToolCall(ctx, settlement.ID)
+			if err != nil {
+				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			}
+			if call.ID != settlement.ID || call.SessionID != run.SessionID || call.RunID != run.ID {
+				return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrConflict}
+			}
 			if err := settlementStore.SettleToolCall(ctx, settlement); err != nil {
 				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 			}
+			if plan.Dispatch != nil {
+				_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ToolSettledPoint, reconciledToolSettledNotice(run, call, settlement))
+			}
 		}
+	}
+	o.observeResume(ctx, run, "resume")
+	run.OwnerID = o.ownerID()
+	run.Status = session.RunRunning
+	run.LeaseUntil = o.now().Add(o.lease())
+	run.StartedAt = o.now()
+	observed := o.startObservedRun(ctx, run, "", run.StartedAt)
+	defer func() {
+		o.finishObservedRun(observed, result, o.now())
+	}()
+	if err := o.Store.FinishRun(ctx, run); err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
 	calls, err := o.Store.ListUnfinishedToolCalls(ctx, run.ID)
 	if err != nil {
@@ -222,6 +233,20 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 		}
 	}
 	return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true})
+}
+
+func reconciledToolSettledNotice(run session.Run, call session.ToolCall, settlement session.ToolSettlement) ToolSettledNotice {
+	var payload toolOutputPayload
+	_ = json.Unmarshal(settlement.Output, &payload)
+	return ToolSettledNotice{
+		SessionID:  run.SessionID,
+		RunID:      run.ID,
+		ToolCallID: call.ID,
+		ToolName:   call.Name,
+		Status:     settlement.Status,
+		Result:     ToolResult{Output: payload.Content, Structured: cloneJSON(payload.Structured)},
+		Error:      classifyExtensionError(errorString(settlement.Error)),
+	}
 }
 
 func (o *StreamingOrchestrator) resumeTools(ctx context.Context, run session.Run) (map[string]Tool, error) {

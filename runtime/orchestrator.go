@@ -101,7 +101,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		EventID:            o.IDs.NewEventID(),
 	}
 	admitter := o.admitter()
-	admitter.Events = o.eventSink(ctx)
+	admitter.Events = o.eventSinkFor(ctx, admitter.Events)
 	admitted, err := admitter.Admit(ctx, AdmissionRequest{
 		IDs:             ids,
 		ParentMessageID: request.ParentID,

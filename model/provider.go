@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -75,8 +76,7 @@ func (i Identity) Clone() Identity {
 	return next
 }
 
-// Clone returns a defensive copy of request containers. Message and tool info
-// pointers remain provider-owned values and must not be mutated by adapters.
+// Clone returns a defensive copy of the complete mutable request graph.
 func (r Request) Clone() Request {
 	next := r
 	next.Identity = r.Identity.Clone()
@@ -299,13 +299,7 @@ func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
 		if message == nil {
 			continue
 		}
-		next := *message
-		next.MultiContent = cloneSlice(message.MultiContent)
-		next.UserInputMultiContent = cloneSlice(message.UserInputMultiContent)
-		next.AssistantGenMultiContent = cloneSlice(message.AssistantGenMultiContent)
-		next.ToolCalls = cloneSlice(message.ToolCalls)
-		next.Extra = cloneAnyMap(message.Extra)
-		dst[i] = &next
+		dst[i] = cloneMutable(message)
 	}
 	return dst
 }
@@ -333,15 +327,15 @@ func cloneParamsOneOf(src *einoschema.ParamsOneOf) *einoschema.ParamsOneOf {
 	}
 	schema, err := src.ToJSONSchema()
 	if err != nil || schema == nil {
-		return src
+		return nil
 	}
 	data, err := json.Marshal(schema)
 	if err != nil {
-		return src
+		return nil
 	}
 	var cloned jsonschema.Schema
 	if err := json.Unmarshal(data, &cloned); err != nil {
-		return src
+		return nil
 	}
 	return einoschema.NewParamsOneOfByJSONSchema(&cloned)
 }
@@ -350,11 +344,98 @@ func cloneAnyMap(src map[string]any) map[string]any {
 	if src == nil {
 		return nil
 	}
-	dst := make(map[string]any, len(src))
-	for key, value := range src {
-		dst[key] = value
+	return cloneMutable(src)
+}
+
+type cloneVisit struct {
+	typ     reflect.Type
+	pointer uintptr
+	kind    reflect.Kind
+}
+
+func cloneMutable[T any](src T) T {
+	value := cloneReflectValue(reflect.ValueOf(src), make(map[cloneVisit]reflect.Value))
+	if !value.IsValid() {
+		var zero T
+		return zero
 	}
-	return dst
+	return value.Interface().(T)
+}
+
+// cloneReflectValue preserves concrete values in arbitrary provider metadata
+// while separating every mutable pointer, map, and slice reachable from it.
+func cloneReflectValue(value reflect.Value, seen map[cloneVisit]reflect.Value) reflect.Value {
+	if !value.IsValid() {
+		return value
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneReflectValue(value.Elem(), seen)
+		result := reflect.New(value.Type()).Elem()
+		result.Set(cloned)
+		return result
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind()}
+		if cloned, ok := seen[visit]; ok {
+			return cloned
+		}
+		result := reflect.New(value.Type().Elem())
+		seen[visit] = result
+		result.Elem().Set(cloneReflectValue(value.Elem(), seen))
+		return result
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind()}
+		if cloned, ok := seen[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeMapWithSize(value.Type(), value.Len())
+		seen[visit] = result
+		iterator := value.MapRange()
+		for iterator.Next() {
+			result.SetMapIndex(iterator.Key(), cloneReflectValue(iterator.Value(), seen))
+		}
+		return result
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind()}
+		if cloned, ok := seen[visit]; ok {
+			return cloned
+		}
+		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		seen[visit] = result
+		for index := range value.Len() {
+			result.Index(index).Set(cloneReflectValue(value.Index(index), seen))
+		}
+		return result
+	case reflect.Array:
+		result := reflect.New(value.Type()).Elem()
+		for index := range value.Len() {
+			result.Index(index).Set(cloneReflectValue(value.Index(index), seen))
+		}
+		return result
+	case reflect.Struct:
+		result := reflect.New(value.Type()).Elem()
+		result.Set(value)
+		for index := range value.NumField() {
+			if value.Type().Field(index).IsExported() {
+				result.Field(index).Set(cloneReflectValue(value.Field(index), seen))
+			}
+		}
+		return result
+	default:
+		return value
+	}
 }
 
 func cloneSlice[T any](src []T) []T {

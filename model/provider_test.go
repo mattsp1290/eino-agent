@@ -102,6 +102,10 @@ func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
 func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	t.Parallel()
 
+	index := 3
+	url := "https://example.test/image.png"
+	nestedMessageExtra := map[string]any{"labels": []any{"original"}}
+	nestedToolExtra := map[string]any{"labels": []any{"original"}}
 	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
 		"text": {Type: einoschema.String, Required: true},
 	})
@@ -109,12 +113,21 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 		Identity: Identity{TraceAttributes: map[string]string{"trace": "value"}},
 		Messages: []*einoschema.Message{{
 			Content: "hello",
-			Extra:   map[string]any{"key": "value"},
+			Extra:   map[string]any{"nested": nestedMessageExtra},
+			ToolCalls: []einoschema.ToolCall{{
+				Index: &index,
+				Extra: map[string]any{"nested": nestedToolExtra},
+			}},
+			UserInputMultiContent: []einoschema.MessageInputPart{{
+				Type:  einoschema.ChatMessagePartTypeImageURL,
+				Extra: map[string]any{"labels": []any{"part-original"}},
+				Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{URL: &url, Extra: map[string]any{"labels": []any{"image-original"}}}},
+			}},
 		}},
 		Tools: []*einoschema.ToolInfo{{
 			Name:        "tool",
 			ParamsOneOf: params,
-			Extra:       map[string]any{"key": "value"},
+			Extra:       map[string]any{"nested": map[string]any{"labels": []any{"original"}}},
 		}},
 		Options: map[string]string{"temperature": "0"},
 	}
@@ -122,16 +135,28 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	cloned := request.Clone()
 	cloned.Identity.TraceAttributes["trace"] = "changed"
 	cloned.Messages[0].Content = "changed"
-	cloned.Messages[0].Extra["key"] = "changed"
+	cloned.Messages[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] = "changed"
+	*cloned.Messages[0].ToolCalls[0].Index = 4
+	cloned.Messages[0].ToolCalls[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] = "changed"
+	*cloned.Messages[0].UserInputMultiContent[0].Image.URL = "changed"
+	cloned.Messages[0].UserInputMultiContent[0].Extra["labels"].([]any)[0] = "changed"
+	//nolint:staticcheck // Deep cloning must cover Eino's still-serialized legacy media metadata.
+	cloned.Messages[0].UserInputMultiContent[0].Image.Extra["labels"].([]any)[0] = "changed"
 	cloned.Tools[0].Name = "changed"
-	cloned.Tools[0].Extra["key"] = "changed"
+	cloned.Tools[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] = "changed"
 	cloned.Options["temperature"] = "1"
 
 	if request.Identity.TraceAttributes["trace"] != "value" ||
 		request.Messages[0].Content != "hello" ||
-		request.Messages[0].Extra["key"] != "value" ||
+		nestedMessageExtra["labels"].([]any)[0] != "original" ||
+		index != 3 ||
+		nestedToolExtra["labels"].([]any)[0] != "original" ||
+		url != "https://example.test/image.png" ||
+		request.Messages[0].UserInputMultiContent[0].Extra["labels"].([]any)[0] != "part-original" ||
+		//nolint:staticcheck // Deep cloning must cover Eino's still-serialized legacy media metadata.
+		request.Messages[0].UserInputMultiContent[0].Image.Extra["labels"].([]any)[0] != "image-original" ||
 		request.Tools[0].Name != "tool" ||
-		request.Tools[0].Extra["key"] != "value" ||
+		request.Tools[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] != "original" ||
 		request.Options["temperature"] != "0" {
 		t.Fatalf("request mutated after clone: %#v", request)
 	}

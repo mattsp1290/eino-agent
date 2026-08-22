@@ -1,6 +1,7 @@
 package session
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -88,35 +89,86 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 func FingerprintExtensionPlan(descriptor ExtensionPlanDescriptor) (string, error) {
 	next := descriptor.Clone()
 	next.Fingerprint = ""
-	sort.Slice(next.Entries, func(i, j int) bool {
-		left, right := next.Entries[i], next.Entries[j]
-		if left.InstanceID != right.InstanceID {
-			return left.InstanceID < right.InstanceID
-		}
-		if left.Kind != right.Kind {
-			return left.Kind < right.Kind
-		}
-		return left.CapabilityID < right.CapabilityID
-	})
 	for index := range next.Entries {
 		if next.SchemaVersion < ExtensionPlanSchemaVersion {
 			next.Entries[index].Order = 0
 		}
 		sort.Slice(next.Entries[index].Registrations, func(i, j int) bool {
-			left, right := next.Entries[index].Registrations[i], next.Entries[index].Registrations[j]
-			if left.Order != right.Order {
-				return left.Order < right.Order
-			}
-			if left.Contract != right.Contract {
-				return left.Contract < right.Contract
-			}
-			return left.ID < right.ID
+			return compareRegistrationIdentity(next.Entries[index].Registrations[i], next.Entries[index].Registrations[j]) < 0
 		})
 	}
+	sort.Slice(next.Entries, func(i, j int) bool {
+		return compareExtensionPlanEntry(next.Entries[i], next.Entries[j]) < 0
+	})
 	raw, err := json.Marshal(next)
 	if err != nil {
 		return "", err
 	}
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:]), nil
+}
+
+func compareExtensionPlanEntry(left, right ExtensionPlanEntry) int {
+	for _, result := range []int{
+		cmp.Compare(left.InstanceID, right.InstanceID),
+		cmp.Compare(left.Kind, right.Kind),
+		cmp.Compare(left.CapabilityID, right.CapabilityID),
+		compareExtensionScope(left.Scope, right.Scope),
+		cmp.Compare(left.Order, right.Order),
+		cmp.Compare(left.Artifact.Name, right.Artifact.Name),
+		cmp.Compare(left.Artifact.Version, right.Artifact.Version),
+		cmp.Compare(left.Artifact.Hash, right.Artifact.Hash),
+		cmp.Compare(left.Artifact.ConfigHash, right.Artifact.ConfigHash),
+		cmp.Compare(left.Artifact.SourceKind, right.Artifact.SourceKind),
+		compareBool(left.Required, right.Required),
+		cmp.Compare(left.SchemaHash, right.SchemaHash),
+		cmp.Compare(left.ExecutorHash, right.ExecutorHash),
+		compareRegistrationIdentities(left.Registrations, right.Registrations),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareRegistrationIdentities(left, right []RegistrationIdentity) int {
+	for index := 0; index < min(len(left), len(right)); index++ {
+		if result := compareRegistrationIdentity(left[index], right[index]); result != 0 {
+			return result
+		}
+	}
+	return cmp.Compare(len(left), len(right))
+}
+
+func compareRegistrationIdentity(left, right RegistrationIdentity) int {
+	for _, result := range []int{
+		cmp.Compare(left.Order, right.Order),
+		cmp.Compare(left.Contract, right.Contract),
+		cmp.Compare(left.ID, right.ID),
+		cmp.Compare(left.Version, right.Version),
+		compareExtensionScope(left.Scope, right.Scope),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareExtensionScope(left, right ExtensionScope) int {
+	if result := cmp.Compare(left.Kind, right.Kind); result != 0 {
+		return result
+	}
+	return cmp.Compare(left.Key, right.Key)
+}
+
+func compareBool(left, right bool) int {
+	if left == right {
+		return 0
+	}
+	if !left {
+		return -1
+	}
+	return 1
 }
