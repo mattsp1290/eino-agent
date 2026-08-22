@@ -150,6 +150,45 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 	}
 }
 
+func TestModelStreamValidationAcceptsUnchangedFunctionBackedModelWithoutHandlers(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "unrelated", Artifact: extension.Artifact{Name: "unrelated", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "notice", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	streamer := functionStreamer(streamFromFunction)
+	client := functionClient(clientFunctionOne)
+	terminalCalled := false
+	observer := functionObserver(func() {})
+	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, ModelStreamInput{Resolved: model.Resolved{Client: client, Streamer: streamer}, Request: model.Request{Observer: observer}}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+		terminalCalled = true
+		reader, writer := einoschema.Pipe[*einoschema.Message](1)
+		writer.Close()
+		return reader, nil
+	})
+	if err != nil || !terminalCalled || reader == nil {
+		t.Fatalf("model stream = %#v, %v terminal=%t", reader, err, terminalCalled)
+	}
+	reader.Close()
+}
+
+func TestModelStreamValidationRejectsCallableReplacement(t *testing.T) {
+	original := ModelStreamInput{Resolved: model.Resolved{Client: functionClient(clientFunctionOne), Streamer: functionStreamer(streamFromFunction)}}
+	candidate := cloneModelStreamInput(original)
+	candidate.Resolved.Client = functionClient(clientFunctionTwo)
+	if err := validateModelStreamInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
+		t.Fatalf("client replacement validation = %v", err)
+	}
+}
+
 func TestPublishedExtensionPointsAppearInCatalog(t *testing.T) {
 	catalog, err := os.ReadFile(filepath.Join("..", "docs", "architecture", "extension-points.md"))
 	if err != nil {
@@ -231,10 +270,16 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	}
 }
 
-func TestInterfaceIdentityRejectsNonComparableCallableValuesWithoutPanic(t *testing.T) {
+func TestInterfaceIdentitySupportsFunctionValuesAndPointerIdentity(t *testing.T) {
 	callable := runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
-	if sameInterfaceIdentity(callable, callable) {
-		t.Fatal("non-comparable callable value unexpectedly acquired stable identity")
+	if !sameInterfaceIdentity(callable, callable) {
+		t.Fatal("unchanged function-backed callable lost identity")
+	}
+	functionFactory := func(marker string) runtimeToolExecutorFunc {
+		return func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: marker}, nil }
+	}
+	if sameInterfaceIdentity(functionFactory("first"), functionFactory("second")) {
+		t.Fatal("distinct closures from the same factory shared identity")
 	}
 	first := &callable
 	other := callable
@@ -243,6 +288,89 @@ func TestInterfaceIdentityRejectsNonComparableCallableValuesWithoutPanic(t *test
 		t.Fatal("pointer-backed callable identity comparison is not exact")
 	}
 }
+
+func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "clone-failure", Artifact: extension.Artifact{Name: "clone-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var contextEntered, toolEntered bool
+	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		if err := extension.Use(registrar, ContextAssemblePoint, extension.Registration{ID: "context", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ContextAssembly, next extension.Next[ContextAssembly, ContextAssembly]) (ContextAssembly, error) {
+			contextEntered = true
+			input.Base[0].Extra["nested"].(map[string]any)["value"] = "mutated"
+			return next(ctx, input)
+		}); err != nil {
+			return err
+		}
+		return extension.Use(registrar, ToolPreparePoint, extension.Registration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input PreparedToolCall, next extension.Next[PreparedToolCall, PreparedToolCall]) (PreparedToolCall, error) {
+			toolEntered = true
+			input.Tool.Info.Extra["nested"].(map[string]any)["value"] = "mutated"
+			return next(ctx, input)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	messageNested := map[string]any{"value": "original"}
+	message := einoschema.UserMessage("protected")
+	message.Extra = map[string]any{"nested": messageNested, "unsupported": make(chan struct{})}
+	_, err = extension.Invoke(plan, context.Background(), ContextAssemblePoint, ContextAssembly{Base: []*einoschema.Message{message}}, func(_ context.Context, input ContextAssembly) (ContextAssembly, error) { return input, nil })
+	if !errors.Is(err, extension.ErrProtectedMutation) || contextEntered || messageNested["value"] != "original" {
+		t.Fatalf("context clone failure = %v entered=%t nested=%v", err, contextEntered, messageNested)
+	}
+	toolNested := map[string]any{"value": "original"}
+	tool := Tool{Name: "tool", Info: &einoschema.ToolInfo{Name: "tool", Extra: map[string]any{"nested": toolNested, "unsupported": make(chan struct{})}}}
+	prepared := PreparedToolCall{Tool: tool, Call: ToolCall{ID: "call", Name: "tool", Input: json.RawMessage(`{}`)}}
+	_, err = extension.Invoke(plan, context.Background(), ToolPreparePoint, prepared, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) { return input, nil })
+	if !errors.Is(err, extension.ErrProtectedMutation) || toolEntered || toolNested["value"] != "original" {
+		t.Fatalf("tool clone failure = %v entered=%t nested=%v", err, toolEntered, toolNested)
+	}
+	if err := validateToolExecutionInput(ToolExecution(prepared), cloneToolExecution(ToolExecution(prepared))); !errors.Is(err, extension.ErrProtectedMutation) {
+		t.Fatalf("tool execution clone failure validation = %v", err)
+	}
+}
+
+type functionStreamer func(context.Context, model.Request) (*einoschema.StreamReader[*einoschema.Message], error)
+
+func (f functionStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+	return f(ctx, request)
+}
+
+func streamFromFunction(context.Context, model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+	reader, writer := einoschema.Pipe[*einoschema.Message](1)
+	writer.Close()
+	return reader, nil
+}
+
+type functionClient func()
+
+func (f functionClient) Generate(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.Message, error) {
+	f()
+	return nil, nil
+}
+
+func (f functionClient) Stream(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
+	f()
+	return streamFromFunction(context.Background(), model.Request{})
+}
+
+func (f functionClient) WithTools([]*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
+	return f, nil
+}
+
+func clientFunctionOne() {}
+func clientFunctionTwo() {}
+
+type functionObserver func()
+
+func (f functionObserver) OnProviderStart(context.Context, model.Request)     { f() }
+func (f functionObserver) OnProviderDelta(context.Context, model.StreamDelta) { f() }
+func (f functionObserver) OnProviderError(context.Context, model.Error)       { f() }
+func (f functionObserver) OnProviderEnd(context.Context, model.Response)      { f() }
 
 func TestToolValidationRejectsSameTypeCallableReplacement(t *testing.T) {
 	firstExecutor, secondExecutor := testExecutor("first"), testExecutor("second")
@@ -267,6 +395,16 @@ func TestToolValidationRejectsSameTypeCallableReplacement(t *testing.T) {
 				t.Fatalf("validation = %v", err)
 			}
 		})
+	}
+}
+
+func TestToolValidationAcceptsJSONCloneTypeNormalization(t *testing.T) {
+	original := PreparedToolCall{
+		Tool: Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Extra: map[string]any{"count": 1}}},
+		Call: ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`)},
+	}
+	if err := validatePreparedToolCallInput(original, clonePreparedToolCall(original)); err != nil {
+		t.Fatalf("unchanged tool validation = %v", err)
 	}
 }
 
@@ -344,6 +482,39 @@ func TestResumeRunStrictCallbacksOnlyDoesNotRequireSettlementStore(t *testing.T)
 	result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: descriptor}), run)
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
+	}
+}
+
+func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "resume-duration", Artifact: extension.Artifact{Name: "resume-duration", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var duration time.Duration
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
+			duration = notice.Duration
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := newAdmissionStore()
+	run := session.Run{ID: "run", SessionID: "session", Status: session.RunPending, CreatedAt: time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)}
+	store.runs[run.ID] = run
+	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
+	orchestrator := &StreamingOrchestrator{Store: store, Clock: func() time.Time { return now }}
+	done := make(chan Result, 1)
+	orchestrator.executeResume(withRunPlan(context.Background(), &RunPlan{Dispatch: dispatch}), run, done)
+	result := <-done
+	if result.Error != nil || duration != 0 {
+		t.Fatalf("resume result=%+v duration=%s", result, duration)
+	}
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 

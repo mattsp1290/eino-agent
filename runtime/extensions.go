@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -634,7 +636,7 @@ func validateRunDecision(decision RunDecision) error {
 
 func cloneContextAssembly(value ContextAssembly) ContextAssembly {
 	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
-	value.Base = cloneMessages(value.Base)
+	value.Base = cloneProtectedMessages(value.Base)
 	contributions := value.Contributions
 	value.Contributions = make([]ContextContribution, len(contributions))
 	for index, contribution := range contributions {
@@ -761,7 +763,16 @@ func cloneModelStreamInput(value ModelStreamInput) ModelStreamInput {
 }
 
 func validateModelStreamInput(original, candidate ModelStreamInput) error {
-	if !reflect.DeepEqual(original, candidate) {
+	leftClient, rightClient := original.Resolved.Client, candidate.Resolved.Client
+	leftStreamer, rightStreamer := original.Resolved.Streamer, candidate.Resolved.Streamer
+	leftObserver, rightObserver := original.Request.Observer, candidate.Request.Observer
+	original.Resolved.Client, candidate.Resolved.Client = nil, nil
+	original.Resolved.Streamer, candidate.Resolved.Streamer = nil, nil
+	original.Request.Observer, candidate.Request.Observer = nil, nil
+	if !reflect.DeepEqual(original, candidate) ||
+		!sameInterfaceIdentity(leftClient, rightClient) ||
+		!sameInterfaceIdentity(leftStreamer, rightStreamer) ||
+		!sameInterfaceIdentity(leftObserver, rightObserver) {
 		return extension.ErrProtectedMutation
 	}
 	return nil
@@ -831,11 +842,23 @@ func validateToolExecutionResult(original ToolExecution, output ToolOutcome) err
 func sameProtectedTool(left, right Tool) bool {
 	leftExecutor, rightExecutor := left.Executor, right.Executor
 	leftDecoder, rightDecoder := left.InputDecoder, right.InputDecoder
+	leftInfo, rightInfo := left.Info, right.Info
 	left.Executor, right.Executor = nil, nil
 	left.InputDecoder, right.InputDecoder = nil, nil
-	return reflect.DeepEqual(cloneTool(left), cloneTool(right)) &&
+	left.Info, right.Info = nil, nil
+	return reflect.DeepEqual(left, right) &&
+		sameProtectedToolInfo(leftInfo, rightInfo) &&
 		sameInterfaceIdentity(leftExecutor, rightExecutor) &&
 		sameInterfaceIdentity(leftDecoder, rightDecoder)
+}
+
+func sameProtectedToolInfo(left, right *einoschema.ToolInfo) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	leftRaw, leftErr := json.Marshal(left)
+	rightRaw, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
 }
 
 func sameProtectedToolCall(left, right ToolCall) bool {
@@ -854,10 +877,19 @@ func sameInterfaceIdentity(left, right any) (same bool) {
 		return left == nil && right == nil
 	}
 	leftValue, rightValue := reflect.ValueOf(left), reflect.ValueOf(right)
-	if leftValue.Type() != rightValue.Type() || !leftValue.Comparable() || !rightValue.Comparable() {
+	if leftValue.Type() != rightValue.Type() {
 		return false
 	}
-	return leftValue.Equal(rightValue)
+	if leftValue.Comparable() && rightValue.Comparable() {
+		return leftValue.Equal(rightValue)
+	}
+	type interfaceWords struct {
+		typ  unsafe.Pointer
+		data unsafe.Pointer
+	}
+	leftWords := *(*interfaceWords)(unsafe.Pointer(&left))
+	rightWords := *(*interfaceWords)(unsafe.Pointer(&right))
+	return leftWords.data == rightWords.data
 }
 
 func cloneToolOutcome(value ToolOutcome) ToolOutcome {
@@ -904,9 +936,11 @@ func cloneTool(tool Tool) Tool {
 	tool.Scope.Permissions = cloneSlice(tool.Scope.Permissions)
 	tool.Metadata = cloneStringMap(tool.Metadata)
 	if tool.Info != nil {
-		raw, _ := json.Marshal(tool.Info)
+		raw, err := json.Marshal(tool.Info)
 		var info einoschema.ToolInfo
-		if json.Unmarshal(raw, &info) == nil {
+		if err != nil || json.Unmarshal(raw, &info) != nil {
+			tool.Info = nil
+		} else {
 			tool.Info = &info
 		}
 	}
@@ -940,13 +974,22 @@ func cloneMessageDeep(message *einoschema.Message) *einoschema.Message {
 	}
 	raw, err := json.Marshal(message)
 	if err != nil {
-		clone := *message
-		return &clone
+		return nil
 	}
 	var clone einoschema.Message
 	if json.Unmarshal(raw, &clone) != nil {
-		fallback := *message
-		return &fallback
+		return nil
 	}
 	return &clone
+}
+
+func cloneProtectedMessages(messages []*einoschema.Message) []*einoschema.Message {
+	if messages == nil {
+		return nil
+	}
+	cloned := make([]*einoschema.Message, len(messages))
+	for index, message := range messages {
+		cloned[index] = cloneMessageDeep(message)
+	}
+	return cloned
 }

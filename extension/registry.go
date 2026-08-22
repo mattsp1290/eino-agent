@@ -72,7 +72,30 @@ func (s *stagingRegistrar) Defer(cleanup Cleanup) error {
 	return nil
 }
 
-func (r *Registry) Mount(ctx context.Context, component Component, installer Installer) (mount *Mount, err error) {
+func (r *Registry) Mount(ctx context.Context, component Component, installer Installer) (*Mount, error) {
+	prepared, err := r.PrepareMount(ctx, component, installer)
+	if err != nil {
+		return nil, err
+	}
+	mount, err := r.CommitMount(prepared)
+	if err != nil {
+		return nil, errors.Join(err, prepared.Rollback(context.WithoutCancel(ctx)))
+	}
+	return mount, nil
+}
+
+// PreparedMount contains validated registrations and cleanup effects that have
+// not yet been published. Preparing executes installer code without holding a
+// registry lock; CommitMount performs only the atomic publication step.
+type PreparedMount struct {
+	mu         sync.Mutex
+	registry   *Registry
+	state      *mountState
+	committed  bool
+	rolledBack bool
+}
+
+func (r *Registry) PrepareMount(ctx context.Context, component Component, installer Installer) (prepared *PreparedMount, err error) {
 	if r == nil || installer == nil {
 		return nil, fmt.Errorf("%w: registry and installer required", ErrInvalidComponent)
 	}
@@ -93,18 +116,52 @@ func (r *Registry) Mount(ctx context.Context, component Component, installer Ins
 		return nil, err
 	}
 	stage.closed = true
-	state := &mountState{component: component, entries: append([]registrationEntry(nil), stage.entries...), effects: append([]cleanupState(nil), stage.effects...), active: true, drained: make(chan struct{})}
+	state := &mountState{component: component, entries: append([]registrationEntry(nil), stage.entries...), effects: append([]cleanupState(nil), stage.effects...), drained: make(chan struct{})}
+	return &PreparedMount{registry: r, state: state}, nil
+}
+
+// CommitMount atomically publishes a prepared mount. A failed commit leaves the
+// preparation available for Rollback, which always runs cleanup outside locks.
+func (r *Registry) CommitMount(prepared *PreparedMount) (*Mount, error) {
+	if r == nil || prepared == nil {
+		return nil, fmt.Errorf("%w: registry and prepared mount required", ErrInvalidComponent)
+	}
+	prepared.mu.Lock()
+	defer prepared.mu.Unlock()
+	if prepared.registry != r || prepared.state == nil || prepared.committed || prepared.rolledBack {
+		return nil, ErrMountClosed
+	}
+	state := prepared.state
 	r.mu.Lock()
 	if r.mounts == nil {
 		r.mounts = make(map[string]*mountState)
 	}
-	if _, exists := r.mounts[component.InstanceID]; exists {
+	if _, exists := r.mounts[state.component.InstanceID]; exists {
 		r.mu.Unlock()
-		return nil, fmt.Errorf("%w: %s", ErrDuplicateInstance, component.InstanceID)
+		return nil, fmt.Errorf("%w: %s", ErrDuplicateInstance, state.component.InstanceID)
 	}
-	r.mounts[component.InstanceID] = state
+	state.active = true
+	r.mounts[state.component.InstanceID] = state
 	r.mu.Unlock()
+	prepared.committed = true
 	return &Mount{registry: r, state: state}, nil
+}
+
+// Rollback discards an uncommitted preparation and runs its cleanup effects in
+// reverse order. It is idempotent.
+func (p *PreparedMount) Rollback(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	if p.committed || p.rolledBack {
+		p.mu.Unlock()
+		return nil
+	}
+	p.rolledBack = true
+	effects := p.state.effects
+	p.mu.Unlock()
+	return cleanupReverse(ctx, effects)
 }
 
 type Mount struct {
@@ -134,12 +191,32 @@ func (m *Mount) deactivateLocked() {
 
 type callbackMountKey struct{}
 
+// CallbackContext marks ctx as executing a callback owned by this mount.
+func (m *Mount) CallbackContext(ctx context.Context) context.Context {
+	if m == nil || m.state == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, callbackMountKey{}, m.state)
+}
+
+// CheckClose reports whether closing this mount from ctx would wait on the
+// callback currently using its own lease.
+func (m *Mount) CheckClose(ctx context.Context) error {
+	if m == nil || m.state == nil {
+		return nil
+	}
+	if state, _ := ctx.Value(callbackMountKey{}).(*mountState); state == m.state {
+		return ErrSelfClose
+	}
+	return nil
+}
+
 func (m *Mount) Close(ctx context.Context) error {
 	if m == nil || m.registry == nil || m.state == nil {
 		return nil
 	}
-	if instance, _ := ctx.Value(callbackMountKey{}).(string); instance == m.state.component.InstanceID {
-		return ErrSelfClose
+	if err := m.CheckClose(ctx); err != nil {
+		return err
 	}
 	m.registry.mu.Lock()
 	m.deactivateLocked()
@@ -198,6 +275,7 @@ type Plan struct {
 type plannedEntry struct {
 	registrationEntry
 	component Component
+	state     *mountState
 }
 
 func (r *Registry) Snapshot(target Scope) (*Plan, error) {
@@ -235,7 +313,7 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 			if !scopeApplies(entry.spec.Scope, target) {
 				continue
 			}
-			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component})
+			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component, state: state})
 			leased[state] = struct{}{}
 		}
 	}

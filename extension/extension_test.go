@@ -61,6 +61,87 @@ func TestMountIsAtomicAndRollsBackEffects(t *testing.T) {
 	}
 }
 
+func TestPreparedMountIsInvisibleUntilCommitAndRollbackCleansOnce(t *testing.T) {
+	registry := NewRegistry(nil)
+	cleanups := 0
+	prepared, err := registry.PrepareMount(context.Background(), testComponent("prepared"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
+			return err
+		}
+		return On(registrar, testNotice, spec("prepared", "notice", 0, GlobalScope()), func(context.Context, testPayload) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.entries) != 0 || len(registry.Diagnostics()) != 0 {
+		t.Fatalf("prepared mount published early: entries=%d diagnostics=%v", len(plan.entries), registry.Diagnostics())
+	}
+	plan.Release()
+	if err := prepared.Rollback(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Rollback(context.Background()); err != nil || cleanups != 1 {
+		t.Fatalf("second rollback = %v cleanups=%d", err, cleanups)
+	}
+}
+
+func TestPreparedMountCommitTransfersCleanupToMount(t *testing.T) {
+	registry := NewRegistry(nil)
+	cleanups := 0
+	prepared, err := registry.PrepareMount(context.Background(), testComponent("commit"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
+			return err
+		}
+		return On(registrar, testNotice, spec("commit", "notice", 0, GlobalScope()), func(context.Context, testPayload) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount, err := registry.CommitMount(prepared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Rollback(context.Background()); err != nil || cleanups != 0 {
+		t.Fatalf("rollback after commit = %v cleanups=%d", err, cleanups)
+	}
+	if err := mount.Close(context.Background()); err != nil || cleanups != 1 {
+		t.Fatalf("close = %v cleanups=%d", err, cleanups)
+	}
+}
+
+func TestCallbackIdentityDistinguishesReusedInstanceID(t *testing.T) {
+	registry := NewRegistry(nil)
+	var replacement *Mount
+	old, err := registry.Mount(context.Background(), testComponent("reused"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, testNotice, spec("reused", "old", 0, GlobalScope()), func(ctx context.Context, _ testPayload) error {
+			return replacement.Close(ctx)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	old.Deactivate()
+	replacement, err = registry.Mount(context.Background(), testComponent("reused"), InstallerFunc(func(context.Context, Registrar) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if failures := Notify(plan, context.Background(), testNotice, testPayload{}); len(failures) != 0 {
+		t.Fatalf("closing replacement from old callback failed: %v", failures)
+	}
+	plan.Release()
+	if err := old.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestScopedOrderingDefensiveCopyAndContainedFailures(t *testing.T) {
 	var diagnostics atomic.Int32
 	registry := NewRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))

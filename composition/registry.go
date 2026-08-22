@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -187,18 +188,10 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 	if r == nil || installer == nil {
 		return nil, fmt.Errorf("%w: registry and installer required", extension.ErrInvalidComponent)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	var staged *Registrar
-	extensionMount, err := r.extensions.Mount(ctx, component, extension.InstallerFunc(func(ctx context.Context, extensions extension.Registrar) error {
+	prepared, err := r.extensions.PrepareMount(ctx, component, extension.InstallerFunc(func(ctx context.Context, extensions extension.Registrar) error {
 		registrar := &Registrar{extensions: extensions, component: component}
 		if err := installer.Install(ctx, registrar); err != nil {
-			return err
-		}
-		if err := r.validateTools(registrar.tools); err != nil {
-			return err
-		}
-		if err := r.validatePrompts(registrar.prompts); err != nil {
 			return err
 		}
 		staged = registrar
@@ -231,19 +224,83 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 	if err != nil {
 		return nil, err
 	}
+	rollback := func(primary error) error {
+		return errors.Join(primary, prepared.Rollback(context.WithoutCancel(ctx)))
+	}
+	r.mu.Lock()
+	if err := r.validateTools(staged.tools); err != nil {
+		r.mu.Unlock()
+		return nil, rollback(err)
+	}
+	if err := r.validatePrompts(staged.prompts); err != nil {
+		r.mu.Unlock()
+		return nil, rollback(err)
+	}
+	extensionMount, err := r.extensions.CommitMount(prepared)
+	if err != nil {
+		r.mu.Unlock()
+		return nil, rollback(err)
+	}
 	for _, registration := range staged.tools {
+		registration.Definition = mountToolDefinition(extensionMount, registration.Definition)
 		r.tools = append(r.tools, mountedTool{ToolRegistration: registration, component: component})
 	}
 	for _, registration := range staged.prompts {
+		registration.Provider = mountedPromptProvider{mount: extensionMount, next: registration.Provider}
 		r.prompts = append(r.prompts, mountedPrompt{PromptRegistration: registration, component: component})
 	}
 	for _, registration := range staged.guards {
+		registration.Guard = mountedToolGuard{mount: extensionMount, next: registration.Guard}
 		r.guards = append(r.guards, mountedGuard{GuardRegistration: registration, component: component})
 	}
 	for _, registration := range staged.restrictions {
 		r.restrictions = append(r.restrictions, mountedRestriction{RestrictionRegistration: registration, component: component})
 	}
+	r.mu.Unlock()
 	return &Mount{registry: r, extension: extensionMount, instance: component.InstanceID}, nil
+}
+
+type mountedPromptProvider struct {
+	mount *extension.Mount
+	next  runtime.PromptProvider
+}
+
+func (p mountedPromptProvider) ProvidePrompt(ctx context.Context, prompt runtime.PromptContext) (string, error) {
+	return p.next.ProvidePrompt(p.mount.CallbackContext(ctx), prompt)
+}
+
+type mountedToolGuard struct {
+	mount *extension.Mount
+	next  runtime.ToolGuard
+}
+
+func (g mountedToolGuard) GuardTool(ctx context.Context, request runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
+	return g.next.GuardTool(g.mount.CallbackContext(ctx), request)
+}
+
+func mountToolDefinition(mount *extension.Mount, definition tools.Definition) tools.Definition {
+	next := definition.Clone()
+	if callback := next.Decode; callback != nil {
+		next.Decode = func(ctx context.Context, raw json.RawMessage) (any, error) {
+			return callback(mount.CallbackContext(ctx), raw)
+		}
+	}
+	if callback := next.Normalize; callback != nil {
+		next.Normalize = func(ctx context.Context, input any) (json.RawMessage, error) {
+			return callback(mount.CallbackContext(ctx), input)
+		}
+	}
+	if callback := next.Encode; callback != nil {
+		next.Encode = func(ctx context.Context, value any) (json.RawMessage, error) {
+			return callback(mount.CallbackContext(ctx), value)
+		}
+	}
+	if callback := next.Execute; callback != nil {
+		next.Execute = func(ctx context.Context, execution tools.Execution) (any, error) {
+			return callback(mount.CallbackContext(ctx), execution)
+		}
+	}
+	return next
 }
 
 func (r *Registry) validateTools(staged []ToolRegistration) error {
@@ -310,6 +367,9 @@ func (m *Mount) Deactivate() {
 func (m *Mount) Close(ctx context.Context) error {
 	if m == nil {
 		return nil
+	}
+	if err := m.extension.CheckClose(ctx); err != nil {
+		return err
 	}
 	m.Deactivate()
 	return m.extension.Close(ctx)

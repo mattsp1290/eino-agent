@@ -58,9 +58,10 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, run session.R
 	if plan != nil {
 		defer plan.release()
 	}
+	resumeStartedAt := o.now()
 	result := o.resumeRun(ctx, run)
 	if plan != nil && plan.Dispatch != nil && !run.Terminal() {
-		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(run.StartedAt), Error: classifyExtensionError(result.Error)})
+		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(resumeStartedAt), Error: classifyExtensionError(result.Error)})
 	}
 	done <- result
 }

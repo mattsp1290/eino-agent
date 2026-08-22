@@ -117,6 +117,161 @@ func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
 	}
 }
 
+func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
+	registry := NewRegistry(nil)
+	var nested *Mount
+	done := make(chan error, 1)
+	go func() {
+		_, err := registry.Mount(context.Background(), component("outer"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			_ = registry.Diagnostics()
+			plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				return err
+			}
+			plan.Dispatch.Release()
+			nested, err = registry.Mount(context.Background(), component("nested"), InstallerFunc(func(_ context.Context, nestedRegistrar *Registrar) error {
+				return nestedRegistrar.Tool(ToolRegistration{ID: "nested", InstanceID: "nested", Scope: extension.GlobalScope(), Definition: definition("nested", "nested")})
+			}))
+			if err != nil {
+				return err
+			}
+			if err := registrar.Defer(func(context.Context) error {
+				_ = registry.Diagnostics()
+				plan, acquireErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+				if acquireErr == nil {
+					plan.Dispatch.Release()
+				}
+				return acquireErr
+			}); err != nil {
+				return err
+			}
+			return errors.New("rollback")
+		}))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || err.Error() != "rollback" {
+			t.Fatalf("Mount error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("re-entrant installer or rollback deadlocked")
+	}
+	if nested == nil {
+		t.Fatal("nested mount did not commit")
+	}
+	if err := nested.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.T) {
+	registry := NewRegistry(nil)
+	first, err := registry.Mount(context.Background(), component("first"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "tool", InstanceID: "first", Scope: extension.GlobalScope(), Definition: definition("duplicate", "first")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = first.Close(context.Background()) }()
+	cleaned := false
+	notified := false
+	done := make(chan error, 1)
+	go func() {
+		_, mountErr := registry.Mount(context.Background(), component("rejected"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			if err := registrar.Defer(func(context.Context) error {
+				_ = registry.Diagnostics()
+				cleaned = true
+				return nil
+			}); err != nil {
+				return err
+			}
+			if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", InstanceID: "rejected", Scope: extension.GlobalScope()}, func(context.Context, string) error {
+				notified = true
+				return nil
+			}); err != nil {
+				return err
+			}
+			return registrar.Tool(ToolRegistration{ID: "tool", InstanceID: "rejected", Scope: extension.GlobalScope(), Definition: definition("duplicate", "rejected")})
+		}))
+		done <- mountErr
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, tools.ErrDuplicateRegistration) || !cleaned {
+			t.Fatalf("conflicting Mount = %v cleaned=%t", err, cleaned)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("conflict rollback deadlocked")
+	}
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Dispatch.Release()
+	_ = extension.Notify(plan.Dispatch, context.Background(), compositionNotice, "test")
+	if notified {
+		t.Fatal("rejected mount handler was published")
+	}
+}
+
+func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
+	registry := NewRegistry(nil)
+	var mount *Mount
+	definition := definition("self-close", "self-close")
+	definition.Normalize = func(ctx context.Context, _ any) (json.RawMessage, error) {
+		return nil, mount.Close(ctx)
+	}
+	definition.Execute = func(ctx context.Context, _ tools.Execution) (any, error) {
+		return nil, mount.Close(ctx)
+	}
+	var err error
+	mount, err = registry.Mount(context.Background(), component("self-close"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		if err := registrar.Tool(ToolRegistration{ID: "tool", InstanceID: "self-close", Scope: extension.GlobalScope(), Definition: definition}); err != nil {
+			return err
+		}
+		if err := registrar.Prompt(PromptRegistration{ID: "prompt", InstanceID: "self-close", Name: "prompt", Scope: extension.GlobalScope(), Provider: runtime.PromptProviderFunc(func(ctx context.Context, _ runtime.PromptContext) (string, error) {
+			return "", mount.Close(ctx)
+		})}); err != nil {
+			return err
+		}
+		return registrar.Guard(GuardRegistration{ID: "guard", InstanceID: "self-close", Scope: extension.GlobalScope(), Guard: runtime.ToolGuardFunc(func(ctx context.Context, _ runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
+			return runtime.ToolGuardResult{}, mount.Close(ctx)
+		})})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plan.Prompts[0].Provider.ProvidePrompt(context.Background(), runtime.PromptContext{}); !errors.Is(err, extension.ErrSelfClose) {
+		t.Fatalf("prompt self-close = %v", err)
+	}
+	if _, err := plan.Guards[0].Guard.GuardTool(context.Background(), runtime.ToolGuardRequest{}); !errors.Is(err, extension.ErrSelfClose) {
+		t.Fatalf("guard self-close = %v", err)
+	}
+	resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("ResolveTools = %#v, %v", resolved, err)
+	}
+	if _, err := resolved[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{}`)); !errors.Is(err, extension.ErrSelfClose) {
+		t.Fatalf("decoder self-close = %v", err)
+	}
+	if _, err := resolved[0].Executor.Execute(context.Background(), runtime.ToolCall{Input: json.RawMessage(`{}`)}); !errors.Is(err, extension.ErrSelfClose) {
+		t.Fatalf("executor self-close = %v", err)
+	}
+	diagnostics := registry.Diagnostics()
+	if len(diagnostics.Tools) != 1 {
+		t.Fatalf("self-close deactivated mount: %#v", diagnostics)
+	}
+	plan.Dispatch.Release()
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 	registry := NewRegistry(nil)
 	mount, err := registry.Mount(context.Background(), component("mismatch"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
