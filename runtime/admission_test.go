@@ -139,6 +139,48 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	}
 }
 
+func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
+	store := newAdmissionStore()
+	admitter := Admitter{Store: store}
+	request := admissionRequest()
+	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "first", Kind: session.ExtensionHandlers, Required: true}}}
+	request.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(request.ExtensionPlan)
+	if _, err := admitter.Admit(context.Background(), request); err != nil {
+		t.Fatalf("first Admit error = %v", err)
+	}
+
+	retry := request
+	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "second", Kind: session.ExtensionHandlers, Required: true}}}
+	retry.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(retry.ExtensionPlan)
+	if _, err := admitter.Admit(context.Background(), retry); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("mismatched retry error = %v, want ErrExtensionPlanMismatch", err)
+	}
+}
+
+func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "original", Kind: session.ExtensionHandlers, Required: true}}}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	corrupt := descriptor.Clone()
+	corrupt.Entries[0].InstanceID = "changed"
+	if err := validateMatchingExtensionPlans(corrupt, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("persisted stale fingerprint error = %v", err)
+	}
+	if err := validateMatchingExtensionPlans(descriptor, corrupt); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("requested stale fingerprint error = %v", err)
+	}
+}
+
+func TestMatchingExtensionPlansUsesSchemaCanonicalization(t *testing.T) {
+	persisted := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "ordered", Kind: session.ExtensionPrompt, Required: true, Order: 10}}}
+	requested := persisted.Clone()
+	requested.Entries[0].Order = 20
+	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
+	requested.Fingerprint, _ = session.FingerprintExtensionPlan(requested)
+	if err := validateMatchingExtensionPlans(persisted, requested); err != nil {
+		t.Fatalf("schema-v1 canonical plans did not match: %v", err)
+	}
+}
+
 func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.T) {
 	t.Parallel()
 

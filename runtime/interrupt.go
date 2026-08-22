@@ -166,6 +166,9 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			}
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
+		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+			_ = extension.Notify(plan.Dispatch, ctx, ToolStartedPoint, ToolStartedNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Time: claimed.StartedAt})
+		}
 		toolCall := ToolCall{
 			ID:        claimed.ID,
 			SessionID: claimed.SessionID,

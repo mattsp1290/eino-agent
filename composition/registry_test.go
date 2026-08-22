@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -78,6 +79,106 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 		t.Fatalf("AcquireResumePlan = %#v, %v", resumed, err)
 	}
 	resumed.Dispatch.Release()
+}
+
+func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := component("selected-tools")
+	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		if err := registrar.Tool(ToolRegistration{ID: "a", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: definition("a", "a")}); err != nil {
+			return err
+		}
+		return registrar.Tool(ToolRegistration{ID: "b", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: definition("b", "b")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+
+	tests := []struct {
+		name       string
+		config     config.ToolConfig
+		wantTools  []string
+		wantStrict bool
+	}{
+		{name: "disabled wins", config: config.ToolConfig{Enabled: []string{"a", "b"}, Disabled: []string{"b"}}, wantTools: []string{"a"}, wantStrict: true},
+		{name: "explicit empty enabled", config: config.ToolConfig{Enabled: []string{}}, wantTools: []string{}, wantStrict: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{Config: config.Snapshot{Tools: test.config}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.Dispatch.Release()
+			resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			gotTools := make([]string, len(resolved))
+			for index, tool := range resolved {
+				gotTools[index] = tool.Name
+			}
+			if !reflect.DeepEqual(gotTools, test.wantTools) {
+				t.Fatalf("resolved tools = %v, want %v", gotTools, test.wantTools)
+			}
+			var descriptorTools int
+			for _, entry := range plan.Descriptor.Entries {
+				if entry.Kind == session.ExtensionTool {
+					descriptorTools++
+				}
+			}
+			if descriptorTools != len(test.wantTools) || plan.RequiresToolSettlement != test.wantStrict {
+				t.Fatalf("descriptor tools=%d requires settlement=%t", descriptorTools, plan.RequiresToolSettlement)
+			}
+		})
+	}
+}
+
+func TestResumeFiltersPersistedToolIdentityBeforeScopeShadowing(t *testing.T) {
+	registry := NewRegistry(nil)
+	baseComponent := component("scope-collision")
+	mountVersion := func(includeSessionTool bool) *Mount {
+		mount, err := registry.Mount(context.Background(), baseComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "session-marker", InstanceID: baseComponent.InstanceID, Scope: extension.SessionScope("session-a")}, func(context.Context, string) error { return nil }); err != nil {
+				return err
+			}
+			if err := registrar.Tool(ToolRegistration{ID: "global", InstanceID: baseComponent.InstanceID, Scope: extension.GlobalScope(), Definition: definition("echo", "global")}); err != nil {
+				return err
+			}
+			if includeSessionTool {
+				return registrar.Tool(ToolRegistration{ID: "session", InstanceID: baseComponent.InstanceID, Scope: extension.SessionScope("session-a"), Definition: definition("echo", "session")})
+			}
+			return nil
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mount
+	}
+
+	firstMount := mountVersion(false)
+	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := first.Descriptor.Clone()
+	first.Dispatch.Release()
+	if err := firstMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	secondMount := mountVersion(true)
+	defer func() { _ = secondMount.Close(context.Background()) }()
+	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	if err != nil {
+		t.Fatalf("AcquireResumePlan = %v", err)
+	}
+	defer resumed.Dispatch.Release()
+	resolved, err := resumed.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	if err != nil || len(resolved) != 1 || resolved[0].Info.Desc != "global" {
+		t.Fatalf("resumed tools = %#v, %v", resolved, err)
+	}
 }
 
 func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {

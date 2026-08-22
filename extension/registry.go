@@ -296,7 +296,7 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 	if r == nil {
 		return &Plan{}, nil
 	}
-	if err := validateScope(target); err != nil {
+	if err := validateTargetScope(target); err != nil {
 		return nil, err
 	}
 	r.mu.Lock()

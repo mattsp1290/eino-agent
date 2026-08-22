@@ -189,6 +189,32 @@ func TestScopedOrderingDefensiveCopyAndContainedFailures(t *testing.T) {
 	}
 }
 
+func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := testComponent("opaque-target")
+	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, testNotice, spec(component.InstanceID, "global", 0, GlobalScope()), func(context.Context, testPayload) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+
+	for _, key := range []string{"user@example.com", "dXNlcg=="} {
+		plan, err := registry.Snapshot(SessionScope(key))
+		if err != nil {
+			t.Fatalf("Snapshot(%q) = %v", key, err)
+		}
+		if len(plan.Diagnostics()) != 1 {
+			t.Fatalf("Snapshot(%q) diagnostics = %#v", key, plan.Diagnostics())
+		}
+		plan.Release()
+	}
+	if _, err := registry.Snapshot(SessionScope("")); !errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("empty session target error = %v, want ErrInvalidRegistration", err)
+	}
+}
+
 func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 	registry := NewRegistry(nil)
 	var sequence []string

@@ -750,7 +750,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapsh
 			Kind: session.PartToolResult, Payload: cloneJSON(output), CreatedAt: o.now(), UpdatedAt: o.now(),
 		}
 		if settlementStore != nil {
-			err = settlementStore.SettleToolCall(ctx, session.ToolSettlement{ID: callID, ClaimedBy: record.ClaimedBy, ClaimToken: record.ClaimToken, Status: status, Output: cloneJSON(output), Error: errText, Metadata: cloneStringMap(record.Metadata), CompletedAt: record.CompletedAt, ResultMessage: resultMessage, ResultPart: resultPart})
+			err = settlementStore.SettleToolCall(context.WithoutCancel(ctx), session.ToolSettlement{ID: callID, ClaimedBy: record.ClaimedBy, ClaimToken: record.ClaimToken, Status: status, Output: cloneJSON(output), Error: errText, Metadata: cloneStringMap(record.Metadata), CompletedAt: record.CompletedAt, ResultMessage: resultMessage, ResultPart: resultPart})
 		} else {
 			err = o.Store.FinishToolCall(ctx, record)
 			if err == nil {

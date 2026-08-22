@@ -10,6 +10,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -376,11 +377,12 @@ func (m *Mount) Close(ctx context.Context) error {
 }
 
 func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRequest) (*runtime.RunPlan, error) {
-	return r.acquire(ctx, request.SessionID, nil, session.PlanStrict, session.ExtensionPlanSchemaVersion)
+	return r.acquire(ctx, request.SessionID, nil, requestedToolSelector(request.Config.Tools), session.PlanStrict, session.ExtensionPlanSchemaVersion)
 }
 
 func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
 	instances := make(map[string]bool)
+	toolIdentities := make(map[planToolIdentity]bool)
 	var sessionID session.ID
 	recoverSessionID := func(scope session.ExtensionScope) error {
 		if scope.Kind != string(extension.ScopeSession) || scope.Key == "" {
@@ -396,6 +398,9 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 		if entry.Required {
 			instances[entry.InstanceID] = true
 		}
+		if entry.Required && entry.Kind == session.ExtensionTool {
+			toolIdentities[planToolIdentity{InstanceID: entry.InstanceID, Scope: entry.Scope, CapabilityID: entry.CapabilityID}] = true
+		}
 		if err := recoverSessionID(entry.Scope); err != nil {
 			return nil, err
 		}
@@ -405,7 +410,7 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 			}
 		}
 	}
-	plan, err := r.acquire(ctx, sessionID, instances, persisted.Mode, persisted.SchemaVersion)
+	plan, err := r.acquire(ctx, sessionID, instances, persistedToolSelector(toolIdentities), persisted.Mode, persisted.SchemaVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +421,7 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	return plan, nil
 }
 
-func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, mode session.PlanMode, schemaVersion int) (*runtime.RunPlan, error) {
+func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, selectTool planToolSelector, mode session.PlanMode, schemaVersion int) (*runtime.RunPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -440,7 +445,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	if err != nil {
 		return nil, err
 	}
-	selected := selectTools(r.tools, target, instances)
+	selected := selectTools(r.tools, target, instances, selectTool)
 	prompts := selectPrompts(r.prompts, target, instances)
 	guards := selectGuards(r.guards, target, instances)
 	restrictions := selectRestrictions(r.restrictions, target, instances)
@@ -504,11 +509,46 @@ func toolAllowed(name string, restrictions []mountedRestriction) bool {
 	return true
 }
 
-func selectTools(entries []mountedTool, target extension.Scope, instances map[string]bool) []mountedTool {
+type planToolSelector func(mountedTool) bool
+
+type planToolIdentity struct {
+	InstanceID   string
+	Scope        session.ExtensionScope
+	CapabilityID string
+}
+
+func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
+	enabled := make(map[string]bool, len(toolConfig.Enabled))
+	for _, name := range toolConfig.Enabled {
+		enabled[name] = true
+	}
+	disabled := make(map[string]bool, len(toolConfig.Disabled))
+	for _, name := range toolConfig.Disabled {
+		disabled[name] = true
+	}
+	return func(entry mountedTool) bool {
+		if disabled[entry.Definition.Name] {
+			return false
+		}
+		return toolConfig.Enabled == nil || enabled[entry.Definition.Name]
+	}
+}
+
+func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelector {
+	return func(entry mountedTool) bool {
+		return identities[planToolIdentity{
+			InstanceID:   entry.InstanceID,
+			Scope:        scopeIdentity(entry.Scope),
+			CapabilityID: entry.Definition.Name + "/" + entry.ID,
+		}]
+	}
+}
+
+func selectTools(entries []mountedTool, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []mountedTool {
 	global := make(map[string]mountedTool)
 	sessionLayer := make(map[string]mountedTool)
 	for _, entry := range entries {
-		if instances != nil && !instances[entry.component.InstanceID] {
+		if instances != nil && !instances[entry.component.InstanceID] || selectTool != nil && !selectTool(entry) {
 			continue
 		}
 		switch {

@@ -286,6 +286,22 @@ func validateScope(scope Scope) error {
 	return nil
 }
 
+func validateTargetScope(scope Scope) error {
+	switch scope.Kind {
+	case ScopeGlobal:
+		if scope.Key != "" {
+			return fmt.Errorf("%w: global scope key must be empty", ErrInvalidRegistration)
+		}
+	case ScopeSession:
+		if scope.Key == "" {
+			return fmt.Errorf("%w: session key required", ErrInvalidRegistration)
+		}
+	default:
+		return fmt.Errorf("%w: unsupported scope", ErrInvalidRegistration)
+	}
+	return nil
+}
+
 func validateArtifact(component Component) error {
 	artifact := component.Artifact
 	if !identifierPattern.MatchString(component.InstanceID) || !identifierPattern.MatchString(artifact.Name) || strings.TrimSpace(artifact.Version) == "" || artifact.Hash == "" || artifact.ConfigHash == "" {

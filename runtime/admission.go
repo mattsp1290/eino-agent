@@ -127,6 +127,9 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 	if err != nil {
 		return AdmittedRun{}, err
 	}
+	if err := validateMatchingExtensionPlans(runRecord.ExtensionPlan, request.ExtensionPlan); err != nil {
+		return AdmittedRun{}, err
+	}
 	sessionRecord, err := a.Store.GetSession(ctx, runRecord.SessionID)
 	if err != nil {
 		return AdmittedRun{}, err
@@ -136,6 +139,21 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 		return AdmittedRun{}, err
 	}
 	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, request, now), nil
+}
+
+func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDescriptor) error {
+	persistedFingerprint, err := session.FingerprintExtensionPlan(persisted)
+	if err != nil || persisted.Fingerprint != "" && persisted.Fingerprint != persistedFingerprint {
+		return ErrExtensionPlanMismatch
+	}
+	requestedFingerprint, err := session.FingerprintExtensionPlan(requested)
+	if err != nil || requested.Fingerprint != "" && requested.Fingerprint != requestedFingerprint {
+		return ErrExtensionPlanMismatch
+	}
+	if persistedFingerprint != requestedFingerprint {
+		return ErrExtensionPlanMismatch
+	}
+	return nil
 }
 
 func admitDurable(ctx context.Context, store session.Store, request AdmissionRequest, now time.Time) (AdmittedRun, error) {

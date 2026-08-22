@@ -15,6 +15,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
@@ -901,6 +902,108 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	}
 	if call.Status != session.ToolCallInterrupted {
 		t.Fatalf("tool call = %+v", call)
+	}
+}
+
+func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	defer func() { _ = store.Close() }()
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "tools", Kind: session.ExtensionTool, Required: true, CapabilityID: "echo/tool"}}}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	toolRegistry := staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			cancel()
+			return ToolResult{Output: "ok"}, nil
+		}),
+	}}}
+	orch := &StreamingOrchestrator{
+		Store: store,
+		Model: resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+			for _, message := range request.Messages {
+				if message.Role == einoschema.Tool {
+					return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				}
+			}
+			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-cancel", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+		})},
+		Plans:   staticRunPlanProvider{plan: &RunPlan{Tools: toolRegistry, Descriptor: descriptor}},
+		IDs:     &sequenceIDs{},
+		Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
+		OwnerID: "owner-1",
+	}
+	handle, err := orch.Start(ctx, Request{SessionID: "session-cancel", ParentID: "user-1", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	<-handle.Done()
+	call, err := store.GetToolCall(context.Background(), "call-cancel")
+	if err != nil {
+		t.Fatalf("GetToolCall error = %v", err)
+	}
+	if call.Status != session.ToolCallCompleted {
+		t.Fatalf("tool call status = %s, want completed", call.Status)
+	}
+}
+
+func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call session.ToolCallStatus
+		want []string
+	}{
+		{name: "pending", call: session.ToolCallPending, want: []string{"started", "settled"}},
+		{name: "running", call: session.ToolCallRunning, want: []string{"settled"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			registry := extension.NewRegistry(nil)
+			component := extension.Component{InstanceID: "resume-lifecycle", Artifact: extension.Artifact{Name: "resume-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+			var notices []string
+			mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+				if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ToolStartedNotice) error {
+					notices = append(notices, "started")
+					return nil
+				}); err != nil {
+					return err
+				}
+				return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ToolSettledNotice) error {
+					notices = append(notices, "settled")
+					return nil
+				})
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = mount.Close(context.Background()) }()
+			dispatch, err := registry.Snapshot(extension.GlobalScope())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer dispatch.Release()
+
+			store, run := resumeStoreWithTool(t, "old-owner", test.call)
+			orch := &StreamingOrchestrator{
+				Store: store,
+				Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+					return ToolResult{Output: "ok"}, nil
+				})}}},
+				IDs:     &sequenceIDs{},
+				Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
+				OwnerID: "new-owner",
+			}
+			result := orch.resumeRun(withRunPlan(context.Background(), &RunPlan{Dispatch: dispatch}), run)
+			if result.Error != nil {
+				t.Fatalf("resumeRun result = %+v", result)
+			}
+			if strings.Join(notices, ",") != strings.Join(test.want, ",") {
+				t.Fatalf("notices = %v, want %v", notices, test.want)
+			}
+		})
 	}
 }
 
