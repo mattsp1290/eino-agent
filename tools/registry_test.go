@@ -23,6 +23,11 @@ func TestRegisterValidatesDefinitions(t *testing.T) {
 	if _, err := registry.Register(Definition{}); !errors.Is(err, ErrInvalidDefinition) {
 		t.Fatalf("Register empty error = %v, want ErrInvalidDefinition", err)
 	}
+	malformed := testDefinition("malformed")
+	malformed.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"broken": nil})
+	if err := ValidateDefinition(malformed); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("ValidateDefinition malformed error = %v, want ErrInvalidDefinition", err)
+	}
 	definition := testDefinition("echo")
 	if _, err := registry.Register(definition); err != nil {
 		t.Fatalf("Register error = %v", err)

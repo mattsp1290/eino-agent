@@ -130,6 +130,9 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 	if registration.Scope.Kind == extension.ScopeGlobal && registration.Scope.Key != "" || registration.Scope.Kind == extension.ScopeSession && registration.Scope.Key == "" {
 		return fmt.Errorf("%w: invalid composed tool scope key", extension.ErrInvalidRegistration)
 	}
+	if err := tools.ValidateDefinition(registration.Definition); err != nil {
+		return err
+	}
 	for _, existing := range r.tools {
 		if existing.Scope == registration.Scope && existing.Definition.Name == registration.Definition.Name {
 			return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, registration.Definition.Name)

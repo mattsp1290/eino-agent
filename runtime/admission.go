@@ -142,6 +142,9 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 }
 
 func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDescriptor) error {
+	if persisted.SchemaVersion == 0 && persisted.Mode == "" && persisted.Fingerprint == "" && persisted.Entries == nil {
+		persisted = legacyExtensionPlanDescriptor()
+	}
 	persistedFingerprint, err := session.FingerprintExtensionPlan(persisted)
 	if err != nil || persisted.Fingerprint != "" && persisted.Fingerprint != persistedFingerprint {
 		return ErrExtensionPlanMismatch

@@ -106,7 +106,7 @@ func NewRegistry() *Registry {
 
 // Register adds one new tool definition.
 func (r *Registry) Register(definition Definition) (Registration, error) {
-	if err := validateDefinition(definition); err != nil {
+	if err := ValidateDefinition(definition); err != nil {
 		return Registration{}, err
 	}
 	r.mu.Lock()
@@ -126,7 +126,7 @@ func (r *Registry) Register(definition Definition) (Registration, error) {
 // Replace updates an existing definition if registration still names the active
 // generation. This prevents stale plugin reloads from overwriting newer tools.
 func (r *Registry) Replace(registration Registration, definition Definition) (Registration, error) {
-	if err := validateDefinition(definition); err != nil {
+	if err := ValidateDefinition(definition); err != nil {
 		return Registration{}, err
 	}
 	if registration.Name != definition.Name {
@@ -241,7 +241,9 @@ func (d Definition) Clone() Definition {
 	return next
 }
 
-func validateDefinition(definition Definition) error {
+// ValidateDefinition reports whether definition can be safely registered and
+// materialized by a tool registry.
+func ValidateDefinition(definition Definition) error {
 	if strings.TrimSpace(definition.Name) == "" {
 		return fmt.Errorf("%w: name required", ErrInvalidDefinition)
 	}
@@ -254,7 +256,7 @@ func validateDefinition(definition Definition) error {
 	if definition.Execute == nil {
 		return fmt.Errorf("%w: executor required for %s", ErrInvalidDefinition, definition.Name)
 	}
-	if _, err := cloneParamsOneOfChecked(definition.Parameters); err != nil {
+	if err := validateParameters(definition.Parameters); err != nil {
 		return fmt.Errorf("%w: parameters for %s: %v", ErrInvalidDefinition, definition.Name, err)
 	}
 	switch definition.Concurrency {
@@ -263,6 +265,16 @@ func validateDefinition(definition Definition) error {
 		return fmt.Errorf("%w: unsupported concurrency %q", ErrInvalidDefinition, definition.Concurrency)
 	}
 	return nil
+}
+
+func validateParameters(parameters *einoschema.ParamsOneOf) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("invalid parameter schema: %v", recovered)
+		}
+	}()
+	_, err = cloneParamsOneOfChecked(parameters)
+	return err
 }
 
 func materialize(definition Definition, snapshot runtime.TurnSnapshot) runtime.Tool {

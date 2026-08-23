@@ -81,6 +81,36 @@ func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 	}
 }
 
+func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
+	original := ToolCall{
+		SessionID: "session",
+		RunID:     "run",
+		Input:     json.RawMessage(`{"op":"delete"}`),
+		Scope:     ToolScope{Permissions: []string{"write"}},
+	}
+	plan := &RunPlan{Guards: []MountedToolGuard{
+		{ID: "mutate", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+			copy(request.Call.Input, json.RawMessage(`{"op":"hidden"}`))
+			copy(request.Call.Scope.Permissions, []string{"audit"})
+			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
+		})},
+		{ID: "deny-original", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+			if string(request.Call.Input) != `{"op":"delete"}` || !reflect.DeepEqual(request.Call.Scope.Permissions, []string{"write"}) {
+				t.Fatalf("second guard request = %#v", request.Call)
+			}
+			return ToolGuardResult{Decision: ToolGuardDeny}, nil
+		})},
+	}}
+
+	decision, err := evaluateToolGuards(context.Background(), plan, Tool{Name: "danger"}, original)
+	if err != nil || decision.Decision != ToolGuardDeny {
+		t.Fatalf("evaluateToolGuards = %#v, %v", decision, err)
+	}
+	if string(original.Input) != `{"op":"delete"}` || !reflect.DeepEqual(original.Scope.Permissions, []string{"write"}) {
+		t.Fatalf("original call mutated = %#v", original)
+	}
+}
+
 func TestToolOutcomeSealRejectsDispositionMutation(t *testing.T) {
 	outcome := sealToolOutcome(ToolOutcome{Call: ToolCall{ID: "call"}, Disposition: ToolExecuted})
 	outcome.Disposition = ToolDenied
@@ -563,6 +593,63 @@ func TestAcquireResumePlanUsesStrictToolSettlementPredicate(t *testing.T) {
 	}
 }
 
+func TestAcquireResumePlanRejectsLiveLegacyExtensionsForStrictDescriptor(t *testing.T) {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+
+	tests := []struct {
+		name      string
+		configure func(*StreamingOrchestrator)
+	}{
+		{name: "tools", configure: func(orchestrator *StreamingOrchestrator) {
+			orchestrator.Tools = ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) { return nil, nil })
+		}},
+		{name: "context", configure: func(orchestrator *StreamingOrchestrator) {
+			orchestrator.Context = []ContextSource{ContextSourceFunc(func(context.Context, TurnSnapshot) ([]*einoschema.Message, error) { return nil, nil })}
+		}},
+		{name: "hooks", configure: func(orchestrator *StreamingOrchestrator) {
+			orchestrator.Hooks = []Hook{HookFuncs{}}
+		}},
+		{name: "middleware", configure: func(orchestrator *StreamingOrchestrator) {
+			orchestrator.Middleware = []ToolMiddleware{ToolMiddlewareFuncs{}}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resumeCalls := 0
+			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}, resumeCalls: &resumeCalls}}
+			test.configure(orchestrator)
+			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+				t.Fatalf("acquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
+			}
+			if resumeCalls != 0 {
+				t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
+			}
+		})
+	}
+
+	t.Run("strict without legacy extensions", func(t *testing.T) {
+		orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}}
+		if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); err != nil {
+			t.Fatalf("acquireResumePlan = %v", err)
+		}
+	})
+
+	t.Run("partial legacy permits live extensions", func(t *testing.T) {
+		partial := descriptor.Clone()
+		partial.Mode = session.PlanPartialLegacy
+		partial.Fingerprint, _ = session.FingerprintExtensionPlan(partial)
+		orchestrator := &StreamingOrchestrator{
+			Store:      newAdmissionStore(),
+			Plans:      staticRunPlanProvider{plan: &RunPlan{Descriptor: partial}},
+			Middleware: []ToolMiddleware{ToolMiddlewareFuncs{}},
+		}
+		if _, err := orchestrator.acquireResumePlan(context.Background(), partial); err != nil {
+			t.Fatalf("acquireResumePlan = %v", err)
+		}
+	})
+}
+
 func TestAcquireResumePlanRecomputesProviderDescriptorFingerprint(t *testing.T) {
 	descriptor := session.ExtensionPlanDescriptor{
 		SchemaVersion: session.ExtensionPlanSchemaVersion,
@@ -804,13 +891,19 @@ func TestVersionOnePromptAndGuardDescriptorsAreUnverifiable(t *testing.T) {
 	}
 }
 
-type staticRunPlanProvider struct{ plan *RunPlan }
+type staticRunPlanProvider struct {
+	plan        *RunPlan
+	resumeCalls *int
+}
 
 func (p staticRunPlanProvider) AcquireRunPlan(context.Context, RunPlanRequest) (*RunPlan, error) {
 	return p.plan, nil
 }
 
 func (p staticRunPlanProvider) AcquireResumePlan(context.Context, session.ExtensionPlanDescriptor) (*RunPlan, error) {
+	if p.resumeCalls != nil {
+		(*p.resumeCalls)++
+	}
 	return p.plan, nil
 }
 

@@ -157,6 +157,42 @@ func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 	}
 }
 
+func TestAdmitAcceptsPreExtensionPersistedPlanOnLegacyRetry(t *testing.T) {
+	store := newAdmissionStore()
+	admitter := Admitter{Store: store}
+	request := admissionRequest()
+	request.ExtensionPlan = legacyExtensionPlanDescriptor()
+	if _, err := admitter.Admit(context.Background(), request); err != nil {
+		t.Fatalf("first Admit error = %v", err)
+	}
+
+	stored := store.runs[request.IDs.RunID]
+	stored.ExtensionPlan = session.ExtensionPlanDescriptor{}
+	store.runs[stored.ID] = stored
+
+	retry, err := admitter.Admit(context.Background(), request)
+	if err != nil {
+		t.Fatalf("legacy retry error = %v", err)
+	}
+	if !retry.AlreadyAdmitted {
+		t.Fatal("legacy retry did not report AlreadyAdmitted")
+	}
+}
+
+func TestMatchingExtensionPlansNormalizesOnlyPersistedExactZeroDescriptor(t *testing.T) {
+	legacy := legacyExtensionPlanDescriptor()
+	if err := validateMatchingExtensionPlans(session.ExtensionPlanDescriptor{}, legacy); err != nil {
+		t.Fatalf("zero persisted descriptor mismatch = %v", err)
+	}
+	if err := validateMatchingExtensionPlans(legacy, session.ExtensionPlanDescriptor{}); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("zero requested descriptor error = %v, want ErrExtensionPlanMismatch", err)
+	}
+	partial := session.ExtensionPlanDescriptor{Entries: []session.ExtensionPlanEntry{}}
+	if err := validateMatchingExtensionPlans(partial, legacy); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("partially populated persisted descriptor error = %v, want ErrExtensionPlanMismatch", err)
+	}
+}
+
 func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
 	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "original", Kind: session.ExtensionHandlers, Required: true}}}
 	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)

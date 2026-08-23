@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	einoschema "github.com/cloudwego/eino/schema"
+
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
@@ -31,6 +33,48 @@ func definition(name, marker string) tools.Definition {
 		},
 		Encode:  func(_ context.Context, value any) (json.RawMessage, error) { return value.(json.RawMessage), nil },
 		Execute: func(context.Context, tools.Execution) (any, error) { return json.RawMessage(`{"ok":true}`), nil },
+	}
+}
+
+func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*tools.Definition)
+	}{
+		{name: "missing decoder", mutate: func(definition *tools.Definition) { definition.Decode = nil }},
+		{name: "missing encoder", mutate: func(definition *tools.Definition) { definition.Encode = nil }},
+		{name: "missing executor", mutate: func(definition *tools.Definition) { definition.Execute = nil }},
+		{name: "malformed schema", mutate: func(definition *tools.Definition) {
+			definition.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"broken": nil})
+		}},
+		{name: "unsupported concurrency", mutate: func(definition *tools.Definition) {
+			definition.Concurrency = runtime.ToolConcurrency("exclusive")
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewRegistry(nil)
+			component := component("invalid-tool")
+			invalid := definition("broken", "broken")
+			test.mutate(&invalid)
+			_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+				return registrar.Tool(ToolRegistration{ID: "broken", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: invalid})
+			}))
+			if !errors.Is(err, tools.ErrInvalidDefinition) {
+				t.Fatalf("Mount error = %v, want ErrInvalidDefinition", err)
+			}
+			if len(registry.tools) != 0 {
+				t.Fatalf("mounted tools = %d, want 0", len(registry.tools))
+			}
+			plan, planErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if planErr != nil {
+				t.Fatalf("AcquireRunPlan error = %v", planErr)
+			}
+			defer plan.Dispatch.Release()
+			if len(plan.Descriptor.Entries) != 0 {
+				t.Fatalf("plan entries = %#v, want none", plan.Descriptor.Entries)
+			}
+		})
 	}
 }
 

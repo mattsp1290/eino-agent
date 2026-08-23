@@ -360,9 +360,7 @@ func runPlanFromContext(ctx context.Context) *RunPlan {
 
 func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunPlanRequest) (*RunPlan, error) {
 	if o.Plans == nil {
-		descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanLegacy}
-		descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-		return &RunPlan{Descriptor: descriptor}, nil
+		return &RunPlan{Descriptor: legacyExtensionPlanDescriptor()}, nil
 	}
 	plan, err := o.Plans.AcquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config.Clone()})
 	if err != nil {
@@ -392,7 +390,7 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 		plan.release()
 		return nil, fmt.Errorf("%w: invalid fresh descriptor fingerprint", ErrExtensionPlanMismatch)
 	}
-	if o.Tools != nil || len(o.Context) != 0 || len(o.Hooks) != 0 || len(o.Middleware) != 0 {
+	if o.hasLegacyExtensions() {
 		plan.Descriptor.Mode = session.PlanPartialLegacy
 	}
 	fingerprint, fingerprintErr = session.FingerprintExtensionPlan(plan.Descriptor)
@@ -413,6 +411,9 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descriptor session.ExtensionPlanDescriptor) (*RunPlan, error) {
 	if descriptor.SchemaVersion == 0 || descriptor.Mode == "" || descriptor.Mode == session.PlanLegacy {
 		return &RunPlan{Descriptor: descriptor.Clone()}, nil
+	}
+	if descriptor.Mode == session.PlanStrict && o.hasLegacyExtensions() {
+		return nil, ErrExtensionPlanMismatch
 	}
 	if !descriptorOrderingVerifiable(descriptor) {
 		return nil, fmt.Errorf("%w: descriptor schema does not record prompt/guard order", ErrExtensionPlanMismatch)
@@ -449,6 +450,16 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 		}
 	}
 	return plan, nil
+}
+
+func (o *StreamingOrchestrator) hasLegacyExtensions() bool {
+	return o.Tools != nil || len(o.Context) != 0 || len(o.Hooks) != 0 || len(o.Middleware) != 0
+}
+
+func legacyExtensionPlanDescriptor() session.ExtensionPlanDescriptor {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanLegacy}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	return descriptor
 }
 
 func descriptorHasTools(descriptor session.ExtensionPlanDescriptor) bool {
@@ -599,12 +610,12 @@ func evaluateToolGuards(ctx context.Context, plan *RunPlan, tool Tool, call Tool
 	if plan == nil || len(plan.Guards) == 0 {
 		return ToolGuardResult{Decision: ToolGuardAbstain}, nil
 	}
-	request := ToolGuardRequest{SessionID: call.SessionID, RunID: call.RunID, Call: cloneToolCall(call), ToolName: tool.Name}
 	denial := ToolGuardResult{Decision: ToolGuardAbstain}
 	for _, mounted := range plan.Guards {
 		if mounted.Guard == nil {
 			return ToolGuardResult{}, errors.New("nil tool guard")
 		}
+		request := ToolGuardRequest{SessionID: call.SessionID, RunID: call.RunID, Call: cloneToolCall(call), ToolName: tool.Name}
 		result, err := mounted.Guard.GuardTool(ctx, request)
 		if err != nil {
 			return ToolGuardResult{}, err
