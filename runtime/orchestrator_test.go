@@ -1440,16 +1440,17 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		t.Fatalf("create session: %v", err)
 	}
 	run, err := store.AdmitRun(ctx, session.Run{
-		ID:         "run-resume",
-		SessionID:  "session-resume",
-		OwnerID:    "owner-1",
-		LeaseUntil: now.Add(-time.Minute),
-		Agent:      "agent",
-		ProviderID: "fake",
-		ModelID:    "test",
-		Status:     session.RunPending,
-		Config:     map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
-		CreatedAt:  now,
+		ID:            "run-resume",
+		SessionID:     "session-resume",
+		OwnerID:       "owner-1",
+		LeaseUntil:    now.Add(-time.Minute),
+		Agent:         "agent",
+		ProviderID:    "fake",
+		ModelID:       "test",
+		Status:        session.RunPending,
+		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
+		ExtensionPlan: legacyTestPlanDescriptor(),
+		CreatedAt:     now,
 	})
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
@@ -1479,6 +1480,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return now },
 		OwnerID: "owner-1",
+		Plans:   legacyResumeTestPlanProvider(),
 	}
 
 	start := make(chan struct{})
@@ -1551,6 +1553,7 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return now },
 		OwnerID: "owner-1",
+		Plans:   legacyResumeTestPlanProvider(),
 	}
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
@@ -1594,7 +1597,7 @@ func TestStreamingOrchestratorResumeSkipsBeforeAndRunsAfterForPendingExecution(t
 				return result, nil
 			},
 		}},
-		IDs: &sequenceIDs{}, OwnerID: "owner-1",
+		IDs: &sequenceIDs{}, OwnerID: "owner-1", Plans: legacyResumeTestPlanProvider(),
 	}
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
@@ -1631,7 +1634,7 @@ func TestStreamingOrchestratorResumeInterruptedRunningCallSkipsMiddleware(t *tes
 				return result, nil
 			},
 		}},
-		IDs: &sequenceIDs{}, OwnerID: "owner-1",
+		IDs: &sequenceIDs{}, OwnerID: "owner-1", Plans: legacyResumeTestPlanProvider(),
 	}
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
@@ -1663,6 +1666,7 @@ func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return now },
 		OwnerID: "owner-1",
+		Plans:   legacyResumeTestPlanProvider(),
 	}
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
@@ -1699,16 +1703,17 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		t.Fatalf("create session: %v", err)
 	}
 	run, err := store.AdmitRun(ctx, session.Run{
-		ID:         "run-resume",
-		SessionID:  "session-resume",
-		OwnerID:    owner,
-		LeaseUntil: now.Add(-time.Minute),
-		Agent:      "agent",
-		ProviderID: "fake",
-		ModelID:    "test",
-		Status:     session.RunPending,
-		Config:     map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
-		CreatedAt:  now,
+		ID:            "run-resume",
+		SessionID:     "session-resume",
+		OwnerID:       owner,
+		LeaseUntil:    now.Add(-time.Minute),
+		Agent:         "agent",
+		ProviderID:    "fake",
+		ModelID:       "test",
+		Status:        session.RunPending,
+		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
+		ExtensionPlan: legacyTestPlanDescriptor(),
+		CreatedAt:     now,
 	})
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
@@ -1792,7 +1797,33 @@ func newTestOrchestrator(store *admissionStore, streamer model.Streamer) *Stream
 		Clock:     func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) },
 		OwnerID:   "owner-1",
 		QueueSize: 2,
+		Plans:     legacyRunTestPlanProvider(),
 	}
+}
+
+func legacyTestPlanDescriptor() session.ExtensionPlanDescriptor {
+	descriptor := emptyExtensionPlanDescriptor()
+	descriptor.Mode = session.PlanPartialLegacy
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	return descriptor
+}
+
+func legacyRunTestPlanProvider() RunPlanProvider {
+	return legacyRunPlanProvider{}
+}
+
+func legacyResumeTestPlanProvider() RunPlanProvider {
+	return staticRunPlanProvider{plan: &RunPlan{Descriptor: legacyTestPlanDescriptor()}}
+}
+
+type legacyRunPlanProvider struct{}
+
+func (legacyRunPlanProvider) AcquireRunPlan(context.Context, RunPlanRequest) (*RunPlan, error) {
+	return &RunPlan{Descriptor: emptyExtensionPlanDescriptor()}, nil
+}
+
+func (legacyRunPlanProvider) AcquireResumePlan(context.Context, session.ExtensionPlanDescriptor) (*RunPlan, error) {
+	return &RunPlan{Descriptor: legacyTestPlanDescriptor()}, nil
 }
 
 func orchestratorConfig() config.Snapshot {

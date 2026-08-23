@@ -562,34 +562,41 @@ func TestStrictToolPlanRejectsUnsupportedStoreBeforeAdmission(t *testing.T) {
 	}
 }
 
-func TestPartialLegacyToolPlanDoesNotRequireSettlementStore(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "tool-plugin", Kind: session.ExtensionTool, Required: true}}}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) { return nil, nil }), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}}
-	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"})
-	if err != nil {
-		t.Fatalf("acquire partial-legacy tool plan = %v", err)
+func TestAcquireRunPlanRejectsAnonymousLegacyExtensionsWithoutProvider(t *testing.T) {
+	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) { return nil, nil })}
+	if _, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"}); !errors.Is(err, ErrInvalidOrchestrator) {
+		t.Fatalf("acquire anonymous plan = %v, want ErrInvalidOrchestrator", err)
 	}
-	if plan.Descriptor.Mode != session.PlanPartialLegacy {
-		t.Fatalf("mode = %s, want partial-legacy", plan.Descriptor.Mode)
+}
+
+func TestStartRejectsAnonymousContextBeforeResolvingOrLoading(t *testing.T) {
+	var modelCalls, contextCalls int
+	orchestrator := &StreamingOrchestrator{
+		Store: newAdmissionStore(),
+		Model: model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+			modelCalls++
+			return model.Resolved{}, nil
+		}),
+		Context: []ContextSource{ContextSourceFunc(func(context.Context, TurnSnapshot) ([]*einoschema.Message, error) {
+			contextCalls++
+			return nil, nil
+		})},
+		IDs: &sequenceIDs{},
+	}
+	if _, err := orchestrator.Start(context.Background(), Request{SessionID: "session", Config: orchestratorConfig()}); !errors.Is(err, ErrInvalidOrchestrator) {
+		t.Fatalf("Start error = %v, want ErrInvalidOrchestrator", err)
+	}
+	if modelCalls != 0 || contextCalls != 0 {
+		t.Fatalf("side effects before rejection: model=%d context=%d", modelCalls, contextCalls)
 	}
 }
 
 func TestAcquireResumePlanUsesStrictToolSettlementPredicate(t *testing.T) {
-	for _, test := range []struct {
-		name       string
-		descriptor session.ExtensionPlanDescriptor
-	}{
-		{name: "strict callbacks only", descriptor: session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}},
-		{name: "partial legacy tool", descriptor: session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanPartialLegacy, Entries: []session.ExtensionPlanEntry{{InstanceID: "tool", Kind: session.ExtensionTool, Required: true}}}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			test.descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(test.descriptor)
-			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: test.descriptor}}}
-			if _, err := orchestrator.acquireResumePlan(context.Background(), test.descriptor); err != nil {
-				t.Fatalf("acquireResumePlan = %v", err)
-			}
-		})
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}}
+	if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); err != nil {
+		t.Fatalf("acquireResumePlan = %v", err)
 	}
 }
 
@@ -635,7 +642,7 @@ func TestAcquireResumePlanRejectsLiveLegacyExtensionsForStrictDescriptor(t *test
 		}
 	})
 
-	t.Run("partial legacy permits live extensions", func(t *testing.T) {
+	t.Run("partial legacy requires matching live extensions", func(t *testing.T) {
 		partial := descriptor.Clone()
 		partial.Mode = session.PlanPartialLegacy
 		partial.Fingerprint, _ = session.FingerprintExtensionPlan(partial)
@@ -648,6 +655,61 @@ func TestAcquireResumePlanRejectsLiveLegacyExtensionsForStrictDescriptor(t *test
 			t.Fatalf("acquireResumePlan = %v", err)
 		}
 	})
+}
+
+func TestEmptyStrictPlanAcquiresAndResumesWithoutProvider(t *testing.T) {
+	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore()}
+	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Descriptor.Mode != session.PlanStrict || plan.Descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || plan.Descriptor.Fingerprint == "" {
+		t.Fatalf("empty descriptor = %#v", plan.Descriptor)
+	}
+	resumed, err := orchestrator.acquireResumePlan(context.Background(), plan.Descriptor)
+	if err != nil {
+		t.Fatalf("resume empty strict plan = %v", err)
+	}
+	if resumed.Descriptor.Fingerprint != plan.Descriptor.Fingerprint || resumed.Descriptor.Mode != plan.Descriptor.Mode || resumed.Descriptor.SchemaVersion != plan.Descriptor.SchemaVersion || len(resumed.Descriptor.Entries) != 0 {
+		t.Fatalf("resumed descriptor = %#v, want %#v", resumed.Descriptor, plan.Descriptor)
+	}
+}
+
+func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
+	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
+	valid.Fingerprint, _ = session.FingerprintExtensionPlan(valid)
+	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
+		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
+		"stale": func() session.ExtensionPlanDescriptor {
+			next := valid.Clone()
+			next.Entries[0].InstanceID = "corrupt"
+			return next
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			resumeCalls := 0
+			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: valid}, resumeCalls: &resumeCalls}}
+			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+				t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
+			}
+			if resumeCalls != 0 {
+				t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
+			}
+		})
+	}
+}
+
+func TestAcquireResumePlanRejectsLegacyModeBeforeProvider(t *testing.T) {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanLegacy}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	resumeCalls := 0
+	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: emptyExtensionPlanDescriptor()}, resumeCalls: &resumeCalls}}
+	if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
+	}
+	if resumeCalls != 0 {
+		t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
+	}
 }
 
 func TestAcquireResumePlanRecomputesProviderDescriptorFingerprint(t *testing.T) {

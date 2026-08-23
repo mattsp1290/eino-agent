@@ -92,7 +92,8 @@ func WithModelResolver(value model.Resolver) Option {
 	return interfaceOption("ModelResolver", value, func(o *StreamingOrchestrator, value model.Resolver) { o.Model = value })
 }
 
-// WithToolRegistry sets the tool registry.
+// WithToolRegistry sets the legacy tool registry. Starting or resuming runs
+// with anonymous extension fields also requires WithRunPlanProvider.
 func WithToolRegistry(value ToolRegistry) Option {
 	return interfaceOption("ToolRegistry", value, func(o *StreamingOrchestrator, value ToolRegistry) { o.Tools = value })
 }
@@ -102,7 +103,8 @@ func WithRunPlanProvider(value RunPlanProvider) Option {
 	return interfaceOption("RunPlanProvider", value, func(o *StreamingOrchestrator, value RunPlanProvider) { o.Plans = value })
 }
 
-// WithContextSource appends a context source.
+// WithContextSource appends a legacy context source. Starting or resuming runs
+// with anonymous extension fields also requires WithRunPlanProvider.
 func WithContextSource(value ContextSource) Option {
 	return interfaceOption("ContextSource", value, func(o *StreamingOrchestrator, value ContextSource) { o.Context = append(o.Context, value) })
 }
@@ -112,7 +114,8 @@ func WithEventSink(value EventSink) Option {
 	return interfaceOption("EventSink", value, func(o *StreamingOrchestrator, value EventSink) { o.Events = value })
 }
 
-// WithHook appends a lifecycle hook.
+// WithHook appends a legacy lifecycle hook. Starting or resuming runs with
+// anonymous extension fields also requires WithRunPlanProvider.
 func WithHook(value Hook) Option {
 	return interfaceOption("Hook", value, func(o *StreamingOrchestrator, value Hook) { o.Hooks = append(o.Hooks, value) })
 }
@@ -122,7 +125,8 @@ func WithPermissions(value permissions.Policy) Option {
 	return interfaceOption("Permissions", value, func(o *StreamingOrchestrator, value permissions.Policy) { o.Permissions = value })
 }
 
-// WithToolMiddleware appends tool-call middleware.
+// WithToolMiddleware appends legacy tool-call middleware. Starting or resuming
+// runs with anonymous extension fields also requires WithRunPlanProvider.
 func WithToolMiddleware(value ToolMiddleware) Option {
 	return interfaceOption("ToolMiddleware", value, func(o *StreamingOrchestrator, value ToolMiddleware) { o.Middleware = append(o.Middleware, value) })
 }

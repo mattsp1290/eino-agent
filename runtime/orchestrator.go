@@ -76,19 +76,21 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err := o.validate(request); err != nil {
 		return nil, err
 	}
+	plan, err := o.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
+	if err != nil {
+		return nil, err
+	}
 	resolved, err := o.Model.Resolve(ctx, request.Config.Model, model.Runtime{
 		Directory: request.Config.Metadata["workspace_root"],
 		Options:   cloneStringMap(request.Config.Agent.Options),
 	})
 	if err != nil {
+		plan.release()
 		return nil, err
 	}
 	input, err := o.providerInput(ctx, request)
 	if err != nil {
-		return nil, err
-	}
-	plan, err := o.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
-	if err != nil {
+		plan.release()
 		return nil, err
 	}
 	ctx = withRunPlan(ctx, plan)

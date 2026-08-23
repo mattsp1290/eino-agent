@@ -110,6 +110,7 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 			toolsResolved = true
 			return nil, nil
 		})),
+		WithRunPlanProvider(legacyRunTestPlanProvider()),
 		WithEventSink(EventSinkFunc(func(context.Context, Event) error {
 			eventEmitted = true
 			return nil

@@ -112,9 +112,10 @@ mode:
 - `strict`: every described artifact, configuration, ordered registration,
   schema, executor, guard, prompt, and restriction identity must match;
 - `partial-legacy`: described entries match strictly, but anonymous legacy
-  fields remain outside the reproducibility claim;
-- `legacy`: current callback/tool configuration is used without a provenance
-  guarantee.
+  fields remain outside the reproducibility claim and therefore require an
+  explicit plan provider;
+- `legacy`: retained for durable decoding compatibility but rejected during
+  new acquisition and resume.
 
 Descriptor schema v2 records prompt and guard order, including explicit zero,
 so behavior-changing reordering changes the fingerprint. Schema-v1 callback-

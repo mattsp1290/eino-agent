@@ -345,6 +345,145 @@ func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 	}
 }
 
+func TestInvokeJoinsInFlightDelegation(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		terminalErr error
+		callbackErr error
+		wantErr     error
+	}{
+		{name: "success"},
+		{name: "delegated failure", terminalErr: errors.New("delegated failure"), wantErr: errors.New("delegated failure")},
+		{name: "callback failure", callbackErr: errors.New("callback failure"), wantErr: errors.New("callback failure")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.terminalErr != nil {
+				test.wantErr = test.terminalErr
+			}
+			if test.callbackErr != nil {
+				test.wantErr = test.callbackErr
+			}
+			registry := NewRegistry(nil)
+			component := testComponent("async-" + strings.ReplaceAll(test.name, " ", "-"))
+			terminalStarted := make(chan struct{})
+			releaseTerminal := make(chan struct{})
+			_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+				return Use(registrar, testAround, spec(component.InstanceID, "async", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+					go func() { _, _ = next(ctx, input) }()
+					<-terminalStarted
+					if test.callbackErr != nil {
+						return "", test.callbackErr
+					}
+					return "wrapped", nil
+				})
+			}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, err := registry.Snapshot(GlobalScope())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.Release()
+			returned := make(chan error, 1)
+			go func() {
+				_, invokeErr := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+					close(terminalStarted)
+					<-releaseTerminal
+					return "delegated", test.terminalErr
+				})
+				returned <- invokeErr
+			}()
+			select {
+			case invokeErr := <-returned:
+				t.Fatalf("Invoke returned before delegation completed: %v", invokeErr)
+			case <-time.After(20 * time.Millisecond):
+			}
+			close(releaseTerminal)
+			invokeErr := <-returned
+			if test.wantErr == nil && invokeErr != nil {
+				t.Fatalf("Invoke error = %v", invokeErr)
+			}
+			if test.wantErr != nil && !errors.Is(invokeErr, test.wantErr) {
+				t.Fatalf("Invoke error = %v, want %v", invokeErr, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := testComponent("late-next")
+	savedNext := make(chan Next[testPayload, string], 1)
+	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return Use(registrar, testAround, spec(component.InstanceID, "late", 0, GlobalScope()), func(_ context.Context, _ testPayload, next Next[testPayload, string]) (string, error) {
+			savedNext <- next
+			return "fabricated", nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	var terminalCalls atomic.Int32
+	if _, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		terminalCalls.Add(1)
+		return "terminal", nil
+	}); !errors.Is(err, ErrNextNotCalled) {
+		t.Fatalf("Invoke error = %v, want ErrNextNotCalled", err)
+	}
+	if _, err := (<-savedNext)(context.Background(), testPayload{Protected: "fixed"}); !errors.Is(err, ErrNextNotCalled) {
+		t.Fatalf("late next error = %v, want ErrNextNotCalled", err)
+	}
+	if calls := terminalCalls.Load(); calls != 0 {
+		t.Fatalf("terminal calls = %d, want 0", calls)
+	}
+}
+
+func TestInvokeConcurrentDuplicateDelegationExecutesTerminalOnce(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := testComponent("duplicate-next")
+	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return Use(registrar, testAround, spec(component.InstanceID, "duplicate", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			start := make(chan struct{})
+			errs := make(chan error, 2)
+			for range 2 {
+				go func() {
+					<-start
+					_, nextErr := next(ctx, input)
+					errs <- nextErr
+				}()
+			}
+			close(start)
+			<-errs
+			<-errs
+			return "wrapped", nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	var terminalCalls atomic.Int32
+	if _, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		terminalCalls.Add(1)
+		return "terminal", nil
+	}); !errors.Is(err, ErrNextCalledTwice) {
+		t.Fatalf("Invoke error = %v, want ErrNextCalledTwice", err)
+	}
+	if calls := terminalCalls.Load(); calls != 1 {
+		t.Fatalf("terminal calls = %d, want 1", calls)
+	}
+}
+
 func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
 	registry := NewRegistry(nil)
 	component := testComponent("context")

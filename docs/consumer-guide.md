@@ -49,6 +49,7 @@ orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithTransactor(store),
     runtime.WithModelResolver(providerResolver),
     runtime.WithToolRegistry(toolRegistry),
+    runtime.WithRunPlanProvider(planProvider),
     runtime.WithEventSink(eventSink{Store: store, Tail: tail, IDs: ids}),
     runtime.WithIDGenerator(ids),
     runtime.WithOwnerID("api-server-1"),
@@ -225,8 +226,14 @@ orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithModelResolver(resolver),
     runtime.WithIDGenerator(ids),
     runtime.WithToolRegistry(registry),
+    runtime.WithRunPlanProvider(planProvider),
 )
 ```
+
+Anonymous tool registries, context sources, hooks, and middleware require an
+explicit run-plan provider and are recorded as `partial-legacy`. Prefer a
+`composition.Registry` as the plan provider for strict, restart-verifiable
+capabilities. Runs with no extensions use a fingerprinted empty strict plan.
 
 Set `ModuleConfig.Observer` when guest log lines should be exported through an
 `einoobs.Observer`; `wasmext` attaches the configured module name and verified

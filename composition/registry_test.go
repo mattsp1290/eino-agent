@@ -476,6 +476,49 @@ func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 	}
 }
 
+func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
+	registry := NewRegistry(nil)
+	component := component("schema-fingerprint")
+	mountSchema := func(parameterType einoschema.DataType) *Mount {
+		mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			tool := definition("schema-tool", "stable")
+			tool.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+				"value": {Type: parameterType, Required: true},
+			})
+			return registrar.Tool(ToolRegistration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: tool})
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mount
+	}
+
+	firstMount := mountSchema(einoschema.String)
+	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := first.Descriptor.Clone()
+	first.Dispatch.Release()
+	if err := firstMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	secondMount := mountSchema(einoschema.Integer)
+	defer func() { _ = secondMount.Close(context.Background()) }()
+	second, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Dispatch.Release()
+	if persisted.Fingerprint == second.Descriptor.Fingerprint || persisted.Entries[0].SchemaHash == second.Descriptor.Entries[0].SchemaHash {
+		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, second.Descriptor)
+	}
+	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("changed schema resume = %v, want ErrExtensionPlanMismatch", err)
+	}
+}
+
 func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testing.T) {
 	registry := NewRegistry(nil)
 	component := component("mixed-handlers")

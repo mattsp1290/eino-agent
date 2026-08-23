@@ -157,11 +157,10 @@ func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 	}
 }
 
-func TestAdmitAcceptsPreExtensionPersistedPlanOnLegacyRetry(t *testing.T) {
+func TestAdmitRejectsZeroPersistedPlanOnRetry(t *testing.T) {
 	store := newAdmissionStore()
 	admitter := Admitter{Store: store}
 	request := admissionRequest()
-	request.ExtensionPlan = legacyExtensionPlanDescriptor()
 	if _, err := admitter.Admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
 	}
@@ -170,26 +169,29 @@ func TestAdmitAcceptsPreExtensionPersistedPlanOnLegacyRetry(t *testing.T) {
 	stored.ExtensionPlan = session.ExtensionPlanDescriptor{}
 	store.runs[stored.ID] = stored
 
-	retry, err := admitter.Admit(context.Background(), request)
-	if err != nil {
-		t.Fatalf("legacy retry error = %v", err)
-	}
-	if !retry.AlreadyAdmitted {
-		t.Fatal("legacy retry did not report AlreadyAdmitted")
+	if _, err := admitter.Admit(context.Background(), request); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("zero persisted retry error = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
 
-func TestMatchingExtensionPlansNormalizesOnlyPersistedExactZeroDescriptor(t *testing.T) {
-	legacy := legacyExtensionPlanDescriptor()
-	if err := validateMatchingExtensionPlans(session.ExtensionPlanDescriptor{}, legacy); err != nil {
-		t.Fatalf("zero persisted descriptor mismatch = %v", err)
-	}
-	if err := validateMatchingExtensionPlans(legacy, session.ExtensionPlanDescriptor{}); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("zero requested descriptor error = %v, want ErrExtensionPlanMismatch", err)
-	}
-	partial := session.ExtensionPlanDescriptor{Entries: []session.ExtensionPlanEntry{}}
-	if err := validateMatchingExtensionPlans(partial, legacy); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("partially populated persisted descriptor error = %v, want ErrExtensionPlanMismatch", err)
+func TestMatchingExtensionPlansRejectsZeroAndLegacyDescriptors(t *testing.T) {
+	strict := emptyExtensionPlanDescriptor()
+	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
+		"zero":           {},
+		"legacy":         {SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanLegacy},
+		"partial legacy": {SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanPartialLegacy},
+	} {
+		descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+		t.Run(name+" persisted", func(t *testing.T) {
+			if err := validateMatchingExtensionPlans(descriptor, strict); !errors.Is(err, ErrExtensionPlanMismatch) {
+				t.Fatalf("error = %v, want ErrExtensionPlanMismatch", err)
+			}
+		})
+		t.Run(name+" requested", func(t *testing.T) {
+			if err := validateMatchingExtensionPlans(strict, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+				t.Fatalf("error = %v, want ErrExtensionPlanMismatch", err)
+			}
+		})
 	}
 }
 
@@ -360,9 +362,10 @@ func admissionRequest() AdmissionRequest {
 			Provider: model.Provider{ID: "openai"},
 			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
 		},
-		Input:    []*einoschema.Message{{Role: "user", Content: "hello"}},
-		OwnerID:  "owner-1",
-		Metadata: map[string]string{"request": "admission"},
+		Input:         []*einoschema.Message{{Role: "user", Content: "hello"}},
+		OwnerID:       "owner-1",
+		Metadata:      map[string]string{"request": "admission"},
+		ExtensionPlan: emptyExtensionPlanDescriptor(),
 	}
 }
 

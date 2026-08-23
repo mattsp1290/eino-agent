@@ -161,6 +161,7 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 		OwnerID:  "owner-1",
 		Clock:    func() time.Time { return now },
 		Observer: observer,
+		Plans:    legacyResumeTestPlanProvider(),
 	}
 	handle, err := orch.Resume(context.Background(), run.ID)
 	if err != nil {

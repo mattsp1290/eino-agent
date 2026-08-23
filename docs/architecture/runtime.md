@@ -310,9 +310,9 @@ can build directly against them:
 When `WithRunPlanProvider` is configured, admission freezes callbacks, tools,
 prompts, guards, and restrictions into one leased plan and persists its
 canonical descriptor. Strict resume resolves that exact descriptor before any
-durable state change; partial-legacy and legacy modes make their narrower
-reproducibility guarantees explicit. The authoritative point catalog and model
-and tool pipeline diagrams are in
+durable state change. Partial-legacy requires an explicit provider and matching
+live legacy fields; legacy descriptors are rejected. The authoritative point
+catalog and model and tool pipeline diagrams are in
 [`extension-points.md`](extension-points.md).
 
 The optional model-request ledger assigns one `(attempt, step)` record per

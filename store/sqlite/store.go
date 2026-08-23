@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -490,7 +491,7 @@ func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettl
 	if err != nil {
 		return err
 	}
-	if call.ResultMessageID == "" || call.ResultPartID == "" || settlement.ResultMessage.ID != call.ResultMessageID || settlement.ResultPart.ID != call.ResultPartID || settlement.ResultPart.MessageID != call.ResultMessageID {
+	if !validToolResultEnvelope(call, settlement) {
 		return session.ErrConflict
 	}
 	settled, err := settlement.Apply(call)
@@ -507,6 +508,29 @@ func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettl
 		return err
 	}
 	return nil
+}
+
+func validToolResultEnvelope(call session.ToolCall, settlement session.ToolSettlement) bool {
+	message := settlement.ResultMessage
+	part := settlement.ResultPart
+	return call.ResultMessageID != "" && call.ResultPartID != "" &&
+		message.ID == call.ResultMessageID && message.SessionID == call.SessionID && message.RunID == call.RunID && message.ParentID == call.MessageID && message.Role == session.RoleTool &&
+		part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && part.SessionID == call.SessionID && part.RunID == call.RunID && part.Kind == session.PartToolResult &&
+		rawJSONEqual(part.Payload, settlement.Output)
+}
+
+func rawJSONEqual(left, right json.RawMessage) bool {
+	left = bytes.TrimSpace(left)
+	right = bytes.TrimSpace(right)
+	if len(left) == 0 || len(right) == 0 {
+		return len(left) == len(right)
+	}
+	var leftValue any
+	var rightValue any
+	if json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil {
+		return reflect.DeepEqual(leftValue, rightValue)
+	}
+	return bytes.Equal(left, right)
 }
 
 // ListUnreconciledToolSettlements returns terminal calls whose reserved result

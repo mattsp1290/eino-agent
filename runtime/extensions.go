@@ -360,7 +360,10 @@ func runPlanFromContext(ctx context.Context) *RunPlan {
 
 func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunPlanRequest) (*RunPlan, error) {
 	if o.Plans == nil {
-		return &RunPlan{Descriptor: legacyExtensionPlanDescriptor()}, nil
+		if o.hasLegacyExtensions() {
+			return nil, fmt.Errorf("%w: anonymous extension fields require a run plan provider", ErrInvalidOrchestrator)
+		}
+		return &RunPlan{Descriptor: emptyExtensionPlanDescriptor()}, nil
 	}
 	plan, err := o.Plans.AcquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config.Clone()})
 	if err != nil {
@@ -370,10 +373,14 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 		return nil, fmt.Errorf("%w: provider returned nil plan", ErrExtensionPlanMismatch)
 	}
 	if plan.Descriptor.SchemaVersion == 0 {
-		plan.Descriptor.SchemaVersion = 1
+		plan.Descriptor.SchemaVersion = session.ExtensionPlanSchemaVersion
 	}
 	if plan.Descriptor.Mode == "" {
 		plan.Descriptor.Mode = session.PlanStrict
+	}
+	if plan.Descriptor.Mode != session.PlanStrict {
+		plan.release()
+		return nil, fmt.Errorf("%w: provider returned non-strict plan", ErrExtensionPlanMismatch)
 	}
 	if !descriptorOrderingVerifiable(plan.Descriptor) {
 		plan.release()
@@ -409,16 +416,27 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 }
 
 func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descriptor session.ExtensionPlanDescriptor) (*RunPlan, error) {
-	if descriptor.SchemaVersion == 0 || descriptor.Mode == "" || descriptor.Mode == session.PlanLegacy {
-		return &RunPlan{Descriptor: descriptor.Clone()}, nil
+	if descriptor.SchemaVersion == 0 || descriptor.Mode == "" || descriptor.Mode == session.PlanLegacy || descriptor.Fingerprint == "" {
+		return nil, ErrExtensionPlanMismatch
 	}
-	if descriptor.Mode == session.PlanStrict && o.hasLegacyExtensions() {
+	persistedFingerprint, fingerprintErr := session.FingerprintExtensionPlan(descriptor)
+	if fingerprintErr != nil || descriptor.Fingerprint != persistedFingerprint {
+		return nil, ErrExtensionPlanMismatch
+	}
+	if descriptor.Mode == session.PlanStrict && o.hasLegacyExtensions() || descriptor.Mode == session.PlanPartialLegacy && !o.hasLegacyExtensions() {
+		return nil, ErrExtensionPlanMismatch
+	}
+	if descriptor.Mode != session.PlanStrict && descriptor.Mode != session.PlanPartialLegacy {
 		return nil, ErrExtensionPlanMismatch
 	}
 	if !descriptorOrderingVerifiable(descriptor) {
 		return nil, fmt.Errorf("%w: descriptor schema does not record prompt/guard order", ErrExtensionPlanMismatch)
 	}
 	if o.Plans == nil {
+		empty := emptyExtensionPlanDescriptor()
+		if descriptor.Fingerprint == empty.Fingerprint && len(descriptor.Entries) == 0 && descriptor.SchemaVersion == empty.SchemaVersion {
+			return &RunPlan{Descriptor: descriptor.Clone()}, nil
+		}
 		return nil, fmt.Errorf("%w: run requires a plan provider", ErrExtensionPlanMismatch)
 	}
 	plan, err := o.Plans.AcquireResumePlan(ctx, descriptor.Clone())
@@ -426,6 +444,10 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 		return nil, err
 	}
 	if plan == nil {
+		return nil, ErrExtensionPlanMismatch
+	}
+	if plan.Descriptor.Mode != descriptor.Mode {
+		plan.release()
 		return nil, ErrExtensionPlanMismatch
 	}
 	providedFingerprint := plan.Descriptor.Fingerprint
@@ -456,8 +478,8 @@ func (o *StreamingOrchestrator) hasLegacyExtensions() bool {
 	return o.Tools != nil || len(o.Context) != 0 || len(o.Hooks) != 0 || len(o.Middleware) != 0
 }
 
-func legacyExtensionPlanDescriptor() session.ExtensionPlanDescriptor {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanLegacy}
+func emptyExtensionPlanDescriptor() session.ExtensionPlanDescriptor {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict}
 	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 	return descriptor
 }

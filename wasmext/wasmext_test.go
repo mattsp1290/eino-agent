@@ -540,6 +540,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 		})),
 		runtime.WithIDGenerator(&wasmTestIDs{}),
 		runtime.WithToolRegistry(registry),
+		runtime.WithRunPlanProvider(wasmTestPlanProvider{}),
 		runtime.WithPermissions(policy),
 		runtime.WithOwnerID("wasm-blackbox"),
 	)
@@ -568,6 +569,18 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if toolCall.Status != session.ToolCallCompleted || !strings.Contains(string(toolCall.Input), `"permission_pattern":"allow"`) || !strings.Contains(string(toolCall.Output), `"echo"`) {
 		t.Fatalf("durable tool call = %+v", toolCall)
 	}
+}
+
+type wasmTestPlanProvider struct{}
+
+func (wasmTestPlanProvider) AcquireRunPlan(context.Context, runtime.RunPlanRequest) (*runtime.RunPlan, error) {
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	return &runtime.RunPlan{Descriptor: descriptor}, nil
+}
+
+func (wasmTestPlanProvider) AcquireResumePlan(_ context.Context, descriptor session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
+	return &runtime.RunPlan{Descriptor: descriptor.Clone()}, nil
 }
 
 func executeLoadedDefinition(ctx context.Context, definition tools.Definition, input string) (any, error) {

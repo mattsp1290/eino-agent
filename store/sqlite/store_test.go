@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -179,6 +180,55 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	stale.ClaimToken = "stale"
 	if err := st.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("terminal stale settlement = %v", err)
+	}
+}
+
+func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testing.T) {
+	tests := map[string]func(*session.ToolSettlement){
+		"message id":      func(value *session.ToolSettlement) { value.ResultMessage.ID = "wrong" },
+		"message session": func(value *session.ToolSettlement) { value.ResultMessage.SessionID = "wrong" },
+		"message run":     func(value *session.ToolSettlement) { value.ResultMessage.RunID = "wrong" },
+		"message parent":  func(value *session.ToolSettlement) { value.ResultMessage.ParentID = "wrong" },
+		"message role":    func(value *session.ToolSettlement) { value.ResultMessage.Role = session.RoleAssistant },
+		"part id":         func(value *session.ToolSettlement) { value.ResultPart.ID = "wrong" },
+		"part message":    func(value *session.ToolSettlement) { value.ResultPart.MessageID = "wrong" },
+		"part session":    func(value *session.ToolSettlement) { value.ResultPart.SessionID = "wrong" },
+		"part run":        func(value *session.ToolSettlement) { value.ResultPart.RunID = "wrong" },
+		"part kind":       func(value *session.ToolSettlement) { value.ResultPart.Kind = session.PartText },
+		"part payload":    func(value *session.ToolSettlement) { value.ResultPart.Payload = json.RawMessage(`{"different":true}`) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			st, call := setupClaimedToolCall(t)
+			defer func() { _ = st.Close() }()
+			ctx := context.Background()
+			call, err := st.GetToolCall(ctx, call.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC()
+			output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+			settlement := session.ToolSettlement{
+				ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
+				ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
+				ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+			}
+			mutate(&settlement)
+			if err := st.SettleToolCall(ctx, settlement); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("SettleToolCall error = %v, want ErrConflict", err)
+			}
+			current, err := st.GetToolCall(ctx, call.ID)
+			if err != nil || !reflect.DeepEqual(current, call) {
+				t.Fatalf("tool call mutated: current=%#v original=%#v err=%v", current, call, err)
+			}
+			if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
+				t.Fatalf("reserved message error = %v, want ErrNotFound", err)
+			}
+			var part session.Part
+			if err := st.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{call.ResultPartID}, &part); !errors.Is(err, session.ErrNotFound) {
+				t.Fatalf("reserved part error = %v, want ErrNotFound", err)
+			}
+		})
 	}
 }
 

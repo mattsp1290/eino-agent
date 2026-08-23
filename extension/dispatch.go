@@ -91,6 +91,8 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			return zero, fmt.Errorf("extension interceptor type mismatch")
 		}
 		var calls atomic.Int32
+		var delegation atomic.Uint32
+		delegationDone := make(chan struct{})
 		var delegatedOutput O
 		var delegatedSucceeded bool
 		var delegatedFailure error
@@ -98,6 +100,13 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			if calls.Add(1) != 1 {
 				return zero, ErrNextCalledTwice
 			}
+			if !delegation.CompareAndSwap(delegationOpen, delegationRunning) {
+				return zero, ErrNextNotCalled
+			}
+			defer func() {
+				delegation.Store(delegationComplete)
+				close(delegationDone)
+			}()
 			if nextCtx == nil {
 				nextCtx = currentCtx
 			}
@@ -111,6 +120,20 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			return out, nil
 		}
 		out, err := callAround(context.WithValue(currentCtx, callbackMountKey{}, entry.state), around, cloneInput(point.clone, candidate), next)
+	sealDelegation:
+		for {
+			switch delegation.Load() {
+			case delegationOpen:
+				if delegation.CompareAndSwap(delegationOpen, delegationSealed) {
+					break sealDelegation
+				}
+			case delegationRunning:
+				<-delegationDone
+				break sealDelegation
+			default:
+				break sealDelegation
+			}
+		}
 		count := calls.Load()
 		if count > 1 {
 			return zero, ErrNextCalledTwice
@@ -154,6 +177,13 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 	}
 	return invoke(0, ctx, cloneInput(point.clone, input))
 }
+
+const (
+	delegationOpen uint32 = iota
+	delegationRunning
+	delegationSealed
+	delegationComplete
+)
 
 func callAround[I, O any](ctx context.Context, around Around[I, O], input I, next Next[I, O]) (out O, err error) {
 	defer func() {

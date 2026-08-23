@@ -668,10 +668,14 @@ func buildDescriptor(dispatch *extension.Plan, selected []mountedTool, prompts [
 		descriptor.Entries[index].Registrations = append(descriptor.Entries[index].Registrations, session.RegistrationIdentity{ID: diagnostic.ID, Contract: diagnostic.Contract.ID, Version: diagnostic.Contract.Version, Order: diagnostic.Order, Scope: scopeIdentity(diagnostic.Scope)})
 	}
 	for _, entry := range selected {
+		schemaHash, err := toolSchemaHash(entry.Definition)
+		if err != nil {
+			return session.ExtensionPlanDescriptor{}, err
+		}
 		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{
 			InstanceID: entry.InstanceID, Kind: session.ExtensionTool, Artifact: artifactIdentity(entry.component.Artifact), Required: true,
 			Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Definition.Name + "/" + entry.ID,
-			SchemaHash: toolSchemaHash(entry.Definition), ExecutorHash: entry.Definition.Provenance.ExecutorHash,
+			SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
 		})
 	}
 	for _, entry := range prompts {
@@ -701,16 +705,23 @@ func scopeIdentity(scope extension.Scope) session.ExtensionScope {
 	return session.ExtensionScope{Kind: string(scope.Kind), Key: scope.Key}
 }
 
-func toolSchemaHash(definition tools.Definition) string {
-	raw, _ := json.Marshal(struct {
+func toolSchemaHash(definition tools.Definition) (string, error) {
+	parameters, err := definition.Parameters.ToJSONSchema()
+	if err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(struct {
 		Name        string
 		Description string
 		Parameters  any
 		Permissions []string
 		RetrySafe   bool
-	}{definition.Name, definition.Description, definition.Parameters, definition.Permissions, definition.RetrySafe})
+	}{definition.Name, definition.Description, parameters, definition.Permissions, definition.RetrySafe})
+	if err != nil {
+		return "", err
+	}
 	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:])
+	return hex.EncodeToString(digest[:]), nil
 }
 
 type Diagnostics struct {

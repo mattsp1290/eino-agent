@@ -170,7 +170,7 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Desc: "echo"}, Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: runtimeToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		return ToolResult{Output: string(call.Input)}, nil
 	})}
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithToolRegistry(staticToolRegistry{tools: []Tool{tool}}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithToolRegistry(staticToolRegistry{tools: []Tool{tool}}), WithRunPlanProvider(legacyRunTestPlanProvider()), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
 	if err != nil {
 		t.Fatal(err)
 	}

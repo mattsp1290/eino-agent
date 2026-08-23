@@ -142,21 +142,25 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 }
 
 func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDescriptor) error {
-	if persisted.SchemaVersion == 0 && persisted.Mode == "" && persisted.Fingerprint == "" && persisted.Entries == nil {
-		persisted = legacyExtensionPlanDescriptor()
+	if !admissibleExtensionPlanMode(persisted.Mode) || persisted.SchemaVersion == 0 || persisted.Fingerprint == "" || !admissibleExtensionPlanMode(requested.Mode) || requested.SchemaVersion == 0 || requested.Fingerprint == "" {
+		return ErrExtensionPlanMismatch
 	}
 	persistedFingerprint, err := session.FingerprintExtensionPlan(persisted)
-	if err != nil || persisted.Fingerprint != "" && persisted.Fingerprint != persistedFingerprint {
+	if err != nil || persisted.Fingerprint != persistedFingerprint {
 		return ErrExtensionPlanMismatch
 	}
 	requestedFingerprint, err := session.FingerprintExtensionPlan(requested)
-	if err != nil || requested.Fingerprint != "" && requested.Fingerprint != requestedFingerprint {
+	if err != nil || requested.Fingerprint != requestedFingerprint {
 		return ErrExtensionPlanMismatch
 	}
 	if persistedFingerprint != requestedFingerprint {
 		return ErrExtensionPlanMismatch
 	}
 	return nil
+}
+
+func admissibleExtensionPlanMode(mode session.PlanMode) bool {
+	return mode == session.PlanStrict || mode == session.PlanPartialLegacy
 }
 
 func admitDurable(ctx context.Context, store session.Store, request AdmissionRequest, now time.Time) (AdmittedRun, error) {
