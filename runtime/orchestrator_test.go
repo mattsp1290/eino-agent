@@ -890,6 +890,7 @@ func TestStreamingOrchestratorToolMiddlewareErrorSettlesFailedAndContinues(t *te
 	t.Parallel()
 	store := newAdmissionStore()
 	var executed []string
+	var afterCalls int
 	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		for _, msg := range request.Messages {
 			if msg.Role == einoschema.Tool {
@@ -911,12 +912,20 @@ func TestStreamingOrchestratorToolMiddlewareErrorSettlesFailedAndContinues(t *te
 			return ToolResult{Output: "ok"}, nil
 		})},
 	}}
-	orch.Middleware = []ToolMiddleware{ToolMiddlewareFuncs{Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
-		if call.Name == "fail" {
-			return call.Input, errors.New("middleware rejected input")
-		}
-		return call.Input, nil
-	}}}
+	orch.Middleware = []ToolMiddleware{ToolMiddlewareFuncs{
+		Before: func(_ context.Context, _ Tool, call ToolCall) (json.RawMessage, error) {
+			if call.Name == "fail" {
+				return call.Input, errors.New("middleware rejected input")
+			}
+			return call.Input, nil
+		},
+		After: func(_ context.Context, _ Tool, call ToolCall, result ToolResult, _ error) (ToolResult, error) {
+			if call.Name == "fail" {
+				afterCalls++
+			}
+			return result, nil
+		},
+	}}
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || strings.Join(executed, ",") != "ok" {
 		t.Fatalf("result = %+v, executed = %v", result, executed)
@@ -925,6 +934,72 @@ func TestStreamingOrchestratorToolMiddlewareErrorSettlesFailedAndContinues(t *te
 	sibling, _ := store.GetToolCall(context.Background(), "call-sibling")
 	if failed.Status != session.ToolCallFailed || !strings.Contains(failed.Error, "middleware rejected") || sibling.Status != session.ToolCallCompleted {
 		t.Fatalf("failed=%+v sibling=%+v", failed, sibling)
+	}
+	if afterCalls != 0 {
+		t.Fatalf("AfterToolCall invoked %d time(s) for preparation failure", afterCalls)
+	}
+}
+
+func TestToolPrepareExtensionFailureSkipsLegacyAfterAndTransformsResult(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "prepare-failure", Artifact: extension.Artifact{Name: "prepare-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var transformCalls int
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		if err := extension.Use(registrar, ToolPreparePoint, extension.Registration{ID: "reject", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, PreparedToolCall, extension.Next[PreparedToolCall, PreparedToolCall]) (PreparedToolCall, error) {
+			return PreparedToolCall{}, errors.New("extension rejected preparation")
+		}); err != nil {
+			return err
+		}
+		return extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, outcome ToolOutcome, _ extension.Next[ToolOutcome, ToolOutcome]) (ToolOutcome, error) {
+			transformCalls++
+			outcome.Result.Output = "transformed preparation failure"
+			return outcome, nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := newAdmissionStore()
+	var executorCalls, afterCalls int
+	var modelVisible string
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, message := range request.Messages {
+			if message.Role == einoschema.Tool {
+				modelVisible = message.Content
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-prepare-failure", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+	}))
+	orch.Tools = staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		executorCalls++
+		return ToolResult{Output: "executed"}, nil
+	})}}}
+	orch.Middleware = []ToolMiddleware{ToolMiddlewareFuncs{After: func(_ context.Context, _ Tool, _ ToolCall, result ToolResult, _ error) (ToolResult, error) {
+		afterCalls++
+		return result, nil
+	}}}
+	orch.Plans = staticRunPlanProvider{plan: &RunPlan{Dispatch: dispatch}}
+
+	result := startAndWait(t, orch)
+	if result.Error != nil || result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-prepare-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executorCalls != 0 || afterCalls != 0 || transformCalls != 1 {
+		t.Fatalf("executor=%d after=%d transform=%d", executorCalls, afterCalls, transformCalls)
+	}
+	if call.Status != session.ToolCallFailed || !strings.Contains(string(call.Output), `"status":"operational_failure"`) || !strings.Contains(modelVisible, "tool execution failed") {
+		t.Fatalf("call=%+v model-visible=%q", call, modelVisible)
 	}
 }
 

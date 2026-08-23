@@ -60,14 +60,19 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, run session.R
 		defer plan.release()
 	}
 	resumeStartedAt := o.now()
-	result := o.resumeRun(ctx, run)
-	if plan != nil && plan.Dispatch != nil && !run.Terminal() {
+	settled := false
+	result := o.resumeRunWithSettlement(ctx, run, &settled)
+	if settled && plan != nil && plan.Dispatch != nil && !run.Terminal() {
 		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(resumeStartedAt), Error: classifyExtensionError(result.Error)})
 	}
 	done <- result
 }
 
 func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) (result Result) {
+	return o.resumeRunWithSettlement(ctx, run, nil)
+}
+
+func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, run session.Run, settled *bool) (result Result) {
 	if run.Terminal() {
 		return Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
 	}
@@ -115,7 +120,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
 	if len(calls) == 0 {
-		return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true})
+		return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
 	}
 	snapshot := o.resumeSnapshot(run)
 	tools, err := o.resumeTools(ctx, run)
@@ -196,6 +201,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 		observedTool := o.startObservedToolCall(ctx, snapshot, tool, toolCall)
 		outcome := o.executeToolOutcome(ctx, tool, toolCall)
 		outcome = o.afterToolOutcome(ctx, tool, outcome)
+		outcome = o.transformToolOutcome(ctx, outcome)
 		result, execErr := outcome.Result, outcome.RawError
 		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, outcome.Disposition, execErr)
 		claimed.Status = status
@@ -231,10 +237,10 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			}
 		}
 		if errors.Is(execErr, context.Canceled) {
-			return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: execErr})
+			return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: execErr}, settled)
 		}
 	}
-	return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true})
+	return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
 }
 
 func reconciledToolSettledNotice(run session.Run, call session.ToolCall, settlement session.ToolSettlement) ToolSettledNotice {
@@ -336,15 +342,19 @@ func (o *StreamingOrchestrator) appendToolResult(ctx context.Context, run sessio
 	return err
 }
 
-func (o *StreamingOrchestrator) finishResume(ctx context.Context, run session.Run, result Result) Result {
+func (o *StreamingOrchestrator) finishResume(ctx context.Context, run session.Run, result Result, settled *bool) Result {
 	run.Status = result.Status
 	run.FinishedAt = o.now()
 	if result.Error != nil {
 		run.Error = result.Error.Error()
 	}
-	if err := o.Store.FinishRun(context.WithoutCancel(ctx), run); err != nil && result.Error == nil {
-		result.Status = session.RunFailed
-		result.Error = err
+	if err := o.Store.FinishRun(context.WithoutCancel(ctx), run); err != nil {
+		if result.Error == nil {
+			result.Status = session.RunFailed
+			result.Error = err
+		}
+	} else if settled != nil {
+		*settled = true
 	}
 	return result
 }

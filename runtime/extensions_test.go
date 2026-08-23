@@ -657,6 +657,136 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	}
 }
 
+func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
+	finishErr := errors.New("terminal finish failed")
+	for _, test := range []struct {
+		name       string
+		streamer   scriptedStreamer
+		finishErr  error
+		wantStatus session.RunStatus
+		wantNotice int
+		wantError  bool
+	}{
+		{name: "completed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		}), wantStatus: session.RunCompleted, wantNotice: 1},
+		{name: "failed and persisted", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			return nil, errors.New("provider failed")
+		}), wantStatus: session.RunFailed, wantNotice: 1, wantError: true},
+		{name: "terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		}), finishErr: finishErr, wantStatus: session.RunFailed, wantNotice: 0, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := newAdmissionStore()
+			store := &runLifecycleStore{admissionStore: base, terminalFinishErr: test.finishErr}
+			var notices []RunSettledNotice
+			plan, closePlan := settledNoticePlan(t, &notices)
+			defer closePlan()
+			orchestrator := &StreamingOrchestrator{
+				Store: store, Model: resolvedModel{streamer: test.streamer}, IDs: &sequenceIDs{},
+				Clock: func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1", QueueSize: 2,
+			}
+			orchestrator.Plans = staticRunPlanProvider{plan: plan}
+
+			result := startAndWait(t, orchestrator)
+			if result.Status != test.wantStatus || (result.Error != nil) != test.wantError {
+				t.Fatalf("result = %+v", result)
+			}
+			if len(notices) != test.wantNotice {
+				t.Fatalf("settled notices = %#v, want %d", notices, test.wantNotice)
+			}
+			if len(notices) == 1 && notices[0].Result.Status != test.wantStatus {
+				t.Fatalf("settled notice result = %+v", notices[0].Result)
+			}
+		})
+	}
+}
+
+func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
+	finishErr := errors.New("terminal finish failed")
+	listErr := errors.New("unfinished calls unavailable")
+	for _, test := range []struct {
+		name       string
+		finishErr  error
+		listErr    error
+		wantNotice int
+		wantError  error
+	}{
+		{name: "interrupted and persisted", wantNotice: 1},
+		{name: "terminal persistence failed", finishErr: finishErr, wantError: finishErr},
+		{name: "pre-finalization failure", listErr: listErr, wantError: listErr},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := newAdmissionStore()
+			run := session.Run{ID: "resume-run", SessionID: "resume-session", OwnerID: "old-owner", Status: session.RunPending, CreatedAt: time.Now().UTC()}
+			base.runs[run.ID] = run
+			store := &runLifecycleStore{admissionStore: base, terminalFinishErr: test.finishErr, listErr: test.listErr}
+			var notices []RunSettledNotice
+			plan, closePlan := settledNoticePlan(t, &notices)
+			defer closePlan()
+			orchestrator := &StreamingOrchestrator{Store: store, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: time.Now}
+			done := make(chan Result, 1)
+			orchestrator.executeResume(withRunPlan(context.Background(), plan), run, done)
+			result := <-done
+
+			if !errors.Is(result.Error, test.wantError) {
+				t.Fatalf("resume result = %+v, want error %v", result, test.wantError)
+			}
+			if len(notices) != test.wantNotice {
+				t.Fatalf("settled notices = %#v, want %d", notices, test.wantNotice)
+			}
+			if len(notices) == 1 && notices[0].Result.Status != session.RunInterrupted {
+				t.Fatalf("settled notice result = %+v", notices[0].Result)
+			}
+		})
+	}
+}
+
+type runLifecycleStore struct {
+	*admissionStore
+	terminalFinishErr error
+	listErr           error
+}
+
+func (s *runLifecycleStore) FinishRun(ctx context.Context, run session.Run) error {
+	if run.Terminal() && s.terminalFinishErr != nil {
+		return s.terminalFinishErr
+	}
+	return s.admissionStore.FinishRun(ctx, run)
+}
+
+func (s *runLifecycleStore) ListUnfinishedToolCalls(ctx context.Context, runID session.RunID) ([]session.ToolCall, error) {
+	if s.listErr != nil {
+		return nil, s.listErr
+	}
+	return s.admissionStore.ListUnfinishedToolCalls(ctx, runID)
+}
+
+func settledNoticePlan(t *testing.T, notices *[]RunSettledNotice) (*RunPlan, func()) {
+	t.Helper()
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "settlement-gate", Artifact: extension.Artifact{Name: "settlement-gate", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
+			*notices = append(*notices, notice)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &RunPlan{Dispatch: dispatch}, func() {
+		if err := mount.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestVersionOnePromptAndGuardDescriptorsAreUnverifiable(t *testing.T) {
 	for _, kind := range []session.ExtensionKind{session.ExtensionPrompt, session.ExtensionGuard} {
 		descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "ordered", Kind: kind, Required: true}}}

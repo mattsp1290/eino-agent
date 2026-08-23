@@ -277,7 +277,7 @@ func validateScope(scope Scope) error {
 			return fmt.Errorf("%w: global scope key must be empty", ErrInvalidRegistration)
 		}
 	case ScopeSession:
-		if !identifierPattern.MatchString(scope.Key) {
+		if scope.Key == "" {
 			return fmt.Errorf("%w: session key required", ErrInvalidRegistration)
 		}
 	default:

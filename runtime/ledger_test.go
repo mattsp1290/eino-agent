@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
@@ -95,6 +97,52 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
 	if err != nil || len(batch.Records) != 2 || batch.Records[0].State != session.ModelRequestFailed || batch.Records[1].State != session.ModelRequestCompleted || batch.Records[0].Attempt != 1 || batch.Records[1].Attempt != 2 {
 		t.Fatalf("retry records = %#v, %v", batch.Records, err)
+	}
+}
+
+func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "panic-ledger", Artifact: extension.Artifact{Name: "panic-ledger", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var completed []ModelCompletedNotice
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, ModelCompletedPoint, extension.Registration{ID: "completed", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ModelCompletedNotice) error {
+			completed = append(completed, notice)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		panic("provider panic")
+	})
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.Plans = staticRunPlanProvider{plan: &RunPlan{Dispatch: dispatch}}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: provider panic") {
+		t.Fatalf("result = %#v", result)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed {
+		t.Fatalf("records = %#v, %v", batch.Records, err)
+	}
+	if len(completed) != 1 || completed[0].Error.Code == "" {
+		t.Fatalf("model-completed notices = %#v", completed)
 	}
 }
 

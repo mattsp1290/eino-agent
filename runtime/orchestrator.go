@@ -144,14 +144,14 @@ func (o *StreamingOrchestrator) execute(ctx context.Context, admitted AdmittedRu
 	if plan != nil {
 		defer plan.release()
 	}
-	result := o.run(ctx, admitted)
-	if plan != nil && plan.Dispatch != nil {
+	result, settled := o.run(ctx, admitted)
+	if settled && plan != nil && plan.Dispatch != nil {
 		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
 	}
 	done <- result
 }
 
-func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (result Result) {
+func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (result Result, settled bool) {
 	run := admitted.Run
 	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
 	var observed observedRun
@@ -166,7 +166,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 			result.Error = fmt.Errorf("provider stream panic: %v", recovered)
 		}
 		result.Usage = runtimeUsage(runUsage)
-		result = o.finish(ctx, run, result)
+		result, settled = o.finish(ctx, run, result)
 		o.finishObservedRun(observed, result, o.now())
 	}()
 	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
@@ -176,12 +176,12 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 		if err != nil {
 			result.Status = session.RunFailed
 			result.Error = err
-			return result
+			return result, false
 		}
 		if decision.Kind == RunReject {
 			result.Status = session.RunFailed
 			result.Error = model.Error{Code: decision.Code, Message: decision.Message, Cause: model.ErrProviderRejected}
-			return result
+			return result, false
 		}
 	}
 	run.Status = session.RunRunning
@@ -190,7 +190,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 	if err := o.Store.FinishRun(ctx, run); err != nil {
 		result.Status = session.RunFailed
 		result.Error = err
-		return result
+		return result, false
 	}
 	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
 		_ = extension.Notify(plan.Dispatch, ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
@@ -199,13 +199,13 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 	if err != nil {
 		result.Status = statusForError(err)
 		result.Error = err
-		return result
+		return result, false
 	}
 	result = o.executeAttempts(ctx, snapshot, admitted.AssistantMessage.ID, &runUsage)
 	for _, hook := range o.Hooks {
 		_ = hook.AfterTurn(ctx, snapshot.Clone(), result)
 	}
-	return result
+	return result, false
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
@@ -353,6 +353,11 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 	var requestRecord *session.ModelRequestRecord
 	var requestStore session.ModelRequestStore
 	defer func() {
+		if recovered := recover(); recovered != nil {
+			streamErr = fmt.Errorf("provider stream panic: %v", recovered)
+			err = streamErr
+			message = nil
+		}
 		// Accumulate this stream's usage into the run total in the same defer
 		// that reports it to observability, so the persisted run total stays
 		// exactly consistent with the run span's summed usage (both include
@@ -727,8 +732,9 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapsh
 		outcome := ToolOutcome{Call: cloneToolCall(call), Disposition: ToolFailed, RawError: prepared.middlewareErr, Error: classifyExtensionError(prepared.middlewareErr)}
 		if prepared.middlewareErr == nil {
 			outcome = o.executeToolOutcome(ctx, tool, call)
+			outcome = o.afterToolOutcome(ctx, tool, outcome)
 		}
-		outcome = o.afterToolOutcome(ctx, tool, outcome)
+		outcome = o.transformToolOutcome(ctx, outcome)
 		result, execErr := outcome.Result, outcome.RawError
 		output, status, errText := encodeToolOutput(callID, result, tool.Retention, outcome.Disposition, execErr)
 		record.Status = status
@@ -845,6 +851,10 @@ func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool,
 		}
 	}
 	outcome.Result = cloneRuntimeToolResult(result)
+	return outcome
+}
+
+func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, outcome ToolOutcome) ToolOutcome {
 	outcome = sealToolOutcome(outcome)
 	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
 		transformed, err := extension.Invoke(plan.Dispatch, ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
@@ -950,7 +960,7 @@ func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, snapshot TurnS
 	})
 }
 
-func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, result Result) Result {
+func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, result Result) (Result, bool) {
 	if result.Status == "" {
 		result.Status = session.RunCompleted
 	}
@@ -959,9 +969,13 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, res
 	if result.Error != nil {
 		run.Error = result.Error.Error()
 	}
-	if err := o.Store.FinishRun(context.WithoutCancel(ctx), run); err != nil && result.Error == nil {
-		result.Status = session.RunFailed
-		result.Error = err
+	settled := true
+	if err := o.Store.FinishRun(context.WithoutCancel(ctx), run); err != nil {
+		settled = false
+		if result.Error == nil {
+			result.Status = session.RunFailed
+			result.Error = err
+		}
 	}
 	for _, hook := range o.Hooks {
 		_ = hook.AfterRun(context.WithoutCancel(ctx), result)
@@ -981,7 +995,7 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, res
 			Time: o.now(),
 		})
 	}
-	return result
+	return result, settled
 }
 
 func toolCallEventPayload(output json.RawMessage, name string, input json.RawMessage) map[string]any {

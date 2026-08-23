@@ -215,6 +215,38 @@ func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
 	}
 }
 
+func TestRegistrationAcceptsOpaqueSessionScopeKeys(t *testing.T) {
+	keys := []string{"user@example.com", "dXNlcg==", "  spaced session  ", strings.Repeat("x", 300) + "=="}
+	registry := NewRegistry(nil)
+	counts := make([]int, len(keys))
+	for index, key := range keys {
+		component := testComponent("opaque-registration-" + strconv.Itoa(index))
+		_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return On(registrar, testNotice, spec(component.InstanceID, "notice", 0, SessionScope(key)), func(context.Context, testPayload) error {
+				counts[index]++
+				return nil
+			})
+		}))
+		if err != nil {
+			t.Fatalf("Mount(%q) = %v", key, err)
+		}
+	}
+
+	for index, key := range keys {
+		plan, err := registry.Snapshot(SessionScope(key))
+		if err != nil {
+			t.Fatalf("Snapshot(%q) = %v", key, err)
+		}
+		if failures := Notify(plan, context.Background(), testNotice, testPayload{}); len(failures) != 0 {
+			t.Fatalf("Notify(%q) = %v", key, failures)
+		}
+		plan.Release()
+		if counts[index] != 1 {
+			t.Fatalf("callback count for %q = %d, want 1", key, counts[index])
+		}
+	}
+}
+
 func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 	registry := NewRegistry(nil)
 	var sequence []string
@@ -486,7 +518,7 @@ func FuzzSessionScope(f *testing.F) {
 	f.Add("session-1", "session-1")
 	f.Add("session-1", "session-2")
 	f.Fuzz(func(t *testing.T, registered, target string) {
-		if !identifierPattern.MatchString(registered) || !identifierPattern.MatchString(target) {
+		if registered == "" || target == "" {
 			t.Skip()
 		}
 		applies := scopeApplies(SessionScope(registered), SessionScope(target))

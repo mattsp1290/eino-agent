@@ -522,17 +522,30 @@ func (s *Store) ListUnreconciledToolSettlements(ctx context.Context, runID sessi
 		if call.ResultMessageID == "" || call.ResultPartID == "" {
 			continue
 		}
-		if _, err := s.GetMessage(ctx, call.ResultMessageID); err == nil {
+		resultMessage, messageErr := s.GetMessage(ctx, call.ResultMessageID)
+		if messageErr != nil && !errors.Is(messageErr, session.ErrNotFound) {
+			return nil, messageErr
+		}
+		var resultPart session.Part
+		partErr := s.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{call.ResultPartID}, &resultPart)
+		if partErr != nil && !errors.Is(partErr, session.ErrNotFound) {
+			return nil, partErr
+		}
+		if messageErr == nil && partErr == nil {
 			continue
-		} else if !errors.Is(err, session.ErrNotFound) {
-			return nil, err
 		}
 		createdAt := call.CompletedAt
+		if errors.Is(messageErr, session.ErrNotFound) {
+			resultMessage = session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: createdAt, UpdatedAt: createdAt}
+		}
+		if errors.Is(partErr, session.ErrNotFound) {
+			resultPart = session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: append(json.RawMessage(nil), call.Output...), CreatedAt: createdAt, UpdatedAt: createdAt}
+		}
 		result = append(result, session.ToolSettlement{
 			ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: call.Status, Output: append(json.RawMessage(nil), call.Output...), Error: call.Error,
 			Metadata: cloneStrings(call.Metadata), CompletedAt: call.CompletedAt,
-			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: createdAt, UpdatedAt: createdAt},
-			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: append(json.RawMessage(nil), call.Output...), CreatedAt: createdAt, UpdatedAt: createdAt},
+			ResultMessage: resultMessage,
+			ResultPart:    resultPart,
 		})
 	}
 	return result, nil

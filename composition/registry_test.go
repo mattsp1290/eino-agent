@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -79,6 +80,45 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 		t.Fatalf("AcquireResumePlan = %#v, %v", resumed, err)
 	}
 	resumed.Dispatch.Release()
+}
+
+func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
+	for index, key := range []string{"user@example.com==", strings.Repeat("opaque", 60) + "=="} {
+		registry := NewRegistry(nil)
+		mountedComponent := component("opaque-scope-" + string(rune('a'+index)))
+		mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", InstanceID: mountedComponent.InstanceID, Scope: extension.SessionScope(key)}, func(context.Context, string) error { return nil }); err != nil {
+				return err
+			}
+			return registrar.Tool(ToolRegistration{ID: "tool", InstanceID: mountedComponent.InstanceID, Scope: extension.SessionScope(key), Definition: definition("echo", "opaque")})
+		}))
+		if err != nil {
+			t.Fatalf("Mount(%q) = %v", key, err)
+		}
+
+		plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: session.ID(key)})
+		if err != nil {
+			t.Fatalf("AcquireRunPlan(%q) = %v", key, err)
+		}
+		resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(key)})
+		if err != nil || len(resolved) != 1 || resolved[0].Name != "echo" {
+			t.Fatalf("matching scope tools = %#v, %v", resolved, err)
+		}
+		plan.Dispatch.Release()
+
+		other, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "other"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved, err = other.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "other"})
+		if err != nil || len(resolved) != 0 {
+			t.Fatalf("other scope tools = %#v, %v", resolved, err)
+		}
+		other.Dispatch.Release()
+		if err := mount.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {

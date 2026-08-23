@@ -182,6 +182,55 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	}
 }
 
+func TestListUnreconciledToolSettlementsRepairsMissingReservedPart(t *testing.T) {
+	st, call := setupClaimedToolCall(t)
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+	call.Status = session.ToolCallCompleted
+	call.Output = output
+	call.CompletedAt = now
+	if err := st.FinishToolCall(ctx, call); err != nil {
+		t.Fatal(err)
+	}
+	resultMessage := session.Message{
+		ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID,
+		Role: session.RoleTool, Agent: "legacy-agent", ModelID: "legacy-model", CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := st.AppendMessage(ctx, resultMessage); err != nil {
+		t.Fatal(err)
+	}
+
+	unreconciled, err := st.ListUnreconciledToolSettlements(ctx, call.RunID)
+	if err != nil || len(unreconciled) != 1 {
+		t.Fatalf("unreconciled = %#v, %v", unreconciled, err)
+	}
+	if unreconciled[0].ResultMessage.Agent != resultMessage.Agent || unreconciled[0].ResultMessage.ModelID != resultMessage.ModelID {
+		t.Fatalf("existing result message was reconstructed: %#v", unreconciled[0].ResultMessage)
+	}
+	if err := st.SettleToolCall(ctx, unreconciled[0]); err != nil {
+		t.Fatalf("repair settlement = %v", err)
+	}
+	batch, err := st.ListMessages(ctx, call.SessionID, session.ReplayCursor{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPart := false
+	for _, part := range batch.Parts {
+		if part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && string(part.Payload) == string(output) {
+			foundPart = true
+		}
+	}
+	if !foundPart {
+		t.Fatalf("reserved result part missing from replay: %#v", batch.Parts)
+	}
+	unreconciled, err = st.ListUnreconciledToolSettlements(ctx, call.RunID)
+	if err != nil || len(unreconciled) != 0 {
+		t.Fatalf("after repair unreconciled = %#v, %v", unreconciled, err)
+	}
+}
+
 func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	st, call := setupClaimedToolCall(t)
 	defer func() { _ = st.Close() }()
