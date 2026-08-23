@@ -348,9 +348,11 @@ func cloneAnyMap(src map[string]any) map[string]any {
 }
 
 type cloneVisit struct {
-	typ     reflect.Type
-	pointer uintptr
-	kind    reflect.Kind
+	typ      reflect.Type
+	pointer  uintptr
+	kind     reflect.Kind
+	length   int
+	capacity int
 }
 
 func cloneMutable[T any](src T) T {
@@ -408,7 +410,7 @@ func cloneReflectValue(value reflect.Value, seen map[cloneVisit]reflect.Value) r
 		if value.IsNil() {
 			return reflect.Zero(value.Type())
 		}
-		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind()}
+		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind(), length: value.Len(), capacity: value.Cap()}
 		if cloned, ok := seen[visit]; ok {
 			return cloned
 		}

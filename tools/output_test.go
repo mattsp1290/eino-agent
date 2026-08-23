@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -113,7 +114,17 @@ func TestBuildToolSettlementClassifiesExpectedFailure(t *testing.T) {
 	if settlement.CompletedAt.IsZero() {
 		t.Fatalf("settlement CompletedAt was not populated")
 	}
-	if part.Kind != session.PartToolResult || !strings.Contains(string(part.Payload), outputStatusExpectedFailure) {
+	if settlement.ResultMessage.ID != "result-message-1" || settlement.ResultMessage.ParentID != "message-1" || settlement.ResultMessage.Role != session.RoleTool {
+		t.Fatalf("result message = %+v", settlement.ResultMessage)
+	}
+	if settlement.ResultPart.ID != "result-part-1" || settlement.ResultPart.MessageID != settlement.ResultMessage.ID || settlement.ResultPart.Kind != session.PartToolResult {
+		t.Fatalf("result part = %+v", settlement.ResultPart)
+	}
+	if !settlement.ResultMessage.CreatedAt.Equal(settlement.CompletedAt) || !settlement.ResultMessage.UpdatedAt.Equal(settlement.CompletedAt) ||
+		!settlement.ResultPart.CreatedAt.Equal(settlement.CompletedAt) || !settlement.ResultPart.UpdatedAt.Equal(settlement.CompletedAt) {
+		t.Fatalf("result timestamps differ from settlement: %+v", settlement)
+	}
+	if !reflect.DeepEqual(part, settlement.ResultPart) || !strings.Contains(string(part.Payload), outputStatusExpectedFailure) {
 		t.Fatalf("part = %+v", part)
 	}
 }
@@ -156,16 +167,36 @@ func TestBuildToolSettlementRequiresClaimIdentity(t *testing.T) {
 	}
 }
 
+func TestBuildToolSettlementRequiresReservedResultIDs(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*runtime.ToolCall)
+	}{
+		{name: "message", mutate: func(call *runtime.ToolCall) { call.ResultMessageID = "" }},
+		{name: "part", mutate: func(call *runtime.ToolCall) { call.ResultPartID = "" }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			call := toolCall()
+			test.mutate(&call)
+			if _, _, err := BuildToolSettlement(runtime.Tool{}, call, runtime.ToolResult{}, nil, toolClaim()); err == nil {
+				t.Fatal("BuildToolSettlement accepted missing reserved result ID")
+			}
+		})
+	}
+}
+
 func toolClaim() session.ToolClaimIdentity {
 	return session.ToolClaimIdentity{ClaimedBy: "worker", ClaimToken: "token"}
 }
 
 func toolCall() runtime.ToolCall {
 	return runtime.ToolCall{
-		ID:        "call-1",
-		SessionID: "session-1",
-		RunID:     "run-1",
-		MessageID: "message-1",
-		Name:      "read_file",
+		ID:              "call-1",
+		SessionID:       "session-1",
+		RunID:           "run-1",
+		MessageID:       "message-1",
+		ResultMessageID: "result-message-1",
+		ResultPartID:    "result-part-1",
+		Name:            "read_file",
 	}
 }

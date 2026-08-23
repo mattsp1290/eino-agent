@@ -181,21 +181,23 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, run session.Run) 
 			_ = extension.Notify(plan.Dispatch, ctx, ToolStartedPoint, ToolStartedNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Time: claimed.StartedAt})
 		}
 		toolCall := ToolCall{
-			ID:        claimed.ID,
-			SessionID: claimed.SessionID,
-			RunID:     claimed.RunID,
-			MessageID: claimed.MessageID,
-			Name:      claimed.Name,
-			Scope:     tool.Scope,
-			Pattern:   toolPattern(claimed.Input, claimed.Name),
-			Input:     cloneJSON(claimed.Input),
+			ID:              claimed.ID,
+			SessionID:       claimed.SessionID,
+			RunID:           claimed.RunID,
+			MessageID:       claimed.MessageID,
+			ResultMessageID: claimed.ResultMessageID,
+			ResultPartID:    claimed.ResultPartID,
+			Name:            claimed.Name,
+			Scope:           tool.Scope,
+			Pattern:         toolPattern(claimed.Input, claimed.Name),
+			Input:           cloneJSON(claimed.Input),
 		}
 		o.observeToolMaterialized(ctx, snapshot, tool, toolCall)
 		observedTool := o.startObservedToolCall(ctx, snapshot, tool, toolCall)
 		outcome := o.executeToolOutcome(ctx, tool, toolCall)
 		outcome = o.afterToolOutcome(ctx, tool, outcome)
 		result, execErr := outcome.Result, outcome.RawError
-		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, execErr)
+		output, status, errText := encodeToolOutput(claimed.ID, result, tool.Retention, outcome.Disposition, execErr)
 		claimed.Status = status
 		claimed.Output = cloneJSON(output)
 		claimed.CompletedAt = o.now()

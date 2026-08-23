@@ -73,6 +73,9 @@ func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtim
 	if len(claims) != 1 || claims[0].ClaimedBy == "" || claims[0].ClaimToken == "" {
 		return session.ToolSettlement{}, session.Part{}, errors.New("tool settlement claim identity required")
 	}
+	if call.ResultMessageID == "" || call.ResultPartID == "" {
+		return session.ToolSettlement{}, session.Part{}, errors.New("tool settlement reserved result IDs required")
+	}
 	status := outputStatusFromResult(result, execErr)
 	modelResult := result
 	if execErr != nil {
@@ -92,6 +95,17 @@ func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtim
 	if err != nil {
 		return session.ToolSettlement{}, session.Part{}, err
 	}
+	completedAt := time.Now().UTC()
+	part := session.Part{
+		ID:        call.ResultPartID,
+		MessageID: call.ResultMessageID,
+		SessionID: call.SessionID,
+		RunID:     call.RunID,
+		Kind:      session.PartToolResult,
+		Payload:   raw,
+		CreatedAt: completedAt,
+		UpdatedAt: completedAt,
+	}
 	settlement := session.ToolSettlement{
 		ID:          call.ID,
 		ClaimedBy:   claims[0].ClaimedBy,
@@ -99,17 +113,20 @@ func BuildToolSettlement(tool runtime.Tool, call runtime.ToolCall, result runtim
 		Status:      toolCallStatus(status),
 		Output:      raw,
 		Metadata:    settlementMetadata(tool, status, output),
-		CompletedAt: time.Now().UTC(),
+		CompletedAt: completedAt,
+		ResultMessage: session.Message{
+			ID:        call.ResultMessageID,
+			SessionID: call.SessionID,
+			RunID:     call.RunID,
+			ParentID:  call.MessageID,
+			Role:      session.RoleTool,
+			CreatedAt: completedAt,
+			UpdatedAt: completedAt,
+		},
+		ResultPart: part,
 	}
 	if execErr != nil {
 		settlement.Error = execErr.Error()
-	}
-	part := session.Part{
-		MessageID: call.MessageID,
-		SessionID: call.SessionID,
-		RunID:     call.RunID,
-		Kind:      session.PartToolResult,
-		Payload:   raw,
 	}
 	return settlement, part, nil
 }

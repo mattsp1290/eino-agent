@@ -961,6 +961,27 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	}
 }
 
+func TestEncodeToolOutputUsesProtectedDisposition(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		disposition ToolDisposition
+		result      ToolResult
+		wantStatus  session.ToolCallStatus
+		wantPayload string
+	}{
+		{name: "denied", disposition: ToolDenied, result: ToolResult{Output: "blocked"}, wantStatus: session.ToolCallFailed, wantPayload: "expected_failure"},
+		{name: "approval required", disposition: ToolApprovalRequired, result: ToolResult{Output: "approve"}, wantStatus: session.ToolCallFailed, wantPayload: "expected_failure"},
+		{name: "model visible interruption", disposition: ToolInterrupted, result: ToolResult{Output: "interrupted"}, wantStatus: session.ToolCallInterrupted, wantPayload: "interrupted"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			output, status, errText := encodeToolOutput("call", test.result, RetentionPolicy{MaxInlineBytes: 4096}, test.disposition, nil)
+			if status != test.wantStatus || errText != "" || !strings.Contains(string(output), `"status":"`+test.wantPayload+`"`) || !strings.Contains(string(output), test.result.Output) {
+				t.Fatalf("output=%s status=%s error=%q", output, status, errText)
+			}
+		})
+	}
+}
+
 func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -971,9 +992,11 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 	defer func() { _ = store.Close() }()
 	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "tools", Kind: session.ExtensionTool, Required: true, CapabilityID: "echo/tool"}}}
 	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+	var executedCall ToolCall
 	toolRegistry := staticToolRegistry{tools: []Tool{{
 		Name: "echo",
-		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executedCall = call
 			cancel()
 			return ToolResult{Output: "ok"}, nil
 		}),
@@ -1005,6 +1028,136 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 	if call.Status != session.ToolCallCompleted {
 		t.Fatalf("tool call status = %s, want completed", call.Status)
 	}
+	if executedCall.ResultMessageID != call.ResultMessageID || executedCall.ResultPartID != call.ResultPartID || executedCall.ResultMessageID == "" || executedCall.ResultPartID == "" {
+		t.Fatalf("runtime call reservations = %+v, durable call = %+v", executedCall, call)
+	}
+}
+
+func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransform(t *testing.T) {
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var notices []ToolSettledNotice
+	var executed atomic.Bool
+	toolRegistry := staticToolRegistry{tools: []Tool{{
+		Name:      "echo",
+		Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executed.Store(true)
+			return ToolResult{}, nil
+		}),
+	}}}
+	plan := transformedPermissionRunPlan(t, toolRegistry, &notices)
+	var modelVisible string
+	orchestrator := &StreamingOrchestrator{
+		Store: store,
+		Model: resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+			for _, message := range request.Messages {
+				if message.Role == einoschema.Tool {
+					modelVisible = message.Content
+					return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				}
+			}
+			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-denied", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+		})},
+		Plans: staticRunPlanProvider{plan: plan},
+		Permissions: permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+			return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
+		}),
+		IDs: &sequenceIDs{}, Clock: func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1",
+	}
+	handle, err := orchestrator.Start(ctx, Request{SessionID: "session-denied", ParentID: "user", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.Error != nil || result.Status != session.RunCompleted || executed.Load() {
+		t.Fatalf("run result = %+v", result)
+	}
+	call, err := store.GetToolCall(ctx, "call-denied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.Status != session.ToolCallFailed || call.Error != "" || !strings.Contains(string(call.Output), `"status":"expected_failure"`) || !strings.Contains(string(call.Output), "transformed denial") {
+		t.Fatalf("durable denied call = %+v", call)
+	}
+	if !strings.Contains(modelVisible, `"status":"expected_failure"`) || !strings.Contains(modelVisible, "transformed denial") {
+		t.Fatalf("model-visible denied result = %s", modelVisible)
+	}
+	if len(notices) != 1 || notices[0].Status != session.ToolCallFailed || notices[0].Result.Metadata["permission_status"] != "denied" {
+		t.Fatalf("settled notices = %#v", notices)
+	}
+}
+
+func TestResumePreservesDeniedDispositionAfterFreshResultTransform(t *testing.T) {
+	ctx := context.Background()
+	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
+	var notices []ToolSettledNotice
+	var executed atomic.Bool
+	toolRegistry := staticToolRegistry{tools: []Tool{{
+		Name:      "echo",
+		Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			executed.Store(true)
+			return ToolResult{}, nil
+		}),
+	}}}
+	plan := transformedPermissionRunPlan(t, toolRegistry, &notices)
+	orchestrator := &StreamingOrchestrator{
+		Store: store,
+		Permissions: permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+			return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
+		}),
+		IDs: &sequenceIDs{}, Clock: func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1",
+	}
+	result := orchestrator.resumeRun(withRunPlan(ctx, plan), run)
+	if result.Error != nil || executed.Load() {
+		t.Fatalf("resume result = %+v", result)
+	}
+	call, err := store.GetToolCall(ctx, "call-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.Status != session.ToolCallFailed || call.Error != "" || !strings.Contains(string(call.Output), `"status":"expected_failure"`) || !strings.Contains(string(call.Output), "transformed denial") {
+		t.Fatalf("resumed denied call = %+v", call)
+	}
+	if len(notices) != 1 || notices[0].Status != session.ToolCallFailed || notices[0].Result.Metadata["permission_status"] != "denied" {
+		t.Fatalf("settled notices = %#v", notices)
+	}
+}
+
+func transformedPermissionRunPlan(t *testing.T, tools ToolRegistry, notices *[]ToolSettledNotice) *RunPlan {
+	t.Helper()
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "permission-transform", Artifact: extension.Artifact{Name: "permission-transform", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolOutcome, next extension.Next[ToolOutcome, ToolOutcome]) (ToolOutcome, error) {
+			outcome, err := next(ctx, input)
+			outcome.Result = ToolResult{Output: "transformed denial"}
+			return outcome, err
+		}); err != nil {
+			return err
+		}
+		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+			*notices = append(*notices, notice)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := strictToolDescriptor(t)
+	plan := &RunPlan{Descriptor: descriptor, Dispatch: dispatch, Tools: tools}
+	t.Cleanup(func() { _ = mount.Close(context.Background()) })
+	t.Cleanup(func() { plan.release() })
+	return plan
 }
 
 func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
@@ -1489,13 +1642,15 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		t.Fatalf("append message: %v", err)
 	}
 	call := session.ToolCall{
-		ID:        "call-resume",
-		SessionID: run.SessionID,
-		RunID:     run.ID,
-		MessageID: "assistant-resume",
-		Name:      "echo",
-		Input:     []byte(`{"text":"hi"}`),
-		Status:    session.ToolCallPending,
+		ID:              "call-resume",
+		SessionID:       run.SessionID,
+		RunID:           run.ID,
+		MessageID:       "assistant-resume",
+		ResultMessageID: "result-resume",
+		ResultPartID:    "part-resume",
+		Name:            "echo",
+		Input:           []byte(`{"text":"hi"}`),
+		Status:          session.ToolCallPending,
 	}
 	created, err := store.CreateToolCall(ctx, call)
 	if err != nil {

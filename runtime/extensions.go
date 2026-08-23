@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	einoschema "github.com/cloudwego/eino/schema"
+	"github.com/eino-contrib/jsonschema"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -423,10 +424,22 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 	if err != nil {
 		return nil, err
 	}
-	if plan == nil || plan.Descriptor.Fingerprint != descriptor.Fingerprint {
-		if plan != nil {
-			plan.release()
-		}
+	if plan == nil {
+		return nil, ErrExtensionPlanMismatch
+	}
+	providedFingerprint := plan.Descriptor.Fingerprint
+	fingerprint, fingerprintErr := session.FingerprintExtensionPlan(plan.Descriptor)
+	if fingerprintErr != nil {
+		plan.release()
+		return nil, fingerprintErr
+	}
+	if providedFingerprint != "" && providedFingerprint != fingerprint {
+		plan.release()
+		return nil, fmt.Errorf("%w: invalid resume descriptor fingerprint", ErrExtensionPlanMismatch)
+	}
+	plan.Descriptor.Fingerprint = fingerprint
+	if fingerprint != descriptor.Fingerprint {
+		plan.release()
 		return nil, ErrExtensionPlanMismatch
 	}
 	if descriptorRequiresToolSettlement(descriptor) {
@@ -862,7 +875,11 @@ func sameProtectedToolInfo(left, right *einoschema.ToolInfo) bool {
 	}
 	leftRaw, leftErr := json.Marshal(left)
 	rightRaw, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
+	leftSchema, leftSchemaErr := protectedParamsOneOfJSON(left.ParamsOneOf)
+	rightSchema, rightSchemaErr := protectedParamsOneOfJSON(right.ParamsOneOf)
+	return leftErr == nil && rightErr == nil &&
+		leftSchemaErr == nil && rightSchemaErr == nil &&
+		bytes.Equal(leftRaw, rightRaw) && bytes.Equal(leftSchema, rightSchema)
 }
 
 func sameProtectedToolCall(left, right ToolCall) bool {
@@ -940,15 +957,52 @@ func cloneTool(tool Tool) Tool {
 	tool.Scope.Permissions = cloneSlice(tool.Scope.Permissions)
 	tool.Metadata = cloneStringMap(tool.Metadata)
 	if tool.Info != nil {
+		params, paramsErr := cloneProtectedParamsOneOf(tool.Info.ParamsOneOf)
 		raw, err := json.Marshal(tool.Info)
 		var info einoschema.ToolInfo
-		if err != nil || json.Unmarshal(raw, &info) != nil {
+		if paramsErr != nil || err != nil || json.Unmarshal(raw, &info) != nil {
 			tool.Info = nil
 		} else {
+			info.ParamsOneOf = params
 			tool.Info = &info
 		}
 	}
 	return tool
+}
+
+func cloneProtectedParamsOneOf(src *einoschema.ParamsOneOf) (*einoschema.ParamsOneOf, error) {
+	if src == nil {
+		return nil, nil
+	}
+	raw, err := protectedParamsOneOfJSON(src)
+	if err != nil {
+		return nil, err
+	}
+	var cloned jsonschema.Schema
+	if err := json.Unmarshal(raw, &cloned); err != nil {
+		return nil, err
+	}
+	return einoschema.NewParamsOneOfByJSONSchema(&cloned), nil
+}
+
+func protectedParamsOneOfJSON(src *einoschema.ParamsOneOf) (raw []byte, err error) {
+	if src == nil {
+		return nil, nil
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			raw = nil
+			err = fmt.Errorf("tool parameter schema conversion panic: %v", recovered)
+		}
+	}()
+	schema, err := src.ToJSONSchema()
+	if err != nil {
+		return nil, err
+	}
+	if schema == nil {
+		return nil, errors.New("tool parameter schema conversion returned nil")
+	}
+	return json.Marshal(schema)
 }
 
 func cloneToolCall(call ToolCall) ToolCall {

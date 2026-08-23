@@ -165,6 +165,39 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	}
 }
 
+func TestRequestCloneDistinguishesAliasedSliceHeadersByShape(t *testing.T) {
+	t.Parallel()
+
+	type fullFirst struct {
+		Full   []string
+		Prefix []string
+	}
+	type prefixFirst struct {
+		Prefix []string
+		Full   []string
+	}
+	base := []string{"first", "second", "third"}
+	request := Request{Messages: []*einoschema.Message{{Extra: map[string]any{
+		"full_first":   fullFirst{Full: base[:3], Prefix: base[:1]},
+		"prefix_first": prefixFirst{Prefix: base[:1], Full: base[:3]},
+	}}}}
+
+	cloned := request.Clone()
+	first := cloned.Messages[0].Extra["full_first"].(fullFirst)
+	second := cloned.Messages[0].Extra["prefix_first"].(prefixFirst)
+	if len(first.Full) != 3 || len(first.Prefix) != 1 || len(second.Full) != 3 || len(second.Prefix) != 1 {
+		t.Fatalf("cloned slice lengths = first(%d,%d) second(%d,%d)", len(first.Full), len(first.Prefix), len(second.Full), len(second.Prefix))
+	}
+	if first.Full[2] != "third" || first.Prefix[0] != "first" || second.Full[2] != "third" || second.Prefix[0] != "first" {
+		t.Fatalf("cloned slice values = first(%v,%v) second(%v,%v)", first.Full, first.Prefix, second.Full, second.Prefix)
+	}
+	first.Full[0] = "changed"
+	second.Prefix[0] = "also changed"
+	if base[0] != "first" {
+		t.Fatalf("source backing slice mutated: %v", base)
+	}
+}
+
 type testAdapter struct {
 	provider     Provider
 	models       []Descriptor

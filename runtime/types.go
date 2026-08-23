@@ -97,15 +97,17 @@ type ToolExecutor interface {
 
 // ToolCall is the runtime view of a model-requested tool invocation.
 type ToolCall struct {
-	ID        session.ToolCallID
-	SessionID session.ID
-	RunID     session.RunID
-	MessageID session.MessageID
-	Name      string
-	Scope     ToolScope
-	Pattern   string
-	Input     json.RawMessage
-	Approval  ApprovalRequester
+	ID              session.ToolCallID
+	SessionID       session.ID
+	RunID           session.RunID
+	MessageID       session.MessageID
+	ResultMessageID session.MessageID
+	ResultPartID    session.PartID
+	Name            string
+	Scope           ToolScope
+	Pattern         string
+	Input           json.RawMessage
+	Approval        ApprovalRequester
 }
 
 // ToolScope describes the authority and serialization scope for a tool.

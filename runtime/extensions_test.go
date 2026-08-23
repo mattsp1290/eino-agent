@@ -366,6 +366,25 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	if err := validateToolExecutionInput(ToolExecution(prepared), cloneToolExecution(ToolExecution(prepared))); !errors.Is(err, extension.ErrProtectedMutation) {
 		t.Fatalf("tool execution clone failure validation = %v", err)
 	}
+	for _, test := range []struct {
+		name   string
+		params *einoschema.ParamsOneOf
+	}{
+		{name: "panicking parameter entry", params: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"broken": nil})},
+		{name: "empty schema wrapper", params: &einoschema.ParamsOneOf{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			toolEntered = false
+			malformed := PreparedToolCall{
+				Tool: Tool{Name: "tool", Info: &einoschema.ToolInfo{Name: "tool", ParamsOneOf: test.params}},
+				Call: ToolCall{ID: "call", Name: "tool", Input: json.RawMessage(`{}`)},
+			}
+			_, invokeErr := extension.Invoke(plan, context.Background(), ToolPreparePoint, malformed, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) { return input, nil })
+			if !errors.Is(invokeErr, extension.ErrProtectedMutation) || toolEntered {
+				t.Fatalf("malformed schema clone failure = %v entered=%t", invokeErr, toolEntered)
+			}
+		})
+	}
 }
 
 type functionStreamer func(context.Context, model.Request) (*einoschema.StreamReader[*einoschema.Message], error)
@@ -442,6 +461,49 @@ func TestToolValidationAcceptsJSONCloneTypeNormalization(t *testing.T) {
 	}
 }
 
+func TestProtectedToolInfoClonePreservesAndValidatesParameterSchema(t *testing.T) {
+	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+		"text": {Type: einoschema.String, Required: true},
+	})
+	original := PreparedToolCall{
+		Tool: Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", ParamsOneOf: params}},
+		Call: ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`)},
+	}
+	cloned := clonePreparedToolCall(original)
+	if cloned.Tool.Info == nil || cloned.Tool.Info.ParamsOneOf == nil || cloned.Tool.Info.ParamsOneOf == params {
+		t.Fatalf("cloned tool info = %#v", cloned.Tool.Info)
+	}
+	wantSchema, err := params.ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotSchema, err := cloned.Tool.Info.ToJSONSchema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantRaw, _ := json.Marshal(wantSchema)
+	gotRaw, _ := json.Marshal(gotSchema)
+	if !reflect.DeepEqual(wantRaw, gotRaw) {
+		t.Fatalf("cloned schema = %s, want %s", gotRaw, wantRaw)
+	}
+	if err := validatePreparedToolCallInput(original, cloned); err != nil {
+		t.Fatalf("unchanged schema validation = %v", err)
+	}
+
+	replaced := clonePreparedToolCall(original)
+	replaced.Tool.Info.ParamsOneOf = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+		"count": {Type: einoschema.Integer, Required: true},
+	})
+	if err := validatePreparedToolCallInput(original, replaced); !errors.Is(err, extension.ErrProtectedMutation) {
+		t.Fatalf("schema replacement validation = %v", err)
+	}
+	removed := clonePreparedToolCall(original)
+	removed.Tool.Info.ParamsOneOf = nil
+	if err := validatePreparedToolCallInput(original, removed); !errors.Is(err, extension.ErrProtectedMutation) {
+		t.Fatalf("schema removal validation = %v", err)
+	}
+}
+
 type testInputDecoder [1]byte
 
 func (*testInputDecoder) DecodeToolInput(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
@@ -499,6 +561,49 @@ func TestAcquireResumePlanUsesStrictToolSettlementPredicate(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAcquireResumePlanRecomputesProviderDescriptorFingerprint(t *testing.T) {
+	descriptor := session.ExtensionPlanDescriptor{
+		SchemaVersion: session.ExtensionPlanSchemaVersion,
+		Mode:          session.PlanStrict,
+		Entries: []session.ExtensionPlanEntry{{
+			InstanceID: "callbacks",
+			Kind:       session.ExtensionHandlers,
+			Required:   true,
+			Artifact:   session.ArtifactIdentity{Name: "callbacks", Hash: "persisted"},
+		}},
+	}
+	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
+
+	t.Run("rejects copied stale fingerprint", func(t *testing.T) {
+		changed := descriptor.Clone()
+		changed.Entries[0].Artifact.Hash = "changed"
+		changed.Fingerprint = descriptor.Fingerprint
+		released := false
+		orchestrator := &StreamingOrchestrator{
+			Store: newAdmissionStore(),
+			Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: changed, Release: func() {
+				released = true
+			}}},
+		}
+		if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) || !released {
+			t.Fatalf("acquireResumePlan = %v released=%t", err, released)
+		}
+	})
+
+	t.Run("canonicalizes omitted fingerprint", func(t *testing.T) {
+		matching := descriptor.Clone()
+		matching.Fingerprint = ""
+		orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: matching}}}
+		plan, err := orchestrator.acquireResumePlan(context.Background(), descriptor)
+		if err != nil {
+			t.Fatalf("acquireResumePlan = %v", err)
+		}
+		if plan.Descriptor.Fingerprint != descriptor.Fingerprint {
+			t.Fatalf("fingerprint = %q, want %q", plan.Descriptor.Fingerprint, descriptor.Fingerprint)
+		}
+	})
 }
 
 func TestResumeRunStrictCallbacksOnlyDoesNotRequireSettlementStore(t *testing.T) {

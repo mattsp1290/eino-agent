@@ -699,6 +699,8 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapsh
 		if err != nil {
 			return nil, err
 		}
+		call.ResultMessageID = record.ResultMessageID
+		call.ResultPartID = record.ResultPartID
 		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{
 			ID:        string(callID),
 			Name:      call.Name,
@@ -728,7 +730,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapsh
 		}
 		outcome = o.afterToolOutcome(ctx, tool, outcome)
 		result, execErr := outcome.Result, outcome.RawError
-		output, status, errText := encodeToolOutput(callID, result, tool.Retention, execErr)
+		output, status, errText := encodeToolOutput(callID, result, tool.Retention, outcome.Disposition, execErr)
 		record.Status = status
 		record.Output = cloneJSON(output)
 		record.CompletedAt = o.now()
@@ -853,6 +855,15 @@ func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool,
 			return outcome
 		}
 		outcome = transformed
+		outcome.Result = cloneRuntimeToolResult(outcome.Result)
+		if len(outcome.PermissionMetadata) != 0 {
+			if outcome.Result.Metadata == nil {
+				outcome.Result.Metadata = make(map[string]string)
+			}
+			for key, value := range outcome.PermissionMetadata {
+				outcome.Result.Metadata[key] = value
+			}
+		}
 	}
 	return outcome
 }
@@ -1118,19 +1129,41 @@ func eventError(err error) EventError {
 	return EventError{Message: err.Error()}
 }
 
-func encodeToolOutput(callID session.ToolCallID, result ToolResult, policy RetentionPolicy, err error) (json.RawMessage, session.ToolCallStatus, string) {
+func encodeToolOutput(callID session.ToolCallID, result ToolResult, policy RetentionPolicy, disposition ToolDisposition, err error) (json.RawMessage, session.ToolCallStatus, string) {
 	payload := toolOutputPayload{
 		ToolCallID: string(callID),
 		Status:     "completed",
 	}
-	if err != nil {
+	switch disposition {
+	case ToolDenied, ToolApprovalRequired:
+		payload.Status = "expected_failure"
+		applyToolOutputBounds(&payload, result, policy)
+		return mustJSON(payload), session.ToolCallFailed, ""
+	case ToolInterrupted:
+		payload.Status = "interrupted"
+		if err == nil {
+			applyToolOutputBounds(&payload, result, policy)
+			return mustJSON(payload), session.ToolCallInterrupted, ""
+		}
+		payload.Content = "tool execution failed"
+		return mustJSON(payload), session.ToolCallInterrupted, err.Error()
+	case ToolFailed:
 		payload.Status = "operational_failure"
 		payload.Content = "tool execution failed"
-		if errors.Is(err, context.Canceled) {
-			payload.Status = "interrupted"
-			return mustJSON(payload), session.ToolCallInterrupted, err.Error()
+		if err == nil {
+			return mustJSON(payload), session.ToolCallFailed, ""
 		}
 		return mustJSON(payload), session.ToolCallFailed, err.Error()
+	case ToolExecuted:
+		if err != nil {
+			payload.Status = "operational_failure"
+			payload.Content = "tool execution failed"
+			return mustJSON(payload), session.ToolCallFailed, err.Error()
+		}
+	default:
+		payload.Status = "operational_failure"
+		payload.Content = "tool execution failed"
+		return mustJSON(payload), session.ToolCallFailed, "invalid tool disposition"
 	}
 	applyToolOutputBounds(&payload, result, policy)
 	return mustJSON(payload), session.ToolCallCompleted, ""
