@@ -302,6 +302,68 @@ func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
 	}
 }
 
+func TestSessionScopedCallbackOnlyMountIgnoresUnrelatedPlan(t *testing.T) {
+	registry := NewRegistry(nil)
+	mountedComponent := component("callback-only")
+	mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return extension.On(registrar.Extensions(), compositionNotice, extension.Registration{
+			ID: "notice", InstanceID: mountedComponent.InstanceID, Scope: extension.SessionScope("session-a"),
+		}, func(context.Context, string) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Dispatch.Release()
+	mount.Deactivate()
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatalf("unrelated plan retained callback-only mount: %v", err)
+	}
+}
+
+func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
+	registry := NewRegistry(nil)
+	componentA := component("resume-lease-a")
+	mountA, err := registry.Mount(context.Background(), componentA, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "tool-a", InstanceID: componentA.InstanceID, Scope: extension.SessionScope("session-a"), Definition: definition("tool-a", "a")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	planA, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := planA.Descriptor.Clone()
+	planA.Dispatch.Release()
+
+	componentB := component("resume-lease-b")
+	mountB, err := registry.Mount(context.Background(), componentB, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "tool-b", InstanceID: componentB.InstanceID, Scope: extension.SessionScope("session-a"), Definition: definition("tool-b", "b")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Dispatch.Release()
+
+	mountB.Deactivate()
+	if err := mountB.Close(context.Background()); err != nil {
+		t.Fatalf("resumed A plan retained later B mount: %v", err)
+	}
+	resumed.Dispatch.Release()
+	mountA.Deactivate()
+	if err := mountA.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
 	registry := NewRegistry(nil)
 	var nested *Mount

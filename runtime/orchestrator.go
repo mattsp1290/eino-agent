@@ -5,13 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"sync"
 	"time"
-	"unicode/utf8"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 	einoobs "github.com/mattsp1290/eino-obs"
 
@@ -93,7 +90,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		plan.release()
 		return nil, err
 	}
-	ctx = withRunPlan(ctx, plan)
+	execution := newRunExecution(o, plan)
 	now := o.now()
 	ids := AdmissionIDs{
 		SessionID:          request.SessionID,
@@ -103,7 +100,8 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		EventID:            o.IDs.NewEventID(),
 	}
 	admitter := o.admitter()
-	admitter.Events = o.eventSinkFor(ctx, admitter.Events)
+	admitter.Events = execution.eventSink(admitter.Events)
+	admitter.Extensions = execution.dispatch()
 	admitted, err := admitter.Admit(ctx, AdmissionRequest{
 		IDs:             ids,
 		ParentMessageID: request.ParentID,
@@ -128,7 +126,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 			o.observeInterrupt(context.WithoutCancel(ctx), admitted.Run, admitted.AssistantMessage.ID, reason)
 		},
 	}
-	go o.execute(withRunPlan(runCtx, plan), admitted, handle.done)
+	go o.execute(runCtx, execution, admitted, handle.done)
 	return handle, nil
 }
 
@@ -140,20 +138,17 @@ func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID
 	return o.Store.ActiveRun(ctx, sessionID)
 }
 
-func (o *StreamingOrchestrator) execute(ctx context.Context, admitted AdmittedRun, done chan<- Result) {
+func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecution, admitted AdmittedRun, done chan<- Result) {
 	defer close(done)
-	plan := runPlanFromContext(ctx)
-	if plan != nil {
-		defer plan.release()
-	}
-	result, settled := o.run(ctx, admitted)
-	if settled && plan != nil && plan.Dispatch != nil {
-		_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
+	defer execution.release()
+	result, settled := o.run(ctx, execution, admitted)
+	if settled {
+		_ = extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
 	}
 	done <- result
 }
 
-func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (result Result, settled bool) {
+func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution, admitted AdmittedRun) (result Result, settled bool) {
 	run := admitted.Run
 	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
 	var observed observedRun
@@ -168,11 +163,11 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 			result.Error = fmt.Errorf("provider stream panic: %v", recovered)
 		}
 		result.Usage = runtimeUsage(runUsage)
-		result, settled = o.finish(ctx, run, result)
+		result, settled = o.finish(ctx, execution, run, result)
 		o.finishObservedRun(observed, result, o.now())
 	}()
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		decision, err := extension.Invoke(plan.Dispatch, ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID}, func(context.Context, RunGateInput) (RunDecision, error) {
+	{
+		decision, err := extension.Invoke(execution.dispatch(), ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID}, func(context.Context, RunGateInput) (RunDecision, error) {
 			return RunDecision{Kind: RunContinue}, nil
 		})
 		if err != nil {
@@ -194,23 +189,21 @@ func (o *StreamingOrchestrator) run(ctx context.Context, admitted AdmittedRun) (
 		result.Error = err
 		return result, false
 	}
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		_ = extension.Notify(plan.Dispatch, ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
-	}
-	snapshot, err := o.prepareSnapshot(ctx, admitted.Snapshot, admitted.AssistantMessage.ID)
+	_ = extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
+	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot, admitted.AssistantMessage.ID)
 	if err != nil {
 		result.Status = statusForError(err)
 		result.Error = err
 		return result, false
 	}
-	result = o.executeAttempts(ctx, snapshot, admitted.AssistantMessage.ID, &runUsage)
+	result = o.executeAttempts(ctx, execution, snapshot, admitted.AssistantMessage.ID, &runUsage)
 	for _, hook := range o.Hooks {
 		_ = hook.AfterTurn(ctx, snapshot.Clone(), result)
 	}
 	return result, false
 }
 
-func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
+func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
 	for _, source := range o.Context {
 		if source == nil {
 			continue
@@ -221,9 +214,9 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 		}
 		snapshot.Messages = append(snapshot.Messages, cloneMessages(messages)...)
 	}
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
+	if execution.dispatch() != nil {
 		assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
-		assembled, err := extension.Invoke(plan.Dispatch, ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
+		assembled, err := extension.Invoke(execution.dispatch(), ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
@@ -236,8 +229,8 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 		}
 		snapshot.Tools = cloneSlice(tools)
 	}
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Tools != nil {
-		planned, err := plan.Tools.ResolveTools(ctx, snapshot.Clone())
+	if execution.plan.Tools != nil {
+		planned, err := execution.plan.Tools.ResolveTools(ctx, snapshot.Clone())
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
@@ -254,8 +247,8 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 		}
 		sort.Slice(snapshot.Tools, func(i, j int) bool { return snapshot.Tools[i].Name < snapshot.Tools[j].Name })
 	}
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		_, err := extension.Invoke(plan.Dispatch, ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
+	if execution.dispatch() != nil {
+		_, err := extension.Invoke(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
@@ -272,11 +265,11 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, snapshot Tu
 	return snapshot, nil
 }
 
-func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
+func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
 	attempts := o.attempts()
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		result, err := o.executeOne(ctx, snapshot, messageID, attempt, usage)
+		result, err := o.executeOne(ctx, execution, snapshot, messageID, attempt, usage)
 		if err == nil {
 			return result
 		}
@@ -298,16 +291,16 @@ func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, snapshot Tu
 	return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunFailed, Error: last}
 }
 
-func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int, usage *model.Usage) (Result, error) {
+func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, attempt int, usage *model.Usage) (Result, error) {
 	messages := cloneMessages(snapshot.Messages)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
-		msg, err := o.streamModel(ctx, snapshot, currentMessageID, messages, attempt, turn+1, usage)
+		msg, err := o.streamModel(ctx, execution, snapshot, currentMessageID, messages, attempt, turn+1, usage)
 		if err != nil {
 			return Result{}, err
 		}
 		normalizeToolCallIDs(msg, o.IDs)
-		preparedCalls, err := o.prepareToolCalls(ctx, snapshot, currentMessageID, msg.ToolCalls)
+		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, msg.ToolCalls)
 		if err != nil {
 			return Result{}, err
 		}
@@ -324,7 +317,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 			return Result{}, model.Error{Code: "tool_turn_limit_exceeded", Message: "model exceeded tool turn limit", Cause: model.ErrProviderRejected}
 		}
 		messages = append(messages, msg)
-		toolMessages, err := o.executePreparedTools(ctx, snapshot, currentMessageID, preparedCalls)
+		toolMessages, err := o.executePreparedTools(ctx, execution, snapshot, currentMessageID, preparedCalls)
 		if err != nil {
 			return Result{}, err
 		}
@@ -346,458 +339,8 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, snapshot TurnSna
 	}
 }
 
-func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (message *einoschema.Message, err error) {
-	queue := newEventQueue(ctx, o.QueueSize, o.eventSink(ctx))
-	defer queue.close()
-	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
-	var streamUsage model.Usage
-	var streamErr error
-	var requestRecord *session.ModelRequestRecord
-	var requestStore session.ModelRequestStore
-	var modelRequested bool
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			streamErr = fmt.Errorf("provider stream panic: %v", recovered)
-			err = streamErr
-			message = nil
-		}
-		// Accumulate this stream's usage into the run total in the same defer
-		// that reports it to observability, so the persisted run total stays
-		// exactly consistent with the run span's summed usage (both include
-		// partial usage from a failed/canceled stream).
-		if usage != nil {
-			*usage = addUsage(*usage, streamUsage)
-		}
-		ledgerTransitionOK := true
-		if requestRecord != nil {
-			state := session.ModelRequestCompleted
-			if streamErr != nil {
-				state = session.ModelRequestFailed
-			}
-			if transitionErr := updateModelRequest(ctx, requestStore, requestRecord, state, streamErr, o.now()); transitionErr != nil {
-				streamErr = transitionErr
-				err = transitionErr
-				message = nil
-				ledgerTransitionOK = false
-			}
-		}
-		if streamErr != nil {
-			o.errorObservedStream(obsStream, streamErr, streamUsage)
-		} else {
-			o.endObservedStream(obsStream, streamUsage)
-		}
-		if plan := runPlanFromContext(ctx); modelRequested && ledgerTransitionOK && plan != nil && plan.Dispatch != nil {
-			_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
-		}
-	}()
-	observer := &streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
-	request := snapshot.ProviderRequest(messageID, o.Trace, observer)
-	request.Messages = cloneMessages(messages)
-	request.System, err = o.renderSystemPrompt(ctx, snapshot, attempt, step)
-	if err != nil {
-		streamErr = err
-		return nil, err
-	}
-	requestRecord, requestStore, err = o.prepareModelRequest(ctx, snapshot, request, messageID, attempt, step)
-	if err != nil {
-		streamErr = err
-		return nil, err
-	}
-	if requestRecord != nil {
-		request.IdempotencyKey = string(requestRecord.ID)
-		if err = updateModelRequest(ctx, requestStore, requestRecord, session.ModelRequestDispatchStarted, nil, o.now()); err != nil {
-			streamErr = err
-			return nil, err
-		}
-	}
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		requestRecordID := session.ModelRequestID("")
-		if requestRecord != nil {
-			requestRecordID = requestRecord.ID
-		}
-		contentHash := modelRequestContentHash(request)
-		if requestRecord != nil {
-			contentHash = requestRecord.ContentSHA256
-		}
-		_ = extension.Notify(plan.Dispatch, ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecordID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
-		modelRequested = true
-	}
-	var reader *einoschema.StreamReader[*einoschema.Message]
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		reader, err = extension.Invoke(plan.Dispatch, ctx, ModelStreamPoint, ModelStreamInput{Resolved: snapshot.Model, Request: request}, func(ctx context.Context, input ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
-			return openStream(ctx, input.Resolved, input.Request)
-		})
-	} else {
-		reader, err = openStream(ctx, snapshot.Model, request)
-	}
-	if err != nil {
-		streamErr = err
-		return nil, err
-	}
-	if reader == nil {
-		streamErr = model.Error{Code: "nil_provider_stream", Message: "provider returned nil stream"}
-		return nil, streamErr
-	}
-	defer reader.Close()
-	var chunks []*einoschema.Message
-	for {
-		if err := ctx.Err(); err != nil {
-			streamErr = err
-			return nil, err
-		}
-		chunk, err := reader.Recv()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			streamErr = err
-			return nil, err
-		}
-		if err := ctx.Err(); err != nil {
-			streamErr = err
-			return nil, err
-		}
-		if chunk == nil {
-			streamErr = model.Error{Code: "malformed_provider_stream", Message: "provider returned nil message chunk"}
-			return nil, streamErr
-		}
-		o.observeStreamChunk(obsStream, int64(len(chunks)))
-		chunks = append(chunks, chunk)
-		if err := queue.emit(Event{
-			Kind:       EventMessageDelta,
-			SessionID:  snapshot.SessionID,
-			RunID:      snapshot.RunID,
-			MessageID:  messageID,
-			EpochID:    snapshot.EpochID,
-			ProviderID: string(request.Identity.ProviderID),
-			ModelID:    string(request.Identity.ModelID),
-			Payload:    mustJSON(map[string]string{"content": chunk.Content, "reasoning": chunk.ReasoningContent}),
-			LiveOnly:   true,
-			Time:       o.now(),
-		}); err != nil {
-			streamErr = err
-			return nil, err
-		}
-	}
-	if len(chunks) == 0 {
-		streamUsage = observer.usageSnapshot()
-		return einoschema.AssistantMessage("", nil), nil
-	}
-	msg, err := einoschema.ConcatMessages(chunks)
-	if err != nil {
-		streamErr = model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
-		return nil, streamErr
-	}
-	streamUsage = resolveStreamUsage(observer.usageSnapshot(), msg)
-	return msg, nil
-}
-
-func openStream(ctx context.Context, resolved model.Resolved, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	if resolved.Streamer != nil {
-		if request.IdempotencyKey != "" {
-			if streamer, ok := resolved.Streamer.(model.IdempotentStreamer); ok {
-				return streamer.StreamProviderWithIdempotencyKey(ctx, request, request.IdempotencyKey)
-			}
-		}
-		return resolved.Streamer.StreamProvider(ctx, request)
-	}
-	client := resolved.Client
-	if client == nil {
-		return nil, model.Error{Code: "model_client_missing", Message: "resolved model has no client", Cause: model.ErrProviderUnavailable}
-	}
-	if len(request.Tools) > 0 {
-		withTools, err := client.WithTools(request.Tools)
-		if err != nil {
-			return nil, err
-		}
-		client = withTools
-	}
-	messages := cloneMessages(request.Messages)
-	if request.System != "" {
-		messages = append([]*einoschema.Message{einoschema.SystemMessage(request.System)}, messages...)
-	}
-	return client.Stream(ctx, messages, einomodel.WithTools(request.Tools))
-}
-
-func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message) error {
-	calls, err := normalizeToolCalls(msg.ToolCalls)
-	if err != nil {
-		return err
-	}
-	ordinal := int64(0)
-	if msg.Content != "" {
-		if err := o.appendPart(ctx, session.Part{
-			ID:        o.IDs.NewPartID(),
-			MessageID: messageID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			Kind:      session.PartText,
-			Ordinal:   ordinal,
-			Payload:   mustJSON(map[string]string{"text": msg.Content}),
-			CreatedAt: o.now(),
-			UpdatedAt: o.now(),
-		}); err != nil {
-			return err
-		}
-		ordinal++
-	}
-	if msg.ReasoningContent != "" {
-		if err := o.appendPart(ctx, session.Part{
-			ID:        o.IDs.NewPartID(),
-			MessageID: messageID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			Kind:      session.PartReasoning,
-			Ordinal:   ordinal,
-			Payload:   mustJSON(map[string]string{"text": msg.ReasoningContent}),
-			CreatedAt: o.now(),
-			UpdatedAt: o.now(),
-		}); err != nil {
-			return err
-		}
-		ordinal++
-	}
-	for _, call := range calls {
-		payload := toolCallPayload{
-			ID:        call.call.ID,
-			Name:      call.call.Function.Name,
-			Arguments: call.arguments,
-		}
-		if err := o.appendPart(ctx, session.Part{
-			ID:        o.IDs.NewPartID(),
-			MessageID: messageID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			Kind:      session.PartToolCall,
-			Ordinal:   ordinal,
-			Payload:   mustJSON(payload),
-			CreatedAt: o.now(),
-			UpdatedAt: o.now(),
-		}); err != nil {
-			return err
-		}
-		ordinal++
-	}
-	return nil
-}
-
-type normalizedToolCall struct {
-	call      einoschema.ToolCall
-	arguments json.RawMessage
-}
-
-func normalizeToolCalls(calls []einoschema.ToolCall) ([]normalizedToolCall, error) {
-	normalized := make([]normalizedToolCall, 0, len(calls))
-	for _, call := range calls {
-		arguments, err := normalizedToolArguments(call.Function.Arguments)
-		if err != nil {
-			return nil, err
-		}
-		normalized = append(normalized, normalizedToolCall{call: call, arguments: arguments})
-	}
-	return normalized, nil
-}
-
-type preparedToolCall struct {
-	schemaCall    einoschema.ToolCall
-	tool          Tool
-	call          ToolCall
-	middlewareErr error
-}
-
-func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []einoschema.ToolCall) ([]preparedToolCall, error) {
-	byName := map[string]Tool{}
-	for _, tool := range snapshot.Tools {
-		byName[tool.Name] = tool
-	}
-	prepared := make([]preparedToolCall, 0, len(calls))
-	for _, schemaCall := range calls {
-		callID := session.ToolCallID(schemaCall.ID)
-		if callID == "" {
-			callID = o.IDs.NewToolCallID()
-		}
-		tool, ok := byName[schemaCall.Function.Name]
-		if !ok || tool.Executor == nil {
-			err := fmt.Errorf("tool %q unavailable", schemaCall.Function.Name)
-			o.observeToolSettled(ctx, snapshot, Tool{Name: schemaCall.Function.Name}, ToolCall{
-				ID:        callID,
-				SessionID: snapshot.SessionID,
-				RunID:     snapshot.RunID,
-				MessageID: messageID,
-				Name:      schemaCall.Function.Name,
-			}, session.ToolCallFailed, 0, err, nil)
-			return nil, err
-		}
-		input, err := normalizedToolArguments(schemaCall.Function.Arguments)
-		if err != nil {
-			return nil, err
-		}
-		if tool.InputDecoder != nil {
-			decoded, err := tool.InputDecoder.DecodeToolInput(ctx, input)
-			if err != nil {
-				return nil, err
-			}
-			input = decoded
-		}
-		call := ToolCall{
-			ID:        callID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			MessageID: messageID,
-			Name:      schemaCall.Function.Name,
-			Scope:     tool.Scope,
-			Input:     cloneJSON(input),
-		}
-		input, middlewareErr := o.beforeToolCall(ctx, tool, call)
-		call.Input = cloneJSON(input)
-		if middlewareErr == nil {
-			if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-				prepared, err := extension.Invoke(plan.Dispatch, ctx, ToolPreparePoint, PreparedToolCall{Tool: tool, Call: call}, func(_ context.Context, value PreparedToolCall) (PreparedToolCall, error) { return value, nil })
-				if err != nil {
-					middlewareErr = err
-				} else {
-					tool, call, input = prepared.Tool, prepared.Call, cloneJSON(prepared.Call.Input)
-				}
-			}
-		}
-		call.Pattern = toolPattern(input, schemaCall.Function.Name)
-		schemaCall.Function.Arguments = string(input)
-		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-			_ = extension.Notify(plan.Dispatch, ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
-		}
-		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: middlewareErr})
-	}
-	return prepared, nil
-}
-
-func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.Message, error) {
-	messages := make([]*einoschema.Message, 0, len(calls))
-	var settlementStore session.ToolSettlementStore
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Descriptor.Mode == session.PlanStrict {
-		var ok bool
-		settlementStore, ok = o.Store.(session.ToolSettlementStore)
-		if !ok {
-			return nil, fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)
-		}
-	}
-	for _, prepared := range calls {
-		schemaCall := prepared.schemaCall
-		tool := prepared.tool
-		call := prepared.call
-		callID := call.ID
-		input := call.Input
-		var resultMessageID session.MessageID
-		var resultPartID session.PartID
-		if settlementStore != nil {
-			resultMessageID = o.IDs.NewMessageID()
-			resultPartID = o.IDs.NewPartID()
-		}
-		record, err := o.Store.CreateToolCall(ctx, session.ToolCall{
-			ID:              callID,
-			SessionID:       snapshot.SessionID,
-			RunID:           snapshot.RunID,
-			MessageID:       messageID,
-			ResultMessageID: resultMessageID,
-			ResultPartID:    resultPartID,
-			Name:            call.Name,
-			Input:           cloneJSON(input),
-			Status:          session.ToolCallPending,
-			RetrySafe:       tool.RetrySafe,
-			Metadata:        cloneStringMap(tool.Metadata),
-		})
-		if err != nil {
-			return nil, err
-		}
-		call.ResultMessageID = record.ResultMessageID
-		call.ResultPartID = record.ResultPartID
-		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{
-			ID:        string(callID),
-			Name:      call.Name,
-			Arguments: cloneJSON(input),
-		})
-		record.Status = session.ToolCallRunning
-		record.ClaimedBy = o.ownerID()
-		record.ClaimToken = string(o.IDs.NewEventID())
-		record.LeaseUntil = o.now().Add(o.lease())
-		record.StartedAt = o.now()
-		if _, err := o.Store.ClaimToolCall(ctx, record); err != nil {
-			return nil, err
-		}
-		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-			_ = extension.Notify(plan.Dispatch, ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
-		}
-		_ = o.emitToolCall(ctx, snapshot, messageID, callID, session.ToolCallRunning, toolCallPayload{
-			ID:        string(callID),
-			Name:      call.Name,
-			Arguments: cloneJSON(input),
-		})
-		o.observeToolMaterialized(ctx, snapshot, tool, call)
-		observedTool := o.startObservedToolCall(ctx, snapshot, tool, call)
-		outcome := ToolOutcome{Call: cloneToolCall(call), Disposition: ToolFailed, RawError: prepared.middlewareErr, Error: classifyExtensionError(prepared.middlewareErr)}
-		if prepared.middlewareErr == nil {
-			outcome = o.executeToolOutcome(ctx, tool, call)
-			outcome = o.afterToolOutcome(ctx, tool, outcome)
-		}
-		outcome = o.transformToolOutcome(ctx, outcome)
-		result, execErr := outcome.Result, outcome.RawError
-		output, status, errText := encodeToolOutput(callID, result, tool.Retention, outcome.Disposition, execErr)
-		record.Status = status
-		record.Output = cloneJSON(output)
-		record.CompletedAt = o.now()
-		record.Error = errText
-		toolMessageID := resultMessageID
-		if toolMessageID == "" {
-			toolMessageID = o.IDs.NewMessageID()
-		}
-		toolPartID := resultPartID
-		if toolPartID == "" {
-			toolPartID = o.IDs.NewPartID()
-		}
-		resultMessage := session.Message{
-			ID: toolMessageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, ParentID: messageID,
-			Role: session.RoleTool, ModelID: string(snapshot.Model.Model.ID), CreatedAt: o.now(), UpdatedAt: o.now(),
-		}
-		resultPart := session.Part{
-			ID: toolPartID, MessageID: toolMessageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID,
-			Kind: session.PartToolResult, Payload: cloneJSON(output), CreatedAt: o.now(), UpdatedAt: o.now(),
-		}
-		if settlementStore != nil {
-			err = settlementStore.SettleToolCall(context.WithoutCancel(ctx), session.ToolSettlement{ID: callID, ClaimedBy: record.ClaimedBy, ClaimToken: record.ClaimToken, Status: status, Output: cloneJSON(output), Error: errText, Metadata: cloneStringMap(record.Metadata), CompletedAt: record.CompletedAt, ResultMessage: resultMessage, ResultPart: resultPart})
-		} else {
-			err = o.Store.FinishToolCall(ctx, record)
-			if err == nil {
-				_, err = o.Store.AppendMessage(ctx, resultMessage)
-			}
-			if err == nil {
-				err = o.appendPart(ctx, resultPart)
-			}
-		}
-		if err != nil {
-			o.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
-			o.observeToolSettled(ctx, snapshot, tool, call, session.ToolCallFailed, o.now().Sub(record.StartedAt), err, nil)
-			return nil, err
-		}
-		if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-			_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Status: status, Result: result, Error: classifyExtensionError(execErr)})
-		}
-		o.finishObservedToolCall(observedTool, status, execErr, result.Metadata)
-		o.observeToolSettled(ctx, snapshot, tool, call, status, record.CompletedAt.Sub(record.StartedAt), execErr, result.Metadata)
-		_ = o.emitToolCall(ctx, snapshot, messageID, callID, status, toolCallEventPayload(output, schemaCall.Function.Name, input))
-		messages = append(messages, einoschema.ToolMessage(string(output), string(callID), einoschema.WithToolName(schemaCall.Function.Name)))
-		if errors.Is(execErr, context.Canceled) {
-			return messages, execErr
-		}
-	}
-	return messages, nil
-}
-
-func (o *StreamingOrchestrator) appendPart(ctx context.Context, part session.Part) error {
-	_, err := o.Store.AppendPart(ctx, part)
-	return err
-}
-
-func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, tool Tool, call ToolCall) ToolOutcome {
-	guard, guardErr := evaluateToolGuards(ctx, runPlanFromContext(ctx), tool, call)
+func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, execution *runExecution, tool Tool, call ToolCall) ToolOutcome {
+	guard, guardErr := evaluateToolGuards(ctx, execution.plan, tool, call)
 	if guardErr != nil {
 		return ToolOutcome{Call: cloneToolCall(call), Disposition: dispositionForError(guardErr), RawError: guardErr, Error: classifyExtensionError(guardErr)}
 	}
@@ -807,17 +350,16 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, tool Too
 	}
 	wrapped := cloneTool(tool)
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		plan := runPlanFromContext(ctx)
-		if plan == nil || plan.Dispatch == nil {
+		if execution.dispatch() == nil {
 			return tool.Executor.Execute(ctx, call)
 		}
-		outcome, err := extension.Invoke(plan.Dispatch, ctx, ToolExecutePoint, ToolExecution{Tool: tool, Call: call}, func(ctx context.Context, input ToolExecution) (ToolOutcome, error) {
-			result, execErr := input.Tool.Executor.Execute(ctx, input.Call)
+		outcome, err := extension.Invoke(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolOutcome, error) {
+			result, execErr := tool.Executor.Execute(ctx, call)
 			disposition := ToolExecuted
 			if execErr != nil {
 				disposition = dispositionForError(execErr)
 			}
-			return sealToolOutcome(ToolOutcome{Call: cloneToolCall(input.Call), Disposition: disposition, Result: result, RawError: execErr, Error: classifyExtensionError(execErr)}), nil
+			return sealToolOutcome(ToolOutcome{Call: extensionToolCall(call), Disposition: disposition, Result: result, RawError: execErr, Error: classifyExtensionError(execErr)}), nil
 		})
 		if err != nil {
 			return ToolResult{}, err
@@ -858,10 +400,10 @@ func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool,
 	return outcome
 }
 
-func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, outcome ToolOutcome) ToolOutcome {
+func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, execution *runExecution, outcome ToolOutcome) ToolOutcome {
 	outcome = sealToolOutcome(outcome)
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		transformed, err := extension.Invoke(plan.Dispatch, ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
+	if execution.dispatch() != nil {
+		transformed, err := extension.Invoke(execution.dispatch(), ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
 		if err != nil {
 			outcome.RawError = errors.Join(outcome.RawError, err)
 			outcome.Error = classifyExtensionError(outcome.RawError)
@@ -945,26 +487,7 @@ func (o *StreamingOrchestrator) afterToolCall(ctx context.Context, tool Tool, ca
 	return result, nil
 }
 
-func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {
-	sink := o.eventSink(ctx)
-	if sink == nil {
-		return nil
-	}
-	return sink.Emit(ctx, Event{
-		Kind:       EventToolCallUpdated,
-		SessionID:  snapshot.SessionID,
-		RunID:      snapshot.RunID,
-		MessageID:  messageID,
-		ToolCallID: callID,
-		EpochID:    snapshot.EpochID,
-		ProviderID: string(snapshot.Model.Provider.ID),
-		ModelID:    string(snapshot.Model.Model.ID),
-		Payload:    mustJSON(withToolStatus(payload, status)),
-		Time:       o.now(),
-	})
-}
-
-func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, result Result) (Result, bool) {
+func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecution, run session.Run, result Result) (Result, bool) {
 	if result.Status == "" {
 		result.Status = session.RunCompleted
 	}
@@ -984,7 +507,7 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, run session.Run, res
 	for _, hook := range o.Hooks {
 		_ = hook.AfterRun(context.WithoutCancel(ctx), result)
 	}
-	if sink := o.eventSink(ctx); sink != nil {
+	if sink := execution.eventSink(o.Events); sink != nil {
 		_ = sink.Emit(context.WithoutCancel(ctx), Event{
 			Kind:      EventRunFinished,
 			SessionID: run.SessionID,
@@ -1147,58 +670,6 @@ func eventError(err error) EventError {
 	return EventError{Message: err.Error()}
 }
 
-func encodeToolOutput(callID session.ToolCallID, result ToolResult, policy RetentionPolicy, disposition ToolDisposition, err error) (json.RawMessage, session.ToolCallStatus, string) {
-	payload := toolOutputPayload{
-		ToolCallID: string(callID),
-		Status:     "completed",
-	}
-	switch disposition {
-	case ToolDenied, ToolApprovalRequired:
-		payload.Status = "expected_failure"
-		applyToolOutputBounds(&payload, result, policy)
-		return mustJSON(payload), session.ToolCallFailed, ""
-	case ToolInterrupted:
-		payload.Status = "interrupted"
-		if err == nil {
-			applyToolOutputBounds(&payload, result, policy)
-			return mustJSON(payload), session.ToolCallInterrupted, ""
-		}
-		payload.Content = "tool execution failed"
-		return mustJSON(payload), session.ToolCallInterrupted, err.Error()
-	case ToolFailed:
-		payload.Status = "operational_failure"
-		payload.Content = "tool execution failed"
-		if err == nil {
-			return mustJSON(payload), session.ToolCallFailed, ""
-		}
-		return mustJSON(payload), session.ToolCallFailed, err.Error()
-	case ToolExecuted:
-		if err != nil {
-			payload.Status = "operational_failure"
-			payload.Content = "tool execution failed"
-			return mustJSON(payload), session.ToolCallFailed, err.Error()
-		}
-	default:
-		payload.Status = "operational_failure"
-		payload.Content = "tool execution failed"
-		return mustJSON(payload), session.ToolCallFailed, "invalid tool disposition"
-	}
-	applyToolOutputBounds(&payload, result, policy)
-	return mustJSON(payload), session.ToolCallCompleted, ""
-}
-
-type toolOutputPayload struct {
-	ToolCallID   string          `json:"tool_call_id"`
-	Status       string          `json:"status"`
-	Content      string          `json:"content,omitempty"`
-	Structured   json.RawMessage `json:"structured,omitempty"`
-	Truncated    bool            `json:"truncated,omitempty"`
-	OriginalSize int64           `json:"original_size,omitempty"`
-	InlineSize   int64           `json:"inline_size,omitempty"`
-	External     bool            `json:"external,omitempty"`
-	Redacted     bool            `json:"redacted,omitempty"`
-}
-
 type toolCallPayload struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
@@ -1218,50 +689,6 @@ func normalizedToolArguments(arguments string) (json.RawMessage, error) {
 		}
 	}
 	return cloneJSON(raw), nil
-}
-
-func applyToolOutputBounds(output *toolOutputPayload, result ToolResult, policy RetentionPolicy) {
-	output.OriginalSize = int64(len(result.Output))
-	if policy.Redact {
-		output.Redacted = true
-		output.External = policy.StoreExternal && (result.Output != "" || len(result.Structured) > 0)
-		return
-	}
-	content := result.Output
-	if policy.MaxInlineBytes >= 0 && int64(len(content)) > policy.MaxInlineBytes {
-		content = validUTF8Prefix(content, int(policy.MaxInlineBytes))
-		output.Truncated = true
-		output.External = policy.StoreExternal
-	}
-	output.Content = content
-	output.InlineSize = int64(len(content))
-	if len(result.Structured) == 0 {
-		return
-	}
-	output.OriginalSize += int64(len(result.Structured))
-	if policy.MaxInlineBytes >= 0 {
-		remaining := policy.MaxInlineBytes - output.InlineSize
-		if remaining < int64(len(result.Structured)) {
-			output.Truncated = true
-			output.External = policy.StoreExternal
-			return
-		}
-	}
-	output.Structured = cloneJSON(result.Structured)
-	output.InlineSize += int64(len(result.Structured))
-}
-
-func validUTF8Prefix(content string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if limit > len(content) {
-		limit = len(content)
-	}
-	for limit > 0 && !utf8.ValidString(content[:limit]) {
-		limit--
-	}
-	return content[:limit]
 }
 
 func normalizeToolCallIDs(msg *einoschema.Message, ids IDGenerator) {
@@ -1307,122 +734,4 @@ func (h *streamingHandle) Interrupt(_ context.Context, reason string) error {
 }
 func (h *streamingHandle) FollowUp(context.Context, []*einoschema.Message) error {
 	return ErrUnsupportedOperation
-}
-
-type streamObserver struct {
-	queue     *eventQueue
-	base      TurnSnapshot
-	messageID session.MessageID
-	now       func() time.Time
-	mu        sync.Mutex
-	usage     model.Usage
-}
-
-func (o *streamObserver) OnProviderStart(context.Context, model.Request) {}
-func (o *streamObserver) OnProviderDelta(_ context.Context, delta model.StreamDelta) {
-	o.setUsage(delta.Usage)
-}
-func (o *streamObserver) OnProviderError(context.Context, model.Error) {}
-func (o *streamObserver) OnProviderEnd(_ context.Context, response model.Response) {
-	o.setUsage(response.Usage)
-}
-
-func (o *streamObserver) setUsage(usage model.Usage) {
-	if o == nil {
-		return
-	}
-	o.mu.Lock()
-	o.usage = mergeUsage(o.usage, usage)
-	o.mu.Unlock()
-}
-
-func (o *streamObserver) usageSnapshot() model.Usage {
-	if o == nil {
-		return model.Usage{}
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.usage
-}
-
-// resolveStreamUsage picks the token usage for a completed model stream. A
-// runtime Streamer adapter reports usage through the ProviderObserver (the
-// `observed` snapshot); the default client-streaming path (resolved.Client, no
-// Streamer) has no such adapter, so the provider's usage instead rides on the
-// concatenated message's ResponseMeta.Usage — the standard Eino usage channel.
-// Prefer the observed usage when present, else fall back to the message's
-// ResponseMeta.Usage so token totals flow on the client path too (without this,
-// run consumers on the client path see zero tokens even when the model reports
-// them).
-func resolveStreamUsage(observed model.Usage, msg *einoschema.Message) model.Usage {
-	if observed.InputTokens != 0 || observed.OutputTokens != 0 {
-		return observed
-	}
-	if msg != nil && msg.ResponseMeta != nil && msg.ResponseMeta.Usage != nil {
-		u := msg.ResponseMeta.Usage
-		return model.Usage{
-			InputTokens:  int64(u.PromptTokens),
-			OutputTokens: int64(u.CompletionTokens),
-		}
-	}
-	return observed
-}
-
-func mergeUsage(current model.Usage, next model.Usage) model.Usage {
-	if next.InputTokens != 0 {
-		current.InputTokens = next.InputTokens
-	}
-	if next.OutputTokens != 0 {
-		current.OutputTokens = next.OutputTokens
-	}
-	if next.ReasoningTokens != 0 {
-		current.ReasoningTokens = next.ReasoningTokens
-	}
-	if next.CacheReadTokens != 0 {
-		current.CacheReadTokens = next.CacheReadTokens
-	}
-	if next.CacheWriteTokens != 0 {
-		current.CacheWriteTokens = next.CacheWriteTokens
-	}
-	if next.Cost != 0 {
-		current.Cost = next.Cost
-	}
-	return current
-}
-
-type eventQueue struct {
-	ctx    context.Context
-	events chan Event
-	sink   EventSink
-	done   chan struct{}
-}
-
-func newEventQueue(ctx context.Context, size int, sink EventSink) *eventQueue {
-	if size <= 0 {
-		size = 1
-	}
-	q := &eventQueue{ctx: ctx, events: make(chan Event, size), sink: sink, done: make(chan struct{})}
-	go func() {
-		defer close(q.done)
-		for event := range q.events {
-			if q.sink != nil {
-				_ = q.sink.Emit(ctx, event)
-			}
-		}
-	}()
-	return q
-}
-
-func (q *eventQueue) emit(event Event) error {
-	select {
-	case <-q.ctx.Done():
-		return q.ctx.Err()
-	case q.events <- event:
-		return nil
-	}
-}
-
-func (q *eventQueue) close() {
-	close(q.events)
-	<-q.done
 }

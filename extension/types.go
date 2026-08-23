@@ -222,6 +222,7 @@ func (f InstallerFunc) Install(ctx context.Context, registrar Registrar) error {
 type Registrar interface {
 	register(registrationEntry) error
 	Defer(Cleanup) error
+	Lease(Scope) error
 }
 
 type entryKind uint8

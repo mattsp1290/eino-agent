@@ -545,6 +545,63 @@ func TestDeactivateSnapshotIsolationAndCloseDrain(t *testing.T) {
 	}
 }
 
+func TestExplicitLeaseScopesRespectTargetAndInstanceFilters(t *testing.T) {
+	newLeaseMount := func(t *testing.T, registry *Registry, instance string) *Mount {
+		t.Helper()
+		mount, err := registry.Mount(context.Background(), testComponent(instance), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return registrar.Lease(SessionScope("session-a"))
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mount
+	}
+
+	t.Run("included instance drains", func(t *testing.T) {
+		registry := NewRegistry(nil)
+		mount := newLeaseMount(t, registry, "included-lease")
+		plan, err := registry.SnapshotInstances(SessionScope("session-a"), []string{"included-lease"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mount.Deactivate()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+		defer cancel()
+		if err := mount.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("Close before included lease release = %v", err)
+		}
+		plan.Release()
+		if err := mount.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("excluded instance and target do not drain", func(t *testing.T) {
+		for _, test := range []struct {
+			name   string
+			target Scope
+			ids    []string
+		}{
+			{name: "instance", target: SessionScope("session-a"), ids: []string{"some-other-instance"}},
+			{name: "target", target: SessionScope("session-b"), ids: []string{"excluded-lease"}},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				registry := NewRegistry(nil)
+				mount := newLeaseMount(t, registry, "excluded-lease")
+				plan, err := registry.SnapshotInstances(test.target, test.ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer plan.Release()
+				mount.Deactivate()
+				if err := mount.Close(context.Background()); err != nil {
+					t.Fatalf("unrelated plan retained mount: %v", err)
+				}
+			})
+		}
+	})
+}
+
 func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
 	registry := NewRegistry(nil)
 	secret := errors.New("credential-sentinel-do-not-persist")

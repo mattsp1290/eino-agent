@@ -42,10 +42,15 @@ func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	settlement, part, err := tools.BuildToolSettlement(runtime.Tool{Retention: runtime.RetentionPolicy{MaxInlineBytes: 100}}, runtime.ToolCall{
+	tool := runtime.Tool{Retention: runtime.RetentionPolicy{MaxInlineBytes: 100}}
+	call := runtime.ToolCall{
 		ID: durable.ID, SessionID: durable.SessionID, RunID: durable.RunID, MessageID: durable.MessageID,
 		ResultMessageID: durable.ResultMessageID, ResultPartID: durable.ResultPartID, Name: durable.Name,
-	}, runtime.ToolResult{Output: "ok"}, nil, session.ToolClaimIdentity{ClaimedBy: durable.ClaimedBy, ClaimToken: durable.ClaimToken})
+	}
+	settlement, part, err := tools.BuildToolSettlement(runtime.ToolSettlementInput{
+		Tool: tool, Call: call, Claimed: durable, Disposition: runtime.ToolExecuted,
+		Result: runtime.ToolResult{Output: "ok"}, CompletedAt: now.Add(time.Second),
+	})
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}

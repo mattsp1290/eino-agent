@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -99,12 +100,13 @@ func TestEncodeModelOutputSuppressesToolControlledFieldsWhenTruncated(t *testing
 }
 
 func TestBuildToolSettlementClassifiesExpectedFailure(t *testing.T) {
-	settlement, part, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{
+	result := runtime.ToolResult{
 		Output: "denied by policy",
 		Metadata: map[string]string{
 			MetadataPermissionStatus: "denied",
 		},
-	}, nil, toolClaim())
+	}
+	settlement, part, err := BuildToolSettlement(settlementInput(runtime.Tool{}, toolCall(), result, nil))
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}
@@ -131,9 +133,10 @@ func TestBuildToolSettlementClassifiesExpectedFailure(t *testing.T) {
 
 func TestBuildToolSettlementClassifiesOperationalFailureWithoutLeakingErrorToModel(t *testing.T) {
 	errBoom := errors.New("database password appeared in a lower layer")
-	settlement, part, err := BuildToolSettlement(runtime.Tool{
+	tool := runtime.Tool{
 		Retention: runtime.RetentionPolicy{MaxInlineBytes: 200},
-	}, toolCall(), runtime.ToolResult{}, errBoom, toolClaim())
+	}
+	settlement, part, err := BuildToolSettlement(settlementInput(tool, toolCall(), runtime.ToolResult{}, errBoom))
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}
@@ -146,7 +149,7 @@ func TestBuildToolSettlementClassifiesOperationalFailureWithoutLeakingErrorToMod
 }
 
 func TestBuildToolSettlementClassifiesInterruption(t *testing.T) {
-	settlement, part, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, context.Canceled, toolClaim())
+	settlement, part, err := BuildToolSettlement(settlementInput(runtime.Tool{}, toolCall(), runtime.ToolResult{}, context.Canceled))
 	if err != nil {
 		t.Fatalf("build settlement: %v", err)
 	}
@@ -159,10 +162,14 @@ func TestBuildToolSettlementClassifiesInterruption(t *testing.T) {
 }
 
 func TestBuildToolSettlementRequiresClaimIdentity(t *testing.T) {
-	if _, _, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, nil); err == nil {
+	input := settlementInput(runtime.Tool{}, toolCall(), runtime.ToolResult{}, nil)
+	input.Claimed.ClaimedBy = ""
+	if _, _, err := BuildToolSettlement(input); err == nil {
 		t.Fatal("BuildToolSettlement accepted missing claim identity")
 	}
-	if _, _, err := BuildToolSettlement(runtime.Tool{}, toolCall(), runtime.ToolResult{}, nil, session.ToolClaimIdentity{}); err == nil {
+	input = settlementInput(runtime.Tool{}, toolCall(), runtime.ToolResult{}, nil)
+	input.Claimed.ClaimToken = ""
+	if _, _, err := BuildToolSettlement(input); err == nil {
 		t.Fatal("BuildToolSettlement accepted empty claim identity")
 	}
 }
@@ -178,7 +185,7 @@ func TestBuildToolSettlementRequiresReservedResultIDs(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			call := toolCall()
 			test.mutate(&call)
-			if _, _, err := BuildToolSettlement(runtime.Tool{}, call, runtime.ToolResult{}, nil, toolClaim()); err == nil {
+			if _, _, err := BuildToolSettlement(settlementInput(runtime.Tool{}, call, runtime.ToolResult{}, nil)); err == nil {
 				t.Fatal("BuildToolSettlement accepted missing reserved result ID")
 			}
 		})
@@ -187,6 +194,23 @@ func TestBuildToolSettlementRequiresReservedResultIDs(t *testing.T) {
 
 func toolClaim() session.ToolClaimIdentity {
 	return session.ToolClaimIdentity{ClaimedBy: "worker", ClaimToken: "token"}
+}
+
+func settlementInput(tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, err error) runtime.ToolSettlementInput {
+	claim := toolClaim()
+	return runtime.ToolSettlementInput{
+		Tool: tool,
+		Call: call,
+		Claimed: session.ToolCall{
+			ID: call.ID, SessionID: call.SessionID, RunID: call.RunID, MessageID: call.MessageID,
+			ResultMessageID: call.ResultMessageID, ResultPartID: call.ResultPartID,
+			ClaimedBy: claim.ClaimedBy, ClaimToken: claim.ClaimToken,
+		},
+		Disposition: dispositionFromResult(result, err),
+		Result:      result,
+		Err:         err,
+		CompletedAt: time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC),
+	}
 }
 
 func toolCall() runtime.ToolCall {

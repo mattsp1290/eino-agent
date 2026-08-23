@@ -26,14 +26,13 @@ func TestSystemPromptMaterializationIsExplicitAndOrdered(t *testing.T) {
 		{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })},
 		{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })},
 	}}
-	ctx := withRunPlan(context.Background(), plan)
 	orchestrator := &StreamingOrchestrator{}
-	text, err := orchestrator.renderSystemPrompt(ctx, snapshot, 1, 2)
+	text, err := orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
 	if err != nil || text != "first\n\nlast" {
 		t.Fatalf("default-off prompt = %q, %v", text, err)
 	}
 	orchestrator.SystemPromptMaterialization = true
-	text, err = orchestrator.renderSystemPrompt(ctx, snapshot, 1, 2)
+	text, err = orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
 	if err != nil || text != "first\n\nconfigured\n\nlast" {
 		t.Fatalf("enabled prompt = %q, %v", text, err)
 	}
@@ -75,7 +74,7 @@ func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 		executed = true
 		return ToolResult{Output: "bad"}, nil
 	})}
-	outcome := orchestrator.executeToolOutcome(withRunPlan(context.Background(), plan), tool, ToolCall{ID: "call", Name: "danger", Input: []byte(`{}`)})
+	outcome := orchestrator.executeToolOutcome(context.Background(), newRunExecution(orchestrator, plan), tool, ToolCall{ID: "call", Name: "danger", Input: []byte(`{}`)})
 	if outcome.Disposition != ToolDenied || outcome.Result.Metadata["permission_status"] != "denied" || permissionsCalled || executed || !reflect.DeepEqual(sequence, []string{"deny", "audit"}) {
 		t.Fatalf("outcome=%#v permissions=%t executed=%t sequence=%v", outcome, permissionsCalled, executed, sequence)
 	}
@@ -180,7 +179,7 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 	}
 }
 
-func TestModelStreamValidationAcceptsUnchangedFunctionBackedModelWithoutHandlers(t *testing.T) {
+func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "unrelated", Artifact: extension.Artifact{Name: "unrelated", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -198,8 +197,12 @@ func TestModelStreamValidationAcceptsUnchangedFunctionBackedModelWithoutHandlers
 	client := functionClient(clientFunctionOne)
 	terminalCalled := false
 	observer := functionObserver(func() {})
-	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, ModelStreamInput{Resolved: model.Resolved{Client: client, Streamer: streamer}, Request: model.Request{Observer: observer}}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+	input := extensionModelStreamInput(ModelStreamInput{Resolved: model.Resolved{Client: client, Streamer: streamer}, Request: model.Request{Observer: observer}})
+	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, input, func(_ context.Context, value ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		terminalCalled = true
+		if value.Resolved.Client != nil || value.Resolved.Streamer != nil || value.Request.Observer != nil {
+			t.Fatal("model stream terminal received host callable")
+		}
 		reader, writer := einoschema.Pipe[*einoschema.Message](1)
 		writer.Close()
 		return reader, nil
@@ -211,7 +214,7 @@ func TestModelStreamValidationAcceptsUnchangedFunctionBackedModelWithoutHandlers
 }
 
 func TestModelStreamValidationRejectsCallableReplacement(t *testing.T) {
-	original := ModelStreamInput{Resolved: model.Resolved{Client: functionClient(clientFunctionOne), Streamer: functionStreamer(streamFromFunction)}}
+	original := extensionModelStreamInput(ModelStreamInput{Resolved: model.Resolved{Client: functionClient(clientFunctionOne), Streamer: functionStreamer(streamFromFunction)}})
 	candidate := cloneModelStreamInput(original)
 	candidate.Resolved.Client = functionClient(clientFunctionTwo)
 	if err := validateModelStreamInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
@@ -325,7 +328,8 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 		return []Tool{{Name: "echo"}}, nil
 	})}
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
-	prepared, err := (&StreamingOrchestrator{}).prepareSnapshot(withRunPlan(context.Background(), plan), snapshot, "message")
+	host := &StreamingOrchestrator{}
+	prepared, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot, "message")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,22 +338,26 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	}
 }
 
-func TestInterfaceIdentitySupportsFunctionValuesAndPointerIdentity(t *testing.T) {
-	callable := runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
-	if !sameInterfaceIdentity(callable, callable) {
-		t.Fatal("unchanged function-backed callable lost identity")
+func TestProtectedViewsRejectCallableInjection(t *testing.T) {
+	modelInput := extensionModelStreamInput(ModelStreamInput{})
+	modelCandidate := cloneModelStreamInput(modelInput)
+	modelCandidate.Resolved.Streamer = functionStreamer(streamFromFunction)
+	if err := validateModelStreamInput(modelInput, modelCandidate); !errors.Is(err, extension.ErrProtectedMutation) {
+		t.Fatalf("streamer injection validation = %v", err)
 	}
-	functionFactory := func(marker string) runtimeToolExecutorFunc {
-		return func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: marker}, nil }
+
+	tool := extensionTool(Tool{Name: "tool"})
+	toolCandidate := cloneTool(tool)
+	toolCandidate.Executor = runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
+	if sameProtectedTool(tool, toolCandidate) {
+		t.Fatal("executor injection passed protected tool validation")
 	}
-	if sameInterfaceIdentity(functionFactory("first"), functionFactory("second")) {
-		t.Fatal("distinct closures from the same factory shared identity")
-	}
-	first := &callable
-	other := callable
-	second := &other
-	if !sameInterfaceIdentity(first, first) || sameInterfaceIdentity(first, second) {
-		t.Fatal("pointer-backed callable identity comparison is not exact")
+
+	call := extensionToolCall(ToolCall{ID: "call"})
+	callCandidate := cloneToolCall(call)
+	callCandidate.Approval = approvalFunc(func(context.Context, ApprovalRequest) error { return nil })
+	if sameProtectedToolCall(call, callCandidate) {
+		t.Fatal("approval injection passed protected call validation")
 	}
 }
 
@@ -767,7 +775,7 @@ func TestResumeRunStrictCallbacksOnlyDoesNotRequireSettlementStore(t *testing.T)
 	}
 	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
 	orchestrator := &StreamingOrchestrator{Store: store, OwnerID: "new-owner", Clock: func() time.Time { return now }}
-	result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: descriptor}), run)
+	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, &RunPlan{Descriptor: descriptor}), run, nil)
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
 	}
@@ -796,7 +804,7 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
 	orchestrator := &StreamingOrchestrator{Store: store, Clock: func() time.Time { return now }}
 	done := make(chan Result, 1)
-	orchestrator.executeResume(withRunPlan(context.Background(), &RunPlan{Dispatch: dispatch}), run, done)
+	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, &RunPlan{Dispatch: dispatch}), run, done)
 	result := <-done
 	if result.Error != nil || duration != 0 {
 		t.Fatalf("resume result=%+v duration=%s", result, duration)
@@ -876,7 +884,7 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			defer closePlan()
 			orchestrator := &StreamingOrchestrator{Store: store, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: time.Now}
 			done := make(chan Result, 1)
-			orchestrator.executeResume(withRunPlan(context.Background(), plan), run, done)
+			orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan), run, done)
 			result := <-done
 
 			if !errors.Is(result.Error, test.wantError) {

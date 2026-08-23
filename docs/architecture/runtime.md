@@ -132,6 +132,13 @@ captures:
 Runtime setters, config reloads, hook changes, and user follow-ups affect future
 turn snapshots only. They do not mutate an in-flight model call.
 
+Each fresh or resumed run also owns an explicit internal execution object. It
+holds the frozen `RunPlan`, extension dispatch, and composed event sink and is
+passed through admission, request-ledger, model, tool, settlement, and resume
+boundaries. Run-plan state is never hidden in `context.Context`; contexts carry
+cancellation and deadlines only. The execution object releases its frozen plan
+exactly once when the run goroutine exits.
+
 Compaction creates a new `session.ContextEpoch`. A context epoch records the
 parent epoch, summarized message range, summary message, retained tail start,
 provider/model used for the summary, trigger/reason, and next-run policy.
@@ -170,8 +177,9 @@ Every tool call follows this durable lifecycle:
 3. runtime claims the call with an owner and claim token before executing it;
 4. tool receives `context.Context`, session/run/message/call IDs, and an
    approval requester;
-5. runtime records output, attachments, metadata, or error;
-6. runtime writes a tool-result message/part for the next provider context;
+5. runtime converts the protected outcome to one bounded canonical output;
+6. runtime settles the call and reserved tool-result message/part through one
+   shared fresh/resume operation;
 7. observability receives tool start/end/error events.
 
 If interruption happens while a call is running, runtime settles the durable

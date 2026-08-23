@@ -17,8 +17,6 @@ import (
 	"github.com/mattsp1290/eino-agent/tools"
 )
 
-var leasePoint = extension.NewNotification(extension.Contract{ID: "eino-agent/composition/lease", Version: "1"}, extension.NotificationContained, func(value struct{}) struct{} { return value })
-
 type Installer interface {
 	Install(context.Context, *Registrar) error
 }
@@ -82,6 +80,9 @@ func (r *Registrar) Prompt(registration PromptRegistration) error {
 			return fmt.Errorf("%w: prompt %s", extension.ErrDuplicateRegistration, registration.Name)
 		}
 	}
+	if err := r.extensions.Lease(registration.Scope); err != nil {
+		return err
+	}
 	r.prompts = append(r.prompts, registration)
 	return nil
 }
@@ -93,6 +94,9 @@ func (r *Registrar) Guard(registration GuardRegistration) error {
 		}
 		return fmt.Errorf("%w: invalid guard registration", extension.ErrInvalidRegistration)
 	}
+	if err := r.extensions.Lease(registration.Scope); err != nil {
+		return err
+	}
 	r.guards = append(r.guards, registration)
 	return nil
 }
@@ -103,6 +107,9 @@ func (r *Registrar) RestrictTools(registration RestrictionRegistration) error {
 	}
 	registration.Allowed = append([]string(nil), registration.Allowed...)
 	registration.Denied = append([]string(nil), registration.Denied...)
+	if err := r.extensions.Lease(registration.Scope); err != nil {
+		return err
+	}
 	r.restrictions = append(r.restrictions, registration)
 	return nil
 }
@@ -143,6 +150,9 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 		InstanceID: r.component.InstanceID, ArtifactName: r.component.Artifact.Name,
 		ArtifactVersion: r.component.Artifact.Version, ArtifactHash: r.component.Artifact.Hash,
 		ConfigHash: r.component.Artifact.ConfigHash, ExecutorHash: r.component.Artifact.Hash,
+	}
+	if err := r.extensions.Lease(registration.Scope); err != nil {
+		return err
 	}
 	r.tools = append(r.tools, registration)
 	return nil
@@ -199,30 +209,6 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 			return err
 		}
 		staged = registrar
-		scopes := map[extension.Scope]bool{}
-		for _, registration := range registrar.tools {
-			scopes[registration.Scope] = true
-		}
-		for _, registration := range registrar.prompts {
-			scopes[registration.Scope] = true
-		}
-		for _, registration := range registrar.guards {
-			scopes[registration.Scope] = true
-		}
-		for _, registration := range registrar.restrictions {
-			scopes[registration.Scope] = true
-		}
-		if len(scopes) == 0 {
-			scopes[extension.GlobalScope()] = true
-		}
-		index := 0
-		for scope := range scopes {
-			id := fmt.Sprintf("composition-lease-%06d", index)
-			if err := extension.On(extensions, leasePoint, extension.Registration{ID: id, InstanceID: component.InstanceID, Order: -1 << 30, Scope: scope}, func(context.Context, struct{}) error { return nil }); err != nil {
-				return err
-			}
-			index++
-		}
 		return nil
 	}))
 	if err != nil {
@@ -656,9 +642,6 @@ func buildDescriptor(dispatch *extension.Plan, selected []mountedTool, prompts [
 	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: schemaVersion, Mode: mode}
 	byInstance := map[string]int{}
 	for _, diagnostic := range dispatch.Diagnostics() {
-		if diagnostic.Contract == leasePoint.Contract() {
-			continue
-		}
 		index, ok := byInstance[diagnostic.InstanceID]
 		if !ok {
 			index = len(descriptor.Entries)

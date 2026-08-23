@@ -104,7 +104,8 @@ func TestRunAdmittedNotificationWaitsForLegacyBeforeRunSuccess(t *testing.T) {
 	defer plan.Release()
 	beforeRunErr := errors.New("before run failed")
 	admitter := Admitter{Store: newAdmissionStore(), Hooks: []Hook{failingBeforeRunHook{err: beforeRunErr}}}
-	_, err = admitter.Admit(withRunPlan(context.Background(), &RunPlan{Dispatch: plan}), admissionRequest())
+	admitter.Extensions = plan
+	_, err = admitter.Admit(context.Background(), admissionRequest())
 	if !errors.Is(err, beforeRunErr) || called {
 		t.Fatalf("Admit error = %v, notification called = %t", err, called)
 	}

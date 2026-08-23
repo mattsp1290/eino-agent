@@ -17,12 +17,23 @@ tools, prompts, guards, and restrictions and implements
 blocks new snapshots immediately; `Close` waits for frozen plans to release and
 then runs effects in reverse order.
 
+Non-callback composition artifacts declare their lease scope directly through
+`extension.Registrar.Lease`. Snapshot target and instance filters apply to
+those leases exactly as they do to callback registrations, so an unrelated
+session or a later same-session mount cannot keep a component alive.
+
 ## Ordering and failure
 
 Entries sort by `(order, global-before-session, instance ID, registration ID)`.
 Around interceptors form an onion in that order. Their guarded `next` may be
 called once; required-delegation points reject a successful short circuit.
 Point-owned validators defend immutable identity and outcome fields.
+
+Callback-facing model, tool, and call values are data-only projections.
+Provider clients, streamers, observers, tool executors, input decoders, and
+approval requesters are always nil at the extension boundary; attempts to
+inject callable values fail closed. Runtime keeps the authoritative callables
+outside the callback graph and closes over them only in the terminal adapter.
 
 Notification handlers receive defensive copies. A handler error or panic is
 reported locally and never changes the run result or prevents later handlers.
@@ -97,6 +108,11 @@ decode/normalize
 Running calls found during resume are never re-executed. Strict plans reconcile
 or atomically settle their reserved result before notification. Pending calls
 reuse the persisted normalized input, so prepare transforms do not run twice.
+Fresh and pending-resume calls share one post-claim execution and settlement
+operation. It builds the bounded result payload, terminal call, result message,
+and result part at one completion time, commits them with a cancellation-free
+settlement context, and only then publishes the settled notice. Fresh execution
+alone publishes pending/running/terminal transport updates.
 
 ## Scope, provenance, and resume
 

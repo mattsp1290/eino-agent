@@ -54,6 +54,7 @@ type Admitter struct {
 	Transactor session.Transactor
 	Events     EventSink
 	Hooks      []Hook
+	Extensions *extension.Plan
 	Clock      func() time.Time
 }
 
@@ -207,8 +208,8 @@ func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRu
 			Time:       now,
 		})
 	}
-	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
-		_ = extension.Notify(plan.Dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor, Metadata: boundedTurnMetadata(admitted.Snapshot), Time: now})
+	if a.Extensions != nil {
+		_ = extension.Notify(a.Extensions, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: request.ExtensionPlan, Metadata: boundedTurnMetadata(admitted.Snapshot), Time: now})
 	}
 	return nil
 }

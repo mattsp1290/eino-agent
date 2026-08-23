@@ -1,0 +1,164 @@
+package runtime
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"time"
+
+	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/session"
+)
+
+type ClassifiedError struct {
+	Code      string
+	Message   string
+	Retryable bool
+}
+
+type RunAdmittedNotice struct {
+	SessionID session.ID
+	RunID     session.RunID
+	Plan      session.ExtensionPlanDescriptor
+	Metadata  BoundedTurnMetadata
+	Time      time.Time
+}
+
+type RunStartedNotice struct {
+	SessionID session.ID
+	RunID     session.RunID
+	Time      time.Time
+}
+
+type RunSettledNotice struct {
+	SessionID session.ID
+	Result    Result
+	Duration  time.Duration
+	Error     ClassifiedError
+}
+
+type ModelRequestedNotice struct {
+	SessionID       session.ID
+	RunID           session.RunID
+	MessageID       session.MessageID
+	Attempt         int
+	Step            int
+	ProviderID      string
+	ModelID         string
+	RequestRecordID session.ModelRequestID
+	MessageCount    int
+	ToolCount       int
+	ContentHash     string
+}
+
+type ModelCompletedNotice struct {
+	SessionID session.ID
+	RunID     session.RunID
+	MessageID session.MessageID
+	Attempt   int
+	Step      int
+	Usage     Usage
+	Error     ClassifiedError
+}
+
+type ToolPreparedNotice struct {
+	SessionID  session.ID
+	RunID      session.RunID
+	MessageID  session.MessageID
+	ToolCallID session.ToolCallID
+	ToolName   string
+	Input      json.RawMessage
+	Component  map[string]string
+}
+
+type ToolStartedNotice struct {
+	SessionID  session.ID
+	RunID      session.RunID
+	ToolCallID session.ToolCallID
+	ToolName   string
+	Time       time.Time
+}
+
+type ToolSettledNotice struct {
+	SessionID  session.ID
+	RunID      session.RunID
+	ToolCallID session.ToolCallID
+	ToolName   string
+	Status     session.ToolCallStatus
+	Result     ToolResult
+	Error      ClassifiedError
+}
+
+var (
+	RunBeforeExecutePoint    = extension.NewInterceptor(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, func(value RunGateInput) RunGateInput { return value }, validateRunGateInput, validateRunDecision)
+	ContextAssemblePoint     = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput, validateContextAssembly, validateContextAssemblyResult)
+	TurnPreparePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, cloneBoundedTurnMetadata, validateBoundedTurnMetadataInput, validateBoundedTurnMetadata, validateBoundedTurnMetadataResult)
+	ModelStreamPoint         = extension.NewRequiredDelegatingInterceptor(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateModelStreamInput, validateStreamReader, validateDelegatedStreamReader)
+	ToolPreparePoint         = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCall, validatePreparedToolCallInput, validatePreparedToolCall, validatePreparedToolCallResult)
+	ToolExecutePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecution, validateToolExecutionInput, validateToolOutcome, validateToolExecutionResult)
+	ToolResultTransformPoint = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-result-transform", Version: "1"}, cloneToolOutcome, validateToolOutcomeInput, validateToolOutcome, validateToolOutcomeResult)
+
+	RunAdmittedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-admitted", Version: "1"}, extension.NotificationContained, cloneRunAdmittedNotice)
+	RunStartedPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-started", Version: "1"}, extension.NotificationContained, func(value RunStartedNotice) RunStartedNotice { return value })
+	RunSettledPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-settled", Version: "1"}, extension.NotificationContained, cloneRunSettledNotice)
+	ModelRequestedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/model-requested", Version: "1"}, extension.NotificationContained, func(value ModelRequestedNotice) ModelRequestedNotice { return value })
+	ModelCompletedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/model-completed", Version: "1"}, extension.NotificationContained, func(value ModelCompletedNotice) ModelCompletedNotice { return value })
+	ToolPreparedPoint   = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-prepared", Version: "1"}, extension.NotificationContained, cloneToolPreparedNotice)
+	ToolStartedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-started", Version: "1"}, extension.NotificationContained, func(value ToolStartedNotice) ToolStartedNotice { return value })
+	ToolSettledPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-settled", Version: "1"}, extension.NotificationContained, cloneToolSettledNotice)
+	EventPublishedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/event-published", Version: "1"}, extension.NotificationContained, cloneEvent)
+)
+
+type compositeEventSink struct {
+	infrastructure EventSink
+	plan           *extension.Plan
+}
+
+func (s compositeEventSink) Emit(ctx context.Context, event Event) error {
+	var err error
+	if s.infrastructure != nil {
+		err = s.infrastructure.Emit(ctx, cloneEvent(event))
+	}
+	_ = extension.Notify(s.plan, ctx, EventPublishedPoint, event)
+	return err
+}
+
+func cloneRunAdmittedNotice(value RunAdmittedNotice) RunAdmittedNotice {
+	value.Plan = value.Plan.Clone()
+	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
+	return value
+}
+
+func cloneRunSettledNotice(value RunSettledNotice) RunSettledNotice { return value }
+
+func cloneToolPreparedNotice(value ToolPreparedNotice) ToolPreparedNotice {
+	value.Input = cloneJSON(value.Input)
+	value.Component = cloneStringMap(value.Component)
+	return value
+}
+
+func cloneToolSettledNotice(value ToolSettledNotice) ToolSettledNotice {
+	value.Result.Structured = cloneJSON(value.Result.Structured)
+	value.Result.Attachments = cloneAttachments(value.Result.Attachments)
+	value.Result.Metadata = cloneStringMap(value.Result.Metadata)
+	return value
+}
+
+func cloneEvent(value Event) Event {
+	value.Payload = cloneJSON(value.Payload)
+	return value
+}
+
+func classifyExtensionError(err error) ClassifiedError {
+	if err == nil {
+		return ClassifiedError{}
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return ClassifiedError{Code: "interrupted", Message: "operation interrupted", Retryable: true}
+	}
+	var callback *extension.CallbackError
+	if errors.As(err, &callback) {
+		return ClassifiedError{Code: callback.Code, Message: "extension callback failed"}
+	}
+	return ClassifiedError{Code: "operation_failed", Message: "operation failed"}
+}

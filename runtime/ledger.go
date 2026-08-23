@@ -147,7 +147,7 @@ func findNonEmptyExtra(value reflect.Value, path string, seen map[uintptr]bool) 
 	return "", false
 }
 
-func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, snapshot TurnSnapshot, request model.Request, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {
+func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {
 	if !o.ModelRequestLedger {
 		return nil, nil, nil
 	}
@@ -164,8 +164,8 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, snapsho
 	safeConfig, _ := json.Marshal(audited.SafeCallConfig)
 	now := o.now()
 	planHash := ""
-	if plan := runPlanFromContext(ctx); plan != nil {
-		planHash = plan.Descriptor.Fingerprint
+	if execution != nil && execution.plan != nil {
+		planHash = execution.plan.Descriptor.Fingerprint
 	}
 	record := session.ModelRequestRecord{
 		ID:        session.ModelRequestID(fmt.Sprintf("%s:%s:%d:%d", snapshot.RunID, messageID, attempt, step)),

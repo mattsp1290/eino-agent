@@ -28,6 +28,7 @@ type cleanupState struct {
 type mountState struct {
 	component Component
 	entries   []registrationEntry
+	leases    []Scope
 	effects   []cleanupState
 	active    bool
 	refs      int
@@ -38,6 +39,7 @@ type mountState struct {
 type stagingRegistrar struct {
 	component Component
 	entries   []registrationEntry
+	leases    []Scope
 	effects   []cleanupState
 	closed    bool
 }
@@ -69,6 +71,24 @@ func (s *stagingRegistrar) Defer(cleanup Cleanup) error {
 		return fmt.Errorf("%w: nil cleanup", ErrInvalidRegistration)
 	}
 	s.effects = append(s.effects, cleanupState{fn: cleanup})
+	return nil
+}
+
+// Lease retains the mounted component while a frozen plan for scope is active.
+// Lease scopes are lifecycle metadata; they are not dispatched or fingerprinted.
+func (s *stagingRegistrar) Lease(scope Scope) error {
+	if s.closed {
+		return ErrMountClosed
+	}
+	if err := validateScope(scope); err != nil {
+		return err
+	}
+	for _, existing := range s.leases {
+		if existing == scope {
+			return nil
+		}
+	}
+	s.leases = append(s.leases, scope)
 	return nil
 }
 
@@ -116,7 +136,13 @@ func (r *Registry) PrepareMount(ctx context.Context, component Component, instal
 		return nil, err
 	}
 	stage.closed = true
-	state := &mountState{component: component, entries: append([]registrationEntry(nil), stage.entries...), effects: append([]cleanupState(nil), stage.effects...), drained: make(chan struct{})}
+	state := &mountState{
+		component: component,
+		entries:   append([]registrationEntry(nil), stage.entries...),
+		leases:    append([]Scope(nil), stage.leases...),
+		effects:   append([]cleanupState(nil), stage.effects...),
+		drained:   make(chan struct{}),
+	}
 	return &PreparedMount{registry: r, state: state}, nil
 }
 
@@ -309,11 +335,21 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 		if allowed != nil && !allowed[state.component.InstanceID] {
 			continue
 		}
+		applies := false
 		for _, entry := range state.entries {
 			if !scopeApplies(entry.spec.Scope, target) {
 				continue
 			}
 			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component, state: state})
+			applies = true
+		}
+		for _, scope := range state.leases {
+			if scopeApplies(scope, target) {
+				applies = true
+				break
+			}
+		}
+		if applies {
 			leased[state] = struct{}{}
 		}
 	}

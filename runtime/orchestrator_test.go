@@ -1049,7 +1049,7 @@ func TestEncodeToolOutputUsesProtectedDisposition(t *testing.T) {
 		{name: "model visible interruption", disposition: ToolInterrupted, result: ToolResult{Output: "interrupted"}, wantStatus: session.ToolCallInterrupted, wantPayload: "interrupted"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			output, status, errText := encodeToolOutput("call", test.result, RetentionPolicy{MaxInlineBytes: 4096}, test.disposition, nil)
+			output, _, status, errText := encodeToolOutput("call", test.result, RetentionPolicy{MaxInlineBytes: 4096}, test.disposition, nil)
 			if status != test.wantStatus || errText != "" || !strings.Contains(string(output), `"status":"`+test.wantPayload+`"`) || !strings.Contains(string(output), test.result.Output) {
 				t.Fatalf("output=%s status=%s error=%q", output, status, errText)
 			}
@@ -1188,7 +1188,7 @@ func TestResumePreservesDeniedDispositionAfterFreshResultTransform(t *testing.T)
 		}),
 		IDs: &sequenceIDs{}, Clock: func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1",
 	}
-	result := orchestrator.resumeRun(withRunPlan(ctx, plan), run)
+	result := orchestrator.resumeRunWithSettlement(ctx, newRunExecution(orchestrator, plan), run, nil)
 	if result.Error != nil || executed.Load() {
 		t.Fatalf("resume result = %+v", result)
 	}
@@ -1280,7 +1280,7 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 				Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
 				OwnerID: "new-owner",
 			}
-			result := orch.resumeRun(withRunPlan(context.Background(), &RunPlan{Dispatch: dispatch}), run)
+			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, &RunPlan{Dispatch: dispatch}), run, nil)
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
 			}
@@ -1315,7 +1315,7 @@ func TestResumeReconciliationNotifiesAfterDurableSettlement(t *testing.T) {
 	descriptor := strictToolDescriptor(t)
 	orchestrator := &StreamingOrchestrator{Store: reconciling, IDs: &sequenceIDs{}, OwnerID: "new-owner"}
 
-	result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: descriptor, Dispatch: dispatch}), run)
+	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, &RunPlan{Descriptor: descriptor, Dispatch: dispatch}), run, nil)
 	if result.Error != nil {
 		t.Fatalf("resume result = %+v", result)
 	}
@@ -1348,7 +1348,7 @@ func TestResumeReconciliationFailureDoesNotRefreshRunLease(t *testing.T) {
 			reconciling := &reconciliationStore{Store: store, settlements: []session.ToolSettlement{settlement}, listErr: test.listErr, settleErr: test.settleErr}
 			orchestrator := &StreamingOrchestrator{Store: reconciling, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: func() time.Time { return run.LeaseUntil.Add(time.Hour) }}
 
-			result := orchestrator.resumeRun(withRunPlan(context.Background(), &RunPlan{Descriptor: strictToolDescriptor(t)}), run)
+			result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, &RunPlan{Descriptor: strictToolDescriptor(t)}), run, nil)
 			if !errors.Is(result.Error, test.wantErr) || result.Status != session.RunFailed {
 				t.Fatalf("resume result = %+v", result)
 			}
@@ -1415,7 +1415,7 @@ func resumeStoreWithUnreconciledSettlement(t *testing.T) (*sqlitestore.Store, se
 		t.Fatal(err)
 	}
 	completedAt := run.CreatedAt.Add(time.Second)
-	output := mustJSON(toolOutputPayload{ToolCallID: string(call.ID), Status: "completed", Content: "recovered", Structured: json.RawMessage(`{"ok":true}`)})
+	output := mustJSON(ToolOutput{ToolCallID: string(call.ID), Status: "completed", Content: "recovered", Structured: json.RawMessage(`{"ok":true}`)})
 	settlement := session.ToolSettlement{
 		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
 		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: completedAt, UpdatedAt: completedAt},

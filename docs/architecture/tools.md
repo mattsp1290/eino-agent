@@ -76,3 +76,18 @@ present the owner and token of the durable tool claim whose work it commits;
 missing or stale claim identities conflict before terminal state is applied.
 The protected stage order is documented in
 [`extension-points.md`](extension-points.md#exact-pipelines).
+
+## Canonical result encoding
+
+The runtime owns the single tool-output encoder and settlement builder.
+`runtime.ToolOutput` contains only bounded model-visible fields: call ID,
+status, inline content/structured data, truncation sizes, and external/redacted
+flags. Tool-controlled attachment locations and arbitrary metadata are never
+copied into provider history.
+
+`tools.ModelOutput` aliases that runtime type, while
+`tools.EncodeModelOutput` and `tools.BuildToolSettlement` are thin adapters over
+the runtime implementation. Callers building a settlement supply the
+authoritative claimed `session.ToolCall` and one explicit completion time; the
+builder does not read a clock or store. Runtime persists host-owned output
+classification and size metadata alongside the fenced terminal call.
