@@ -716,7 +716,14 @@ func toolSchemaHash(definition tools.Definition) (string, error) {
 		Parameters  any
 		Permissions []string
 		RetrySafe   bool
-	}{definition.Name, definition.Description, parameters, definition.Permissions, definition.RetrySafe})
+		Concurrency runtime.ToolConcurrency
+		Retention   runtime.RetentionPolicy
+		Metadata    map[string]string
+	}{
+		Name: definition.Name, Description: definition.Description, Parameters: parameters,
+		Permissions: definition.Permissions, RetrySafe: definition.RetrySafe, Concurrency: definition.Concurrency,
+		Retention: definition.Retention, Metadata: definition.Metadata,
+	})
 	if err != nil {
 		return "", err
 	}

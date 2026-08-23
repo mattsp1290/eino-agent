@@ -519,6 +519,86 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	}
 }
 
+func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*tools.Definition)
+	}{
+		{name: "max inline bytes", mutate: func(definition *tools.Definition) { definition.Retention.MaxInlineBytes++ }},
+		{name: "external storage", mutate: func(definition *tools.Definition) { definition.Retention.StoreExternal = false }},
+		{name: "redaction", mutate: func(definition *tools.Definition) { definition.Retention.Redact = false }},
+		{name: "concurrency", mutate: func(definition *tools.Definition) { definition.Concurrency = runtime.ToolConcurrencySequential }},
+		{name: "metadata", mutate: func(definition *tools.Definition) { definition.Metadata["policy"] = "changed" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := NewRegistry(nil)
+			component := component("policy-fingerprint")
+			newDefinition := func() tools.Definition {
+				tool := definition("policy-tool", "stable")
+				tool.Concurrency = runtime.ToolConcurrencyParallel
+				tool.Retention = runtime.RetentionPolicy{MaxInlineBytes: 1024, StoreExternal: true, Redact: true}
+				tool.Metadata = map[string]string{"policy": "stable", "source": "test"}
+				return tool
+			}
+			mountDefinition := func(tool tools.Definition) *Mount {
+				mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+					return registrar.Tool(ToolRegistration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: tool})
+				}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return mount
+			}
+
+			firstMount := mountDefinition(newDefinition())
+			first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted := first.Descriptor.Clone()
+			first.Dispatch.Release()
+			if err := firstMount.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			changed := newDefinition()
+			test.mutate(&changed)
+			secondMount := mountDefinition(changed)
+			defer func() { _ = secondMount.Close(context.Background()) }()
+			second, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer second.Dispatch.Release()
+			if persisted.Fingerprint == second.Descriptor.Fingerprint || persisted.Entries[0].SchemaHash == second.Descriptor.Entries[0].SchemaHash {
+				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, second.Descriptor)
+			}
+			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+				t.Fatalf("changed policy resume = %v, want ErrExtensionPlanMismatch", err)
+			}
+		})
+	}
+}
+
+func TestToolSchemaHashCanonicalizesMetadataOrder(t *testing.T) {
+	first := definition("metadata-tool", "stable")
+	first.Metadata = map[string]string{"alpha": "one", "beta": "two"}
+	second := definition("metadata-tool", "stable")
+	second.Metadata = map[string]string{"beta": "two", "alpha": "one"}
+	firstHash, err := toolSchemaHash(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHash, err := toolSchemaHash(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash != secondHash {
+		t.Fatalf("equivalent metadata hashes differ: %s != %s", firstHash, secondHash)
+	}
+}
+
 func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testing.T) {
 	registry := NewRegistry(nil)
 	component := component("mixed-handlers")

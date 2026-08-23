@@ -107,23 +107,10 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 
-	registry := extension.NewRegistry(nil)
-	component := extension.Component{InstanceID: "panic-ledger", Artifact: extension.Artifact{Name: "panic-ledger", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	var sequence []string
 	var completed []ModelCompletedNotice
-	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, ModelCompletedPoint, extension.Registration{ID: "completed", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ModelCompletedNotice) error {
-			completed = append(completed, notice)
-			return nil
-		})
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = mount.Close(context.Background()) }()
-	dispatch, err := registry.Snapshot(extension.GlobalScope())
-	if err != nil {
-		t.Fatal(err)
-	}
+	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
+	defer cleanup()
 
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		panic("provider panic")
@@ -132,7 +119,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator.Plans = staticRunPlanProvider{plan: &RunPlan{Dispatch: dispatch}}
+	orchestrator.Plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: provider panic") {
 		t.Fatalf("result = %#v", result)
@@ -141,8 +128,63 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed {
 		t.Fatalf("records = %#v, %v", batch.Records, err)
 	}
-	if len(completed) != 1 || completed[0].Error.Code == "" {
-		t.Fatalf("model-completed notices = %#v", completed)
+	if strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Error.Code == "" {
+		t.Fatalf("model lifecycle sequence = %#v, completed = %#v", sequence, completed)
+	}
+}
+
+func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	updateErr := errors.New("dispatch start update failed")
+	failingStore := &dispatchStartFailingStore{Store: store, ModelRequestStore: store, err: updateErr}
+	var sequence []string
+	var completed []ModelCompletedNotice
+	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
+	defer cleanup()
+	called := false
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		called = true
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(failingStore), WithTransactor(store), WithModelResolver(resolvedModel{streamer: streamer}),
+		WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "dispatch-start-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if !errors.Is(result.Error, updateErr) || called || len(sequence) != 0 || len(completed) != 0 {
+		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
+	}
+}
+
+func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var sequence []string
+	var completed []ModelCompletedNotice
+	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
+	defer cleanup()
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "lifecycle-success-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if result.Error != nil || strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Error.Code != "" {
+		t.Fatalf("result=%#v sequence=%#v completed=%#v", result, sequence, completed)
 	}
 }
 
@@ -190,6 +232,10 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
+	var sequence []string
+	var completed []ModelCompletedNotice
+	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
+	defer cleanup()
 	called := false
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		called = true
@@ -199,14 +245,60 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	orchestrator.Plans = staticRunPlanProvider{plan: plan}
 	message := einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "unsafe-call", Extra: map[string]any{"credential": "sentinel"}}})
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "unsafe-session", Input: []*einoschema.Message{message}, Config: orchestratorConfig()})
-	if result.Error == nil || called {
-		t.Fatalf("result=%#v adapter_called=%t", result, called)
+	if result.Error == nil || called || len(sequence) != 0 || len(completed) != 0 {
+		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
 	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
 	if err != nil || len(batch.Records) != 0 {
 		t.Fatalf("unsafe request records=%#v error=%v", batch.Records, err)
+	}
+}
+
+type dispatchStartFailingStore struct {
+	session.Store
+	session.ModelRequestStore
+	err error
+}
+
+func (s *dispatchStartFailingStore) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
+	if record.State == session.ModelRequestDispatchStarted {
+		return s.err
+	}
+	return s.ModelRequestStore.UpdateModelRequest(ctx, record)
+}
+
+func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]ModelCompletedNotice) (*RunPlan, func()) {
+	t.Helper()
+	registry := extension.NewRegistry(nil)
+	component := extension.Component{InstanceID: "model-lifecycle", Artifact: extension.Artifact{Name: "model-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		if err := extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "requested", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error {
+			*sequence = append(*sequence, "requested")
+			return nil
+		}); err != nil {
+			return err
+		}
+		return extension.On(registrar, ModelCompletedPoint, extension.Registration{ID: "completed", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ModelCompletedNotice) error {
+			*sequence = append(*sequence, "completed")
+			*completed = append(*completed, notice)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		_ = mount.Close(context.Background())
+		t.Fatal(err)
+	}
+	return &RunPlan{Dispatch: dispatch}, func() {
+		if err := mount.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

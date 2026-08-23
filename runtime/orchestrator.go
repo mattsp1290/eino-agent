@@ -354,6 +354,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 	var streamErr error
 	var requestRecord *session.ModelRequestRecord
 	var requestStore session.ModelRequestStore
+	var modelRequested bool
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			streamErr = fmt.Errorf("provider stream panic: %v", recovered)
@@ -385,7 +386,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 		} else {
 			o.endObservedStream(obsStream, streamUsage)
 		}
-		if plan := runPlanFromContext(ctx); ledgerTransitionOK && plan != nil && plan.Dispatch != nil {
+		if plan := runPlanFromContext(ctx); modelRequested && ledgerTransitionOK && plan != nil && plan.Dispatch != nil {
 			_ = extension.Notify(plan.Dispatch, context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
 		}
 	}()
@@ -419,6 +420,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, snapshot TurnSn
 			contentHash = requestRecord.ContentSHA256
 		}
 		_ = extension.Notify(plan.Dispatch, ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecordID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
+		modelRequested = true
 	}
 	var reader *einoschema.StreamReader[*einoschema.Message]
 	if plan := runPlanFromContext(ctx); plan != nil && plan.Dispatch != nil {
