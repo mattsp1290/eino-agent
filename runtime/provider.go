@@ -9,8 +9,8 @@ import (
 )
 
 // ProviderRequest builds the transport-neutral request passed to model
-// adapters for one turn. ToolInfo pointers remain owned by the materialized
-// tools; providers must treat them as immutable.
+// adapters for one turn. The caller validates and defensively clones the
+// complete request before dispatch.
 func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, observer model.StreamObserver) model.Request {
 	tools := make([]*einoschema.ToolInfo, 0, len(s.Tools))
 	for _, tool := range s.Tools {
@@ -24,7 +24,7 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		Tools:    tools,
 		Options:  cloneStringMap(s.Config.Agent.Options),
 		Observer: observer,
-	}.Clone()
+	}
 }
 
 func modelIdentity(identity agentcontext.Identity) model.Identity {

@@ -303,7 +303,6 @@ func materialize(definition Definition, snapshot runtime.TurnSnapshot) runtime.T
 		Info: &einoschema.ToolInfo{
 			Name:        definition.Name,
 			Desc:        definition.Description,
-			Extra:       cloneAnyMap(definition.Metadata),
 			ParamsOneOf: cloneParamsOneOf(definition.Parameters),
 		},
 		Executor:     &toolExecutor{definition: definition.Clone(), snapshot: snapshot.Clone()},
@@ -461,17 +460,6 @@ func cloneStringMap(src map[string]string) map[string]string {
 		return nil
 	}
 	dst := make(map[string]string, len(src))
-	for key, value := range src {
-		dst[key] = value
-	}
-	return dst
-}
-
-func cloneAnyMap(src map[string]string) map[string]any {
-	if src == nil {
-		return nil
-	}
-	dst := make(map[string]any, len(src))
 	for key, value := range src {
 		dst[key] = value
 	}

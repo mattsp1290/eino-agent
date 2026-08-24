@@ -533,59 +533,6 @@ func rawJSONEqual(left, right json.RawMessage) bool {
 	return bytes.Equal(left, right)
 }
 
-// ListUnreconciledToolSettlements returns terminal calls whose reserved result
-// record is absent. SQLite transactions normally make this empty; the method
-// also repairs databases written by non-atomic/legacy paths.
-func (s *Store) ListUnreconciledToolSettlements(ctx context.Context, runID session.RunID) ([]session.ToolSettlement, error) {
-	calls, err := listJSON[session.ToolCall](ctx, s, `SELECT record FROM tool_calls WHERE run_id = ? AND status IN (?, ?, ?) ORDER BY id`, runID, session.ToolCallCompleted, session.ToolCallFailed, session.ToolCallInterrupted)
-	if err != nil {
-		return nil, err
-	}
-	var result []session.ToolSettlement
-	for _, call := range calls {
-		if call.ResultMessageID == "" || call.ResultPartID == "" {
-			continue
-		}
-		resultMessage, messageErr := s.GetMessage(ctx, call.ResultMessageID)
-		if messageErr != nil && !errors.Is(messageErr, session.ErrNotFound) {
-			return nil, messageErr
-		}
-		var resultPart session.Part
-		partErr := s.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{call.ResultPartID}, &resultPart)
-		if partErr != nil && !errors.Is(partErr, session.ErrNotFound) {
-			return nil, partErr
-		}
-		if messageErr == nil && partErr == nil {
-			continue
-		}
-		createdAt := call.CompletedAt
-		if errors.Is(messageErr, session.ErrNotFound) {
-			resultMessage = session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: createdAt, UpdatedAt: createdAt}
-		}
-		if errors.Is(partErr, session.ErrNotFound) {
-			resultPart = session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: append(json.RawMessage(nil), call.Output...), CreatedAt: createdAt, UpdatedAt: createdAt}
-		}
-		result = append(result, session.ToolSettlement{
-			ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: call.Status, Output: append(json.RawMessage(nil), call.Output...), Error: call.Error,
-			Metadata: cloneStrings(call.Metadata), CompletedAt: call.CompletedAt,
-			ResultMessage: resultMessage,
-			ResultPart:    resultPart,
-		})
-	}
-	return result, nil
-}
-
-func cloneStrings(input map[string]string) map[string]string {
-	if input == nil {
-		return nil
-	}
-	result := make(map[string]string, len(input))
-	for key, value := range input {
-		result[key] = value
-	}
-	return result
-}
-
 func (s *Store) StartContextEpoch(ctx context.Context, record session.ContextEpoch) (session.ContextEpoch, error) {
 	var existing session.ContextEpoch
 	if err := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &existing); err == nil {

@@ -41,31 +41,26 @@ type IDGenerator interface {
 
 // StreamingOrchestrator executes admitted runs against Eino model streams.
 type StreamingOrchestrator struct {
-	Store                       session.Store
-	Model                       model.Resolver
-	Tools                       ToolRegistry
-	Plans                       RunPlanProvider
-	Context                     []ContextSource
-	Events                      EventSink
-	Hooks                       []Hook
-	IDs                         IDGenerator
-	Clock                       func() time.Time
-	OwnerID                     string
-	Trace                       agentcontext.TraceContext
-	Attempts                    int
-	ToolTurns                   int
-	QueueSize                   int
-	Lease                       time.Duration
-	History                     history.Options
-	Permissions                 permissions.Policy
-	Middleware                  []ToolMiddleware
-	Admit                       *Admitter
-	Transactor                  session.Transactor
-	Observer                    *einoobs.Observer
-	SystemPromptMaterialization bool
-	ModelRequestLedger          bool
-	ModelRequestSafeOptions     []string
-	ModelRequestMaxBytes        int
+	Store                   session.Store
+	Model                   model.Resolver
+	Plans                   RunPlanProvider
+	Events                  EventSink
+	IDs                     IDGenerator
+	Clock                   func() time.Time
+	OwnerID                 string
+	Trace                   agentcontext.TraceContext
+	Attempts                int
+	ToolTurns               int
+	QueueSize               int
+	Lease                   time.Duration
+	History                 history.Options
+	Permissions             permissions.Policy
+	Admit                   *Admitter
+	Transactor              session.Transactor
+	Observer                *einoobs.Observer
+	ModelRequestLedger      bool
+	ModelRequestSafeOptions []string
+	ModelRequestMaxBytes    int
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -77,17 +72,21 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
+	ownershipTransferred := false
+	defer func() {
+		if !ownershipTransferred {
+			plan.release()
+		}
+	}()
 	resolved, err := o.Model.Resolve(ctx, request.Config.Model, model.Runtime{
 		Directory: request.Config.Metadata["workspace_root"],
 		Options:   cloneStringMap(request.Config.Agent.Options),
 	})
 	if err != nil {
-		plan.release()
 		return nil, err
 	}
 	input, err := o.providerInput(ctx, request)
 	if err != nil {
-		plan.release()
 		return nil, err
 	}
 	execution := newRunExecution(o, plan)
@@ -111,10 +110,9 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		OwnerID:         o.ownerID(),
 		LeaseUntil:      now.Add(o.lease()),
 		Metadata:        request.Metadata,
-		ExtensionPlan:   plan.Descriptor,
+		ExtensionPlan:   plan.Descriptor(),
 	})
 	if err != nil {
-		plan.release()
 		return nil, err
 	}
 	runCtx, cancel := context.WithCancel(ctx)
@@ -126,6 +124,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 			o.observeInterrupt(context.WithoutCancel(ctx), admitted.Run, admitted.AssistantMessage.ID, reason)
 		},
 	}
+	ownershipTransferred = true
 	go o.execute(runCtx, execution, admitted, handle.done)
 	return handle, nil
 }
@@ -197,40 +196,23 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 		return result, false
 	}
 	result = o.executeAttempts(ctx, execution, snapshot, admitted.AssistantMessage.ID, &runUsage)
-	for _, hook := range o.Hooks {
-		_ = hook.AfterTurn(ctx, snapshot.Clone(), result)
-	}
 	return result, false
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
-	for _, source := range o.Context {
-		if source == nil {
-			continue
-		}
-		messages, err := source.LoadContext(ctx, snapshot.Clone())
-		if err != nil {
-			return TurnSnapshot{}, err
-		}
-		snapshot.Messages = append(snapshot.Messages, cloneMessages(messages)...)
-	}
 	if execution.dispatch() != nil {
 		assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
 		assembled, err := extension.Invoke(execution.dispatch(), ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
-		snapshot.Messages = materializeContextAssembly(assembled)
-	}
-	if o.Tools != nil {
-		tools, err := o.Tools.ResolveTools(ctx, snapshot.Clone())
+		snapshot.Messages, err = materializeContextAssembly(assembled)
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
-		snapshot.Tools = cloneSlice(tools)
 	}
-	if execution.plan.Tools != nil {
-		planned, err := execution.plan.Tools.ResolveTools(ctx, snapshot.Clone())
+	if execution.plan.tools != nil {
+		planned, err := execution.plan.tools.ResolveTools(ctx, snapshot.Clone())
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
@@ -249,13 +231,6 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	}
 	if execution.dispatch() != nil {
 		_, err := extension.Invoke(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
-		if err != nil {
-			return TurnSnapshot{}, err
-		}
-	}
-	for _, hook := range o.Hooks {
-		var err error
-		snapshot, err = hook.BeforeTurn(ctx, snapshot.Clone())
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
@@ -382,12 +357,7 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 }
 
 func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool, outcome ToolOutcome) ToolOutcome {
-	result, middlewareErr := o.afterToolCall(ctx, tool, outcome.Call, outcome.Result, outcome.RawError)
-	if middlewareErr != nil {
-		outcome.RawError = errors.Join(outcome.RawError, middlewareErr)
-		outcome.Error = classifyExtensionError(outcome.RawError)
-		outcome.Disposition = dispositionForError(outcome.RawError)
-	}
+	result := outcome.Result
 	if len(outcome.PermissionMetadata) != 0 {
 		if result.Metadata == nil {
 			result.Metadata = make(map[string]string)
@@ -453,40 +423,6 @@ func (f runtimeToolExecutorFunc) Execute(ctx context.Context, call ToolCall) (To
 	return f(ctx, call)
 }
 
-func (o *StreamingOrchestrator) beforeToolCall(ctx context.Context, tool Tool, call ToolCall) (json.RawMessage, error) {
-	input := cloneJSON(call.Input)
-	for _, middleware := range o.Middleware {
-		if middleware == nil {
-			continue
-		}
-		call.Input = cloneJSON(input)
-		next, err := middleware.BeforeToolCall(ctx, tool, call)
-		if err != nil {
-			return input, err
-		}
-		if !json.Valid(next) {
-			return input, fmt.Errorf("tool middleware returned malformed JSON input")
-		}
-		input = cloneJSON(next)
-	}
-	return input, nil
-}
-
-func (o *StreamingOrchestrator) afterToolCall(ctx context.Context, tool Tool, call ToolCall, result ToolResult, execErr error) (ToolResult, error) {
-	for index := len(o.Middleware) - 1; index >= 0; index-- {
-		middleware := o.Middleware[index]
-		if middleware == nil {
-			continue
-		}
-		next, err := middleware.AfterToolCall(ctx, tool, call, result, execErr)
-		if err != nil {
-			return result, err
-		}
-		result = next
-	}
-	return result, nil
-}
-
 func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecution, run session.Run, result Result) (Result, bool) {
 	if result.Status == "" {
 		result.Status = session.RunCompleted
@@ -503,9 +439,6 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 			result.Status = session.RunFailed
 			result.Error = err
 		}
-	}
-	for _, hook := range o.Hooks {
-		_ = hook.AfterRun(context.WithoutCancel(ctx), result)
 	}
 	if sink := execution.eventSink(o.Events); sink != nil {
 		_ = sink.Emit(context.WithoutCancel(ctx), Event{
@@ -533,12 +466,17 @@ func toolCallEventPayload(output json.RawMessage, name string, input json.RawMes
 	return payload
 }
 
-func withToolStatus(payload any, status session.ToolCallStatus) map[string]any {
-	raw, _ := json.Marshal(payload)
+func withToolStatus(payload any, status session.ToolCallStatus) (map[string]any, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode tool event payload: %w", err)
+	}
 	result := map[string]any{}
-	_ = json.Unmarshal(raw, &result)
+	if err := json.Unmarshal(raw, &result); err != nil {
+		return nil, fmt.Errorf("decode tool event payload: %w", err)
+	}
 	result["status"] = string(status)
-	return result
+	return result, nil
 }
 
 func toolPattern(input json.RawMessage, fallback string) string {
@@ -598,9 +536,6 @@ func (o *StreamingOrchestrator) admitter() Admitter {
 		if admitter.Events == nil {
 			admitter.Events = o.Events
 		}
-		if admitter.Hooks == nil {
-			admitter.Hooks = o.Hooks
-		}
 		if admitter.Clock == nil {
 			admitter.Clock = o.Clock
 		}
@@ -609,7 +544,7 @@ func (o *StreamingOrchestrator) admitter() Admitter {
 		}
 		return admitter
 	}
-	return Admitter{Store: o.Store, Transactor: o.Transactor, Events: o.Events, Hooks: o.Hooks, Clock: o.Clock}
+	return Admitter{Store: o.Store, Transactor: o.Transactor, Events: o.Events, Clock: o.Clock}
 }
 
 func (o *StreamingOrchestrator) now() time.Time {
@@ -708,7 +643,7 @@ func normalizeToolCallIDs(msg *einoschema.Message, ids IDGenerator) {
 func mustJSON(value any) json.RawMessage {
 	raw, err := json.Marshal(value)
 	if err != nil {
-		return []byte(`{}`)
+		panic(fmt.Errorf("encode internal JSON value: %w", err))
 	}
 	return raw
 }

@@ -27,12 +27,16 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	defer func() { _ = store.Close() }()
 	var submitted model.Request
 	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
-		submitted = request.Clone()
+		var cloneErr error
+		submitted, cloneErr = request.Clone()
+		if cloneErr != nil {
+			return nil, cloneErr
+		}
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
-		WithModelRequestLedger(true), WithModelRequestSafeOptions("temperature"), WithSystemPromptMaterialization(true),
+		WithModelRequestLedger(true), WithModelRequestSafeOptions("temperature"),
 		WithClock(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) }),
 	)
 	if err != nil {
@@ -212,7 +216,7 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Desc: "echo"}, Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: runtimeToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		return ToolResult{Output: string(call.Input)}, nil
 	})}
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithToolRegistry(staticToolRegistry{tools: []Tool{tool}}), WithRunPlanProvider(legacyRunTestPlanProvider()), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(staticRunPlanProvider{plan: testRunPlanWithTools(staticToolRegistry{tools: []Tool{tool}})}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +299,7 @@ func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]Mod
 		_ = mount.Close(context.Background())
 		t.Fatal(err)
 	}
-	return &RunPlan{Dispatch: dispatch}, func() {
+	return testRunPlanWithDispatch(dispatch), func() {
 		if err := mount.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -383,7 +387,11 @@ func (s *recordingIdempotentStreamer) StreamProvider(context.Context, model.Requ
 
 func (s *recordingIdempotentStreamer) StreamProviderWithIdempotencyKey(_ context.Context, request model.Request, key string) (*einoschema.StreamReader[*einoschema.Message], error) {
 	s.key = key
-	s.request = request.Clone()
+	var err error
+	s.request, err = request.Clone()
+	if err != nil {
+		return nil, err
+	}
 	reader, writer := einoschema.Pipe[*einoschema.Message](1)
 	_ = writer.Send(einoschema.AssistantMessage("done", nil), nil)
 	writer.Close()

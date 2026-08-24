@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	"github.com/mattsp1290/eino-agent/permissions"
@@ -96,7 +95,7 @@ func modelVisiblePermissionResult(code string, message string) ToolResult {
 		"status":  code,
 		"message": message,
 	}
-	raw, _ := json.Marshal(payload)
+	raw := mustJSON(payload)
 	return ToolResult{
 		Output:     message,
 		Structured: raw,

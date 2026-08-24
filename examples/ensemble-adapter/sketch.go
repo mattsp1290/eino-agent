@@ -133,7 +133,10 @@ func MapRunEvent(event RunEvent) MappedEvent {
 }
 
 func payload(value any) json.RawMessage {
-	raw, _ := json.Marshal(value)
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return json.RawMessage("null")
+	}
 	return raw
 }
 

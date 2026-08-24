@@ -129,7 +129,7 @@ captures:
 - resolved system prompt;
 - creation time.
 
-Runtime setters, config reloads, hook changes, and user follow-ups affect future
+Config reloads, composition mount changes, and user follow-ups affect future
 turn snapshots only. They do not mutate an in-flight model call.
 
 Each fresh or resumed run also owns an explicit internal execution object. It
@@ -251,9 +251,8 @@ Host applications embed the runtime by providing:
 - a `session.Store` and optional `session.Transactor`;
 - a `config.Loader` and `config.Validator`;
 - a `model.Catalog`, `model.AuthResolver`, and `model.Resolver`;
-- a `runtime.ToolRegistry`;
-- optional `runtime.ContextSource` implementations;
-- optional `runtime.Hook` implementations;
+- a `runtime.RunPlanProvider`, normally `composition.Registry`, for tools,
+  prompts, guards, and typed extension handlers;
 - one or more `runtime.EventSink` adapters for AG-UI and observability.
 
 The host remains responsible for HTTP routing, authentication, tenancy,
@@ -265,33 +264,33 @@ policy.
 `runtime.NewStreamingOrchestrator` applies functional options in order and
 validates the complete construction before a run can start. `Store`, `Model`,
 and `IDs` are required and are all named in one construction error when
-missing. Later scalar options override earlier ones; context sources, hooks,
-and tool middleware append deterministically. Nil interface dependencies are
-errors. Existing zero-value fallbacks and struct-literal construction remain
-supported.
+missing. Later scalar options override earlier ones, and nil interface
+dependencies are errors. The run-plan provider is the sole executable
+extension source; an omitted provider yields a sealed empty plan.
 
 `Admit` is deliberately excluded from options. `admitter()` derives it from
-`Store`, `Transactor`, `Events`, `Hooks`, and `Clock`, which prevents a second
+`Store`, `Transactor`, `Events`, and `Clock`, which prevents a second
 independently configured dependency graph.
 
-### Tool-call middleware save points
+### Tool interception save points
 
-The `BeforeToolCall` chain runs in registration order after typed input decode.
-The runtime computes the permission pattern and persists the assistant
+`runtime.ToolPreparePoint` runs in registration order after typed input decode.
+The runtime derives the permission pattern from final normalized JSON and
+persists the assistant
 tool-call part, pending/running events, and durable call only from the final
 rewritten JSON. Permission checks and the executor see that same input. A
-before error still admits and settles a failed durable call and does not abort
+prepare error still admits and settles a failed durable call and does not abort
 unrelated sibling calls.
 
-The `AfterToolCall` chain runs in reverse order after execution and before
-encoding/settlement. Durable output, the terminal event, the tool-result part,
-and model-visible message all use the final patch. The executor error is
-immutable and remains authoritative.
+`runtime.ToolResultTransformPoint` unwinds in reverse registration order after
+execution and before encoding/settlement. Durable output, the terminal event,
+the tool-result part, and model-visible message all use the final patch. The
+executor error is immutable and remains authoritative.
 
-Resume never repeats `BeforeToolCall`: pending records already hold rewritten
-input. A pending call that is reclaimed and executed runs `AfterToolCall`; a
-running call settled interrupted without re-execution skips it. This is the
-exactly-once boundary for argument rewriting.
+Resume never repeats `ToolPreparePoint`: pending records already hold rewritten
+input. A pending call that is reclaimed and executed runs
+`ToolResultTransformPoint`; a running call settled interrupted without
+re-execution skips it. This is the exactly-once boundary for argument rewriting.
 
 ## Initial Public Interfaces
 
@@ -315,12 +314,10 @@ can build directly against them:
 
 ## Frozen extension plans
 
-When `WithRunPlanProvider` is configured, admission freezes callbacks, tools,
-prompts, guards, and restrictions into one leased plan and persists its
-canonical descriptor. Strict resume resolves that exact descriptor before any
-durable state change. Partial-legacy requires an explicit provider and matching
-live legacy fields; legacy descriptors are rejected. The authoritative point
-catalog and model and tool pipeline diagrams are in
+Admission freezes callbacks, tools, prompts, guards, and restrictions into one
+leased plan and persists its runtime-derived canonical descriptor. Resume
+resolves an exact current-schema fingerprint match before any durable state
+change. The authoritative point catalog and model and tool pipeline diagrams are in
 [`extension-points.md`](extension-points.md).
 
 The optional model-request ledger assigns one `(attempt, step)` record per

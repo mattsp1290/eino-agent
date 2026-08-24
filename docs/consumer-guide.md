@@ -13,7 +13,7 @@ For a runnable starting point, see `examples/minimal-server` and
 
 | Package | Use it for | You still provide |
 | --- | --- | --- |
-| `runtime` | Run admission, active run handles, interruption, resume, turn snapshots, tool execution, hooks, and runtime events. | Store, provider/model resolver, tool registry, config snapshot, auth, HTTP routes. |
+| `runtime` | Run admission, active run handles, interruption, resume, turn snapshots, tool execution, typed extension dispatch, and runtime events. | Store, provider/model resolver, run-plan provider, config snapshot, auth, HTTP routes. |
 | `session` | Durable sessions, runs, messages, parts, tool calls, context epochs, replay cursors, and recovery records. | A concrete store backend and tenancy-specific session IDs. |
 | `store/sqlite` | Embedded SQLite `session.Store` and `session.Transactor` implementation. | Database path, lifecycle, backups, migrations policy, production HA choice. |
 | `store/storetest` | Contract tests for custom stores. | Backend-specific persistence and isolation tests. |
@@ -30,11 +30,11 @@ For a runnable starting point, see `examples/minimal-server` and
 
 A typical server wires these pieces once at startup through
 `runtime.NewStreamingOrchestrator`. This snippet is schematic:
-`newIDGenerator`, `providerResolver`, `toolRegistry`, and `eventSink` are
+`newIDGenerator`, `providerResolver`, `planProvider`, and `eventSink` are
 application-owned implementations. The required fields for a successful minimal
 start are `Store`, `Model`, `IDs`, and a non-empty request `SessionID`.
-`Transactor`, `Events`, `Tools`, `Permissions`, `OwnerID`, queue sizing, leases,
-hooks, and context sources add production behavior.
+`Transactor`, `Events`, `Plans`, `Permissions`, `OwnerID`, queue sizing, and
+leases add production behavior.
 
 ```go
 store, err := sqlite.Open(ctx, "agent.db")
@@ -48,7 +48,6 @@ orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithStore(store),
     runtime.WithTransactor(store),
     runtime.WithModelResolver(providerResolver),
-    runtime.WithToolRegistry(toolRegistry),
     runtime.WithRunPlanProvider(planProvider),
     runtime.WithEventSink(eventSink{Store: store, Tail: tail, IDs: ids}),
     runtime.WithIDGenerator(ids),
@@ -188,24 +187,10 @@ do not change migration order after release.
 
 ## Tool Lifecycle
 
-Register native and Wasm-backed tools through the same `tools.Registry` path.
-The embedding host owns Wasm shutdown:
+Mount native and Wasm-backed tool definitions through the same
+`composition.Registry`. The embedding host owns the mount and Wasm shutdown:
 
 ```go
-registry := tools.NewRegistry()
-_, err := registry.Register(tools.Definition{
-    Name:        "lookup_ticket",
-    Description: "Look up a support ticket by ID.",
-    Parameters:  params,
-    Decode:      decodeTicketInput,
-    Encode:      encodeTicketOutput,
-    Execute:     executeTicketLookup,
-    RetrySafe:   true,
-})
-if err != nil {
-    return err
-}
-
 loader := wasmext.NewLoader()
 defer loader.Close(ctx)
 wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
@@ -217,32 +202,50 @@ wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
 if err != nil {
     return err
 }
-if _, err := registry.Register(wasmDefinition); err != nil {
+plans := composition.NewRegistry(nil)
+component := extension.Component{
+    InstanceID: "review-tool-v1",
+    Artifact: extension.Artifact{
+        Name: "review-tool", Version: "1", Hash: expectedDigest,
+        ConfigHash: configDigest, SourceKind: extension.SourceWasm,
+    },
+}
+mount, err := plans.Mount(ctx, component, composition.InstallerFunc(
+    func(_ context.Context, registrar *composition.Registrar) error {
+        return registrar.Tool(composition.ToolRegistration{
+            ID: "review-tool", InstanceID: component.InstanceID,
+            Scope: extension.GlobalScope(), Definition: wasmDefinition,
+        })
+    },
+))
+if err != nil {
     return err
 }
+defer mount.Close(ctx)
 
 orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithStore(store),
     runtime.WithModelResolver(resolver),
     runtime.WithIDGenerator(ids),
-    runtime.WithToolRegistry(registry),
-    runtime.WithRunPlanProvider(planProvider),
+    runtime.WithRunPlanProvider(plans),
 )
 ```
 
-Anonymous tool registries, context sources, hooks, and middleware require an
-explicit run-plan provider and are recorded as `partial-legacy`. Prefer a
-`composition.Registry` as the plan provider for strict, restart-verifiable
-capabilities. Runs with no extensions use a fingerprinted empty strict plan.
+Every executable extension enters through a `runtime.RunPlanProvider` and is
+bound to stable artifact, scope, and capability identity before its descriptor
+is fingerprinted. Native `tools.Definition` values use the same
+`composition.Registrar.Tool` path with a `SourceNative` component. Runs with no
+extensions use a fingerprinted empty plan.
 
 Set `ModuleConfig.Observer` when guest log lines should be exported through an
 `einoobs.Observer`; `wasmext` attaches the configured module name and verified
 digest and enforces a 4 KiB-or-tighter message bound.
 
-`tools.Definition` requires `Decode`, `Encode`, and `Execute`. `Register`
-creates a generation; `Replace` updates only the active generation so delayed
-plugin reloads cannot overwrite newer definitions. `config.Snapshot.Tools`
-controls per-run enable/disable filtering during tool materialization:
+`tools.Definition` requires `Decode`, `Encode`, and `Execute`.
+`composition.Registry.Mount` validates and freezes definitions under a stable
+component identity; deactivation stops future plan acquisition while acquired
+plans retain their leases. `config.Snapshot.Tools` controls per-run
+enable/disable filtering during tool materialization:
 
 ```go
 snapshot.Tools.Enabled = []string{"lookup_ticket"}
@@ -352,11 +355,11 @@ and scoped capabilities. Mount instances need stable artifact and effective
 configuration hashes; these become durable resume identity. Global scope and
 exact session scope route trusted code but do not provide tenant isolation.
 
-Pass the registry via `runtime.WithRunPlanProvider`. Enable
-`WithSystemPromptMaterialization(true)` only when the configured agent prompt
-should reach providers; named mounted prompt sections remain explicit and are
-evaluated per provider step. Enable `WithModelRequestLedger(true)` only with a
-store implementing `session.ModelRequestStore`, set a retention policy, and
-allowlist only non-secret option keys. See the
+Pass the registry via `runtime.WithRunPlanProvider`. The configured agent
+prompt is always materialized at `runtime.OrderRuntime`; named mounted prompt
+sections are evaluated per provider step around it. Enable
+`WithModelRequestLedger(true)` only with a store implementing
+`session.ModelRequestStore`, set a retention policy, and allowlist only
+non-secret option keys. See the
 [`extension point catalog`](architecture/extension-points.md) and the
 [`native extension example`](../examples/native-extension).

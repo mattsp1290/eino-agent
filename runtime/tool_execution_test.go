@@ -15,7 +15,7 @@ import (
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
-func TestPartialLegacySettlementSurvivesCancellation(t *testing.T) {
+func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store, run := resumeStoreWithTool(t, "old-owner", session.ToolCallPending)
 	claimed, err := store.GetToolCall(context.Background(), "call-resume")
@@ -24,7 +24,7 @@ func TestPartialLegacySettlementSurvivesCancellation(t *testing.T) {
 	}
 	claimed.Status = session.ToolCallRunning
 	claimed.ClaimedBy = "owner-1"
-	claimed.ClaimToken = "partial-claim"
+	claimed.ClaimToken = "atomic-claim"
 	claimed.StartedAt = run.CreatedAt
 	claimed, err = store.ClaimToolCall(context.Background(), claimed)
 	if err != nil {
@@ -38,7 +38,7 @@ func TestPartialLegacySettlementSurvivesCancellation(t *testing.T) {
 		Store: store, IDs: &sequenceIDs{}, OwnerID: "owner-1",
 		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
 	}
-	plan := &RunPlan{Descriptor: session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanPartialLegacy}}
+	plan := &RunPlan{descriptor: strictToolDescriptor(t)}
 	call := runtimeCallFromClaim(tool, claimed)
 	settled, err := newRunExecution(orchestrator, plan).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
 	if err != nil {
@@ -60,7 +60,7 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("executor secret")
 	})}}}
-	plan := &RunPlan{Descriptor: strictToolDescriptor(t), Tools: toolRegistry, Release: func() { releases.Add(1) }}
+	plan := &RunPlan{descriptor: strictToolDescriptor(t), tools: toolRegistry, releaseExtra: func() { releases.Add(1) }}
 	sink := &capturingSink{}
 	orchestrator := &StreamingOrchestrator{
 		Store: store,
@@ -96,7 +96,7 @@ func TestPendingResumeToolPanicSettlesWithoutTransportEvent(t *testing.T) {
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("resume executor secret")
 	})}}}
-	plan := &RunPlan{Descriptor: strictToolDescriptor(t), Tools: toolRegistry, Release: func() { releases.Add(1) }}
+	plan := &RunPlan{descriptor: strictToolDescriptor(t), tools: toolRegistry, releaseExtra: func() { releases.Add(1) }}
 	orchestrator := &StreamingOrchestrator{
 		Store: store, IDs: &sequenceIDs{}, Events: sink, OwnerID: "owner-1",
 		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },

@@ -10,7 +10,6 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
-	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -21,7 +20,7 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	store := newAdmissionStore()
 	sink := &capturingSink{}
 	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
-	admitter := Admitter{Store: store, Events: sink, Hooks: []Hook{capturingHook{}}, Clock: func() time.Time { return now }}
+	admitter := Admitter{Store: store, Events: sink, Clock: func() time.Time { return now }}
 	request := admissionRequest()
 	admitted, err := admitter.Admit(context.Background(), request)
 	if err != nil {
@@ -84,40 +83,12 @@ func TestAdmitRequiresContextEpochID(t *testing.T) {
 	}
 }
 
-func TestRunAdmittedNotificationWaitsForLegacyBeforeRunSuccess(t *testing.T) {
-	registry := extension.NewRegistry(nil)
-	component := extension.Component{InstanceID: "admission-order", Artifact: extension.Artifact{Name: "admission-order", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
-	called := false
-	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, RunAdmittedPoint, extension.Registration{ID: "observe", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, RunAdmittedNotice) error {
-			called = true
-			return nil
-		})
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := registry.Snapshot(extension.GlobalScope())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer plan.Release()
-	beforeRunErr := errors.New("before run failed")
-	admitter := Admitter{Store: newAdmissionStore(), Hooks: []Hook{failingBeforeRunHook{err: beforeRunErr}}}
-	admitter.Extensions = plan
-	_, err = admitter.Admit(context.Background(), admissionRequest())
-	if !errors.Is(err, beforeRunErr) || called {
-		t.Fatalf("Admit error = %v, notification called = %t", err, called)
-	}
-}
-
 func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
 	sink := &capturingSink{}
-	hook := &countingHook{}
-	admitter := Admitter{Store: store, Events: sink, Hooks: []Hook{hook}, Clock: func() time.Time { return time.Unix(1, 0) }}
+	admitter := Admitter{Store: store, Events: sink, Clock: func() time.Time { return time.Unix(1, 0) }}
 	request := admissionRequest()
 	if _, err := admitter.Admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
@@ -130,8 +101,8 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 		if !again.AlreadyAdmitted {
 			t.Fatal("duplicate admission did not report AlreadyAdmitted")
 		}
-		if hook.calls != 1 || len(sink.events) != 1 {
-			t.Fatalf("duplicate replayed side effects: hook=%d sink=%d", hook.calls, len(sink.events))
+		if len(sink.events) != 1 {
+			t.Fatalf("duplicate replayed side effects: sink=%d", len(sink.events))
 		}
 		return
 	}
@@ -144,14 +115,14 @@ func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 	store := newAdmissionStore()
 	admitter := Admitter{Store: store}
 	request := admissionRequest()
-	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "first", Kind: session.ExtensionHandlers, Required: true}}}
+	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "first", Kind: session.ExtensionHandlers, Required: true}}}
 	request.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(request.ExtensionPlan)
 	if _, err := admitter.Admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
 	}
 
 	retry := request
-	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "second", Kind: session.ExtensionHandlers, Required: true}}}
+	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "second", Kind: session.ExtensionHandlers, Required: true}}}
 	retry.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(retry.ExtensionPlan)
 	if _, err := admitter.Admit(context.Background(), retry); !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("mismatched retry error = %v, want ErrExtensionPlanMismatch", err)
@@ -175,21 +146,20 @@ func TestAdmitRejectsZeroPersistedPlanOnRetry(t *testing.T) {
 	}
 }
 
-func TestMatchingExtensionPlansRejectsZeroAndLegacyDescriptors(t *testing.T) {
-	strict := emptyExtensionPlanDescriptor()
+func TestMatchingExtensionPlansRejectsZeroAndWrongSchemaDescriptors(t *testing.T) {
+	current := emptyExtensionPlanDescriptor()
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
-		"zero":           {},
-		"legacy":         {SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanLegacy},
-		"partial legacy": {SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanPartialLegacy},
+		"zero":         {},
+		"wrong schema": {SchemaVersion: session.ExtensionPlanSchemaVersion - 1},
 	} {
 		descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 		t.Run(name+" persisted", func(t *testing.T) {
-			if err := validateMatchingExtensionPlans(descriptor, strict); !errors.Is(err, ErrExtensionPlanMismatch) {
+			if err := validateMatchingExtensionPlans(descriptor, current); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("error = %v, want ErrExtensionPlanMismatch", err)
 			}
 		})
 		t.Run(name+" requested", func(t *testing.T) {
-			if err := validateMatchingExtensionPlans(strict, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+			if err := validateMatchingExtensionPlans(current, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("error = %v, want ErrExtensionPlanMismatch", err)
 			}
 		})
@@ -197,7 +167,7 @@ func TestMatchingExtensionPlansRejectsZeroAndLegacyDescriptors(t *testing.T) {
 }
 
 func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "original", Kind: session.ExtensionHandlers, Required: true}}}
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "original", Kind: session.ExtensionHandlers, Required: true}}}
 	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 	corrupt := descriptor.Clone()
 	corrupt.Entries[0].InstanceID = "changed"
@@ -206,17 +176,6 @@ func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
 	}
 	if err := validateMatchingExtensionPlans(descriptor, corrupt); !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("requested stale fingerprint error = %v", err)
-	}
-}
-
-func TestMatchingExtensionPlansUsesSchemaCanonicalization(t *testing.T) {
-	persisted := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "ordered", Kind: session.ExtensionPrompt, Required: true, Order: 10}}}
-	requested := persisted.Clone()
-	requested.Entries[0].Order = 20
-	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
-	requested.Fingerprint, _ = session.FingerprintExtensionPlan(requested)
-	if err := validateMatchingExtensionPlans(persisted, requested); err != nil {
-		t.Fatalf("schema-v1 canonical plans did not match: %v", err)
 	}
 }
 
@@ -286,31 +245,6 @@ func TestAdmitFallsBackToConfigModelIdentity(t *testing.T) {
 	}
 	if admitted.Run.ProviderID != "openai" || admitted.Run.ModelID != "gpt-4.1" {
 		t.Fatalf("run model identity = %q/%q", admitted.Run.ProviderID, admitted.Run.ModelID)
-	}
-}
-
-func TestBeforeRunHookFailureDoesNotEraseAdmission(t *testing.T) {
-	t.Parallel()
-
-	store := newAdmissionStore()
-	errHook := errors.New("hook failed")
-	admitter := Admitter{
-		Store: store,
-		Hooks: []Hook{failingBeforeRunHook{err: errHook}},
-	}
-	_, err := admitter.Admit(context.Background(), admissionRequest())
-	if !errors.Is(err, errHook) {
-		t.Fatalf("Admit error = %v, want hook error", err)
-	}
-	if _, err := store.GetRun(context.Background(), "run-1"); err != nil {
-		t.Fatalf("run missing after hook failure: %v", err)
-	}
-	batch, err := store.ListMessages(context.Background(), "session-1", session.ReplayCursor{Limit: 10})
-	if err != nil {
-		t.Fatalf("ListMessages error = %v", err)
-	}
-	if len(batch.Messages) != 1 {
-		t.Fatalf("messages after hook failure = %#v", batch.Messages)
 	}
 }
 
@@ -386,42 +320,6 @@ type failingSink struct {
 func (s failingSink) Emit(context.Context, Event) error {
 	return s.err
 }
-
-type capturingHook struct{}
-
-func (capturingHook) BeforeRun(context.Context, session.Run) error { return nil }
-func (capturingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
-	return TurnSnapshot{}, nil
-}
-func (capturingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
-func (capturingHook) AfterRun(context.Context, Result) error                { return nil }
-
-type countingHook struct {
-	calls int
-}
-
-func (h *countingHook) BeforeRun(context.Context, session.Run) error {
-	h.calls++
-	return nil
-}
-func (h *countingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
-	return TurnSnapshot{}, nil
-}
-func (h *countingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
-func (h *countingHook) AfterRun(context.Context, Result) error                { return nil }
-
-type failingBeforeRunHook struct {
-	err error
-}
-
-func (h failingBeforeRunHook) BeforeRun(context.Context, session.Run) error { return h.err }
-func (h failingBeforeRunHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
-	return TurnSnapshot{}, nil
-}
-func (h failingBeforeRunHook) AfterTurn(context.Context, TurnSnapshot, Result) error {
-	return nil
-}
-func (h failingBeforeRunHook) AfterRun(context.Context, Result) error { return nil }
 
 type admissionStore struct {
 	sessions          map[session.ID]session.Session
@@ -683,6 +581,21 @@ func (s *admissionStore) FinishToolCall(_ context.Context, call session.ToolCall
 		return session.ErrNotFound
 	}
 	s.toolCalls[call.ID] = call
+	return nil
+}
+
+func (s *admissionStore) SettleToolCall(_ context.Context, settlement session.ToolSettlement) error {
+	call, ok := s.toolCalls[settlement.ID]
+	if !ok {
+		return session.ErrNotFound
+	}
+	terminal, err := settlement.Apply(call)
+	if err != nil {
+		return err
+	}
+	s.toolCalls[terminal.ID] = terminal
+	s.messages[settlement.ResultMessage.ID] = settlement.ResultMessage
+	s.parts[settlement.ResultPart.ID] = settlement.ResultPart
 	return nil
 }
 func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.ContextEpoch) (session.ContextEpoch, error) {

@@ -19,7 +19,7 @@ import (
 	"github.com/mattsp1290/eino-agent/tools"
 )
 
-var compositionNotice = extension.NewNotification(extension.Contract{ID: "test/composition-notice", Version: "1"}, extension.NotificationContained, func(value string) string { return value })
+var compositionNotice = extension.NewNotification(extension.Contract{ID: "test/composition-notice", Version: "1"}, extension.NotificationContained, func(value string) (string, error) { return value, nil })
 
 func component(id string) extension.Component {
 	return extension.Component{InstanceID: id, Artifact: extension.Artifact{Name: id, Version: "1", Hash: id + "-hash", ConfigHash: id + "-config", SourceKind: extension.SourceNative}}
@@ -70,9 +70,9 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 			if planErr != nil {
 				t.Fatalf("AcquireRunPlan error = %v", planErr)
 			}
-			defer plan.Dispatch.Release()
-			if len(plan.Descriptor.Entries) != 0 {
-				t.Fatalf("plan entries = %#v, want none", plan.Descriptor.Entries)
+			defer plan.Release()
+			if len(plan.Descriptor().Entries) != 0 {
+				t.Fatalf("plan entries = %#v, want none", plan.Descriptor().Entries)
 			}
 		})
 	}
@@ -102,28 +102,28 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolsA, err := planA.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a", Config: config.Snapshot{Model: model.Selection{}}})
+	toolsA, err := planA.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a", Config: config.Snapshot{Model: model.Selection{}}})
 	if err != nil || len(toolsA) != 1 || toolsA[0].Info.Desc != "session" {
 		t.Fatalf("session tools = %#v, %v", toolsA, err)
 	}
-	persisted := planA.Descriptor.Clone()
-	planA.Dispatch.Release()
+	persisted := planA.Descriptor()
+	planA.Release()
 
 	planB, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-b"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolsB, _ := planB.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-b", Config: config.Snapshot{}})
+	toolsB, _ := planB.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-b", Config: config.Snapshot{}})
 	if len(toolsB) != 1 || toolsB[0].Info.Desc != "global" {
 		t.Fatalf("other session tools = %#v", toolsB)
 	}
-	planB.Dispatch.Release()
+	planB.Release()
 
 	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
-	if err != nil || resumed.Descriptor.Fingerprint != persisted.Fingerprint {
+	if err != nil || resumed.Descriptor().Fingerprint != persisted.Fingerprint {
 		t.Fatalf("AcquireResumePlan = %#v, %v", resumed, err)
 	}
-	resumed.Dispatch.Release()
+	resumed.Release()
 }
 
 func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
@@ -144,21 +144,21 @@ func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AcquireRunPlan(%q) = %v", key, err)
 		}
-		resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(key)})
+		resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(key)})
 		if err != nil || len(resolved) != 1 || resolved[0].Name != "echo" {
 			t.Fatalf("matching scope tools = %#v, %v", resolved, err)
 		}
-		plan.Dispatch.Release()
+		plan.Release()
 
 		other, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "other"})
 		if err != nil {
 			t.Fatal(err)
 		}
-		resolved, err = other.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "other"})
+		resolved, err = other.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "other"})
 		if err != nil || len(resolved) != 0 {
 			t.Fatalf("other scope tools = %#v, %v", resolved, err)
 		}
-		other.Dispatch.Release()
+		other.Release()
 		if err := mount.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -180,13 +180,12 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 	defer func() { _ = mount.Close(context.Background()) }()
 
 	tests := []struct {
-		name       string
-		config     config.ToolConfig
-		wantTools  []string
-		wantStrict bool
+		name      string
+		config    config.ToolConfig
+		wantTools []string
 	}{
-		{name: "disabled wins", config: config.ToolConfig{Enabled: []string{"a", "b"}, Disabled: []string{"b"}}, wantTools: []string{"a"}, wantStrict: true},
-		{name: "explicit empty enabled", config: config.ToolConfig{Enabled: []string{}}, wantTools: []string{}, wantStrict: false},
+		{name: "disabled wins", config: config.ToolConfig{Enabled: []string{"a", "b"}, Disabled: []string{"b"}}, wantTools: []string{"a"}},
+		{name: "explicit empty enabled", config: config.ToolConfig{Enabled: []string{}}, wantTools: []string{}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -194,8 +193,8 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer plan.Dispatch.Release()
-			resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+			defer plan.Release()
+			resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -207,13 +206,13 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 				t.Fatalf("resolved tools = %v, want %v", gotTools, test.wantTools)
 			}
 			var descriptorTools int
-			for _, entry := range plan.Descriptor.Entries {
+			for _, entry := range plan.Descriptor().Entries {
 				if entry.Kind == session.ExtensionTool {
 					descriptorTools++
 				}
 			}
-			if descriptorTools != len(test.wantTools) || plan.RequiresToolSettlement != test.wantStrict {
-				t.Fatalf("descriptor tools=%d requires settlement=%t", descriptorTools, plan.RequiresToolSettlement)
+			if descriptorTools != len(test.wantTools) {
+				t.Fatalf("descriptor tools=%d, want %d", descriptorTools, len(test.wantTools))
 			}
 		})
 	}
@@ -246,8 +245,8 @@ func TestResumeFiltersPersistedToolIdentityBeforeScopeShadowing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persisted := first.Descriptor.Clone()
-	first.Dispatch.Release()
+	persisted := first.Descriptor()
+	first.Release()
 	if err := firstMount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -258,8 +257,8 @@ func TestResumeFiltersPersistedToolIdentityBeforeScopeShadowing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AcquireResumePlan = %v", err)
 	}
-	defer resumed.Dispatch.Release()
-	resolved, err := resumed.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	defer resumed.Release()
+	resolved, err := resumed.ResolveTools(context.Background(), runtime.TurnSnapshot{})
 	if err != nil || len(resolved) != 1 || resolved[0].Info.Desc != "global" {
 		t.Fatalf("resumed tools = %#v, %v", resolved, err)
 	}
@@ -286,17 +285,17 @@ func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, _ := newPlan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	resolved, _ := newPlan.ResolveTools(context.Background(), runtime.TurnSnapshot{})
 	if len(resolved) != 0 {
 		t.Fatalf("new plan retained tools: %#v", resolved)
 	}
-	newPlan.Dispatch.Release()
+	newPlan.Release()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
 	if err := mount.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Close before release = %v", err)
 	}
-	plan.Dispatch.Release()
+	plan.Release()
 	if err := mount.Close(context.Background()); err != nil || !cleaned {
 		t.Fatalf("Close = %v cleaned=%t", err, cleaned)
 	}
@@ -317,7 +316,7 @@ func TestSessionScopedCallbackOnlyMountIgnoresUnrelatedPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer other.Dispatch.Release()
+	defer other.Release()
 	mount.Deactivate()
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatalf("unrelated plan retained callback-only mount: %v", err)
@@ -337,8 +336,8 @@ func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persisted := planA.Descriptor.Clone()
-	planA.Dispatch.Release()
+	persisted := planA.Descriptor()
+	planA.Release()
 
 	componentB := component("resume-lease-b")
 	mountB, err := registry.Mount(context.Background(), componentB, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
@@ -351,13 +350,13 @@ func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resumed.Dispatch.Release()
+	defer resumed.Release()
 
 	mountB.Deactivate()
 	if err := mountB.Close(context.Background()); err != nil {
 		t.Fatalf("resumed A plan retained later B mount: %v", err)
 	}
-	resumed.Dispatch.Release()
+	resumed.Release()
 	mountA.Deactivate()
 	if err := mountA.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -375,7 +374,7 @@ func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			plan.Dispatch.Release()
+			plan.Release()
 			nested, err = registry.Mount(context.Background(), component("nested"), InstallerFunc(func(_ context.Context, nestedRegistrar *Registrar) error {
 				return nestedRegistrar.Tool(ToolRegistration{ID: "nested", InstanceID: "nested", Scope: extension.GlobalScope(), Definition: definition("nested", "nested")})
 			}))
@@ -386,7 +385,7 @@ func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
 				_ = registry.Diagnostics()
 				plan, acquireErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
 				if acquireErr == nil {
-					plan.Dispatch.Release()
+					plan.Release()
 				}
 				return acquireErr
 			}); err != nil {
@@ -422,7 +421,6 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 	}
 	defer func() { _ = first.Close(context.Background()) }()
 	cleaned := false
-	notified := false
 	done := make(chan error, 1)
 	go func() {
 		_, mountErr := registry.Mount(context.Background(), component("rejected"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
@@ -434,7 +432,6 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 				return err
 			}
 			if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", InstanceID: "rejected", Scope: extension.GlobalScope()}, func(context.Context, string) error {
-				notified = true
 				return nil
 			}); err != nil {
 				return err
@@ -455,10 +452,11 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer plan.Dispatch.Release()
-	_ = extension.Notify(plan.Dispatch, context.Background(), compositionNotice, "test")
-	if notified {
-		t.Fatal("rejected mount handler was published")
+	defer plan.Release()
+	for _, entry := range plan.Descriptor().Entries {
+		if entry.InstanceID == "rejected" {
+			t.Fatal("rejected mount handler was published")
+		}
 	}
 }
 
@@ -493,13 +491,15 @@ func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := plan.Prompts[0].Provider.ProvidePrompt(context.Background(), runtime.PromptContext{}); !errors.Is(err, extension.ErrSelfClose) {
+	prompts := plan.Prompts()
+	guards := plan.Guards()
+	if _, err := prompts[0].Provider.ProvidePrompt(context.Background(), runtime.PromptContext{}); !errors.Is(err, extension.ErrSelfClose) {
 		t.Fatalf("prompt self-close = %v", err)
 	}
-	if _, err := plan.Guards[0].Guard.GuardTool(context.Background(), runtime.ToolGuardRequest{}); !errors.Is(err, extension.ErrSelfClose) {
+	if _, err := guards[0].Guard.GuardTool(context.Background(), runtime.ToolGuardRequest{}); !errors.Is(err, extension.ErrSelfClose) {
 		t.Fatalf("guard self-close = %v", err)
 	}
-	resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{})
 	if err != nil || len(resolved) != 1 {
 		t.Fatalf("ResolveTools = %#v, %v", resolved, err)
 	}
@@ -513,7 +513,7 @@ func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
 	if len(diagnostics.Tools) != 1 {
 		t.Fatalf("self-close deactivated mount: %#v", diagnostics)
 	}
-	plan.Dispatch.Release()
+	plan.Release()
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -528,8 +528,8 @@ func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan, _ := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
-	persisted := plan.Descriptor.Clone()
-	plan.Dispatch.Release()
+	persisted := plan.Descriptor()
+	plan.Release()
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -560,8 +560,8 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persisted := first.Descriptor.Clone()
-	first.Dispatch.Release()
+	persisted := first.Descriptor()
+	first.Release()
 	if err := firstMount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -572,9 +572,10 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer second.Dispatch.Release()
-	if persisted.Fingerprint == second.Descriptor.Fingerprint || persisted.Entries[0].SchemaHash == second.Descriptor.Entries[0].SchemaHash {
-		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, second.Descriptor)
+	defer second.Release()
+	secondDescriptor := second.Descriptor()
+	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].SchemaHash == secondDescriptor.Entries[0].SchemaHash {
+		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 	}
 	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("changed schema resume = %v, want ErrExtensionPlanMismatch", err)
@@ -618,8 +619,8 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			persisted := first.Descriptor.Clone()
-			first.Dispatch.Release()
+			persisted := first.Descriptor()
+			first.Release()
 			if err := firstMount.Close(context.Background()); err != nil {
 				t.Fatal(err)
 			}
@@ -632,9 +633,10 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer second.Dispatch.Release()
-			if persisted.Fingerprint == second.Descriptor.Fingerprint || persisted.Entries[0].SchemaHash == second.Descriptor.Entries[0].SchemaHash {
-				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, second.Descriptor)
+			defer second.Release()
+			secondDescriptor := second.Descriptor()
+			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].SchemaHash == secondDescriptor.Entries[0].SchemaHash {
+				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 			}
 			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 				t.Fatalf("changed policy resume = %v, want ErrExtensionPlanMismatch", err)
@@ -679,8 +681,8 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	persisted := plan.Descriptor.Clone()
-	plan.Dispatch.Release()
+	persisted := plan.Descriptor()
+	plan.Release()
 	if len(persisted.Entries) != 1 || persisted.Entries[0].Scope.Kind != string(extension.ScopeGlobal) || len(persisted.Entries[0].Registrations) != 2 {
 		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Entries)
 	}
@@ -689,12 +691,12 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 	if err != nil {
 		t.Fatalf("AcquireResumePlan = %v", err)
 	}
-	resumed.Dispatch.Release()
+	resumed.Release()
 }
 
 func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 	registry := NewRegistry(nil)
-	persisted := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{
+	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{
 		InstanceID: "mixed", Kind: session.ExtensionHandlers, Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)},
 		Registrations: []session.RegistrationIdentity{
 			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-a"}},
@@ -741,18 +743,20 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer plan.Dispatch.Release()
-	resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a", Config: config.Snapshot{}})
-	if err != nil || len(resolved) != 1 || resolved[0].Name != "b" || len(plan.Prompts) != 1 || plan.Prompts[0].InstanceID != "cap-session" || len(plan.Guards) != 1 {
-		t.Fatalf("plan tools=%#v prompts=%#v guards=%#v err=%v", resolved, plan.Prompts, plan.Guards, err)
+	defer plan.Release()
+	resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a", Config: config.Snapshot{}})
+	prompts, guards := plan.Prompts(), plan.Guards()
+	if err != nil || len(resolved) != 1 || resolved[0].Name != "b" || len(prompts) != 1 || prompts[0].InstanceID != "cap-session" || len(guards) != 1 {
+		t.Fatalf("plan tools=%#v prompts=%#v guards=%#v err=%v", resolved, prompts, guards, err)
 	}
 	var kinds = map[session.ExtensionKind]bool{}
-	for _, entry := range plan.Descriptor.Entries {
+	descriptor := plan.Descriptor()
+	for _, entry := range descriptor.Entries {
 		kinds[entry.Kind] = true
 	}
 	for _, kind := range []session.ExtensionKind{session.ExtensionTool, session.ExtensionPrompt, session.ExtensionGuard, session.ExtensionRestriction} {
 		if !kinds[kind] {
-			t.Fatalf("descriptor missing %s: %#v", kind, plan.Descriptor)
+			t.Fatalf("descriptor missing %s: %#v", kind, descriptor)
 		}
 	}
 }
@@ -783,8 +787,8 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			persisted := first.Descriptor.Clone()
-			first.Dispatch.Release()
+			persisted := first.Descriptor()
+			first.Release()
 			if len(persisted.Entries) != 1 || persisted.Entries[0].Order != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
 				t.Fatalf("ordered descriptor = %#v", persisted)
 			}
@@ -800,7 +804,7 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 	}
 }
 
-func TestVersionOneCallbackAndToolPlanRemainsResumable(t *testing.T) {
+func TestVersionOneCallbackAndToolPlanIsRejected(t *testing.T) {
 	registry := NewRegistry(nil)
 	component := component("v1-compatible")
 	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
@@ -817,16 +821,18 @@ func TestVersionOneCallbackAndToolPlanRemainsResumable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persisted := plan.Descriptor.Clone()
-	plan.Dispatch.Release()
+	persisted := plan.Descriptor()
+	plan.Release()
 	persisted.SchemaVersion = 1
 	persisted.Fingerprint, err = session.FingerprintExtensionPlan(persisted)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
-	if err != nil {
-		t.Fatalf("AcquireResumePlan schema v1 callback/tool plan = %v", err)
+	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("AcquireResumePlan schema v1 callback/tool plan = %v, want mismatch", err)
 	}
-	resumed.Dispatch.Release()
+	if resumed != nil {
+		resumed.Release()
+	}
 }

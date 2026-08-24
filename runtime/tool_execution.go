@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
@@ -102,42 +101,12 @@ func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool
 }
 
 func (e *runExecution) ensureToolResultIDs(call ToolCall, claimed session.ToolCall) (ToolCall, session.ToolCall) {
-	if descriptorRequiresToolSettlement(e.plan.Descriptor) {
-		call.ResultMessageID = claimed.ResultMessageID
-		call.ResultPartID = claimed.ResultPartID
-		return call, claimed
-	}
-	if claimed.ResultMessageID == "" {
-		claimed.ResultMessageID = e.host.IDs.NewMessageID()
-	}
-	if claimed.ResultPartID == "" {
-		claimed.ResultPartID = e.host.IDs.NewPartID()
-	}
 	call.ResultMessageID = claimed.ResultMessageID
 	call.ResultPartID = claimed.ResultPartID
 	return call, claimed
 }
 
 func (e *runExecution) commitToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement) error {
-	if descriptorRequiresToolSettlement(e.plan.Descriptor) {
-		store, ok := e.host.Store.(session.ToolSettlementStore)
-		if !ok {
-			return fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)
-		}
-		return store.SettleToolCall(ctx, settlement)
-	}
-	terminal, err := settlement.Apply(claimed)
-	if err != nil {
-		return err
-	}
-	terminal.ResultMessageID = settlement.ResultMessage.ID
-	terminal.ResultPartID = settlement.ResultPart.ID
-	if err := e.host.Store.FinishToolCall(ctx, terminal); err != nil {
-		return err
-	}
-	if _, err := e.host.Store.AppendMessage(ctx, settlement.ResultMessage); err != nil {
-		return err
-	}
-	_, err = e.host.Store.AppendPart(ctx, settlement.ResultPart)
-	return err
+	_ = claimed
+	return e.host.Store.SettleToolCall(ctx, settlement)
 }

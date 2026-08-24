@@ -72,7 +72,10 @@ func (p *Provider) StreamProvider(ctx context.Context, request model.Request) (*
 	if p == nil {
 		return nil, errors.New("fake provider is nil")
 	}
-	req := request.Clone()
+	req, err := request.Clone()
+	if err != nil {
+		return nil, err
+	}
 	if req.Observer != nil {
 		req.Observer.OnProviderStart(ctx, req)
 	}

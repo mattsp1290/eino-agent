@@ -90,24 +90,30 @@ type ToolSettledNotice struct {
 }
 
 var (
-	RunBeforeExecutePoint    = extension.NewInterceptor(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, func(value RunGateInput) RunGateInput { return value }, validateRunGateInput, validateRunDecision)
+	RunBeforeExecutePoint    = extension.NewInterceptor(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, infallibleClone(func(value RunGateInput) RunGateInput { return value }), validateRunGateInput, validateRunDecision)
 	ContextAssemblePoint     = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput, validateContextAssembly, validateContextAssemblyResult)
-	TurnPreparePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, cloneBoundedTurnMetadata, validateBoundedTurnMetadataInput, validateBoundedTurnMetadata, validateBoundedTurnMetadataResult)
+	TurnPreparePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, infallibleClone(cloneBoundedTurnMetadata), validateBoundedTurnMetadataInput, validateBoundedTurnMetadata, validateBoundedTurnMetadataResult)
 	ModelStreamPoint         = extension.NewRequiredDelegatingInterceptor(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateModelStreamInput, validateStreamReader, validateDelegatedStreamReader)
-	ToolPreparePoint         = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCall, validatePreparedToolCallInput, validatePreparedToolCall, validatePreparedToolCallResult)
-	ToolExecutePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecution, validateToolExecutionInput, validateToolOutcome, validateToolExecutionResult)
-	ToolResultTransformPoint = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-result-transform", Version: "1"}, cloneToolOutcome, validateToolOutcomeInput, validateToolOutcome, validateToolOutcomeResult)
+	ToolPreparePoint         = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCallChecked, validatePreparedToolCallInput, validatePreparedToolCall, validatePreparedToolCallResult)
+	ToolExecutePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecutionChecked, validateToolExecutionInput, validateToolOutcome, validateToolExecutionResult)
+	ToolResultTransformPoint = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-result-transform", Version: "1"}, infallibleClone(cloneToolOutcome), validateToolOutcomeInput, validateToolOutcome, validateToolOutcomeResult)
 
-	RunAdmittedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-admitted", Version: "1"}, extension.NotificationContained, cloneRunAdmittedNotice)
-	RunStartedPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-started", Version: "1"}, extension.NotificationContained, func(value RunStartedNotice) RunStartedNotice { return value })
-	RunSettledPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-settled", Version: "1"}, extension.NotificationContained, cloneRunSettledNotice)
-	ModelRequestedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/model-requested", Version: "1"}, extension.NotificationContained, func(value ModelRequestedNotice) ModelRequestedNotice { return value })
-	ModelCompletedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/model-completed", Version: "1"}, extension.NotificationContained, func(value ModelCompletedNotice) ModelCompletedNotice { return value })
-	ToolPreparedPoint   = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-prepared", Version: "1"}, extension.NotificationContained, cloneToolPreparedNotice)
-	ToolStartedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-started", Version: "1"}, extension.NotificationContained, func(value ToolStartedNotice) ToolStartedNotice { return value })
-	ToolSettledPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-settled", Version: "1"}, extension.NotificationContained, cloneToolSettledNotice)
-	EventPublishedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/event-published", Version: "1"}, extension.NotificationContained, cloneEvent)
+	RunAdmittedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-admitted", Version: "1"}, extension.NotificationContained, infallibleClone(cloneRunAdmittedNotice))
+	RunStartedPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-started", Version: "1"}, extension.NotificationContained, identityClone[RunStartedNotice])
+	RunSettledPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-settled", Version: "1"}, extension.NotificationContained, infallibleClone(cloneRunSettledNotice))
+	ModelRequestedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/model-requested", Version: "1"}, extension.NotificationContained, identityClone[ModelRequestedNotice])
+	ModelCompletedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/model-completed", Version: "1"}, extension.NotificationContained, identityClone[ModelCompletedNotice])
+	ToolPreparedPoint   = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-prepared", Version: "1"}, extension.NotificationContained, infallibleClone(cloneToolPreparedNotice))
+	ToolStartedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-started", Version: "1"}, extension.NotificationContained, identityClone[ToolStartedNotice])
+	ToolSettledPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/tool-settled", Version: "1"}, extension.NotificationContained, infallibleClone(cloneToolSettledNotice))
+	EventPublishedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/event-published", Version: "1"}, extension.NotificationContained, infallibleClone(cloneEvent))
 )
+
+func identityClone[T any](value T) (T, error) { return value, nil }
+
+func infallibleClone[T any](clone func(T) T) extension.CloneFunc[T] {
+	return func(value T) (T, error) { return clone(value), nil }
+}
 
 type compositeEventSink struct {
 	infrastructure EventSink

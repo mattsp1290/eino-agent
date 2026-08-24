@@ -5,9 +5,9 @@ Date: 2026-06-27
 Tool execution is gated by a permission policy before the runtime calls the
 materialized tool executor.
 
-Tool-call middleware runs first. Policy receives the final rewritten input's
+The typed tool-prepare pipeline runs first. Policy receives the final rewritten input's
 computed `runtime.ToolCall.Pattern`, so it always decides on the operation that
-will actually execute. A policy cannot rewrite arguments or bypass middleware.
+will actually execute. A policy cannot rewrite arguments or bypass preparation.
 
 Hosts can supply native policies through `runtime.WithPermissions`, including
 plain functions adapted by `permissions.PolicyFunc`. The versioned
@@ -66,6 +66,5 @@ external policy engine.
 Frozen extension plans may add scoped `runtime.ToolGuard` callbacks. Every
 applicable guard runs after input preparation and before the existing policy
 loop. A guard can only deny or abstain; any denial wins, and no guard can grant
-authority or override another denial. If all abstain, legacy permission and
-approval order, callback count, interruption timing, and output remain
-unchanged.
+authority or override another denial. If all abstain, the host permission and
+approval pipeline proceeds unchanged.

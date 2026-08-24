@@ -20,21 +20,16 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func TestSystemPromptMaterializationIsExplicitAndOrdered(t *testing.T) {
+func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", EpochID: "epoch", SystemPrompt: "configured"}
-	plan := &RunPlan{Prompts: []MountedPrompt{
+	plan := &RunPlan{prompts: []MountedPrompt{
 		{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })},
 		{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })},
 	}}
 	orchestrator := &StreamingOrchestrator{}
 	text, err := orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
-	if err != nil || text != "first\n\nlast" {
-		t.Fatalf("default-off prompt = %q, %v", text, err)
-	}
-	orchestrator.SystemPromptMaterialization = true
-	text, err = orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
 	if err != nil || text != "first\n\nconfigured\n\nlast" {
-		t.Fatalf("enabled prompt = %q, %v", text, err)
+		t.Fatalf("prompt = %q, %v", text, err)
 	}
 }
 
@@ -54,7 +49,7 @@ func TestFallbackModelPrependsSystemWithoutReorderingDurableMessages(t *testing.
 
 func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 	var sequence []string
-	plan := &RunPlan{Guards: []MountedToolGuard{
+	plan := &RunPlan{guards: []MountedToolGuard{
 		{ID: "deny", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "deny")
 			return ToolGuardResult{Decision: ToolGuardDeny, Message: "blocked"}, nil
@@ -87,7 +82,7 @@ func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 		Input:     json.RawMessage(`{"op":"delete"}`),
 		Scope:     ToolScope{Permissions: []string{"write"}},
 	}
-	plan := &RunPlan{Guards: []MountedToolGuard{
+	plan := &RunPlan{guards: []MountedToolGuard{
 		{ID: "mutate", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			copy(request.Call.Input, json.RawMessage(`{"op":"hidden"}`))
 			copy(request.Call.Scope.Permissions, []string{"audit"})
@@ -193,15 +188,12 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	streamer := functionStreamer(streamFromFunction)
-	client := functionClient(clientFunctionOne)
 	terminalCalled := false
-	observer := functionObserver(func() {})
-	input := extensionModelStreamInput(ModelStreamInput{Resolved: model.Resolved{Client: client, Streamer: streamer}, Request: model.Request{Observer: observer}})
+	input := ModelStreamInput{ProviderID: "provider", ModelID: "model", ContentHash: "hash", Audited: AuditedModelInput{System: "system"}}
 	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, input, func(_ context.Context, value ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		terminalCalled = true
-		if value.Resolved.Client != nil || value.Resolved.Streamer != nil || value.Request.Observer != nil {
-			t.Fatal("model stream terminal received host callable")
+		if value.ProviderID != "provider" || value.ModelID != "model" || value.ContentHash != "hash" {
+			t.Fatalf("model stream terminal received wrong data: %#v", value)
 		}
 		reader, writer := einoschema.Pipe[*einoschema.Message](1)
 		writer.Close()
@@ -213,12 +205,15 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	reader.Close()
 }
 
-func TestModelStreamValidationRejectsCallableReplacement(t *testing.T) {
-	original := extensionModelStreamInput(ModelStreamInput{Resolved: model.Resolved{Client: functionClient(clientFunctionOne), Streamer: functionStreamer(streamFromFunction)}})
-	candidate := cloneModelStreamInput(original)
-	candidate.Resolved.Client = functionClient(clientFunctionTwo)
+func TestModelStreamValidationRejectsCanonicalDataReplacement(t *testing.T) {
+	original := ModelStreamInput{ProviderID: "provider", ModelID: "model", ContentHash: "hash"}
+	candidate, err := cloneModelStreamInput(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	candidate.ContentHash = "changed"
 	if err := validateModelStreamInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
-		t.Fatalf("client replacement validation = %v", err)
+		t.Fatalf("content hash replacement validation = %v", err)
 	}
 }
 
@@ -227,7 +222,7 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 	component := extension.Component{InstanceID: "stream-nested-mutation", Artifact: extension.Artifact{Name: "stream-nested-mutation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
-			input.Request.Messages[0].ToolCalls[0].Extra["nested"].(map[string]any)["secret"] = "mutated"
+			input.Audited.Messages[0].Canonical[0] = '['
 			return next(ctx, input)
 		})
 	}))
@@ -240,9 +235,7 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 	}
 	defer plan.Release()
 
-	original := ModelStreamInput{Request: model.Request{Messages: []*einoschema.Message{{
-		ToolCalls: []einoschema.ToolCall{{Extra: map[string]any{"nested": map[string]any{"secret": "original"}}}},
-	}}}}
+	original := ModelStreamInput{ContentHash: "hash", Audited: AuditedModelInput{Messages: []AuditedMessage{{Canonical: json.RawMessage(`{"role":"user","content":"original"}`)}}}}
 	providerCalled := false
 	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, original, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		providerCalled = true
@@ -251,7 +244,7 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 	if reader != nil || !errors.Is(err, extension.ErrProtectedMutation) || providerCalled {
 		t.Fatalf("reader=%v error=%v provider_called=%t", reader, err, providerCalled)
 	}
-	if got := original.Request.Messages[0].ToolCalls[0].Extra["nested"].(map[string]any)["secret"]; got != "original" {
+	if got := string(original.Audited.Messages[0].Canonical); got != `{"role":"user","content":"original"}` {
 		t.Fatalf("original request mutated through interceptor alias: %v", got)
 	}
 }
@@ -324,7 +317,7 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dispatch.Release()
-	plan := &RunPlan{Dispatch: dispatch, Tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) {
+	plan := &RunPlan{dispatch: dispatch, tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) {
 		return []Tool{{Name: "echo"}}, nil
 	})}
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
@@ -339,9 +332,12 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 }
 
 func TestProtectedViewsRejectCallableInjection(t *testing.T) {
-	modelInput := extensionModelStreamInput(ModelStreamInput{})
-	modelCandidate := cloneModelStreamInput(modelInput)
-	modelCandidate.Resolved.Streamer = functionStreamer(streamFromFunction)
+	modelInput := ModelStreamInput{ContentHash: "original"}
+	modelCandidate, err := cloneModelStreamInput(modelInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelCandidate.ContentHash = "changed"
 	if err := validateModelStreamInput(modelInput, modelCandidate); !errors.Is(err, extension.ErrProtectedMutation) {
 		t.Fatalf("streamer injection validation = %v", err)
 	}
@@ -391,14 +387,14 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	message := einoschema.UserMessage("protected")
 	message.Extra = map[string]any{"nested": messageNested, "unsupported": make(chan struct{})}
 	_, err = extension.Invoke(plan, context.Background(), ContextAssemblePoint, ContextAssembly{Base: []*einoschema.Message{message}}, func(_ context.Context, input ContextAssembly) (ContextAssembly, error) { return input, nil })
-	if !errors.Is(err, extension.ErrProtectedMutation) || contextEntered || messageNested["value"] != "original" {
+	if err == nil || contextEntered || messageNested["value"] != "original" {
 		t.Fatalf("context clone failure = %v entered=%t nested=%v", err, contextEntered, messageNested)
 	}
 	toolNested := map[string]any{"value": "original"}
 	tool := Tool{Name: "tool", Info: &einoschema.ToolInfo{Name: "tool", Extra: map[string]any{"nested": toolNested, "unsupported": make(chan struct{})}}}
 	prepared := PreparedToolCall{Tool: tool, Call: ToolCall{ID: "call", Name: "tool", Input: json.RawMessage(`{}`)}}
 	_, err = extension.Invoke(plan, context.Background(), ToolPreparePoint, prepared, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) { return input, nil })
-	if !errors.Is(err, extension.ErrProtectedMutation) || toolEntered || toolNested["value"] != "original" {
+	if err == nil || toolEntered || toolNested["value"] != "original" {
 		t.Fatalf("tool clone failure = %v entered=%t nested=%v", err, toolEntered, toolNested)
 	}
 	if err := validateToolExecutionInput(ToolExecution(prepared), cloneToolExecution(ToolExecution(prepared))); !errors.Is(err, extension.ErrProtectedMutation) {
@@ -418,50 +414,12 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 				Call: ToolCall{ID: "call", Name: "tool", Input: json.RawMessage(`{}`)},
 			}
 			_, invokeErr := extension.Invoke(plan, context.Background(), ToolPreparePoint, malformed, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) { return input, nil })
-			if !errors.Is(invokeErr, extension.ErrProtectedMutation) || toolEntered {
+			if invokeErr == nil || toolEntered {
 				t.Fatalf("malformed schema clone failure = %v entered=%t", invokeErr, toolEntered)
 			}
 		})
 	}
 }
-
-type functionStreamer func(context.Context, model.Request) (*einoschema.StreamReader[*einoschema.Message], error)
-
-func (f functionStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	return f(ctx, request)
-}
-
-func streamFromFunction(context.Context, model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	reader, writer := einoschema.Pipe[*einoschema.Message](1)
-	writer.Close()
-	return reader, nil
-}
-
-type functionClient func()
-
-func (f functionClient) Generate(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.Message, error) {
-	f()
-	return nil, nil
-}
-
-func (f functionClient) Stream(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
-	f()
-	return streamFromFunction(context.Background(), model.Request{})
-}
-
-func (f functionClient) WithTools([]*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
-	return f, nil
-}
-
-func clientFunctionOne() {}
-func clientFunctionTwo() {}
-
-type functionObserver func()
-
-func (f functionObserver) OnProviderStart(context.Context, model.Request)     { f() }
-func (f functionObserver) OnProviderDelta(context.Context, model.StreamDelta) { f() }
-func (f functionObserver) OnProviderError(context.Context, model.Error)       { f() }
-func (f functionObserver) OnProviderEnd(context.Context, model.Response)      { f() }
 
 func TestToolValidationRejectsSameTypeCallableReplacement(t *testing.T) {
 	firstExecutor, secondExecutor := testExecutor("first"), testExecutor("second")
@@ -559,132 +517,28 @@ func testExecutor(marker string) ToolExecutor {
 	return &executor
 }
 
-func TestStrictToolPlanRejectsUnsupportedStoreBeforeAdmission(t *testing.T) {
-	released := false
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "tool-plugin", Kind: session.ExtensionTool, Required: true}}}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor, RequiresToolSettlement: true, Release: func() { released = true }}}}
-	_, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"})
-	if !errors.Is(err, ErrInvalidOrchestrator) || !released {
-		t.Fatalf("acquire strict tool plan = %v released=%t", err, released)
-	}
-}
-
-func TestAcquireRunPlanRejectsAnonymousLegacyExtensionsWithoutProvider(t *testing.T) {
-	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) { return nil, nil })}
-	if _, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"}); !errors.Is(err, ErrInvalidOrchestrator) {
-		t.Fatalf("acquire anonymous plan = %v, want ErrInvalidOrchestrator", err)
-	}
-}
-
-func TestStartRejectsAnonymousContextBeforeResolvingOrLoading(t *testing.T) {
-	var modelCalls, contextCalls int
-	orchestrator := &StreamingOrchestrator{
-		Store: newAdmissionStore(),
-		Model: model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
-			modelCalls++
-			return model.Resolved{}, nil
-		}),
-		Context: []ContextSource{ContextSourceFunc(func(context.Context, TurnSnapshot) ([]*einoschema.Message, error) {
-			contextCalls++
-			return nil, nil
-		})},
-		IDs: &sequenceIDs{},
-	}
-	if _, err := orchestrator.Start(context.Background(), Request{SessionID: "session", Config: orchestratorConfig()}); !errors.Is(err, ErrInvalidOrchestrator) {
-		t.Fatalf("Start error = %v, want ErrInvalidOrchestrator", err)
-	}
-	if modelCalls != 0 || contextCalls != 0 {
-		t.Fatalf("side effects before rejection: model=%d context=%d", modelCalls, contextCalls)
-	}
-}
-
-func TestAcquireResumePlanUsesStrictToolSettlementPredicate(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}}
-	if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); err != nil {
-		t.Fatalf("acquireResumePlan = %v", err)
-	}
-}
-
-func TestAcquireResumePlanRejectsLiveLegacyExtensionsForStrictDescriptor(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-
-	tests := []struct {
-		name      string
-		configure func(*StreamingOrchestrator)
-	}{
-		{name: "tools", configure: func(orchestrator *StreamingOrchestrator) {
-			orchestrator.Tools = ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) { return nil, nil })
-		}},
-		{name: "context", configure: func(orchestrator *StreamingOrchestrator) {
-			orchestrator.Context = []ContextSource{ContextSourceFunc(func(context.Context, TurnSnapshot) ([]*einoschema.Message, error) { return nil, nil })}
-		}},
-		{name: "hooks", configure: func(orchestrator *StreamingOrchestrator) {
-			orchestrator.Hooks = []Hook{HookFuncs{}}
-		}},
-		{name: "middleware", configure: func(orchestrator *StreamingOrchestrator) {
-			orchestrator.Middleware = []ToolMiddleware{ToolMiddlewareFuncs{}}
-		}},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			resumeCalls := 0
-			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}, resumeCalls: &resumeCalls}}
-			test.configure(orchestrator)
-			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
-				t.Fatalf("acquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
-			}
-			if resumeCalls != 0 {
-				t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
-			}
-		})
-	}
-
-	t.Run("strict without legacy extensions", func(t *testing.T) {
-		orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}}
-		if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); err != nil {
-			t.Fatalf("acquireResumePlan = %v", err)
-		}
-	})
-
-	t.Run("partial legacy requires matching live extensions", func(t *testing.T) {
-		partial := descriptor.Clone()
-		partial.Mode = session.PlanPartialLegacy
-		partial.Fingerprint, _ = session.FingerprintExtensionPlan(partial)
-		orchestrator := &StreamingOrchestrator{
-			Store:      newAdmissionStore(),
-			Plans:      staticRunPlanProvider{plan: &RunPlan{Descriptor: partial}},
-			Middleware: []ToolMiddleware{ToolMiddlewareFuncs{}},
-		}
-		if _, err := orchestrator.acquireResumePlan(context.Background(), partial); err != nil {
-			t.Fatalf("acquireResumePlan = %v", err)
-		}
-	})
-}
-
-func TestEmptyStrictPlanAcquiresAndResumesWithoutProvider(t *testing.T) {
+func TestEmptyPlanAcquiresAndResumesWithoutProvider(t *testing.T) {
 	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore()}
 	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Descriptor.Mode != session.PlanStrict || plan.Descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || plan.Descriptor.Fingerprint == "" {
-		t.Fatalf("empty descriptor = %#v", plan.Descriptor)
+	descriptor := plan.Descriptor()
+	if descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || descriptor.Fingerprint == "" {
+		t.Fatalf("empty descriptor = %#v", descriptor)
 	}
-	resumed, err := orchestrator.acquireResumePlan(context.Background(), plan.Descriptor)
+	resumed, err := orchestrator.acquireResumePlan(context.Background(), descriptor)
 	if err != nil {
 		t.Fatalf("resume empty strict plan = %v", err)
 	}
-	if resumed.Descriptor.Fingerprint != plan.Descriptor.Fingerprint || resumed.Descriptor.Mode != plan.Descriptor.Mode || resumed.Descriptor.SchemaVersion != plan.Descriptor.SchemaVersion || len(resumed.Descriptor.Entries) != 0 {
-		t.Fatalf("resumed descriptor = %#v, want %#v", resumed.Descriptor, plan.Descriptor)
+	resumedDescriptor := resumed.Descriptor()
+	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || resumedDescriptor.SchemaVersion != descriptor.SchemaVersion || len(resumedDescriptor.Entries) != 0 {
+		t.Fatalf("resumed descriptor = %#v, want %#v", resumedDescriptor, descriptor)
 	}
 }
 
 func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
-	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
+	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
 	valid.Fingerprint, _ = session.FingerprintExtensionPlan(valid)
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
@@ -696,7 +550,7 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 	} {
 		t.Run(name, func(t *testing.T) {
 			resumeCalls := 0
-			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: valid}, resumeCalls: &resumeCalls}}
+			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{descriptor: valid}, resumeCalls: &resumeCalls}}
 			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
 			}
@@ -707,63 +561,41 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 	}
 }
 
-func TestAcquireResumePlanRejectsLegacyModeBeforeProvider(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanLegacy}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-	resumeCalls := 0
-	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: emptyExtensionPlanDescriptor()}, resumeCalls: &resumeCalls}}
-	if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
+func TestStartReleasesAcquiredPlanWhenResolverPanics(t *testing.T) {
+	releases := 0
+	plan, err := NewRunPlan(RunPlanSpec{Release: func() { releases++ }})
+	if err != nil {
+		t.Fatal(err)
 	}
-	if resumeCalls != 0 {
-		t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
+	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(nil))
+	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	orchestrator.Model = model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+		panic("resolver failed")
+	})
+	defer func() {
+		if recovered := recover(); recovered != "resolver failed" {
+			t.Fatalf("recovered = %#v", recovered)
+		}
+		if releases != 1 {
+			t.Fatalf("plan releases = %d, want 1", releases)
+		}
+	}()
+	_, _ = orchestrator.Start(context.Background(), Request{SessionID: "session", Config: orchestratorConfig()})
+}
+
+func TestRunPlanDescriptorReturnsDefensiveClone(t *testing.T) {
+	plan, err := NewRunPlan(RunPlanSpec{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := plan.Descriptor()
+	first.SchemaVersion = 0
+	if plan.Descriptor().SchemaVersion != session.ExtensionPlanSchemaVersion {
+		t.Fatal("descriptor mutation changed sealed plan")
 	}
 }
 
-func TestAcquireResumePlanRecomputesProviderDescriptorFingerprint(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{
-		SchemaVersion: session.ExtensionPlanSchemaVersion,
-		Mode:          session.PlanStrict,
-		Entries: []session.ExtensionPlanEntry{{
-			InstanceID: "callbacks",
-			Kind:       session.ExtensionHandlers,
-			Required:   true,
-			Artifact:   session.ArtifactIdentity{Name: "callbacks", Hash: "persisted"},
-		}},
-	}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-
-	t.Run("rejects copied stale fingerprint", func(t *testing.T) {
-		changed := descriptor.Clone()
-		changed.Entries[0].Artifact.Hash = "changed"
-		changed.Fingerprint = descriptor.Fingerprint
-		released := false
-		orchestrator := &StreamingOrchestrator{
-			Store: newAdmissionStore(),
-			Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: changed, Release: func() {
-				released = true
-			}}},
-		}
-		if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) || !released {
-			t.Fatalf("acquireResumePlan = %v released=%t", err, released)
-		}
-	})
-
-	t.Run("canonicalizes omitted fingerprint", func(t *testing.T) {
-		matching := descriptor.Clone()
-		matching.Fingerprint = ""
-		orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{Descriptor: matching}}}
-		plan, err := orchestrator.acquireResumePlan(context.Background(), descriptor)
-		if err != nil {
-			t.Fatalf("acquireResumePlan = %v", err)
-		}
-		if plan.Descriptor.Fingerprint != descriptor.Fingerprint {
-			t.Fatalf("fingerprint = %q, want %q", plan.Descriptor.Fingerprint, descriptor.Fingerprint)
-		}
-	})
-}
-
-func TestResumeRunStrictCallbacksOnlyDoesNotRequireSettlementStore(t *testing.T) {
+func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 	store := newAdmissionStore()
 	now := time.Now().UTC()
 	if _, err := store.CreateSession(context.Background(), session.Session{ID: "session", CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -773,9 +605,9 @@ func TestResumeRunStrictCallbacksOnlyDoesNotRequireSettlementStore(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
 	orchestrator := &StreamingOrchestrator{Store: store, OwnerID: "new-owner", Clock: func() time.Time { return now }}
-	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, &RunPlan{Descriptor: descriptor}), run, nil)
+	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, &RunPlan{descriptor: descriptor}), run, nil)
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
 	}
@@ -804,7 +636,7 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
 	orchestrator := &StreamingOrchestrator{Store: store, Clock: func() time.Time { return now }}
 	done := make(chan Result, 1)
-	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, &RunPlan{Dispatch: dispatch}), run, done)
+	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, &RunPlan{dispatch: dispatch}), run, done)
 	result := <-done
 	if result.Error != nil || duration != 0 {
 		t.Fatalf("resume result=%+v duration=%s", result, duration)
@@ -937,26 +769,9 @@ func settledNoticePlan(t *testing.T, notices *[]RunSettledNotice) (*RunPlan, fun
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &RunPlan{Dispatch: dispatch}, func() {
+	return testRunPlanWithDispatch(dispatch), func() {
 		if err := mount.Close(context.Background()); err != nil {
 			t.Fatal(err)
-		}
-	}
-}
-
-func TestVersionOnePromptAndGuardDescriptorsAreUnverifiable(t *testing.T) {
-	for _, kind := range []session.ExtensionKind{session.ExtensionPrompt, session.ExtensionGuard} {
-		descriptor := session.ExtensionPlanDescriptor{SchemaVersion: 1, Mode: session.PlanStrict, Entries: []session.ExtensionPlanEntry{{InstanceID: "ordered", Kind: kind, Required: true}}}
-		descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-		provider := staticRunPlanProvider{plan: &RunPlan{Descriptor: descriptor}}
-		orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: provider}
-		if _, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{}); !errors.Is(err, ErrExtensionPlanMismatch) {
-			t.Fatalf("kind %s fresh error = %v, want mismatch", kind, err)
-		}
-		provider.plan = &RunPlan{Descriptor: descriptor}
-		orchestrator.Plans = provider
-		if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
-			t.Fatalf("kind %s resume error = %v, want mismatch", kind, err)
 		}
 	}
 }

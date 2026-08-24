@@ -15,14 +15,6 @@ const ExtensionPlanSchemaVersion = 2
 // ModelRequestID identifies one durable provider-attempt audit record.
 type ModelRequestID string
 
-type PlanMode string
-
-const (
-	PlanStrict        PlanMode = "strict"
-	PlanPartialLegacy PlanMode = "partial-legacy"
-	PlanLegacy        PlanMode = "legacy"
-)
-
 type ExtensionKind string
 
 const (
@@ -67,9 +59,14 @@ type ExtensionPlanEntry struct {
 	ExecutorHash  string
 }
 
+func (e ExtensionPlanEntry) Clone() ExtensionPlanEntry {
+	next := e
+	next.Registrations = append([]RegistrationIdentity(nil), e.Registrations...)
+	return next
+}
+
 type ExtensionPlanDescriptor struct {
 	SchemaVersion int
-	Mode          PlanMode
 	Fingerprint   string
 	Entries       []ExtensionPlanEntry
 }
@@ -78,8 +75,7 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 	next := d
 	next.Entries = make([]ExtensionPlanEntry, len(d.Entries))
 	for index, entry := range d.Entries {
-		next.Entries[index] = entry
-		next.Entries[index].Registrations = append([]RegistrationIdentity(nil), entry.Registrations...)
+		next.Entries[index] = entry.Clone()
 	}
 	return next
 }
@@ -90,9 +86,6 @@ func FingerprintExtensionPlan(descriptor ExtensionPlanDescriptor) (string, error
 	next := descriptor.Clone()
 	next.Fingerprint = ""
 	for index := range next.Entries {
-		if next.SchemaVersion < ExtensionPlanSchemaVersion {
-			next.Entries[index].Order = 0
-		}
 		sort.Slice(next.Entries[index].Registrations, func(i, j int) bool {
 			return compareRegistrationIdentity(next.Entries[index].Registrations[i], next.Entries[index].Registrations[j]) < 0
 		})

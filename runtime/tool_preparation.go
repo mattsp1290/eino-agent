@@ -98,43 +98,32 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			input = decoded
 		}
 		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Input: cloneJSON(input)}
-		input, middlewareErr := o.beforeToolCall(ctx, tool, call)
-		call.Input = cloneJSON(input)
-		if middlewareErr == nil && execution.dispatch() != nil {
+		input = cloneJSON(call.Input)
+		var prepareErr error
+		if execution.dispatch() != nil {
 			prepared, err := extension.Invoke(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(_ context.Context, value PreparedToolCall) (PreparedToolCall, error) { return value, nil })
 			if err != nil {
-				middlewareErr = err
+				prepareErr = err
 			} else {
 				call.Input = cloneJSON(prepared.Call.Input)
-				call.Pattern = prepared.Call.Pattern
 				input = cloneJSON(prepared.Call.Input)
 			}
 		}
 		call.Pattern = toolPattern(input, schemaCall.Function.Name)
 		schemaCall.Function.Arguments = string(input)
 		_ = extension.Notify(execution.dispatch(), ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
-		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: middlewareErr})
+		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: prepareErr})
 	}
 	return prepared, nil
 }
 
 func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.Message, error) {
 	messages := make([]*einoschema.Message, 0, len(calls))
-	strictSettlement := descriptorRequiresToolSettlement(execution.plan.Descriptor)
-	if strictSettlement {
-		if _, ok := o.Store.(session.ToolSettlementStore); !ok {
-			return nil, fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)
-		}
-	}
 	for _, prepared := range calls {
 		schemaCall, tool, call := prepared.schemaCall, prepared.tool, prepared.call
 		callID, input := call.ID, call.Input
-		var resultMessageID session.MessageID
-		var resultPartID session.PartID
-		if strictSettlement {
-			resultMessageID = o.IDs.NewMessageID()
-			resultPartID = o.IDs.NewPartID()
-		}
+		resultMessageID := o.IDs.NewMessageID()
+		resultPartID := o.IDs.NewPartID()
 		record, err := o.Store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
 		if err != nil {
 			return nil, err
@@ -169,5 +158,9 @@ func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, execution *run
 	if sink == nil {
 		return nil
 	}
-	return sink.Emit(ctx, Event{Kind: EventToolCallUpdated, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: callID, EpochID: snapshot.EpochID, ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID), Payload: mustJSON(withToolStatus(payload, status)), Time: o.now()})
+	withStatus, err := withToolStatus(payload, status)
+	if err != nil {
+		return err
+	}
+	return sink.Emit(ctx, Event{Kind: EventToolCallUpdated, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: callID, EpochID: snapshot.EpochID, ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID), Payload: mustJSON(withStatus), Time: o.now()})
 }

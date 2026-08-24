@@ -30,7 +30,16 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 		}
 		input := value
 		if point.clone != nil {
-			input = point.clone(value)
+			var err error
+			input, err = point.clone(value)
+			if err != nil {
+				failure := callbackFailure(entry, "clone_failed", err)
+				report(plan.reporter, ctx, failure)
+				if point.policy == NotificationReturnFailures {
+					failures = appendBounded(failures, failure)
+				}
+				continue
+			}
 		}
 		err := callObserver(context.WithValue(ctx, callbackMountKey{}, entry.state), observer, input)
 		if err == nil {
@@ -60,7 +69,11 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 		return zero, fmt.Errorf("%w: nil terminal", ErrInvalidRegistration)
 	}
 	if plan == nil || point.key == nil {
-		return terminal(ctx, cloneInput(point.clone, input))
+		cloned, err := cloneInput(point.clone, input)
+		if err != nil {
+			return zero, err
+		}
+		return terminal(ctx, cloned)
 	}
 	entries := make([]plannedEntry, 0)
 	for _, entry := range plan.entries {
@@ -76,7 +89,11 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			}
 		}
 		if index == len(entries) {
-			out, err := terminal(currentCtx, cloneInput(point.clone, candidate))
+			cloned, err := cloneInput(point.clone, candidate)
+			if err != nil {
+				return zero, err
+			}
+			out, err := terminal(currentCtx, cloned)
 			if err == nil && point.validateOut != nil {
 				err = point.validateOut(out)
 			}
@@ -110,7 +127,12 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			if nextCtx == nil {
 				nextCtx = currentCtx
 			}
-			out, err := invoke(index+1, nextCtx, cloneInput(point.clone, nextInput))
+			cloned, err := cloneInput(point.clone, nextInput)
+			if err != nil {
+				delegatedFailure = err
+				return zero, &delegatedError{cause: err}
+			}
+			out, err := invoke(index+1, nextCtx, cloned)
 			if err != nil {
 				delegatedFailure = err
 				return out, &delegatedError{cause: err}
@@ -119,7 +141,11 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			delegatedSucceeded = true
 			return out, nil
 		}
-		out, err := callAround(context.WithValue(currentCtx, callbackMountKey{}, entry.state), around, cloneInput(point.clone, candidate), next)
+		cloned, cloneErr := cloneInput(point.clone, candidate)
+		if cloneErr != nil {
+			return zero, cloneErr
+		}
+		out, err := callAround(context.WithValue(currentCtx, callbackMountKey{}, entry.state), around, cloned, next)
 	sealDelegation:
 		for {
 			switch delegation.Load() {
@@ -175,7 +201,11 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 		}
 		return out, err
 	}
-	return invoke(0, ctx, cloneInput(point.clone, input))
+	cloned, err := cloneInput(point.clone, input)
+	if err != nil {
+		return zero, err
+	}
+	return invoke(0, ctx, cloned)
 }
 
 const (
@@ -194,9 +224,9 @@ func callAround[I, O any](ctx context.Context, around Around[I, O], input I, nex
 	return around(ctx, input, next)
 }
 
-func cloneInput[T any](clone CloneFunc[T], input T) T {
+func cloneInput[T any](clone CloneFunc[T], input T) (T, error) {
 	if clone == nil {
-		return input
+		return input, nil
 	}
 	return clone(input)
 }

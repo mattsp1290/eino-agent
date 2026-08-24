@@ -36,8 +36,8 @@ func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
 				results <- result{err: err}
 				return
 			}
-			defer plan.Dispatch.Release()
-			resolved, err := plan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(sessionID)})
+			defer plan.Release()
+			resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(sessionID)})
 			results <- result{count: len(resolved), err: err}
 		}()
 	}
@@ -63,8 +63,8 @@ func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools, err := newPlan.Tools.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a"})
-	newPlan.Dispatch.Release()
+	tools, err := newPlan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a"})
+	newPlan.Release()
 	if err != nil || len(tools) != 0 {
 		t.Fatalf("post-deactivate tools = %#v, %v", tools, err)
 	}
@@ -73,7 +73,7 @@ func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
 	if err := mount.Close(closeCtx); err == nil || cleaned.Load() {
 		t.Fatalf("close while leased = %v cleaned=%t", err, cleaned.Load())
 	}
-	frozen.Dispatch.Release()
+	frozen.Release()
 	if err := mount.Close(context.Background()); err != nil || !cleaned.Load() {
 		t.Fatalf("final close = %v cleaned=%t", err, cleaned.Load())
 	}

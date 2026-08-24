@@ -57,9 +57,10 @@ settlement to distinguish bad tool-call arguments from host execution failures.
 ## Mutability
 
 The registry defensively copies definition slices/maps and returns fresh
-`runtime.Tool` containers for every materialization. Model-facing tool info
-contains a fresh `Extra` map so one session cannot mutate another session's tool
-metadata through shared `schema.ToolInfo` state.
+`runtime.Tool` containers for every materialization. Host metadata stays on
+`runtime.Tool`; provider-facing `schema.ToolInfo.Extra` is empty. Tool schemas
+and all remaining containers are copied so one session cannot mutate another
+session's model request state.
 
 ## Reversible and strict-plan tools
 
@@ -69,8 +70,8 @@ reload handles from deleting replacements. `composition.Registry` adds global
 and exact-session layers: a session definition shadows a same-name global
 definition, while restrictions only intersect.
 
-Strict registry-backed calls reserve result message and part IDs at admission
-and require `session.ToolSettlementStore`. SQLite commits terminal tool state
+Registry-backed calls reserve result message and part IDs at admission.
+`session.Store.SettleToolCall` commits terminal tool state
 and the model-visible result atomically and idempotently. Each settlement must
 present the owner and token of the durable tool claim whose work it commits;
 missing or stale claim identities conflict before terminal state is applied.

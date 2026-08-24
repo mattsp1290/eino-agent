@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -41,6 +40,12 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 			return nil, err
 		}
 	}
+	ownershipTransferred := false
+	defer func() {
+		if !ownershipTransferred && plan != nil {
+			plan.release()
+		}
+	}()
 	execution := newRunExecution(o, plan)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
@@ -49,6 +54,7 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 		done:        make(chan Result, 1),
 		onInterrupt: func(reason string) { o.observeInterrupt(context.WithoutCancel(ctx), run, "", reason) },
 	}
+	ownershipTransferred = true
 	go o.executeResume(runCtx, execution, run, handle.done)
 	return handle, nil
 }
@@ -68,31 +74,6 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *ru
 func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, execution *runExecution, run session.Run, settled *bool) (result Result) {
 	if run.Terminal() {
 		return Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
-	}
-	var settlementStore session.ToolSettlementStore
-	if descriptorRequiresToolSettlement(execution.plan.Descriptor) {
-		var ok bool
-		settlementStore, ok = o.Store.(session.ToolSettlementStore)
-		if !ok {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("%w: strict tool plan requires ToolSettlementStore", ErrInvalidOrchestrator)}
-		}
-		unreconciled, err := settlementStore.ListUnreconciledToolSettlements(ctx, run.ID)
-		if err != nil {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
-		}
-		for _, settlement := range unreconciled {
-			call, err := o.Store.GetToolCall(ctx, settlement.ID)
-			if err != nil {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
-			}
-			if call.ID != settlement.ID || call.SessionID != run.SessionID || call.RunID != run.ID {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrConflict}
-			}
-			if err := settlementStore.SettleToolCall(ctx, settlement); err != nil {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
-			}
-			_ = extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, reconciledToolSettledNotice(run, call, settlement))
-		}
 	}
 	o.observeResume(ctx, run, "resume")
 	run.OwnerID = o.ownerID()
@@ -174,39 +155,14 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 	return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
 }
 
-func reconciledToolSettledNotice(run session.Run, call session.ToolCall, settlement session.ToolSettlement) ToolSettledNotice {
-	var payload ToolOutput
-	_ = json.Unmarshal(settlement.Output, &payload)
-	return ToolSettledNotice{
-		SessionID:  run.SessionID,
-		RunID:      run.ID,
-		ToolCallID: call.ID,
-		ToolName:   call.Name,
-		Status:     settlement.Status,
-		Result:     ToolResult{Output: payload.Content, Structured: cloneJSON(payload.Structured)},
-		Error:      classifyExtensionError(errorString(settlement.Error)),
-	}
-}
-
 func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runExecution, run session.Run) (map[string]Tool, error) {
-	if o.Tools == nil && execution.plan.Tools == nil {
+	if execution.plan.tools == nil {
 		return nil, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
 	}
 	snapshot := o.resumeSnapshot(run)
-	var resolved []Tool
-	if o.Tools != nil {
-		legacy, err := o.Tools.ResolveTools(ctx, snapshot)
-		if err != nil {
-			return nil, err
-		}
-		resolved = append(resolved, legacy...)
-	}
-	if execution.plan.Tools != nil {
-		planned, err := execution.plan.Tools.ResolveTools(ctx, snapshot)
-		if err != nil {
-			return nil, err
-		}
-		resolved = append(resolved, planned...)
+	resolved, err := execution.plan.tools.ResolveTools(ctx, snapshot)
+	if err != nil {
+		return nil, err
 	}
 	tools := make(map[string]Tool, len(resolved))
 	for _, tool := range resolved {

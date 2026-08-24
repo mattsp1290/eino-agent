@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"reflect"
+	"fmt"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -77,13 +77,20 @@ func (i Identity) Clone() Identity {
 }
 
 // Clone returns a defensive copy of the complete mutable request graph.
-func (r Request) Clone() Request {
+func (r Request) Clone() (Request, error) {
 	next := r
 	next.Identity = r.Identity.Clone()
-	next.Messages = cloneMessages(r.Messages)
-	next.Tools = cloneToolInfos(r.Tools)
+	var err error
+	next.Messages, err = cloneMessages(r.Messages)
+	if err != nil {
+		return Request{}, err
+	}
+	next.Tools, err = cloneToolInfos(r.Tools)
+	if err != nil {
+		return Request{}, err
+	}
 	next.Options = cloneMap(r.Options)
-	return next
+	return next, nil
 }
 
 // Response is the normalized terminal provider response.
@@ -290,154 +297,108 @@ func cloneBoolMap(src map[string]bool) map[string]bool {
 	return dst
 }
 
-func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
+func cloneMessages(src []*einoschema.Message) ([]*einoschema.Message, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	dst := make([]*einoschema.Message, len(src))
-	for i, message := range src {
+	for index, message := range src {
 		if message == nil {
 			continue
 		}
-		dst[i] = cloneMutable(message)
+		for _, part := range message.AssistantGenMultiContent {
+			if part.StreamingMeta != nil {
+				return nil, fmt.Errorf("message %d contains non-copyable streaming metadata", index)
+			}
+		}
+		raw, err := json.Marshal(message)
+		if err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		if err := rejectExtraJSON(raw); err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		var cloned einoschema.Message
+		if err := json.Unmarshal(raw, &cloned); err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		dst[index] = &cloned
 	}
-	return dst
+	return dst, nil
 }
 
-func cloneToolInfos(src []*einoschema.ToolInfo) []*einoschema.ToolInfo {
+func cloneToolInfos(src []*einoschema.ToolInfo) ([]*einoschema.ToolInfo, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	dst := make([]*einoschema.ToolInfo, len(src))
-	for i, tool := range src {
+	for index, tool := range src {
 		if tool == nil {
 			continue
 		}
+		if len(tool.Extra) != 0 {
+			return nil, fmt.Errorf("tool %d contains unsupported extra metadata", index)
+		}
 		next := *tool
-		next.Extra = cloneAnyMap(tool.Extra)
-		next.ParamsOneOf = cloneParamsOneOf(tool.ParamsOneOf)
-		dst[i] = &next
+		var err error
+		next.ParamsOneOf, err = cloneParamsOneOf(tool.ParamsOneOf)
+		if err != nil {
+			return nil, fmt.Errorf("clone tool %d schema: %w", index, err)
+		}
+		dst[index] = &next
 	}
-	return dst
+	return dst, nil
 }
 
-func cloneParamsOneOf(src *einoschema.ParamsOneOf) *einoschema.ParamsOneOf {
+func cloneParamsOneOf(src *einoschema.ParamsOneOf) (*einoschema.ParamsOneOf, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	schema, err := src.ToJSONSchema()
 	if err != nil || schema == nil {
-		return nil
+		if err == nil {
+			err = errors.New("nil JSON schema")
+		}
+		return nil, err
 	}
 	data, err := json.Marshal(schema)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var cloned jsonschema.Schema
 	if err := json.Unmarshal(data, &cloned); err != nil {
-		return nil
+		return nil, err
 	}
-	return einoschema.NewParamsOneOfByJSONSchema(&cloned)
+	return einoschema.NewParamsOneOfByJSONSchema(&cloned), nil
 }
 
-func cloneAnyMap(src map[string]any) map[string]any {
-	if src == nil {
-		return nil
+func rejectExtraJSON(raw json.RawMessage) error {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
 	}
-	return cloneMutable(src)
-}
-
-type cloneVisit struct {
-	typ      reflect.Type
-	pointer  uintptr
-	kind     reflect.Kind
-	length   int
-	capacity int
-}
-
-func cloneMutable[T any](src T) T {
-	value := cloneReflectValue(reflect.ValueOf(src), make(map[cloneVisit]reflect.Value))
-	if !value.IsValid() {
-		var zero T
-		return zero
-	}
-	return value.Interface().(T)
-}
-
-// cloneReflectValue preserves concrete values in arbitrary provider metadata
-// while separating every mutable pointer, map, and slice reachable from it.
-func cloneReflectValue(value reflect.Value, seen map[cloneVisit]reflect.Value) reflect.Value {
-	if !value.IsValid() {
-		return value
-	}
-	switch value.Kind() {
-	case reflect.Interface:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		cloned := cloneReflectValue(value.Elem(), seen)
-		result := reflect.New(value.Type()).Elem()
-		result.Set(cloned)
-		return result
-	case reflect.Pointer:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind()}
-		if cloned, ok := seen[visit]; ok {
-			return cloned
-		}
-		result := reflect.New(value.Type().Elem())
-		seen[visit] = result
-		result.Elem().Set(cloneReflectValue(value.Elem(), seen))
-		return result
-	case reflect.Map:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind()}
-		if cloned, ok := seen[visit]; ok {
-			return cloned
-		}
-		result := reflect.MakeMapWithSize(value.Type(), value.Len())
-		seen[visit] = result
-		iterator := value.MapRange()
-		for iterator.Next() {
-			result.SetMapIndex(iterator.Key(), cloneReflectValue(iterator.Value(), seen))
-		}
-		return result
-	case reflect.Slice:
-		if value.IsNil() {
-			return reflect.Zero(value.Type())
-		}
-		visit := cloneVisit{typ: value.Type(), pointer: value.Pointer(), kind: value.Kind(), length: value.Len(), capacity: value.Cap()}
-		if cloned, ok := seen[visit]; ok {
-			return cloned
-		}
-		result := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
-		seen[visit] = result
-		for index := range value.Len() {
-			result.Index(index).Set(cloneReflectValue(value.Index(index), seen))
-		}
-		return result
-	case reflect.Array:
-		result := reflect.New(value.Type()).Elem()
-		for index := range value.Len() {
-			result.Index(index).Set(cloneReflectValue(value.Index(index), seen))
-		}
-		return result
-	case reflect.Struct:
-		result := reflect.New(value.Type()).Elem()
-		result.Set(value)
-		for index := range value.NumField() {
-			if value.Type().Field(index).IsExported() {
-				result.Field(index).Set(cloneReflectValue(value.Field(index), seen))
+	var visit func(any) error
+	visit = func(current any) error {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if key == "extra" {
+					return errors.New("unsupported extra metadata")
+				}
+				if err := visit(child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				if err := visit(child); err != nil {
+					return err
+				}
 			}
 		}
-		return result
-	default:
-		return value
+		return nil
 	}
+	return visit(value)
 }
 
 func cloneSlice[T any](src []T) []T {

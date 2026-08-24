@@ -366,7 +366,7 @@ func (m *Mount) Close(ctx context.Context) error {
 }
 
 func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRequest) (*runtime.RunPlan, error) {
-	return r.acquire(ctx, request.SessionID, nil, requestedToolSelector(request.Config.Tools), session.PlanStrict, session.ExtensionPlanSchemaVersion)
+	return r.acquire(ctx, request.SessionID, nil, requestedToolSelector(request.Config.Tools))
 }
 
 func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
@@ -399,18 +399,18 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 			}
 		}
 	}
-	plan, err := r.acquire(ctx, sessionID, instances, persistedToolSelector(toolIdentities), persisted.Mode, persisted.SchemaVersion)
+	plan, err := r.acquire(ctx, sessionID, instances, persistedToolSelector(toolIdentities))
 	if err != nil {
 		return nil, err
 	}
-	if plan.Descriptor.Fingerprint != persisted.Fingerprint {
-		plan.Dispatch.Release()
+	if plan.Descriptor().Fingerprint != persisted.Fingerprint {
+		plan.Release()
 		return nil, runtime.ErrExtensionPlanMismatch
 	}
 	return plan, nil
 }
 
-func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, selectTool planToolSelector, mode session.PlanMode, schemaVersion int) (*runtime.RunPlan, error) {
+func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, selectTool planToolSelector) (*runtime.RunPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -438,64 +438,60 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	prompts := selectPrompts(r.prompts, target, instances)
 	guards := selectGuards(r.guards, target, instances)
 	restrictions := selectRestrictions(r.restrictions, target, instances)
-	descriptor, err := buildDescriptor(dispatch, selected, prompts, guards, restrictions, mode, schemaVersion)
-	if err != nil {
-		dispatch.Release()
-		return nil, err
-	}
-	entries := make([]tools.SnapshotEntry, len(selected))
+	planTools := make([]runtime.PlanTool, len(selected))
 	for index, entry := range selected {
-		entries[index] = tools.SnapshotEntry{Registration: tools.Registration{Name: entry.Definition.Name, Generation: uint64(index + 1)}, Definition: entry.Definition.Clone()}
+		schemaHash, hashErr := toolSchemaHash(entry.Definition)
+		if hashErr != nil {
+			dispatch.Release()
+			return nil, hashErr
+		}
+		frozen := tools.NewSnapshot([]tools.SnapshotEntry{{Registration: tools.Registration{Name: entry.Definition.Name, Generation: 1}, Definition: entry.Definition.Clone()}})
+		planTools[index] = runtime.PlanTool{
+			Identity: session.ExtensionPlanEntry{
+				InstanceID: entry.InstanceID, Kind: session.ExtensionTool, Artifact: artifactIdentity(entry.component.Artifact), Required: true,
+				Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Definition.Name + "/" + entry.ID,
+				SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
+			},
+			Resolve: func(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.Tool, error) {
+				resolved, resolveErr := frozen.ResolveTools(ctx, snapshot)
+				if resolveErr != nil {
+					return runtime.Tool{}, resolveErr
+				}
+				if len(resolved) != 1 {
+					return runtime.Tool{}, fmt.Errorf("sealed tool %q did not materialize", entry.Definition.Name)
+				}
+				return resolved[0], nil
+			},
+		}
 	}
-	frozen := tools.NewSnapshot(entries)
-	mountedPrompts := make([]runtime.MountedPrompt, len(prompts))
+	planPrompts := make([]runtime.PlanPrompt, len(prompts))
 	for index, prompt := range prompts {
-		mountedPrompts[index] = runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.InstanceID, Provider: prompt.Provider}
+		planPrompts[index] = runtime.PlanPrompt{
+			Identity: session.ExtensionPlanEntry{InstanceID: prompt.InstanceID, Kind: session.ExtensionPrompt, Artifact: artifactIdentity(prompt.component.Artifact), Required: true, Scope: scopeIdentity(prompt.Scope), CapabilityID: prompt.Name + "/" + prompt.ID, Order: prompt.Order},
+			Prompt:   runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.InstanceID, Provider: prompt.Provider},
+		}
 	}
-	mountedGuards := make([]runtime.MountedToolGuard, len(guards))
+	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
-		mountedGuards[index] = runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.InstanceID, Guard: guard.Guard}
-	}
-	return &runtime.RunPlan{Dispatch: dispatch, Tools: frozenTools{snapshot: frozen, restrictions: restrictions}, Prompts: mountedPrompts, Guards: mountedGuards, Descriptor: descriptor, RequiresToolSettlement: len(selected) != 0}, nil
-}
-
-type frozenTools struct {
-	snapshot     tools.Snapshot
-	restrictions []mountedRestriction
-}
-
-func (f frozenTools) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
-	resolved, err := f.snapshot.ResolveTools(ctx, snapshot)
-	if err != nil {
-		return nil, err
-	}
-	filtered := resolved[:0]
-	for _, tool := range resolved {
-		if toolAllowed(tool.Name, f.restrictions) {
-			filtered = append(filtered, tool)
+		planGuards[index] = runtime.PlanGuard{
+			Identity: session.ExtensionPlanEntry{InstanceID: guard.InstanceID, Kind: session.ExtensionGuard, Artifact: artifactIdentity(guard.component.Artifact), Required: true, Scope: scopeIdentity(guard.Scope), CapabilityID: guard.ID, Order: guard.Order},
+			Guard:    runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.InstanceID, Guard: guard.Guard},
 		}
 	}
-	return filtered, nil
-}
-
-func toolAllowed(name string, restrictions []mountedRestriction) bool {
-	for _, restriction := range restrictions {
-		for _, denied := range restriction.Denied {
-			if denied == name {
-				return false
-			}
+	planRestrictions := make([]runtime.PlanRestriction, len(restrictions))
+	for index, restriction := range restrictions {
+		raw, marshalErr := json.Marshal(struct{ Allowed, Denied []string }{restriction.Allowed, restriction.Denied})
+		if marshalErr != nil {
+			dispatch.Release()
+			return nil, marshalErr
 		}
-		if len(restriction.Allowed) != 0 {
-			found := false
-			for _, allowed := range restriction.Allowed {
-				found = found || allowed == name
-			}
-			if !found {
-				return false
-			}
+		digest := sha256.Sum256(raw)
+		planRestrictions[index] = runtime.PlanRestriction{
+			Identity: session.ExtensionPlanEntry{InstanceID: restriction.InstanceID, Kind: session.ExtensionRestriction, Artifact: artifactIdentity(restriction.component.Artifact), Required: true, Scope: scopeIdentity(restriction.Scope), CapabilityID: restriction.ID, SchemaHash: hex.EncodeToString(digest[:])},
+			Allowed:  append([]string(nil), restriction.Allowed...), Denied: append([]string(nil), restriction.Denied...),
 		}
 	}
-	return true
+	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: dispatch, Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})
 }
 
 type planToolSelector func(mountedTool) bool
@@ -636,48 +632,6 @@ func capabilityApplies(instanceID string, scope, target extension.Scope, instanc
 		return false
 	}
 	return scope.Kind == extension.ScopeGlobal || scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && scope.Key == target.Key
-}
-
-func buildDescriptor(dispatch *extension.Plan, selected []mountedTool, prompts []mountedPrompt, guards []mountedGuard, restrictions []mountedRestriction, mode session.PlanMode, schemaVersion int) (session.ExtensionPlanDescriptor, error) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: schemaVersion, Mode: mode}
-	byInstance := map[string]int{}
-	for _, diagnostic := range dispatch.Diagnostics() {
-		index, ok := byInstance[diagnostic.InstanceID]
-		if !ok {
-			index = len(descriptor.Entries)
-			byInstance[diagnostic.InstanceID] = index
-			descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: diagnostic.InstanceID, Kind: session.ExtensionHandlers, Artifact: artifactIdentity(diagnostic.Artifact), Required: true, Scope: scopeIdentity(diagnostic.Scope)})
-		}
-		descriptor.Entries[index].Registrations = append(descriptor.Entries[index].Registrations, session.RegistrationIdentity{ID: diagnostic.ID, Contract: diagnostic.Contract.ID, Version: diagnostic.Contract.Version, Order: diagnostic.Order, Scope: scopeIdentity(diagnostic.Scope)})
-	}
-	for _, entry := range selected {
-		schemaHash, err := toolSchemaHash(entry.Definition)
-		if err != nil {
-			return session.ExtensionPlanDescriptor{}, err
-		}
-		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{
-			InstanceID: entry.InstanceID, Kind: session.ExtensionTool, Artifact: artifactIdentity(entry.component.Artifact), Required: true,
-			Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Definition.Name + "/" + entry.ID,
-			SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
-		})
-	}
-	for _, entry := range prompts {
-		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionPrompt, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Name + "/" + entry.ID, Order: entry.Order})
-	}
-	for _, entry := range guards {
-		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionGuard, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.ID, Order: entry.Order})
-	}
-	for _, entry := range restrictions {
-		raw, _ := json.Marshal(struct{ Allowed, Denied []string }{entry.Allowed, entry.Denied})
-		digest := sha256.Sum256(raw)
-		descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{InstanceID: entry.InstanceID, Kind: session.ExtensionRestriction, Artifact: artifactIdentity(entry.component.Artifact), Required: true, Scope: scopeIdentity(entry.Scope), CapabilityID: entry.ID, SchemaHash: hex.EncodeToString(digest[:])})
-	}
-	fingerprint, err := session.FingerprintExtensionPlan(descriptor)
-	if err != nil {
-		return session.ExtensionPlanDescriptor{}, err
-	}
-	descriptor.Fingerprint = fingerprint
-	return descriptor, nil
 }
 
 func artifactIdentity(artifact extension.Artifact) session.ArtifactIdentity {

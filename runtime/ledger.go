@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"reflect"
 	"sort"
 	"time"
 
@@ -94,60 +93,48 @@ func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes 
 }
 
 func validateAuditSafeMessage(message *einoschema.Message) error {
-	path, unsafe := findNonEmptyExtra(reflect.ValueOf(message), "Message", make(map[uintptr]bool))
-	if !unsafe {
+	for _, part := range message.AssistantGenMultiContent {
+		if part.StreamingMeta != nil {
+			return fmt.Errorf("model message contains streaming metadata")
+		}
+	}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return err
+	}
+	return rejectCanonicalExtra(raw)
+}
+
+func rejectCanonicalExtra(raw json.RawMessage) error {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	var visit func(any) error
+	visit = func(current any) error {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if key == "extra" {
+					return fmt.Errorf("model message contains unsupported extra metadata")
+				}
+				if err := visit(child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				if err := visit(child); err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	}
-	return fmt.Errorf("model message %s is not audit-safe", path)
+	return visit(value)
 }
 
-// findNonEmptyExtra walks the typed Eino message graph. It only treats fields
-// actually named Extra as provider metadata, so user content containing an
-// ordinary JSON key named "extra" is unaffected.
-func findNonEmptyExtra(value reflect.Value, path string, seen map[uintptr]bool) (string, bool) {
-	if !value.IsValid() {
-		return "", false
-	}
-	for value.Kind() == reflect.Interface || value.Kind() == reflect.Pointer {
-		if value.IsNil() {
-			return "", false
-		}
-		if value.Kind() == reflect.Pointer {
-			pointer := value.Pointer()
-			if seen[pointer] {
-				return "", false
-			}
-			seen[pointer] = true
-		}
-		value = value.Elem()
-	}
-	switch value.Kind() {
-	case reflect.Struct:
-		for index := range value.NumField() {
-			fieldType := value.Type().Field(index)
-			if !fieldType.IsExported() {
-				continue
-			}
-			fieldPath := path + "." + fieldType.Name
-			field := value.Field(index)
-			if fieldType.Name == "Extra" && field.Kind() == reflect.Map && field.Len() != 0 {
-				return fieldPath, true
-			}
-			if nestedPath, unsafe := findNonEmptyExtra(field, fieldPath, seen); unsafe {
-				return nestedPath, true
-			}
-		}
-	case reflect.Slice, reflect.Array:
-		for index := range value.Len() {
-			if nestedPath, unsafe := findNonEmptyExtra(value.Index(index), fmt.Sprintf("%s[%d]", path, index), seen); unsafe {
-				return nestedPath, true
-			}
-		}
-	}
-	return "", false
-}
-
-func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {
+func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {
 	if !o.ModelRequestLedger {
 		return nil, nil, nil
 	}
@@ -155,17 +142,22 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
 	}
-	audited, contentHash, err := AuditModelRequest(request, o.ModelRequestSafeOptions, o.ModelRequestMaxBytes)
+	messages, err := json.Marshal(audited.Messages)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("encode audited messages: %w", err)
 	}
-	messages, _ := json.Marshal(audited.Messages)
-	tools, _ := json.Marshal(audited.Tools)
-	safeConfig, _ := json.Marshal(audited.SafeCallConfig)
+	tools, err := json.Marshal(audited.Tools)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode audited tools: %w", err)
+	}
+	safeConfig, err := json.Marshal(audited.SafeCallConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("encode audited call config: %w", err)
+	}
 	now := o.now()
 	planHash := ""
 	if execution != nil && execution.plan != nil {
-		planHash = execution.plan.Descriptor.Fingerprint
+		planHash = execution.plan.descriptor.Fingerprint
 	}
 	record := session.ModelRequestRecord{
 		ID:        session.ModelRequestID(fmt.Sprintf("%s:%s:%d:%d", snapshot.RunID, messageID, attempt, step)),

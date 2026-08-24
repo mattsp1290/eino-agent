@@ -2,7 +2,6 @@ package session
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"reflect"
 	"time"
@@ -29,15 +28,6 @@ type ToolSettlement struct {
 type ToolClaimIdentity struct {
 	ClaimedBy  string
 	ClaimToken string
-}
-
-// ToolSettlementStore atomically commits terminal tool state and its reserved
-// model-visible result message/part. Implementations must be idempotent by call
-// and reserved result IDs, and must reject settlements whose claim identity
-// does not exactly match the durable call.
-type ToolSettlementStore interface {
-	SettleToolCall(context.Context, ToolSettlement) error
-	ListUnreconciledToolSettlements(context.Context, RunID) ([]ToolSettlement, error)
 }
 
 // Apply returns call with this terminal settlement applied. Applying the same

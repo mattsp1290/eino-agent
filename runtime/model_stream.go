@@ -64,7 +64,17 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		streamErr = err
 		return nil, err
 	}
-	requestRecord, requestStore, err = o.prepareModelRequest(ctx, execution, snapshot, request, messageID, attempt, step)
+	request, err = request.Clone()
+	if err != nil {
+		streamErr = err
+		return nil, err
+	}
+	audited, contentHash, err := AuditModelRequest(request, o.ModelRequestSafeOptions, o.ModelRequestMaxBytes)
+	if err != nil {
+		streamErr = err
+		return nil, err
+	}
+	requestRecord, requestStore, err = o.prepareModelRequest(ctx, execution, snapshot, request, audited, contentHash, messageID, attempt, step)
 	if err != nil {
 		streamErr = err
 		return nil, err
@@ -81,16 +91,12 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		if requestRecord != nil {
 			requestRecordID = requestRecord.ID
 		}
-		contentHash := modelRequestContentHash(request)
-		if requestRecord != nil {
-			contentHash = requestRecord.ContentSHA256
-		}
 		_ = extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecordID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
 		modelRequested = true
 	}
 	var reader *einoschema.StreamReader[*einoschema.Message]
 	if execution.dispatch() != nil {
-		reader, err = extension.Invoke(execution.dispatch(), ctx, ModelStreamPoint, extensionModelStreamInput(ModelStreamInput{Resolved: snapshot.Model, Request: request}), func(ctx context.Context, _ ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+		reader, err = extension.Invoke(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), Audited: audited, ContentHash: contentHash}, func(ctx context.Context, _ ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 			return openStream(ctx, snapshot.Model, request)
 		})
 	} else {

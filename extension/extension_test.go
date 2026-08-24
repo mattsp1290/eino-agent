@@ -32,9 +32,9 @@ var (
 	})
 )
 
-func clonePayload(input testPayload) testPayload {
+func clonePayload(input testPayload) (testPayload, error) {
 	input.Values = append([]string(nil), input.Values...)
-	return input
+	return input, nil
 }
 
 func testComponent(id string) Component {

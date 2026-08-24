@@ -185,92 +185,6 @@ func (fn ToolRegistryFunc) ResolveTools(ctx context.Context, snapshot TurnSnapsh
 	return fn(ctx, snapshot)
 }
 
-// ContextSource contributes prompt or message context before model conversion.
-type ContextSource interface {
-	LoadContext(ctx context.Context, snapshot TurnSnapshot) ([]*einoschema.Message, error)
-}
-
-// ContextSourceFunc adapts a function into a ContextSource.
-type ContextSourceFunc func(context.Context, TurnSnapshot) ([]*einoschema.Message, error)
-
-// LoadContext calls fn.
-func (fn ContextSourceFunc) LoadContext(ctx context.Context, snapshot TurnSnapshot) ([]*einoschema.Message, error) {
-	return fn(ctx, snapshot)
-}
-
-// Hook observes or mutates documented runtime save points.
-type Hook interface {
-	BeforeRun(ctx context.Context, run session.Run) error
-	BeforeTurn(ctx context.Context, snapshot TurnSnapshot) (TurnSnapshot, error)
-	AfterTurn(ctx context.Context, snapshot TurnSnapshot, result Result) error
-	AfterRun(ctx context.Context, result Result) error
-}
-
-// HookFuncs adapts optional functions into a Hook. Nil functions are no-ops;
-// a nil BeforeTurn function returns its input snapshot unchanged.
-type HookFuncs struct {
-	BeforeRunFunc  func(context.Context, session.Run) error
-	BeforeTurnFunc func(context.Context, TurnSnapshot) (TurnSnapshot, error)
-	AfterTurnFunc  func(context.Context, TurnSnapshot, Result) error
-	AfterRunFunc   func(context.Context, Result) error
-}
-
-func (h HookFuncs) BeforeRun(ctx context.Context, run session.Run) error {
-	if h.BeforeRunFunc == nil {
-		return nil
-	}
-	return h.BeforeRunFunc(ctx, run)
-}
-
-func (h HookFuncs) BeforeTurn(ctx context.Context, snapshot TurnSnapshot) (TurnSnapshot, error) {
-	if h.BeforeTurnFunc == nil {
-		return snapshot, nil
-	}
-	return h.BeforeTurnFunc(ctx, snapshot)
-}
-
-func (h HookFuncs) AfterTurn(ctx context.Context, snapshot TurnSnapshot, result Result) error {
-	if h.AfterTurnFunc == nil {
-		return nil
-	}
-	return h.AfterTurnFunc(ctx, snapshot, result)
-}
-
-func (h HookFuncs) AfterRun(ctx context.Context, result Result) error {
-	if h.AfterRunFunc == nil {
-		return nil
-	}
-	return h.AfterRunFunc(ctx, result)
-}
-
-// ToolMiddleware rewrites tool inputs before durable admission and patches
-// executed results before durable settlement.
-type ToolMiddleware interface {
-	BeforeToolCall(ctx context.Context, tool Tool, call ToolCall) (json.RawMessage, error)
-	AfterToolCall(ctx context.Context, tool Tool, call ToolCall, result ToolResult, execErr error) (ToolResult, error)
-}
-
-// ToolMiddlewareFuncs adapts optional functions into ToolMiddleware. Nil
-// functions are identity pass-throughs.
-type ToolMiddlewareFuncs struct {
-	Before func(context.Context, Tool, ToolCall) (json.RawMessage, error)
-	After  func(context.Context, Tool, ToolCall, ToolResult, error) (ToolResult, error)
-}
-
-func (m ToolMiddlewareFuncs) BeforeToolCall(ctx context.Context, tool Tool, call ToolCall) (json.RawMessage, error) {
-	if m.Before == nil {
-		return cloneJSON(call.Input), nil
-	}
-	return m.Before(ctx, tool, call)
-}
-
-func (m ToolMiddlewareFuncs) AfterToolCall(ctx context.Context, tool Tool, call ToolCall, result ToolResult, execErr error) (ToolResult, error) {
-	if m.After == nil {
-		return result, nil
-	}
-	return m.After(ctx, tool, call, result, execErr)
-}
-
 // EventKind classifies internal runtime events before transport adaptation.
 type EventKind string
 
@@ -317,10 +231,9 @@ type ModelFallbackPayload struct {
 // to the to-model and the model transition encoded in Payload. It is
 // model-centric: Event.ProviderID and the optional provider payload fields are
 // left for the caller to set when the fallback crosses providers. Callers fill
-// the remaining envelope fields (IDs, Time) as usual. No error is returned
-// because json.Marshal of a struct of strings cannot fail.
+// the remaining envelope fields (IDs, Time) as usual.
 func NewModelFallbackEvent(from, to, reason string) Event {
-	payload, _ := json.Marshal(ModelFallbackPayload{
+	payload := mustJSON(ModelFallbackPayload{
 		FromModelID: from,
 		ToModelID:   to,
 		Reason:      reason,
@@ -367,11 +280,8 @@ type EventSinkFunc func(context.Context, Event) error
 func (fn EventSinkFunc) Emit(ctx context.Context, event Event) error { return fn(ctx, event) }
 
 var (
-	_ ToolRegistry   = ToolRegistryFunc(nil)
-	_ ContextSource  = ContextSourceFunc(nil)
-	_ Hook           = HookFuncs{}
-	_ ToolMiddleware = ToolMiddlewareFuncs{}
-	_ EventSink      = EventSinkFunc(nil)
+	_ ToolRegistry = ToolRegistryFunc(nil)
+	_ EventSink    = EventSinkFunc(nil)
 )
 
 func cloneSlice[T any](src []T) []T {

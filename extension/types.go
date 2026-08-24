@@ -75,7 +75,7 @@ const (
 	NotificationReturnFailures
 )
 
-type CloneFunc[T any] func(T) T
+type CloneFunc[T any] func(T) (T, error)
 type ValidateFunc[T any] func(T) error
 type OutputValidator[I, O any] func(original I, output O) error
 type DelegatedOutputValidator[O any] func(delegated, returned O) error

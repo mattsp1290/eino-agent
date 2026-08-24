@@ -104,8 +104,6 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 
 	index := 3
 	url := "https://example.test/image.png"
-	nestedMessageExtra := map[string]any{"labels": []any{"original"}}
-	nestedToolExtra := map[string]any{"labels": []any{"original"}}
 	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
 		"text": {Type: einoschema.String, Required: true},
 	})
@@ -113,50 +111,37 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 		Identity: Identity{TraceAttributes: map[string]string{"trace": "value"}},
 		Messages: []*einoschema.Message{{
 			Content: "hello",
-			Extra:   map[string]any{"nested": nestedMessageExtra},
 			ToolCalls: []einoschema.ToolCall{{
 				Index: &index,
-				Extra: map[string]any{"nested": nestedToolExtra},
 			}},
 			UserInputMultiContent: []einoschema.MessageInputPart{{
 				Type:  einoschema.ChatMessagePartTypeImageURL,
-				Extra: map[string]any{"labels": []any{"part-original"}},
-				Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{URL: &url, Extra: map[string]any{"labels": []any{"image-original"}}}},
+				Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{URL: &url}},
 			}},
 		}},
 		Tools: []*einoschema.ToolInfo{{
 			Name:        "tool",
 			ParamsOneOf: params,
-			Extra:       map[string]any{"nested": map[string]any{"labels": []any{"original"}}},
 		}},
 		Options: map[string]string{"temperature": "0"},
 	}
 
-	cloned := request.Clone()
+	cloned, err := request.Clone()
+	if err != nil {
+		t.Fatal(err)
+	}
 	cloned.Identity.TraceAttributes["trace"] = "changed"
 	cloned.Messages[0].Content = "changed"
-	cloned.Messages[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] = "changed"
 	*cloned.Messages[0].ToolCalls[0].Index = 4
-	cloned.Messages[0].ToolCalls[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] = "changed"
 	*cloned.Messages[0].UserInputMultiContent[0].Image.URL = "changed"
-	cloned.Messages[0].UserInputMultiContent[0].Extra["labels"].([]any)[0] = "changed"
-	//nolint:staticcheck // Deep cloning must cover Eino's still-serialized legacy media metadata.
-	cloned.Messages[0].UserInputMultiContent[0].Image.Extra["labels"].([]any)[0] = "changed"
 	cloned.Tools[0].Name = "changed"
-	cloned.Tools[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] = "changed"
 	cloned.Options["temperature"] = "1"
 
 	if request.Identity.TraceAttributes["trace"] != "value" ||
 		request.Messages[0].Content != "hello" ||
-		nestedMessageExtra["labels"].([]any)[0] != "original" ||
 		index != 3 ||
-		nestedToolExtra["labels"].([]any)[0] != "original" ||
 		url != "https://example.test/image.png" ||
-		request.Messages[0].UserInputMultiContent[0].Extra["labels"].([]any)[0] != "part-original" ||
-		//nolint:staticcheck // Deep cloning must cover Eino's still-serialized legacy media metadata.
-		request.Messages[0].UserInputMultiContent[0].Image.Extra["labels"].([]any)[0] != "image-original" ||
 		request.Tools[0].Name != "tool" ||
-		request.Tools[0].Extra["nested"].(map[string]any)["labels"].([]any)[0] != "original" ||
 		request.Options["temperature"] != "0" {
 		t.Fatalf("request mutated after clone: %#v", request)
 	}
@@ -165,36 +150,21 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	}
 }
 
-func TestRequestCloneDistinguishesAliasedSliceHeadersByShape(t *testing.T) {
+func TestRequestCloneRejectsUnsupportedMetadata(t *testing.T) {
 	t.Parallel()
-
-	type fullFirst struct {
-		Full   []string
-		Prefix []string
+	tests := map[string]Request{
+		"message extra": {Messages: []*einoschema.Message{{Extra: map[string]any{"value": 1}}}},
+		"tool extra":    {Tools: []*einoschema.ToolInfo{{Name: "tool", Extra: map[string]any{"value": 1}}}},
+		"streaming metadata": {Messages: []*einoschema.Message{{AssistantGenMultiContent: []einoschema.MessageOutputPart{{
+			Type: einoschema.ChatMessagePartTypeText, Text: "chunk", StreamingMeta: &einoschema.MessageStreamingMeta{Index: 1},
+		}}}}},
 	}
-	type prefixFirst struct {
-		Prefix []string
-		Full   []string
-	}
-	base := []string{"first", "second", "third"}
-	request := Request{Messages: []*einoschema.Message{{Extra: map[string]any{
-		"full_first":   fullFirst{Full: base[:3], Prefix: base[:1]},
-		"prefix_first": prefixFirst{Prefix: base[:1], Full: base[:3]},
-	}}}}
-
-	cloned := request.Clone()
-	first := cloned.Messages[0].Extra["full_first"].(fullFirst)
-	second := cloned.Messages[0].Extra["prefix_first"].(prefixFirst)
-	if len(first.Full) != 3 || len(first.Prefix) != 1 || len(second.Full) != 3 || len(second.Prefix) != 1 {
-		t.Fatalf("cloned slice lengths = first(%d,%d) second(%d,%d)", len(first.Full), len(first.Prefix), len(second.Full), len(second.Prefix))
-	}
-	if first.Full[2] != "third" || first.Prefix[0] != "first" || second.Full[2] != "third" || second.Prefix[0] != "first" {
-		t.Fatalf("cloned slice values = first(%v,%v) second(%v,%v)", first.Full, first.Prefix, second.Full, second.Prefix)
-	}
-	first.Full[0] = "changed"
-	second.Prefix[0] = "also changed"
-	if base[0] != "first" {
-		t.Fatalf("source backing slice mutated: %v", base)
+	for name, request := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := request.Clone(); err == nil {
+				t.Fatal("Clone succeeded for unsupported metadata")
+			}
+		})
 	}
 }
 

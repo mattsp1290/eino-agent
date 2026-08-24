@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -20,6 +21,7 @@ import (
 	"go.bytecodealliance.org/cm"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -261,7 +263,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	messages, err := source.LoadContext(ctx, runtime.TurnSnapshot{RunID: "run", SessionID: "session"})
+	messages, err := source.loadContext(ctx, runtime.TurnSnapshot{RunID: "run", SessionID: "session"})
 	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
 	}
@@ -284,17 +286,17 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.BeforeRun(ctx, session.Run{ID: "run", SessionID: "session"}); err != nil {
+	if err := hook.beforeRun(ctx, session.Run{ID: "run", SessionID: "session"}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := runtime.TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
-	if _, err := hook.BeforeTurn(ctx, snapshot); err != nil {
+	if _, err := hook.beforeTurn(ctx, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.AfterTurn(ctx, snapshot, runtime.Result{RunID: "run"}); err != nil {
+	if err := hook.afterTurn(ctx, snapshot, runtime.Result{RunID: "run"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.AfterRun(ctx, runtime.Result{RunID: "run"}); err != nil {
+	if err := hook.afterRun(ctx, runtime.Result{RunID: "run"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := hook.Close(); err != nil {
@@ -306,7 +308,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	call := runtime.ToolCall{ID: "call", RunID: "run", SessionID: "session", Input: json.RawMessage(`{"replace":true}`)}
-	input, err := middleware.BeforeToolCall(ctx, runtime.Tool{Name: "echo"}, call)
+	input, err := middleware.beforeToolCall(ctx, runtime.Tool{Name: "echo"}, call)
 	if err != nil || string(input) != `{"from":"wasm"}` {
 		var extensionErr *Error
 		if errors.As(err, &extensionErr) {
@@ -314,7 +316,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 		}
 		t.Fatalf("middleware input = %s, %v", input, err)
 	}
-	result, err := middleware.AfterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}}, nil)
+	result, err := middleware.afterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}}, nil)
 	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
 		t.Fatalf("middleware result = %#v, %v", result, err)
 	}
@@ -539,8 +541,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 			}, nil
 		})),
 		runtime.WithIDGenerator(&wasmTestIDs{}),
-		runtime.WithToolRegistry(registry),
-		runtime.WithRunPlanProvider(wasmTestPlanProvider{}),
+		runtime.WithRunPlanProvider(wasmTestPlanProvider{registry: registry}),
 		runtime.WithPermissions(policy),
 		runtime.WithOwnerID("wasm-blackbox"),
 	)
@@ -571,16 +572,26 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 }
 
-type wasmTestPlanProvider struct{}
+type wasmTestPlanProvider struct{ registry runtime.ToolRegistry }
 
-func (wasmTestPlanProvider) AcquireRunPlan(context.Context, runtime.RunPlanRequest) (*runtime.RunPlan, error) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Mode: session.PlanStrict}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-	return &runtime.RunPlan{Descriptor: descriptor}, nil
+func (p wasmTestPlanProvider) AcquireRunPlan(context.Context, runtime.RunPlanRequest) (*runtime.RunPlan, error) {
+	return runtime.NewRunPlan(runtime.RunPlanSpec{Tools: []runtime.PlanTool{{
+		Identity: session.ExtensionPlanEntry{InstanceID: "wasm-test", Kind: session.ExtensionTool, Artifact: session.ArtifactIdentity{Name: "wasm-test", Version: "1", Hash: "hash", SourceKind: string(extension.SourceNative)}, Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: "wasm_echo/tool"},
+		Resolve: func(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.Tool, error) {
+			resolved, err := p.registry.ResolveTools(ctx, snapshot)
+			if err != nil {
+				return runtime.Tool{}, err
+			}
+			if len(resolved) != 1 {
+				return runtime.Tool{}, fmt.Errorf("resolved %d tools", len(resolved))
+			}
+			return resolved[0], nil
+		},
+	}}})
 }
 
-func (wasmTestPlanProvider) AcquireResumePlan(_ context.Context, descriptor session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
-	return &runtime.RunPlan{Descriptor: descriptor.Clone()}, nil
+func (p wasmTestPlanProvider) AcquireResumePlan(ctx context.Context, _ session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
+	return p.AcquireRunPlan(ctx, runtime.RunPlanRequest{})
 }
 
 func executeLoadedDefinition(ctx context.Context, definition tools.Definition, input string) (any, error) {

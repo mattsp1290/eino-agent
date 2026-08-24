@@ -20,7 +20,7 @@ func (e *runExecution) dispatch() *extension.Plan {
 	if e == nil || e.plan == nil {
 		return nil
 	}
-	return e.plan.Dispatch
+	return e.plan.dispatch
 }
 
 func (e *runExecution) release() {

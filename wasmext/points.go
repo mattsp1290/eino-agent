@@ -10,7 +10,7 @@ import (
 )
 
 // RegisterContextSource adapts context-source@0.1.0 to the native context
-// assembly point while preserving the legacy LoadContext constructor surface.
+// assembly point.
 func RegisterContextSource(registrar extension.Registrar, spec extension.Registration, source *LoadedContextSource) error {
 	if source == nil {
 		return fmt.Errorf("nil Wasm context source")
@@ -73,7 +73,7 @@ func contextContributionSource(spec extension.Registration, index int) string {
 
 func finishRegisteredHook(ctx context.Context, hook *LoadedHook, notice runtime.RunSettledNotice) error {
 	snapshot := runtime.TurnSnapshot{RunID: notice.Result.RunID, SessionID: notice.SessionID}
-	return errors.Join(hook.AfterTurn(ctx, snapshot, notice.Result), hook.AfterRun(ctx, notice.Result))
+	return errors.Join(hook.afterTurn(ctx, snapshot, notice.Result), hook.afterRun(ctx, notice.Result))
 }
 
 // RegisterToolMiddleware maps tool-middleware@0.1.0 only to prepare and result
@@ -85,7 +85,7 @@ func RegisterToolMiddleware(registrar extension.Registrar, spec extension.Regist
 	prepare := spec
 	prepare.ID += "/prepare"
 	if err := extension.Use(registrar, runtime.ToolPreparePoint, prepare, func(ctx context.Context, prepared runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
-		input, err := middleware.BeforeToolCall(ctx, prepared.Tool, prepared.Call)
+		input, err := middleware.beforeToolCall(ctx, prepared.Tool, prepared.Call)
 		if err != nil {
 			return runtime.PreparedToolCall{}, err
 		}
@@ -97,7 +97,7 @@ func RegisterToolMiddleware(registrar extension.Registrar, spec extension.Regist
 	result := spec
 	result.ID += "/result"
 	return extension.Use(registrar, runtime.ToolResultTransformPoint, result, func(ctx context.Context, outcome runtime.ToolOutcome, next extension.Next[runtime.ToolOutcome, runtime.ToolOutcome]) (runtime.ToolOutcome, error) {
-		transformed, err := middleware.AfterToolCall(ctx, runtime.Tool{Name: outcome.Call.Name}, outcome.Call, outcome.Result, outcome.RawError)
+		transformed, err := middleware.afterToolCall(ctx, runtime.Tool{Name: outcome.Call.Name}, outcome.Call, outcome.Result, outcome.RawError)
 		if err != nil {
 			return runtime.ToolOutcome{}, err
 		}

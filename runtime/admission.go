@@ -53,7 +53,6 @@ type Admitter struct {
 	Store      session.Store
 	Transactor session.Transactor
 	Events     EventSink
-	Hooks      []Hook
 	Extensions *extension.Plan
 	Clock      func() time.Time
 }
@@ -143,7 +142,7 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 }
 
 func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDescriptor) error {
-	if !admissibleExtensionPlanMode(persisted.Mode) || persisted.SchemaVersion == 0 || persisted.Fingerprint == "" || !admissibleExtensionPlanMode(requested.Mode) || requested.SchemaVersion == 0 || requested.Fingerprint == "" {
+	if persisted.SchemaVersion != session.ExtensionPlanSchemaVersion || persisted.Fingerprint == "" || requested.SchemaVersion != session.ExtensionPlanSchemaVersion || requested.Fingerprint == "" {
 		return ErrExtensionPlanMismatch
 	}
 	persistedFingerprint, err := session.FingerprintExtensionPlan(persisted)
@@ -158,10 +157,6 @@ func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDe
 		return ErrExtensionPlanMismatch
 	}
 	return nil
-}
-
-func admissibleExtensionPlanMode(mode session.PlanMode) bool {
-	return mode == session.PlanStrict || mode == session.PlanPartialLegacy
 }
 
 func admitDurable(ctx context.Context, store session.Store, request AdmissionRequest, now time.Time) (AdmittedRun, error) {
@@ -188,11 +183,6 @@ func admitDurable(ctx context.Context, store session.Store, request AdmissionReq
 }
 
 func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRun, request AdmissionRequest, now time.Time) error {
-	for _, hook := range a.Hooks {
-		if err := hook.BeforeRun(ctx, admitted.Run); err != nil {
-			return err
-		}
-	}
 	if a.Events != nil {
 		event := admissionEvent(request, admitted.Session.ID, admitted.Run.ID, admitted.AssistantMessage.ID, now)
 		_ = a.Events.Emit(ctx, Event{
@@ -319,7 +309,7 @@ func admissionAssistantMessage(request AdmissionRequest, sessionID session.ID, r
 }
 
 func admissionEvent(request AdmissionRequest, sessionID session.ID, runID session.RunID, messageID session.MessageID, now time.Time) session.EventRecord {
-	payload, _ := json.Marshal(map[string]string{
+	payload := mustJSON(map[string]string{
 		"agent":       request.Config.Agent.Name,
 		"provider_id": admissionProviderID(request),
 		"model_id":    admissionModelID(request),

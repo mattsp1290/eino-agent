@@ -154,14 +154,14 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 		_ = store.Close()
 	}()
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}}
 	orch := &StreamingOrchestrator{
 		Store:    store,
-		Tools:    staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}},
 		IDs:      &sequenceIDs{},
 		OwnerID:  "owner-1",
 		Clock:    func() time.Time { return now },
 		Observer: observer,
-		Plans:    legacyResumeTestPlanProvider(),
+		Plans:    staticRunPlanProvider{plan: &RunPlan{tools: toolRegistry, descriptor: run.ExtensionPlan}},
 	}
 	handle, err := orch.Resume(context.Background(), run.ID)
 	if err != nil {
@@ -234,12 +234,12 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 		}})}, nil
 	}))
 	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	setTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "SECRET tool output"}, nil
 		}),
-	}}}
+	}}})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -283,7 +283,7 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 		}})}, nil
 	}))
 	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	setTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Scope: ToolScope{
 			Permissions: []string{"shell"},
@@ -292,7 +292,7 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 			t.Fatal("executor should not run")
 			return ToolResult{}, nil
 		}),
-	}}}
+	}}})
 	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
 		if request.Pattern != "SECRET danger pattern" {
 			t.Fatalf("permission pattern = %q", request.Pattern)
@@ -337,12 +337,12 @@ func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
 		}})}, nil
 	}))
 	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	setTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{}, errors.New("SECRET operational detail")
 		}),
-	}}}
+	}}})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -372,7 +372,7 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 		}})}, nil
 	}))
 	orch.Observer = observer
-	orch.Tools = staticToolRegistry{}
+	setTestTools(orch, staticToolRegistry{})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)
@@ -407,12 +407,12 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 		}})}, nil
 	}))
 	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	setTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "ok"}, nil
 		}),
-	}}}
+	}}})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)

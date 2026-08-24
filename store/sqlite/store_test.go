@@ -166,10 +166,6 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	if _, err := st.GetMessage(ctx, call.ResultMessageID); err != nil {
 		t.Fatalf("reserved result message = %v", err)
 	}
-	unreconciled, err := st.ListUnreconciledToolSettlements(ctx, call.RunID)
-	if err != nil || len(unreconciled) != 0 {
-		t.Fatalf("unreconciled = %#v, %v", unreconciled, err)
-	}
 	conflict := settlement
 	conflict.Output = json.RawMessage(`{"different":true}`)
 	conflict.ResultPart.Payload = conflict.Output
@@ -180,6 +176,51 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	stale.ClaimToken = "stale"
 	if err := st.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("terminal stale settlement = %v", err)
+	}
+}
+
+func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.T) {
+	for _, table := range []string{"messages", "parts"} {
+		t.Run(table, func(t *testing.T) {
+			st, call := setupClaimedToolCall(t)
+			defer func() { _ = st.Close() }()
+			ctx := context.Background()
+			now := time.Now().UTC()
+			output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+			settlement := session.ToolSettlement{
+				ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
+				ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
+				ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+			}
+			call, err := st.GetToolCall(ctx, call.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			trigger := fmt.Sprintf(`CREATE TRIGGER fail_settlement BEFORE INSERT ON %s BEGIN SELECT RAISE(ABORT, 'forced settlement failure'); END`, table)
+			if _, err = st.db.ExecContext(ctx, trigger); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.SettleToolCall(ctx, settlement); err == nil {
+				t.Fatal("SettleToolCall succeeded despite injected persistence failure")
+			}
+			current, err := st.GetToolCall(ctx, call.ID)
+			if err != nil || !reflect.DeepEqual(current, call) {
+				t.Fatalf("tool call was not rolled back: current=%#v original=%#v err=%v", current, call, err)
+			}
+			if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
+				t.Fatalf("result message survived rollback: %v", err)
+			}
+			var part session.Part
+			if err := st.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{call.ResultPartID}, &part); !errors.Is(err, session.ErrNotFound) {
+				t.Fatalf("result part survived rollback: %v", err)
+			}
+			if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_settlement`); err != nil {
+				t.Fatal(err)
+			}
+			if err := st.SettleToolCall(ctx, settlement); err != nil {
+				t.Fatalf("retry after rollback = %v", err)
+			}
+		})
 	}
 }
 
@@ -229,55 +270,6 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 				t.Fatalf("reserved part error = %v, want ErrNotFound", err)
 			}
 		})
-	}
-}
-
-func TestListUnreconciledToolSettlementsRepairsMissingReservedPart(t *testing.T) {
-	st, call := setupClaimedToolCall(t)
-	defer func() { _ = st.Close() }()
-	ctx := context.Background()
-	now := time.Now().UTC()
-	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
-	call.Status = session.ToolCallCompleted
-	call.Output = output
-	call.CompletedAt = now
-	if err := st.FinishToolCall(ctx, call); err != nil {
-		t.Fatal(err)
-	}
-	resultMessage := session.Message{
-		ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID,
-		Role: session.RoleTool, Agent: "legacy-agent", ModelID: "legacy-model", CreatedAt: now, UpdatedAt: now,
-	}
-	if _, err := st.AppendMessage(ctx, resultMessage); err != nil {
-		t.Fatal(err)
-	}
-
-	unreconciled, err := st.ListUnreconciledToolSettlements(ctx, call.RunID)
-	if err != nil || len(unreconciled) != 1 {
-		t.Fatalf("unreconciled = %#v, %v", unreconciled, err)
-	}
-	if unreconciled[0].ResultMessage.Agent != resultMessage.Agent || unreconciled[0].ResultMessage.ModelID != resultMessage.ModelID {
-		t.Fatalf("existing result message was reconstructed: %#v", unreconciled[0].ResultMessage)
-	}
-	if err := st.SettleToolCall(ctx, unreconciled[0]); err != nil {
-		t.Fatalf("repair settlement = %v", err)
-	}
-	batch, err := st.ListMessages(ctx, call.SessionID, session.ReplayCursor{Limit: 100})
-	if err != nil {
-		t.Fatal(err)
-	}
-	foundPart := false
-	for _, part := range batch.Parts {
-		if part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && string(part.Payload) == string(output) {
-			foundPart = true
-		}
-	}
-	if !foundPart {
-		t.Fatalf("reserved result part missing from replay: %#v", batch.Parts)
-	}
-	unreconciled, err = st.ListUnreconciledToolSettlements(ctx, call.RunID)
-	if err != nil || len(unreconciled) != 0 {
-		t.Fatalf("after repair unreconciled = %#v, %v", unreconciled, err)
 	}
 }
 

@@ -40,7 +40,7 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	}
 	source := &LoadedContextSource{module: module}
 	defer func() { _ = source.Close() }()
-	messages, err := source.LoadContext(context.Background(), runtime.TurnSnapshot{
+	messages, err := source.loadContext(context.Background(), runtime.TurnSnapshot{
 		RunID: "run-1", SessionID: "session-1", Messages: []*einoschema.Message{einoschema.UserMessage("SECRET content")},
 	})
 	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.System || messages[1].Content != "context" {
@@ -84,17 +84,17 @@ func TestHookCachesFullMetadataUntilAfterRun(t *testing.T) {
 	}
 	hook := &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}
 	defer func() { _ = hook.Close() }()
-	if err := hook.BeforeRun(context.Background(), session.Run{ID: "run-1", SessionID: "session-1", Agent: "agent"}); err != nil {
+	if err := hook.beforeRun(context.Background(), session.Run{ID: "run-1", SessionID: "session-1", Agent: "agent"}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := runtime.TurnSnapshot{RunID: "run-1", SessionID: "session-1", Tools: []runtime.Tool{{Name: "echo"}}, Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
-	if _, err := hook.BeforeTurn(context.Background(), snapshot); err != nil {
+	if _, err := hook.beforeTurn(context.Background(), snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.AfterTurn(context.Background(), runtime.TurnSnapshot{RunID: "run-1"}, runtime.Result{}); err != nil {
+	if err := hook.afterTurn(context.Background(), runtime.TurnSnapshot{RunID: "run-1"}, runtime.Result{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.AfterRun(context.Background(), runtime.Result{RunID: "run-1"}); err != nil {
+	if err := hook.afterRun(context.Background(), runtime.Result{RunID: "run-1"}); err != nil {
 		t.Fatal(err)
 	}
 	if seen["hook.before-run"].MessageCount != 0 || seen["hook.after-turn"].MessageCount != 1 || seen["hook.after-run"].ToolNames.Len() != 1 {
@@ -310,11 +310,11 @@ func TestToolMiddlewareJSONMappingPreservesProtectedContainers(t *testing.T) {
 	middleware := &LoadedToolMiddleware{module: module}
 	defer func() { _ = middleware.Close() }()
 	call := runtime.ToolCall{ID: "call-1", Input: json.RawMessage(`{"raw":true}`)}
-	input, err := middleware.BeforeToolCall(context.Background(), runtime.Tool{Name: "echo"}, call)
+	input, err := middleware.beforeToolCall(context.Background(), runtime.Tool{Name: "echo"}, call)
 	if err != nil || string(input) != `{"normalized":true}` {
 		t.Fatalf("BeforeToolCall = %s, %v", input, err)
 	}
-	result, err := middleware.AfterToolCall(context.Background(), runtime.Tool{Name: "echo"}, call, runtime.ToolResult{
+	result, err := middleware.afterToolCall(context.Background(), runtime.Tool{Name: "echo"}, call, runtime.ToolResult{
 		Output: "fallback", Structured: json.RawMessage(`{"original":true}`),
 		Attachments: []runtime.Attachment{{ID: "attachment-1"}}, Metadata: map[string]string{"protected": "yes"},
 	}, nil)

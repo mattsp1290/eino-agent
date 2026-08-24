@@ -91,11 +91,11 @@ type toolOutcomeSeal struct {
 }
 
 func evaluateToolGuards(ctx context.Context, plan *RunPlan, tool Tool, call ToolCall) (ToolGuardResult, error) {
-	if plan == nil || len(plan.Guards) == 0 {
+	if plan == nil || len(plan.guards) == 0 {
 		return ToolGuardResult{Decision: ToolGuardAbstain}, nil
 	}
 	denial := ToolGuardResult{Decision: ToolGuardAbstain}
-	for _, mounted := range plan.Guards {
+	for _, mounted := range plan.guards {
 		if mounted.Guard == nil {
 			return ToolGuardResult{}, errors.New("nil tool guard")
 		}
@@ -129,10 +129,19 @@ func clonePreparedToolCall(value PreparedToolCall) PreparedToolCall {
 	return value
 }
 
+func clonePreparedToolCallChecked(value PreparedToolCall) (PreparedToolCall, error) {
+	var err error
+	value.Tool, err = cloneToolChecked(value.Tool)
+	if err != nil {
+		return PreparedToolCall{}, err
+	}
+	value.Call = cloneToolCall(value.Call)
+	return value, nil
+}
+
 func validatePreparedToolCallInput(original, candidate PreparedToolCall) error {
 	leftCall, rightCall := cloneToolCall(original.Call), cloneToolCall(candidate.Call)
 	leftCall.Input, rightCall.Input = nil, nil
-	leftCall.Pattern, rightCall.Pattern = "", ""
 	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(leftCall, rightCall) || !json.Valid(candidate.Call.Input) {
 		return extension.ErrProtectedMutation
 	}
@@ -154,6 +163,16 @@ func cloneToolExecution(value ToolExecution) ToolExecution {
 	value.Tool = cloneTool(value.Tool)
 	value.Call = cloneToolCall(value.Call)
 	return value
+}
+
+func cloneToolExecutionChecked(value ToolExecution) (ToolExecution, error) {
+	var err error
+	value.Tool, err = cloneToolChecked(value.Tool)
+	if err != nil {
+		return ToolExecution{}, err
+	}
+	value.Call = cloneToolCall(value.Call)
+	return value, nil
 }
 
 func validateToolExecutionInput(original, candidate ToolExecution) error {
@@ -242,24 +261,36 @@ func validateToolOutcomeResult(original ToolOutcome, output ToolOutcome) error {
 }
 
 func cloneTool(tool Tool) Tool {
+	cloned, err := cloneToolChecked(tool)
+	if err != nil {
+		return Tool{}
+	}
+	return cloned
+}
+
+func cloneToolChecked(tool Tool) (Tool, error) {
 	tool.Scope.Permissions = cloneSlice(tool.Scope.Permissions)
 	tool.Metadata = cloneStringMap(tool.Metadata)
 	if tool.Info != nil {
 		params, paramsErr := cloneProtectedParamsOneOf(tool.Info.ParamsOneOf)
 		raw, err := json.Marshal(tool.Info)
 		var info einoschema.ToolInfo
-		if paramsErr != nil || err != nil || json.Unmarshal(raw, &info) != nil {
-			tool.Info = nil
-		} else {
-			info.ParamsOneOf = params
-			tool.Info = &info
+		if paramsErr != nil {
+			return Tool{}, paramsErr
 		}
+		if err != nil {
+			return Tool{}, err
+		}
+		if err := json.Unmarshal(raw, &info); err != nil {
+			return Tool{}, err
+		}
+		info.ParamsOneOf = params
+		tool.Info = &info
 	}
-	return tool
+	return tool, nil
 }
 
 func extensionTool(tool Tool) Tool {
-	tool = cloneTool(tool)
 	tool.Executor = nil
 	tool.InputDecoder = nil
 	return tool

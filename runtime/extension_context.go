@@ -16,9 +16,9 @@ import (
 )
 
 const (
-	OrderHostPolicy    = -1000
-	OrderCompatibility = 0
-	OrderApplication   = 1000
+	OrderHostPolicy  = -1000
+	OrderRuntime     = 0
+	OrderApplication = 1000
 )
 
 type PromptContext struct {
@@ -117,12 +117,12 @@ type MessageRoleCounts struct {
 
 func (o *StreamingOrchestrator) renderSystemPrompt(ctx context.Context, plan *RunPlan, snapshot TurnSnapshot, attempt, step int) (string, error) {
 	sections := make([]PromptSection, 0)
-	if o.SystemPromptMaterialization && snapshot.SystemPrompt != "" {
-		sections = append(sections, PromptSection{Name: "agent/system", Order: OrderCompatibility, Text: snapshot.SystemPrompt, InstanceID: "runtime"})
+	if snapshot.SystemPrompt != "" {
+		sections = append(sections, PromptSection{Name: "agent/system", Order: OrderRuntime, Text: snapshot.SystemPrompt, InstanceID: "runtime"})
 	}
 	if plan != nil {
 		promptContext := PromptContext{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Attempt: attempt, Step: step, AgentName: snapshot.Config.Agent.Name, ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID)}
-		for _, mounted := range plan.Prompts {
+		for _, mounted := range plan.prompts {
 			if mounted.Provider == nil {
 				return "", errors.New("nil prompt provider")
 			}
@@ -179,16 +179,23 @@ func validateRunDecision(decision RunDecision) error {
 	return nil
 }
 
-func cloneContextAssembly(value ContextAssembly) ContextAssembly {
+func cloneContextAssembly(value ContextAssembly) (ContextAssembly, error) {
 	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
-	value.Base = cloneProtectedMessages(value.Base)
+	var err error
+	value.Base, err = cloneProtectedMessages(value.Base)
+	if err != nil {
+		return ContextAssembly{}, err
+	}
 	contributions := value.Contributions
 	value.Contributions = make([]ContextContribution, len(contributions))
 	for index, contribution := range contributions {
 		value.Contributions[index] = contribution
-		value.Contributions[index].Message = cloneMessageDeep(contribution.Message)
+		value.Contributions[index].Message, err = cloneMessageDeep(contribution.Message)
+		if err != nil {
+			return ContextAssembly{}, err
+		}
 	}
-	return value
+	return value, nil
 }
 
 func validateContextAssemblyInput(original, candidate ContextAssembly) error {
@@ -206,6 +213,9 @@ func validateContextAssembly(value ContextAssembly) error {
 		}
 		if contribution.Message == nil {
 			return fmt.Errorf("context contribution %q message required", contribution.Source)
+		}
+		if _, err := cloneMessageDeep(contribution.Message); err != nil {
+			return err
 		}
 		if seen[contribution.Source] {
 			return fmt.Errorf("duplicate context contribution %q", contribution.Source)
@@ -278,16 +288,23 @@ func validateBoundedTurnMetadataResult(original, output BoundedTurnMetadata) err
 	return validateBoundedTurnMetadataInput(original, output)
 }
 
-func materializeContextAssembly(value ContextAssembly) []*einoschema.Message {
+func materializeContextAssembly(value ContextAssembly) ([]*einoschema.Message, error) {
 	sort.Slice(value.Contributions, func(i, j int) bool {
 		if value.Contributions[i].Order != value.Contributions[j].Order {
 			return value.Contributions[i].Order < value.Contributions[j].Order
 		}
 		return value.Contributions[i].Source < value.Contributions[j].Source
 	})
-	messages := cloneMessages(value.Base)
-	for _, contribution := range value.Contributions {
-		messages = append(messages, cloneMessageDeep(contribution.Message))
+	messages, err := cloneProtectedMessages(value.Base)
+	if err != nil {
+		return nil, err
 	}
-	return messages
+	for _, contribution := range value.Contributions {
+		message, cloneErr := cloneMessageDeep(contribution.Message)
+		if cloneErr != nil {
+			return nil, cloneErr
+		}
+		messages = append(messages, message)
+	}
+	return messages, nil
 }

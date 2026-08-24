@@ -187,7 +187,7 @@ type LoadedContextSource struct{ module *module }
 
 func (s *LoadedContextSource) Close() error { return s.module.Close() }
 
-func (s *LoadedContextSource) LoadContext(ctx context.Context, snapshot runtime.TurnSnapshot) ([]*einoschema.Message, error) {
+func (s *LoadedContextSource) loadContext(ctx context.Context, snapshot runtime.TurnSnapshot) ([]*einoschema.Message, error) {
 	return s.loadContextMetadata(ctx, turnMetadata(snapshot))
 }
 
@@ -227,10 +227,6 @@ func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSou
 		return nil, err
 	}
 	return &LoadedContextSource{module: module}, nil
-}
-
-func LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error) {
-	return OpenContextSource(ctx, cfg)
 }
 
 // LoadedEventSink emits only a bounded, content-free projection.
@@ -273,8 +269,15 @@ func (h *LoadedHook) Close() error {
 	return h.module.Close()
 }
 
-func (h *LoadedHook) BeforeRun(ctx context.Context, run session.Run) error {
+func (h *LoadedHook) beforeRun(ctx context.Context, run session.Run) error {
 	return h.beforeRunMetadata(ctx, partialTurnMetadata(run))
+}
+
+func (h *LoadedHook) beforeTurn(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.TurnSnapshot, error) {
+	if err := h.beforeTurnMetadata(ctx, turnMetadata(snapshot)); err != nil {
+		return runtime.TurnSnapshot{}, err
+	}
+	return snapshot.Clone(), nil
 }
 
 func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
@@ -285,13 +288,6 @@ func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.Boun
 
 func (h *LoadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
 	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), turn, nil)
-}
-
-func (h *LoadedHook) BeforeTurn(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.TurnSnapshot, error) {
-	if err := h.beforeTurnMetadata(ctx, turnMetadata(snapshot)); err != nil {
-		return runtime.TurnSnapshot{}, err
-	}
-	return snapshot.Clone(), nil
 }
 
 func (h *LoadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
@@ -315,12 +311,12 @@ func (h *LoadedHook) cacheTurn(turn wittypes.TurnMetadata) {
 	h.mu.Unlock()
 }
 
-func (h *LoadedHook) AfterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {
+func (h *LoadedHook) afterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {
 	turn := h.cachedTurn(snapshot.RunID, turnMetadata(snapshot))
 	return h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), turn, nil)
 }
 
-func (h *LoadedHook) AfterRun(ctx context.Context, result runtime.Result) error {
+func (h *LoadedHook) afterRun(ctx context.Context, result runtime.Result) error {
 	h.mu.Lock()
 	turn, ok := h.turns[result.RunID]
 	delete(h.turns, result.RunID)
@@ -349,14 +345,12 @@ func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
 	return &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
 }
 
-func LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error) { return OpenHook(ctx, cfg) }
-
 // LoadedToolMiddleware preserves attachments and metadata on replacement.
 type LoadedToolMiddleware struct{ module *module }
 
 func (m *LoadedToolMiddleware) Close() error { return m.module.Close() }
 
-func (m *LoadedToolMiddleware) BeforeToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall) (json.RawMessage, error) {
+func (m *LoadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall) (json.RawMessage, error) {
 	turn := middlewareTurn(call, tool)
 	request := toolMiddlewareBeforeRequest{ToolName: tool.Name, ToolCallID: string(call.ID), InputJSON: string(call.Input), Turn: turn}
 	var replacement wittypes.Replacement
@@ -366,7 +360,7 @@ func (m *LoadedToolMiddleware) BeforeToolCall(ctx context.Context, tool runtime.
 	return applyInputReplacement(m.module, "tool-middleware.before-tool-call", call.Input, replacement)
 }
 
-func (m *LoadedToolMiddleware) AfterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, _ error) (runtime.ToolResult, error) {
+func (m *LoadedToolMiddleware) afterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, _ error) (runtime.ToolResult, error) {
 	encoded, err := toolResultJSON(result)
 	if err != nil {
 		return runtime.ToolResult{}, extensionError(ErrorPayload, m.module.identity, "tool-middleware.after-tool-call", err)
@@ -397,10 +391,6 @@ func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddl
 		return nil, err
 	}
 	return &LoadedToolMiddleware{module: module}, nil
-}
-
-func LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error) {
-	return OpenToolMiddleware(ctx, cfg)
 }
 
 func partialTurnMetadata(run session.Run) wittypes.TurnMetadata {
@@ -613,7 +603,7 @@ func (l *Loader) LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (p
 }
 
 // LoadContextSource loads and tracks a context-source component.
-func (l *Loader) LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error) {
+func (l *Loader) LoadContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error) {
 	module, err := loadModule(ctx, cfg, contextSourceContract, l.engineFactory())
 	if err != nil {
 		return nil, err
@@ -639,7 +629,7 @@ func (l *Loader) LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.E
 }
 
 // LoadHook loads and tracks a hook component.
-func (l *Loader) LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error) {
+func (l *Loader) LoadHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
 	module, err := loadModule(ctx, cfg, hookContract, l.engineFactory())
 	if err != nil {
 		return nil, err
@@ -652,7 +642,7 @@ func (l *Loader) LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, 
 }
 
 // LoadToolMiddleware loads and tracks a tool-middleware component.
-func (l *Loader) LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error) {
+func (l *Loader) LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error) {
 	module, err := loadModule(ctx, cfg, toolMiddlewareContract, l.engineFactory())
 	if err != nil {
 		return nil, err

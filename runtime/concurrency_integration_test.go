@@ -29,6 +29,10 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 		_ = store.Close()
 	}()
 	var executions atomic.Int64
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		executions.Add(1)
+		return ToolResult{Output: "tool ok"}, nil
+	})}}}
 	orch := &StreamingOrchestrator{
 		Store: store,
 		Model: resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
@@ -46,15 +50,11 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 				},
 			}})}, nil
 		})},
-		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
-			executions.Add(1)
-			return ToolResult{Output: "tool ok"}, nil
-		})}}},
 		IDs:       &sequenceIDs{},
 		Clock:     func() time.Time { return time.Date(2026, 6, 28, 15, 0, 0, 0, time.UTC) },
 		OwnerID:   "owner",
 		QueueSize: 2,
-		Plans:     legacyRunTestPlanProvider(),
+		Plans:     staticRunPlanProvider{plan: testRunPlanWithTools(toolRegistry)},
 	}
 
 	const sessions = 12

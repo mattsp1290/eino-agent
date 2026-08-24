@@ -35,7 +35,10 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 		}},
 	}
 
-	request := snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace"}, nil)
+	request, err := snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace"}, nil).Clone()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if request.Identity.ProviderID != "resolved-provider" || request.Identity.ModelID != "resolved-model" {
 		t.Fatalf("identity provider/model = %q/%q", request.Identity.ProviderID, request.Identity.ModelID)
 	}

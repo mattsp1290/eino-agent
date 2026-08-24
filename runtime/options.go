@@ -92,21 +92,9 @@ func WithModelResolver(value model.Resolver) Option {
 	return interfaceOption("ModelResolver", value, func(o *StreamingOrchestrator, value model.Resolver) { o.Model = value })
 }
 
-// WithToolRegistry sets the legacy tool registry. Starting or resuming runs
-// with anonymous extension fields also requires WithRunPlanProvider.
-func WithToolRegistry(value ToolRegistry) Option {
-	return interfaceOption("ToolRegistry", value, func(o *StreamingOrchestrator, value ToolRegistry) { o.Tools = value })
-}
-
 // WithRunPlanProvider configures immutable per-run extension plans.
 func WithRunPlanProvider(value RunPlanProvider) Option {
 	return interfaceOption("RunPlanProvider", value, func(o *StreamingOrchestrator, value RunPlanProvider) { o.Plans = value })
-}
-
-// WithContextSource appends a legacy context source. Starting or resuming runs
-// with anonymous extension fields also requires WithRunPlanProvider.
-func WithContextSource(value ContextSource) Option {
-	return interfaceOption("ContextSource", value, func(o *StreamingOrchestrator, value ContextSource) { o.Context = append(o.Context, value) })
 }
 
 // WithEventSink sets the event sink.
@@ -114,21 +102,9 @@ func WithEventSink(value EventSink) Option {
 	return interfaceOption("EventSink", value, func(o *StreamingOrchestrator, value EventSink) { o.Events = value })
 }
 
-// WithHook appends a legacy lifecycle hook. Starting or resuming runs with
-// anonymous extension fields also requires WithRunPlanProvider.
-func WithHook(value Hook) Option {
-	return interfaceOption("Hook", value, func(o *StreamingOrchestrator, value Hook) { o.Hooks = append(o.Hooks, value) })
-}
-
 // WithPermissions sets the permission policy.
 func WithPermissions(value permissions.Policy) Option {
 	return interfaceOption("Permissions", value, func(o *StreamingOrchestrator, value permissions.Policy) { o.Permissions = value })
-}
-
-// WithToolMiddleware appends legacy tool-call middleware. Starting or resuming
-// runs with anonymous extension fields also requires WithRunPlanProvider.
-func WithToolMiddleware(value ToolMiddleware) Option {
-	return interfaceOption("ToolMiddleware", value, func(o *StreamingOrchestrator, value ToolMiddleware) { o.Middleware = append(o.Middleware, value) })
 }
 
 // WithIDGenerator sets the durable ID generator.
@@ -164,12 +140,6 @@ func WithToolTurns(value int) Option {
 // WithQueueSize sets the event queue size.
 func WithQueueSize(value int) Option {
 	return func(o *StreamingOrchestrator) error { o.QueueSize = value; return nil }
-}
-
-// WithSystemPromptMaterialization explicitly enables configured Agent system
-// prompts at the provider boundary. It is disabled by default for compatibility.
-func WithSystemPromptMaterialization(enabled bool) Option {
-	return func(o *StreamingOrchestrator) error { o.SystemPromptMaterialization = enabled; return nil }
 }
 
 // WithModelRequestLedger enables the optional durable provider-attempt ledger.
