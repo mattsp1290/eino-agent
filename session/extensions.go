@@ -9,7 +9,7 @@ import (
 )
 
 // ExtensionPlanSchemaVersion is the current durable plan descriptor schema.
-// Version 2 records prompt and guard order explicitly.
+// Version 1 records prompt and guard order explicitly.
 const ExtensionPlanSchemaVersion = 1
 
 // ModelRequestID identifies one durable provider-attempt audit record.

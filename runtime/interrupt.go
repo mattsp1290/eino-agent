@@ -17,16 +17,13 @@ import (
 // before execution, terminal calls are skipped, and active non-owned leases are
 // rejected.
 func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID) (Handle, error) {
-	if o == nil || o.Store == nil {
-		return nil, fmt.Errorf("%w: store required", ErrInvalidOrchestrator)
+	if err := o.validateConfigured(); err != nil {
+		return nil, err
 	}
 	if runID == "" {
 		return nil, fmt.Errorf("%w: run id required", ErrInvalidOrchestrator)
 	}
-	if o.IDs == nil {
-		return nil, fmt.Errorf("%w: id generator required", ErrInvalidOrchestrator)
-	}
-	run, err := o.Store.GetRun(ctx, runID)
+	run, err := o.store.GetRun(ctx, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -36,8 +33,8 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 		if err != nil {
 			return nil, err
 		}
-		run, err = o.Store.ClaimRun(ctx, session.RunClaim{
-			RunID: run.ID, OwnerID: o.ownerID(), ClaimToken: string(o.IDs.NewEventID()), LeaseDuration: o.lease(),
+		run, err = o.store.ClaimRun(ctx, session.RunClaim{
+			RunID: run.ID, OwnerID: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), LeaseDuration: o.lease(),
 		})
 		if err != nil {
 			plan.release()
@@ -110,7 +107,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
 	run = started
-	calls, err := o.Store.ListUnfinishedToolCalls(ctx, run.ID)
+	calls, err := o.store.ListUnfinishedToolCalls(ctx, run.ID)
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
@@ -140,7 +137,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		claimed.Status = session.ToolCallRunning
 		claimed.ClaimedBy = o.ownerID()
 		if claimed.ClaimToken == "" || claimed.ClaimedBy != call.ClaimedBy {
-			claimed.ClaimToken = string(o.IDs.NewEventID())
+			claimed.ClaimToken = string(o.ids.NewEventID())
 		}
 		claimed.StartedAt = o.now()
 		claimed, err = execution.store.ClaimToolCall(ctx, claimed, o.lease())

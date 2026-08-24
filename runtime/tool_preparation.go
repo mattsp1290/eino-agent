@@ -19,20 +19,20 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, execution 
 	}
 	ordinal := int64(0)
 	if msg.Content != "" {
-		if err := execution.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
+		if err := execution.appendPart(ctx, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
 			return err
 		}
 		ordinal++
 	}
 	if msg.ReasoningContent != "" {
-		if err := execution.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
+		if err := execution.appendPart(ctx, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
 			return err
 		}
 		ordinal++
 	}
 	for _, call := range calls {
 		payload := toolCallPayload{ID: call.call.ID, Name: call.call.Function.Name, Arguments: call.arguments}
-		if err := execution.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
+		if err := execution.appendPart(ctx, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
 			return err
 		}
 		ordinal++
@@ -78,7 +78,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 	for _, schemaCall := range calls {
 		callID := session.ToolCallID(schemaCall.ID)
 		if callID == "" {
-			callID = o.IDs.NewToolCallID()
+			callID = o.ids.NewToolCallID()
 		}
 		tool, ok := byName[schemaCall.Function.Name]
 		if !ok || tool.Executor == nil {
@@ -122,15 +122,15 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 	for _, prepared := range calls {
 		schemaCall, tool, call := prepared.schemaCall, prepared.tool, prepared.call
 		callID, input := call.ID, call.Input
-		resultMessageID := o.IDs.NewMessageID()
-		resultPartID := o.IDs.NewPartID()
+		resultMessageID := o.ids.NewMessageID()
+		resultPartID := o.ids.NewPartID()
 		record, err := execution.store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
 		if err != nil {
 			return nil, err
 		}
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		_ = o.emitToolCall(ctx, execution, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{ID: string(callID), Name: call.Name, Arguments: cloneJSON(input)})
-		record.Status, record.ClaimedBy, record.ClaimToken = session.ToolCallRunning, o.ownerID(), string(o.IDs.NewEventID())
+		record.Status, record.ClaimedBy, record.ClaimToken = session.ToolCallRunning, o.ownerID(), string(o.ids.NewEventID())
 		record.StartedAt = o.now()
 		record, err = execution.store.ClaimToolCall(ctx, record, o.lease())
 		if err != nil {
@@ -154,7 +154,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 }
 
 func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {
-	sink := execution.eventSink(o.Events)
+	sink := execution.eventSink(o.events)
 	if sink == nil {
 		return nil
 	}

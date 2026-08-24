@@ -36,10 +36,10 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 		cancel()
 		return ToolResult{Output: "committed"}, nil
 	})}
-	orchestrator := &StreamingOrchestrator{
-		Store: store, IDs: &sequenceIDs{}, OwnerID: "owner-1",
-		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
-	}
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(store), WithOwnerID("owner-1"),
+		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
+	)
 	plan := newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})
 	call := runtimeCallFromClaim(tool, claimed)
 	settled, err := newRunExecution(orchestrator, plan).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
@@ -63,7 +63,7 @@ func TestFinalToolContextIsSortedBoundedAndIsolated(t *testing.T) {
 		{Name: "alpha", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })},
 	}}
 	plan := newTestToolPlan(tools)
-	host := &StreamingOrchestrator{}
+	host := mustConfiguredOrchestrator()
 	snapshot := TurnSnapshot{
 		RunID: "run", SessionID: "session", EpochID: "epoch",
 		Config:   config.Snapshot{Agent: config.Agent{Name: "agent", Mode: "primary"}, Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": "/workspace"}},
@@ -103,14 +103,14 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	})}}}
 	plan := newTestToolPlanWithDispatch(toolRegistry, nil, func() { releases.Add(1) })
 	sink := &capturingSink{}
-	orchestrator := &StreamingOrchestrator{
-		Store: store,
-		Model: resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-panic", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
-		})},
-		Plans: staticRunPlanProvider{plan: plan}, IDs: &sequenceIDs{}, Events: sink, OwnerID: "owner-1",
-		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
-	}
+		})}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: plan}), WithEventSink(sink), WithOwnerID("owner-1"),
+		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
+	)
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-session", ParentID: "user-1", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolExecutionPanic) {
 		t.Fatalf("result = %+v", result)
@@ -138,10 +138,10 @@ func TestPendingResumeToolPanicSettlesWithoutTransportEvent(t *testing.T) {
 		panic("resume executor secret")
 	})}}}
 	plan := newTestToolPlanWithDispatch(toolRegistry, nil, func() { releases.Add(1) })
-	orchestrator := &StreamingOrchestrator{
-		Store: store, IDs: &sequenceIDs{}, Events: sink, OwnerID: "owner-1",
-		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
-	}
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(store), WithEventSink(sink), WithOwnerID("owner-1"),
+		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
+	)
 	done := make(chan Result, 1)
 	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan), run, done)
 	result := <-done

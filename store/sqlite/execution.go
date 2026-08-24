@@ -19,7 +19,7 @@ func (e *executionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	if e.store.tx != nil {
 		return fn(ctx, e)
 	}
-	return e.store.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
+	return e.store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 		store, ok := tx.(*Store)
 		if !ok {
 			return session.ErrConflict
@@ -43,7 +43,7 @@ func (e *executionStore) withFenceState(ctx context.Context, allowTerminal bool,
 		}
 		return fn(e.store, run)
 	}
-	return e.store.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
+	return e.store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 		store, ok := tx.(*Store)
 		if !ok {
 			return session.ErrConflict

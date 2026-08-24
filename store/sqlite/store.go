@@ -76,7 +76,13 @@ func (s *Store) Close() error {
 }
 
 // WithinTx executes fn inside a SQLite transaction.
-func (s *Store) WithinTx(ctx context.Context, fn func(context.Context, session.Tx) error) (err error) {
+func (s *Store) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) (err error) {
+	if s == nil || fn == nil {
+		return session.ErrConflict
+	}
+	if s.tx != nil {
+		return fn(ctx, s)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -514,7 +520,7 @@ func (s *Store) finishToolCall(ctx context.Context, record session.ToolCall) err
 // message/part. Repeating the identical settlement is idempotent.
 func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettlement) error {
 	if s.tx == nil {
-		return s.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
+		return s.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 			store, ok := tx.(*Store)
 			if !ok {
 				return session.ErrConflict

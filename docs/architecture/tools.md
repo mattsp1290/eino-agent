@@ -21,11 +21,11 @@ The `tools` package owns:
 Concrete leaf behavior remains outside this package. Future integration beads
 can wrap `eino-tools` implementations as `tools.Definition` values.
 
-`wasmext.LoadTool` also returns an ordinary `tools.Definition`. Its decode and
-encode functions validate bounded JSON and its executor invokes the versioned
-`tool` WIT world. Register it through the same `Registry.Register` method as a
-native definition. Prefer `wasmext.Loader.LoadTool` so the embedding host has a
-single bounded `Close(ctx)` lifecycle owner.
+`wasmext.Loader.LoadTool` also returns an ordinary `tools.Definition`. Its
+decode and encode functions validate bounded JSON and its executor invokes the
+versioned `tool` WIT world. Mount it through `composition.Registrar.Tool` like
+a native definition; the Loader remains the single `Close(ctx)` lifecycle
+owner.
 
 ## Materialization
 

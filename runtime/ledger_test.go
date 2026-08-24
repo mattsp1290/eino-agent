@@ -123,7 +123,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: provider panic") {
 		t.Fatalf("result = %#v", result)
@@ -155,13 +155,13 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
-		WithStore(failingStore), WithTransactor(store), WithModelResolver(resolvedModel{streamer: streamer}),
+		WithStore(failingStore), WithModelResolver(resolvedModel{streamer: streamer}),
 		WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "dispatch-start-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if !errors.Is(result.Error, updateErr) || called || len(sequence) != 0 || len(completed) != 0 {
 		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
@@ -185,7 +185,7 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "lifecycle-success-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if result.Error != nil || strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Error.Code != "" {
 		t.Fatalf("result=%#v sequence=%#v completed=%#v", result, sequence, completed)
@@ -249,7 +249,7 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator.Plans = staticRunPlanProvider{plan: plan}
+	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	message := einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "unsafe-call", Extra: map[string]any{"credential": "sentinel"}}})
 	if _, err := orchestrator.Start(context.Background(), Request{SessionID: "unsafe-session", Input: []*einoschema.Message{message}, Config: orchestratorConfig()}); err == nil || called || len(sequence) != 0 || len(completed) != 0 {
 		t.Fatalf("start_error=%v adapter_called=%t sequence=%#v completed=%#v", err, called, sequence, completed)
@@ -267,6 +267,16 @@ type dispatchStartFailingStore struct {
 	session.Store
 	session.ModelRequestStore
 	err error
+}
+
+func (s *dispatchStartFailingStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
+	return s.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+		modelRequests, ok := tx.(session.ModelRequestStore)
+		if !ok {
+			return session.ErrConflict
+		}
+		return fn(ctx, &dispatchStartFailingStore{Store: tx, ModelRequestStore: modelRequests, err: s.err})
+	})
 }
 
 func (s *dispatchStartFailingStore) Execution(fence session.RunFence) session.ExecutionStore {

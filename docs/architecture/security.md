@@ -169,7 +169,7 @@ Evidence:
 
 ## Retry Bounds
 
-Provider retries are bounded by `StreamingOrchestrator.Attempts`. Only
+Provider retries are bounded by the constructor's `runtime.WithAttempts` value. Only
 `model.Error` values with `Retryable` set are retried; cancellation is not
 retried. Tool execution is not automatically rerun on resume unless a durable
 pending call is safely claimed. Running calls found during resume are marked

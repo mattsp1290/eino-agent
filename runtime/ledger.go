@@ -135,7 +135,7 @@ func rejectCanonicalExtra(raw json.RawMessage) error {
 }
 
 func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {
-	if !o.ModelRequestLedger {
+	if !o.modelRequestLedger {
 		return nil, nil, nil
 	}
 	if execution == nil || execution.store == nil {

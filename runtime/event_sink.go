@@ -20,10 +20,10 @@ type runEventSink struct {
 func (s runEventSink) Emit(ctx context.Context, event Event) error {
 	if !event.LiveOnly && event.Kind != EventRunStarted && event.Kind != EventRunFinished && s.execution.store != nil {
 		if event.EventID == "" {
-			if s.execution.host == nil || s.execution.host.IDs == nil {
+			if s.execution.host == nil || s.execution.host.ids == nil {
 				return fmt.Errorf("persist runtime event: event id generator required")
 			}
-			event.EventID = s.execution.host.IDs.NewEventID()
+			event.EventID = s.execution.host.ids.NewEventID()
 		}
 		if _, err := s.execution.store.AppendEvent(ctx, durableEventRecord(event, s.execution.host.now)); err != nil {
 			return err

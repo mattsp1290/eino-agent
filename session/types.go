@@ -333,6 +333,7 @@ type EventBatch struct {
 // provide locking and transactions; callers should not infer durability from
 // live AG-UI transport delivery.
 type Store interface {
+	WithinTx(ctx context.Context, fn func(context.Context, Store) error) error
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSession(ctx context.Context, id ID) (Session, error)
 	UpdateSession(ctx context.Context, session Session) error
@@ -374,14 +375,4 @@ type ExecutionStore interface {
 // compaction-aware history projection.
 type ContextEpochReader interface {
 	ListContextEpochs(ctx context.Context, sessionID ID) ([]ContextEpoch, error)
-}
-
-// Tx is a store view scoped to one implementation-defined transaction.
-type Tx interface {
-	Store
-}
-
-// Transactor runs store operations inside one transaction.
-type Transactor interface {
-	WithinTx(ctx context.Context, fn func(context.Context, Tx) error) error
 }

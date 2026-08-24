@@ -35,7 +35,7 @@ func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 		{Identity: testPromptIdentity("z", "b"), Prompt: MountedPrompt{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })}},
 		{Identity: testPromptIdentity("a", "a"), Prompt: MountedPrompt{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })}},
 	}})
-	orchestrator := &StreamingOrchestrator{}
+	orchestrator := mustConfiguredOrchestrator()
 	text, err := orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
 	if err != nil || text != "first\n\nconfigured\n\nlast" {
 		t.Fatalf("prompt = %q, %v", text, err)
@@ -70,10 +70,10 @@ func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 	}})
 	permissionsCalled := false
 	executed := false
-	orchestrator := &StreamingOrchestrator{Permissions: permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	orchestrator := mustConfiguredOrchestrator(WithPermissions(permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		permissionsCalled = true
 		return permissions.Decision{Action: permissions.ActionAllow}, nil
-	})}
+	})))
 	tool := Tool{Name: "danger", Executor: runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		executed = true
 		return ToolResult{Output: "bad"}, nil
@@ -331,7 +331,7 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 		Resolve:  func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
 	}}})
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
-	host := &StreamingOrchestrator{}
+	host := mustConfiguredOrchestrator()
 	prepared, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot, "message")
 	if err != nil {
 		t.Fatal(err)
@@ -532,7 +532,7 @@ func testExecutor(marker string) ToolExecutor {
 }
 
 func TestEmptyPlanAcquiresAndResumesWithoutProvider(t *testing.T) {
-	orchestrator := &StreamingOrchestrator{Store: newAdmissionStore()}
+	orchestrator := mustConfiguredOrchestrator()
 	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{})
 	if err != nil {
 		t.Fatal(err)
@@ -564,7 +564,7 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 	} {
 		t.Run(name, func(t *testing.T) {
 			resumeCalls := 0
-			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{}), resumeCalls: &resumeCalls}}
+			orchestrator := mustConfiguredOrchestrator(WithRunPlanProvider(staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{}), resumeCalls: &resumeCalls}))
 			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
 			}
@@ -581,11 +581,12 @@ func TestStartReleasesAcquiredPlanWhenResolverPanics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(nil))
-	orchestrator.Plans = staticRunPlanProvider{plan: plan}
-	orchestrator.Model = model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
-		panic("resolver failed")
-	})
+	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(nil),
+		WithRunPlanProvider(staticRunPlanProvider{plan: plan}),
+		WithModelResolver(model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+			panic("resolver failed")
+		})),
+	)
 	defer func() {
 		if recovered := recover(); recovered != "resolver failed" {
 			t.Fatalf("recovered = %#v", recovered)
@@ -620,7 +621,7 @@ func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 		t.Fatal(err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	orchestrator := &StreamingOrchestrator{Store: store, OwnerID: "new-owner", Clock: func() time.Time { return now }}
+	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithOwnerID("new-owner"), WithClock(func() time.Time { return now }))
 	execution := newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{}))
 	execution.bindRun(run)
 	result := orchestrator.resumeRunWithSettlement(context.Background(), execution, run, nil)
@@ -650,7 +651,7 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	run := session.Run{ID: "run", SessionID: "session", Status: session.RunPending, CreatedAt: time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)}
 	store.runs[run.ID] = run
 	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
-	orchestrator := &StreamingOrchestrator{Store: store, Clock: func() time.Time { return now }}
+	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithClock(func() time.Time { return now }))
 	done := make(chan Result, 1)
 	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, newTestDispatchPlan(dispatch)), run, done)
 	result := <-done
@@ -689,12 +690,11 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 			var notices []RunSettledNotice
 			plan, closePlan := settledNoticePlan(t, &notices)
 			defer closePlan()
-			orchestrator := &StreamingOrchestrator{
-				Store: store, Model: resolvedModel{streamer: test.streamer}, IDs: &sequenceIDs{},
-				Clock: func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1", QueueSize: 2,
-			}
-			orchestrator.Plans = staticRunPlanProvider{plan: plan}
-			orchestrator.Events = events
+			orchestrator := mustConfiguredOrchestrator(
+				WithStore(store), WithModelResolver(resolvedModel{streamer: test.streamer}),
+				WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
+				WithOwnerID("owner-1"), WithQueueSize(2), WithRunPlanProvider(staticRunPlanProvider{plan: plan}), WithEventSink(events),
+			)
 
 			result := startAndWait(t, orchestrator)
 			if result.Status != test.wantStatus || (result.Error != nil) != test.wantError {
@@ -736,7 +736,7 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			var notices []RunSettledNotice
 			plan, closePlan := settledNoticePlan(t, &notices)
 			defer closePlan()
-			orchestrator := &StreamingOrchestrator{Store: store, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: time.Now, Events: events}
+			orchestrator := mustConfiguredOrchestrator(WithStore(store), WithOwnerID("new-owner"), WithClock(time.Now), WithEventSink(events))
 			done := make(chan Result, 1)
 			orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan), run, done)
 			result := <-done

@@ -26,8 +26,7 @@ func TestStoreContract(t *testing.T) {
 			t.Fatalf("open sqlite store: %v", err)
 		}
 		return storetest.Subject{
-			Store:      st,
-			Transactor: st,
+			Store: st,
 			Cleanup: func() {
 				_ = st.Close()
 			},
@@ -35,7 +34,6 @@ func TestStoreContract(t *testing.T) {
 	}
 
 	storetest.Run(t, factory)
-	storetest.RunTransactional(t, factory)
 }
 
 func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {

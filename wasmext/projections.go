@@ -184,7 +184,7 @@ func payloadErrorKind(err error) ErrorKind {
 }
 
 var (
-	_ permissions.Policy         = (*permissionsPolicy)(nil)
-	_ interface{ Close() error } = (*permissionsPolicy)(nil)
+	_ permissions.Policy         = (*LoadedPermissionsPolicy)(nil)
+	_ interface{ Close() error } = (*LoadedPermissionsPolicy)(nil)
 	_ interface{ Close() error } = (*LoadedTool)(nil)
 )

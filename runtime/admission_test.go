@@ -387,7 +387,7 @@ func newAdmissionStore() *admissionStore {
 	}
 }
 
-func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Tx) error) error {
+func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
 	tx := s.clone()
 	if err := fn(ctx, tx); err != nil {
 		return err

@@ -113,9 +113,10 @@ alone publishes pending/running/terminal transport updates.
 
 Scope is routing for trusted code, not a sandbox. It is either registry-global
 or one exact durable session ID; agent display names are never scope keys.
-Session tools and named prompts shadow same-name global entries. Tool
-restrictions intersect and guards can only deny or abstain, so session layers
-cannot increase authority.
+Tool names must not collide across applicable global and session mounts.
+Named session prompts shadow same-name global prompts. Tool restrictions
+intersect and guards can only deny or abstain, so session layers cannot
+increase authority.
 
 Each admitted run stores one canonical `session.ExtensionPlanDescriptor`.
 `runtime.NewRunPlan` derives it from identity-bound dispatch handlers, tools,
@@ -131,7 +132,7 @@ prevent in-process ABA but are not durable identity.
 ## Request ledger and privacy
 
 `runtime.WithModelRequestLedger(true)` requires a
-`session.ModelRequestStore`. SQLite migration 002 stores bounded canonical
+`session.ModelRequestStore`. The current SQLite schema stores bounded canonical
 messages, rendered system prompt, JSON tool schemas, and an explicit allowlist
 of string call options. The default cap is 4 MiB and oversize content fails
 before provider dispatch; content is never silently truncated.

@@ -19,12 +19,17 @@ import (
 type Option func(*StreamingOrchestrator) error
 
 // NewStreamingOrchestrator constructs and validates an orchestrator. It is the
-// preferred construction path; direct struct literals remain supported.
-//
-// Admit is intentionally not configurable: it is derived from Store,
-// Transactor, Events, Hooks, and Clock by the orchestrator.
+// only supported construction path.
 func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
-	o := &StreamingOrchestrator{}
+	o := &StreamingOrchestrator{
+		clock:                time.Now,
+		ownerIDValue:         "runtime",
+		attemptsValue:        1,
+		toolTurnsValue:       8,
+		queueSize:            1,
+		leaseValue:           time.Minute,
+		modelRequestMaxBytes: defaultModelRequestMaxBytes,
+	}
 	for index, option := range opts {
 		if option == nil {
 			return nil, fmt.Errorf("%w: option %d is nil", ErrInvalidOrchestrator, index)
@@ -34,23 +39,24 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		}
 	}
 	var missing []string
-	if nilInterface(o.Store) {
+	if nilInterface(o.store) {
 		missing = append(missing, "Store")
 	}
-	if nilInterface(o.Model) {
+	if nilInterface(o.model) {
 		missing = append(missing, "Model")
 	}
-	if nilInterface(o.IDs) {
+	if nilInterface(o.ids) {
 		missing = append(missing, "IDs")
 	}
 	if len(missing) != 0 {
 		return nil, fmt.Errorf("%w: missing required dependencies: %s", ErrInvalidOrchestrator, strings.Join(missing, ", "))
 	}
-	if o.ModelRequestLedger {
-		if _, ok := o.Store.(session.ModelRequestStore); !ok {
+	if o.modelRequestLedger {
+		if _, ok := o.store.(session.ModelRequestStore); !ok {
 			return nil, fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
 		}
 	}
+	o.configured = true
 	return o, nil
 }
 
@@ -79,100 +85,128 @@ func nilInterface(value any) bool {
 
 // WithStore sets the durable session store.
 func WithStore(value session.Store) Option {
-	return interfaceOption("Store", value, func(o *StreamingOrchestrator, value session.Store) { o.Store = value })
-}
-
-// WithTransactor sets the optional transactional session store.
-func WithTransactor(value session.Transactor) Option {
-	return interfaceOption("Transactor", value, func(o *StreamingOrchestrator, value session.Transactor) { o.Transactor = value })
+	return interfaceOption("Store", value, func(o *StreamingOrchestrator, value session.Store) { o.store = value })
 }
 
 // WithModelResolver sets the native model resolver.
 func WithModelResolver(value model.Resolver) Option {
-	return interfaceOption("ModelResolver", value, func(o *StreamingOrchestrator, value model.Resolver) { o.Model = value })
+	return interfaceOption("ModelResolver", value, func(o *StreamingOrchestrator, value model.Resolver) { o.model = value })
 }
 
 // WithRunPlanProvider configures immutable per-run extension plans.
 func WithRunPlanProvider(value RunPlanProvider) Option {
-	return interfaceOption("RunPlanProvider", value, func(o *StreamingOrchestrator, value RunPlanProvider) { o.Plans = value })
+	return interfaceOption("RunPlanProvider", value, func(o *StreamingOrchestrator, value RunPlanProvider) { o.plans = value })
 }
 
 // WithEventSink sets the event sink.
 func WithEventSink(value EventSink) Option {
-	return interfaceOption("EventSink", value, func(o *StreamingOrchestrator, value EventSink) { o.Events = value })
+	return interfaceOption("EventSink", value, func(o *StreamingOrchestrator, value EventSink) { o.events = value })
 }
 
 // WithPermissions sets the permission policy.
 func WithPermissions(value permissions.Policy) Option {
-	return interfaceOption("Permissions", value, func(o *StreamingOrchestrator, value permissions.Policy) { o.Permissions = value })
+	return interfaceOption("Permissions", value, func(o *StreamingOrchestrator, value permissions.Policy) { o.permissions = value })
 }
 
 // WithIDGenerator sets the durable ID generator.
 func WithIDGenerator(value IDGenerator) Option {
-	return interfaceOption("IDGenerator", value, func(o *StreamingOrchestrator, value IDGenerator) { o.IDs = value })
+	return interfaceOption("IDGenerator", value, func(o *StreamingOrchestrator, value IDGenerator) { o.ids = value })
 }
 
-// WithClock sets the clock. A nil clock retains the runtime time.Now fallback.
+// WithClock sets the clock.
 func WithClock(value func() time.Time) Option {
-	return func(o *StreamingOrchestrator) error { o.Clock = value; return nil }
+	return interfaceOption("Clock", value, func(o *StreamingOrchestrator, value func() time.Time) { o.clock = value })
 }
 
 // WithOwnerID sets the durable work owner ID.
 func WithOwnerID(value string) Option {
-	return func(o *StreamingOrchestrator) error { o.OwnerID = value; return nil }
+	return func(o *StreamingOrchestrator) error {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%w: OwnerID cannot be empty", ErrInvalidOrchestrator)
+		}
+		o.ownerIDValue = value
+		return nil
+	}
 }
 
 // WithTrace sets trace correlation metadata.
 func WithTrace(value agentcontext.TraceContext) Option {
-	return func(o *StreamingOrchestrator) error { o.Trace = value; return nil }
+	return func(o *StreamingOrchestrator) error {
+		value.Attributes = cloneStringMap(value.Attributes)
+		o.trace = value
+		return nil
+	}
 }
 
 // WithAttempts sets the maximum provider attempts.
 func WithAttempts(value int) Option {
-	return func(o *StreamingOrchestrator) error { o.Attempts = value; return nil }
+	return positiveIntOption("Attempts", value, func(o *StreamingOrchestrator, value int) { o.attemptsValue = value })
 }
 
 // WithToolTurns sets the maximum tool turns.
 func WithToolTurns(value int) Option {
-	return func(o *StreamingOrchestrator) error { o.ToolTurns = value; return nil }
+	return positiveIntOption("ToolTurns", value, func(o *StreamingOrchestrator, value int) { o.toolTurnsValue = value })
 }
 
 // WithQueueSize sets the event queue size.
 func WithQueueSize(value int) Option {
-	return func(o *StreamingOrchestrator) error { o.QueueSize = value; return nil }
+	return positiveIntOption("QueueSize", value, func(o *StreamingOrchestrator, value int) { o.queueSize = value })
 }
 
 // WithModelRequestLedger enables the optional durable provider-attempt ledger.
 func WithModelRequestLedger(enabled bool) Option {
-	return func(o *StreamingOrchestrator) error { o.ModelRequestLedger = enabled; return nil }
+	return func(o *StreamingOrchestrator) error { o.modelRequestLedger = enabled; return nil }
 }
 
 // WithModelRequestSafeOptions allowlists model option keys that may be copied
 // into audit records. No options are recorded by default.
 func WithModelRequestSafeOptions(keys ...string) Option {
 	return func(o *StreamingOrchestrator) error {
-		o.ModelRequestSafeOptions = append([]string(nil), keys...)
+		o.modelRequestSafeOptions = append([]string(nil), keys...)
 		return nil
 	}
 }
 
 // WithModelRequestMaxBytes tightens the default canonical ledger content cap.
 func WithModelRequestMaxBytes(limit int) Option {
-	return func(o *StreamingOrchestrator) error { o.ModelRequestMaxBytes = limit; return nil }
+	return positiveIntOption("ModelRequestMaxBytes", limit, func(o *StreamingOrchestrator, value int) { o.modelRequestMaxBytes = value })
 }
 
 // WithLease sets the durable work lease duration.
 func WithLease(value time.Duration) Option {
-	return func(o *StreamingOrchestrator) error { o.Lease = value; return nil }
+	return func(o *StreamingOrchestrator) error {
+		if value <= 0 {
+			return fmt.Errorf("%w: Lease must be positive", ErrInvalidOrchestrator)
+		}
+		o.leaseValue = value
+		return nil
+	}
 }
 
 // WithHistory sets history projection options.
 func WithHistory(value history.Options) Option {
-	return func(o *StreamingOrchestrator) error { o.History = value; return nil }
+	return func(o *StreamingOrchestrator) error {
+		if value.Epoch != nil {
+			epoch := *value.Epoch
+			value.Epoch = &epoch
+		}
+		o.history = value
+		return nil
+	}
 }
 
 // WithObserver sets the optional Eino observer. Nil preserves existing
 // zero-value observer behavior.
 func WithObserver(value *einoobs.Observer) Option {
-	return func(o *StreamingOrchestrator) error { o.Observer = value; return nil }
+	return func(o *StreamingOrchestrator) error { o.observer = value; return nil }
+}
+
+func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator, int)) Option {
+	return func(o *StreamingOrchestrator) error {
+		if value <= 0 {
+			return fmt.Errorf("%w: %s must be positive", ErrInvalidOrchestrator, name)
+		}
+		apply(o, value)
+		return nil
+	}
 }

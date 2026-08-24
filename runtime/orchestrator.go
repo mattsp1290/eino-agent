@@ -41,26 +41,25 @@ type IDGenerator interface {
 
 // StreamingOrchestrator executes admitted runs against Eino model streams.
 type StreamingOrchestrator struct {
-	Store                   session.Store
-	Model                   model.Resolver
-	Plans                   RunPlanProvider
-	Events                  EventSink
-	IDs                     IDGenerator
-	Clock                   func() time.Time
-	OwnerID                 string
-	Trace                   agentcontext.TraceContext
-	Attempts                int
-	ToolTurns               int
-	QueueSize               int
-	Lease                   time.Duration
-	History                 history.Options
-	Permissions             permissions.Policy
-	Admit                   *Admitter
-	Transactor              session.Transactor
-	Observer                *einoobs.Observer
-	ModelRequestLedger      bool
-	ModelRequestSafeOptions []string
-	ModelRequestMaxBytes    int
+	configured              bool
+	store                   session.Store
+	model                   model.Resolver
+	plans                   RunPlanProvider
+	events                  EventSink
+	ids                     IDGenerator
+	clock                   func() time.Time
+	ownerIDValue            string
+	trace                   agentcontext.TraceContext
+	attemptsValue           int
+	toolTurnsValue          int
+	queueSize               int
+	leaseValue              time.Duration
+	history                 history.Options
+	permissions             permissions.Policy
+	observer                *einoobs.Observer
+	modelRequestLedger      bool
+	modelRequestSafeOptions []string
+	modelRequestMaxBytes    int
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -78,7 +77,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 			plan.release()
 		}
 	}()
-	resolved, err := o.Model.Resolve(ctx, request.Config.Model, model.Runtime{
+	resolved, err := o.model.Resolve(ctx, request.Config.Model, model.Runtime{
 		Directory: request.Config.Metadata["workspace_root"],
 		Options:   cloneStringMap(request.Config.Agent.Options),
 	})
@@ -92,11 +91,11 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	execution := newRunExecution(o, plan)
 	ids := AdmissionIDs{
 		SessionID:          request.SessionID,
-		RunID:              o.IDs.NewRunID(),
-		AssistantMessageID: o.IDs.NewMessageID(),
-		ContextEpochID:     o.IDs.NewEpochID(),
-		EventID:            o.IDs.NewEventID(),
-		RunClaimToken:      string(o.IDs.NewEventID()),
+		RunID:              o.ids.NewRunID(),
+		AssistantMessageID: o.ids.NewMessageID(),
+		ContextEpochID:     o.ids.NewEpochID(),
+		EventID:            o.ids.NewEventID(),
+		RunClaimToken:      string(o.ids.NewEventID()),
 	}
 	admitter := o.admitter()
 	admitter.Events = execution.eventSink(admitter.Events)
@@ -132,10 +131,13 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 
 // Status returns the current active run for a session.
 func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID) (session.Run, error) {
-	if o == nil || o.Store == nil {
-		return session.Run{}, fmt.Errorf("%w: store required", ErrInvalidOrchestrator)
+	if err := o.validateConfigured(); err != nil {
+		return session.Run{}, err
 	}
-	return o.Store.ActiveRun(ctx, sessionID)
+	if sessionID == "" {
+		return session.Run{}, fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
+	}
+	return o.store.ActiveRun(ctx, sessionID)
 }
 
 func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecution, admitted AdmittedRun, done chan<- Result) {
@@ -277,7 +279,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runEx
 		if err != nil {
 			return Result{}, err
 		}
-		normalizeToolCallIDs(msg, o.IDs)
+		normalizeToolCallIDs(msg, o.ids)
 		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, msg.ToolCalls)
 		if err != nil {
 			return Result{}, err
@@ -300,7 +302,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runEx
 			return Result{}, err
 		}
 		messages = append(messages, toolMessages...)
-		currentMessageID = o.IDs.NewMessageID()
+		currentMessageID = o.ids.NewMessageID()
 		if _, err := execution.store.AppendMessage(ctx, session.Message{
 			ID:        currentMessageID,
 			SessionID: snapshot.SessionID,
@@ -349,10 +351,10 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 	})
 	var result ToolResult
 	var err error
-	if o.Permissions == nil {
+	if o.permissions == nil {
 		result, err = wrapped.Executor.Execute(ctx, call)
 	} else {
-		result, err = ExecuteToolWithPermissions(ctx, wrapped, call, o.Permissions)
+		result, err = ExecuteToolWithPermissions(ctx, wrapped, call, o.permissions)
 	}
 	disposition := dispositionForResult(result, err)
 	permissionMetadata := map[string]string(nil)
@@ -457,12 +459,12 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 }
 
 func (o *StreamingOrchestrator) finalRunEvent(run session.Run, result Result) *session.EventRecord {
-	if o == nil || o.IDs == nil {
+	if o == nil || o.ids == nil {
 		return nil
 	}
 	eventErr := eventError(result.Error)
 	return &session.EventRecord{
-		ID: o.IDs.NewEventID(), SessionID: run.SessionID, RunID: run.ID, MessageID: result.MessageID,
+		ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, MessageID: result.MessageID,
 		ProviderID: run.ProviderID, ModelID: run.ModelID, Kind: string(EventRunFinished),
 		Usage:     session.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, ReasoningTokens: result.Usage.ReasoningTokens, CacheReadTokens: result.Usage.CacheReadTokens, CacheWriteTokens: result.Usage.CacheWriteTokens, Cost: result.Usage.Cost},
 		Error:     session.EventError{Code: eventErr.Code, Message: eventErr.Message, Retryable: eventErr.Retryable},
@@ -475,7 +477,7 @@ func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, executio
 	if event == nil {
 		return
 	}
-	if sink := execution.eventSink(o.Events); sink != nil {
+	if sink := execution.eventSink(o.events); sink != nil {
 		_ = sink.Emit(context.WithoutCancel(ctx), Event{
 			Kind: EventRunFinished, EventID: event.ID, SessionID: event.SessionID, RunID: event.RunID,
 			MessageID: event.MessageID, ProviderID: event.ProviderID, ModelID: event.ModelID,
@@ -523,29 +525,24 @@ func toolPattern(input json.RawMessage, fallback string) string {
 }
 
 func (o *StreamingOrchestrator) validate(request Request) error {
-	switch {
-	case o == nil:
-		return fmt.Errorf("%w: orchestrator required", ErrInvalidOrchestrator)
-	case o.Store == nil:
-		return fmt.Errorf("%w: store required", ErrInvalidOrchestrator)
-	case o.Model == nil:
-		return fmt.Errorf("%w: model resolver required", ErrInvalidOrchestrator)
-	case o.IDs == nil:
-		return fmt.Errorf("%w: id generator required", ErrInvalidOrchestrator)
-	case request.SessionID == "":
-		return fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
-	case o.ModelRequestLedger:
-		if _, ok := o.Store.(session.ModelRequestStore); !ok {
-			return fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
-		}
-		return nil
-	default:
-		return nil
+	if err := o.validateConfigured(); err != nil {
+		return err
 	}
+	if request.SessionID == "" {
+		return fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
+	}
+	return nil
+}
+
+func (o *StreamingOrchestrator) validateConfigured() error {
+	if o == nil || !o.configured {
+		return fmt.Errorf("%w: use NewStreamingOrchestrator", ErrInvalidOrchestrator)
+	}
+	return nil
 }
 
 func (o *StreamingOrchestrator) providerInput(ctx context.Context, request Request) ([]*einoschema.Message, error) {
-	historyMessages, err := LoadHistory(ctx, o.Store, request.SessionID, o.History)
+	historyMessages, err := LoadHistory(ctx, o.store, request.SessionID, o.history)
 	if err != nil && !errors.Is(err, session.ErrNotFound) {
 		return nil, err
 	}
@@ -555,58 +552,27 @@ func (o *StreamingOrchestrator) providerInput(ctx context.Context, request Reque
 }
 
 func (o *StreamingOrchestrator) admitter() Admitter {
-	if o.Admit != nil {
-		admitter := *o.Admit
-		if admitter.Store == nil {
-			admitter.Store = o.Store
-		}
-		if admitter.Events == nil {
-			admitter.Events = o.Events
-		}
-		if admitter.Clock == nil {
-			admitter.Clock = o.Clock
-		}
-		if admitter.Transactor == nil {
-			admitter.Transactor = o.Transactor
-		}
-		return admitter
-	}
-	return Admitter{Store: o.Store, Transactor: o.Transactor, Events: o.Events, Clock: o.Clock}
+	return Admitter{Store: o.store, Events: o.events, Clock: o.clock}
 }
 
 func (o *StreamingOrchestrator) now() time.Time {
-	if o.Clock != nil {
-		return o.Clock().UTC()
-	}
-	return time.Now().UTC()
+	return o.clock().UTC()
 }
 
 func (o *StreamingOrchestrator) ownerID() string {
-	if o.OwnerID != "" {
-		return o.OwnerID
-	}
-	return "runtime"
+	return o.ownerIDValue
 }
 
 func (o *StreamingOrchestrator) attempts() int {
-	if o.Attempts > 0 {
-		return o.Attempts
-	}
-	return 1
+	return o.attemptsValue
 }
 
 func (o *StreamingOrchestrator) toolTurns() int {
-	if o.ToolTurns > 0 {
-		return o.ToolTurns
-	}
-	return 8
+	return o.toolTurnsValue
 }
 
 func (o *StreamingOrchestrator) lease() time.Duration {
-	if o.Lease > 0 {
-		return o.Lease
-	}
-	return time.Minute
+	return o.leaseValue
 }
 
 func retryable(err error) bool {

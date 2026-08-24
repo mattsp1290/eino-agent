@@ -236,11 +236,7 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 		return nil, rollback(err)
 	}
 	for _, registration := range staged.tools {
-		registration.Definition, err = mountToolDefinition(extensionMount, registration.Definition)
-		if err != nil {
-			_ = extensionMount.Close(context.WithoutCancel(ctx))
-			return nil, err
-		}
+		registration.Definition = mountToolDefinition(extensionMount, registration.Definition)
 		r.tools = append(r.tools, mountedTool{ToolRegistration: registration, component: component})
 	}
 	for _, registration := range staged.prompts {
@@ -276,11 +272,8 @@ func (g mountedToolGuard) GuardTool(ctx context.Context, request runtime.ToolGua
 	return g.next.GuardTool(g.mount.CallbackContext(ctx), request)
 }
 
-func mountToolDefinition(mount *extension.Mount, definition tools.Definition) (tools.Definition, error) {
-	next, err := definition.Clone()
-	if err != nil {
-		return tools.Definition{}, err
-	}
+func mountToolDefinition(mount *extension.Mount, definition tools.Definition) tools.Definition {
+	next := definition
 	if callback := next.Decode; callback != nil {
 		next.Decode = func(ctx context.Context, raw json.RawMessage) (any, error) {
 			return callback(mount.CallbackContext(ctx), raw)
@@ -301,7 +294,7 @@ func mountToolDefinition(mount *extension.Mount, definition tools.Definition) (t
 			return callback(mount.CallbackContext(ctx), execution)
 		}
 	}
-	return next, nil
+	return next
 }
 
 func (r *Registry) validateTools(staged []ToolRegistration) error {
@@ -562,25 +555,14 @@ func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelecto
 }
 
 func selectTools(entries []mountedTool, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []mountedTool {
-	global := make(map[string]mountedTool)
-	sessionLayer := make(map[string]mountedTool)
+	result := make([]mountedTool, 0, len(entries))
 	for _, entry := range entries {
 		if instances != nil && !instances[entry.component.InstanceID] || selectTool != nil && !selectTool(entry) {
 			continue
 		}
-		switch {
-		case entry.Scope.Kind == extension.ScopeGlobal:
-			global[entry.Definition.Name] = entry
-		case entry.Scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && entry.Scope.Key == target.Key:
-			sessionLayer[entry.Definition.Name] = entry
+		if entry.Scope.Kind == extension.ScopeGlobal || entry.Scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && entry.Scope.Key == target.Key {
+			result = append(result, entry)
 		}
-	}
-	for name, entry := range sessionLayer {
-		global[name] = entry
-	}
-	result := make([]mountedTool, 0, len(global))
-	for _, entry := range global {
-		result = append(result, entry)
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Order != result[j].Order {

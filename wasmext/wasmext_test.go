@@ -159,6 +159,112 @@ func TestModuleTimeoutActivelyInterruptsGuest(t *testing.T) {
 	}
 }
 
+func TestModuleTimeoutQuarantinesStubbornWorkerUntilItExits(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	component := &fakeComponent{}
+	component.call = func(context.Context, string, any, any) error {
+		calls.Add(1)
+		close(started)
+		<-release
+		return nil
+	}
+	engineInstance := &fakeEngine{component: component}
+	cfg := fixtureConfig(t, []byte("stubborn component"))
+	cfg.Limits.Timeout = 20 * time.Millisecond
+	cfg.Limits.CloseDrain = 20 * time.Millisecond
+	policy, err := loadPermissionsPolicy(context.Background(), cfg, func(Limits) (engine, error) { return engineInstance, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make(chan error, 1)
+	go func() {
+		_, callErr := policy.Decide(context.Background(), permissions.Request{})
+		first <- callErr
+	}()
+	<-started
+	queued := make(chan error, 1)
+	go func() {
+		_, callErr := policy.Decide(context.Background(), permissions.Request{})
+		queued <- callErr
+	}()
+	if err := <-first; !IsKind(err, ErrorTimeout) {
+		t.Fatalf("first call error = %v, want timeout", err)
+	}
+	select {
+	case err := <-queued:
+		if !IsKind(err, ErrorClosed) {
+			t.Fatalf("queued call error = %v, want closed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued background call did not wake on quarantine")
+	}
+	if calls.Load() != 1 || component.closed.Load() || engineInstance.closed.Load() {
+		t.Fatalf("calls=%d component_closed=%t engine_closed=%t before worker exit", calls.Load(), component.closed.Load(), engineInstance.closed.Load())
+	}
+	if err := policy.Close(); !IsKind(err, ErrorTimeout) {
+		t.Fatalf("Close before worker exit = %v, want timeout", err)
+	}
+	close(release)
+	select {
+	case <-policy.module.finalized:
+	case <-time.After(time.Second):
+		t.Fatal("deferred module finalization did not complete")
+	}
+	if err := policy.Close(); err != nil {
+		t.Fatalf("Close after worker exit = %v", err)
+	}
+	if !component.closed.Load() || !engineInstance.closed.Load() {
+		t.Fatalf("component_closed=%t engine_closed=%t after worker exit", component.closed.Load(), engineInstance.closed.Load())
+	}
+}
+
+func TestLoaderCloseCanObserveDeferredModuleFinalization(t *testing.T) {
+	t.Parallel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	component := &fakeComponent{}
+	component.call = func(context.Context, string, any, any) error {
+		close(started)
+		<-release
+		return nil
+	}
+	engineInstance := &fakeEngine{component: component}
+	loader := NewLoader()
+	loader.factory = func(Limits) (engine, error) { return engineInstance, nil }
+	cfg := fixtureConfig(t, []byte("loader stubborn component"))
+	cfg.Limits.Timeout = time.Second
+	cfg.Limits.CloseDrain = 20 * time.Millisecond
+	policy, err := loader.LoadPermissionsPolicy(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callDone := make(chan error, 1)
+	go func() {
+		_, callErr := policy.Decide(context.Background(), permissions.Request{})
+		callDone <- callErr
+	}()
+	<-started
+	closeCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := loader.Close(closeCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Loader.Close = %v, want context deadline", err)
+	}
+	if component.closed.Load() || engineInstance.closed.Load() {
+		t.Fatal("Loader.Close destroyed resources while worker remained active")
+	}
+	close(release)
+	<-callDone
+	if err := loader.Close(context.Background()); err != nil {
+		t.Fatalf("second Loader.Close = %v", err)
+	}
+	if !component.closed.Load() || !engineInstance.closed.Load() {
+		t.Fatal("Loader.Close did not report actual deferred finalization")
+	}
+}
+
 func TestSecureModuleLoadingRejectsHashSizeAndEscapingSymlink(t *testing.T) {
 	t.Parallel()
 	component := &fakeComponent{}

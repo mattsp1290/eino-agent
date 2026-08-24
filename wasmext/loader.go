@@ -14,16 +14,20 @@ import (
 
 // Loader owns all modules opened through it and provides one-call shutdown.
 type Loader struct {
-	mu      sync.Mutex
-	closed  bool
-	modules []*module
-	factory engineFactory
+	mu           sync.Mutex
+	closed       bool
+	modules      []*module
+	factory      engineFactory
+	shutdownOnce sync.Once
+	shutdownDone chan struct{}
+	shutdownErr  error
 }
 
 // NewLoader returns an empty module owner.
-func NewLoader() *Loader { return &Loader{factory: newEngine} }
+func NewLoader() *Loader { return &Loader{factory: newEngine, shutdownDone: make(chan struct{})} }
 
-// LoadTool loads and tracks a Wasm-backed native tool definition.
+// LoadTool loads and tracks a Wasm-backed native tool definition. The
+// definition remains valid only until Loader.Close completes.
 func (l *Loader) LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error) {
 	loaded, err := openTool(ctx, cfg, l.engineFactory())
 	if err != nil {
@@ -36,7 +40,8 @@ func (l *Loader) LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definiti
 	return loaded.Definition()
 }
 
-// LoadPermissionsPolicy loads and tracks a Wasm-backed native policy.
+// LoadPermissionsPolicy loads and tracks a Wasm-backed native policy. The
+// policy remains valid only until Loader.Close completes.
 func (l *Loader) LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error) {
 	policy, err := loadPermissionsPolicy(ctx, cfg, l.engineFactory())
 	if err != nil {
@@ -67,7 +72,8 @@ func (l *Loader) LoadContextSource(ctx context.Context, cfg ModuleConfig) (*Load
 	return &LoadedContextSource{module: module, component: component}, nil
 }
 
-// LoadEventSink loads and tracks an event-sink component.
+// LoadEventSink loads and tracks an event-sink component. The sink remains
+// valid only until Loader.Close completes.
 func (l *Loader) LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
 	module, err := loadModule(ctx, cfg, eventSinkContract, l.engineFactory())
 	if err != nil {
@@ -143,25 +149,39 @@ func (l *Loader) track(module *module) error {
 // Close stops new loads, interrupts in-flight calls, and closes every tracked
 // module exactly once. The supplied context bounds the aggregate shutdown.
 func (l *Loader) Close(ctx context.Context) error {
-	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
+	if l == nil {
 		return nil
 	}
-	l.closed = true
-	modules := append([]*module(nil), l.modules...)
-	l.mu.Unlock()
-	done := make(chan error, 1)
-	go func() {
-		var errs []error
-		for index := len(modules) - 1; index >= 0; index-- {
-			errs = append(errs, modules[index].Close())
+	l.shutdownOnce.Do(func() {
+		l.mu.Lock()
+		l.closed = true
+		modules := append([]*module(nil), l.modules...)
+		if l.shutdownDone == nil {
+			l.shutdownDone = make(chan struct{})
 		}
-		done <- errors.Join(errs...)
-	}()
+		l.mu.Unlock()
+		go func() {
+			for index := len(modules) - 1; index >= 0; index-- {
+				modules[index].beginShutdown()
+			}
+			var errs []error
+			for index := len(modules) - 1; index >= 0; index-- {
+				errs = append(errs, modules[index].waitFinalized(context.Background()))
+			}
+			l.mu.Lock()
+			l.shutdownErr = errors.Join(errs...)
+			l.mu.Unlock()
+			close(l.shutdownDone)
+		}()
+	})
+	l.mu.Lock()
+	done := l.shutdownDone
+	l.mu.Unlock()
 	select {
-	case err := <-done:
-		return err
+	case <-done:
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		return l.shutdownErr
 	case <-ctx.Done():
 		return ctx.Err()
 	}

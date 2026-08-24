@@ -10,7 +10,6 @@ import (
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/obs"
-	"github.com/mattsp1290/eino-agent/runtime"
 )
 
 func TestNewObserverFromConfigDefaultsToNoNetwork(t *testing.T) {
@@ -27,12 +26,6 @@ func TestNewObserverFromConfigDefaultsToNoNetwork(t *testing.T) {
 	if mode != ModeNoNetwork {
 		t.Fatalf("mode = %q, want %q", mode, ModeNoNetwork)
 	}
-	orchestrator := &runtime.StreamingOrchestrator{}
-	AttachRuntimeObserver(orchestrator, observer)
-	if orchestrator.Observer != observer {
-		t.Fatal("observer was not attached to runtime")
-	}
-
 	ctx := context.Background()
 	session := observer.StartSession(ctx, einoobs.SessionStart{Name: "test session"})
 	session.End(einoobs.SessionEnd{})

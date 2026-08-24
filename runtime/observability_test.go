@@ -28,8 +28,8 @@ func TestStreamingOrchestratorRecordsNoNetworkObservations(t *testing.T) {
 		request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 3, OutputTokens: 2, ReasoningTokens: 1, CacheReadTokens: 4}})
 		return []*einoschema.Message{einoschema.AssistantMessage("hello", nil)}, nil
 	}))
-	orch.Observer = observer
-	orch.Trace = agentcontext.TraceContext{TraceID: "trace-1"}
+	orch.observer = observer
+	orch.trace = agentcontext.TraceContext{TraceID: "trace-1"}
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -59,8 +59,8 @@ func TestStreamingOrchestratorRecordsRetryAndProviderError(t *testing.T) {
 		calls++
 		return nil, model.Error{Code: "rate_limited", Message: "SECRET prompt retry me", Retryable: true, Cause: model.ErrProviderRateLimited}
 	}))
-	orch.Attempts = 2
-	orch.Observer = observer
+	orch.attemptsValue = 2
+	orch.observer = observer
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed || calls != 2 {
 		t.Fatalf("result = %+v calls=%d", result, calls)
@@ -95,7 +95,7 @@ func TestStreamingOrchestratorRecordsCancellation(t *testing.T) {
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return nil, context.Canceled
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	result := startAndWait(t, orch)
 	if result.Status != session.RunInterrupted || !result.Interrupted {
 		t.Fatalf("result = %+v", result)
@@ -117,7 +117,7 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		ParentID:  "user-1",
@@ -155,14 +155,13 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 	}()
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}}
-	orch := &StreamingOrchestrator{
-		Store:    store,
-		IDs:      &sequenceIDs{},
-		OwnerID:  "owner-1",
-		Clock:    func() time.Time { return now },
-		Observer: observer,
-		Plans:    staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
-	}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithOwnerID("owner-1"),
+		WithClock(func() time.Time { return now }),
+		WithObserver(observer),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
 	handle, err := orch.Resume(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Resume error = %v", err)
@@ -233,7 +232,7 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
@@ -282,7 +281,7 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Scope: ToolScope{
@@ -293,7 +292,7 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 			return ToolResult{}, nil
 		}),
 	}}})
-	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+	orch.permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
 		if request.Pattern != "SECRET danger pattern" {
 			t.Fatalf("permission pattern = %q", request.Pattern)
 		}
@@ -336,7 +335,7 @@ func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
@@ -371,7 +370,7 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed {
@@ -406,7 +405,7 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {

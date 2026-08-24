@@ -231,6 +231,81 @@ func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
 	}
 }
 
+func TestMountRejectsCrossMountToolCollisionAndRemainsReusable(t *testing.T) {
+	registry := NewRegistry(nil)
+	globalComponent := component("global-collision")
+	global, err := registry.Mount(context.Background(), globalComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "global", InstanceID: globalComponent.InstanceID, Scope: extension.GlobalScope(), Definition: definition("echo", "global")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = global.Close(context.Background()) }()
+	sessionComponent := component("session-collision")
+	_, err = registry.Mount(context.Background(), sessionComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "session", InstanceID: sessionComponent.InstanceID, Scope: extension.SessionScope("session-a"), Definition: definition("echo", "session")})
+	}))
+	if !errors.Is(err, tools.ErrDuplicateRegistration) {
+		t.Fatalf("collision Mount error = %v", err)
+	}
+	validComponent := component("valid-after-collision")
+	valid, err := registry.Mount(context.Background(), validComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "valid", InstanceID: validComponent.InstanceID, Scope: extension.GlobalScope(), Definition: definition("other", "valid")})
+	}))
+	if err != nil {
+		t.Fatalf("valid Mount after collision = %v", err)
+	}
+	defer func() { _ = valid.Close(context.Background()) }()
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
+	if err != nil || len(resolved) != 2 || resolved[0].Name != "echo" || resolved[1].Name != "other" {
+		t.Fatalf("resolved tools after collision = %#v, %v", resolved, err)
+	}
+}
+
+func TestMountedToolCallbacksReceiveMountContext(t *testing.T) {
+	registry := NewRegistry(nil)
+	mountedComponent := component("callback-context")
+	var mounted *Mount
+	definition := definition("probe", "probe")
+	definition.Decode = func(ctx context.Context, raw json.RawMessage) (any, error) {
+		if mounted == nil {
+			return nil, errors.New("mount unavailable")
+		}
+		if err := mounted.extension.CheckClose(ctx); !errors.Is(err, extension.ErrSelfClose) {
+			return nil, errors.New("callback context does not identify its mount")
+		}
+		return append(json.RawMessage(nil), raw...), nil
+	}
+	var err error
+	mounted, err = registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "probe", InstanceID: mountedComponent.InstanceID, Scope: extension.GlobalScope(), Definition: definition})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mounted.Close(context.Background()) }()
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("resolved tools = %#v, %v", resolved, err)
+	}
+	if resolved[0].InputDecoder == nil {
+		t.Fatal("mounted tool has no input decoder")
+	}
+	if _, err := resolved[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{}`)); err != nil {
+		t.Fatalf("mounted Decode = %v", err)
+	}
+}
+
 func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
 	registry := NewRegistry(nil)
 	cleaned := false

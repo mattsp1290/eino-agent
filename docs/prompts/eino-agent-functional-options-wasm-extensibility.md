@@ -80,7 +80,7 @@ with one `With<FieldName>` option per public dependency of
 `runtime.StreamingOrchestrator` (see `runtime/orchestrator.go`), including at
 least:
 
-- `WithStore(session.Store)`, `WithTransactor(session.Transactor)`
+- `WithStore(session.Store)`
 - `WithModelResolver(model.Resolver)` — provider registration flows through
   this option: hosts compose native adapters with
   `model.AdapterResolver{Adapters: ..., Catalog: ...}` (`model/provider.go`)
@@ -99,10 +99,8 @@ least:
 - `WithHistory(history.Options)`
 - `WithObserver(*einoobs.Observer)`
 
-`Admit *Admitter` is intentionally excluded: it is a derived aggregate the
-orchestrator synthesizes from `Store`, `Transactor`, `Events`, `Hooks`, and
-`Clock` (`runtime/orchestrator.go`, `admitter()`), not an independent
-dependency. Document that carve-out in the constructor's doc comment.
+`Admit *Admitter` is intentionally excluded: it is derived from the
+orchestrator's canonical private dependencies, not an independent dependency.
 
 Rules:
 
@@ -113,7 +111,7 @@ Rules:
   deferring failure to `Start`. Supply the same defaults the zero-value struct
   currently receives for optional fields.
 - A nil value passed to an interface-typed option (`WithStore`,
-  `WithTransactor`, `WithModelResolver`, `WithToolRegistry`,
+  `WithModelResolver`, `WithToolRegistry`,
   `WithContextSource`, `WithEventSink`, `WithHook`, `WithPermissions`,
   `WithToolMiddleware`, `WithIDGenerator`) is a construction error, not a
   silent no-op. Func-,
@@ -122,8 +120,8 @@ Rules:
   `WithOwnerID`, `WithTrace`) and the pointer-typed `WithObserver` keep
   today's documented zero-value-means-default behavior
   (`runtime/orchestrator.go` fallbacks).
-- Do not remove or deprecate the exported struct fields in this milestone;
-  document the constructor as the preferred path.
+- Keep orchestrator dependencies private and use the constructor as the sole
+  validated path.
 - Apply the same pattern to `tools.NewRegistry` only if it needs new
   configuration for this work; do not gratuitously convert existing
   constructors.
@@ -276,7 +274,7 @@ patch" contract cannot be defined honestly yet. Revisit only after a
 config-side milestone establishes secret classification and patch/merge
 semantics.
 
-Explicitly not Wasm-extensible: `session.Store` and `session.Transactor`
+Explicitly not Wasm-extensible: transactional `session.Store`
 (chatty, transactional, latency-sensitive), `model.Resolver`, `model.Adapter`,
 and `model.Streamer` (model execution stays native), and `runtime.IDGenerator`
 (durable identity stays host-owned).
@@ -374,12 +372,12 @@ For each implemented world, `wasmext` exposes a constructor returning the
 seam's native Go type (Phase A first, Phase B when its wrappers land):
 
 ```go
-func LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error)
-func LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error)
-func LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error)
-func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error)
-func LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error)
-func LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error)
+func OpenTool(ctx context.Context, cfg ModuleConfig) (*LoadedTool, error)
+func OpenPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (*LoadedPermissionsPolicy, error)
+func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error)
+func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error)
+func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error)
+func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error)
 ```
 
 `ModuleConfig` carries path, expected SHA-256, per-call limits, and bounded
@@ -394,7 +392,8 @@ non-secret guest configuration. Wrapper semantics:
 - A guest error or resource-limit violation surfaces as an ordinary Go error
   from the wrapped method; the orchestrator's existing failure handling for
   that seam applies unchanged.
-- `LoadTool` returns a `tools.Definition` (a struct of closures, not an
+- `OpenTool` returns an explicit close handle whose `Definition` method returns
+  a `tools.Definition` (a struct of closures, not an
   interface) whose `Execute` performs the guest call and whose `Decode` and
   `Encode` are JSON passthroughs validating size bounds; `Normalize` is unset.
   It reaches the orchestrator the same way native definitions do:
@@ -418,10 +417,12 @@ non-secret guest configuration. Wrapper semantics:
 End-to-end, native and Wasm-backed dependencies wire in identically:
 
 ```go
-policy, err := wasmext.LoadPermissionsPolicy(ctx, wasmext.ModuleConfig{ /* ... */ })
+loader := wasmext.NewLoader()
+defer loader.Close(context.Background())
+policy, err := loader.LoadPermissionsPolicy(ctx, wasmext.ModuleConfig{ /* ... */ })
 // or: policy := permissions.PolicyFunc(func(ctx context.Context, req permissions.Request) (permissions.Decision, error) { /* ... */ })
 
-def, err := wasmext.LoadTool(ctx, wasmext.ModuleConfig{ /* ... */ })
+def, err := loader.LoadTool(ctx, wasmext.ModuleConfig{ /* ... */ })
 registry := tools.NewRegistry()
 _, err = registry.Register(def) // same registration path as a native tools.Definition
 

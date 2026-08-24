@@ -45,7 +45,7 @@ func newTestDispatchPlan(dispatch *extension.Plan) *RunPlan {
 }
 
 func configureTestTools(orchestrator *StreamingOrchestrator, registry staticToolRegistry) {
-	orchestrator.Plans = staticRunPlanProvider{plan: newTestToolPlan(registry)}
+	orchestrator.plans = staticRunPlanProvider{plan: newTestToolPlan(registry)}
 }
 
 func testToolIdentity(name string) session.ExtensionPlanEntry {

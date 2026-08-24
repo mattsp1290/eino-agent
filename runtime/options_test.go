@@ -3,14 +3,17 @@ package runtime
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	agentcontext "github.com/mattsp1290/eino-agent/context"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/session/history"
 )
 
 func TestNewStreamingOrchestratorMinimalAndOrderedOptions(t *testing.T) {
@@ -29,11 +32,69 @@ func TestNewStreamingOrchestratorMinimalAndOrderedOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStreamingOrchestrator error = %v", err)
 	}
-	if orch.Store != store || orch.IDs != ids || orch.Attempts != 4 || orch.OwnerID != "last" {
+	if orch.store != store || orch.ids != ids || orch.attempts() != 4 || orch.ownerID() != "last" {
 		t.Fatalf("orchestrator options not applied: %+v", orch)
 	}
-	if orch.toolTurns() != 8 || orch.lease() != time.Minute || orch.ownerID() != "last" {
-		t.Fatalf("zero-value fallbacks changed")
+	if orch.toolTurns() != 8 || orch.lease() != time.Minute || orch.queueSize != 1 || orch.modelRequestMaxBytes != defaultModelRequestMaxBytes {
+		t.Fatalf("constructor defaults changed")
+	}
+}
+
+func TestNewStreamingOrchestratorRejectsInvalidExplicitBounds(t *testing.T) {
+	t.Parallel()
+	tests := map[string]Option{
+		"Clock":                WithClock(nil),
+		"OwnerID":              WithOwnerID(""),
+		"Attempts":             WithAttempts(0),
+		"ToolTurns":            WithToolTurns(0),
+		"QueueSize":            WithQueueSize(0),
+		"Lease":                WithLease(0),
+		"ModelRequestMaxBytes": WithModelRequestMaxBytes(0),
+	}
+	for name, option := range tests {
+		name, option := name, option
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewStreamingOrchestrator(
+				WithStore(newAdmissionStore()),
+				WithModelResolver(resolvedModel{}),
+				WithIDGenerator(&sequenceIDs{}),
+				option,
+			)
+			if !errors.Is(err, ErrInvalidOrchestrator) {
+				t.Fatalf("error = %v, want ErrInvalidOrchestrator", err)
+			}
+		})
+	}
+}
+
+func TestNewStreamingOrchestratorCopiesMutableOptionsAndExportsNoConfigurationFields(t *testing.T) {
+	t.Parallel()
+	attributes := map[string]string{"source": "original"}
+	epoch := session.ContextEpoch{ID: "epoch-original"}
+	safeOptions := []string{"temperature"}
+	orch, err := NewStreamingOrchestrator(
+		WithStore(newAdmissionStore()),
+		WithModelResolver(resolvedModel{}),
+		WithIDGenerator(&sequenceIDs{}),
+		WithTrace(agentcontext.TraceContext{Attributes: attributes}),
+		WithHistory(history.Options{Epoch: &epoch}),
+		WithModelRequestSafeOptions(safeOptions...),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attributes["source"] = "mutated"
+	epoch.ID = "epoch-mutated"
+	safeOptions[0] = "secret"
+	if orch.trace.Attributes["source"] != "original" || orch.history.Epoch.ID != "epoch-original" || orch.modelRequestSafeOptions[0] != "temperature" {
+		t.Fatalf("mutable option alias retained: trace=%v history=%v safe=%v", orch.trace, orch.history, orch.modelRequestSafeOptions)
+	}
+	typeOf := reflect.TypeOf(StreamingOrchestrator{})
+	for index := 0; index < typeOf.NumField(); index++ {
+		if field := typeOf.Field(index); field.IsExported() {
+			t.Errorf("StreamingOrchestrator exports configuration field %s", field.Name)
+		}
 	}
 }
 
@@ -56,7 +117,6 @@ func TestNewStreamingOrchestratorRejectsNilInterfaceOptions(t *testing.T) {
 	tests := map[string]Option{
 		"Store":           WithStore(nil),
 		"TypedNilStore":   WithStore(typedNilStore),
-		"Transactor":      WithTransactor(nil),
 		"ModelResolver":   WithModelResolver(nil),
 		"RunPlanProvider": WithRunPlanProvider(nil),
 		"EventSink":       WithEventSink(nil),

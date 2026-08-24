@@ -79,20 +79,25 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	tail := stream.NewTail(64)
 	sink := eventSink{tail: tail}
 	snapshot := minimalConfig()
+	orchestrator, err := runtime.NewStreamingOrchestrator(
+		runtime.WithStore(store),
+		runtime.WithModelResolver(scriptedResolver{}),
+		runtime.WithEventSink(sink),
+		runtime.WithIDGenerator(ids),
+		runtime.WithOwnerID("minimal-server"),
+		runtime.WithQueueSize(16),
+	)
+	if err != nil {
+		tail.Close()
+		_ = store.Close()
+		return nil, err
+	}
 	return &Server{
 		store:   store,
 		tail:    tail,
 		config:  snapshot,
 		handles: map[session.RunID]activeHandle{},
-		runtime: &runtime.StreamingOrchestrator{
-			Store:      store,
-			Transactor: store,
-			Model:      scriptedResolver{},
-			Events:     sink,
-			IDs:        ids,
-			OwnerID:    "minimal-server",
-			QueueSize:  16,
-		},
+		runtime: orchestrator,
 	}, nil
 }
 

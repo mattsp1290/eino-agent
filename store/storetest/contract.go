@@ -15,9 +15,8 @@ import (
 
 // Subject is one store implementation under test.
 type Subject struct {
-	Store      session.Store
-	Transactor session.Transactor
-	Cleanup    func()
+	Store   session.Store
+	Cleanup func()
 }
 
 // Factory creates an isolated store subject for one test. Each call must return
@@ -82,11 +81,8 @@ func Run(t *testing.T, factory Factory) {
 
 	t.Run("transaction rollback hides writes", func(t *testing.T) {
 		subject := setup(t, factory)
-		if subject.Transactor == nil {
-			t.Skip("store does not expose session.Transactor")
-		}
 		ctx := context.Background()
-		if err := subject.Transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
+		if err := subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 			s, err := tx.CreateSession(ctx, sessionRecord("committed"))
 			if err != nil {
 				return err
@@ -105,7 +101,7 @@ func Run(t *testing.T, factory Factory) {
 			t.Fatalf("committed session missing: %v", err)
 		}
 		errRollback := errors.New("rollback")
-		err := subject.Transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
+		err := subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 			_, err := tx.CreateSession(ctx, sessionRecord("rolled-back"))
 			if err != nil {
 				return err
@@ -117,6 +113,45 @@ func Run(t *testing.T, factory Factory) {
 		}
 		if _, err := subject.Store.GetSession(ctx, "rolled-back"); !errors.Is(err, session.ErrNotFound) {
 			t.Fatalf("rolled back session err = %v, want ErrNotFound", err)
+		}
+		if err := subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+			return tx.WithinTx(ctx, func(ctx context.Context, nested session.Store) error {
+				_, err := nested.CreateSession(ctx, sessionRecord("nested-committed"))
+				return err
+			})
+		}); err != nil {
+			t.Fatalf("nested commit: %v", err)
+		}
+		if _, err := subject.Store.GetSession(ctx, "nested-committed"); err != nil {
+			t.Fatalf("nested committed session missing: %v", err)
+		}
+		err = subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+			return tx.WithinTx(ctx, func(ctx context.Context, nested session.Store) error {
+				if _, err := nested.CreateSession(ctx, sessionRecord("nested-propagated")); err != nil {
+					return err
+				}
+				return errRollback
+			})
+		})
+		if !errors.Is(err, errRollback) {
+			t.Fatalf("propagated nested transaction err = %v", err)
+		}
+		if _, err := subject.Store.GetSession(ctx, "nested-propagated"); !errors.Is(err, session.ErrNotFound) {
+			t.Fatalf("propagated nested write err = %v, want ErrNotFound", err)
+		}
+		if err := subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+			_ = tx.WithinTx(ctx, func(ctx context.Context, nested session.Store) error {
+				if _, err := nested.CreateSession(ctx, sessionRecord("nested-swallowed")); err != nil {
+					return err
+				}
+				return errRollback
+			})
+			return nil
+		}); err != nil {
+			t.Fatalf("swallowed nested transaction: %v", err)
+		}
+		if _, err := subject.Store.GetSession(ctx, "nested-swallowed"); err != nil {
+			t.Fatalf("swallowed nested write did not commit: %v", err)
 		}
 		assertPanicRollback(t, ctx, subject)
 	})
@@ -339,38 +374,6 @@ func Run(t *testing.T, factory Factory) {
 	})
 }
 
-// RunTransactional executes the transaction-specific portion of the contract.
-// Transactional backends should call both Run and RunTransactional.
-func RunTransactional(t *testing.T, factory Factory) {
-	t.Helper()
-	t.Run("transactions", func(t *testing.T) {
-		subject := setup(t, factory)
-		if subject.Transactor == nil {
-			t.Fatal("factory returned nil Transactor")
-		}
-		ctx := context.Background()
-		if err := subject.Transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
-			s, err := tx.CreateSession(ctx, sessionRecord("tx-committed"))
-			if err != nil {
-				return err
-			}
-			r, err := tx.AdmitRun(ctx, run("tx-run", s.ID, "owner"), time.Minute)
-			if err != nil {
-				return err
-			}
-			execution := tx.Execution(session.RunFence{RunID: r.ID, ClaimToken: r.ClaimToken})
-			_, err = execution.AppendEvent(ctx, eventRecord("tx-event", s.ID, r.ID, 1))
-			return err
-		}); err != nil {
-			t.Fatalf("commit transaction: %v", err)
-		}
-		if _, err := subject.Store.GetSession(ctx, "tx-committed"); err != nil {
-			t.Fatalf("committed session missing: %v", err)
-		}
-		assertPanicRollback(t, ctx, subject)
-	})
-}
-
 func setup(t testing.TB, factory Factory) Subject {
 	t.Helper()
 	subject := factory(t)
@@ -387,21 +390,20 @@ func setup(t testing.TB, factory Factory) Subject {
 
 func assertPanicRollback(t testing.TB, ctx context.Context, subject Subject) {
 	t.Helper()
-	if subject.Transactor == nil {
-		return
-	}
 	func() {
 		defer func() {
 			if recover() == nil {
 				t.Fatalf("transaction panic was not rethrown")
 			}
 		}()
-		_ = subject.Transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
-			_, err := tx.CreateSession(ctx, sessionRecord("panic-rolled-back"))
-			if err != nil {
-				return err
-			}
-			panic("rollback")
+		_ = subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+			return tx.WithinTx(ctx, func(ctx context.Context, nested session.Store) error {
+				_, err := nested.CreateSession(ctx, sessionRecord("panic-rolled-back"))
+				if err != nil {
+					return err
+				}
+				panic("rollback")
+			})
 		})
 	}()
 	if _, err := subject.Store.GetSession(ctx, "panic-rolled-back"); !errors.Is(err, session.ErrNotFound) {

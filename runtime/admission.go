@@ -55,7 +55,6 @@ type AdmittedRun struct {
 // Admitter persists the admission boundary before any provider execution.
 type Admitter struct {
 	Store      session.Store
-	Transactor session.Transactor
 	Events     EventSink
 	Extensions *extension.Plan
 	Clock      func() time.Time
@@ -90,22 +89,12 @@ func (a Admitter) Admit(ctx context.Context, request AdmissionRequest) (Admitted
 	}
 
 	var admitted AdmittedRun
-	transactor := a.transactor()
-	if transactor != nil {
-		err := transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
-			var err error
-			admitted, err = admitDurable(ctx, tx, request, frozenSnapshot, now)
-			return err
-		})
-		if err != nil {
-			return AdmittedRun{}, err
-		}
-	} else {
+	if err := a.Store.WithinTx(ctx, func(ctx context.Context, store session.Store) error {
 		var err error
-		admitted, err = admitDurable(ctx, a.Store, request, frozenSnapshot, now)
-		if err != nil {
-			return AdmittedRun{}, err
-		}
+		admitted, err = admitDurable(ctx, store, request, frozenSnapshot, now)
+		return err
+	}); err != nil {
+		return AdmittedRun{}, err
 	}
 	if err := a.afterDurableAdmission(ctx, admitted, request, now); err != nil {
 		return AdmittedRun{}, err
@@ -127,14 +116,6 @@ func (a Admitter) now() time.Time {
 		return a.Clock().UTC()
 	}
 	return time.Now().UTC()
-}
-
-func (a Admitter) transactor() session.Transactor {
-	if a.Transactor != nil {
-		return a.Transactor
-	}
-	transactor, _ := a.Store.(session.Transactor)
-	return transactor
 }
 
 func (a Admitter) existingAdmission(ctx context.Context, request AdmissionRequest, snapshot TurnSnapshot, now time.Time) (AdmittedRun, error) {

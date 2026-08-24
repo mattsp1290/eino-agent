@@ -9,17 +9,16 @@ downstream implementation beads.
 
 ## Scope
 
-The public store boundary is `session.Store` plus optional
-`session.Transactor`. Concrete backends may be SQLite, embedded log, in-memory
-test stores, or hosted databases, but they must expose the same behavior to the
-runtime.
+The public store boundary is transactional `session.Store`. Concrete backends
+may be SQLite, embedded log, in-memory test stores, or hosted databases, but
+they must expose the same atomic behavior to the runtime.
 
 The reusable contract suite lives in `store/storetest`. Each concrete backend
 must call:
 
 ```go
 storetest.Run(t, func(t testing.TB) storetest.Subject {
-    return storetest.Subject{Store: newStore(t), Transactor: newTransactor(t)}
+    return storetest.Subject{Store: newStore(t)}
 })
 ```
 
@@ -65,9 +64,10 @@ or reconcile interrupted work.
 
 ## Transactions
 
-Backends that can provide transactions should implement `session.Transactor`.
-`WithinTx` must commit if `fn` returns nil and roll back if `fn` returns a
-non-nil error or panics.
+Every backend implements `session.Store.WithinTx`. The outermost call commits
+if `fn` returns nil and rolls back if `fn` returns a non-nil error or panics.
+Nested calls reuse the current transaction without a savepoint; only an error
+or panic that escapes the outermost callback forces rollback.
 
 Transaction boundaries matter for:
 
@@ -76,9 +76,6 @@ Transaction boundaries matter for:
 - creating, claiming, and writing the first tool-call part;
 - finishing a run together with its final durable event;
 - creating a context epoch and writing compaction summary/tail metadata.
-
-Stores without transaction support must document their weaker guarantees and
-should still pass the non-transactional contract tests.
 
 ## Replay Ordering
 

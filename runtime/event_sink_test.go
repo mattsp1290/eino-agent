@@ -21,7 +21,7 @@ func TestRunEventSinkPersistsOnlyIntermediateDurableEventsThroughFence(t *testin
 		t.Fatal(err)
 	}
 	infrastructure := &capturingSink{}
-	execution := newRunExecution(&StreamingOrchestrator{Store: store, IDs: &sequenceIDs{}}, nil)
+	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store)), nil)
 	execution.bindRun(run)
 	sink := execution.eventSink(infrastructure)
 

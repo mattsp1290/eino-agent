@@ -15,7 +15,7 @@ For a runnable starting point, see `examples/minimal-server` and
 | --- | --- | --- |
 | `runtime` | Run admission, active run handles, interruption, resume, turn snapshots, tool execution, typed extension dispatch, and runtime events. | Store, provider/model resolver, run-plan provider, config snapshot, auth, HTTP routes. |
 | `session` | Durable sessions, runs, messages, parts, tool calls, context epochs, replay cursors, and recovery records. | A concrete store backend and tenancy-specific session IDs. |
-| `store/sqlite` | Embedded SQLite `session.Store` and `session.Transactor` implementation. | Database path, lifecycle, backups, migrations policy, production HA choice. |
+| `store/sqlite` | Embedded transactional `session.Store` implementation. | Database path, lifecycle, backups, migrations policy, production HA choice. |
 | `store/storetest` | Contract tests for custom stores. | Backend-specific persistence and isolation tests. |
 | `transport` | HTTP adapters for AG-UI SSE replay/live tail, interrupt, resume, and message decoding. | Route layout, middleware, auth, request validation, cursor persistence. |
 | `agui` | Durability/replay policy for AG-UI event families and client-tool classification. | Product decisions for conditional reasoning/state/custom-event replay. |
@@ -33,8 +33,8 @@ A typical server wires these pieces once at startup through
 `newIDGenerator`, `providerResolver`, `planProvider`, and `eventSink` are
 application-owned implementations. The required fields for a successful minimal
 start are `Store`, `Model`, `IDs`, and a non-empty request `SessionID`.
-`Transactor`, `Events`, `Plans`, `Permissions`, `OwnerID`, queue sizing, and
-leases add production behavior.
+`Events`, `Plans`, `Permissions`, `OwnerID`, queue sizing, and leases add
+production behavior.
 
 ```go
 store, err := sqlite.Open(ctx, "agent.db")
@@ -46,7 +46,6 @@ ids := newIDGenerator()
 
 orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithStore(store),
-    runtime.WithTransactor(store),
     runtime.WithModelResolver(providerResolver),
     runtime.WithRunPlanProvider(planProvider),
     runtime.WithEventSink(eventSink{Store: store, Tail: tail, IDs: ids}),
@@ -162,10 +161,8 @@ cursor boundaries; they are not a substitute for durable message/part history.
 
 ## Storage Requirements
 
-Custom stores must implement `session.Store`; transactional stores should also
-implement `session.Transactor`. Every backend should run `store/storetest.Run`
-from its tests. Backends that expose `session.Transactor` should also run
-`store/storetest.RunTransactional`.
+Custom stores must implement the complete transactional `session.Store`
+contract. Every backend should run `store/storetest.Run` from its tests.
 
 Required semantics:
 

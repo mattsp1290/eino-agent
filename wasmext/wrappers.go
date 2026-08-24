@@ -64,16 +64,6 @@ func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 	return &LoadedTool{module: module, component: component, definition: definition}, nil
 }
 
-// LoadTool returns a native tools.Definition. Embedders that need a direct
-// close handle should use OpenTool or Loader.LoadTool.
-func LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error) {
-	loaded, err := OpenTool(ctx, cfg)
-	if err != nil {
-		return tools.Definition{}, err
-	}
-	return loaded.Definition()
-}
-
 func toolDefinition(module *module, component toolComponent, metadata wittypes.ToolMetadata) (tools.Definition, error) {
 	if strings.TrimSpace(metadata.Name) == "" || len(metadata.Name) > 128 || int64(len(metadata.Description)) > module.limits.MaxOutputBytes {
 		return tools.Definition{}, extensionError(ErrorContract, module.identity, "tool.metadata", errors.New("invalid tool metadata"))
@@ -147,15 +137,16 @@ type toolExecuteRequest struct {
 	Turn       wittypes.TurnMetadata
 }
 
-type permissionsPolicy struct {
+// LoadedPermissionsPolicy owns one Wasm-backed permission policy.
+type LoadedPermissionsPolicy struct {
 	module    *module
 	component permissionsComponent
 }
 
 // Close releases the compiled policy component.
-func (p *permissionsPolicy) Close() error { return p.module.Close() }
+func (p *LoadedPermissionsPolicy) Close() error { return p.module.Close() }
 
-func (p *permissionsPolicy) Decide(ctx context.Context, request permissions.Request) (permissions.Decision, error) {
+func (p *LoadedPermissionsPolicy) Decide(ctx context.Context, request permissions.Request) (permissions.Decision, error) {
 	input := wittypes.PermissionRequest{
 		ToolName: request.ToolName, ToolCallID: request.ToolCallID, Permission: request.Permission,
 		ArgumentsSummary: request.Pattern, SessionID: request.SessionID, RunID: request.RunID,
@@ -186,13 +177,12 @@ func (p *permissionsPolicy) Decide(ctx context.Context, request permissions.Requ
 	return decision, nil
 }
 
-// LoadPermissionsPolicy loads a component as the native permissions.Policy
-// interface. The returned concrete value also implements io.Closer.
-func LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error) {
+// OpenPermissionsPolicy loads a policy while retaining an explicit close handle.
+func OpenPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (*LoadedPermissionsPolicy, error) {
 	return loadPermissionsPolicy(ctx, cfg, newEngine)
 }
 
-func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*permissionsPolicy, error) {
+func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedPermissionsPolicy, error) {
 	module, err := loadModule(ctx, cfg, permissionsPolicyContract, factory)
 	if err != nil {
 		return nil, err
@@ -202,7 +192,7 @@ func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engine
 		_ = module.Close()
 		return nil, err
 	}
-	return &permissionsPolicy{module: module, component: component}, nil
+	return &LoadedPermissionsPolicy{module: module, component: component}, nil
 }
 
 // LoadedContextSource adapts context-source@0.1.0 and owns its component.
@@ -294,10 +284,6 @@ func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, err
 		return nil, err
 	}
 	return &LoadedEventSink{module: module, component: component}, nil
-}
-
-func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
-	return OpenEventSink(ctx, cfg)
 }
 
 // LoadedHook caches full turn metadata by run for deterministic after hooks.

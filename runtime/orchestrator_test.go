@@ -60,9 +60,8 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	}
 }
 
-func TestStreamingOrchestratorPreservesConfiguredAdmissionEventSink(t *testing.T) {
+func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	store := newAdmissionStore()
-	admissionSink := &capturingSink{}
 	runtimeSink := &capturingSink{}
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "admission-events", Artifact: extension.Artifact{Name: "admission-events", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
@@ -83,25 +82,20 @@ func TestStreamingOrchestratorPreservesConfiguredAdmissionEventSink(t *testing.T
 	}
 	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
-	}))
-	orchestrator.Admit = &Admitter{Events: admissionSink}
-	orchestrator.Events = runtimeSink
-	orchestrator.Plans = staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}
+	}), WithEventSink(runtimeSink), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
 
 	result := startAndWait(t, orchestrator)
 	if result.Error != nil {
 		t.Fatalf("result = %+v", result)
 	}
-	if len(admissionSink.events) != 1 || admissionSink.events[0].Kind != EventRunStarted {
-		t.Fatalf("admission events = %#v", admissionSink.events)
-	}
+	var starts int
 	for _, event := range runtimeSink.events {
 		if event.Kind == EventRunStarted {
-			t.Fatalf("orchestrator sink received custom admission event: %#v", runtimeSink.events)
+			starts++
 		}
 	}
-	if len(runtimeSink.events) == 0 {
-		t.Fatal("orchestrator sink did not receive execution events")
+	if starts != 1 || len(runtimeSink.events) < 2 {
+		t.Fatalf("runtime events = %#v, want one admission start plus execution events", runtimeSink.events)
 	}
 	var publishedStarts int
 	for _, kind := range published {
@@ -214,14 +208,14 @@ func TestStreamingOrchestratorHonorsCancellationDuringDeltaBackpressure(t *testi
 			einoschema.AssistantMessage("c", nil),
 		}, nil
 	}))
-	orch.Events = blockingSinkFunc(func(ctx context.Context, event Event) error {
+	orch.events = blockingSinkFunc(func(ctx context.Context, event Event) error {
 		if event.Kind == EventMessageDelta {
 			once.Do(func() { close(started) })
 			<-ctx.Done()
 		}
 		return nil
 	})
-	orch.QueueSize = 1
+	orch.queueSize = 1
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		ParentID:  "user-1",
@@ -253,7 +247,7 @@ func TestStreamingOrchestratorRetriesRetryableProviderErrors(t *testing.T) {
 		}
 		return []*einoschema.Message{einoschema.AssistantMessage("ok", nil)}, nil
 	}))
-	orch.Attempts = 2
+	orch.attemptsValue = 2
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || attempts != 2 {
 		t.Fatalf("result = %+v attempts=%d", result, attempts)
@@ -272,8 +266,8 @@ func TestStreamingOrchestratorBoundedQueueAppliesBackpressure(t *testing.T) {
 			einoschema.AssistantMessage("c", nil),
 		}, nil
 	}))
-	orch.Events = sink
-	orch.QueueSize = 1
+	orch.events = sink
+	orch.queueSize = 1
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -441,7 +435,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 			return ToolResult{Output: "hi"}, nil
 		}),
 	}}})
-	orch.Events = sink
+	orch.events = sink
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || calls != 2 {
 		t.Fatalf("result = %+v calls=%d", result, calls)
@@ -520,7 +514,7 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 			return ToolResult{Output: "hi"}, nil
 		}),
 	}}})
-	orch.Events = sink
+	orch.events = sink
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || calls != 2 {
 		t.Fatalf("result = %+v calls=%d", result, calls)
@@ -728,7 +722,7 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 			return ToolResult{Output: "executed"}, nil
 		}),
 	}}})
-	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+	orch.permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
 		if request.Pattern != "go" {
 			t.Fatalf("permission pattern = %q, want go", request.Pattern)
 		}
@@ -821,21 +815,20 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 			return ToolResult{Output: "ok"}, nil
 		}),
 	}}}
-	orch := &StreamingOrchestrator{
-		Store: store,
-		Model: resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 			for _, message := range request.Messages {
 				if message.Role == einoschema.Tool {
 					return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 				}
 			}
 			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-cancel", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
-		})},
-		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
-		IDs:     &sequenceIDs{},
-		Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
-		OwnerID: "owner-1",
-	}
+		})}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
+		WithOwnerID("owner-1"),
+	)
 	handle, err := orch.Start(ctx, Request{SessionID: "session-cancel", ParentID: "user-1", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
@@ -872,9 +865,9 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 	}}}
 	plan := transformedPermissionRunPlan(t, toolRegistry, &notices)
 	var modelVisible string
-	orchestrator := &StreamingOrchestrator{
-		Store: store,
-		Model: resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 			for _, message := range request.Messages {
 				if message.Role == einoschema.Tool {
 					modelVisible = message.Content
@@ -882,13 +875,13 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 				}
 			}
 			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-denied", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
-		})},
-		Plans: staticRunPlanProvider{plan: plan},
-		Permissions: permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+		})}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: plan}),
+		WithPermissions(permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 			return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
-		}),
-		IDs: &sequenceIDs{}, Clock: func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1",
-	}
+		})),
+		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }), WithOwnerID("owner-1"),
+	)
 	handle, err := orchestrator.Start(ctx, Request{SessionID: "session-denied", ParentID: "user", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
@@ -926,13 +919,13 @@ func TestResumePreservesDeniedDispositionAfterFreshResultTransform(t *testing.T)
 		}),
 	}}}
 	plan := transformedPermissionRunPlan(t, toolRegistry, &notices)
-	orchestrator := &StreamingOrchestrator{
-		Store: store,
-		Permissions: permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithPermissions(permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 			return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
-		}),
-		IDs: &sequenceIDs{}, Clock: func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1",
-	}
+		})),
+		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }), WithOwnerID("owner-1"),
+	)
 	result := orchestrator.resumeRunWithSettlement(ctx, newRunExecution(orchestrator, plan), run, nil)
 	if result.Error != nil || executed.Load() {
 		t.Fatalf("resume result = %+v", result)
@@ -1018,12 +1011,11 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 				return ToolResult{Output: "ok"}, nil
 			})}}}
-			orch := &StreamingOrchestrator{
-				Store:   store,
-				IDs:     &sequenceIDs{},
-				Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
-				OwnerID: "new-owner",
-			}
+			orch := mustConfiguredOrchestrator(
+				WithStore(store),
+				WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
+				WithOwnerID("new-owner"),
+			)
 			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, newTestToolPlanWithDispatch(toolRegistry, dispatch, nil)), run, nil)
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
@@ -1089,13 +1081,10 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 		return ToolResult{Output: "ok"}, nil
 	})}}}
-	orch := &StreamingOrchestrator{
-		Store:   store,
-		IDs:     &sequenceIDs{},
-		Clock:   func() time.Time { return now },
-		OwnerID: "owner-1",
-		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
-	}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithClock(func() time.Time { return now }), WithOwnerID("owner-1"),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
 
 	start := make(chan struct{})
 	results := make(chan Result, 2)
@@ -1164,13 +1153,10 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 		resumedContext = call.Context.Clone()
 		return ToolResult{Output: "ok"}, nil
 	})}}}
-	orch := &StreamingOrchestrator{
-		Store:   store,
-		IDs:     &sequenceIDs{},
-		Clock:   func() time.Time { return now },
-		OwnerID: "owner-1",
-		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
-	}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithClock(func() time.Time { return now }), WithOwnerID("owner-1"),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
 		t.Fatalf("Resume error: %v", err)
@@ -1203,6 +1189,13 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	defer func() { _ = store.Close() }()
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 	streamer := scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
 		close(entered)
 		select {
@@ -1214,21 +1207,39 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	})
 	plan := mustTestRunPlan(RunPlanSpec{})
 	provider := staticRunPlanProvider{plan: plan}
-	owner := &StreamingOrchestrator{
-		Store: store, Model: resolvedModel{streamer: streamer}, Plans: provider, IDs: &sequenceIDs{},
-		OwnerID: "owner-a", Lease: 15 * time.Millisecond,
-		Clock: func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) },
-	}
+	owner := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(provider),
+		WithOwnerID("owner-a"), WithLease(100*time.Millisecond),
+		WithClock(func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) }),
+	)
 	handle, err := owner.Start(context.Background(), Request{SessionID: "heartbeat-session", Input: []*einoschema.Message{einoschema.UserMessage("wait")}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-entered
-	time.Sleep(45 * time.Millisecond)
-	resumer := &StreamingOrchestrator{
-		Store: store, Plans: provider, IDs: &sequenceIDs{}, OwnerID: "owner-b", Lease: 15 * time.Millisecond,
-		Clock: func() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) },
+	initial, err := store.GetRun(context.Background(), handle.RunID())
+	if err != nil {
+		t.Fatal(err)
 	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		current, getErr := store.GetRun(context.Background(), handle.RunID())
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		now := time.Now()
+		if now.After(initial.LeaseUntil) && current.LeaseUntil.After(now) {
+			break
+		}
+		if now.After(deadline) {
+			t.Fatalf("heartbeat did not renew initial lease %s; current lease %s", initial.LeaseUntil, current.LeaseUntil)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	resumer := mustConfiguredOrchestrator(
+		WithStore(store), WithRunPlanProvider(provider), WithOwnerID("owner-b"), WithLease(100*time.Millisecond),
+		WithClock(func() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) }),
+	)
 	if _, err := resumer.Resume(context.Background(), handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
 		t.Fatalf("Resume error = %v, want ErrSessionBusy", err)
 	}
@@ -1250,13 +1261,10 @@ func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
 		executions.Add(1)
 		return ToolResult{Output: "ok"}, nil
 	})}}}
-	orch := &StreamingOrchestrator{
-		Store:   store,
-		IDs:     &sequenceIDs{},
-		Clock:   func() time.Time { return now },
-		OwnerID: "owner-1",
-		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
-	}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithClock(func() time.Time { return now }), WithOwnerID("owner-1"),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
 		t.Fatalf("Resume error: %v", err)
@@ -1358,7 +1366,7 @@ func TestStreamingOrchestratorFailsWhenToolLoopExceedsLimit(t *testing.T) {
 			return ToolResult{Output: "again"}, nil
 		}),
 	}}})
-	orch.ToolTurns = 1
+	orch.toolTurnsValue = 1
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed || result.Error == nil {
 		t.Fatalf("result = %+v", result)
@@ -1379,16 +1387,30 @@ func startAndWait(t *testing.T, orch *StreamingOrchestrator) Result {
 	return <-handle.Done()
 }
 
-func newTestOrchestrator(store *admissionStore, streamer model.Streamer) *StreamingOrchestrator {
-	return &StreamingOrchestrator{
-		Store:     store,
-		Model:     resolvedModel{streamer: streamer},
-		IDs:       &sequenceIDs{},
-		Clock:     func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) },
-		OwnerID:   "owner-1",
-		QueueSize: 2,
-		Plans:     staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})},
+func newTestOrchestrator(store *admissionStore, streamer model.Streamer, extra ...Option) *StreamingOrchestrator {
+	options := []Option{
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: streamer}),
+		WithIDGenerator(&sequenceIDs{}),
+		WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
+		WithOwnerID("owner-1"),
+		WithQueueSize(2),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	}
+	return mustConfiguredOrchestrator(append(options, extra...)...)
+}
+
+func mustConfiguredOrchestrator(extra ...Option) *StreamingOrchestrator {
+	options := []Option{
+		WithStore(newAdmissionStore()),
+		WithModelResolver(resolvedModel{}),
+		WithIDGenerator(&sequenceIDs{}),
+	}
+	orchestrator, err := NewStreamingOrchestrator(append(options, extra...)...)
+	if err != nil {
+		panic(err)
+	}
+	return orchestrator
 }
 
 func orchestratorConfig() config.Snapshot {

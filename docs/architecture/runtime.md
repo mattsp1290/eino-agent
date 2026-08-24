@@ -93,9 +93,8 @@ The `session.Store` interface is intentionally centered on durable facts:
 - tool-call claim and settlement records;
 - context epoch start/finish records.
 
-The `session.Transactor` interface is separate so concrete stores can provide
-SQL, embedded log, or in-memory test transactions without shaping every runtime
-method around one database.
+`session.Store.WithinTx` is mandatory so every supported backend provides the
+same store-owned atomic admission boundary.
 
 Store implementations must provide these invariants:
 
@@ -258,7 +257,7 @@ bead owns exact redaction defaults and exported attribute names.
 
 Host applications embed the runtime by providing:
 
-- a `session.Store` and optional `session.Transactor`;
+- a transactional `session.Store`;
 - a `config.Loader` and `config.Validator`;
 - a `model.Catalog`, `model.AuthResolver`, and `model.Resolver`;
 - a `runtime.RunPlanProvider`, normally `composition.Registry`, for tools,
@@ -281,9 +280,9 @@ missing. Later scalar options override earlier ones, and nil interface
 dependencies are errors. The run-plan provider is the sole executable
 extension source; an omitted provider yields a sealed empty plan.
 
-`Admit` is deliberately excluded from options. `admitter()` derives it from
-`Store`, `Transactor`, `Events`, and `Clock`, which prevents a second
-independently configured dependency graph.
+`Admit` is deliberately excluded from options. The orchestrator derives it
+from its private store, event sink, extension plan, and clock, which prevents a
+second independently configured dependency graph.
 
 ### Tool interception save points
 

@@ -33,7 +33,7 @@ go run ./examples/minimal-server -addr :8080
 
 It wires:
 
-- `store/sqlite` as the durable `session.Store` and `session.Transactor`;
+- `store/sqlite` as the durable transactional `session.Store`;
 - `runtime.StreamingOrchestrator` for run admission and interruption;
 - `stream.Tail` for live AG-UI deltas;
 - `transport.SSEHandler` for replay plus live tail;

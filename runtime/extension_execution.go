@@ -17,20 +17,20 @@ type runExecution struct {
 }
 
 func (e *runExecution) bindRun(run session.Run) {
-	if e == nil || e.host == nil || e.host.Store == nil {
+	if e == nil || e.host == nil || e.host.store == nil {
 		return
 	}
-	e.store = e.host.Store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	e.store = e.host.store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 }
 
 func (e *runExecution) ensureStore(ctx context.Context, runID session.RunID) error {
 	if e.store != nil {
 		return nil
 	}
-	if e == nil || e.host == nil || e.host.Store == nil {
+	if e == nil || e.host == nil || e.host.store == nil {
 		return session.ErrConflict
 	}
-	run, err := e.host.Store.GetRun(ctx, runID)
+	run, err := e.host.store.GetRun(ctx, runID)
 	if err != nil {
 		return err
 	}

@@ -19,8 +19,8 @@ mount atomically stages typed callback registrations, tools, prompts, guards,
 restrictions, and cleanup. Each executable behavior carries its identity in
 the same plan record, so descriptor state cannot drift from execution state.
 
-`Admit` has no option. It is a derived aggregate synthesized from `Store`,
-`Transactor`, `Events`, and `Clock`.
+`Admit` has no option. It is derived from the orchestrator's private store,
+event sink, extension plan, and clock.
 
 | Seam | Native path | Wasm contract | Wrapper status |
 | --- | --- | --- | --- |
@@ -30,7 +30,7 @@ the same plan record, so descriptor state cannot drift from execution state.
 | Event sink | `runtime.EventSink` / `EventSinkFunc` | `event-sink` | Implemented |
 | Hook | Typed lifecycle points in `runtime` | `hook` | Implemented |
 | Tool middleware | `runtime.ToolPreparePoint` and `runtime.ToolResultTransformPoint` | `tool-middleware` | Implemented |
-| Persistence | `session.Store` and `session.Transactor` | none | Native only by design |
+| Persistence | transactional `session.Store` | none | Native only by design |
 | Models/providers | `model.Resolver`, normally `model.AdapterResolver` | none | Native only by design |
 | Durable IDs | `runtime.IDGenerator` | none | Native only by design |
 
@@ -109,12 +109,12 @@ against the checked-in guests.
 | pi extension point | eino-agent seam | Native path | Wasm path / status |
 | --- | --- | --- | --- |
 | `customTools` | Tool plan | `tools.Definition`, `composition.Registrar.Tool` | `wasmext.Loader.LoadTool`, `tool` world |
-| `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.LoadPermissionsPolicy`, `permissions-policy` world |
+| `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.Loader.LoadPermissionsPolicy`, `permissions-policy` world |
 | `tool_call` argument rewrite | Tool prepare point | `extension.Use` with `runtime.ToolPreparePoint` | `wasmext.RegisterToolMiddleware` |
 | `tool_result` patch | Tool result point | `extension.Use` with `runtime.ToolResultTransformPoint` | `wasmext.RegisterToolMiddleware` |
 | `before_agent_start` / context | Typed lifecycle points | `runtime.RunBeforeExecutePoint`, `runtime.ContextAssemblePoint` | `wasmext.RegisterContextSource`, `wasmext.RegisterHook` |
 | `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world and wrapper |
-| `sessionManager` | Session persistence | `session.Store`, `session.Transactor`, `runtime.WithStore`, `runtime.WithTransactor` | No Wasm path by design |
+| `sessionManager` | Session persistence | `session.Store`, `runtime.WithStore` | No Wasm path by design |
 | `registerProvider` | Model resolver | `model.AdapterResolver`, `runtime.WithModelResolver` | No Wasm path by design; models and credentials stay native |
 | Provider request/header interception | Adapter transport | Wrap `model.Adapter` | Gap by design; adapters own transport and credentials |
 | Model selection | Admission snapshot/resolver | `config.Snapshot.Model`, `model.Resolver` | No Wasm path by design |

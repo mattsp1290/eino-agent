@@ -17,7 +17,7 @@ import (
 )
 
 func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (message *einoschema.Message, err error) {
-	queue := newEventQueue(ctx, o.QueueSize, execution.eventSink(o.Events))
+	queue := newEventQueue(ctx, o.queueSize, execution.eventSink(o.events))
 	defer queue.close()
 	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
 	var streamUsage model.Usage
@@ -57,7 +57,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		}
 	}()
 	observer := &streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
-	request := snapshot.ProviderRequest(messageID, o.Trace, observer)
+	request := snapshot.ProviderRequest(messageID, o.trace, observer)
 	request.Messages = cloneMessages(messages)
 	request.System, err = o.renderSystemPrompt(ctx, execution.plan, snapshot, attempt, step)
 	if err != nil {
@@ -69,7 +69,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		streamErr = err
 		return nil, err
 	}
-	audited, contentHash, err := AuditModelRequest(request, o.ModelRequestSafeOptions, o.ModelRequestMaxBytes)
+	audited, contentHash, err := AuditModelRequest(request, o.modelRequestSafeOptions, o.modelRequestMaxBytes)
 	if err != nil {
 		streamErr = err
 		return nil, err

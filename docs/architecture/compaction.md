@@ -16,7 +16,7 @@ The first milestone keeps the behavior explicit:
   epoch is supplied.
 
 `session/compaction.AppendBoundary` writes the summary message and part, then
-finishes the epoch with the summary message ID. It uses `session.Transactor`
+finishes the epoch with the summary message ID. It uses `session.Store.WithinTx`
 when the supplied store implements it; otherwise callers should treat the
 operation as sequential store writes.
 

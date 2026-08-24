@@ -276,10 +276,10 @@ func (p *RunPlan) release() {
 }
 
 func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunPlanRequest) (*RunPlan, error) {
-	if o.Plans == nil {
+	if o.plans == nil {
 		return NewRunPlan(RunPlanSpec{})
 	}
-	plan, err := o.Plans.AcquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config.Clone()})
+	plan, err := o.plans.AcquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config.Clone()})
 	if err != nil {
 		return nil, err
 	}
@@ -300,14 +300,14 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 	if err != nil || fingerprint != descriptor.Fingerprint {
 		return nil, ErrExtensionPlanMismatch
 	}
-	if o.Plans == nil {
+	if o.plans == nil {
 		empty, emptyErr := NewRunPlan(RunPlanSpec{})
 		if emptyErr == nil && descriptor.Fingerprint == empty.descriptor.Fingerprint && len(descriptor.Entries) == 0 {
 			return empty, nil
 		}
 		return nil, fmt.Errorf("%w: run requires a plan provider", ErrExtensionPlanMismatch)
 	}
-	plan, err := o.Plans.AcquireResumePlan(ctx, descriptor.Clone())
+	plan, err := o.plans.AcquireResumePlan(ctx, descriptor.Clone())
 	if err != nil {
 		return nil, err
 	}

@@ -11,7 +11,7 @@ will actually execute. A policy cannot rewrite arguments or bypass preparation.
 
 Hosts can supply native policies through `runtime.WithPermissions`, including
 plain functions adapted by `permissions.PolicyFunc`. The versioned
-`permissions-policy` WIT world and `wasmext.LoadPermissionsPolicy` provide the
+`permissions-policy` WIT world and `wasmext.Loader.LoadPermissionsPolicy` provide the
 same Go interface for Wasm-backed policies; model execution and credentials
 remain native.
 
