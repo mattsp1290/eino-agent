@@ -21,17 +21,21 @@ func FreezeTurnSnapshot(
 	messages []*einoschema.Message,
 	systemPrompt string,
 	now time.Time,
-) TurnSnapshot {
+) (TurnSnapshot, error) {
+	request, err := (model.Request{Messages: messages}).Clone()
+	if err != nil {
+		return TurnSnapshot{}, err
+	}
 	return TurnSnapshot{
 		RunID:        runID,
 		SessionID:    sessionID,
 		EpochID:      epochID,
 		Config:       snapshot.Clone(),
 		Model:        cloneResolved(resolved),
-		Messages:     cloneMessages(messages),
+		Messages:     request.Messages,
 		SystemPrompt: systemPrompt,
 		CreatedAt:    now,
-	}
+	}, nil
 }
 
 func cloneResolved(resolved model.Resolved) model.Resolved {

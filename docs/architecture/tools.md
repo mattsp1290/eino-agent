@@ -3,7 +3,7 @@
 Date: 2026-06-27
 
 The typed tool registry turns host or adapter tool definitions into
-`runtime.Tool` values for a specific `runtime.TurnSnapshot`.
+`runtime.Tool` values from a bounded `runtime.ToolScopeContext`.
 
 ## Responsibilities
 
@@ -12,10 +12,10 @@ The `tools` package owns:
 - registration-time validation for tool definitions;
 - stale-registration protection using monotonically increasing generations;
 - typed decoding of model-provided JSON input;
-- typed execution context carrying the durable runtime tool call and turn
-  snapshot;
+- typed execution context carrying the durable runtime tool call and bounded,
+  content-free turn metadata;
 - structured output encoding;
-- per-session scope and concurrency metadata;
+- per-session authority scope;
 - model-facing `schema.ToolInfo` assembly without reusing mutable containers.
 
 Concrete leaf behavior remains outside this package. Future integration beads
@@ -29,19 +29,19 @@ single bounded `Close(ctx)` lifecycle owner.
 
 ## Materialization
 
-Materialization happens per turn snapshot. Enabled and disabled tool names from
+Materialization happens per bounded scope context. Enabled and disabled tool names from
 `config.ToolConfig` are applied at resolve time, so a config reload affects
-future turn snapshots without mutating tools already retained by an in-flight
+future runs without mutating tools already retained by an in-flight
 run.
 
-Default scopes derive from snapshot metadata:
+Default scopes derive from bounded workspace metadata:
 
 - `workspace_id` becomes `runtime.ToolScope.WorkspaceID`;
 - `workspace_root` becomes `runtime.ToolScope.Root`;
-- the default concurrency key is `session_id:tool_name`.
 
 Definitions can override this with a `ScopeResolver` when a tool needs a
-different serialization domain.
+different authority root. The resolver receives no messages, configuration
+graph, provider clients, or executable definition.
 
 ## Input And Output
 
@@ -67,8 +67,9 @@ session's model request state.
 `tools.Registry.Snapshot` freezes definitions in deterministic generation
 order. `Unregister` removes only the exact active generation, preventing stale
 reload handles from deleting replacements. `composition.Registry` adds global
-and exact-session layers: a session definition shadows a same-name global
-definition, while restrictions only intersect.
+and exact-session layers. Applicable global and session tools may not share a
+name, preventing request-scoped behavior from shadowing a trusted server tool;
+restrictions only intersect.
 
 Registry-backed calls reserve result message and part IDs at admission.
 `session.Store.SettleToolCall` commits terminal tool state

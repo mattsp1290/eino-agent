@@ -26,7 +26,7 @@ type RunPlanProvider interface {
 
 type PlanTool struct {
 	Identity session.ExtensionPlanEntry
-	Resolve  func(context.Context, TurnSnapshot) (Tool, error)
+	Resolve  func(context.Context, ToolScopeContext) (Tool, error)
 }
 
 // PlanPrompt binds one prompt implementation to its persisted identity.
@@ -62,7 +62,7 @@ type RunPlanSpec struct {
 // RunPlan is the immutable executable state for one run.
 type RunPlan struct {
 	dispatch     *extension.Plan
-	tools        ToolRegistry
+	tools        sealedPlanTools
 	prompts      []MountedPrompt
 	guards       []MountedToolGuard
 	descriptor   session.ExtensionPlanDescriptor
@@ -183,11 +183,11 @@ type sealedPlanTools struct {
 	restrictions []PlanRestriction
 }
 
-func (s sealedPlanTools) ResolveTools(ctx context.Context, snapshot TurnSnapshot) ([]Tool, error) {
+func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContext) ([]Tool, error) {
 	result := make([]Tool, 0, len(s.capabilities))
 	seen := make(map[string]bool, len(s.capabilities))
 	for _, capability := range s.capabilities {
-		tool, err := capability.Resolve(ctx, snapshot.Clone())
+		tool, err := capability.Resolve(ctx, scope.Clone())
 		if err != nil {
 			return nil, err
 		}
@@ -231,12 +231,12 @@ func (p *RunPlan) Descriptor() session.ExtensionPlanDescriptor {
 }
 
 // ResolveTools materializes the immutable tool capabilities sealed into the
-// plan. It never consults a live registry.
-func (p *RunPlan) ResolveTools(ctx context.Context, snapshot TurnSnapshot) ([]Tool, error) {
-	if p == nil || p.tools == nil {
+// plan from bounded scope data. It never consults a live registry.
+func (p *RunPlan) ResolveTools(ctx context.Context, scope ToolScopeContext) ([]Tool, error) {
+	if p == nil || len(p.tools.capabilities) == 0 {
 		return nil, nil
 	}
-	return p.tools.ResolveTools(ctx, snapshot)
+	return p.tools.ResolveTools(ctx, scope)
 }
 
 // Prompts returns a defensive copy of the sealed prompt capability list.

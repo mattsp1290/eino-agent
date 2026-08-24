@@ -106,16 +106,18 @@ not treat them as the source of conversation content.
 
 ## Tool-Call Claim Semantics
 
-Tool calls use a create, claim, finish lifecycle:
+Tool calls use a create, claim, atomic-settlement lifecycle:
 
 1. `CreateToolCall` writes a pending call before execution.
 2. `ClaimToolCall` atomically changes pending to running and records
    `ClaimedBy`, `ClaimToken`, and `LeaseUntil`.
 3. A second claim for the same pending/running call returns
    `session.ErrConflict`.
-4. `FinishToolCall` records completed, failed, or interrupted state.
-5. `FinishToolCall` must verify the successful claim owner/token and return
-   `session.ErrConflict` for stale or stolen settlement attempts.
+4. `SettleToolCall` atomically records completed, failed, or interrupted state
+   together with the reserved tool-result message and part.
+5. `SettleToolCall` verifies the successful claim owner/token and returns
+   `session.ErrConflict` for stale or stolen settlement attempts. Repeating an
+   identical settlement is idempotent; contradictory state or envelopes conflict.
 6. `ListUnfinishedToolCalls` returns pending/running calls for a run.
 
 This prevents double execution and gives recovery enough data to decide whether

@@ -79,10 +79,13 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 	t.Parallel()
 	store := newAdmissionStore()
 	var toolsResolved, eventEmitted bool
-	toolRegistry := ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) {
-		toolsResolved = true
-		return nil, nil
-	})
+	toolPlan := mustTestRunPlan(RunPlanSpec{Tools: []PlanTool{{
+		Identity: testToolIdentity("probe"),
+		Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
+			toolsResolved = true
+			return Tool{Name: "probe", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })}, nil
+		},
+	}}})
 	orch, err := NewStreamingOrchestrator(
 		WithStore(store),
 		WithModelResolver(model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
@@ -91,7 +94,7 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 			})}.Resolve(context.Background(), model.Selection{}, model.Runtime{})
 		})),
 		WithIDGenerator(&sequenceIDs{}),
-		WithRunPlanProvider(staticRunPlanProvider{plan: testRunPlanWithTools(toolRegistry)}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: toolPlan}),
 		WithEventSink(EventSinkFunc(func(context.Context, Event) error {
 			eventEmitted = true
 			return nil

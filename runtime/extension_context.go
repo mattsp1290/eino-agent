@@ -234,6 +234,28 @@ func cloneBoundedTurnMetadata(value BoundedTurnMetadata) BoundedTurnMetadata {
 	return value
 }
 
+// NewToolScopeContext projects trusted runtime state into the data-only value
+// accepted by tool materializers.
+func NewToolScopeContext(snapshot TurnSnapshot) ToolScopeContext {
+	return ToolScopeContext{
+		SessionID:     snapshot.SessionID,
+		WorkspaceID:   snapshot.Config.Metadata["workspace_id"],
+		WorkspaceRoot: snapshot.Config.Metadata["workspace_root"],
+		EnabledTools:  cloneSlice(snapshot.Config.Tools.Enabled),
+		DisabledTools: cloneSlice(snapshot.Config.Tools.Disabled),
+	}
+}
+
+func toolContext(snapshot TurnSnapshot, tools []Tool) ToolContext {
+	projected := snapshot
+	projected.Tools = cloneSlice(tools)
+	return ToolContext{
+		Turn:          boundedTurnMetadata(projected),
+		WorkspaceID:   snapshot.Config.Metadata["workspace_id"],
+		WorkspaceRoot: snapshot.Config.Metadata["workspace_root"],
+	}.Clone()
+}
+
 func boundedTurnMetadata(snapshot TurnSnapshot) BoundedTurnMetadata {
 	toolNames := make([]string, 0, len(snapshot.Tools))
 	for _, tool := range snapshot.Tools {

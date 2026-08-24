@@ -22,10 +22,10 @@ import (
 
 func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", EpochID: "epoch", SystemPrompt: "configured"}
-	plan := &RunPlan{prompts: []MountedPrompt{
-		{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })},
-		{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })},
-	}}
+	plan := mustTestRunPlan(RunPlanSpec{Prompts: []PlanPrompt{
+		{Identity: testPromptIdentity("z", "b"), Prompt: MountedPrompt{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })}},
+		{Identity: testPromptIdentity("a", "a"), Prompt: MountedPrompt{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })}},
+	}})
 	orchestrator := &StreamingOrchestrator{}
 	text, err := orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
 	if err != nil || text != "first\n\nconfigured\n\nlast" {
@@ -49,16 +49,16 @@ func TestFallbackModelPrependsSystemWithoutReorderingDurableMessages(t *testing.
 
 func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 	var sequence []string
-	plan := &RunPlan{guards: []MountedToolGuard{
-		{ID: "deny", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+	plan := mustTestRunPlan(RunPlanSpec{Guards: []PlanGuard{
+		{Identity: testGuardIdentity("deny"), Guard: MountedToolGuard{ID: "deny", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "deny")
 			return ToolGuardResult{Decision: ToolGuardDeny, Message: "blocked"}, nil
-		})},
-		{ID: "audit", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+		})}},
+		{Identity: testGuardIdentity("audit"), Guard: MountedToolGuard{ID: "audit", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "audit")
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
-		})},
-	}}
+		})}},
+	}})
 	permissionsCalled := false
 	executed := false
 	orchestrator := &StreamingOrchestrator{Permissions: permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
@@ -82,19 +82,19 @@ func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 		Input:     json.RawMessage(`{"op":"delete"}`),
 		Scope:     ToolScope{Permissions: []string{"write"}},
 	}
-	plan := &RunPlan{guards: []MountedToolGuard{
-		{ID: "mutate", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+	plan := mustTestRunPlan(RunPlanSpec{Guards: []PlanGuard{
+		{Identity: testGuardIdentity("mutate"), Guard: MountedToolGuard{ID: "mutate", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			copy(request.Call.Input, json.RawMessage(`{"op":"hidden"}`))
 			copy(request.Call.Scope.Permissions, []string{"audit"})
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
-		})},
-		{ID: "deny-original", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+		})}},
+		{Identity: testGuardIdentity("deny-original"), Guard: MountedToolGuard{ID: "deny-original", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			if string(request.Call.Input) != `{"op":"delete"}` || !reflect.DeepEqual(request.Call.Scope.Permissions, []string{"write"}) {
 				t.Fatalf("second guard request = %#v", request.Call)
 			}
 			return ToolGuardResult{Decision: ToolGuardDeny}, nil
-		})},
-	}}
+		})}},
+	}})
 
 	decision, err := evaluateToolGuards(context.Background(), plan, Tool{Name: "danger"}, original)
 	if err != nil || decision.Decision != ToolGuardDeny {
@@ -317,9 +317,10 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer dispatch.Release()
-	plan := &RunPlan{dispatch: dispatch, tools: ToolRegistryFunc(func(context.Context, TurnSnapshot) ([]Tool, error) {
-		return []Tool{{Name: "echo"}}, nil
-	})}
+	plan := mustTestRunPlan(RunPlanSpec{Dispatch: dispatch, Tools: []PlanTool{{
+		Identity: testToolIdentity("echo"),
+		Resolve:  func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
+	}}})
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
 	host := &StreamingOrchestrator{}
 	prepared, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot, "message")
@@ -550,7 +551,7 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 	} {
 		t.Run(name, func(t *testing.T) {
 			resumeCalls := 0
-			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: &RunPlan{descriptor: valid}, resumeCalls: &resumeCalls}}
+			orchestrator := &StreamingOrchestrator{Store: newAdmissionStore(), Plans: staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{}), resumeCalls: &resumeCalls}}
 			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
 			}
@@ -605,9 +606,8 @@ func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "callbacks", Kind: session.ExtensionHandlers, Required: true}}}
 	orchestrator := &StreamingOrchestrator{Store: store, OwnerID: "new-owner", Clock: func() time.Time { return now }}
-	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, &RunPlan{descriptor: descriptor}), run, nil)
+	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{})), run, nil)
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
 	}
@@ -636,7 +636,7 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
 	orchestrator := &StreamingOrchestrator{Store: store, Clock: func() time.Time { return now }}
 	done := make(chan Result, 1)
-	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, &RunPlan{dispatch: dispatch}), run, done)
+	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, newTestDispatchPlan(dispatch)), run, done)
 	result := <-done
 	if result.Error != nil || duration != 0 {
 		t.Fatalf("resume result=%+v duration=%s", result, duration)
@@ -769,7 +769,7 @@ func settledNoticePlan(t *testing.T, notices *[]RunSettledNotice) (*RunPlan, fun
 	if err != nil {
 		t.Fatal(err)
 	}
-	return testRunPlanWithDispatch(dispatch), func() {
+	return newTestDispatchPlan(dispatch), func() {
 		if err := mount.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}

@@ -28,7 +28,7 @@ func TestRegistryToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	materialized, err := toolRegistry.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session"})
+	materialized, err := toolRegistry.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session"})
 	if err != nil || len(materialized) != 1 {
 		t.Fatalf("ResolveTools = %#v, %v", materialized, err)
 	}

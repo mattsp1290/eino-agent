@@ -5,13 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
-	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -99,13 +97,6 @@ func TestResolveToolsMaterializesPerSessionScopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveTools A error = %v", err)
 	}
-	toolsB, err := registry.ResolveTools(context.Background(), snapshot("session-b"))
-	if err != nil {
-		t.Fatalf("ResolveTools B error = %v", err)
-	}
-	if toolsA[0].Scope.ConcurrencyKey == toolsB[0].Scope.ConcurrencyKey {
-		t.Fatalf("concurrency keys should be per-session, got %q", toolsA[0].Scope.ConcurrencyKey)
-	}
 	if toolsA[0].Scope.WorkspaceID != "workspace-session-a" || toolsA[0].Scope.Root != "project://session-a" {
 		t.Fatalf("scope A = %#v", toolsA[0].Scope)
 	}
@@ -121,8 +112,8 @@ func TestResolveToolsHonorsEnabledDisabledAndClonesModelInfo(t *testing.T) {
 		}
 	}
 	snap := snapshot("session")
-	snap.Config.Tools.Enabled = []string{"echo", "search"}
-	snap.Config.Tools.Disabled = []string{"search"}
+	snap.EnabledTools = []string{"echo", "search"}
+	snap.DisabledTools = []string{"search"}
 
 	materialized, err := registry.ResolveTools(context.Background(), snap)
 	if err != nil {
@@ -149,7 +140,7 @@ func TestExplicitEmptyEnabledListMaterializesNoTools(t *testing.T) {
 		t.Fatalf("Register error = %v", err)
 	}
 	snap := snapshot("session")
-	snap.Config.Tools.Enabled = []string{}
+	snap.EnabledTools = []string{}
 
 	materialized, err := registry.ResolveTools(context.Background(), snap)
 	if err != nil {
@@ -264,7 +255,7 @@ func TestScopeResolverCanReplaceWithoutDeadlock(t *testing.T) {
 	}
 	replaced := make(chan error, 1)
 	definition := testDefinition("echo")
-	definition.Scope = func(_ runtime.TurnSnapshot, _ Definition) runtime.ToolScope {
+	definition.Scope = func(runtime.ToolScopeContext) runtime.ToolScope {
 		next := testDefinition("echo")
 		_, err := registry.Replace(registration, next)
 		replaced <- err
@@ -320,42 +311,6 @@ func TestParameterSchemasAreClonedPerMaterialization(t *testing.T) {
 	}
 }
 
-func TestConcurrentSessionsMaterializeIndependently(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry()
-	if _, err := registry.Register(testDefinition("echo")); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
-	const sessions = 16
-	var wg sync.WaitGroup
-	keys := make(chan string, sessions)
-	for i := range sessions {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			materialized, err := registry.ResolveTools(context.Background(), snapshot(session.ID(fmt.Sprintf("session-%02d", i))))
-			if err != nil {
-				t.Errorf("ResolveTools error = %v", err)
-				return
-			}
-			keys <- materialized[0].Scope.ConcurrencyKey
-		}(i)
-	}
-	wg.Wait()
-	close(keys)
-	seen := map[string]bool{}
-	for key := range keys {
-		if seen[key] {
-			t.Fatalf("duplicate concurrency key %q", key)
-		}
-		seen[key] = true
-	}
-	if len(seen) != sessions {
-		t.Fatalf("keys = %d, want %d", len(seen), sessions)
-	}
-}
-
 func testDefinition(name string) Definition {
 	return Definition{
 		Name:        name,
@@ -379,21 +334,14 @@ func testDefinition(name string) Definition {
 			return execution.Input, nil
 		},
 		RetrySafe:   true,
-		Concurrency: runtime.ToolConcurrencySequential,
 		Permissions: []string{"workspace:read"},
 		Metadata:    map[string]string{"kind": "test"},
 	}
 }
 
-func snapshot(id session.ID) runtime.TurnSnapshot {
-	return runtime.TurnSnapshot{
-		SessionID: id,
-		Config: config.Snapshot{
-			Metadata: map[string]string{
-				"workspace_id":   "workspace-" + string(id),
-				"workspace_root": "project://" + string(id),
-			},
-		},
+func snapshot(id session.ID) runtime.ToolScopeContext {
+	return runtime.ToolScopeContext{
+		SessionID: id, WorkspaceID: "workspace-" + string(id), WorkspaceRoot: "project://" + string(id),
 	}
 }
 

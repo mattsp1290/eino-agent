@@ -97,7 +97,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			}
 			input = decoded
 		}
-		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Input: cloneJSON(input)}
+		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
 		input = cloneJSON(call.Input)
 		var prepareErr error
 		if execution.dispatch() != nil {

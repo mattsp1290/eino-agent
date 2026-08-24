@@ -6,7 +6,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
@@ -29,9 +28,6 @@ func TestSessionPlanIsScopedPerSession(t *testing.T) {
 	}
 	if strings.Contains(resultB.Output, "ship") {
 		t.Fatalf("session B leaked plan state: %s", resultB.Output)
-	}
-	if toolsA[NamePlanSet].Scope.ConcurrencyKey == toolsB[NamePlanSet].Scope.ConcurrencyKey {
-		t.Fatalf("session tools share concurrency key %q", toolsA[NamePlanSet].Scope.ConcurrencyKey)
 	}
 }
 
@@ -178,12 +174,8 @@ func TestSessionHooksReceiveSessionID(t *testing.T) {
 
 func resolve(t *testing.T, registry *agenttools.Registry, id session.ID) map[string]runtime.Tool {
 	t.Helper()
-	materialized, err := registry.ResolveTools(context.Background(), runtime.TurnSnapshot{
-		SessionID: id,
-		Config: config.Snapshot{Metadata: map[string]string{
-			"workspace_id":   "workspace-" + string(id),
-			"workspace_root": "/workspace/" + string(id),
-		}},
+	materialized, err := registry.ResolveTools(context.Background(), runtime.ToolScopeContext{
+		SessionID: id, WorkspaceID: "workspace-" + string(id), WorkspaceRoot: "/workspace/" + string(id),
 	})
 	if err != nil {
 		t.Fatalf("ResolveTools error = %v", err)

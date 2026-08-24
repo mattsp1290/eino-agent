@@ -106,7 +106,7 @@ func toolDefinition(module *module, metadata wittypes.ToolMetadata) (tools.Defin
 			return nil, extensionError(ErrorPayload, module.identity, "tool.execute", errors.New("decoded input is not JSON"))
 		}
 		request := toolExecuteRequest{
-			ToolCallID: string(execution.Call.ID), InputJSON: string(raw), Turn: turnMetadata(execution.Snapshot),
+			ToolCallID: string(execution.Call.ID), InputJSON: string(raw), Turn: turnMetadataFromBounded(execution.Context.Turn),
 		}
 		var output string
 		if err := module.call(ctx, "tool.execute", len(raw), request, &output); err != nil {

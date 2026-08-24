@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
@@ -38,7 +40,7 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 		Store: store, IDs: &sequenceIDs{}, OwnerID: "owner-1",
 		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },
 	}
-	plan := &RunPlan{descriptor: strictToolDescriptor(t)}
+	plan := newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})
 	call := runtimeCallFromClaim(tool, claimed)
 	settled, err := newRunExecution(orchestrator, plan).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
 	if err != nil {
@@ -48,6 +50,45 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 		t.Fatalf("settlement = %+v", settled.Settlement)
 	}
 	assertDurableToolResult(t, store, claimed.SessionID, claimed.ID, session.ToolCallCompleted, "committed")
+}
+
+func TestFinalToolContextIsSortedBoundedAndIsolated(t *testing.T) {
+	var received ToolContext
+	tools := staticToolRegistry{tools: []Tool{
+		{Name: "zeta", Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			received = call.Context.Clone()
+			call.Context.Turn.ToolNames[0] = "mutated"
+			return ToolResult{Output: "ok"}, nil
+		})},
+		{Name: "alpha", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })},
+	}}
+	plan := newTestToolPlan(tools)
+	host := &StreamingOrchestrator{}
+	snapshot := TurnSnapshot{
+		RunID: "run", SessionID: "session", EpochID: "epoch",
+		Config:   config.Snapshot{Agent: config.Agent{Name: "agent", Mode: "primary"}, Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": "/workspace"}},
+		Model:    model.Resolved{Provider: model.Provider{ID: "provider"}, Model: model.Descriptor{ID: "model"}},
+		Messages: []*einoschema.Message{einoschema.UserMessage("secret")},
+	}
+	preparedSnapshot, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot, "message")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls, err := host.prepareToolCalls(context.Background(), newRunExecution(host, plan), preparedSnapshot, "message", []einoschema.ToolCall{{ID: "call", Function: einoschema.FunctionCall{Name: "zeta", Arguments: `{}`}}})
+	if err != nil || len(calls) != 1 {
+		t.Fatalf("prepared calls = %#v, %v", calls, err)
+	}
+	outcome := host.executeToolOutcome(context.Background(), newRunExecution(host, plan), calls[0].tool, calls[0].call)
+	if outcome.RawError != nil {
+		t.Fatal(outcome.RawError)
+	}
+	wantNames := []string{"alpha", "zeta"}
+	if !reflect.DeepEqual(received.Turn.ToolNames, wantNames) || received.Turn.SessionID != "session" || received.Turn.RunID != "run" || received.WorkspaceID != "workspace" || received.WorkspaceRoot != "/workspace" {
+		t.Fatalf("tool context = %#v", received)
+	}
+	if !reflect.DeepEqual(calls[0].call.Context.Turn.ToolNames, wantNames) || len(calls[0].call.Context.Turn.ToolNames) != 2 {
+		t.Fatalf("executor mutation leaked into runtime context: %#v", calls[0].call.Context)
+	}
 }
 
 func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
@@ -60,7 +101,7 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("executor secret")
 	})}}}
-	plan := &RunPlan{descriptor: strictToolDescriptor(t), tools: toolRegistry, releaseExtra: func() { releases.Add(1) }}
+	plan := newTestToolPlanWithDispatch(toolRegistry, nil, func() { releases.Add(1) })
 	sink := &capturingSink{}
 	orchestrator := &StreamingOrchestrator{
 		Store: store,
@@ -96,7 +137,7 @@ func TestPendingResumeToolPanicSettlesWithoutTransportEvent(t *testing.T) {
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("resume executor secret")
 	})}}}
-	plan := &RunPlan{descriptor: strictToolDescriptor(t), tools: toolRegistry, releaseExtra: func() { releases.Add(1) }}
+	plan := newTestToolPlanWithDispatch(toolRegistry, nil, func() { releases.Add(1) })
 	orchestrator := &StreamingOrchestrator{
 		Store: store, IDs: &sequenceIDs{}, Events: sink, OwnerID: "owner-1",
 		Clock: func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) },

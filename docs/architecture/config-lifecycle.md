@@ -12,8 +12,8 @@ run admissions.
    deterministic name order.
 3. The lifecycle validates permissions, observability policy, agent identity,
    and model selection before runtime execution begins.
-4. `runtime.FreezeTurnSnapshot` clones config and message containers for the
-   provider turn.
+4. `runtime.FreezeTurnSnapshot` performs a checked deep clone of config and the
+   supported Eino message graph before durable admission begins.
 
 Plugin errors are admission failures. They do not create a partially admitted
 run, and they do not mutate an already frozen run snapshot.

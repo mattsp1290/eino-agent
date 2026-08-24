@@ -116,9 +116,9 @@ or to retry only when an explicit retry-safe contract allows it.
 
 ## Turn Snapshots and Context Epochs
 
-`runtime.TurnSnapshot` is the immutable-by-contract state for one provider
-request. Runtime admission must clone `config.Snapshot` and each retained
-snapshot container before exposing it to hooks or provider execution. It
+`runtime.TurnSnapshot` is internal state for one provider request. Runtime
+admission checks and deep-clones `config.Snapshot` and the complete supported
+Eino message graph before any durable write. It
 captures:
 
 - durable run/session/context epoch IDs;
@@ -186,11 +186,12 @@ If interruption happens while a call is running, runtime settles the durable
 record as interrupted. Automatic retry is allowed only when the tool declares it
 retry-safe and the store proves the prior call did not settle.
 
-Tool materialization includes scope and scheduling metadata. Filesystem-like
-tools should use a canonical workspace-root concurrency key and sequential
-execution so `file_read`, `file_write`, `file_edit`, search, shell, and patch
-operations do not corrupt shared workspace state. Tool input decoding and output
-retention are runtime policy, not hidden metadata conventions.
+Tool materialization receives only bounded scope data, and execution receives
+only durable call data plus content-free turn metadata. Filesystem-like tools
+own synchronization around canonical workspace roots so `file_read`,
+`file_write`, `file_edit`, search, shell, and patch operations do not corrupt
+shared state. Tool input decoding and output retention are runtime policy, not
+hidden metadata conventions.
 
 ## Provider and Model Resolution
 

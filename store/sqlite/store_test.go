@@ -99,49 +99,6 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 	}
 }
 
-func TestFinishToolCallRejectsConflictingConcurrentSettlement(t *testing.T) {
-	st, call := setupClaimedToolCall(t)
-	defer func() {
-		_ = st.Close()
-	}()
-
-	ctx := context.Background()
-	const contenders = 8
-	start := make(chan struct{})
-	errs := make(chan error, contenders)
-	var wg sync.WaitGroup
-	for i := range contenders {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			<-start
-			settlement := call
-			settlement.Status = session.ToolCallCompleted
-			settlement.Output = []byte(fmt.Sprintf(`{"worker":%d}`, i))
-			settlement.CompletedAt = time.Now().UTC().Add(time.Duration(i) * time.Nanosecond)
-			errs <- st.FinishToolCall(ctx, settlement)
-		}(i)
-	}
-	close(start)
-	wg.Wait()
-	close(errs)
-
-	var success, conflict int
-	for err := range errs {
-		switch {
-		case err == nil:
-			success++
-		case errors.Is(err, session.ErrConflict):
-			conflict++
-		default:
-			t.Fatalf("finish err = %v", err)
-		}
-	}
-	if success != 1 || conflict != contenders-1 {
-		t.Fatalf("success=%d conflict=%d, want 1/%d", success, conflict, contenders-1)
-	}
-}
-
 func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing.T) {
 	st, call := setupClaimedToolCall(t)
 	defer func() { _ = st.Close() }()

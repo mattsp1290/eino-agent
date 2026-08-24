@@ -220,50 +220,8 @@ func Run(t *testing.T, factory Factory) {
 		if _, err := subject.Store.ClaimToolCall(ctx, call); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("second claim err = %v, want ErrConflict", err)
 		}
-		stolen := claimed
-		stolen.ClaimedBy = "worker-2"
-		stolen.ClaimToken = "claim-2"
-		stolen.Status = session.ToolCallCompleted
-		stolen.CompletedAt = time.Now()
-		if err := subject.Store.FinishToolCall(ctx, stolen); !errors.Is(err, session.ErrConflict) {
-			t.Fatalf("finish with wrong claim err = %v, want ErrConflict", err)
-		}
-		claimed.Status = session.ToolCallCompleted
-		claimed.Output = []byte(`{"text":"ok"}`)
-		claimed.CompletedAt = time.Now()
-		if err := subject.Store.FinishToolCall(ctx, claimed); err != nil {
-			t.Fatalf("finish tool call: %v", err)
-		}
-		if err := subject.Store.FinishToolCall(ctx, claimed); err != nil {
-			t.Fatalf("idempotent finish tool call: %v", err)
-		}
-		conflictingFinish := claimed
-		conflictingFinish.Output = []byte(`{"text":"changed"}`)
-		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
-			t.Fatalf("conflicting repeat finish err = %v, want ErrConflict", err)
-		}
-		conflictingFinish = claimed
-		conflictingFinish.Status = session.ToolCallFailed
-		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
-			t.Fatalf("conflicting status finish err = %v, want ErrConflict", err)
-		}
-		conflictingFinish = claimed
-		conflictingFinish.Error = "different error"
-		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
-			t.Fatalf("conflicting error finish err = %v, want ErrConflict", err)
-		}
-		conflictingFinish = claimed
-		conflictingFinish.Metadata = map[string]string{"output_status": "changed"}
-		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
-			t.Fatalf("conflicting metadata finish err = %v, want ErrConflict", err)
-		}
-		conflictingFinish = claimed
-		conflictingFinish.CompletedAt = claimed.CompletedAt.Add(time.Second)
-		if err := subject.Store.FinishToolCall(ctx, conflictingFinish); !errors.Is(err, session.ErrConflict) {
-			t.Fatalf("conflicting completion time finish err = %v, want ErrConflict", err)
-		}
-		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 0 {
-			t.Fatalf("unfinished calls = %d, err = %v; want none", len(unfinished), err)
+		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 1 {
+			t.Fatalf("unfinished calls = %d, err = %v; want claimed call", len(unfinished), err)
 		}
 	})
 

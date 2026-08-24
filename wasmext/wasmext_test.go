@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -70,7 +71,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.Message{einoschema.SystemMessage("secret conversation"), einoschema.UserMessage("secret user")},
 		SystemPrompt: "secret system prompt",
 	}
-	materialized, err := registry.ResolveTools(context.Background(), snapshot)
+	materialized, err := registry.ResolveTools(context.Background(), runtime.NewToolScopeContext(snapshot))
 	if err != nil || len(materialized) != 1 {
 		t.Fatalf("ResolveTools = %v, %v", materialized, err)
 	}
@@ -78,7 +79,10 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeToolInput error = %v", err)
 	}
-	result, err := materialized[0].Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: decoded})
+	result, err := materialized[0].Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: decoded, Context: runtime.ToolContext{Turn: runtime.BoundedTurnMetadata{
+		RunID: "run-1", SessionID: "session-1", EpochID: "epoch-1", AgentName: "agent", AgentMode: "primary",
+		ToolNames: []string{"wasm_echo"}, MessageCount: 2, RoleCounts: runtime.MessageRoleCounts{System: 1, User: 1}, HasSystemPrompt: true,
+	}}})
 	if err != nil {
 		t.Fatalf("Execute error = %v", err)
 	}
@@ -88,7 +92,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 	component.mu.Lock()
 	request := component.lastInput.(toolExecuteRequest)
 	component.mu.Unlock()
-	if request.Turn.AgentName != "agent" || request.Turn.MessageCount != 2 || request.Turn.RoleCounts.System != 1 || request.Turn.RoleCounts.User != 1 {
+	if request.Turn.AgentName != "agent" || request.Turn.MessageCount != 2 || request.Turn.RoleCounts.System != 1 || request.Turn.RoleCounts.User != 1 || !reflect.DeepEqual(request.Turn.ToolNames.Slice(), []string{"wasm_echo"}) {
 		t.Fatalf("turn metadata = %+v", request.Turn)
 	}
 	visible := strings.Join([]string{request.ToolCallID, request.InputJSON, request.Turn.RunID, request.Turn.SessionID, request.Turn.AgentName, request.Turn.AgentMode, request.Turn.ProviderID, request.Turn.ModelID}, " ")
@@ -572,13 +576,13 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 }
 
-type wasmTestPlanProvider struct{ registry runtime.ToolRegistry }
+type wasmTestPlanProvider struct{ registry *tools.Registry }
 
 func (p wasmTestPlanProvider) AcquireRunPlan(context.Context, runtime.RunPlanRequest) (*runtime.RunPlan, error) {
 	return runtime.NewRunPlan(runtime.RunPlanSpec{Tools: []runtime.PlanTool{{
 		Identity: session.ExtensionPlanEntry{InstanceID: "wasm-test", Kind: session.ExtensionTool, Artifact: session.ArtifactIdentity{Name: "wasm-test", Version: "1", Hash: "hash", SourceKind: string(extension.SourceNative)}, Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: "wasm_echo/tool"},
-		Resolve: func(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.Tool, error) {
-			resolved, err := p.registry.ResolveTools(ctx, snapshot)
+		Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
+			resolved, err := p.registry.ResolveTools(ctx, scope)
 			if err != nil {
 				return runtime.Tool{}, err
 			}

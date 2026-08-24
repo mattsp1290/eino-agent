@@ -211,8 +211,8 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 			return TurnSnapshot{}, err
 		}
 	}
-	if execution.plan.tools != nil {
-		planned, err := execution.plan.tools.ResolveTools(ctx, snapshot.Clone())
+	if len(execution.plan.tools.capabilities) != 0 {
+		planned, err := execution.plan.ResolveTools(ctx, NewToolScopeContext(snapshot))
 		if err != nil {
 			return TurnSnapshot{}, err
 		}
@@ -326,10 +326,10 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 	wrapped := cloneTool(tool)
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		if execution.dispatch() == nil {
-			return tool.Executor.Execute(ctx, call)
+			return tool.Executor.Execute(ctx, cloneToolCall(call))
 		}
 		outcome, err := extension.Invoke(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolOutcome, error) {
-			result, execErr := tool.Executor.Execute(ctx, call)
+			result, execErr := tool.Executor.Execute(ctx, cloneToolCall(call))
 			disposition := ToolExecuted
 			if execErr != nil {
 				disposition = dispositionForError(execErr)

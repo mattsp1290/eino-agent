@@ -8,7 +8,7 @@ import (
 )
 
 // ToolSettlement is the terminal state produced by executing a durable tool
-// call. Stores can use Apply to make FinishToolCall idempotent while still
+// call. Stores can use Apply to make SettleToolCall idempotent while still
 // rejecting conflicting repeated settlements.
 type ToolSettlement struct {
 	ID            ToolCallID

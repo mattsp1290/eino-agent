@@ -155,13 +155,12 @@ func planSetDefinition(state *State) agenttools.Definition {
 			items := clonePlan(input.Items)
 			state.mu.Lock()
 			state.ensure()
-			state.plans[execution.Snapshot.SessionID] = items
+			state.plans[execution.Context.Turn.SessionID] = items
 			state.mu.Unlock()
 			return map[string]any{"items": items}, nil
 		},
 		RetrySafe:   true,
 		Scope:       sessionScope("plan"),
-		Concurrency: runtime.ToolConcurrencySequential,
 		Permissions: []string{"session.plan"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -176,13 +175,12 @@ func planGetDefinition(state *State) agenttools.Definition {
 		Encode:      encodeJSON,
 		Execute: func(_ context.Context, execution agenttools.Execution) (any, error) {
 			state.mu.RLock()
-			items := clonePlan(state.plans[execution.Snapshot.SessionID])
+			items := clonePlan(state.plans[execution.Context.Turn.SessionID])
 			state.mu.RUnlock()
 			return map[string]any{"items": items}, nil
 		},
 		RetrySafe:   true,
 		Scope:       sessionScope("plan"),
-		Concurrency: runtime.ToolConcurrencySequential,
 		Permissions: []string{"session.plan"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -211,29 +209,29 @@ func retainOutputDefinition(state *State) agenttools.Definition {
 			output.InlineSize = int64(len(content))
 			state.mu.Lock()
 			state.ensure()
-			if state.outputs[execution.Snapshot.SessionID] == nil {
-				state.outputs[execution.Snapshot.SessionID] = map[string]RetainedOutput{}
+			sessionID := execution.Context.Turn.SessionID
+			if state.outputs[sessionID] == nil {
+				state.outputs[sessionID] = map[string]RetainedOutput{}
 			}
-			if previous, ok := state.outputs[execution.Snapshot.SessionID][input.ID]; ok {
-				state.outputBytes[execution.Snapshot.SessionID] -= previous.InlineSize
+			if previous, ok := state.outputs[sessionID][input.ID]; ok {
+				state.outputBytes[sessionID] -= previous.InlineSize
 			}
 			maxSessionBytes := state.maxSessionBytes()
 			if maxSessionBytes >= 0 {
-				available := maxSessionBytes - state.outputBytes[execution.Snapshot.SessionID]
+				available := maxSessionBytes - state.outputBytes[sessionID]
 				if available < output.InlineSize {
 					output.Content = validUTF8Prefix(output.Content, int(available))
 					output.InlineSize = int64(len(output.Content))
 					output.Truncated = true
 				}
 			}
-			state.outputs[execution.Snapshot.SessionID][input.ID] = output
-			state.outputBytes[execution.Snapshot.SessionID] += output.InlineSize
+			state.outputs[sessionID][input.ID] = output
+			state.outputBytes[sessionID] += output.InlineSize
 			state.mu.Unlock()
 			return output, nil
 		},
 		RetrySafe:   true,
 		Scope:       sessionScope("retained_output"),
-		Concurrency: runtime.ToolConcurrencySequential,
 		Permissions: []string{"session.retained_output"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096, StoreExternal: true},
 		Metadata:    map[string]string{"source": "session"},
@@ -252,10 +250,9 @@ func subagentDefinition(runner SubagentRunner) agenttools.Definition {
 			if input.Task == "" {
 				return nil, fmt.Errorf("task required")
 			}
-			return runner.RunSubagent(ctx, SubagentRequest{SessionID: execution.Snapshot.SessionID, Task: input.Task})
+			return runner.RunSubagent(ctx, SubagentRequest{SessionID: execution.Context.Turn.SessionID, Task: input.Task})
 		},
 		Scope:       sessionScope("subagent"),
-		Concurrency: runtime.ToolConcurrencySequential,
 		Permissions: []string{"session.subagent"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -274,10 +271,9 @@ func skillLoadDefinition(loader SkillLoader) agenttools.Definition {
 			if input.Name == "" {
 				return nil, fmt.Errorf("name required")
 			}
-			return loader.LoadSkill(ctx, SkillRequest{SessionID: execution.Snapshot.SessionID, Name: input.Name})
+			return loader.LoadSkill(ctx, SkillRequest{SessionID: execution.Context.Turn.SessionID, Name: input.Name})
 		},
 		Scope:       sessionScope("skill"),
-		Concurrency: runtime.ToolConcurrencySequential,
 		Permissions: []string{"session.skill"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -313,12 +309,11 @@ func encodeJSON(_ context.Context, value any) (json.RawMessage, error) {
 	return json.Marshal(value)
 }
 
-func sessionScope(kind string) agenttools.ScopeResolver {
-	return func(snapshot runtime.TurnSnapshot, _ agenttools.Definition) runtime.ToolScope {
+func sessionScope(_ string) agenttools.ScopeResolver {
+	return func(context runtime.ToolScopeContext) runtime.ToolScope {
 		return runtime.ToolScope{
-			WorkspaceID:    snapshot.Config.Metadata["workspace_id"],
-			Root:           "session://" + string(snapshot.SessionID),
-			ConcurrencyKey: "session:" + string(snapshot.SessionID) + ":" + kind,
+			WorkspaceID: context.WorkspaceID,
+			Root:        "session://" + string(context.SessionID),
 		}
 	}
 }

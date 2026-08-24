@@ -84,10 +84,39 @@ type Tool struct {
 	Executor     ToolExecutor
 	RetrySafe    bool
 	Scope        ToolScope
-	Concurrency  ToolConcurrency
 	InputDecoder InputDecoder
 	Retention    RetentionPolicy
 	Metadata     map[string]string
+}
+
+// ToolScopeContext is the data-only input used while selecting and scoping
+// tools. It deliberately excludes messages, model clients, and executors.
+type ToolScopeContext struct {
+	SessionID     session.ID
+	WorkspaceID   string
+	WorkspaceRoot string
+	EnabledTools  []string
+	DisabledTools []string
+}
+
+// Clone returns a defensive copy of the context containers.
+func (c ToolScopeContext) Clone() ToolScopeContext {
+	c.EnabledTools = cloneSlice(c.EnabledTools)
+	c.DisabledTools = cloneSlice(c.DisabledTools)
+	return c
+}
+
+// ToolContext is the bounded data exposed during tool execution.
+type ToolContext struct {
+	Turn          BoundedTurnMetadata
+	WorkspaceID   string
+	WorkspaceRoot string
+}
+
+// Clone returns a defensive copy of the context containers.
+func (c ToolContext) Clone() ToolContext {
+	c.Turn = cloneBoundedTurnMetadata(c.Turn)
+	return c
 }
 
 // ToolExecutor executes one tool call under durable runtime control.
@@ -108,25 +137,15 @@ type ToolCall struct {
 	Pattern         string
 	Input           json.RawMessage
 	Approval        ApprovalRequester
+	Context         ToolContext
 }
 
-// ToolScope describes the authority and serialization scope for a tool.
+// ToolScope describes the authority scope for a tool.
 type ToolScope struct {
-	WorkspaceID    string
-	Root           string
-	ConcurrencyKey string
-	Permissions    []string
+	WorkspaceID string
+	Root        string
+	Permissions []string
 }
-
-// ToolConcurrency describes whether calls with the same scope may overlap.
-type ToolConcurrency string
-
-const (
-	// ToolConcurrencyParallel allows concurrent calls.
-	ToolConcurrencyParallel ToolConcurrency = "parallel"
-	// ToolConcurrencySequential serializes calls sharing the same concurrency key.
-	ToolConcurrencySequential ToolConcurrency = "sequential"
-)
 
 // InputDecoder validates and normalizes model-provided tool input.
 type InputDecoder interface {
@@ -170,19 +189,6 @@ type ApprovalRequest struct {
 // ApprovalRequester is exposed to runtime tools for dynamic permissions.
 type ApprovalRequester interface {
 	Ask(ctx context.Context, request ApprovalRequest) error
-}
-
-// ToolRegistry materializes Eino-compatible runtime tools for a turn snapshot.
-type ToolRegistry interface {
-	ResolveTools(ctx context.Context, snapshot TurnSnapshot) ([]Tool, error)
-}
-
-// ToolRegistryFunc adapts a function into a ToolRegistry.
-type ToolRegistryFunc func(context.Context, TurnSnapshot) ([]Tool, error)
-
-// ResolveTools calls fn.
-func (fn ToolRegistryFunc) ResolveTools(ctx context.Context, snapshot TurnSnapshot) ([]Tool, error) {
-	return fn(ctx, snapshot)
 }
 
 // EventKind classifies internal runtime events before transport adaptation.
@@ -279,10 +285,7 @@ type EventSinkFunc func(context.Context, Event) error
 // Emit calls fn.
 func (fn EventSinkFunc) Emit(ctx context.Context, event Event) error { return fn(ctx, event) }
 
-var (
-	_ ToolRegistry = ToolRegistryFunc(nil)
-	_ EventSink    = EventSinkFunc(nil)
-)
+var _ EventSink = EventSinkFunc(nil)
 
 func cloneSlice[T any](src []T) []T {
 	if src == nil {

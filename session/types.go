@@ -339,7 +339,6 @@ type Store interface {
 	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
 	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
 	ClaimToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
-	FinishToolCall(ctx context.Context, call ToolCall) error
 	SettleToolCall(ctx context.Context, settlement ToolSettlement) error
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -95,7 +96,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
 	}
 	snapshot := o.resumeSnapshot(run)
-	tools, err := o.resumeTools(ctx, execution, run)
+	tools, toolContext, err := o.resumeTools(ctx, execution, run)
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
@@ -140,6 +141,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 			Scope:           tool.Scope,
 			Pattern:         toolPattern(claimed.Input, claimed.Name),
 			Input:           cloneJSON(claimed.Input),
+			Context:         toolContext.Clone(),
 		}
 		settledTool, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, toolCall, claimed, nil)
 		if err != nil {
@@ -155,23 +157,25 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 	return o.finishResume(ctx, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
 }
 
-func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runExecution, run session.Run) (map[string]Tool, error) {
-	if execution.plan.tools == nil {
-		return nil, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
+func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runExecution, run session.Run) (map[string]Tool, ToolContext, error) {
+	if len(execution.plan.tools.capabilities) == 0 {
+		return nil, ToolContext{}, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
 	}
 	snapshot := o.resumeSnapshot(run)
-	resolved, err := execution.plan.tools.ResolveTools(ctx, snapshot)
+	resolved, err := execution.plan.ResolveTools(ctx, NewToolScopeContext(snapshot))
 	if err != nil {
-		return nil, err
+		return nil, ToolContext{}, err
 	}
+	sort.Slice(resolved, func(i, j int) bool { return resolved[i].Name < resolved[j].Name })
+	snapshot.Tools = cloneSlice(resolved)
 	tools := make(map[string]Tool, len(resolved))
 	for _, tool := range resolved {
 		if _, exists := tools[tool.Name]; exists {
-			return nil, fmt.Errorf("duplicate effective tool %q", tool.Name)
+			return nil, ToolContext{}, fmt.Errorf("duplicate effective tool %q", tool.Name)
 		}
 		tools[tool.Name] = tool
 	}
-	return tools, nil
+	return tools, toolContext(snapshot, resolved), nil
 }
 
 func (o *StreamingOrchestrator) resumeSnapshot(run session.Run) TurnSnapshot {

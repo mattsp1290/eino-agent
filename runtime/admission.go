@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,15 +30,16 @@ type AdmissionIDs struct {
 
 // AdmissionRequest describes the durable records created before execution.
 type AdmissionRequest struct {
-	IDs             AdmissionIDs
-	ParentMessageID session.MessageID
-	Config          config.Snapshot
-	Model           model.Resolved
-	Input           []*einoschema.Message
-	OwnerID         string
-	LeaseUntil      time.Time
-	Metadata        map[string]string
-	ExtensionPlan   session.ExtensionPlanDescriptor
+	IDs                  AdmissionIDs
+	ParentMessageID      session.MessageID
+	Config               config.Snapshot
+	Model                model.Resolved
+	Input                []*einoschema.Message
+	OwnerID              string
+	LeaseUntil           time.Time
+	Metadata             map[string]string
+	ExtensionPlan        session.ExtensionPlanDescriptor
+	admissionFingerprint string
 }
 
 // AdmittedRun is the durable state created before model execution begins.
@@ -66,8 +69,16 @@ func (a Admitter) Admit(ctx context.Context, request AdmissionRequest) (Admitted
 	if err := validateAdmissionIDs(request.IDs); err != nil {
 		return AdmittedRun{}, err
 	}
+	request, err := freezeAdmissionRequest(request)
+	if err != nil {
+		return AdmittedRun{}, fmt.Errorf("%w: freeze request: %v", ErrInvalidAdmission, err)
+	}
 	now := a.now()
-	if existing, err := a.existingAdmission(ctx, request, now); err == nil {
+	frozenSnapshot, err := FreezeTurnSnapshot(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, request.Input, request.Config.Agent.SystemPrompt, now)
+	if err != nil {
+		return AdmittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
+	}
+	if existing, err := a.existingAdmission(ctx, request, frozenSnapshot, now); err == nil {
 		existing.AlreadyAdmitted = true
 		return existing, nil
 	} else if !errors.Is(err, session.ErrNotFound) {
@@ -79,7 +90,7 @@ func (a Admitter) Admit(ctx context.Context, request AdmissionRequest) (Admitted
 	if transactor != nil {
 		err := transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
 			var err error
-			admitted, err = admitDurable(ctx, tx, request, now)
+			admitted, err = admitDurable(ctx, tx, request, frozenSnapshot, now)
 			return err
 		})
 		if err != nil {
@@ -87,7 +98,7 @@ func (a Admitter) Admit(ctx context.Context, request AdmissionRequest) (Admitted
 		}
 	} else {
 		var err error
-		admitted, err = admitDurable(ctx, a.Store, request, now)
+		admitted, err = admitDurable(ctx, a.Store, request, frozenSnapshot, now)
 		if err != nil {
 			return AdmittedRun{}, err
 		}
@@ -122,12 +133,15 @@ func (a Admitter) transactor() session.Transactor {
 	return transactor
 }
 
-func (a Admitter) existingAdmission(ctx context.Context, request AdmissionRequest, now time.Time) (AdmittedRun, error) {
+func (a Admitter) existingAdmission(ctx context.Context, request AdmissionRequest, snapshot TurnSnapshot, now time.Time) (AdmittedRun, error) {
 	runRecord, err := a.Store.GetRun(ctx, request.IDs.RunID)
 	if err != nil {
 		return AdmittedRun{}, err
 	}
 	if err := validateMatchingExtensionPlans(runRecord.ExtensionPlan, request.ExtensionPlan); err != nil {
+		return AdmittedRun{}, err
+	}
+	if err := validateExistingAdmission(runRecord, request); err != nil {
 		return AdmittedRun{}, err
 	}
 	sessionRecord, err := a.Store.GetSession(ctx, runRecord.SessionID)
@@ -136,9 +150,15 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 	}
 	assistantMessage, err := findMessage(ctx, a.Store, sessionRecord.ID, request.IDs.AssistantMessageID)
 	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			return AdmittedRun{}, session.ErrConflict
+		}
 		return AdmittedRun{}, err
 	}
-	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, request, now), nil
+	if sessionRecord.ID != request.IDs.SessionID || assistantMessage.ID != request.IDs.AssistantMessageID || assistantMessage.SessionID != sessionRecord.ID || assistantMessage.RunID != runRecord.ID || assistantMessage.ParentID != request.ParentMessageID || assistantMessage.Agent != request.Config.Agent.Name || assistantMessage.ModelID != admissionModelID(request) {
+		return AdmittedRun{}, session.ErrConflict
+	}
+	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, snapshot, now), nil
 }
 
 func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDescriptor) error {
@@ -159,7 +179,7 @@ func validateMatchingExtensionPlans(persisted, requested session.ExtensionPlanDe
 	return nil
 }
 
-func admitDurable(ctx context.Context, store session.Store, request AdmissionRequest, now time.Time) (AdmittedRun, error) {
+func admitDurable(ctx context.Context, store session.Store, request AdmissionRequest, snapshot TurnSnapshot, now time.Time) (AdmittedRun, error) {
 	sessionRecord, err := store.CreateSession(ctx, admissionSession(request, now))
 	if err != nil {
 		return AdmittedRun{}, err
@@ -179,7 +199,7 @@ func admitDurable(ctx context.Context, store session.Store, request AdmissionReq
 	if _, err := store.AppendEvent(ctx, event); err != nil {
 		return AdmittedRun{}, err
 	}
-	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, request, now), nil
+	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, snapshot, now), nil
 }
 
 func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRun, request AdmissionRequest, now time.Time) error {
@@ -204,22 +224,52 @@ func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRu
 	return nil
 }
 
-func buildAdmittedRun(sessionRecord session.Session, runRecord session.Run, assistantMessage session.Message, request AdmissionRequest, now time.Time) AdmittedRun {
+func buildAdmittedRun(sessionRecord session.Session, runRecord session.Run, assistantMessage session.Message, snapshot TurnSnapshot, now time.Time) AdmittedRun {
+	snapshot.RunID = runRecord.ID
+	snapshot.SessionID = sessionRecord.ID
+	snapshot.EpochID = runRecord.ContextEpoch
+	snapshot.CreatedAt = now
 	return AdmittedRun{
 		Session:          sessionRecord,
 		Run:              runRecord,
 		AssistantMessage: assistantMessage,
-		Snapshot: FreezeTurnSnapshot(
-			runRecord.ID,
-			sessionRecord.ID,
-			request.IDs.ContextEpochID,
-			request.Config,
-			request.Model,
-			request.Input,
-			request.Config.Agent.SystemPrompt,
-			now,
-		),
+		Snapshot:         snapshot,
 	}
+}
+
+const admissionFingerprintKey = "_admission_fingerprint"
+
+func freezeAdmissionRequest(request AdmissionRequest) (AdmissionRequest, error) {
+	request.Config = request.Config.Clone()
+	request.Model = cloneResolved(request.Model)
+	cloned, err := (model.Request{Messages: request.Input}).Clone()
+	if err != nil {
+		return AdmissionRequest{}, err
+	}
+	request.Input = cloned.Messages
+	request.Metadata = cloneStringMap(request.Metadata)
+	request.ExtensionPlan = request.ExtensionPlan.Clone()
+	payload := struct {
+		Config       config.Snapshot
+		Provider     model.Provider
+		Model        model.Descriptor
+		Messages     []*einoschema.Message
+		SystemPrompt string
+	}{request.Config, request.Model.Provider, request.Model.Model, request.Input, request.Config.Agent.SystemPrompt}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return AdmissionRequest{}, err
+	}
+	sum := sha256.Sum256(raw)
+	request.admissionFingerprint = hex.EncodeToString(sum[:])
+	return request, nil
+}
+
+func validateExistingAdmission(run session.Run, request AdmissionRequest) error {
+	if run.ID != request.IDs.RunID || run.SessionID != request.IDs.SessionID || run.ContextEpoch != request.IDs.ContextEpochID || run.ParentMsgID != request.ParentMessageID || run.Agent != request.Config.Agent.Name || run.ProviderID != admissionProviderID(request) || run.ModelID != admissionModelID(request) || run.Config[admissionFingerprintKey] != request.admissionFingerprint {
+		return session.ErrConflict
+	}
+	return nil
 }
 
 func findMessage(ctx context.Context, store session.Store, sessionID session.ID, id session.MessageID) (session.Message, error) {
@@ -287,7 +337,7 @@ func admissionRun(request AdmissionRequest, sessionID session.ID, now time.Time)
 		ModelID:       admissionModelID(request),
 		ContextEpoch:  request.IDs.ContextEpochID,
 		Status:        session.RunPending,
-		Config:        admissionConfig(request.Config),
+		Config:        admissionConfig(request),
 		Components:    admissionComponents(request.Config),
 		ExtensionPlan: request.ExtensionPlan.Clone(),
 		CreatedAt:     now,
@@ -343,11 +393,13 @@ func admissionModelID(request AdmissionRequest) string {
 	return string(request.Config.Model.ModelID)
 }
 
-func admissionConfig(snapshot config.Snapshot) map[string]string {
+func admissionConfig(request AdmissionRequest) map[string]string {
+	snapshot := request.Config
 	return map[string]string{
-		"agent":          snapshot.Agent.Name,
-		"workspace_id":   snapshot.Metadata["workspace_id"],
-		"workspace_root": snapshot.Metadata["workspace_root"],
+		"agent":                 snapshot.Agent.Name,
+		"workspace_id":          snapshot.Metadata["workspace_id"],
+		"workspace_root":        snapshot.Metadata["workspace_root"],
+		admissionFingerprintKey: request.admissionFingerprint,
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,14 +81,12 @@ func TestStreamingOrchestratorPreservesConfiguredAdmissionEventSink(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	}))
 	orchestrator.Admit = &Admitter{Events: admissionSink}
 	orchestrator.Events = runtimeSink
-	orchestrator.Plans = staticRunPlanProvider{plan: &RunPlan{descriptor: descriptor, dispatch: dispatch}}
+	orchestrator.Plans = staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}
 
 	result := startAndWait(t, orchestrator)
 	if result.Error != nil {
@@ -313,7 +312,7 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 		msg.ReasoningContent = "partial reasoning"
 		return []*einoschema.Message{msg}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			t.Fatal("executor should not run for malformed tool arguments")
@@ -357,7 +356,7 @@ func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 			if string(call.Input) != `{}` {
@@ -436,7 +435,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "hi"}, nil
@@ -515,7 +514,7 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 			Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hi"}`},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "hi"}, nil
@@ -597,7 +596,7 @@ func TestStreamingOrchestratorGeneratesMissingToolCallIDsConsistently(t *testing
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "ok"}, nil
@@ -640,7 +639,7 @@ func TestStreamingOrchestratorBoundsToolOutput(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name:      "echo",
 		Retention: RetentionPolicy{MaxInlineBytes: 2, StoreExternal: true},
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
@@ -679,7 +678,7 @@ func TestStreamingOrchestratorContinuesAfterToolFailurePayload(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{}, errors.New("tool failed")
@@ -718,7 +717,7 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name:      "echo",
 		Retention: RetentionPolicy{MaxInlineBytes: 4096},
 		Scope: ToolScope{
@@ -765,7 +764,7 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{}, context.Canceled
@@ -813,8 +812,6 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	defer func() { _ = store.Close() }()
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "tools", Kind: session.ExtensionTool, Required: true, CapabilityID: "echo/tool"}}}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 	var executedCall ToolCall
 	toolRegistry := staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -834,7 +831,7 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 			}
 			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-cancel", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
 		})},
-		Plans:   staticRunPlanProvider{plan: &RunPlan{tools: toolRegistry, descriptor: descriptor}},
+		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
 		OwnerID: "owner-1",
@@ -952,7 +949,7 @@ func TestResumePreservesDeniedDispositionAfterFreshResultTransform(t *testing.T)
 	}
 }
 
-func transformedPermissionRunPlan(t *testing.T, tools ToolRegistry, notices *[]ToolSettledNotice) *RunPlan {
+func transformedPermissionRunPlan(t *testing.T, tools staticToolRegistry, notices *[]ToolSettledNotice) *RunPlan {
 	t.Helper()
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "permission-transform", Artifact: extension.Artifact{Name: "permission-transform", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
@@ -976,8 +973,7 @@ func transformedPermissionRunPlan(t *testing.T, tools ToolRegistry, notices *[]T
 	if err != nil {
 		t.Fatal(err)
 	}
-	descriptor := strictToolDescriptor(t)
-	plan := &RunPlan{descriptor: descriptor, dispatch: dispatch, tools: tools}
+	plan := newTestToolPlanWithDispatch(tools, dispatch, nil)
 	t.Cleanup(func() { _ = mount.Close(context.Background()) })
 	t.Cleanup(func() { plan.release() })
 	return plan
@@ -1028,7 +1024,7 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 				Clock:   func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) },
 				OwnerID: "new-owner",
 			}
-			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, &RunPlan{dispatch: dispatch, tools: toolRegistry}), run, nil)
+			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, newTestToolPlanWithDispatch(toolRegistry, dispatch, nil)), run, nil)
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
 			}
@@ -1064,7 +1060,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		ModelID:       "test",
 		Status:        session.RunPending,
 		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
-		ExtensionPlan: strictToolDescriptor(t),
+		ExtensionPlan: testEchoPlanDescriptor(),
 		CreatedAt:     now,
 	})
 	if err != nil {
@@ -1097,7 +1093,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return now },
 		OwnerID: "owner-1",
-		Plans:   staticRunPlanProvider{plan: &RunPlan{tools: toolRegistry, descriptor: run.ExtensionPlan}},
+		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
 	}
 
 	start := make(chan struct{})
@@ -1161,8 +1157,10 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
 	var executions atomic.Int64
-	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+	var resumedContext ToolContext
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		executions.Add(1)
+		resumedContext = call.Context.Clone()
 		return ToolResult{Output: "ok"}, nil
 	})}}}
 	orch := &StreamingOrchestrator{
@@ -1170,7 +1168,7 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return now },
 		OwnerID: "owner-1",
-		Plans:   staticRunPlanProvider{plan: &RunPlan{tools: toolRegistry, descriptor: run.ExtensionPlan}},
+		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
 	}
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
@@ -1190,6 +1188,9 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 	if executions.Load() != 1 {
 		t.Fatalf("tool executions = %d, want 1", executions.Load())
 	}
+	if !reflect.DeepEqual(resumedContext.Turn.ToolNames, []string{"echo"}) || resumedContext.Turn.RunID != run.ID || resumedContext.Turn.SessionID != run.SessionID || resumedContext.WorkspaceID != "workspace-1" || resumedContext.WorkspaceRoot != "/workspace" {
+		t.Fatalf("resumed tool context = %#v", resumedContext)
+	}
 }
 
 func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
@@ -1208,7 +1209,7 @@ func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
 		IDs:     &sequenceIDs{},
 		Clock:   func() time.Time { return now },
 		OwnerID: "owner-1",
-		Plans:   staticRunPlanProvider{plan: &RunPlan{tools: toolRegistry, descriptor: run.ExtensionPlan}},
+		Plans:   staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
 	}
 	handle, err := orch.Resume(ctx, run.ID)
 	if err != nil {
@@ -1254,7 +1255,7 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		ModelID:       "test",
 		Status:        session.RunPending,
 		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
-		ExtensionPlan: strictToolDescriptor(t),
+		ExtensionPlan: testEchoPlanDescriptor(),
 		CreatedAt:     now,
 	})
 	if err != nil {
@@ -1304,7 +1305,7 @@ func TestStreamingOrchestratorFailsWhenToolLoopExceedsLimit(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "again"}, nil
@@ -1339,7 +1340,7 @@ func newTestOrchestrator(store *admissionStore, streamer model.Streamer) *Stream
 		Clock:     func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) },
 		OwnerID:   "owner-1",
 		QueueSize: 2,
-		Plans:     staticRunPlanProvider{plan: testRunPlanWithTools(nil)},
+		Plans:     staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})},
 	}
 }
 
@@ -1447,7 +1448,7 @@ type staticToolRegistry struct {
 	tools []Tool
 }
 
-func (r staticToolRegistry) ResolveTools(context.Context, TurnSnapshot) ([]Tool, error) {
+func (r staticToolRegistry) ResolveTools(context.Context, ToolScopeContext) ([]Tool, error) {
 	return r.tools, nil
 }
 

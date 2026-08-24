@@ -21,7 +21,6 @@ import (
 	"github.com/mattsp1290/eino-tools/result"
 	"github.com/mattsp1290/eino-tools/urlfetch"
 
-	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/internal/workspace"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -52,9 +51,6 @@ func TestRegisterDefaultsMaterializesLeafTools(t *testing.T) {
 	for _, tool := range materialized {
 		got = append(got, tool.Name)
 		if tool.Name == fileops.NameRead {
-			if tool.Concurrency != runtime.ToolConcurrencySequential {
-				t.Fatalf("file_read concurrency = %q", tool.Concurrency)
-			}
 			if tool.Scope.Root != canonicalRoot {
 				t.Fatalf("file_read root = %q, want %q", tool.Scope.Root, canonicalRoot)
 			}
@@ -160,9 +156,6 @@ func TestWorkspaceToolsAllowDifferentCanonicalRootsInParallel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolveTools B error = %v", err)
 	}
-	if toolA[0].Scope.ConcurrencyKey == toolB[0].Scope.ConcurrencyKey {
-		t.Fatalf("different roots share concurrency key %q", toolA[0].Scope.ConcurrencyKey)
-	}
 	startTool(t, toolA[0])
 	probe.waitEnter(t)
 	startTool(t, toolB[0])
@@ -201,10 +194,6 @@ func TestWorkspaceToolsSerializeSymlinkAliasRoots(t *testing.T) {
 	aliasTools, err := registry.ResolveTools(context.Background(), snapshot(alias, "session-alias"))
 	if err != nil {
 		t.Fatalf("ResolveTools alias error = %v", err)
-	}
-	if realTools[0].Scope.ConcurrencyKey != aliasTools[0].Scope.ConcurrencyKey {
-		t.Fatalf("alias roots use different concurrency keys: %q != %q",
-			realTools[0].Scope.ConcurrencyKey, aliasTools[0].Scope.ConcurrencyKey)
 	}
 	startTool(t, realTools[0])
 	probe.waitEnter(t)
@@ -405,13 +394,9 @@ func TestRegisterDefaultsNilURLFetchOptionsRegisters(t *testing.T) {
 	}
 }
 
-func snapshot(root string, id session.ID) runtime.TurnSnapshot {
-	return runtime.TurnSnapshot{
-		SessionID: id,
-		Config: config.Snapshot{Metadata: map[string]string{
-			"workspace_id":   "workspace-" + string(id),
-			"workspace_root": root,
-		}},
+func snapshot(root string, id session.ID) runtime.ToolScopeContext {
+	return runtime.ToolScopeContext{
+		SessionID: id, WorkspaceID: "workspace-" + string(id), WorkspaceRoot: root,
 	}
 }
 

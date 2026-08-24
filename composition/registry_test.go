@@ -13,7 +13,6 @@ import (
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
-	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
@@ -46,9 +45,6 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 		{name: "missing executor", mutate: func(definition *tools.Definition) { definition.Execute = nil }},
 		{name: "malformed schema", mutate: func(definition *tools.Definition) {
 			definition.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"broken": nil})
-		}},
-		{name: "unsupported concurrency", mutate: func(definition *tools.Definition) {
-			definition.Concurrency = runtime.ToolConcurrency("exclusive")
 		}},
 	}
 	for _, test := range tests {
@@ -91,7 +87,7 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 	}
 	defer func() { _ = global.Close(context.Background()) }()
 	scoped, err := registry.Mount(context.Background(), component("scoped"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
-		return registrar.Tool(ToolRegistration{ID: "echo-session", InstanceID: "scoped", Scope: extension.SessionScope("session-a"), Definition: definition("echo", "session")})
+		return registrar.Tool(ToolRegistration{ID: "echo-session", InstanceID: "scoped", Scope: extension.SessionScope("session-a"), Definition: definition("session_echo", "session")})
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -102,8 +98,8 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolsA, err := planA.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a", Config: config.Snapshot{Model: model.Selection{}}})
-	if err != nil || len(toolsA) != 1 || toolsA[0].Info.Desc != "session" {
+	toolsA, err := planA.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
+	if err != nil || len(toolsA) != 2 || toolsA[0].Info.Desc != "global" || toolsA[1].Info.Desc != "session" {
 		t.Fatalf("session tools = %#v, %v", toolsA, err)
 	}
 	persisted := planA.Descriptor()
@@ -113,7 +109,7 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	toolsB, _ := planB.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-b", Config: config.Snapshot{}})
+	toolsB, _ := planB.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-b"})
 	if len(toolsB) != 1 || toolsB[0].Info.Desc != "global" {
 		t.Fatalf("other session tools = %#v", toolsB)
 	}
@@ -144,7 +140,7 @@ func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 		if err != nil {
 			t.Fatalf("AcquireRunPlan(%q) = %v", key, err)
 		}
-		resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(key)})
+		resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: session.ID(key)})
 		if err != nil || len(resolved) != 1 || resolved[0].Name != "echo" {
 			t.Fatalf("matching scope tools = %#v, %v", resolved, err)
 		}
@@ -154,7 +150,7 @@ func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		resolved, err = other.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "other"})
+		resolved, err = other.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "other"})
 		if err != nil || len(resolved) != 0 {
 			t.Fatalf("other scope tools = %#v, %v", resolved, err)
 		}
@@ -194,7 +190,7 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer plan.Release()
-			resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+			resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -218,49 +214,20 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 	}
 }
 
-func TestResumeFiltersPersistedToolIdentityBeforeScopeShadowing(t *testing.T) {
+func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
 	registry := NewRegistry(nil)
 	baseComponent := component("scope-collision")
-	mountVersion := func(includeSessionTool bool) *Mount {
-		mount, err := registry.Mount(context.Background(), baseComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
-			if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "session-marker", InstanceID: baseComponent.InstanceID, Scope: extension.SessionScope("session-a")}, func(context.Context, string) error { return nil }); err != nil {
-				return err
-			}
-			if err := registrar.Tool(ToolRegistration{ID: "global", InstanceID: baseComponent.InstanceID, Scope: extension.GlobalScope(), Definition: definition("echo", "global")}); err != nil {
-				return err
-			}
-			if includeSessionTool {
-				return registrar.Tool(ToolRegistration{ID: "session", InstanceID: baseComponent.InstanceID, Scope: extension.SessionScope("session-a"), Definition: definition("echo", "session")})
-			}
-			return nil
-		}))
-		if err != nil {
-			t.Fatal(err)
+	_, err := registry.Mount(context.Background(), baseComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		if err := registrar.Tool(ToolRegistration{ID: "global", InstanceID: baseComponent.InstanceID, Scope: extension.GlobalScope(), Definition: definition("echo", "global")}); err != nil {
+			return err
 		}
-		return mount
+		return registrar.Tool(ToolRegistration{ID: "session", InstanceID: baseComponent.InstanceID, Scope: extension.SessionScope("session-a"), Definition: definition("echo", "session")})
+	}))
+	if !errors.Is(err, tools.ErrDuplicateRegistration) {
+		t.Fatalf("Mount error = %v, want ErrDuplicateRegistration", err)
 	}
-
-	firstMount := mountVersion(false)
-	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	persisted := first.Descriptor()
-	first.Release()
-	if err := firstMount.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	secondMount := mountVersion(true)
-	defer func() { _ = secondMount.Close(context.Background()) }()
-	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
-	if err != nil {
-		t.Fatalf("AcquireResumePlan = %v", err)
-	}
-	defer resumed.Release()
-	resolved, err := resumed.ResolveTools(context.Background(), runtime.TurnSnapshot{})
-	if err != nil || len(resolved) != 1 || resolved[0].Info.Desc != "global" {
-		t.Fatalf("resumed tools = %#v, %v", resolved, err)
+	if len(registry.tools) != 0 {
+		t.Fatalf("collision mount published %d tools", len(registry.tools))
 	}
 }
 
@@ -285,7 +252,7 @@ func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, _ := newPlan.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	resolved, _ := newPlan.ResolveTools(context.Background(), runtime.ToolScopeContext{})
 	if len(resolved) != 0 {
 		t.Fatalf("new plan retained tools: %#v", resolved)
 	}
@@ -499,7 +466,7 @@ func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
 	if _, err := guards[0].Guard.GuardTool(context.Background(), runtime.ToolGuardRequest{}); !errors.Is(err, extension.ErrSelfClose) {
 		t.Fatalf("guard self-close = %v", err)
 	}
-	resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{})
+	resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{})
 	if err != nil || len(resolved) != 1 {
 		t.Fatalf("ResolveTools = %#v, %v", resolved, err)
 	}
@@ -590,7 +557,6 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 		{name: "max inline bytes", mutate: func(definition *tools.Definition) { definition.Retention.MaxInlineBytes++ }},
 		{name: "external storage", mutate: func(definition *tools.Definition) { definition.Retention.StoreExternal = false }},
 		{name: "redaction", mutate: func(definition *tools.Definition) { definition.Retention.Redact = false }},
-		{name: "concurrency", mutate: func(definition *tools.Definition) { definition.Concurrency = runtime.ToolConcurrencySequential }},
 		{name: "metadata", mutate: func(definition *tools.Definition) { definition.Metadata["policy"] = "changed" }},
 	}
 	for _, test := range tests {
@@ -599,7 +565,6 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			component := component("policy-fingerprint")
 			newDefinition := func() tools.Definition {
 				tool := definition("policy-tool", "stable")
-				tool.Concurrency = runtime.ToolConcurrencyParallel
 				tool.Retention = runtime.RetentionPolicy{MaxInlineBytes: 1024, StoreExternal: true, Redact: true}
 				tool.Metadata = map[string]string{"policy": "stable", "source": "test"}
 				return tool
@@ -744,7 +709,7 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a", Config: config.Snapshot{}})
+	resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
 	prompts, guards := plan.Prompts(), plan.Guards()
 	if err != nil || len(resolved) != 1 || resolved[0].Name != "b" || len(prompts) != 1 || prompts[0].InstanceID != "cap-session" || len(guards) != 1 {
 		t.Fatalf("plan tools=%#v prompts=%#v guards=%#v err=%v", resolved, prompts, guards, err)

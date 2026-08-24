@@ -216,7 +216,7 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Desc: "echo"}, Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: runtimeToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		return ToolResult{Output: string(call.Input)}, nil
 	})}
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(staticRunPlanProvider{plan: testRunPlanWithTools(staticToolRegistry{tools: []Tool{tool}})}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,13 +251,15 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 	}
 	orchestrator.Plans = staticRunPlanProvider{plan: plan}
 	message := einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "unsafe-call", Extra: map[string]any{"credential": "sentinel"}}})
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "unsafe-session", Input: []*einoschema.Message{message}, Config: orchestratorConfig()})
-	if result.Error == nil || called || len(sequence) != 0 || len(completed) != 0 {
-		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
+	if _, err := orchestrator.Start(context.Background(), Request{SessionID: "unsafe-session", Input: []*einoschema.Message{message}, Config: orchestratorConfig()}); err == nil || called || len(sequence) != 0 || len(completed) != 0 {
+		t.Fatalf("start_error=%v adapter_called=%t sequence=%#v completed=%#v", err, called, sequence, completed)
 	}
-	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	batch, err := store.ListModelRequests(context.Background(), "run-1", session.ModelRequestCursor{Limit: 10})
 	if err != nil || len(batch.Records) != 0 {
 		t.Fatalf("unsafe request records=%#v error=%v", batch.Records, err)
+	}
+	if _, err := store.ActiveRun(context.Background(), "unsafe-session"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("unsafe admission created a run: %v", err)
 	}
 }
 
@@ -299,7 +301,7 @@ func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]Mod
 		_ = mount.Close(context.Background())
 		t.Fatal(err)
 	}
-	return testRunPlanWithDispatch(dispatch), func() {
+	return newTestDispatchPlan(dispatch), func() {
 		if err := mount.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}

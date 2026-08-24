@@ -153,11 +153,7 @@ func registerWorkspace(ctx context.Context, registry *agenttools.Registry, spec 
 		return agenttools.Registration{}, err
 	}
 	definition := baseDefinition(spec.name, info)
-	definition.Concurrency = runtime.ToolConcurrencySequential
-	if spec.concurrent {
-		definition.Concurrency = runtime.ToolConcurrencyParallel
-	}
-	definition.Scope = workspaceScope(spec.name, definition.Concurrency)
+	definition.Scope = workspaceScope()
 	definition.Execute = executeWorkspace(spec)
 	return registry.Register(definition)
 }
@@ -200,7 +196,7 @@ func baseDefinition(name string, info *einoschema.ToolInfo) agenttools.Definitio
 
 func executeWorkspace(spec workspaceSpec) agenttools.Executor {
 	return func(ctx context.Context, execution agenttools.Execution) (any, error) {
-		root, err := canonicalRoot(execution.Snapshot)
+		root, err := canonicalRoot(execution.Context.WorkspaceRoot)
 		if err != nil {
 			return nil, err
 		}
@@ -263,26 +259,21 @@ func encodeRaw(_ context.Context, value any) (json.RawMessage, error) {
 	return cloneRaw(raw), nil
 }
 
-func workspaceScope(name string, concurrency runtime.ToolConcurrency) agenttools.ScopeResolver {
-	return func(snapshot runtime.TurnSnapshot, _ agenttools.Definition) runtime.ToolScope {
-		root, err := canonicalRoot(snapshot)
+func workspaceScope() agenttools.ScopeResolver {
+	return func(context runtime.ToolScopeContext) runtime.ToolScope {
+		root, err := canonicalRoot(context.WorkspaceRoot)
 		if err != nil {
-			root = snapshot.Config.Metadata["workspace_root"]
-		}
-		key := "workspace:" + root
-		if concurrency == runtime.ToolConcurrencyParallel {
-			key += ":" + name
+			root = context.WorkspaceRoot
 		}
 		return runtime.ToolScope{
-			WorkspaceID:    snapshot.Config.Metadata["workspace_id"],
-			Root:           root,
-			ConcurrencyKey: key,
+			WorkspaceID: context.WorkspaceID,
+			Root:        root,
 		}
 	}
 }
 
-func canonicalRoot(snapshot runtime.TurnSnapshot) (string, error) {
-	return workspace.CanonicalRoot(snapshot.Config.Metadata["workspace_root"])
+func canonicalRoot(root string) (string, error) {
+	return workspace.CanonicalRoot(root)
 }
 
 func cloneRaw(raw json.RawMessage) json.RawMessage {

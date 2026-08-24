@@ -111,6 +111,46 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	}
 }
 
+func TestAdmitCloneFailureHasNoDurableOrLiveSideEffects(t *testing.T) {
+	store := newAdmissionStore()
+	sink := &capturingSink{}
+	request := admissionRequest()
+	request.Input[0].Extra = map[string]any{"unsupported": make(chan int)}
+	_, err := (Admitter{Store: store, Events: sink}).Admit(context.Background(), request)
+	if !errors.Is(err, ErrInvalidAdmission) {
+		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
+	}
+	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.events) != 0 || len(store.epochs) != 0 || len(sink.events) != 0 {
+		t.Fatalf("clone failure mutated state: sessions=%d runs=%d messages=%d events=%d epochs=%d live=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.events), len(store.epochs), len(sink.events))
+	}
+}
+
+func TestAdmitRejectsMismatchedIdempotentRequestState(t *testing.T) {
+	tests := map[string]func(*AdmissionRequest){
+		"session":           func(r *AdmissionRequest) { r.IDs.SessionID = "other-session" },
+		"epoch":             func(r *AdmissionRequest) { r.IDs.ContextEpochID = "other-epoch" },
+		"assistant message": func(r *AdmissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
+		"parent message":    func(r *AdmissionRequest) { r.ParentMessageID = "other-parent" },
+		"config":            func(r *AdmissionRequest) { r.Config.Agent.Mode = "other-mode" },
+		"model":             func(r *AdmissionRequest) { r.Model.Model.ID = "other-model" },
+		"input":             func(r *AdmissionRequest) { r.Input = []*einoschema.Message{{Role: "user", Content: "other-input"}} },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := newAdmissionStore()
+			admitter := Admitter{Store: store}
+			request := admissionRequest()
+			if _, err := admitter.Admit(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&request)
+			if _, err := admitter.Admit(context.Background(), request); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("retry error = %v, want ErrConflict", err)
+			}
+		})
+	}
+}
+
 func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 	store := newAdmissionStore()
 	admitter := Admitter{Store: store}
@@ -330,7 +370,7 @@ type admissionStore struct {
 	toolCalls         map[session.ToolCallID]session.ToolCall
 	epochs            map[session.EpochID]session.ContextEpoch
 	appendEventErr    error
-	finishToolCallErr error
+	settleToolCallErr error
 }
 
 func newAdmissionStore() *admissionStore {
@@ -370,7 +410,7 @@ func (s *admissionStore) clone() *admissionStore {
 		toolCalls:         cloneMap(s.toolCalls),
 		epochs:            cloneMap(s.epochs),
 		appendEventErr:    s.appendEventErr,
-		finishToolCallErr: s.finishToolCallErr,
+		settleToolCallErr: s.settleToolCallErr,
 	}
 }
 
@@ -573,18 +613,10 @@ func (s *admissionStore) ClaimToolCall(_ context.Context, call session.ToolCall)
 	s.toolCalls[call.ID] = call
 	return call, nil
 }
-func (s *admissionStore) FinishToolCall(_ context.Context, call session.ToolCall) error {
-	if s.finishToolCallErr != nil {
-		return s.finishToolCallErr
-	}
-	if _, ok := s.toolCalls[call.ID]; !ok {
-		return session.ErrNotFound
-	}
-	s.toolCalls[call.ID] = call
-	return nil
-}
-
 func (s *admissionStore) SettleToolCall(_ context.Context, settlement session.ToolSettlement) error {
+	if s.settleToolCallErr != nil {
+		return s.settleToolCallErr
+	}
 	call, ok := s.toolCalls[settlement.ID]
 	if !ok {
 		return session.ErrNotFound

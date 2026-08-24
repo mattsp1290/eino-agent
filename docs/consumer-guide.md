@@ -253,18 +253,20 @@ snapshot.Tools.Disabled = []string{"shell"}
 ```
 
 To register the standard coding-agent leaf tools from `eino-tools`, call
-`tools/einotools.RegisterDefaults(ctx, registry, options)`. To compose
-server-side tools with AG-UI client tools, wrap the server registry with
-`tools/agui.NewRegistry(serverRegistry, dispatcher)` and update per-session
-client definitions through `SetClientTools`. The server still owns client-tool
-dispatch authorization and any product-specific approval flow.
+`tools/einotools.RegisterDefaults(ctx, registry, options)`. Mount server tools
+and AG-UI client tools into the same `composition.Registry`, pass it through
+`runtime.WithRunPlanProvider`, and publish each request generation with
+`tools/agui.MountClientTools`. The host closes the prior session mount before
+publishing a replacement and supplies a restart-stable dispatcher artifact ID
+that changes whenever dispatch behavior changes.
 
 Runtime-controlled tools use this lifecycle:
 
-1. Materialize tools for one immutable `runtime.TurnSnapshot`.
+1. Select and scope tools from a data-only `runtime.ToolScopeContext`.
 2. Persist a pending `session.ToolCall` before execution.
 3. Claim the call with owner, claim token, and lease.
-4. Execute with `context.Context`, durable IDs, scope, and approval requester.
+4. Execute with `context.Context`, durable IDs, scope, approval requester, and
+   a bounded `runtime.ToolContext` containing content-free turn metadata.
 5. Settle output, structured output, attachments, metadata, or error.
 6. Append tool-result message/part records for the next provider turn.
 7. Emit observability and audit events.
@@ -276,12 +278,14 @@ Non-idempotent tools must not be retried automatically after interruption or
 restart. Retry requires both `runtime.Tool.RetrySafe` and store evidence that
 the prior call did not settle.
 
-Tools that touch shared workspace state should use sequential concurrency with
-a canonical workspace-root key. Independent workspaces may run concurrently.
+Tools that touch shared workspace state own synchronization at the resource
+boundary. The built-in workspace tools lock canonical roots internally; the
+runtime does not advertise a separate scheduling contract.
 
 ## Configuration
 
-`config.Snapshot` is frozen at admission. Config reloads, plugin changes,
+`config.Snapshot` and the complete mutable Eino message graph are checked and
+deep-cloned before any durable admission write. Config reloads, plugin changes,
 permission changes, and provider/model changes affect later runs only. They do
 not mutate an in-flight turn snapshot.
 

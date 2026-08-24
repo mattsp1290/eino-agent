@@ -340,6 +340,7 @@ func protectedParamsOneOfJSON(src *einoschema.ParamsOneOf) (raw []byte, err erro
 func cloneToolCall(call ToolCall) ToolCall {
 	call.Input = cloneJSON(call.Input)
 	call.Scope.Permissions = cloneSlice(call.Scope.Permissions)
+	call.Context = call.Context.Clone()
 	return call
 }
 

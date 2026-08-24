@@ -436,7 +436,7 @@ func (s *Store) ClaimToolCall(ctx context.Context, record session.ToolCall) (ses
 	return record, nil
 }
 
-func (s *Store) FinishToolCall(ctx context.Context, record session.ToolCall) error {
+func (s *Store) finishToolCall(ctx context.Context, record session.ToolCall) error {
 	current, err := s.GetToolCall(ctx, record.ID)
 	if err != nil {
 		return err
@@ -498,7 +498,7 @@ func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettl
 	if err != nil {
 		return err
 	}
-	if err := s.FinishToolCall(ctx, settled); err != nil {
+	if err := s.finishToolCall(ctx, settled); err != nil {
 		return err
 	}
 	if _, err := s.AppendMessage(ctx, settlement.ResultMessage); err != nil {

@@ -39,8 +39,8 @@ type InputNormalizer func(ctx context.Context, input any) (json.RawMessage, erro
 // Executor executes one typed tool invocation.
 type Executor func(ctx context.Context, execution Execution) (any, error)
 
-// ScopeResolver returns the runtime scope for one materialized definition.
-type ScopeResolver func(snapshot runtime.TurnSnapshot, definition Definition) runtime.ToolScope
+// ScopeResolver returns runtime authority from bounded, data-only scope input.
+type ScopeResolver func(runtime.ToolScopeContext) runtime.ToolScope
 
 // Definition is a typed tool declaration registered by host code or adapters.
 type Definition struct {
@@ -53,7 +53,6 @@ type Definition struct {
 	Execute     Executor
 	RetrySafe   bool
 	Scope       ScopeResolver
-	Concurrency runtime.ToolConcurrency
 	Retention   runtime.RetentionPolicy
 	Permissions []string
 	Metadata    map[string]string
@@ -74,9 +73,9 @@ type Provenance struct {
 
 // Execution is the decoded input and durable runtime context for one call.
 type Execution struct {
-	Input    any
-	Call     runtime.ToolCall
-	Snapshot runtime.TurnSnapshot
+	Input   any
+	Call    runtime.ToolCall
+	Context runtime.ToolContext
 }
 
 // Registration identifies one active tool registration generation.
@@ -85,7 +84,8 @@ type Registration struct {
 	Generation uint64
 }
 
-// Registry stores typed tool definitions and materializes them per snapshot.
+// Registry stores typed tool definitions and materializes them per bounded
+// scope context.
 type Registry struct {
 	mu   sync.RWMutex
 	defs map[string]registered
@@ -212,24 +212,24 @@ func NewSnapshot(entries []SnapshotEntry) Snapshot {
 }
 
 // ResolveTools materializes from the immutable snapshot.
-func (s Snapshot) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
+func (s Snapshot) ResolveTools(ctx context.Context, scope runtime.ToolScopeContext) ([]runtime.Tool, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	enabled := enabledSet(snapshot)
-	disabled := disabledSet(snapshot)
+	enabled := enabledSet(scope)
+	disabled := disabledSet(scope)
 	result := make([]runtime.Tool, 0, len(s.entries))
 	for _, entry := range s.entries {
 		if includeTool(entry.Definition.Name, enabled, disabled) {
-			result = append(result, materialize(entry.Definition.Clone(), snapshot.Clone()))
+			result = append(result, materialize(entry.Definition.Clone(), scope.Clone()))
 		}
 	}
 	return result, nil
 }
 
-// ResolveTools materializes enabled tools for a run snapshot.
-func (r *Registry) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
-	return r.Snapshot().ResolveTools(ctx, snapshot)
+// ResolveTools materializes enabled tools for a bounded scope context.
+func (r *Registry) ResolveTools(ctx context.Context, scope runtime.ToolScopeContext) ([]runtime.Tool, error) {
+	return r.Snapshot().ResolveTools(ctx, scope)
 }
 
 // Clone returns a defensive copy of definition containers.
@@ -259,11 +259,6 @@ func ValidateDefinition(definition Definition) error {
 	if err := validateParameters(definition.Parameters); err != nil {
 		return fmt.Errorf("%w: parameters for %s: %v", ErrInvalidDefinition, definition.Name, err)
 	}
-	switch definition.Concurrency {
-	case "", runtime.ToolConcurrencyParallel, runtime.ToolConcurrencySequential:
-	default:
-		return fmt.Errorf("%w: unsupported concurrency %q", ErrInvalidDefinition, definition.Concurrency)
-	}
 	return nil
 }
 
@@ -277,26 +272,19 @@ func validateParameters(parameters *einoschema.ParamsOneOf) (err error) {
 	return err
 }
 
-func materialize(definition Definition, snapshot runtime.TurnSnapshot) runtime.Tool {
+func materialize(definition Definition, context runtime.ToolScopeContext) runtime.Tool {
 	scope := runtime.ToolScope{}
 	if definition.Scope != nil {
-		scope = definition.Scope(snapshot, definition.Clone())
+		scope = definition.Scope(context.Clone())
 	}
 	if scope.WorkspaceID == "" {
-		scope.WorkspaceID = snapshot.Config.Metadata["workspace_id"]
+		scope.WorkspaceID = context.WorkspaceID
 	}
 	if scope.Root == "" {
-		scope.Root = snapshot.Config.Metadata["workspace_root"]
-	}
-	if scope.ConcurrencyKey == "" {
-		scope.ConcurrencyKey = string(snapshot.SessionID) + ":" + definition.Name
+		scope.Root = context.WorkspaceRoot
 	}
 	if len(scope.Permissions) == 0 {
 		scope.Permissions = cloneSlice(definition.Permissions)
-	}
-	concurrency := definition.Concurrency
-	if concurrency == "" {
-		concurrency = runtime.ToolConcurrencyParallel
 	}
 	return runtime.Tool{
 		Name: definition.Name,
@@ -305,10 +293,9 @@ func materialize(definition Definition, snapshot runtime.TurnSnapshot) runtime.T
 			Desc:        definition.Description,
 			ParamsOneOf: cloneParamsOneOf(definition.Parameters),
 		},
-		Executor:     &toolExecutor{definition: definition.Clone(), snapshot: snapshot.Clone()},
+		Executor:     &toolExecutor{definition: definition.Clone(), scope: context.Clone()},
 		RetrySafe:    definition.RetrySafe,
 		Scope:        cloneScope(scope),
-		Concurrency:  concurrency,
 		InputDecoder: &toolDecoder{definition: definition.Clone()},
 		Retention:    definition.Retention,
 		Metadata:     cloneStringMap(definition.Metadata),
@@ -336,7 +323,7 @@ func (d toolDecoder) DecodeToolInput(ctx context.Context, raw json.RawMessage) (
 
 type toolExecutor struct {
 	definition Definition
-	snapshot   runtime.TurnSnapshot
+	scope      runtime.ToolScopeContext
 }
 
 func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runtime.ToolResult, error) {
@@ -344,10 +331,20 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 	if err != nil {
 		return runtime.ToolResult{}, fmt.Errorf("%w: %v", ErrMalformedInput, err)
 	}
+	executionContext := call.Context.Clone()
+	if executionContext.Turn.SessionID == "" {
+		executionContext.Turn.SessionID = e.scope.SessionID
+	}
+	if executionContext.WorkspaceID == "" {
+		executionContext.WorkspaceID = e.scope.WorkspaceID
+	}
+	if executionContext.WorkspaceRoot == "" {
+		executionContext.WorkspaceRoot = e.scope.WorkspaceRoot
+	}
 	output, err := e.definition.Execute(ctx, Execution{
-		Input:    decoded,
-		Call:     call,
-		Snapshot: e.snapshot.Clone(),
+		Input:   decoded,
+		Call:    call,
+		Context: executionContext,
 	})
 	if err != nil {
 		return runtime.ToolResult{}, err
@@ -363,23 +360,23 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 	}, nil
 }
 
-func enabledSet(snapshot runtime.TurnSnapshot) map[string]bool {
-	if snapshot.Config.Tools.Enabled == nil {
+func enabledSet(scope runtime.ToolScopeContext) map[string]bool {
+	if scope.EnabledTools == nil {
 		return nil
 	}
-	result := make(map[string]bool, len(snapshot.Config.Tools.Enabled))
-	for _, name := range snapshot.Config.Tools.Enabled {
+	result := make(map[string]bool, len(scope.EnabledTools))
+	for _, name := range scope.EnabledTools {
 		result[name] = true
 	}
 	return result
 }
 
-func disabledSet(snapshot runtime.TurnSnapshot) map[string]bool {
-	if len(snapshot.Config.Tools.Disabled) == 0 {
+func disabledSet(scope runtime.ToolScopeContext) map[string]bool {
+	if len(scope.DisabledTools) == 0 {
 		return nil
 	}
-	result := make(map[string]bool, len(snapshot.Config.Tools.Disabled))
-	for _, name := range snapshot.Config.Tools.Disabled {
+	result := make(map[string]bool, len(scope.DisabledTools))
+	for _, name := range scope.DisabledTools {
 		result[name] = true
 	}
 	return result

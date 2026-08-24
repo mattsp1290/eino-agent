@@ -294,14 +294,26 @@ func mountToolDefinition(mount *extension.Mount, definition tools.Definition) to
 }
 
 func (r *Registry) validateTools(staged []ToolRegistration) error {
-	for _, candidate := range staged {
+	for index, candidate := range staged {
+		for _, other := range staged[index+1:] {
+			if other.Definition.Name == candidate.Definition.Name && toolScopesOverlap(other.Scope, candidate.Scope) {
+				return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
+			}
+		}
 		for _, existing := range r.tools {
-			if existing.Scope == candidate.Scope && existing.Definition.Name == candidate.Definition.Name {
+			if existing.Definition.Name == candidate.Definition.Name && toolScopesOverlap(existing.Scope, candidate.Scope) {
 				return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
 			}
 		}
 	}
 	return nil
+}
+
+func toolScopesOverlap(left, right extension.Scope) bool {
+	if left.Kind == extension.ScopeGlobal || right.Kind == extension.ScopeGlobal {
+		return true
+	}
+	return left.Kind == extension.ScopeSession && right.Kind == extension.ScopeSession && left.Key == right.Key
 }
 
 func (r *Registry) validatePrompts(staged []PromptRegistration) error {
@@ -452,8 +464,8 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 				Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Definition.Name + "/" + entry.ID,
 				SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
 			},
-			Resolve: func(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.Tool, error) {
-				resolved, resolveErr := frozen.ResolveTools(ctx, snapshot)
+			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
+				resolved, resolveErr := frozen.ResolveTools(ctx, scope)
 				if resolveErr != nil {
 					return runtime.Tool{}, resolveErr
 				}
@@ -653,12 +665,11 @@ func toolSchemaHash(definition tools.Definition) (string, error) {
 		Parameters  any
 		Permissions []string
 		RetrySafe   bool
-		Concurrency runtime.ToolConcurrency
 		Retention   runtime.RetentionPolicy
 		Metadata    map[string]string
 	}{
 		Name: definition.Name, Description: definition.Description, Parameters: parameters,
-		Permissions: definition.Permissions, RetrySafe: definition.RetrySafe, Concurrency: definition.Concurrency,
+		Permissions: definition.Permissions, RetrySafe: definition.RetrySafe,
 		Retention: definition.Retention, Metadata: definition.Metadata,
 	})
 	if err != nil {

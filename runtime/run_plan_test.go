@@ -1,43 +1,74 @@
 package runtime
 
 import (
-	"testing"
+	"context"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-// testRunPlanWithTools keeps older orchestration behavior tests focused on
-// runtime execution while production plan-construction invariants are tested
-// separately through NewRunPlan and composition.Registry.
-func testRunPlanWithTools(registry ToolRegistry) *RunPlan {
-	plan, err := NewRunPlan(RunPlanSpec{})
-	if err != nil {
-		panic(err)
-	}
-	plan.tools = registry
-	return plan
-}
-
-func testRunPlanWithDispatch(dispatch *extension.Plan) *RunPlan {
-	plan, err := NewRunPlan(RunPlanSpec{Dispatch: dispatch})
+func mustTestRunPlan(spec RunPlanSpec) *RunPlan {
+	plan, err := NewRunPlan(spec)
 	if err != nil {
 		panic(err)
 	}
 	return plan
 }
 
-func setTestTools(orchestrator *StreamingOrchestrator, registry ToolRegistry) {
-	orchestrator.Plans = staticRunPlanProvider{plan: testRunPlanWithTools(registry)}
+func newTestToolPlan(registry staticToolRegistry) *RunPlan {
+	return mustTestRunPlan(RunPlanSpec{Tools: testPlanTools(registry)})
 }
 
-func strictToolDescriptor(t *testing.T) session.ExtensionPlanDescriptor {
-	t.Helper()
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "tools", Kind: session.ExtensionTool, Required: true, CapabilityID: "echo/tool"}}}
-	var err error
-	descriptor.Fingerprint, err = session.FingerprintExtensionPlan(descriptor)
-	if err != nil {
-		t.Fatal(err)
+func testPlanTools(registry staticToolRegistry) []PlanTool {
+	capabilities := make([]PlanTool, len(registry.tools))
+	for index, candidate := range registry.tools {
+		tool := cloneTool(candidate)
+		capabilities[index] = PlanTool{
+			Identity: testToolIdentity(tool.Name),
+			Resolve:  func(context.Context, ToolScopeContext) (Tool, error) { return cloneTool(tool), nil },
+		}
 	}
-	return descriptor
+	return capabilities
+}
+
+func newTestToolPlanWithDispatch(registry staticToolRegistry, dispatch *extension.Plan, release func()) *RunPlan {
+	return mustTestRunPlan(RunPlanSpec{Tools: testPlanTools(registry), Dispatch: dispatch, Release: release})
+}
+
+func newTestDispatchPlan(dispatch *extension.Plan) *RunPlan {
+	return mustTestRunPlan(RunPlanSpec{Dispatch: dispatch})
+}
+
+func configureTestTools(orchestrator *StreamingOrchestrator, registry staticToolRegistry) {
+	orchestrator.Plans = staticRunPlanProvider{plan: newTestToolPlan(registry)}
+}
+
+func testToolIdentity(name string) session.ExtensionPlanEntry {
+	return session.ExtensionPlanEntry{
+		InstanceID: "test-tools", Kind: session.ExtensionTool,
+		Artifact: session.ArtifactIdentity{Name: "test-tools", Version: "1", Hash: "test-tools-hash", ConfigHash: "test-tools-config", SourceKind: string(extension.SourceNative)},
+		Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: name + "/test",
+	}
+}
+
+func testPromptIdentity(name, instance string) session.ExtensionPlanEntry {
+	return session.ExtensionPlanEntry{
+		InstanceID: instance, Kind: session.ExtensionPrompt,
+		Artifact: session.ArtifactIdentity{Name: "test-prompts", Version: "1", Hash: "test-prompts-hash", ConfigHash: "test-prompts-config", SourceKind: string(extension.SourceNative)},
+		Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: name + "/test",
+	}
+}
+
+func testGuardIdentity(id string) session.ExtensionPlanEntry {
+	return session.ExtensionPlanEntry{
+		InstanceID: "test-guards", Kind: session.ExtensionGuard,
+		Artifact: session.ArtifactIdentity{Name: "test-guards", Version: "1", Hash: "test-guards-hash", ConfigHash: "test-guards-config", SourceKind: string(extension.SourceNative)},
+		Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: id + "/test",
+	}
+}
+
+func testEchoPlanDescriptor() session.ExtensionPlanDescriptor {
+	return newTestToolPlan(staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		return ToolResult{}, nil
+	})}}}).Descriptor()
 }

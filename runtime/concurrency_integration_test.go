@@ -54,7 +54,7 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 		Clock:     func() time.Time { return time.Date(2026, 6, 28, 15, 0, 0, 0, time.UTC) },
 		OwnerID:   "owner",
 		QueueSize: 2,
-		Plans:     staticRunPlanProvider{plan: testRunPlanWithTools(toolRegistry)},
+		Plans:     staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
 	}
 
 	const sessions = 12

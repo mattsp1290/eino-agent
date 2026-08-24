@@ -161,7 +161,7 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 		OwnerID:  "owner-1",
 		Clock:    func() time.Time { return now },
 		Observer: observer,
-		Plans:    staticRunPlanProvider{plan: &RunPlan{tools: toolRegistry, descriptor: run.ExtensionPlan}},
+		Plans:    staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)},
 	}
 	handle, err := orch.Resume(context.Background(), run.ID)
 	if err != nil {
@@ -234,7 +234,7 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 		}})}, nil
 	}))
 	orch.Observer = observer
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "SECRET tool output"}, nil
@@ -283,7 +283,7 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 		}})}, nil
 	}))
 	orch.Observer = observer
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Scope: ToolScope{
 			Permissions: []string{"shell"},
@@ -337,7 +337,7 @@ func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
 		}})}, nil
 	}))
 	orch.Observer = observer
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{}, errors.New("SECRET operational detail")
@@ -372,7 +372,7 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 		}})}, nil
 	}))
 	orch.Observer = observer
-	setTestTools(orch, staticToolRegistry{})
+	configureTestTools(orch, staticToolRegistry{})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)
@@ -395,7 +395,7 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	store.finishToolCallErr = errors.New("SECRET settlement detail")
+	store.settleToolCallErr = errors.New("SECRET settlement detail")
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
 			ID:   "call-settle",
@@ -407,7 +407,7 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 		}})}, nil
 	}))
 	orch.Observer = observer
-	setTestTools(orch, staticToolRegistry{tools: []Tool{{
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "ok"}, nil

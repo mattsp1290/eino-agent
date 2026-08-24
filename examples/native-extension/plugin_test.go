@@ -37,7 +37,7 @@ func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
 				return
 			}
 			defer plan.Release()
-			resolved, err := plan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: session.ID(sessionID)})
+			resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: session.ID(sessionID)})
 			results <- result{count: len(resolved), err: err}
 		}()
 	}
@@ -63,7 +63,7 @@ func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tools, err := newPlan.ResolveTools(context.Background(), runtime.TurnSnapshot{SessionID: "session-a"})
+	tools, err := newPlan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
 	newPlan.Release()
 	if err != nil || len(tools) != 0 {
 		t.Fatalf("post-deactivate tools = %#v, %v", tools, err)
