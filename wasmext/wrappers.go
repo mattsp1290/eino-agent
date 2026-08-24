@@ -5,15 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 	"sync"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
-	"go.bytecodealliance.org/cm"
 
-	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -25,11 +22,12 @@ import (
 // Register Definition through the ordinary tools.Registry path.
 type LoadedTool struct {
 	module     *module
+	component  toolComponent
 	definition tools.Definition
 }
 
 // Definition returns the native tool definition backed by this component.
-func (t *LoadedTool) Definition() tools.Definition { return t.definition.Clone() }
+func (t *LoadedTool) Definition() (tools.Definition, error) { return t.definition.Clone() }
 
 // Close releases the compiled component and stops accepting calls.
 func (t *LoadedTool) Close() error { return t.module.Close() }
@@ -44,17 +42,26 @@ func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 	if err != nil {
 		return nil, err
 	}
-	var metadata wittypes.ToolMetadata
-	if err := module.call(ctx, "tool.metadata", 0, nil, &metadata); err != nil {
-		_ = module.Close()
-		return nil, err
-	}
-	definition, err := toolDefinition(module, metadata)
+	component, err := componentAs[toolComponent](module, "tool.metadata")
 	if err != nil {
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedTool{module: module, definition: definition}, nil
+	var metadata wittypes.ToolMetadata
+	if err := module.call(ctx, "tool.metadata", 0, func(callCtx context.Context) error {
+		var callErr error
+		metadata, callErr = component.ToolMetadata(callCtx)
+		return callErr
+	}); err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	definition, err := toolDefinition(module, component, metadata)
+	if err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedTool{module: module, component: component, definition: definition}, nil
 }
 
 // LoadTool returns a native tools.Definition. Embedders that need a direct
@@ -64,10 +71,10 @@ func LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error) {
 	if err != nil {
 		return tools.Definition{}, err
 	}
-	return loaded.Definition(), nil
+	return loaded.Definition()
 }
 
-func toolDefinition(module *module, metadata wittypes.ToolMetadata) (tools.Definition, error) {
+func toolDefinition(module *module, component toolComponent, metadata wittypes.ToolMetadata) (tools.Definition, error) {
 	if strings.TrimSpace(metadata.Name) == "" || len(metadata.Name) > 128 || int64(len(metadata.Description)) > module.limits.MaxOutputBytes {
 		return tools.Definition{}, extensionError(ErrorContract, module.identity, "tool.metadata", errors.New("invalid tool metadata"))
 	}
@@ -109,7 +116,11 @@ func toolDefinition(module *module, metadata wittypes.ToolMetadata) (tools.Defin
 			ToolCallID: string(execution.Call.ID), InputJSON: string(raw), Turn: turnMetadataFromBounded(execution.Context.Turn),
 		}
 		var output string
-		if err := module.call(ctx, "tool.execute", len(raw), request, &output); err != nil {
+		if err := module.call(ctx, "tool.execute", len(raw), func(callCtx context.Context) error {
+			var callErr error
+			output, callErr = component.ExecuteTool(callCtx, request)
+			return callErr
+		}); err != nil {
 			return nil, err
 		}
 		if err := validateBoundedJSON([]byte(output), module.limits.MaxOutputBytes); err != nil {
@@ -136,7 +147,10 @@ type toolExecuteRequest struct {
 	Turn       wittypes.TurnMetadata
 }
 
-type permissionsPolicy struct{ module *module }
+type permissionsPolicy struct {
+	module    *module
+	component permissionsComponent
+}
 
 // Close releases the compiled policy component.
 func (p *permissionsPolicy) Close() error { return p.module.Close() }
@@ -148,7 +162,11 @@ func (p *permissionsPolicy) Decide(ctx context.Context, request permissions.Requ
 	}
 	inputSize := len(input.ToolName) + len(input.ToolCallID) + len(input.Permission) + len(input.ArgumentsSummary) + len(input.SessionID) + len(input.RunID)
 	var output wittypes.PermissionDecision
-	if err := p.module.call(ctx, "permissions-policy.decide", inputSize, input, &output); err != nil {
+	if err := p.module.call(ctx, "permissions-policy.decide", inputSize, func(callCtx context.Context) error {
+		var callErr error
+		output, callErr = p.component.DecidePermissions(callCtx, input)
+		return callErr
+	}); err != nil {
 		return permissions.Decision{}, err
 	}
 	if int64(len(output.Reason)) > p.module.limits.MaxOutputBytes {
@@ -179,11 +197,19 @@ func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engine
 	if err != nil {
 		return nil, err
 	}
-	return &permissionsPolicy{module: module}, nil
+	component, err := componentAs[permissionsComponent](module, "permissions-policy.decide")
+	if err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &permissionsPolicy{module: module, component: component}, nil
 }
 
 // LoadedContextSource adapts context-source@0.1.0 and owns its component.
-type LoadedContextSource struct{ module *module }
+type LoadedContextSource struct {
+	module    *module
+	component contextComponent
+}
 
 func (s *LoadedContextSource) Close() error { return s.module.Close() }
 
@@ -197,7 +223,11 @@ func (s *LoadedContextSource) loadBoundedContext(ctx context.Context, metadata r
 
 func (s *LoadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.Message, error) {
 	var output []wittypes.TextMessage
-	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), turn, &output); err != nil {
+	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), func(callCtx context.Context) error {
+		var callErr error
+		output, callErr = s.component.LoadContext(callCtx, turn)
+		return callErr
+	}); err != nil {
 		return nil, err
 	}
 	messages := make([]*einoschema.Message, 0, len(output))
@@ -226,11 +256,19 @@ func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSou
 	if err != nil {
 		return nil, err
 	}
-	return &LoadedContextSource{module: module}, nil
+	component, err := componentAs[contextComponent](module, "context-source.load-context")
+	if err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedContextSource{module: module, component: component}, nil
 }
 
 // LoadedEventSink emits only a bounded, content-free projection.
-type LoadedEventSink struct{ module *module }
+type LoadedEventSink struct {
+	module    *module
+	component eventComponent
+}
 
 func (s *LoadedEventSink) Close() error { return s.module.Close() }
 
@@ -240,7 +278,9 @@ func (s *LoadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
 		MessageID: string(event.MessageID), ToolCallID: string(event.ToolCallID), EpochID: string(event.EpochID),
 		TimestampUnixMillis: event.Time.UTC().UnixMilli(), PayloadSummary: boundedEventSummary(event, s.module.limits.MaxOutputBytes),
 	}
-	return s.module.call(ctx, "event-sink.emit", boundedEventSize(input), input, nil)
+	return s.module.call(ctx, "event-sink.emit", boundedEventSize(input), func(callCtx context.Context) error {
+		return s.component.EmitEvent(callCtx, input)
+	})
 }
 
 func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error) {
@@ -248,7 +288,12 @@ func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, err
 	if err != nil {
 		return nil, err
 	}
-	return &LoadedEventSink{module: module}, nil
+	component, err := componentAs[eventComponent](module, "event-sink.emit")
+	if err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedEventSink{module: module, component: component}, nil
 }
 
 func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
@@ -257,9 +302,10 @@ func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, er
 
 // LoadedHook caches full turn metadata by run for deterministic after hooks.
 type LoadedHook struct {
-	module *module
-	mu     sync.RWMutex
-	turns  map[session.RunID]wittypes.TurnMetadata
+	module    *module
+	component hookComponent
+	mu        sync.RWMutex
+	turns     map[session.RunID]wittypes.TurnMetadata
 }
 
 func (h *LoadedHook) Close() error {
@@ -287,7 +333,7 @@ func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.Boun
 }
 
 func (h *LoadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
-	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), turn, nil)
+	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.BeforeRun(callCtx, turn) })
 }
 
 func (h *LoadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
@@ -295,7 +341,7 @@ func (h *LoadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.Bou
 }
 
 func (h *LoadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
-	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), turn, nil); err != nil {
+	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.BeforeTurn(callCtx, turn) }); err != nil {
 		return err
 	}
 	h.cacheTurn(turn)
@@ -313,7 +359,7 @@ func (h *LoadedHook) cacheTurn(turn wittypes.TurnMetadata) {
 
 func (h *LoadedHook) afterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {
 	turn := h.cachedTurn(snapshot.RunID, turnMetadata(snapshot))
-	return h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), turn, nil)
+	return h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterTurn(callCtx, turn) })
 }
 
 func (h *LoadedHook) afterRun(ctx context.Context, result runtime.Result) error {
@@ -324,7 +370,7 @@ func (h *LoadedHook) afterRun(ctx context.Context, result runtime.Result) error 
 	if !ok {
 		turn = wittypes.TurnMetadata{RunID: string(result.RunID)}
 	}
-	return h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), turn, nil)
+	return h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterRun(callCtx, turn) })
 }
 
 func (h *LoadedHook) cachedTurn(runID session.RunID, fallback wittypes.TurnMetadata) wittypes.TurnMetadata {
@@ -342,11 +388,19 @@ func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
+	component, err := componentAs[hookComponent](module, "hook.before-run")
+	if err != nil {
+		_ = module.Close()
+		return nil, err
+	}
+	return &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
 }
 
 // LoadedToolMiddleware preserves attachments and metadata on replacement.
-type LoadedToolMiddleware struct{ module *module }
+type LoadedToolMiddleware struct {
+	module    *module
+	component middlewareComponent
+}
 
 func (m *LoadedToolMiddleware) Close() error { return m.module.Close() }
 
@@ -354,7 +408,11 @@ func (m *LoadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.
 	turn := middlewareTurn(call, tool)
 	request := toolMiddlewareBeforeRequest{ToolName: tool.Name, ToolCallID: string(call.ID), InputJSON: string(call.Input), Turn: turn}
 	var replacement wittypes.Replacement
-	if err := m.module.call(ctx, "tool-middleware.before-tool-call", len(request.ToolName)+len(request.ToolCallID)+len(request.InputJSON)+turnMetadataSize(turn), request, &replacement); err != nil {
+	if err := m.module.call(ctx, "tool-middleware.before-tool-call", len(request.ToolName)+len(request.ToolCallID)+len(request.InputJSON)+turnMetadataSize(turn), func(callCtx context.Context) error {
+		var callErr error
+		replacement, callErr = m.component.BeforeToolCall(callCtx, request)
+		return callErr
+	}); err != nil {
 		return nil, err
 	}
 	return applyInputReplacement(m.module, "tool-middleware.before-tool-call", call.Input, replacement)
@@ -369,7 +427,11 @@ func (m *LoadedToolMiddleware) afterToolCall(ctx context.Context, tool runtime.T
 	request := toolMiddlewareAfterRequest{ToolName: tool.Name, ToolCallID: string(call.ID), InputJSON: string(call.Input), OutputJSON: string(encoded), Turn: turn}
 	var replacement wittypes.Replacement
 	inputSize := len(request.ToolName) + len(request.ToolCallID) + len(request.InputJSON) + len(request.OutputJSON) + turnMetadataSize(turn)
-	if err := m.module.call(ctx, "tool-middleware.after-tool-call", inputSize, request, &replacement); err != nil {
+	if err := m.module.call(ctx, "tool-middleware.after-tool-call", inputSize, func(callCtx context.Context) error {
+		var callErr error
+		replacement, callErr = m.component.AfterToolCall(callCtx, request)
+		return callErr
+	}); err != nil {
 		return runtime.ToolResult{}, err
 	}
 	return applyResultReplacement(m.module, result, replacement)
@@ -390,312 +452,10 @@ func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddl
 	if err != nil {
 		return nil, err
 	}
-	return &LoadedToolMiddleware{module: module}, nil
-}
-
-func partialTurnMetadata(run session.Run) wittypes.TurnMetadata {
-	return wittypes.TurnMetadata{RunID: string(run.ID), SessionID: string(run.SessionID), EpochID: string(run.ContextEpoch), AgentName: run.Agent, ProviderID: run.ProviderID, ModelID: run.ModelID}
-}
-
-func middlewareTurn(call runtime.ToolCall, tool runtime.Tool) wittypes.TurnMetadata {
-	return wittypes.TurnMetadata{RunID: string(call.RunID), SessionID: string(call.SessionID), ToolNames: cm.ToList([]string{tool.Name})}
-}
-
-func turnMetadataSize(turn wittypes.TurnMetadata) int {
-	size := len(turn.RunID) + len(turn.SessionID) + len(turn.EpochID) + len(turn.AgentName) + len(turn.AgentMode) + len(turn.ProviderID) + len(turn.ModelID)
-	for _, name := range turn.ToolNames.Slice() {
-		size += len(name)
-	}
-	return size
-}
-
-func boundedEventSize(event wittypes.BoundedEvent) int {
-	return len(event.Kind) + len(event.SessionID) + len(event.RunID) + len(event.MessageID) + len(event.ToolCallID) + len(event.EpochID) + len(event.PayloadSummary)
-}
-
-func boundedEventSummary(event runtime.Event, limit int64) string {
-	summary := fmt.Sprintf("payload_bytes=%d redaction=%s live_only=%t", len(event.Payload), event.Redaction, event.LiveOnly)
-	if int64(len(summary)) > limit {
-		return summary[:limit]
-	}
-	return summary
-}
-
-func toolResultJSON(result runtime.ToolResult) (json.RawMessage, error) {
-	if len(result.Structured) != 0 && json.Valid(result.Structured) {
-		return cloneRawMessage(result.Structured), nil
-	}
-	return json.Marshal(result.Output)
-}
-
-func applyInputReplacement(module *module, operation string, original json.RawMessage, replacement wittypes.Replacement) (json.RawMessage, error) {
-	if replacement.Unchanged() {
-		return cloneRawMessage(original), nil
-	}
-	if raw := replacement.JSON(); raw != nil {
-		if err := validateBoundedJSON([]byte(*raw), module.limits.MaxOutputBytes); err != nil {
-			return nil, extensionError(payloadErrorKind(err), module.identity, operation, err)
-		}
-		return json.RawMessage(*raw), nil
-	}
-	if guestErr := replacement.Error(); guestErr != nil {
-		return nil, structuredGuestError(*guestErr)
-	}
-	return nil, extensionError(ErrorContract, module.identity, operation, nil)
-}
-
-func applyResultReplacement(module *module, original runtime.ToolResult, replacement wittypes.Replacement) (runtime.ToolResult, error) {
-	if replacement.Unchanged() {
-		return cloneToolResult(original), nil
-	}
-	if rawText := replacement.JSON(); rawText != nil {
-		raw := json.RawMessage(*rawText)
-		if err := validateBoundedJSON(raw, module.limits.MaxOutputBytes); err != nil {
-			return runtime.ToolResult{}, extensionError(payloadErrorKind(err), module.identity, "tool-middleware.after-tool-call", err)
-		}
-		next := cloneToolResult(original)
-		var text string
-		if json.Unmarshal(raw, &text) == nil {
-			next.Output = text
-			next.Structured = nil
-		} else {
-			next.Output = string(raw)
-			next.Structured = cloneRawMessage(raw)
-		}
-		return next, nil
-	}
-	if guestErr := replacement.Error(); guestErr != nil {
-		return runtime.ToolResult{}, structuredGuestError(*guestErr)
-	}
-	return runtime.ToolResult{}, extensionError(ErrorContract, module.identity, "tool-middleware.after-tool-call", nil)
-}
-
-func cloneToolResult(result runtime.ToolResult) runtime.ToolResult {
-	next := result
-	next.Structured = cloneRawMessage(result.Structured)
-	next.Attachments = append([]runtime.Attachment(nil), result.Attachments...)
-	next.Metadata = make(map[string]string, len(result.Metadata))
-	for key, value := range result.Metadata {
-		next.Metadata[key] = value
-	}
-	return next
-}
-
-func cloneRawMessage(raw json.RawMessage) json.RawMessage {
-	return append(json.RawMessage(nil), raw...)
-}
-
-func structuredGuestError(input wittypes.StructuredError) error {
-	code := strings.TrimSpace(input.Code)
-	if code == "" || len(code) > 128 {
-		code = "wasm_extension_rejected"
-	}
-	message := input.Message
-	if len(message) > 1024 {
-		message = message[:1024]
-	}
-	return model.Error{Code: code, Message: message, Retryable: input.Retryable}
-}
-
-func turnMetadata(snapshot runtime.TurnSnapshot) wittypes.TurnMetadata {
-	toolNames := make([]string, 0, len(snapshot.Tools))
-	for _, tool := range snapshot.Tools {
-		toolNames = append(toolNames, tool.Name)
-	}
-	counts := wittypes.RoleCounts{}
-	for _, message := range snapshot.Messages {
-		if message == nil {
-			continue
-		}
-		switch message.Role {
-		case einoschema.System:
-			counts.System = saturatingIncrement(counts.System)
-		case einoschema.User:
-			counts.User = saturatingIncrement(counts.User)
-		case einoschema.Assistant:
-			counts.Assistant = saturatingIncrement(counts.Assistant)
-		case einoschema.Tool:
-			counts.Tool = saturatingIncrement(counts.Tool)
-		}
-	}
-	messageCount := len(snapshot.Messages)
-	if messageCount > math.MaxUint32 {
-		messageCount = math.MaxUint32
-	}
-	return wittypes.TurnMetadata{
-		RunID: string(snapshot.RunID), SessionID: string(snapshot.SessionID), EpochID: string(snapshot.EpochID),
-		AgentName: snapshot.Config.Agent.Name, AgentMode: snapshot.Config.Agent.Mode,
-		ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID),
-		ToolNames: cm.ToList(toolNames), MessageCount: uint32(messageCount), RoleCounts: counts,
-		HasSystemPrompt: snapshot.SystemPrompt != "" || snapshot.Config.Agent.SystemPrompt != "",
-	}
-}
-
-func turnMetadataFromBounded(metadata runtime.BoundedTurnMetadata) wittypes.TurnMetadata {
-	return wittypes.TurnMetadata{
-		RunID: string(metadata.RunID), SessionID: string(metadata.SessionID), EpochID: string(metadata.EpochID),
-		AgentName: metadata.AgentName, AgentMode: metadata.AgentMode,
-		ProviderID: metadata.ProviderID, ModelID: metadata.ModelID,
-		ToolNames: cm.ToList(append([]string(nil), metadata.ToolNames...)), MessageCount: metadata.MessageCount,
-		RoleCounts: wittypes.RoleCounts{
-			System: metadata.RoleCounts.System, User: metadata.RoleCounts.User,
-			Assistant: metadata.RoleCounts.Assistant, Tool: metadata.RoleCounts.Tool,
-		},
-		HasSystemPrompt: metadata.HasSystemPrompt,
-	}
-}
-
-func saturatingIncrement(value uint32) uint32 {
-	if value == math.MaxUint32 {
-		return value
-	}
-	return value + 1
-}
-
-func payloadErrorKind(err error) ErrorKind {
-	if errors.Is(err, errModuleTooLarge) {
-		return ErrorSize
-	}
-	return ErrorPayload
-}
-
-var (
-	_ permissions.Policy         = (*permissionsPolicy)(nil)
-	_ interface{ Close() error } = (*permissionsPolicy)(nil)
-	_ interface{ Close() error } = (*LoadedTool)(nil)
-)
-
-// Loader owns all modules opened through it and provides one-call shutdown.
-type Loader struct {
-	mu      sync.Mutex
-	closed  bool
-	modules []*module
-	factory engineFactory
-}
-
-// NewLoader returns an empty module owner.
-func NewLoader() *Loader { return &Loader{factory: newEngine} }
-
-// LoadTool loads and tracks a Wasm-backed native tool definition.
-func (l *Loader) LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error) {
-	loaded, err := openTool(ctx, cfg, l.engineFactory())
+	component, err := componentAs[middlewareComponent](module, "tool-middleware.before-tool-call")
 	if err != nil {
-		return tools.Definition{}, err
-	}
-	if err := l.track(loaded.module); err != nil {
-		_ = loaded.Close()
-		return tools.Definition{}, err
-	}
-	return loaded.Definition(), nil
-}
-
-// LoadPermissionsPolicy loads and tracks a Wasm-backed native policy.
-func (l *Loader) LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error) {
-	policy, err := loadPermissionsPolicy(ctx, cfg, l.engineFactory())
-	if err != nil {
-		return nil, err
-	}
-	if err := l.track(policy.module); err != nil {
-		_ = policy.Close()
-		return nil, err
-	}
-	return policy, nil
-}
-
-// LoadContextSource loads and tracks a context-source component.
-func (l *Loader) LoadContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error) {
-	module, err := loadModule(ctx, cfg, contextSourceContract, l.engineFactory())
-	if err != nil {
-		return nil, err
-	}
-	if err := l.track(module); err != nil {
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedContextSource{module: module}, nil
-}
-
-// LoadEventSink loads and tracks an event-sink component.
-func (l *Loader) LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
-	module, err := loadModule(ctx, cfg, eventSinkContract, l.engineFactory())
-	if err != nil {
-		return nil, err
-	}
-	if err := l.track(module); err != nil {
-		_ = module.Close()
-		return nil, err
-	}
-	return &LoadedEventSink{module: module}, nil
-}
-
-// LoadHook loads and tracks a hook component.
-func (l *Loader) LoadHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
-	module, err := loadModule(ctx, cfg, hookContract, l.engineFactory())
-	if err != nil {
-		return nil, err
-	}
-	if err := l.track(module); err != nil {
-		_ = module.Close()
-		return nil, err
-	}
-	return &LoadedHook{module: module, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
-}
-
-// LoadToolMiddleware loads and tracks a tool-middleware component.
-func (l *Loader) LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error) {
-	module, err := loadModule(ctx, cfg, toolMiddlewareContract, l.engineFactory())
-	if err != nil {
-		return nil, err
-	}
-	if err := l.track(module); err != nil {
-		_ = module.Close()
-		return nil, err
-	}
-	return &LoadedToolMiddleware{module: module}, nil
-}
-
-func (l *Loader) engineFactory() engineFactory {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.factory == nil {
-		l.factory = newEngine
-	}
-	return l.factory
-}
-
-func (l *Loader) track(module *module) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.closed {
-		return extensionError(ErrorClosed, module.identity, "load", nil)
-	}
-	l.modules = append(l.modules, module)
-	return nil
-}
-
-// Close stops new loads, interrupts in-flight calls, and closes every tracked
-// module exactly once. The supplied context bounds the aggregate shutdown.
-func (l *Loader) Close(ctx context.Context) error {
-	l.mu.Lock()
-	if l.closed {
-		l.mu.Unlock()
-		return nil
-	}
-	l.closed = true
-	modules := append([]*module(nil), l.modules...)
-	l.mu.Unlock()
-	done := make(chan error, 1)
-	go func() {
-		var errs []error
-		for index := len(modules) - 1; index >= 0; index-- {
-			errs = append(errs, modules[index].Close())
-		}
-		done <- errors.Join(errs...)
-	}()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return &LoadedToolMiddleware{module: module, component: component}, nil
 }

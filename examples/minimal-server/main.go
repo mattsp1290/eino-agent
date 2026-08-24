@@ -77,7 +77,7 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	}
 	ids := &sequenceIDs{}
 	tail := stream.NewTail(64)
-	sink := eventSink{store: store, tail: tail, ids: ids, now: time.Now}
+	sink := eventSink{tail: tail}
 	snapshot := minimalConfig()
 	return &Server{
 		store:   store,
@@ -388,59 +388,11 @@ func lastUserText(messages []*einoschema.Message) string {
 }
 
 type eventSink struct {
-	store session.Store
-	tail  *stream.Tail
-	ids   runtime.IDGenerator
-	now   func() time.Time
+	tail *stream.Tail
 }
 
 func (s eventSink) Emit(ctx context.Context, event runtime.Event) error {
-	if !event.LiveOnly && event.Kind != runtime.EventRunStarted {
-		if event.EventID == "" && s.ids != nil {
-			event.EventID = s.ids.NewEventID()
-		}
-		if _, err := s.store.AppendEvent(ctx, eventRecord(event, s.now)); err != nil {
-			return err
-		}
-	}
 	return s.tail.Emit(ctx, event)
-}
-
-func eventRecord(event runtime.Event, now func() time.Time) session.EventRecord {
-	createdAt := event.Time
-	if createdAt.IsZero() {
-		createdAt = now().UTC()
-	}
-	return session.EventRecord{
-		ID:         event.EventID,
-		SessionID:  event.SessionID,
-		RunID:      event.RunID,
-		MessageID:  event.MessageID,
-		PartID:     event.PartID,
-		ToolCallID: event.ToolCallID,
-		EpochID:    event.EpochID,
-		ProviderID: event.ProviderID,
-		ModelID:    event.ModelID,
-		ParentID:   event.ParentID,
-		Kind:       string(event.Kind),
-		Usage: session.Usage{
-			InputTokens:      event.Usage.InputTokens,
-			OutputTokens:     event.Usage.OutputTokens,
-			ReasoningTokens:  event.Usage.ReasoningTokens,
-			CacheReadTokens:  event.Usage.CacheReadTokens,
-			CacheWriteTokens: event.Usage.CacheWriteTokens,
-			Cost:             event.Usage.Cost,
-		},
-		Error: session.EventError{
-			Code:      event.Error.Code,
-			Message:   event.Error.Message,
-			Retryable: event.Error.Retryable,
-		},
-		Redaction: session.RedactionClass(event.Redaction),
-		Payload:   event.Payload,
-		LiveOnly:  event.LiveOnly,
-		CreatedAt: createdAt,
-	}
 }
 
 type sequenceIDs struct {

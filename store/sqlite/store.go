@@ -20,16 +20,13 @@ import (
 //go:embed migrations/001_sqlite_store.sql
 var migration001 string
 
-//go:embed migrations/002_model_requests.sql
-var migration002 string
-
 // Store persists sessions in SQLite.
 type Store struct {
 	db *sql.DB
 	tx *sql.Tx
 }
 
-// Open opens or creates a SQLite store and applies deterministic migrations.
+// Open opens a current SQLite store or atomically initializes an empty one.
 func Open(ctx context.Context, path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -40,26 +37,30 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, migration001); err != nil {
+	empty, err := emptySchema(ctx, db)
+	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	var version int
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if version > 2 {
-		_ = db.Close()
-		return nil, fmt.Errorf("%w: unsupported sqlite schema version %d", session.ErrConflict, version)
-	}
-	if version < 2 {
-		if _, err := db.ExecContext(ctx, migration002); err != nil {
+	if empty {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
 			_ = db.Close()
 			return nil, err
 		}
-	}
-	if err := verifySchema(ctx, db); err != nil {
+		if _, err = tx.ExecContext(ctx, migration001); err == nil {
+			err = verifySchema(ctx, tx)
+		}
+		if err == nil {
+			err = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+		if err != nil {
+			_ = db.Close()
+			return nil, err
+		}
+	} else if err := verifySchema(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -132,13 +133,16 @@ func (s *Store) UpdateSession(ctx context.Context, record session.Session) error
 	return rowsAffected(result)
 }
 
-func (s *Store) AdmitRun(ctx context.Context, record session.Run) (session.Run, error) {
+func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration time.Duration) (session.Run, error) {
+	if record.ClaimToken == "" || leaseDuration <= 0 {
+		return session.Run{}, session.ErrConflict
+	}
 	var existing session.Run
 	if err := s.getJSON(ctx, "SELECT record FROM runs WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sameAdmittedRun(existing, record) {
 			return session.Run{}, session.ErrConflict
 		}
-		return existing, nil
+		return s.GetRun(ctx, record.ID)
 	} else if !errors.Is(err, session.ErrNotFound) {
 		return session.Run{}, err
 	}
@@ -153,11 +157,13 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run) (session.Run, 
 	if err != nil {
 		return session.Run{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO runs(id, session_id, status, owner_id, record, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		record.ID, record.SessionID, record.Status, record.OwnerID, raw, timeText(record.CreatedAt))
+	leaseMicros := durationMicros(leaseDuration)
+	_, err = s.exec(ctx, `INSERT INTO runs(id, session_id, status, owner_id, claim_token, lease_until, record, created_at)
+		VALUES (?, ?, ?, ?, ?, CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER) + ?, ?, ?)`,
+		record.ID, record.SessionID, record.Status, record.OwnerID, record.ClaimToken, leaseMicros, raw, timeText(record.CreatedAt))
 	if constraintFailed(err) {
 		if reread, getErr := s.GetRun(ctx, record.ID); getErr == nil {
-			if sameRecord(reread, record) {
+			if sameAdmittedRun(reread, record) {
 				return reread, nil
 			}
 			return session.Run{}, session.ErrConflict
@@ -166,39 +172,68 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run) (session.Run, 
 			return session.Run{}, session.ErrSessionBusy
 		}
 	}
-	return record, mapErr(err)
+	if err != nil {
+		return session.Run{}, mapErr(err)
+	}
+	return s.GetRun(ctx, record.ID)
+}
+
+func sameAdmittedRun(left, right session.Run) bool {
+	left.LeaseUntil = time.Time{}
+	right.LeaseUntil = time.Time{}
+	return sameRecord(left, right)
 }
 
 func (s *Store) GetRun(ctx context.Context, id session.RunID) (session.Run, error) {
-	var record session.Run
-	err := s.getJSON(ctx, "SELECT record FROM runs WHERE id = ?", []any{id}, &record)
-	return record, err
+	return s.getRun(ctx, `SELECT record, status, owner_id, claim_token, lease_until FROM runs WHERE id = ?`, id)
 }
 
 func (s *Store) ActiveRun(ctx context.Context, sessionID session.ID) (session.Run, error) {
-	var record session.Run
-	err := s.getJSON(ctx, `SELECT record FROM runs WHERE session_id = ? AND status IN (?, ?) ORDER BY created_at LIMIT 1`,
-		[]any{sessionID, session.RunPending, session.RunRunning}, &record)
-	return record, err
+	return s.getRun(ctx, `SELECT record, status, owner_id, claim_token, lease_until FROM runs WHERE session_id = ? AND status IN (?, ?) ORDER BY created_at LIMIT 1`, sessionID, session.RunPending, session.RunRunning)
 }
 
 func (s *Store) ListUnfinishedRuns(ctx context.Context) ([]session.Run, error) {
-	return listJSON[session.Run](ctx, s, `SELECT record FROM runs WHERE status IN (?, ?) ORDER BY created_at, id`, session.RunPending, session.RunRunning)
-}
-
-func (s *Store) RenewRunLease(ctx context.Context, runID session.RunID, ownerID string, until time.Time) error {
-	run, err := s.GetRun(ctx, runID)
+	rows, err := s.query(ctx, `SELECT record, status, owner_id, claim_token, lease_until FROM runs WHERE status IN (?, ?) ORDER BY created_at, id`, session.RunPending, session.RunRunning)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if run.OwnerID != ownerID {
-		return session.ErrConflict
+	defer func() { _ = rows.Close() }()
+	var result []session.Run
+	for rows.Next() {
+		record, scanErr := scanRun(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, record)
 	}
-	run.LeaseUntil = until
-	return s.FinishRun(ctx, run)
+	return result, rows.Err()
 }
 
-func (s *Store) FinishRun(ctx context.Context, record session.Run) error {
+func (s *Store) ClaimRun(ctx context.Context, claim session.RunClaim) (session.Run, error) {
+	if claim.RunID == "" || claim.OwnerID == "" || claim.ClaimToken == "" || claim.LeaseDuration <= 0 {
+		return session.Run{}, session.ErrConflict
+	}
+	result, err := s.exec(ctx, `UPDATE runs SET status = ?, owner_id = ?, claim_token = ?,
+		lease_until = CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER) + ?
+		WHERE id = ? AND status IN (?, ?) AND lease_until <= CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)`,
+		session.RunRunning, claim.OwnerID, claim.ClaimToken, durationMicros(claim.LeaseDuration), claim.RunID, session.RunPending, session.RunRunning)
+	if err != nil {
+		return session.Run{}, mapErr(err)
+	}
+	if err := rowsAffected(result); err != nil {
+		if current, getErr := s.GetRun(ctx, claim.RunID); getErr == nil && !current.Terminal() {
+			return session.Run{}, session.ErrSessionBusy
+		}
+		return session.Run{}, session.ErrConflict
+	}
+	return s.GetRun(ctx, claim.RunID)
+}
+
+func (s *Store) Execution(fence session.RunFence) session.ExecutionStore {
+	return &executionStore{store: s, fence: fence}
+}
+
+func (s *Store) writeRun(ctx context.Context, record session.Run) error {
 	current, err := s.GetRun(ctx, record.ID)
 	if err != nil {
 		return err
@@ -213,8 +248,8 @@ func (s *Store) FinishRun(ctx context.Context, record session.Run) error {
 	if err != nil {
 		return err
 	}
-	result, err := s.exec(ctx, `UPDATE runs SET status = ?, owner_id = ?, record = ? WHERE id = ? AND status IN (?, ?)`,
-		record.Status, record.OwnerID, raw, record.ID, session.RunPending, session.RunRunning)
+	result, err := s.exec(ctx, `UPDATE runs SET status = ?, owner_id = ?, claim_token = ?, record = ? WHERE id = ? AND claim_token = ? AND status IN (?, ?)`,
+		record.Status, record.OwnerID, record.ClaimToken, raw, record.ID, record.ClaimToken, session.RunPending, session.RunRunning)
 	if err != nil {
 		return mapErr(err)
 	}
@@ -687,59 +722,6 @@ func sameRecord[T any](left, right T) bool {
 	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
 }
 
-func verifySchema(ctx context.Context, db *sql.DB) error {
-	var version int
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
-		return err
-	}
-	if version != 2 {
-		return fmt.Errorf("%w: unsupported sqlite schema version %d", session.ErrConflict, version)
-	}
-	required := map[string][]string{
-		"sessions":       {"id", "record", "updated_at"},
-		"runs":           {"id", "session_id", "status", "owner_id", "record", "created_at"},
-		"messages":       {"id", "session_id", "run_id", "role", "record", "created_at"},
-		"parts":          {"id", "message_id", "session_id", "run_id", "ordinal", "record", "created_at"},
-		"events":         {"id", "session_id", "run_id", "kind", "record", "created_at"},
-		"tool_calls":     {"id", "session_id", "run_id", "message_id", "status", "claimed_by", "claim_token", "record"},
-		"context_epochs": {"id", "session_id", "record", "closed_at"},
-		"model_requests": {"id", "run_id", "state", "attempt", "step", "record", "created_at"},
-	}
-	for table, columns := range required {
-		if err := verifyColumns(ctx, db, table, columns); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func verifyColumns(ctx context.Context, db *sql.DB, table string, required []string) error {
-	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_info(?)`, table)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		_ = rows.Close()
-	}()
-	present := make(map[string]bool, len(required))
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return err
-		}
-		present[name] = true
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, column := range required {
-		if !present[column] {
-			return fmt.Errorf("%w: sqlite schema missing %s.%s", session.ErrConflict, table, column)
-		}
-	}
-	return nil
-}
-
 func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if s.tx != nil {
 		return s.tx.ExecContext(ctx, query, args...)
@@ -773,6 +755,48 @@ func (s *Store) getJSON(ctx context.Context, query string, args []any, dst any) 
 		return fmt.Errorf("%w: %v", session.ErrConflict, err)
 	}
 	return nil
+}
+
+type rowScanner interface {
+	Scan(...any) error
+}
+
+func (s *Store) getRun(ctx context.Context, query string, args ...any) (session.Run, error) {
+	record, err := scanRun(s.queryRow(ctx, query, args...))
+	if errors.Is(err, sql.ErrNoRows) {
+		return session.Run{}, session.ErrNotFound
+	}
+	return record, err
+}
+
+func scanRun(row rowScanner) (session.Run, error) {
+	var (
+		raw         []byte
+		status      session.RunStatus
+		ownerID     string
+		claimToken  string
+		leaseMicros int64
+	)
+	if err := row.Scan(&raw, &status, &ownerID, &claimToken, &leaseMicros); err != nil {
+		return session.Run{}, err
+	}
+	var record session.Run
+	if err := json.Unmarshal(raw, &record); err != nil {
+		return session.Run{}, fmt.Errorf("%w: %v", session.ErrConflict, err)
+	}
+	record.Status = status
+	record.OwnerID = ownerID
+	record.ClaimToken = claimToken
+	record.LeaseUntil = time.UnixMicro(leaseMicros).UTC()
+	return record, nil
+}
+
+func durationMicros(duration time.Duration) int64 {
+	micros := duration.Microseconds()
+	if micros < 1 {
+		return 1
+	}
+	return micros
 }
 
 func listJSON[T any](ctx context.Context, s *Store, query string, args ...any) ([]T, error) {

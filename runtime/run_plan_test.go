@@ -22,10 +22,15 @@ func newTestToolPlan(registry staticToolRegistry) *RunPlan {
 func testPlanTools(registry staticToolRegistry) []PlanTool {
 	capabilities := make([]PlanTool, len(registry.tools))
 	for index, candidate := range registry.tools {
-		tool := cloneTool(candidate)
+		tool, err := cloneToolChecked(candidate)
+		if err != nil {
+			panic(err)
+		}
 		capabilities[index] = PlanTool{
 			Identity: testToolIdentity(tool.Name),
-			Resolve:  func(context.Context, ToolScopeContext) (Tool, error) { return cloneTool(tool), nil },
+			Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
+				return cloneToolChecked(tool)
+			},
 		}
 	}
 	return capabilities

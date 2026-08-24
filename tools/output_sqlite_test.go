@@ -23,7 +23,7 @@ func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "run", SessionID: "session", OwnerID: "worker", Status: session.RunPending, CreatedAt: now}); err != nil {
+	if _, err := store.AdmitRun(ctx, session.Run{ID: "run", SessionID: "session", OwnerID: "worker", ClaimToken: "claim-run", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant", SessionID: "session", RunID: "run", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {

@@ -66,7 +66,10 @@ func TestUnregisterRequiresExactGenerationAndSnapshotIsStable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	frozen := registry.Snapshot()
+	frozen, err := registry.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := registry.Unregister(Registration{Name: first.Name, Generation: first.Generation + 1}); !errors.Is(err, ErrStaleRegistration) {
 		t.Fatalf("stale Unregister = %v", err)
 	}
@@ -76,7 +79,11 @@ func TestUnregisterRequiresExactGenerationAndSnapshotIsStable(t *testing.T) {
 	if err := registry.Unregister(first); !errors.Is(err, ErrStaleRegistration) {
 		t.Fatalf("repeated Unregister = %v", err)
 	}
-	if entries := frozen.Entries(); len(entries) != 2 || entries[0].Registration != first || entries[1].Registration != second {
+	entries, err := frozen.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 || entries[0].Registration != first || entries[1].Registration != second {
 		t.Fatalf("frozen entries = %#v", entries)
 	}
 	materialized, err := frozen.ResolveTools(context.Background(), snapshot("session"))

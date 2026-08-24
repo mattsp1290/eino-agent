@@ -26,6 +26,7 @@ type AdmissionIDs struct {
 	AssistantMessageID session.MessageID
 	ContextEpochID     session.EpochID
 	EventID            session.EventID
+	RunClaimToken      string
 }
 
 // AdmissionRequest describes the durable records created before execution.
@@ -36,7 +37,7 @@ type AdmissionRequest struct {
 	Model                model.Resolved
 	Input                []*einoschema.Message
 	OwnerID              string
-	LeaseUntil           time.Time
+	LeaseDuration        time.Duration
 	Metadata             map[string]string
 	ExtensionPlan        session.ExtensionPlanDescriptor
 	admissionFingerprint string
@@ -68,6 +69,9 @@ func (a Admitter) Admit(ctx context.Context, request AdmissionRequest) (Admitted
 	}
 	if err := validateAdmissionIDs(request.IDs); err != nil {
 		return AdmittedRun{}, err
+	}
+	if request.LeaseDuration <= 0 {
+		return AdmittedRun{}, fmt.Errorf("%w: positive lease duration required", ErrInvalidAdmission)
 	}
 	request, err := freezeAdmissionRequest(request)
 	if err != nil {
@@ -184,19 +188,20 @@ func admitDurable(ctx context.Context, store session.Store, request AdmissionReq
 	if err != nil {
 		return AdmittedRun{}, err
 	}
-	runRecord, err := store.AdmitRun(ctx, admissionRun(request, sessionRecord.ID, now))
+	runRecord, err := store.AdmitRun(ctx, admissionRun(request, sessionRecord.ID, now), request.LeaseDuration)
 	if err != nil {
 		return AdmittedRun{}, err
 	}
-	if _, err := store.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
+	executionStore := store.Execution(session.RunFence{RunID: runRecord.ID, ClaimToken: runRecord.ClaimToken})
+	if _, err := executionStore.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
 		return AdmittedRun{}, err
 	}
-	assistantMessage, err := store.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, now))
+	assistantMessage, err := executionStore.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, now))
 	if err != nil {
 		return AdmittedRun{}, err
 	}
 	event := admissionEvent(request, sessionRecord.ID, runRecord.ID, assistantMessage.ID, now)
-	if _, err := store.AppendEvent(ctx, event); err != nil {
+	if _, err := executionStore.AppendEvent(ctx, event); err != nil {
 		return AdmittedRun{}, err
 	}
 	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, snapshot, now), nil
@@ -266,7 +271,7 @@ func freezeAdmissionRequest(request AdmissionRequest) (AdmissionRequest, error) 
 }
 
 func validateExistingAdmission(run session.Run, request AdmissionRequest) error {
-	if run.ID != request.IDs.RunID || run.SessionID != request.IDs.SessionID || run.ContextEpoch != request.IDs.ContextEpochID || run.ParentMsgID != request.ParentMessageID || run.Agent != request.Config.Agent.Name || run.ProviderID != admissionProviderID(request) || run.ModelID != admissionModelID(request) || run.Config[admissionFingerprintKey] != request.admissionFingerprint {
+	if run.ID != request.IDs.RunID || run.ClaimToken != request.IDs.RunClaimToken || run.SessionID != request.IDs.SessionID || run.ContextEpoch != request.IDs.ContextEpochID || run.ParentMsgID != request.ParentMessageID || run.Agent != request.Config.Agent.Name || run.ProviderID != admissionProviderID(request) || run.ModelID != admissionModelID(request) || run.Config[admissionFingerprintKey] != request.admissionFingerprint {
 		return session.ErrConflict
 	}
 	return nil
@@ -303,6 +308,8 @@ func validateAdmissionIDs(ids AdmissionIDs) error {
 		return fmt.Errorf("%w: context epoch id required", ErrInvalidAdmission)
 	case ids.EventID == "":
 		return fmt.Errorf("%w: event id required", ErrInvalidAdmission)
+	case ids.RunClaimToken == "":
+		return fmt.Errorf("%w: run claim token required", ErrInvalidAdmission)
 	default:
 		return nil
 	}
@@ -322,16 +329,12 @@ func admissionSession(request AdmissionRequest, now time.Time) session.Session {
 }
 
 func admissionRun(request AdmissionRequest, sessionID session.ID, now time.Time) session.Run {
-	leaseUntil := request.LeaseUntil
-	if leaseUntil.IsZero() {
-		leaseUntil = now.Add(time.Minute)
-	}
 	return session.Run{
 		ID:            request.IDs.RunID,
 		SessionID:     sessionID,
 		ParentMsgID:   request.ParentMessageID,
 		OwnerID:       request.OwnerID,
-		LeaseUntil:    leaseUntil,
+		ClaimToken:    request.IDs.RunClaimToken,
 		Agent:         request.Config.Agent.Name,
 		ProviderID:    admissionProviderID(request),
 		ModelID:       admissionModelID(request),

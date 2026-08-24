@@ -1,3 +1,5 @@
+//go:build cgo
+
 package wasmext
 
 import (
@@ -7,6 +9,8 @@ import (
 
 	wasmtime "github.com/bytecodealliance/wasmtime-go/v47"
 )
+
+const cgoEnabled = true
 
 type wasmtimeEngine struct {
 	mu     sync.Mutex
@@ -71,10 +75,6 @@ type wasmtimeComponent struct {
 	limits    Limits
 	contract  worldContract
 	once      sync.Once
-}
-
-func (c *wasmtimeComponent) Call(ctx context.Context, operation string, input, output any) error {
-	return c.callABI(ctx, operation, input, output)
 }
 
 func (c *wasmtimeComponent) Interrupt() { c.engine.IncrementEpoch() }

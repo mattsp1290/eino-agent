@@ -12,27 +12,27 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message) error {
+func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message) error {
 	calls, err := normalizeToolCalls(msg.ToolCalls)
 	if err != nil {
 		return err
 	}
 	ordinal := int64(0)
 	if msg.Content != "" {
-		if err := o.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
+		if err := execution.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
 			return err
 		}
 		ordinal++
 	}
 	if msg.ReasoningContent != "" {
-		if err := o.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
+		if err := execution.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
 			return err
 		}
 		ordinal++
 	}
 	for _, call := range calls {
 		payload := toolCallPayload{ID: call.call.ID, Name: call.call.Function.Name, Arguments: call.arguments}
-		if err := o.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
+		if err := execution.appendPart(ctx, session.Part{ID: o.IDs.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
 			return err
 		}
 		ordinal++
@@ -40,8 +40,8 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, snapshot T
 	return nil
 }
 
-func (o *StreamingOrchestrator) appendPart(ctx context.Context, part session.Part) error {
-	_, err := o.Store.AppendPart(ctx, part)
+func (e *runExecution) appendPart(ctx context.Context, part session.Part) error {
+	_, err := e.store.AppendPart(ctx, part)
 	return err
 }
 
@@ -124,15 +124,15 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		callID, input := call.ID, call.Input
 		resultMessageID := o.IDs.NewMessageID()
 		resultPartID := o.IDs.NewPartID()
-		record, err := o.Store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
+		record, err := execution.store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
 		if err != nil {
 			return nil, err
 		}
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		_ = o.emitToolCall(ctx, execution, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{ID: string(callID), Name: call.Name, Arguments: cloneJSON(input)})
 		record.Status, record.ClaimedBy, record.ClaimToken = session.ToolCallRunning, o.ownerID(), string(o.IDs.NewEventID())
-		record.LeaseUntil, record.StartedAt = o.now().Add(o.lease()), o.now()
-		record, err = o.Store.ClaimToolCall(ctx, record)
+		record.StartedAt = o.now()
+		record, err = execution.store.ClaimToolCall(ctx, record, o.lease())
 		if err != nil {
 			return nil, err
 		}

@@ -4,6 +4,8 @@ import (
 	"context"
 
 	einoobs "github.com/mattsp1290/eino-obs"
+
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
 
 type engine interface {
@@ -12,9 +14,43 @@ type engine interface {
 }
 
 type compiledComponent interface {
-	Call(context.Context, string, any, any) error
 	Interrupt()
 	Close() error
+}
+
+type toolComponent interface {
+	compiledComponent
+	ToolMetadata(context.Context) (wittypes.ToolMetadata, error)
+	ExecuteTool(context.Context, toolExecuteRequest) (string, error)
+}
+
+type permissionsComponent interface {
+	compiledComponent
+	DecidePermissions(context.Context, wittypes.PermissionRequest) (wittypes.PermissionDecision, error)
+}
+
+type contextComponent interface {
+	compiledComponent
+	LoadContext(context.Context, wittypes.TurnMetadata) ([]wittypes.TextMessage, error)
+}
+
+type eventComponent interface {
+	compiledComponent
+	EmitEvent(context.Context, wittypes.BoundedEvent) error
+}
+
+type hookComponent interface {
+	compiledComponent
+	BeforeRun(context.Context, wittypes.TurnMetadata) error
+	BeforeTurn(context.Context, wittypes.TurnMetadata) error
+	AfterTurn(context.Context, wittypes.TurnMetadata) error
+	AfterRun(context.Context, wittypes.TurnMetadata) error
+}
+
+type middlewareComponent interface {
+	compiledComponent
+	BeforeToolCall(context.Context, toolMiddlewareBeforeRequest) (wittypes.Replacement, error)
+	AfterToolCall(context.Context, toolMiddlewareAfterRequest) (wittypes.Replacement, error)
 }
 
 type engineFactory func(Limits) (engine, error)

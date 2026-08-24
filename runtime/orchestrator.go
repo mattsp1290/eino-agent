@@ -90,13 +90,13 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		return nil, err
 	}
 	execution := newRunExecution(o, plan)
-	now := o.now()
 	ids := AdmissionIDs{
 		SessionID:          request.SessionID,
 		RunID:              o.IDs.NewRunID(),
 		AssistantMessageID: o.IDs.NewMessageID(),
 		ContextEpochID:     o.IDs.NewEpochID(),
 		EventID:            o.IDs.NewEventID(),
+		RunClaimToken:      string(o.IDs.NewEventID()),
 	}
 	admitter := o.admitter()
 	admitter.Events = execution.eventSink(admitter.Events)
@@ -108,13 +108,14 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		Model:           resolved,
 		Input:           input,
 		OwnerID:         o.ownerID(),
-		LeaseUntil:      now.Add(o.lease()),
+		LeaseDuration:   o.lease(),
 		Metadata:        request.Metadata,
 		ExtensionPlan:   plan.Descriptor(),
 	})
 	if err != nil {
 		return nil, err
 	}
+	execution.bindRun(admitted.Run)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
 		runID:  admitted.Run.ID,
@@ -149,6 +150,7 @@ func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecu
 
 func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution, admitted AdmittedRun) (result Result, settled bool) {
 	run := admitted.Run
+	ctx = execution.startLease(ctx, o.lease())
 	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
 	var observed observedRun
 	// runUsage accumulates provider usage across every model stream in the run
@@ -180,14 +182,15 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 			return result, false
 		}
 	}
-	run.Status = session.RunRunning
 	run.StartedAt = o.now()
 	observed = o.startObservedRun(ctx, run, admitted.AssistantMessage.ID, run.StartedAt)
-	if err := o.Store.FinishRun(ctx, run); err != nil {
+	started, err := execution.store.StartRun(ctx, run.StartedAt)
+	if err != nil {
 		result.Status = session.RunFailed
 		result.Error = err
 		return result, false
 	}
+	run = started
 	_ = extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
 	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot, admitted.AssistantMessage.ID)
 	if err != nil {
@@ -282,7 +285,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runEx
 		for index := range preparedCalls {
 			msg.ToolCalls[index] = preparedCalls[index].schemaCall
 		}
-		if err := o.persistAssistant(ctx, snapshot, currentMessageID, msg); err != nil {
+		if err := o.persistAssistant(ctx, execution, snapshot, currentMessageID, msg); err != nil {
 			return Result{}, err
 		}
 		if len(msg.ToolCalls) == 0 {
@@ -298,7 +301,7 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runEx
 		}
 		messages = append(messages, toolMessages...)
 		currentMessageID = o.IDs.NewMessageID()
-		if _, err := o.Store.AppendMessage(ctx, session.Message{
+		if _, err := execution.store.AppendMessage(ctx, session.Message{
 			ID:        currentMessageID,
 			SessionID: snapshot.SessionID,
 			RunID:     snapshot.RunID,
@@ -323,7 +326,10 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 		result := modelVisiblePermissionResult("denied", guard.Message)
 		return ToolOutcome{Call: cloneToolCall(call), Disposition: ToolDenied, Result: result, PermissionMetadata: cloneStringMap(result.Metadata)}
 	}
-	wrapped := cloneTool(tool)
+	wrapped, cloneErr := cloneToolChecked(tool)
+	if cloneErr != nil {
+		return ToolOutcome{Call: cloneToolCall(call), Disposition: ToolFailed, RawError: cloneErr, Error: classifyExtensionError(cloneErr)}
+	}
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		if execution.dispatch() == nil {
 			return tool.Executor.Execute(ctx, cloneToolCall(call))
@@ -424,6 +430,10 @@ func (f runtimeToolExecutorFunc) Execute(ctx context.Context, call ToolCall) (To
 }
 
 func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecution, run session.Run, result Result) (Result, bool) {
+	if leaseErr := execution.stopLease(); leaseErr != nil && result.Error == nil {
+		result.Status = session.RunFailed
+		result.Error = leaseErr
+	}
 	if result.Status == "" {
 		result.Status = session.RunCompleted
 	}
@@ -432,30 +442,47 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 	if result.Error != nil {
 		run.Error = result.Error.Error()
 	}
+	finalEvent := o.finalRunEvent(run, result)
 	settled := true
-	if err := o.Store.FinishRun(context.WithoutCancel(ctx), run); err != nil {
+	if err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent); err != nil {
 		settled = false
 		if result.Error == nil {
 			result.Status = session.RunFailed
 			result.Error = err
 		}
+	} else {
+		o.publishRunFinished(ctx, execution, finalEvent, result)
+	}
+	return result, settled
+}
+
+func (o *StreamingOrchestrator) finalRunEvent(run session.Run, result Result) *session.EventRecord {
+	if o == nil || o.IDs == nil {
+		return nil
+	}
+	eventErr := eventError(result.Error)
+	return &session.EventRecord{
+		ID: o.IDs.NewEventID(), SessionID: run.SessionID, RunID: run.ID, MessageID: result.MessageID,
+		ProviderID: run.ProviderID, ModelID: run.ModelID, Kind: string(EventRunFinished),
+		Usage:     session.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, ReasoningTokens: result.Usage.ReasoningTokens, CacheReadTokens: result.Usage.CacheReadTokens, CacheWriteTokens: result.Usage.CacheWriteTokens, Cost: result.Usage.Cost},
+		Error:     session.EventError{Code: eventErr.Code, Message: eventErr.Message, Retryable: eventErr.Retryable},
+		Payload:   mustJSON(map[string]any{"status": string(result.Status), "interrupted": result.Interrupted}),
+		Redaction: session.RedactionMetadata, CreatedAt: o.now(),
+	}
+}
+
+func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, execution *runExecution, event *session.EventRecord, result Result) {
+	if event == nil {
+		return
 	}
 	if sink := execution.eventSink(o.Events); sink != nil {
 		_ = sink.Emit(context.WithoutCancel(ctx), Event{
-			Kind:      EventRunFinished,
-			SessionID: run.SessionID,
-			RunID:     run.ID,
-			MessageID: result.MessageID,
-			Usage:     result.Usage,
-			Error:     eventError(result.Error),
-			Payload: mustJSON(map[string]any{
-				"status":      string(result.Status),
-				"interrupted": result.Interrupted,
-			}),
-			Time: o.now(),
+			Kind: EventRunFinished, EventID: event.ID, SessionID: event.SessionID, RunID: event.RunID,
+			MessageID: event.MessageID, ProviderID: event.ProviderID, ModelID: event.ModelID,
+			Usage: result.Usage, Error: eventError(result.Error), Redaction: RedactionClass(event.Redaction),
+			Payload: cloneJSON(event.Payload), Time: event.CreatedAt,
 		})
 	}
-	return result, settled
 }
 
 func toolCallEventPayload(output json.RawMessage, name string, input json.RawMessage) map[string]any {

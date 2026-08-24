@@ -45,7 +45,7 @@ func Run(t *testing.T, factory Factory) {
 			go func(i int) {
 				defer wg.Done()
 				<-start
-				r, err := subject.Store.AdmitRun(ctx, run(session.RunID(fmt.Sprintf("run-%02d", i)), s.ID, fmt.Sprintf("owner-%02d", i)))
+				r, err := subject.Store.AdmitRun(ctx, run(session.RunID(fmt.Sprintf("run-%02d", i)), s.ID, fmt.Sprintf("owner-%02d", i)), time.Minute)
 				results <- result{run: r, err: err}
 			}(i)
 		}
@@ -71,10 +71,11 @@ func Run(t *testing.T, factory Factory) {
 		}
 		admitted.Status = session.RunInterrupted
 		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
-		if err := subject.Store.FinishRun(ctx, admitted); err != nil {
+		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		if err := execution.SettleRun(ctx, admitted, nil); err != nil {
 			t.Fatalf("finish first run: %v", err)
 		}
-		if _, err := subject.Store.AdmitRun(ctx, run("run-3", s.ID, "owner-3")); err != nil {
+		if _, err := subject.Store.AdmitRun(ctx, run("run-3", s.ID, "owner-3"), time.Minute); err != nil {
 			t.Fatalf("admit after terminal run: %v", err)
 		}
 	})
@@ -90,11 +91,12 @@ func Run(t *testing.T, factory Factory) {
 			if err != nil {
 				return err
 			}
-			r, err := tx.AdmitRun(ctx, run("committed-run", s.ID, "owner"))
+			r, err := tx.AdmitRun(ctx, run("committed-run", s.ID, "owner"), time.Minute)
 			if err != nil {
 				return err
 			}
-			_, err = tx.AppendEvent(ctx, eventRecord("committed-event", s.ID, r.ID, 1))
+			execution := tx.Execution(session.RunFence{RunID: r.ID, ClaimToken: r.ClaimToken})
+			_, err = execution.AppendEvent(ctx, eventRecord("committed-event", s.ID, r.ID, 1))
 			return err
 		}); err != nil {
 			t.Fatalf("commit transaction: %v", err)
@@ -124,11 +126,12 @@ func Run(t *testing.T, factory Factory) {
 		ctx := context.Background()
 		s := createSession(t, ctx, subject.Store, "session-replay")
 		r := admitRun(t, ctx, subject.Store, run("run-replay", s.ID, "owner"))
-		msg1 := appendMessage(t, ctx, subject.Store, message("msg-z", s.ID, r.ID, session.RoleUser))
-		msg2 := appendMessage(t, ctx, subject.Store, message("msg-a", s.ID, r.ID, session.RoleAssistant))
-		appendPart(t, ctx, subject.Store, part("prt-z", msg2.ID, s.ID, r.ID, 20))
-		appendPart(t, ctx, subject.Store, part("prt-m", msg1.ID, s.ID, r.ID, 10))
-		appendPart(t, ctx, subject.Store, part("prt-a", msg2.ID, s.ID, r.ID, 30))
+		execution := executionFor(subject.Store, r)
+		msg1 := appendMessage(t, ctx, execution, message("msg-z", s.ID, r.ID, session.RoleUser))
+		msg2 := appendMessage(t, ctx, execution, message("msg-a", s.ID, r.ID, session.RoleAssistant))
+		appendPart(t, ctx, execution, part("prt-z", msg2.ID, s.ID, r.ID, 20))
+		appendPart(t, ctx, execution, part("prt-m", msg1.ID, s.ID, r.ID, 10))
+		appendPart(t, ctx, execution, part("prt-a", msg2.ID, s.ID, r.ID, 30))
 		batch, err := subject.Store.ListMessages(ctx, s.ID, session.ReplayCursor{Limit: 10})
 		if err != nil {
 			t.Fatalf("list messages: %v", err)
@@ -173,16 +176,17 @@ func Run(t *testing.T, factory Factory) {
 			t.Fatalf("conflicting duplicate session err = %v, want ErrConflict", err)
 		}
 		r := admitRun(t, ctx, subject.Store, run("run-idempotent", s.ID, "owner"))
+		execution := executionFor(subject.Store, r)
 		msg := message("msg-idempotent", s.ID, r.ID, session.RoleUser)
-		if _, err := subject.Store.AppendMessage(ctx, msg); err != nil {
+		if _, err := execution.AppendMessage(ctx, msg); err != nil {
 			t.Fatalf("append message: %v", err)
 		}
-		if _, err := subject.Store.AppendMessage(ctx, msg); err != nil {
+		if _, err := execution.AppendMessage(ctx, msg); err != nil {
 			t.Fatalf("repeat append message: %v", err)
 		}
 		changed := msg
 		changed.Role = session.RoleAssistant
-		if _, err := subject.Store.AppendMessage(ctx, changed); !errors.Is(err, session.ErrConflict) {
+		if _, err := execution.AppendMessage(ctx, changed); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("conflicting duplicate message err = %v, want ErrConflict", err)
 		}
 	})
@@ -192,7 +196,8 @@ func Run(t *testing.T, factory Factory) {
 		ctx := context.Background()
 		s := createSession(t, ctx, subject.Store, "session-tools")
 		r := admitRun(t, ctx, subject.Store, run("run-tools", s.ID, "owner"))
-		msg := appendMessage(t, ctx, subject.Store, message("msg-tools", s.ID, r.ID, session.RoleAssistant))
+		execution := executionFor(subject.Store, r)
+		msg := appendMessage(t, ctx, execution, message("msg-tools", s.ID, r.ID, session.RoleAssistant))
 		call := session.ToolCall{
 			ID:        "call-1",
 			SessionID: s.ID,
@@ -202,13 +207,12 @@ func Run(t *testing.T, factory Factory) {
 			Status:    session.ToolCallPending,
 			RetrySafe: true,
 		}
-		if _, err := subject.Store.CreateToolCall(ctx, call); err != nil {
+		if _, err := execution.CreateToolCall(ctx, call); err != nil {
 			t.Fatalf("create tool call: %v", err)
 		}
 		call.ClaimedBy = "worker-1"
 		call.ClaimToken = "claim-1"
-		call.LeaseUntil = time.Now().Add(time.Minute)
-		claimed, err := subject.Store.ClaimToolCall(ctx, call)
+		claimed, err := execution.ClaimToolCall(ctx, call, time.Minute)
 		if err != nil {
 			t.Fatalf("claim tool call: %v", err)
 		}
@@ -217,7 +221,7 @@ func Run(t *testing.T, factory Factory) {
 		}
 		call.ClaimedBy = "worker-2"
 		call.ClaimToken = "claim-2"
-		if _, err := subject.Store.ClaimToolCall(ctx, call); !errors.Is(err, session.ErrConflict) {
+		if _, err := execution.ClaimToolCall(ctx, call, time.Minute); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("second claim err = %v, want ErrConflict", err)
 		}
 		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 1 {
@@ -230,6 +234,7 @@ func Run(t *testing.T, factory Factory) {
 		ctx := context.Background()
 		s := createSession(t, ctx, subject.Store, "session-recovery")
 		r := admitRun(t, ctx, subject.Store, run("run-recovery", s.ID, "owner"))
+		execution := executionFor(subject.Store, r)
 		event := session.EventRecord{
 			ID:          "evt-1",
 			SessionID:   s.ID,
@@ -244,13 +249,13 @@ func Run(t *testing.T, factory Factory) {
 			Redaction: session.RedactionMetadata,
 			CreatedAt: time.Now(),
 		}
-		if _, err := subject.Store.AppendEvent(ctx, event); err != nil {
+		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("append event: %v", err)
 		}
-		if _, err := subject.Store.AppendEvent(ctx, event); err != nil {
+		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("repeat append event: %v", err)
 		}
-		if _, err := subject.Store.AppendEvent(ctx, eventRecord("evt-2", s.ID, r.ID, 2)); err != nil {
+		if _, err := execution.AppendEvent(ctx, eventRecord("evt-2", s.ID, r.ID, 2)); err != nil {
 			t.Fatalf("append second event: %v", err)
 		}
 		runs, err := subject.Store.ListUnfinishedRuns(ctx)
@@ -283,7 +288,7 @@ func Run(t *testing.T, factory Factory) {
 		}
 		later := time.Now().UTC()
 		earlier := later.Add(-time.Minute)
-		epoch, err := subject.Store.StartContextEpoch(ctx, session.ContextEpoch{
+		epoch, err := execution.StartContextEpoch(ctx, session.ContextEpoch{
 			ID:               "epoch-2",
 			SessionID:        s.ID,
 			SummaryMessageID: "summary",
@@ -300,14 +305,14 @@ func Run(t *testing.T, factory Factory) {
 		if err != nil {
 			t.Fatalf("start context epoch: %v", err)
 		}
-		duplicate, err := subject.Store.StartContextEpoch(ctx, epoch)
+		duplicate, err := execution.StartContextEpoch(ctx, epoch)
 		if err != nil {
 			t.Fatalf("duplicate start context epoch: %v", err)
 		}
 		if duplicate.ID != epoch.ID {
 			t.Fatalf("duplicate epoch = %#v, want %#v", duplicate, epoch)
 		}
-		if _, err := subject.Store.StartContextEpoch(ctx, session.ContextEpoch{
+		if _, err := execution.StartContextEpoch(ctx, session.ContextEpoch{
 			ID:        "epoch-1",
 			SessionID: s.ID,
 			Trigger:   "manual",
@@ -317,7 +322,7 @@ func Run(t *testing.T, factory Factory) {
 			t.Fatalf("start earlier context epoch: %v", err)
 		}
 		epoch.ClosedAt = epoch.CreatedAt.Add(time.Minute)
-		if err := subject.Store.FinishContextEpoch(ctx, epoch); err != nil {
+		if err := execution.FinishContextEpoch(ctx, epoch); err != nil {
 			t.Fatalf("finish context epoch: %v", err)
 		}
 		reader, ok := subject.Store.(session.ContextEpochReader)
@@ -349,11 +354,12 @@ func RunTransactional(t *testing.T, factory Factory) {
 			if err != nil {
 				return err
 			}
-			r, err := tx.AdmitRun(ctx, run("tx-run", s.ID, "owner"))
+			r, err := tx.AdmitRun(ctx, run("tx-run", s.ID, "owner"), time.Minute)
 			if err != nil {
 				return err
 			}
-			_, err = tx.AppendEvent(ctx, eventRecord("tx-event", s.ID, r.ID, 1))
+			execution := tx.Execution(session.RunFence{RunID: r.ID, ClaimToken: r.ClaimToken})
+			_, err = execution.AppendEvent(ctx, eventRecord("tx-event", s.ID, r.ID, 1))
 			return err
 		}); err != nil {
 			t.Fatalf("commit transaction: %v", err)
@@ -414,14 +420,18 @@ func createSession(t testing.TB, ctx context.Context, st session.Store, id sessi
 
 func admitRun(t testing.TB, ctx context.Context, st session.Store, r session.Run) session.Run {
 	t.Helper()
-	admitted, err := st.AdmitRun(ctx, r)
+	admitted, err := st.AdmitRun(ctx, r, time.Minute)
 	if err != nil {
 		t.Fatalf("admit run %s: %v", r.ID, err)
 	}
 	return admitted
 }
 
-func appendMessage(t testing.TB, ctx context.Context, st session.Store, msg session.Message) session.Message {
+func executionFor(st session.Store, run session.Run) session.ExecutionStore {
+	return st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+}
+
+func appendMessage(t testing.TB, ctx context.Context, st session.ExecutionStore, msg session.Message) session.Message {
 	t.Helper()
 	got, err := st.AppendMessage(ctx, msg)
 	if err != nil {
@@ -430,7 +440,7 @@ func appendMessage(t testing.TB, ctx context.Context, st session.Store, msg sess
 	return got
 }
 
-func appendPart(t testing.TB, ctx context.Context, st session.Store, p session.Part) session.Part {
+func appendPart(t testing.TB, ctx context.Context, st session.ExecutionStore, p session.Part) session.Part {
 	t.Helper()
 	got, err := st.AppendPart(ctx, p)
 	if err != nil {
@@ -456,7 +466,7 @@ func run(id session.RunID, sessionID session.ID, owner string) session.Run {
 		ID:         id,
 		SessionID:  sessionID,
 		OwnerID:    owner,
-		LeaseUntil: now.Add(time.Minute),
+		ClaimToken: "claim-" + string(id),
 		Agent:      "default",
 		ProviderID: "provider",
 		ModelID:    "model",

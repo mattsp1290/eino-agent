@@ -10,7 +10,7 @@ import (
 
 // ExtensionPlanSchemaVersion is the current durable plan descriptor schema.
 // Version 2 records prompt and guard order explicitly.
-const ExtensionPlanSchemaVersion = 2
+const ExtensionPlanSchemaVersion = 1
 
 // ModelRequestID identifies one durable provider-attempt audit record.
 type ModelRequestID string

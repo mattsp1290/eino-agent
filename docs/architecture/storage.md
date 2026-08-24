@@ -42,7 +42,8 @@ parts, context epochs, and durable events.
 
 ## Atomic Run Admission
 
-`session.Store.AdmitRun` is both creation and ownership acquisition.
+`session.Store.AdmitRun` is both creation and ownership acquisition. It accepts
+a lease duration; the store clock stamps the absolute deadline.
 
 Required behavior:
 
@@ -50,9 +51,13 @@ Required behavior:
 - Exactly one nonterminal run may own a session.
 - A second nonterminal admission returns `session.ErrSessionBusy`.
 - Terminal statuses are `RunInterrupted`, `RunFailed`, and `RunCompleted`.
-- After `FinishRun` records a terminal state, the next run may be admitted.
-- `OwnerID` and `LeaseUntil` are stored so recovery can distinguish stale
-  registrations from current owners.
+- After scoped `SettleRun` records terminal state and its durable event, the next
+  run may be admitted.
+- `ClaimToken` is mutation authority. `OwnerID` is diagnostic metadata.
+- `ClaimRun` atomically replaces owner/token only when the store clock observes
+  an expired nonterminal lease.
+- `Store.Execution(RunFence)` returns the only execution mutation capability;
+  every write validates the current run token in the same transaction.
 
 `ActiveRun` returns the current nonterminal owner or `session.ErrNotFound`.
 `ListUnfinishedRuns` returns every nonterminal run so process startup can mark
@@ -69,7 +74,7 @@ Transaction boundaries matter for:
 - admitting a run and writing its first durable event;
 - appending a message and its initial parts;
 - creating, claiming, and writing the first tool-call part;
-- finishing a run and settling unfinished tool calls;
+- finishing a run together with its final durable event;
 - creating a context epoch and writing compaction summary/tail metadata.
 
 Stores without transaction support must document their weaker guarantees and
@@ -101,21 +106,24 @@ Durable events must:
 - be listable in stable event order with `EventCursor`;
 - be usable after restart to explain recovery and replay decisions.
 
-Live-only events may be persisted as audit records, but replay clients should
-not treat them as the source of conversation content.
+Runtime does not persist live-only transport events. Replay clients reconstruct
+conversation content from committed messages, parts, epochs, and durable event
+projections rather than old transport frames.
 
 ## Tool-Call Claim Semantics
 
 Tool calls use a create, claim, atomic-settlement lifecycle:
 
 1. `CreateToolCall` writes a pending call before execution.
-2. `ClaimToolCall` atomically changes pending to running and records
-   `ClaimedBy`, `ClaimToken`, and `LeaseUntil`.
+2. Scoped `ClaimToolCall` atomically changes pending to running, records
+   `ClaimedBy`, `ClaimToken`, and a store-clock deadline, and extends the owning
+   run lease to at least the same deadline.
 3. A second claim for the same pending/running call returns
    `session.ErrConflict`.
 4. `SettleToolCall` atomically records completed, failed, or interrupted state
    together with the reserved tool-result message and part.
-5. `SettleToolCall` verifies the successful claim owner/token and returns
+5. `SettleToolCall` verifies both the successful tool claim and current run
+   claim token, and returns
    `session.ErrConflict` for stale or stolen settlement attempts. Repeating an
    identical settlement is idempotent; contradictory state or envelopes conflict.
 6. `ListUnfinishedToolCalls` returns pending/running calls for a run.

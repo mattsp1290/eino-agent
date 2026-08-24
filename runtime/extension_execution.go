@@ -1,12 +1,44 @@
 package runtime
 
-import "github.com/mattsp1290/eino-agent/extension"
+import (
+	"context"
+
+	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/session"
+)
 
 // runExecution owns the frozen extension plan for one fresh or resumed run.
 // Request contexts carry cancellation and request values, never plan identity.
 type runExecution struct {
-	host *StreamingOrchestrator
-	plan *RunPlan
+	host  *StreamingOrchestrator
+	plan  *RunPlan
+	store session.ExecutionStore
+	lease *runLeaseHeartbeat
+}
+
+func (e *runExecution) bindRun(run session.Run) {
+	if e == nil || e.host == nil || e.host.Store == nil {
+		return
+	}
+	e.store = e.host.Store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+}
+
+func (e *runExecution) ensureStore(ctx context.Context, runID session.RunID) error {
+	if e.store != nil {
+		return nil
+	}
+	if e == nil || e.host == nil || e.host.Store == nil {
+		return session.ErrConflict
+	}
+	run, err := e.host.Store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	e.bindRun(run)
+	if e.store == nil {
+		return session.ErrConflict
+	}
+	return nil
 }
 
 func newRunExecution(host *StreamingOrchestrator, plan *RunPlan) *runExecution {
@@ -30,8 +62,11 @@ func (e *runExecution) release() {
 }
 
 func (e *runExecution) eventSink(infrastructure EventSink) EventSink {
-	if e == nil || e.dispatch() == nil {
+	if e == nil {
 		return infrastructure
 	}
-	return compositeEventSink{infrastructure: infrastructure, plan: e.dispatch()}
+	if e.store == nil && infrastructure == nil && e.dispatch() == nil {
+		return nil
+	}
+	return runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}
 }

@@ -181,9 +181,9 @@ Required semantics:
 
 SQLite is available as an embedded implementation. Hosted or multi-region
 backends must preserve the same observable behavior at the `session.Store`
-boundary. SQLite migrations are backend-owned durable state changes: take
-backups before production migrations, test rollback from a copied database, and
-do not change migration order after release.
+boundary. The pre-release SQLite backend accepts only its current schema. After
+a schema change, recreate local databases rather than relying on upgrade or
+rollback compatibility.
 
 ## Tool Lifecycle
 

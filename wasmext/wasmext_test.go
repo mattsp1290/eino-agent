@@ -57,7 +57,10 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		t.Fatalf("openTool error = %v", err)
 	}
 	defer func() { _ = loaded.Close() }()
-	definition := loaded.Definition()
+	definition, err := loaded.Definition()
+	if err != nil {
+		t.Fatal(err)
+	}
 	registry := tools.NewRegistry()
 	if _, err := registry.Register(definition); err != nil {
 		t.Fatalf("Register error = %v", err)
@@ -216,6 +219,7 @@ func TestContractAndPayloadViolationsAreClassifiedAndBounded(t *testing.T) {
 }
 
 func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
+	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	for _, test := range []struct {
 		name     string
@@ -260,6 +264,7 @@ func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
 }
 
 func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
+	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	ctx := context.Background()
 
@@ -330,6 +335,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 }
 
 func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
+	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	toolConfig := checkedInFixtureConfig(t, root, "tool.wasm")
 	observer := einoobs.New(einoobs.Config{})
@@ -343,7 +349,10 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 		t.Fatalf("OpenTool error = %v", err)
 	}
 	defer func() { _ = loadedTool.Close() }()
-	definition := loadedTool.Definition()
+	definition, err := loadedTool.Definition()
+	if err != nil {
+		t.Fatal(err)
+	}
 	decoded, err := definition.Decode(context.Background(), json.RawMessage(`{"value":1}`))
 	if err != nil {
 		t.Fatalf("Decode error = %v", err)
@@ -382,6 +391,7 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 }
 
 func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
+	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	for _, test := range []struct {
 		name  string
@@ -398,7 +408,11 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = loaded.Close() }()
-			_, err = executeLoadedDefinition(context.Background(), loaded.Definition(), test.input)
+			definition, definitionErr := loaded.Definition()
+			if definitionErr != nil {
+				t.Fatal(definitionErr)
+			}
+			_, err = executeLoadedDefinition(context.Background(), definition, test.input)
 			if !IsKind(err, test.kind) {
 				t.Fatalf("Execute error = %v, want %s", err, test.kind)
 			}
@@ -415,17 +429,27 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		}
 		defer func() { _ = loaded.Close() }()
 		started := time.Now()
-		_, err = executeLoadedDefinition(context.Background(), loaded.Definition(), `{"mode":"hang"}`)
+		definition, definitionErr := loaded.Definition()
+		if definitionErr != nil {
+			t.Error(definitionErr)
+			return
+		}
+		_, err = executeLoadedDefinition(context.Background(), definition, `{"mode":"hang"}`)
 		if !IsKind(err, ErrorTimeout) || time.Since(started) > time.Second {
 			t.Fatalf("Execute error = %v after %s", err, time.Since(started))
 		}
-		if _, err := executeLoadedDefinition(context.Background(), loaded.Definition(), `{"value":1}`); err != nil {
+		definition, definitionErr = loaded.Definition()
+		if definitionErr != nil {
+			t.Fatal(definitionErr)
+		}
+		if _, err := executeLoadedDefinition(context.Background(), definition, `{"value":1}`); err != nil {
 			t.Fatalf("call after interrupted guest = %v", err)
 		}
 	})
 }
 
 func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T) {
+	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	exporter := &signalExporter{entered: make(chan struct{})}
 	cfg := checkedInFixtureConfig(t, root, "tool.wasm")
@@ -436,7 +460,10 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	definition := loaded.Definition()
+	definition, err := loaded.Definition()
+	if err != nil {
+		t.Fatal(err)
+	}
 	callError := make(chan error, 1)
 	go func() {
 		_, callErr := executeLoadedDefinition(context.Background(), definition, `{"mode":"hang"}`)
@@ -465,13 +492,17 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 }
 
 func TestCheckedInToolConcurrentUse(t *testing.T) {
+	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	loaded, err := OpenTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = loaded.Close() }()
-	definition := loaded.Definition()
+	definition, err := loaded.Definition()
+	if err != nil {
+		t.Fatal(err)
+	}
 	const calls = 12
 	errorsChannel := make(chan error, calls)
 	var wait sync.WaitGroup
@@ -497,6 +528,7 @@ func TestCheckedInToolConcurrentUse(t *testing.T) {
 }
 
 func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
+	requireCGO(t)
 	ctx := context.Background()
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	loader := NewLoader()
@@ -675,6 +707,13 @@ func fixtureConfig(t *testing.T, bytes []byte) ModuleConfig {
 	return fixtureConfigAt(t, root, "component.wasm", bytes)
 }
 
+func requireCGO(t *testing.T) {
+	t.Helper()
+	if !cgoEnabled {
+		t.Skip("Wasmtime component integration requires cgo")
+	}
+}
+
 func fixtureConfigAt(t *testing.T, root, name string, bytes []byte) ModuleConfig {
 	t.Helper()
 	path := filepath.Join(root, name)
@@ -711,11 +750,50 @@ type fakeComponent struct {
 	interrupts atomic.Int64
 }
 
-func (c *fakeComponent) Call(ctx context.Context, operation string, input, output any) error {
+func (c *fakeComponent) invoke(ctx context.Context, operation string, input, output any) error {
 	if c.call == nil {
 		return nil
 	}
 	return c.call(ctx, operation, input, output)
+}
+func (c *fakeComponent) ToolMetadata(ctx context.Context) (output wittypes.ToolMetadata, err error) {
+	err = c.invoke(ctx, "tool.metadata", nil, &output)
+	return
+}
+func (c *fakeComponent) ExecuteTool(ctx context.Context, input toolExecuteRequest) (output string, err error) {
+	err = c.invoke(ctx, "tool.execute", input, &output)
+	return
+}
+func (c *fakeComponent) DecidePermissions(ctx context.Context, input wittypes.PermissionRequest) (output wittypes.PermissionDecision, err error) {
+	err = c.invoke(ctx, "permissions-policy.decide", input, &output)
+	return
+}
+func (c *fakeComponent) LoadContext(ctx context.Context, input wittypes.TurnMetadata) (output []wittypes.TextMessage, err error) {
+	err = c.invoke(ctx, "context-source.load-context", input, &output)
+	return
+}
+func (c *fakeComponent) EmitEvent(ctx context.Context, input wittypes.BoundedEvent) error {
+	return c.invoke(ctx, "event-sink.emit", input, nil)
+}
+func (c *fakeComponent) BeforeRun(ctx context.Context, input wittypes.TurnMetadata) error {
+	return c.invoke(ctx, "hook.before-run", input, nil)
+}
+func (c *fakeComponent) BeforeTurn(ctx context.Context, input wittypes.TurnMetadata) error {
+	return c.invoke(ctx, "hook.before-turn", input, nil)
+}
+func (c *fakeComponent) AfterTurn(ctx context.Context, input wittypes.TurnMetadata) error {
+	return c.invoke(ctx, "hook.after-turn", input, nil)
+}
+func (c *fakeComponent) AfterRun(ctx context.Context, input wittypes.TurnMetadata) error {
+	return c.invoke(ctx, "hook.after-run", input, nil)
+}
+func (c *fakeComponent) BeforeToolCall(ctx context.Context, input toolMiddlewareBeforeRequest) (output wittypes.Replacement, err error) {
+	err = c.invoke(ctx, "tool-middleware.before-tool-call", input, &output)
+	return
+}
+func (c *fakeComponent) AfterToolCall(ctx context.Context, input toolMiddlewareAfterRequest) (output wittypes.Replacement, err error) {
+	err = c.invoke(ctx, "tool-middleware.after-tool-call", input, &output)
+	return
 }
 func (c *fakeComponent) Interrupt()   { c.interrupts.Add(1) }
 func (c *fakeComponent) Close() error { c.closed.Store(true); return nil }
@@ -727,7 +805,8 @@ type blockingComponent struct {
 }
 
 func newBlockingComponent() *blockingComponent {
-	return &blockingComponent{release: make(chan struct{})}
+	component := &blockingComponent{release: make(chan struct{})}
+	component.call = func(context.Context, string, any, any) error { <-component.release; return nil }
+	return component
 }
-func (c *blockingComponent) Call(context.Context, string, any, any) error { <-c.release; return nil }
-func (c *blockingComponent) Interrupt()                                   { c.interrupts.Add(1); c.once.Do(func() { close(c.release) }) }
+func (c *blockingComponent) Interrupt() { c.interrupts.Add(1); c.once.Do(func() { close(c.release) }) }

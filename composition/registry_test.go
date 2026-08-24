@@ -769,9 +769,9 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 	}
 }
 
-func TestVersionOneCallbackAndToolPlanIsRejected(t *testing.T) {
+func TestUnsupportedVersionTwoPlanIsRejected(t *testing.T) {
 	registry := NewRegistry(nil)
-	component := component("v1-compatible")
+	component := component("unsupported-version")
 	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {
 			return err
@@ -788,14 +788,14 @@ func TestVersionOneCallbackAndToolPlanIsRejected(t *testing.T) {
 	}
 	persisted := plan.Descriptor()
 	plan.Release()
-	persisted.SchemaVersion = 1
+	persisted.SchemaVersion = 2
 	persisted.Fingerprint, err = session.FingerprintExtensionPlan(persisted)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
 	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("AcquireResumePlan schema v1 callback/tool plan = %v, want mismatch", err)
+		t.Fatalf("AcquireResumePlan schema v2 callback/tool plan = %v, want mismatch", err)
 	}
 	if resumed != nil {
 		resumed.Release()

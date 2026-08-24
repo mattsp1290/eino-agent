@@ -1054,7 +1054,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		ID:            "run-resume",
 		SessionID:     "session-resume",
 		OwnerID:       "owner-1",
-		LeaseUntil:    now.Add(-time.Minute),
+		ClaimToken:    "old-claim",
 		Agent:         "agent",
 		ProviderID:    "fake",
 		ModelID:       "test",
@@ -1062,10 +1062,11 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
 		ExtensionPlan: testEchoPlanDescriptor(),
 		CreatedAt:     now,
-	})
+	}, time.Millisecond)
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
+	time.Sleep(2 * time.Millisecond)
 	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
@@ -1193,6 +1194,51 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 	}
 }
 
+func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
+	t.Parallel()
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	streamer := scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+		close(entered)
+		select {
+		case <-release:
+			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+	plan := mustTestRunPlan(RunPlanSpec{})
+	provider := staticRunPlanProvider{plan: plan}
+	owner := &StreamingOrchestrator{
+		Store: store, Model: resolvedModel{streamer: streamer}, Plans: provider, IDs: &sequenceIDs{},
+		OwnerID: "owner-a", Lease: 15 * time.Millisecond,
+		Clock: func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) },
+	}
+	handle, err := owner.Start(context.Background(), Request{SessionID: "heartbeat-session", Input: []*einoschema.Message{einoschema.UserMessage("wait")}, Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	time.Sleep(45 * time.Millisecond)
+	resumer := &StreamingOrchestrator{
+		Store: store, Plans: provider, IDs: &sequenceIDs{}, OwnerID: "owner-b", Lease: 15 * time.Millisecond,
+		Clock: func() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) },
+	}
+	if _, err := resumer.Resume(context.Background(), handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
+		t.Fatalf("Resume error = %v, want ErrSessionBusy", err)
+	}
+	close(release)
+	result := <-handle.Done()
+	if result.Error != nil || result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v", result)
+	}
+}
+
 func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
 	t.Parallel()
 
@@ -1249,7 +1295,7 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		ID:            "run-resume",
 		SessionID:     "session-resume",
 		OwnerID:       owner,
-		LeaseUntil:    now.Add(-time.Minute),
+		ClaimToken:    "old-claim",
 		Agent:         "agent",
 		ProviderID:    "fake",
 		ModelID:       "test",
@@ -1257,10 +1303,11 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
 		ExtensionPlan: testEchoPlanDescriptor(),
 		CreatedAt:     now,
-	})
+	}, time.Millisecond)
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
+	time.Sleep(2 * time.Millisecond)
 	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}

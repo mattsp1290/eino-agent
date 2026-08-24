@@ -97,11 +97,12 @@ small; current sink errors are discarded by runtime call sites.
 Wasmtime-go v47 supplies compilation, reflection, linking, stores, limits, and
 epoch interruption, but its published Go surface does not yet expose dynamic
 component-function calls or nested host-interface definitions. `wasmext`
-therefore keeps a small, Phase-A-specific lifting/lowering and host-linking
-layer over Wasmtime's official v47 C component API beside the engine adapter.
-That layer is internal, round-tripped against the checked-in guests, and does
-not change wrapper or orchestrator APIs. It can be replaced directly when the
-equivalent Go API is released.
+therefore keeps a small lifting/lowering and host-linking layer over Wasmtime's
+official v47 C component API. Host wrappers depend on narrow typed interfaces
+for the tool, permissions, context, event, hook, and middleware worlds; export
+names and codecs are selected by those typed methods rather than an
+`operation string`/`any` switchboard. The layer is internal and round-tripped
+against the checked-in guests.
 
 ## pi parity map
 

@@ -107,6 +107,8 @@ func (e *runExecution) ensureToolResultIDs(call ToolCall, claimed session.ToolCa
 }
 
 func (e *runExecution) commitToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement) error {
-	_ = claimed
-	return e.host.Store.SettleToolCall(ctx, settlement)
+	if err := e.ensureStore(ctx, claimed.RunID); err != nil {
+		return err
+	}
+	return e.store.SettleToolCall(ctx, settlement)
 }

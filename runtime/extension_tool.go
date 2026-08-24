@@ -123,12 +123,6 @@ func evaluateToolGuards(ctx context.Context, plan *RunPlan, tool Tool, call Tool
 	return denial, nil
 }
 
-func clonePreparedToolCall(value PreparedToolCall) PreparedToolCall {
-	value.Tool = cloneTool(value.Tool)
-	value.Call = cloneToolCall(value.Call)
-	return value
-}
-
 func clonePreparedToolCallChecked(value PreparedToolCall) (PreparedToolCall, error) {
 	var err error
 	value.Tool, err = cloneToolChecked(value.Tool)
@@ -157,12 +151,6 @@ func validatePreparedToolCall(value PreparedToolCall) error {
 
 func validatePreparedToolCallResult(original PreparedToolCall, output PreparedToolCall) error {
 	return validatePreparedToolCallInput(original, output)
-}
-
-func cloneToolExecution(value ToolExecution) ToolExecution {
-	value.Tool = cloneTool(value.Tool)
-	value.Call = cloneToolCall(value.Call)
-	return value
 }
 
 func cloneToolExecutionChecked(value ToolExecution) (ToolExecution, error) {
@@ -258,14 +246,6 @@ func validateToolOutcomeInput(original, candidate ToolOutcome) error {
 
 func validateToolOutcomeResult(original ToolOutcome, output ToolOutcome) error {
 	return validateToolOutcomeInput(original, output)
-}
-
-func cloneTool(tool Tool) Tool {
-	cloned, err := cloneToolChecked(tool)
-	if err != nil {
-		return Tool{}
-	}
-	return cloned
 }
 
 func cloneToolChecked(tool Tool) (Tool, error) {

@@ -138,10 +138,10 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	if !o.ModelRequestLedger {
 		return nil, nil, nil
 	}
-	store, ok := o.Store.(session.ModelRequestStore)
-	if !ok {
+	if execution == nil || execution.store == nil {
 		return nil, nil, fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
 	}
+	store := session.ModelRequestStore(execution.store)
 	messages, err := json.Marshal(audited.Messages)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode audited messages: %w", err)

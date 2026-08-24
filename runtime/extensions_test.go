@@ -20,6 +20,15 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+func mustClonePreparedToolCall(t *testing.T, value PreparedToolCall) PreparedToolCall {
+	t.Helper()
+	cloned, err := clonePreparedToolCallChecked(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cloned
+}
+
 func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", EpochID: "epoch", SystemPrompt: "configured"}
 	plan := mustTestRunPlan(RunPlanSpec{Prompts: []PlanPrompt{
@@ -344,7 +353,10 @@ func TestProtectedViewsRejectCallableInjection(t *testing.T) {
 	}
 
 	tool := extensionTool(Tool{Name: "tool"})
-	toolCandidate := cloneTool(tool)
+	toolCandidate, err := cloneToolChecked(tool)
+	if err != nil {
+		t.Fatal(err)
+	}
 	toolCandidate.Executor = runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })
 	if sameProtectedTool(tool, toolCandidate) {
 		t.Fatal("executor injection passed protected tool validation")
@@ -398,8 +410,9 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	if err == nil || toolEntered || toolNested["value"] != "original" {
 		t.Fatalf("tool clone failure = %v entered=%t nested=%v", err, toolEntered, toolNested)
 	}
-	if err := validateToolExecutionInput(ToolExecution(prepared), cloneToolExecution(ToolExecution(prepared))); !errors.Is(err, extension.ErrProtectedMutation) {
-		t.Fatalf("tool execution clone failure validation = %v", err)
+	clonedExecution, cloneErr := cloneToolExecutionChecked(ToolExecution(prepared))
+	if cloneErr == nil || clonedExecution.Tool.Name != "" || clonedExecution.Call.ID != "" {
+		t.Fatalf("tool execution clone failure = %v, clone = %#v", cloneErr, clonedExecution)
 	}
 	for _, test := range []struct {
 		name   string
@@ -439,7 +452,7 @@ func TestToolValidationRejectsSameTypeCallableReplacement(t *testing.T) {
 		{name: "approval", mutate: func(value *PreparedToolCall) { value.Call.Approval = secondApproval }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			candidate := clonePreparedToolCall(original)
+			candidate := mustClonePreparedToolCall(t, original)
 			test.mutate(&candidate)
 			if err := validatePreparedToolCallInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
 				t.Fatalf("validation = %v", err)
@@ -453,7 +466,7 @@ func TestToolValidationAcceptsJSONCloneTypeNormalization(t *testing.T) {
 		Tool: Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Extra: map[string]any{"count": 1}}},
 		Call: ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`)},
 	}
-	if err := validatePreparedToolCallInput(original, clonePreparedToolCall(original)); err != nil {
+	if err := validatePreparedToolCallInput(original, mustClonePreparedToolCall(t, original)); err != nil {
 		t.Fatalf("unchanged tool validation = %v", err)
 	}
 }
@@ -466,7 +479,7 @@ func TestProtectedToolInfoClonePreservesAndValidatesParameterSchema(t *testing.T
 		Tool: Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", ParamsOneOf: params}},
 		Call: ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`)},
 	}
-	cloned := clonePreparedToolCall(original)
+	cloned := mustClonePreparedToolCall(t, original)
 	if cloned.Tool.Info == nil || cloned.Tool.Info.ParamsOneOf == nil || cloned.Tool.Info.ParamsOneOf == params {
 		t.Fatalf("cloned tool info = %#v", cloned.Tool.Info)
 	}
@@ -487,14 +500,14 @@ func TestProtectedToolInfoClonePreservesAndValidatesParameterSchema(t *testing.T
 		t.Fatalf("unchanged schema validation = %v", err)
 	}
 
-	replaced := clonePreparedToolCall(original)
+	replaced := mustClonePreparedToolCall(t, original)
 	replaced.Tool.Info.ParamsOneOf = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
 		"count": {Type: einoschema.Integer, Required: true},
 	})
 	if err := validatePreparedToolCallInput(original, replaced); !errors.Is(err, extension.ErrProtectedMutation) {
 		t.Fatalf("schema replacement validation = %v", err)
 	}
-	removed := clonePreparedToolCall(original)
+	removed := mustClonePreparedToolCall(t, original)
 	removed.Tool.Info.ParamsOneOf = nil
 	if err := validatePreparedToolCallInput(original, removed); !errors.Is(err, extension.ErrProtectedMutation) {
 		t.Fatalf("schema removal validation = %v", err)
@@ -602,12 +615,15 @@ func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 	if _, err := store.CreateSession(context.Background(), session.Session{ID: "session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	run, err := store.AdmitRun(context.Background(), session.Run{ID: "run", SessionID: "session", OwnerID: "old-owner", Status: session.RunPending, CreatedAt: now})
+	run, err := store.AdmitRun(context.Background(), session.Run{ID: "run", SessionID: "session", OwnerID: "old-owner", ClaimToken: "old-claim", Status: session.RunPending, CreatedAt: now}, time.Millisecond)
 	if err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(2 * time.Millisecond)
 	orchestrator := &StreamingOrchestrator{Store: store, OwnerID: "new-owner", Clock: func() time.Time { return now }}
-	result := orchestrator.resumeRunWithSettlement(context.Background(), newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{})), run, nil)
+	execution := newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{}))
+	execution.bindRun(run)
+	result := orchestrator.resumeRunWithSettlement(context.Background(), execution, run, nil)
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
 	}
@@ -669,6 +685,7 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			base := newAdmissionStore()
 			store := &runLifecycleStore{admissionStore: base, terminalFinishErr: test.finishErr}
+			events := &capturingSink{}
 			var notices []RunSettledNotice
 			plan, closePlan := settledNoticePlan(t, &notices)
 			defer closePlan()
@@ -677,6 +694,7 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 				Clock: func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }, OwnerID: "owner-1", QueueSize: 2,
 			}
 			orchestrator.Plans = staticRunPlanProvider{plan: plan}
+			orchestrator.Events = events
 
 			result := startAndWait(t, orchestrator)
 			if result.Status != test.wantStatus || (result.Error != nil) != test.wantError {
@@ -687,6 +705,9 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 			}
 			if len(notices) == 1 && notices[0].Result.Status != test.wantStatus {
 				t.Fatalf("settled notice result = %+v", notices[0].Result)
+			}
+			if got := countEvents(events.events, EventRunFinished); got != test.wantNotice {
+				t.Fatalf("run_finished events = %d, want %d", got, test.wantNotice)
 			}
 		})
 	}
@@ -704,17 +725,18 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 	}{
 		{name: "interrupted and persisted", wantNotice: 1},
 		{name: "terminal persistence failed", finishErr: finishErr, wantError: finishErr},
-		{name: "pre-finalization failure", listErr: listErr, wantError: listErr},
+		{name: "pre-finalization failure", listErr: listErr, wantNotice: 1, wantError: listErr},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			base := newAdmissionStore()
-			run := session.Run{ID: "resume-run", SessionID: "resume-session", OwnerID: "old-owner", Status: session.RunPending, CreatedAt: time.Now().UTC()}
+			run := session.Run{ID: "resume-run", SessionID: "resume-session", OwnerID: "old-owner", ClaimToken: "resume-claim", Status: session.RunPending, CreatedAt: time.Now().UTC()}
 			base.runs[run.ID] = run
 			store := &runLifecycleStore{admissionStore: base, terminalFinishErr: test.finishErr, listErr: test.listErr}
+			events := &capturingSink{}
 			var notices []RunSettledNotice
 			plan, closePlan := settledNoticePlan(t, &notices)
 			defer closePlan()
-			orchestrator := &StreamingOrchestrator{Store: store, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: time.Now}
+			orchestrator := &StreamingOrchestrator{Store: store, IDs: &sequenceIDs{}, OwnerID: "new-owner", Clock: time.Now, Events: events}
 			done := make(chan Result, 1)
 			orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan), run, done)
 			result := <-done
@@ -725,17 +747,50 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			if len(notices) != test.wantNotice {
 				t.Fatalf("settled notices = %#v, want %d", notices, test.wantNotice)
 			}
-			if len(notices) == 1 && notices[0].Result.Status != session.RunInterrupted {
-				t.Fatalf("settled notice result = %+v", notices[0].Result)
+			if got := countEvents(events.events, EventRunFinished); got != test.wantNotice {
+				t.Fatalf("run_finished events = %d, want %d", got, test.wantNotice)
+			}
+			wantStatus := session.RunInterrupted
+			if test.listErr != nil {
+				wantStatus = session.RunFailed
+			}
+			if len(notices) == 1 && notices[0].Result.Status != wantStatus {
+				t.Fatalf("settled notice result = %+v, want %s", notices[0].Result, wantStatus)
 			}
 		})
 	}
+}
+
+func countEvents(events []Event, kind EventKind) int {
+	var count int
+	for _, event := range events {
+		if event.Kind == kind {
+			count++
+		}
+	}
+	return count
 }
 
 type runLifecycleStore struct {
 	*admissionStore
 	terminalFinishErr error
 	listErr           error
+}
+
+func (s *runLifecycleStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &runLifecycleExecution{ExecutionStore: s.admissionStore.Execution(fence), terminalFinishErr: s.terminalFinishErr}
+}
+
+type runLifecycleExecution struct {
+	session.ExecutionStore
+	terminalFinishErr error
+}
+
+func (s *runLifecycleExecution) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) error {
+	if run.Terminal() && s.terminalFinishErr != nil {
+		return s.terminalFinishErr
+	}
+	return s.ExecutionStore.SettleRun(ctx, run, event)
 }
 
 func (s *runLifecycleStore) FinishRun(ctx context.Context, run session.Run) error {

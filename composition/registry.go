@@ -145,7 +145,11 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 			return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, registration.Definition.Name)
 		}
 	}
-	registration.Definition = registration.Definition.Clone()
+	frozen, err := registration.Definition.Clone()
+	if err != nil {
+		return fmt.Errorf("freeze composed tool %q: %w", registration.Definition.Name, err)
+	}
+	registration.Definition = frozen
 	registration.Definition.Provenance = tools.Provenance{
 		InstanceID: r.component.InstanceID, ArtifactName: r.component.Artifact.Name,
 		ArtifactVersion: r.component.Artifact.Version, ArtifactHash: r.component.Artifact.Hash,
@@ -232,7 +236,11 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 		return nil, rollback(err)
 	}
 	for _, registration := range staged.tools {
-		registration.Definition = mountToolDefinition(extensionMount, registration.Definition)
+		registration.Definition, err = mountToolDefinition(extensionMount, registration.Definition)
+		if err != nil {
+			_ = extensionMount.Close(context.WithoutCancel(ctx))
+			return nil, err
+		}
 		r.tools = append(r.tools, mountedTool{ToolRegistration: registration, component: component})
 	}
 	for _, registration := range staged.prompts {
@@ -268,8 +276,11 @@ func (g mountedToolGuard) GuardTool(ctx context.Context, request runtime.ToolGua
 	return g.next.GuardTool(g.mount.CallbackContext(ctx), request)
 }
 
-func mountToolDefinition(mount *extension.Mount, definition tools.Definition) tools.Definition {
-	next := definition.Clone()
+func mountToolDefinition(mount *extension.Mount, definition tools.Definition) (tools.Definition, error) {
+	next, err := definition.Clone()
+	if err != nil {
+		return tools.Definition{}, err
+	}
 	if callback := next.Decode; callback != nil {
 		next.Decode = func(ctx context.Context, raw json.RawMessage) (any, error) {
 			return callback(mount.CallbackContext(ctx), raw)
@@ -290,7 +301,7 @@ func mountToolDefinition(mount *extension.Mount, definition tools.Definition) to
 			return callback(mount.CallbackContext(ctx), execution)
 		}
 	}
-	return next
+	return next, nil
 }
 
 func (r *Registry) validateTools(staged []ToolRegistration) error {
@@ -457,7 +468,16 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			dispatch.Release()
 			return nil, hashErr
 		}
-		frozen := tools.NewSnapshot([]tools.SnapshotEntry{{Registration: tools.Registration{Name: entry.Definition.Name, Generation: 1}, Definition: entry.Definition.Clone()}})
+		definition, cloneErr := entry.Definition.Clone()
+		if cloneErr != nil {
+			dispatch.Release()
+			return nil, cloneErr
+		}
+		frozen, freezeErr := tools.NewSnapshot([]tools.SnapshotEntry{{Registration: tools.Registration{Name: entry.Definition.Name, Generation: 1}, Definition: definition}})
+		if freezeErr != nil {
+			dispatch.Release()
+			return nil, freezeErr
+		}
 		planTools[index] = runtime.PlanTool{
 			Identity: session.ExtensionPlanEntry{
 				InstanceID: entry.InstanceID, Kind: session.ExtensionTool, Artifact: artifactIdentity(entry.component.Artifact), Required: true,

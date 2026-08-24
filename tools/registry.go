@@ -109,6 +109,10 @@ func (r *Registry) Register(definition Definition) (Registration, error) {
 	if err := ValidateDefinition(definition); err != nil {
 		return Registration{}, err
 	}
+	frozen, err := definition.Clone()
+	if err != nil {
+		return Registration{}, fmt.Errorf("%w: freeze %s: %v", ErrInvalidDefinition, definition.Name, err)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.defs == nil {
@@ -119,7 +123,7 @@ func (r *Registry) Register(definition Definition) (Registration, error) {
 	}
 	r.next++
 	registration := Registration{Name: definition.Name, Generation: r.next}
-	r.defs[definition.Name] = registered{definition: definition.Clone(), generation: registration.Generation}
+	r.defs[definition.Name] = registered{definition: frozen, generation: registration.Generation}
 	return registration, nil
 }
 
@@ -132,6 +136,10 @@ func (r *Registry) Replace(registration Registration, definition Definition) (Re
 	if registration.Name != definition.Name {
 		return Registration{}, fmt.Errorf("%w: registration %s cannot replace %s", ErrStaleRegistration, registration.Name, definition.Name)
 	}
+	frozen, err := definition.Clone()
+	if err != nil {
+		return Registration{}, fmt.Errorf("%w: freeze %s: %v", ErrInvalidDefinition, definition.Name, err)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	current, ok := r.defs[registration.Name]
@@ -140,7 +148,7 @@ func (r *Registry) Replace(registration Registration, definition Definition) (Re
 	}
 	r.next++
 	next := Registration{Name: definition.Name, Generation: r.next}
-	r.defs[definition.Name] = registered{definition: definition.Clone(), generation: next.Generation}
+	r.defs[definition.Name] = registered{definition: frozen, generation: next.Generation}
 	return next, nil
 }
 
@@ -167,14 +175,19 @@ type SnapshotEntry struct {
 type Snapshot struct{ entries []SnapshotEntry }
 
 // Snapshot returns every active definition ordered by registration generation.
-func (r *Registry) Snapshot() Snapshot {
+func (r *Registry) Snapshot() (Snapshot, error) {
 	if r == nil {
-		return Snapshot{}
+		return Snapshot{}, nil
 	}
 	r.mu.RLock()
 	entries := make([]SnapshotEntry, 0, len(r.defs))
 	for name, entry := range r.defs {
-		entries = append(entries, SnapshotEntry{Registration: Registration{Name: name, Generation: entry.generation}, Definition: entry.definition.Clone()})
+		definition, err := entry.definition.Clone()
+		if err != nil {
+			r.mu.RUnlock()
+			return Snapshot{}, fmt.Errorf("freeze snapshot tool %q: %w", name, err)
+		}
+		entries = append(entries, SnapshotEntry{Registration: Registration{Name: name, Generation: entry.generation}, Definition: definition})
 	}
 	r.mu.RUnlock()
 	sort.Slice(entries, func(i, j int) bool {
@@ -183,24 +196,32 @@ func (r *Registry) Snapshot() Snapshot {
 		}
 		return entries[i].Registration.Name < entries[j].Registration.Name
 	})
-	return Snapshot{entries: entries}
+	return Snapshot{entries: entries}, nil
 }
 
 // Entries returns a defensive copy of the frozen generations.
-func (s Snapshot) Entries() []SnapshotEntry {
+func (s Snapshot) Entries() ([]SnapshotEntry, error) {
 	result := make([]SnapshotEntry, len(s.entries))
 	for index, entry := range s.entries {
-		result[index] = SnapshotEntry{Registration: entry.Registration, Definition: entry.Definition.Clone()}
+		definition, err := entry.Definition.Clone()
+		if err != nil {
+			return nil, fmt.Errorf("clone snapshot tool %q: %w", entry.Registration.Name, err)
+		}
+		result[index] = SnapshotEntry{Registration: entry.Registration, Definition: definition}
 	}
-	return result
+	return result, nil
 }
 
 // NewSnapshot builds a frozen snapshot from entries supplied by a composition
 // coordinator. Entries are sorted by generation and name.
-func NewSnapshot(entries []SnapshotEntry) Snapshot {
+func NewSnapshot(entries []SnapshotEntry) (Snapshot, error) {
 	next := make([]SnapshotEntry, len(entries))
 	for index, entry := range entries {
-		next[index] = SnapshotEntry{Registration: entry.Registration, Definition: entry.Definition.Clone()}
+		definition, err := entry.Definition.Clone()
+		if err != nil {
+			return Snapshot{}, fmt.Errorf("freeze snapshot tool %q: %w", entry.Registration.Name, err)
+		}
+		next[index] = SnapshotEntry{Registration: entry.Registration, Definition: definition}
 	}
 	sort.Slice(next, func(i, j int) bool {
 		if next[i].Registration.Generation != next[j].Registration.Generation {
@@ -208,7 +229,7 @@ func NewSnapshot(entries []SnapshotEntry) Snapshot {
 		}
 		return next[i].Registration.Name < next[j].Registration.Name
 	})
-	return Snapshot{entries: next}
+	return Snapshot{entries: next}, nil
 }
 
 // ResolveTools materializes from the immutable snapshot.
@@ -221,7 +242,15 @@ func (s Snapshot) ResolveTools(ctx context.Context, scope runtime.ToolScopeConte
 	result := make([]runtime.Tool, 0, len(s.entries))
 	for _, entry := range s.entries {
 		if includeTool(entry.Definition.Name, enabled, disabled) {
-			result = append(result, materialize(entry.Definition.Clone(), scope.Clone()))
+			definition, err := entry.Definition.Clone()
+			if err != nil {
+				return nil, fmt.Errorf("clone snapshot tool %q: %w", entry.Definition.Name, err)
+			}
+			tool, err := materialize(definition, scope.Clone())
+			if err != nil {
+				return nil, fmt.Errorf("materialize snapshot tool %q: %w", entry.Definition.Name, err)
+			}
+			result = append(result, tool)
 		}
 	}
 	return result, nil
@@ -229,16 +258,24 @@ func (s Snapshot) ResolveTools(ctx context.Context, scope runtime.ToolScopeConte
 
 // ResolveTools materializes enabled tools for a bounded scope context.
 func (r *Registry) ResolveTools(ctx context.Context, scope runtime.ToolScopeContext) ([]runtime.Tool, error) {
-	return r.Snapshot().ResolveTools(ctx, scope)
+	snapshot, err := r.Snapshot()
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.ResolveTools(ctx, scope)
 }
 
 // Clone returns a defensive copy of definition containers.
-func (d Definition) Clone() Definition {
+func (d Definition) Clone() (Definition, error) {
 	next := d
-	next.Parameters = cloneParamsOneOf(d.Parameters)
+	parameters, err := cloneParamsOneOfChecked(d.Parameters)
+	if err != nil {
+		return Definition{}, err
+	}
+	next.Parameters = parameters
 	next.Permissions = cloneSlice(d.Permissions)
 	next.Metadata = cloneStringMap(d.Metadata)
-	return next
+	return next, nil
 }
 
 // ValidateDefinition reports whether definition can be safely registered and
@@ -272,7 +309,7 @@ func validateParameters(parameters *einoschema.ParamsOneOf) (err error) {
 	return err
 }
 
-func materialize(definition Definition, context runtime.ToolScopeContext) runtime.Tool {
+func materialize(definition Definition, context runtime.ToolScopeContext) (runtime.Tool, error) {
 	scope := runtime.ToolScope{}
 	if definition.Scope != nil {
 		scope = definition.Scope(context.Clone())
@@ -286,20 +323,32 @@ func materialize(definition Definition, context runtime.ToolScopeContext) runtim
 	if len(scope.Permissions) == 0 {
 		scope.Permissions = cloneSlice(definition.Permissions)
 	}
+	executorDefinition, err := definition.Clone()
+	if err != nil {
+		return runtime.Tool{}, err
+	}
+	decoderDefinition, err := definition.Clone()
+	if err != nil {
+		return runtime.Tool{}, err
+	}
+	parameters, err := cloneParamsOneOfChecked(definition.Parameters)
+	if err != nil {
+		return runtime.Tool{}, err
+	}
 	return runtime.Tool{
 		Name: definition.Name,
 		Info: &einoschema.ToolInfo{
 			Name:        definition.Name,
 			Desc:        definition.Description,
-			ParamsOneOf: cloneParamsOneOf(definition.Parameters),
+			ParamsOneOf: parameters,
 		},
-		Executor:     &toolExecutor{definition: definition.Clone(), scope: context.Clone()},
+		Executor:     &toolExecutor{definition: executorDefinition, scope: context.Clone()},
 		RetrySafe:    definition.RetrySafe,
 		Scope:        cloneScope(scope),
-		InputDecoder: &toolDecoder{definition: definition.Clone()},
+		InputDecoder: &toolDecoder{definition: decoderDefinition},
 		Retention:    definition.Retention,
 		Metadata:     cloneStringMap(definition.Metadata),
-	}
+	}, nil
 }
 
 type toolDecoder struct {
@@ -405,14 +454,6 @@ func normalizeInput(ctx context.Context, definition Definition, decoded any) (js
 		return nil, err
 	}
 	return encoded, nil
-}
-
-func cloneParamsOneOf(src *einoschema.ParamsOneOf) *einoschema.ParamsOneOf {
-	cloned, err := cloneParamsOneOfChecked(src)
-	if err != nil {
-		return src
-	}
-	return cloned
 }
 
 func cloneParamsOneOfChecked(src *einoschema.ParamsOneOf) (*einoschema.ParamsOneOf, error) {

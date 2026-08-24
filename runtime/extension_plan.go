@@ -197,7 +197,11 @@ func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContex
 		}
 		seen[tool.Name] = true
 		if planToolAllowed(tool.Name, s.restrictions) {
-			result = append(result, cloneTool(tool))
+			cloned, cloneErr := cloneToolChecked(tool)
+			if cloneErr != nil {
+				return nil, fmt.Errorf("freeze resolved tool %q: %w", tool.Name, cloneErr)
+			}
+			result = append(result, cloned)
 		}
 	}
 	return result, nil

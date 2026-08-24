@@ -52,7 +52,7 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 	if _, err := st.CreateSession(ctx, session.Session{ID: "session-claim", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := st.AdmitRun(ctx, session.Run{ID: "run-claim", SessionID: "session-claim", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+	if _, err := st.AdmitRun(ctx, session.Run{ID: "run-claim", SessionID: "session-claim", OwnerID: "owner", ClaimToken: "claim-run", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
 	if _, err := st.AppendMessage(ctx, session.Message{ID: "msg-claim", SessionID: "session-claim", RunID: "run-claim", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -272,28 +272,159 @@ func TestFinishRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 	if _, err := st.CreateSession(ctx, session.Session{ID: "session-run", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	run, err := st.AdmitRun(ctx, session.Run{ID: "run-finish", SessionID: "session-run", OwnerID: "owner", Status: session.RunPending, CreatedAt: now})
+	run, err := st.AdmitRun(ctx, session.Run{ID: "run-finish", SessionID: "session-run", OwnerID: "owner", ClaimToken: "claim-finish", Status: session.RunPending, CreatedAt: now}, time.Minute)
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
 	run.Status = session.RunCompleted
 	run.FinishedAt = now.Add(time.Second)
-	if err := st.FinishRun(ctx, run); err != nil {
+	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if err := execution.SettleRun(ctx, run, nil); err != nil {
 		t.Fatalf("finish run: %v", err)
 	}
-	if err := st.FinishRun(ctx, run); err != nil {
+	if err := execution.SettleRun(ctx, run, nil); err != nil {
 		t.Fatalf("idempotent finish run: %v", err)
 	}
 	conflict := run
 	conflict.Status = session.RunFailed
 	conflict.Error = "different"
-	if err := st.FinishRun(ctx, conflict); !errors.Is(err, session.ErrConflict) {
+	if err := execution.SettleRun(ctx, conflict, nil); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("conflicting finish err = %v, want ErrConflict", err)
 	}
 	stale := run
 	stale.Status = session.RunRunning
-	if err := st.FinishRun(ctx, stale); !errors.Is(err, session.ErrConflict) {
+	if err := execution.SettleRun(ctx, stale, nil); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale nonterminal update err = %v, want ErrConflict", err)
+	}
+}
+
+func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st, err := Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	now := time.Now().UTC()
+	if _, err := st.CreateSession(ctx, session.Session{ID: "claim-session", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.AdmitRun(ctx, session.Run{ID: "claim-run", SessionID: "claim-session", OwnerID: "old-owner", ClaimToken: "old-token", Status: session.RunPending, CreatedAt: now}, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldExecution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	time.Sleep(3 * time.Millisecond)
+
+	type claimResult struct {
+		run session.Run
+		err error
+	}
+	results := make(chan claimResult, 2)
+	for _, token := range []string{"new-token-a", "new-token-b"} {
+		token := token
+		go func() {
+			claimed, claimErr := st.ClaimRun(ctx, session.RunClaim{RunID: run.ID, OwnerID: token, ClaimToken: token, LeaseDuration: time.Minute})
+			results <- claimResult{run: claimed, err: claimErr}
+		}()
+	}
+	var winner session.Run
+	var losses int
+	for range 2 {
+		result := <-results
+		if result.err == nil {
+			winner = result.run
+		} else if errors.Is(result.err, session.ErrSessionBusy) || errors.Is(result.err, session.ErrConflict) {
+			losses++
+		} else {
+			t.Fatalf("ClaimRun error = %v", result.err)
+		}
+	}
+	if winner.ClaimToken == "" || winner.ClaimToken == run.ClaimToken || losses != 1 {
+		t.Fatalf("winner = %+v, losses = %d", winner, losses)
+	}
+	if _, err := oldExecution.AppendMessage(ctx, session.Message{ID: "stale-message", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale AppendMessage error = %v", err)
+	}
+	stalePart := session.Part{ID: "stale-part", MessageID: "stale-message", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, CreatedAt: now, UpdatedAt: now}
+	if _, err := oldExecution.AppendPart(ctx, stalePart); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale AppendPart error = %v", err)
+	}
+	if err := oldExecution.UpdatePart(ctx, stalePart); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale UpdatePart error = %v", err)
+	}
+	if _, err := oldExecution.AppendEvent(ctx, session.EventRecord{ID: "stale-event", SessionID: run.SessionID, RunID: run.ID, Kind: "stale", CreatedAt: now}); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale AppendEvent error = %v", err)
+	}
+	staleCall := session.ToolCall{ID: "stale-call", SessionID: run.SessionID, RunID: run.ID, MessageID: "stale-message", Status: session.ToolCallPending}
+	if _, err := oldExecution.CreateToolCall(ctx, staleCall); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale CreateToolCall error = %v", err)
+	}
+	if _, err := oldExecution.ClaimToolCall(ctx, staleCall, time.Minute); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale ClaimToolCall error = %v", err)
+	}
+	if err := oldExecution.SettleToolCall(ctx, session.ToolSettlement{ID: staleCall.ID}); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale SettleToolCall error = %v", err)
+	}
+	staleEpoch := session.ContextEpoch{ID: "stale-epoch", SessionID: run.SessionID, CreatedAt: now}
+	if _, err := oldExecution.StartContextEpoch(ctx, staleEpoch); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale StartContextEpoch error = %v", err)
+	}
+	if err := oldExecution.FinishContextEpoch(ctx, staleEpoch); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale FinishContextEpoch error = %v", err)
+	}
+	staleRequest := session.ModelRequestRecord{ID: "stale-request", SessionID: run.SessionID, RunID: run.ID, CreatedAt: now, UpdatedAt: now}
+	if _, err := oldExecution.CreateModelRequest(ctx, staleRequest); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale CreateModelRequest error = %v", err)
+	}
+	if err := oldExecution.UpdateModelRequest(ctx, staleRequest); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale UpdateModelRequest error = %v", err)
+	}
+	if _, err := oldExecution.StartRun(ctx, now); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale StartRun error = %v", err)
+	}
+	if _, err := oldExecution.RenewRunLease(ctx, time.Minute); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale RenewRunLease error = %v", err)
+	}
+	staleRun := winner
+	staleRun.ClaimToken = run.ClaimToken
+	staleRun.Status = session.RunCompleted
+	staleRun.FinishedAt = time.Now().UTC()
+	if err := oldExecution.SettleRun(ctx, staleRun, nil); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("stale SettleRun error = %v", err)
+	}
+	if batch, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{}); err != nil || len(batch.Messages) != 0 || len(batch.Parts) != 0 {
+		t.Fatalf("stale history persisted: messages=%d parts=%d err=%v", len(batch.Messages), len(batch.Parts), err)
+	}
+	if batch, err := st.ListEvents(ctx, run.SessionID, session.EventCursor{}); err != nil || len(batch.Events) != 0 {
+		t.Fatalf("stale events persisted: events=%d err=%v", len(batch.Events), err)
+	}
+	if _, err := st.GetToolCall(ctx, staleCall.ID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("stale tool call persisted: %v", err)
+	}
+	if _, err := st.GetModelRequest(ctx, staleRequest.ID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("stale model request persisted: %v", err)
+	}
+	if epochs, err := st.ListContextEpochs(ctx, run.SessionID); err != nil || len(epochs) != 0 {
+		t.Fatalf("stale epoch persisted: epochs=%d err=%v", len(epochs), err)
+	}
+	currentExecution := st.Execution(session.RunFence{RunID: winner.ID, ClaimToken: winner.ClaimToken})
+	if _, err := currentExecution.AppendMessage(ctx, session.Message{ID: "foreign-message", SessionID: "another-session", RunID: winner.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("cross-session AppendMessage error = %v", err)
+	}
+	if _, err := currentExecution.StartContextEpoch(ctx, session.ContextEpoch{ID: "foreign-epoch", SessionID: "another-session", CreatedAt: now}); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("cross-session StartContextEpoch error = %v", err)
+	}
+	foreignSettlement := winner
+	foreignSettlement.SessionID = "another-session"
+	foreignSettlement.Status = session.RunCompleted
+	foreignSettlement.FinishedAt = now
+	if err := currentExecution.SettleRun(ctx, foreignSettlement, nil); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("cross-session SettleRun error = %v", err)
+	}
+	if _, err := currentExecution.AppendMessage(ctx, session.Message{ID: "winner-message", SessionID: winner.SessionID, RunID: winner.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("winner AppendMessage: %v", err)
 	}
 }
 
@@ -334,24 +465,63 @@ func TestOpenRejectsUnsupportedSchemaVersion(t *testing.T) {
 	}
 }
 
-func TestOpenUpgradesVersionOneDatabase(t *testing.T) {
+func TestOpenRejectsIncompleteVersionOneDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(migration001); err != nil {
+	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_version(version, applied_at) VALUES (1, 'now');`); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
 	store, err := Open(context.Background(), path)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("Open succeeded for incomplete schema")
 	}
-	defer func() { _ = store.Close() }()
-	var version int
-	if err := store.db.QueryRow(`SELECT MAX(version) FROM schema_version`).Scan(&version); err != nil || version != 2 {
-		t.Fatalf("version = %d, %v", version, err)
+	if !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("Open err = %v, want ErrConflict", err)
+	}
+}
+
+func TestOpenRejectsVersionOneSchemaDrift(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate string
+	}{
+		{name: "extra column", mutate: `ALTER TABLE sessions ADD COLUMN legacy TEXT`},
+		{name: "missing index", mutate: `DROP INDEX events_replay_idx`},
+		{name: "extra object", mutate: `CREATE TABLE legacy_state(id TEXT PRIMARY KEY)`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "store.db")
+			store, err := Open(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(test.mutate); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err = Open(context.Background(), path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatal("Open succeeded for drifted current-version schema")
+			}
+			if !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("Open err = %v, want ErrConflict", err)
+			}
+		})
 	}
 }
 
@@ -366,7 +536,7 @@ func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "ledger-session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "ledger-run", SessionID: "ledger-session", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+	if _, err := store.AdmitRun(ctx, session.Run{ID: "ledger-run", SessionID: "ledger-session", OwnerID: "owner", ClaimToken: "claim-ledger", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 	for index := 1; index <= 2; index++ {
@@ -416,7 +586,7 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
 		_ = st.Close()
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := st.AdmitRun(ctx, session.Run{ID: "run-tool", SessionID: "session-tool", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+	if _, err := st.AdmitRun(ctx, session.Run{ID: "run-tool", SessionID: "session-tool", OwnerID: "owner", ClaimToken: "claim-tool-run", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
 		_ = st.Close()
 		t.Fatalf("admit run: %v", err)
 	}

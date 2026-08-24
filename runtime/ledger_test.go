@@ -269,6 +269,22 @@ type dispatchStartFailingStore struct {
 	err error
 }
 
+func (s *dispatchStartFailingStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &dispatchStartFailingExecution{ExecutionStore: s.Store.Execution(fence), err: s.err}
+}
+
+type dispatchStartFailingExecution struct {
+	session.ExecutionStore
+	err error
+}
+
+func (s *dispatchStartFailingExecution) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
+	if record.State == session.ModelRequestDispatchStarted {
+		return s.err
+	}
+	return s.ExecutionStore.UpdateModelRequest(ctx, record)
+}
+
 func (s *dispatchStartFailingStore) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
 	if record.State == session.ModelRequestDispatchStarted {
 		return s.err

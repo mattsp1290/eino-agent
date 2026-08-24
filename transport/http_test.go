@@ -225,7 +225,7 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-http", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "run-http", SessionID: "session-http", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+	if _, err := store.AdmitRun(ctx, session.Run{ID: "run-http", SessionID: "session-http", OwnerID: "owner", ClaimToken: "claim-http", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
 	if _, err := store.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {

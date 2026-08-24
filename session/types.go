@@ -79,6 +79,7 @@ type Run struct {
 	ParentRunID   RunID
 	ParentMsgID   MessageID
 	OwnerID       string
+	ClaimToken    string
 	LeaseUntil    time.Time
 	Agent         string
 	ProviderID    string
@@ -92,6 +93,21 @@ type Run struct {
 	StartedAt     time.Time
 	FinishedAt    time.Time
 	Error         string
+}
+
+// RunFence identifies the one execution currently authorized to mutate a run.
+type RunFence struct {
+	RunID      RunID
+	ClaimToken string
+}
+
+// RunClaim requests atomic ownership of an expired nonterminal run. Stores use
+// their own clock to compare expiry and stamp the returned lease deadline.
+type RunClaim struct {
+	RunID         RunID
+	OwnerID       string
+	ClaimToken    string
+	LeaseDuration time.Duration
 }
 
 // Terminal reports whether the run no longer owns execution.
@@ -323,25 +339,35 @@ type Store interface {
 	// AdmitRun atomically creates a run and makes it the active owner for its
 	// session. Implementations return ErrSessionBusy when another nonterminal
 	// run owns the session.
-	AdmitRun(ctx context.Context, run Run) (Run, error)
+	AdmitRun(ctx context.Context, run Run, leaseDuration time.Duration) (Run, error)
+	ClaimRun(ctx context.Context, claim RunClaim) (Run, error)
+	Execution(fence RunFence) ExecutionStore
 	GetRun(ctx context.Context, id RunID) (Run, error)
 	ActiveRun(ctx context.Context, sessionID ID) (Run, error)
 	ListUnfinishedRuns(ctx context.Context) ([]Run, error)
-	RenewRunLease(ctx context.Context, runID RunID, ownerID string, until time.Time) error
-	FinishRun(ctx context.Context, run Run) error
+	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
+	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
+	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
+	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
+}
+
+// ExecutionStore is the run-fenced mutation capability used after admission or
+// resume. Implementations must verify the fence atomically with every write.
+type ExecutionStore interface {
+	WithinTx(ctx context.Context, fn func(context.Context, ExecutionStore) error) error
+	StartRun(ctx context.Context, startedAt time.Time) (Run, error)
+	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
+	SettleRun(ctx context.Context, run Run, finalEvent *EventRecord) error
 	AppendMessage(ctx context.Context, message Message) (Message, error)
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
-	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
 	AppendEvent(ctx context.Context, event EventRecord) (EventRecord, error)
-	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
 	CreateToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
-	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
-	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
-	ClaimToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
+	ClaimToolCall(ctx context.Context, call ToolCall, leaseDuration time.Duration) (ToolCall, error)
 	SettleToolCall(ctx context.Context, settlement ToolSettlement) error
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
+	ModelRequestStore
 }
 
 // ContextEpochReader replays durable context epoch records for audit and

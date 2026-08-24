@@ -274,7 +274,9 @@ type Event struct {
 	LiveOnly    bool
 }
 
-// EventSink receives internal runtime events.
+// EventSink receives transport and observability copies of internal runtime
+// events. It has no durable-store authority; runtime persists durable events
+// through the current run's fenced ExecutionStore before publication.
 type EventSink interface {
 	Emit(ctx context.Context, event Event) error
 }

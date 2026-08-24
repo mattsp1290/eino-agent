@@ -139,7 +139,7 @@ func secureModulePath(root, path string) (string, error) {
 	return candidateReal, nil
 }
 
-func (m *module) call(ctx context.Context, operation string, inputBytes int, input, output any) error {
+func (m *module) call(ctx context.Context, operation string, inputBytes int, invoke func(context.Context) error) error {
 	if int64(inputBytes) > m.limits.MaxInputBytes {
 		return extensionError(ErrorSize, m.identity, operation, errors.New("input exceeds bound"))
 	}
@@ -166,7 +166,7 @@ func (m *module) call(ctx context.Context, operation string, inputBytes int, inp
 	callCtx, cancel := context.WithTimeout(ctx, m.limits.Timeout)
 	defer cancel()
 	done := make(chan error, 1)
-	go func() { done <- m.component.Call(callCtx, operation, input, output) }()
+	go func() { done <- invoke(callCtx) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -185,6 +185,15 @@ func (m *module) call(ctx context.Context, operation string, inputBytes int, inp
 		}
 		return extensionError(ErrorTimeout, m.identity, operation, callCtx.Err())
 	}
+}
+
+func componentAs[T any](m *module, operation string) (T, error) {
+	var zero T
+	component, ok := any(m.component).(T)
+	if !ok {
+		return zero, extensionError(ErrorContract, m.identity, operation, errors.New("compiled component does not implement world interface"))
+	}
+	return component, nil
 }
 
 func (m *module) Close() error {

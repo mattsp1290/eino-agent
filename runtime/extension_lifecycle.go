@@ -115,20 +115,6 @@ func infallibleClone[T any](clone func(T) T) extension.CloneFunc[T] {
 	return func(value T) (T, error) { return clone(value), nil }
 }
 
-type compositeEventSink struct {
-	infrastructure EventSink
-	plan           *extension.Plan
-}
-
-func (s compositeEventSink) Emit(ctx context.Context, event Event) error {
-	var err error
-	if s.infrastructure != nil {
-		err = s.infrastructure.Emit(ctx, cloneEvent(event))
-	}
-	_ = extension.Notify(s.plan, ctx, EventPublishedPoint, event)
-	return err
-}
-
 func cloneRunAdmittedNotice(value RunAdmittedNotice) RunAdmittedNotice {
 	value.Plan = value.Plan.Clone()
 	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)

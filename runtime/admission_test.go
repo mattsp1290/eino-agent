@@ -312,6 +312,7 @@ func admissionRequest() AdmissionRequest {
 			AssistantMessageID: "assistant-1",
 			ContextEpochID:     "epoch-1",
 			EventID:            "event-1",
+			RunClaimToken:      "claim-run-1",
 		},
 		ParentMessageID: "user-1",
 		Config: config.Snapshot{
@@ -339,6 +340,7 @@ func admissionRequest() AdmissionRequest {
 		},
 		Input:         []*einoschema.Message{{Role: "user", Content: "hello"}},
 		OwnerID:       "owner-1",
+		LeaseDuration: time.Minute,
 		Metadata:      map[string]string{"request": "admission"},
 		ExtensionPlan: emptyExtensionPlanDescriptor(),
 	}
@@ -435,7 +437,7 @@ func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.S
 
 func (s *admissionStore) UpdateSession(context.Context, session.Session) error { return nil }
 
-func (s *admissionStore) AdmitRun(_ context.Context, run session.Run) (session.Run, error) {
+func (s *admissionStore) AdmitRun(_ context.Context, run session.Run, leaseDuration time.Duration) (session.Run, error) {
 	if existing, ok := s.runs[run.ID]; ok {
 		if sameRun(existing, run) {
 			return existing, nil
@@ -447,8 +449,29 @@ func (s *admissionStore) AdmitRun(_ context.Context, run session.Run) (session.R
 			return session.Run{}, session.ErrSessionBusy
 		}
 	}
+	run.LeaseUntil = time.Now().UTC().Add(leaseDuration)
 	s.runs[run.ID] = run
 	return run, nil
+}
+
+func (s *admissionStore) ClaimRun(_ context.Context, claim session.RunClaim) (session.Run, error) {
+	run, ok := s.runs[claim.RunID]
+	if !ok {
+		return session.Run{}, session.ErrNotFound
+	}
+	if run.Terminal() || run.LeaseUntil.After(time.Now().UTC()) {
+		return session.Run{}, session.ErrSessionBusy
+	}
+	run.OwnerID = claim.OwnerID
+	run.ClaimToken = claim.ClaimToken
+	run.Status = session.RunRunning
+	run.LeaseUntil = time.Now().UTC().Add(claim.LeaseDuration)
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *admissionStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &fakeExecutionStore{admissionStore: s, fence: fence}
 }
 
 func (s *admissionStore) GetRun(_ context.Context, id session.RunID) (session.Run, error) {
@@ -665,6 +688,7 @@ func sameRun(left session.Run, right session.Run) bool {
 		left.SessionID == right.SessionID &&
 		left.ParentMsgID == right.ParentMsgID &&
 		left.OwnerID == right.OwnerID &&
+		left.ClaimToken == right.ClaimToken &&
 		left.Agent == right.Agent &&
 		left.ProviderID == right.ProviderID &&
 		left.ModelID == right.ModelID &&
@@ -686,3 +710,78 @@ func sameEpoch(left session.ContextEpoch, right session.ContextEpoch) bool {
 		left.Reason == right.Reason &&
 		left.NextAction == right.NextAction
 }
+
+type fakeExecutionStore struct {
+	*admissionStore
+	fence session.RunFence
+}
+
+func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Context, session.ExecutionStore) error) error {
+	return fn(ctx, s)
+}
+
+func (s *fakeExecutionStore) valid() bool {
+	run, ok := s.runs[s.fence.RunID]
+	return ok && !run.Terminal() && run.ClaimToken == s.fence.ClaimToken
+}
+
+func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (session.Run, error) {
+	if !s.valid() {
+		return session.Run{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	run.Status = session.RunRunning
+	run.StartedAt = startedAt
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Duration) (session.Run, error) {
+	if !s.valid() {
+		return session.Run{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	run.LeaseUntil = time.Now().UTC().Add(duration)
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *fakeExecutionStore) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) error {
+	if !s.valid() || run.ID != s.fence.RunID || run.ClaimToken != s.fence.ClaimToken {
+		return session.ErrConflict
+	}
+	if err := s.FinishRun(ctx, run); err != nil {
+		return err
+	}
+	if event != nil {
+		_, err := s.AppendEvent(ctx, *event)
+		return err
+	}
+	return nil
+}
+
+func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, call session.ToolCall, duration time.Duration) (session.ToolCall, error) {
+	if !s.valid() {
+		return session.ToolCall{}, session.ErrConflict
+	}
+	call.LeaseUntil = time.Now().UTC().Add(duration)
+	return s.admissionStore.ClaimToolCall(ctx, call)
+}
+
+func (s *fakeExecutionStore) CreateModelRequest(context.Context, session.ModelRequestRecord) (session.ModelRequestRecord, error) {
+	return session.ModelRequestRecord{}, session.ErrNotFound
+}
+
+func (s *fakeExecutionStore) UpdateModelRequest(context.Context, session.ModelRequestRecord) error {
+	return session.ErrNotFound
+}
+
+func (s *fakeExecutionStore) GetModelRequest(context.Context, session.ModelRequestID) (session.ModelRequestRecord, error) {
+	return session.ModelRequestRecord{}, session.ErrNotFound
+}
+
+func (s *fakeExecutionStore) ListModelRequests(context.Context, session.RunID, session.ModelRequestCursor) (session.ModelRequestBatch, error) {
+	return session.ModelRequestBatch{}, nil
+}
+
+var _ session.ExecutionStore = (*fakeExecutionStore)(nil)

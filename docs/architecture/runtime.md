@@ -104,8 +104,12 @@ Store implementations must provide these invariants:
 - only one nonterminal run owns a session unless a future branch design
   explicitly allows parallel ownership;
 - `ErrSessionBusy` is returned when admission conflicts with an active owner;
-- leases and owner IDs support stale-owner detection without relying on process
-  IDs alone;
+- each execution has a unique claim token; owner IDs are diagnostic labels and
+  never grant mutation authority;
+- the store clock stamps and compares run/tool leases, while a run heartbeat
+  renews the lease during long model and tool calls;
+- resume atomically replaces the token only after the store-timed lease expires,
+  and stale-token writes return `session.ErrConflict`;
 - replay reads come from messages and parts, not from captured SSE frames;
 - unfinished runs and tool calls can be detected after restart;
 - non-idempotent unfinished tool calls are not automatically rerun.
@@ -133,11 +137,14 @@ Config reloads, composition mount changes, and user follow-ups affect future
 turn snapshots only. They do not mutate an in-flight model call.
 
 Each fresh or resumed run also owns an explicit internal execution object. It
-holds the frozen `RunPlan`, extension dispatch, and composed event sink and is
+holds the frozen `RunPlan`, extension dispatch, composed event sink, and the
+`session.ExecutionStore` capability bound to the current run claim token, and is
 passed through admission, request-ledger, model, tool, settlement, and resume
 boundaries. Run-plan state is never hidden in `context.Context`; contexts carry
 cancellation and deadlines only. The execution object releases its frozen plan
-exactly once when the run goroutine exits.
+exactly once when the run goroutine exits. The scoped store fences history,
+event, model-ledger, tool, context-epoch, lease, and terminal writes. Terminal
+run state and its final durable event commit atomically before live notification.
 
 Compaction creates a new `session.ContextEpoch`. A context epoch records the
 parent epoch, summarized message range, summary message, retained tail start,
@@ -160,8 +167,10 @@ AG-UI adapters should:
 - persist settled message/part snapshots separately from SSE delivery state;
 - expose replay and live-tail APIs that are explicit about this distinction.
 
-The durable store should not persist old SSE frames as the replay source of
-truth.
+The runtime persists non-live event projections through the current fenced
+execution capability before publication. External `EventSink` adapters are
+transport/observability consumers only and have no store mutation authority.
+Live-only SSE frames are not persisted as the replay source of truth.
 
 ## Tool Lifecycle
 
@@ -255,6 +264,9 @@ Host applications embed the runtime by providing:
 - a `runtime.RunPlanProvider`, normally `composition.Registry`, for tools,
   prompts, guards, and typed extension handlers;
 - one or more `runtime.EventSink` adapters for AG-UI and observability.
+
+Event sinks receive copies only after any required durable write; they must not
+write session state themselves.
 
 The host remains responsible for HTTP routing, authentication, tenancy,
 deployment-specific config discovery, concrete database selection, and UI
