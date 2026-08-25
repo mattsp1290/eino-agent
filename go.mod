@@ -9,7 +9,7 @@ require (
 	github.com/mattsp1290/eino-agent/wasmext/gen v0.0.0
 	github.com/mattsp1290/eino-agui v0.1.1
 	github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b
-	github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b
+	github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2
 	modernc.org/sqlite v1.53.0
 )
 

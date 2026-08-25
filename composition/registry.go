@@ -27,11 +27,13 @@ func (f InstallerFunc) Install(ctx context.Context, registrar *Registrar) error 
 }
 
 type ToolRegistration struct {
-	ID         string
-	InstanceID string
-	Order      int
-	Scope      extension.Scope
-	Definition tools.Definition
+	ID                 string
+	InstanceID         string
+	Order              int
+	Scope              extension.Scope
+	SourceSchemaHash   string
+	SourceExecutorHash string
+	Definition         tools.Definition
 }
 
 type PromptRegistration struct {
@@ -140,6 +142,9 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 	if err := tools.ValidateDefinition(registration.Definition); err != nil {
 		return err
 	}
+	if err := validateToolSourceIdentity(registration.SourceSchemaHash, registration.SourceExecutorHash); err != nil {
+		return err
+	}
 	for _, existing := range r.tools {
 		if existing.Scope == registration.Scope && existing.Definition.Name == registration.Definition.Name {
 			return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, registration.Definition.Name)
@@ -150,10 +155,14 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 		return fmt.Errorf("freeze composed tool %q: %w", registration.Definition.Name, err)
 	}
 	registration.Definition = frozen
+	executorHash, err := composedToolExecutorHash(registration.SourceExecutorHash, r.component.Artifact.Hash)
+	if err != nil {
+		return err
+	}
 	registration.Definition.Provenance = tools.Provenance{
 		InstanceID: r.component.InstanceID, ArtifactName: r.component.Artifact.Name,
 		ArtifactVersion: r.component.Artifact.Version, ArtifactHash: r.component.Artifact.Hash,
-		ConfigHash: r.component.Artifact.ConfigHash, ExecutorHash: r.component.Artifact.Hash,
+		ConfigHash: r.component.Artifact.ConfigHash, ExecutorHash: executorHash,
 	}
 	if err := r.extensions.Lease(registration.Scope); err != nil {
 		return err
@@ -483,7 +492,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	restrictions := selectRestrictions(r.restrictions, target, instances)
 	planTools := make([]runtime.PlanTool, len(selected))
 	for index, entry := range selected {
-		schemaHash, hashErr := toolSchemaHash(entry.Definition)
+		schemaHash, hashErr := composedToolSchemaHash(entry.ToolRegistration)
 		if hashErr != nil {
 			dispatch.Release()
 			return nil, hashErr

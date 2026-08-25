@@ -77,8 +77,8 @@ github.com/mattsp1290/eino-agui v0.1.1 h1:rCbvp7SLOh4lNmQSXGMFs8KF2azgOR9+w7TJxr
 github.com/mattsp1290/eino-agui v0.1.1/go.mod h1:fQDZcRInNsi7lgYf6kH6v4O1qTZN6DmlV8pOPh1I+qA=
 github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b h1:Wk0c8Baxm8DgT3B7iWPaOP1k2QKAoc20Wv6dEvebepc=
 github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b/go.mod h1:h2idE8ypJFzcq4eOKOXGPrx56UyhI+UwKkFUyN4L0o8=
-github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b h1:+OT6RE/DFrNxEEqjqv38Jbar40emDOXuBlsiW/LiujI=
-github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b/go.mod h1:4S9/M93yJeu7UPPR8r2W5t+k+V6FJtQcS/Fy04qUgGA=
+github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2 h1:vcAOW8f7dWOs3g6IwgKMTvYGpXGaSplaNrcXSh0K2Ko=
+github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2/go.mod h1:4S9/M93yJeu7UPPR8r2W5t+k+V6FJtQcS/Fy04qUgGA=
 github.com/mgutz/ansi v0.0.0-20170206155736-9520e82c474b h1:j7+1HpAFS1zy5+Q4qx1fWh90gTKwiN4QCGoY9TWyyO4=
 github.com/mgutz/ansi v0.0.0-20170206155736-9520e82c474b/go.mod h1:01TrycV0kFyexm33Z7vhZRXopbI8J3TDReVlkTgMUxE=
 github.com/modern-go/concurrent v0.0.0-20180228061459-e0a39a4cb421/go.mod h1:6dJC0mAP4ikYIbvyc7fijjWJddQyLn8Ig3JB5CqoB9Q=

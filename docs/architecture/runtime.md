@@ -44,7 +44,8 @@ thin:
 
 - `agui` or `transport/agui`: HTTP/SSE admission and replay/tail APIs that use
   `eino-agui`.
-- `tools`: adapters that wrap `eino-tools` packages in `runtime.Tool`.
+- `tools/einotools`: composition-native translation of the deterministic
+  `eino-tools/catalog` bundle into frozen `runtime.Tool` capabilities.
 - `observability`: adapters that map `runtime.Event` and durable records into
   `eino-obs`.
 - `store/*`: concrete `session.Store` implementations.
@@ -177,6 +178,11 @@ Live-only SSE frames are not persisted as the replay source of truth.
 contains Eino `ToolInfo`, an executor, retry-safety metadata, and runtime
 metadata. The concrete leaf behavior should come from `eino-tools` where
 possible.
+
+Run admission resolves an existing workspace root to one canonical absolute
+directory before persistence. Initial execution and resume use that stored
+authority root. Standard catalog tool order remains stable through composition
+and provider request construction and participates in durable identity.
 
 Every tool call follows this durable lifecycle:
 

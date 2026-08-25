@@ -248,14 +248,60 @@ snapshot.Tools.Enabled = []string{"lookup_ticket"}
 snapshot.Tools.Disabled = []string{"shell"}
 ```
 
-Standard `eino-tools` leaf adapters are not yet composition-connected. The
-legacy `tools/einotools.RegisterDefaults` helper populates only a low-level
-`tools.Registry` and must not be presented as a production run-plan setup. The
-required neutral provider shape is recorded in the sibling `eino-tools`
-request. Mount server tools and AG-UI client tools into a
-`composition.Registry`, pass it through `runtime.WithRunPlanProvider`, and
-publish each request generation with `tools/agui.MountClientTools`. The host
-closes the prior session mount before publishing a replacement and supplies a
+Mount the standard `eino-tools` catalog through the same composition registry
+used by every other executable component:
+
+```go
+plans := composition.NewRegistry(reporter)
+component := extension.Component{
+    InstanceID: "standard-coding-tools",
+    Artifact: extension.Artifact{
+        Name: "eino-tools-standard", Version: "63a3c99",
+        Hash: adapterArtifactDigest, ConfigHash: catalogPolicyDigest,
+        SourceKind: extension.SourceNative,
+    },
+}
+standardMount, err := einotools.MountStandard(ctx, plans, component, einotools.Options{
+    Scope: extension.GlobalScope(),
+    Catalog: einotoolcatalog.Options{
+        URLFetchOptions: urlPolicy,
+        TrackerWriter: trackerWriter,
+    },
+    Permissions: map[string][]string{
+        einotoolcatalog.IDFileRead: {"workspace.read"},
+        einotoolcatalog.IDShell: {"shell"},
+        einotoolcatalog.IDURLFetch: {"network"},
+    },
+})
+if err != nil {
+    return err
+}
+defer standardMount.Close(context.Background())
+
+orchestrator, err := runtime.NewStreamingOrchestrator(
+    runtime.WithRunPlanProvider(plans),
+    // store, model resolver, IDs, permissions, events, and other options...
+)
+```
+
+`catalogPolicyDigest` must cover opaque URL client policy, user-interaction
+surface and I/O policy, tracker-writer configuration, and the deployment rule
+that keeps fingerprinted search/shell executables stable. The adapter owns one
+process-wide lock domain for every catalog definition marked non-concurrent.
+Admission resolves an existing workspace symlink once and persists that
+canonical root for resume.
+
+Filesystem permission patterns are cleaned workspace-relative request paths;
+they are lexical, so workspace admission still owns symlink policy inside the
+root. Shell commands, URLs, and tracker IDs become operation patterns. Patterns
+are bounded to 4096 bytes. `apply_patch` and `user_interact` use stable generic
+patterns because one patch can touch several files and questions must not enter
+permission metadata. The default MCP `user_interact` leaf returns a `pending`
+envelope; the hosting application supplies question correlation and the later
+answer flow.
+
+Mount AG-UI client tools into `plans` with `tools/agui.MountClientTools`. Close
+the prior session mount before publishing a replacement, and supply a
 restart-stable dispatcher artifact ID that changes whenever dispatch behavior
 changes.
 

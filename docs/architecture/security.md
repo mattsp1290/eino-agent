@@ -147,7 +147,16 @@ Evidence:
 - `tools.TestEncodeModelOutputBoundsStructuredPayload`
 - `tools/session.TestRetainedOutputIsBoundedAndSessionScoped`
 - `tools/session.TestRetainedOutputHonorsAggregateSessionLimitAndZeroLimit`
-- `tools/einotools.TestFileReadWrapperPreservesEinoToolsContract`
+- `tools/einotools.TestMountStandardPublishesCatalogOrderAndExecutesFileRead`
+
+The standard adapter persists cleaned lexical workspace-relative paths as
+permission patterns and leaf input. Workspace admission owns symlink policy
+inside the canonical root. Shell commands, URLs, and tracker targets use their
+normalized operation identity, bounded to 4096 bytes. Apply-patch and user
+interaction use generic patterns so patch contents and questions do not leak
+into permission metadata. The default MCP user-interaction result is a pending
+envelope; a hosting application must supply durable correlation and answer
+delivery.
 
 ## Tokens and Credentials
 

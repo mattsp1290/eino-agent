@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strconv"
@@ -114,9 +115,13 @@ func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T
 
 	store := newAdmissionStore()
 	now := time.Date(2026, 6, 27, 11, 0, 0, 0, time.UTC)
+	workspaceRoot, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, _ = store.CreateSession(context.Background(), session.Session{
 		ID:        "session-1",
-		Directory: "/workspace",
+		Directory: workspaceRoot,
 		Title:     "session-1",
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -385,6 +390,7 @@ func TestNormalizedToolArgumentsRequiresObjects(t *testing.T) {
 		{name: "empty", input: "", want: `{}`},
 		{name: "object", input: `{"text":"hi"}`, want: `{"text":"hi"}`},
 		{name: "canonical object", input: `{ "z": 1, "a": 2 }`, want: `{"a":2,"z":1}`},
+		{name: "duplicate top-level key", input: `{"text":"a","text":"b"}`, wantErr: true},
 		{name: "null", input: `null`, wantErr: true},
 		{name: "array", input: `[]`, wantErr: true},
 		{name: "string", input: `"value"`, wantErr: true},
@@ -1429,7 +1435,7 @@ func orchestratorConfig() config.Snapshot {
 		Model: selection,
 		Metadata: map[string]string{
 			"workspace_id":   "workspace-1",
-			"workspace_root": "/workspace",
+			"workspace_root": os.TempDir(),
 		},
 	}
 }

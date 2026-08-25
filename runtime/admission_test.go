@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
 	"time"
@@ -81,6 +83,52 @@ func TestAdmitRequiresContextEpochID(t *testing.T) {
 	_, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
+	}
+}
+
+func TestAdmitPersistsResolvedWorkspaceAcrossSymlinkRetarget(t *testing.T) {
+	parent := t.TempDir()
+	first := filepath.Join(parent, "first")
+	second := filepath.Join(parent, "second")
+	if err := os.Mkdir(first, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "workspace")
+	if err := os.Symlink(first, alias); err != nil {
+		t.Fatal(err)
+	}
+	request := admissionRequest()
+	request.Config.Metadata["workspace_root"] = alias
+	admitted, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Run.Config["workspace_root"] != resolved || admitted.Snapshot.Config.Metadata["workspace_root"] != resolved {
+		t.Fatalf("workspace identity = run %q snapshot %q, want %q", admitted.Run.Config["workspace_root"], admitted.Snapshot.Config.Metadata["workspace_root"], resolved)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, alias); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Run.Config["workspace_root"] != resolved {
+		t.Fatalf("retarget changed persisted root to %q", admitted.Run.Config["workspace_root"])
+	}
+}
+
+func TestAdmitRejectsNonexistentWorkspace(t *testing.T) {
+	request := admissionRequest()
+	request.Config.Metadata["workspace_root"] = filepath.Join(t.TempDir(), "missing")
+	if _, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request); err == nil {
+		t.Fatal("expected nonexistent workspace rejection")
 	}
 }
 
@@ -334,7 +382,7 @@ func admissionRequest() AdmissionRequest {
 			Model: selection,
 			Metadata: map[string]string{
 				"workspace_id":   "workspace-1",
-				"workspace_root": "/workspace",
+				"workspace_root": os.TempDir(),
 			},
 			Plugins: []config.Plugin{{
 				Name:    "plugin",

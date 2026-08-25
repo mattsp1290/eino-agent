@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -227,6 +228,16 @@ const admissionFingerprintKey = "_admission_fingerprint"
 
 func freezeAdmissionRequest(request AdmissionRequest) (AdmissionRequest, error) {
 	request.Config = request.Config.Clone()
+	root, err := canonicalAdmissionWorkspace(request.Config.Metadata["workspace_root"])
+	if err != nil {
+		return AdmissionRequest{}, err
+	}
+	if request.Config.Metadata == nil && root != "" {
+		request.Config.Metadata = make(map[string]string)
+	}
+	if root != "" {
+		request.Config.Metadata["workspace_root"] = root
+	}
 	request.Model = cloneResolved(request.Model)
 	cloned, err := (model.Request{Messages: request.Input}).Clone()
 	if err != nil {
@@ -249,6 +260,21 @@ func freezeAdmissionRequest(request AdmissionRequest) (AdmissionRequest, error) 
 	sum := sha256.Sum256(raw)
 	request.admissionFingerprint = hex.EncodeToString(sum[:])
 	return request, nil
+}
+
+func canonicalAdmissionWorkspace(root string) (string, error) {
+	if root == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(root) {
+		return "", fmt.Errorf("workspace root must be absolute: %q", root)
+	}
+	clean := filepath.Clean(root)
+	resolved, err := filepath.EvalSymlinks(clean)
+	if err != nil {
+		return "", fmt.Errorf("resolve workspace root %q: %w", root, err)
+	}
+	return resolved, nil
 }
 
 func validateExistingAdmission(run session.Run, request AdmissionRequest) error {

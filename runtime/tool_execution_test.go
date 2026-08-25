@@ -52,7 +52,7 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 	assertDurableToolResult(t, store, claimed.SessionID, claimed.ID, session.ToolCallCompleted, "committed")
 }
 
-func TestFinalToolContextIsSortedBoundedAndIsolated(t *testing.T) {
+func TestFinalToolContextPreservesPlanOrderAndIsIsolated(t *testing.T) {
 	var received ToolContext
 	tools := staticToolRegistry{tools: []Tool{
 		{Name: "zeta", Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
@@ -82,7 +82,7 @@ func TestFinalToolContextIsSortedBoundedAndIsolated(t *testing.T) {
 	if outcome.RawError != nil {
 		t.Fatal(outcome.RawError)
 	}
-	wantNames := []string{"alpha", "zeta"}
+	wantNames := []string{"zeta", "alpha"}
 	if !reflect.DeepEqual(received.Turn.ToolNames, wantNames) || received.Turn.SessionID != "session" || received.Turn.RunID != "run" || received.WorkspaceID != "workspace" || received.WorkspaceRoot != "/workspace" {
 		t.Fatalf("tool context = %#v", received)
 	}

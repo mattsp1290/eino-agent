@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -188,7 +187,6 @@ func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runE
 	if err != nil {
 		return nil, ToolContext{}, err
 	}
-	sort.Slice(resolved, func(i, j int) bool { return resolved[i].Name < resolved[j].Name })
 	snapshot.Tools = cloneSlice(resolved)
 	tools := make(map[string]Tool, len(resolved))
 	for _, tool := range resolved {

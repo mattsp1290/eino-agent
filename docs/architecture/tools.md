@@ -20,8 +20,10 @@ The `tools` package owns:
 - per-session authority scope;
 - model-facing `schema.ToolInfo` assembly without reusing mutable containers.
 
-Concrete leaf behavior remains outside this package. Future integration beads
-can wrap `eino-tools` implementations as `tools.Definition` values.
+Concrete leaf behavior remains outside this package.
+`tools/einotools.MountStandard` translates deterministic
+`eino-tools/catalog` definitions into `tools.Definition` values and mounts the
+complete set atomically through `composition.Registry`.
 
 `wasmext.Loader.LoadTool` also returns an ordinary `tools.Definition`. Its
 decode and encode functions validate bounded JSON and its executor invokes the
@@ -58,6 +60,13 @@ input. Runtime invokes it after the final prepare interceptor and persists the
 result with the canonical object input. Runtime never probes generic JSON for
 permission field names. Definitions without a callback use the tool name.
 
+The standard adapter cleans filesystem operation patterns into a lexical,
+workspace-relative namespace and persists that normalized input before
+permission evaluation and execution. It derives shell commands, URLs, and
+tracker IDs directly, and uses bounded generic patterns for apply-patch and
+user interaction. Runtime rejects duplicate top-level argument keys before
+canonical object encoding.
+
 Malformed model input is returned as `tools.ErrMalformedInput`, allowing runtime
 settlement to distinguish bad tool-call arguments from host execution failures.
 
@@ -77,6 +86,13 @@ reload handles from deleting replacements. `composition.Registry` adds global
 and exact-session layers. Applicable global and session tools may not share a
 name, preventing request-scoped behavior from shadowing a trusted server tool;
 restrictions only intersect.
+
+Catalog source schema/executor hashes are composed with host definition order
+and component artifact identity before they enter `session.ToolPlanIdentity`.
+Changing the leaf source, host policy, tool order, or adapter artifact therefore
+rejects strict resume. Non-concurrent standard definitions share one
+process-wide, ref-counted lock coordinator; workspace keys are canonical roots
+and static keys are catalog IDs.
 
 Registry-backed calls reserve result message and part IDs at admission.
 `session.Store.SettleToolCall` commits terminal tool state

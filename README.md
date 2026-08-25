@@ -16,12 +16,16 @@ tool settlement, and observability/redaction policy.
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.8.13`
 - AG-UI bridge: `github.com/mattsp1290/eino-agui v0.1.1`
 - Observability: `github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b`
-- Coding tools: `github.com/mattsp1290/eino-tools v0.0.0-20260627192031-e6ee664be93b`
+- Coding tools: `github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2`
 
 See `docs/dependency-status.md` for prerequisite evidence,
 `docs/consumer-guide.md` for the public embedding contract,
 `docs/examples/minimal-server.md` for a runnable server example, and
 `docs/architecture/runtime.md` for the package architecture.
+
+Standard coding tools mount atomically through
+`tools/einotools.MountStandard` into `composition.Registry`; the runtime uses
+that registry as its `runtime.RunPlanProvider`.
 
 ## Quick Embed
 

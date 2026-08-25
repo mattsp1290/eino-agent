@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 	"time"
 
@@ -14,6 +13,7 @@ import (
 
 	agentcontext "github.com/mattsp1290/eino-agent/context"
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/internal/jsonobject"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
@@ -229,7 +229,6 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 			seen[tool.Name] = true
 			snapshot.Tools = append(snapshot.Tools, tool)
 		}
-		sort.Slice(snapshot.Tools, func(i, j int) bool { return snapshot.Tools[i].Name < snapshot.Tools[j].Name })
 	}
 	if execution.dispatch() != nil {
 		_, err := extension.Invoke(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
@@ -601,12 +600,9 @@ func normalizedToolArguments(arguments string) (json.RawMessage, error) {
 }
 
 func canonicalToolObject(raw json.RawMessage) (json.RawMessage, error) {
-	if !json.Valid(raw) {
-		return nil, errors.New("invalid JSON")
-	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
-		return nil, errors.New("tool input must be a non-null JSON object")
+	object, err := jsonobject.Decode(raw)
+	if err != nil {
+		return nil, err
 	}
 	canonical, err := json.Marshal(object)
 	if err != nil {
