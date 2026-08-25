@@ -204,6 +204,7 @@ type ToolCall struct {
 	ResultMessageID MessageID
 	ResultPartID    PartID
 	Name            string
+	Pattern         string
 	Input           json.RawMessage
 	Output          json.RawMessage
 	Status          ToolCallStatus

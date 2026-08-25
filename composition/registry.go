@@ -284,6 +284,11 @@ func mountToolDefinition(mount *extension.Mount, definition tools.Definition) to
 			return callback(mount.CallbackContext(ctx), input)
 		}
 	}
+	if callback := next.Pattern; callback != nil {
+		next.Pattern = func(ctx context.Context, input any) (string, error) {
+			return callback(mount.CallbackContext(ctx), input)
+		}
+	}
 	if callback := next.Encode; callback != nil {
 		next.Encode = func(ctx context.Context, value any) (json.RawMessage, error) {
 			return callback(mount.CallbackContext(ctx), value)
@@ -386,6 +391,9 @@ func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRe
 }
 
 func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
+	if err := session.ValidateExtensionPlan(persisted); err != nil || persisted.Fingerprint == "" {
+		return nil, runtime.ErrExtensionPlanMismatch
+	}
 	instances := make(map[string]bool)
 	toolIdentities := make(map[planToolIdentity]bool)
 	var sessionID session.ID
@@ -400,16 +408,35 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 		return nil
 	}
 	for _, entry := range persisted.Entries {
-		if entry.Required {
-			instances[entry.InstanceID] = true
+		instances[entry.InstanceID] = true
+		kind, kindErr := entry.Kind()
+		if kindErr != nil {
+			return nil, runtime.ErrExtensionPlanMismatch
 		}
-		if entry.Required && entry.Kind == session.ExtensionTool {
-			toolIdentities[planToolIdentity{InstanceID: entry.InstanceID, Scope: entry.Scope, CapabilityID: entry.CapabilityID}] = true
+		switch kind {
+		case session.ExtensionTool:
+			toolIdentities[planToolIdentity{InstanceID: entry.InstanceID, Scope: entry.Tool.Scope, RegistrationID: entry.Tool.RegistrationID, ToolName: entry.Tool.Name}] = true
+			if err := recoverSessionID(entry.Tool.Scope); err != nil {
+				return nil, err
+			}
+		case session.ExtensionPrompt:
+			if err := recoverSessionID(entry.Prompt.Scope); err != nil {
+				return nil, err
+			}
+		case session.ExtensionGuard:
+			if err := recoverSessionID(entry.Guard.Scope); err != nil {
+				return nil, err
+			}
+		case session.ExtensionRestriction:
+			if err := recoverSessionID(entry.Restriction.Scope); err != nil {
+				return nil, err
+			}
+		case session.ExtensionHandlers:
 		}
-		if err := recoverSessionID(entry.Scope); err != nil {
-			return nil, err
+		if entry.Handlers == nil {
+			continue
 		}
-		for _, registration := range entry.Registrations {
+		for _, registration := range entry.Handlers.Registrations {
 			if err := recoverSessionID(registration.Scope); err != nil {
 				return nil, err
 			}
@@ -473,9 +500,8 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 		}
 		planTools[index] = runtime.PlanTool{
 			Identity: session.ExtensionPlanEntry{
-				InstanceID: entry.InstanceID, Kind: session.ExtensionTool, Artifact: artifactIdentity(entry.component.Artifact), Required: true,
-				Scope: scopeIdentity(entry.Scope), CapabilityID: entry.Definition.Name + "/" + entry.ID,
-				SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
+				InstanceID: entry.InstanceID, Artifact: artifactIdentity(entry.component.Artifact),
+				Tool: &session.ToolPlanIdentity{Name: entry.Definition.Name, RegistrationID: entry.ID, Scope: scopeIdentity(entry.Scope), SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash},
 			},
 			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 				resolved, resolveErr := frozen.ResolveTools(ctx, scope)
@@ -492,27 +518,21 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	planPrompts := make([]runtime.PlanPrompt, len(prompts))
 	for index, prompt := range prompts {
 		planPrompts[index] = runtime.PlanPrompt{
-			Identity: session.ExtensionPlanEntry{InstanceID: prompt.InstanceID, Kind: session.ExtensionPrompt, Artifact: artifactIdentity(prompt.component.Artifact), Required: true, Scope: scopeIdentity(prompt.Scope), CapabilityID: prompt.Name + "/" + prompt.ID, Order: prompt.Order},
+			Identity: session.ExtensionPlanEntry{InstanceID: prompt.InstanceID, Artifact: artifactIdentity(prompt.component.Artifact), Prompt: &session.PromptPlanIdentity{Name: prompt.Name, RegistrationID: prompt.ID, Scope: scopeIdentity(prompt.Scope), Order: prompt.Order}},
 			Prompt:   runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.InstanceID, Provider: prompt.Provider},
 		}
 	}
 	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
 		planGuards[index] = runtime.PlanGuard{
-			Identity: session.ExtensionPlanEntry{InstanceID: guard.InstanceID, Kind: session.ExtensionGuard, Artifact: artifactIdentity(guard.component.Artifact), Required: true, Scope: scopeIdentity(guard.Scope), CapabilityID: guard.ID, Order: guard.Order},
+			Identity: session.ExtensionPlanEntry{InstanceID: guard.InstanceID, Artifact: artifactIdentity(guard.component.Artifact), Guard: &session.GuardPlanIdentity{RegistrationID: guard.ID, Scope: scopeIdentity(guard.Scope), Order: guard.Order}},
 			Guard:    runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.InstanceID, Guard: guard.Guard},
 		}
 	}
 	planRestrictions := make([]runtime.PlanRestriction, len(restrictions))
 	for index, restriction := range restrictions {
-		raw, marshalErr := json.Marshal(struct{ Allowed, Denied []string }{restriction.Allowed, restriction.Denied})
-		if marshalErr != nil {
-			dispatch.Release()
-			return nil, marshalErr
-		}
-		digest := sha256.Sum256(raw)
 		planRestrictions[index] = runtime.PlanRestriction{
-			Identity: session.ExtensionPlanEntry{InstanceID: restriction.InstanceID, Kind: session.ExtensionRestriction, Artifact: artifactIdentity(restriction.component.Artifact), Required: true, Scope: scopeIdentity(restriction.Scope), CapabilityID: restriction.ID, SchemaHash: hex.EncodeToString(digest[:])},
+			Identity: session.ExtensionPlanEntry{InstanceID: restriction.InstanceID, Artifact: artifactIdentity(restriction.component.Artifact), Restriction: &session.RestrictionPlanIdentity{RegistrationID: restriction.ID, Scope: scopeIdentity(restriction.Scope), RulesHash: runtime.RestrictionRulesHash(restriction.Allowed, restriction.Denied)}},
 			Allowed:  append([]string(nil), restriction.Allowed...), Denied: append([]string(nil), restriction.Denied...),
 		}
 	}
@@ -522,9 +542,10 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 type planToolSelector func(mountedTool) bool
 
 type planToolIdentity struct {
-	InstanceID   string
-	Scope        session.ExtensionScope
-	CapabilityID string
+	InstanceID     string
+	Scope          session.ExtensionScope
+	RegistrationID string
+	ToolName       string
 }
 
 func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
@@ -547,9 +568,7 @@ func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
 func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelector {
 	return func(entry mountedTool) bool {
 		return identities[planToolIdentity{
-			InstanceID:   entry.InstanceID,
-			Scope:        scopeIdentity(entry.Scope),
-			CapabilityID: entry.Definition.Name + "/" + entry.ID,
+			InstanceID: entry.InstanceID, Scope: scopeIdentity(entry.Scope), RegistrationID: entry.ID, ToolName: entry.Definition.Name,
 		}]
 	}
 }

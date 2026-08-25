@@ -163,7 +163,7 @@ func runtimeCallFromClaim(tool Tool, claimed session.ToolCall) ToolCall {
 	return ToolCall{
 		ID: claimed.ID, SessionID: claimed.SessionID, RunID: claimed.RunID, MessageID: claimed.MessageID,
 		ResultMessageID: claimed.ResultMessageID, ResultPartID: claimed.ResultPartID,
-		Name: claimed.Name, Scope: tool.Scope, Pattern: toolPattern(claimed.Input, claimed.Name), Input: cloneJSON(claimed.Input),
+		Name: claimed.Name, Scope: tool.Scope, Pattern: claimed.Pattern, Input: cloneJSON(claimed.Input),
 	}
 }
 

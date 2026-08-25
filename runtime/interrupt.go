@@ -123,6 +123,10 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		if session.TerminalToolCall(call.Status) {
 			continue
 		}
+		canonicalInput, canonicalErr := canonicalToolObject(call.Input)
+		if canonicalErr != nil || string(canonicalInput) != string(call.Input) || call.Pattern == "" || len(call.Pattern) > 4096 {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("invalid persisted tool call %q", call.ID)}
+		}
 		tool, ok := tools[call.Name]
 		if !ok || tool.Executor == nil {
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("tool %q unavailable", call.Name)}
@@ -157,7 +161,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 			ResultPartID:    claimed.ResultPartID,
 			Name:            claimed.Name,
 			Scope:           tool.Scope,
-			Pattern:         toolPattern(claimed.Input, claimed.Name),
+			Pattern:         claimed.Pattern,
 			Input:           cloneJSON(claimed.Input),
 			Context:         toolContext.Clone(),
 		}

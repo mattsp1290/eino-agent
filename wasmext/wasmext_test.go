@@ -56,7 +56,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("openTool error = %v", err)
 	}
-	defer func() { _ = loaded.Close() }()
+	defer func() { _ = loaded.close() }()
 	definition, err := loaded.Definition()
 	if err != nil {
 		t.Fatal(err)
@@ -126,14 +126,14 @@ func TestPermissionsPolicyWrapperAllDecisions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadPermissionsPolicy error = %v", err)
 	}
-	defer func() { _ = policy.Close() }()
+	defer func() { _ = policy.close() }()
 	for permission, action := range map[string]permissions.Action{"allow": permissions.ActionAllow, "deny": permissions.ActionDeny, "ask": permissions.ActionAsk} {
 		decision, err := policy.Decide(context.Background(), permissions.Request{Permission: permission, Pattern: "rewritten"})
 		if err != nil || decision.Action != action || decision.Reason != "rewritten" {
 			t.Errorf("Decide(%s) = %+v, %v", permission, decision, err)
 		}
 	}
-	if err := policy.Close(); err != nil {
+	if err := policy.close(); err != nil {
 		t.Fatalf("second Close error = %v", err)
 	}
 	_, err = policy.Decide(context.Background(), permissions.Request{Permission: "allow"})
@@ -152,7 +152,7 @@ func TestModuleTimeoutActivelyInterruptsGuest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadPermissionsPolicy error = %v", err)
 	}
-	defer func() { _ = policy.Close() }()
+	defer func() { _ = policy.close() }()
 	_, err = policy.Decide(context.Background(), permissions.Request{})
 	if !IsKind(err, ErrorTimeout) || component.interrupts.Load() == 0 {
 		t.Fatalf("timeout error = %v, interrupts = %d", err, component.interrupts.Load())
@@ -204,7 +204,7 @@ func TestModuleTimeoutQuarantinesStubbornWorkerUntilItExits(t *testing.T) {
 	if calls.Load() != 1 || component.closed.Load() || engineInstance.closed.Load() {
 		t.Fatalf("calls=%d component_closed=%t engine_closed=%t before worker exit", calls.Load(), component.closed.Load(), engineInstance.closed.Load())
 	}
-	if err := policy.Close(); !IsKind(err, ErrorTimeout) {
+	if err := policy.close(); !IsKind(err, ErrorTimeout) {
 		t.Fatalf("Close before worker exit = %v, want timeout", err)
 	}
 	close(release)
@@ -213,7 +213,7 @@ func TestModuleTimeoutQuarantinesStubbornWorkerUntilItExits(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("deferred module finalization did not complete")
 	}
-	if err := policy.Close(); err != nil {
+	if err := policy.close(); err != nil {
 		t.Fatalf("Close after worker exit = %v", err)
 	}
 	if !component.closed.Load() || !engineInstance.closed.Load() {
@@ -374,7 +374,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	ctx := context.Background()
 
-	source, err := OpenContextSource(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"))
+	source, err := openContextSourceDefault(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,22 +382,22 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
 	}
-	if err := source.Close(); err != nil {
+	if err := source.close(); err != nil {
 		t.Fatal(err)
 	}
 
-	sink, err := OpenEventSink(ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
+	sink, err := openEventSinkDefault(ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := sink.Emit(ctx, runtime.Event{Kind: runtime.EventRunStarted, SessionID: "session", RunID: "run", Payload: json.RawMessage(`{"secret":"credential-sentinel"}`), Time: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.Close(); err != nil {
+	if err := sink.close(); err != nil {
 		t.Fatal(err)
 	}
 
-	hook, err := OpenHook(ctx, checkedInFixtureConfig(t, root, "hook.wasm"))
+	hook, err := openHookDefault(ctx, checkedInFixtureConfig(t, root, "hook.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -414,11 +414,11 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err := hook.afterRun(ctx, runtime.Result{RunID: "run"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.Close(); err != nil {
+	if err := hook.close(); err != nil {
 		t.Fatal(err)
 	}
 
-	middleware, err := OpenToolMiddleware(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"))
+	middleware, err := openToolMiddlewareDefault(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +435,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
 		t.Fatalf("middleware result = %#v, %v", result, err)
 	}
-	if err := middleware.Close(); err != nil {
+	if err := middleware.close(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -446,7 +446,7 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	toolConfig := checkedInFixtureConfig(t, root, "tool.wasm")
 	observer := einoobs.New(einoobs.Config{})
 	toolConfig.Observer = observer
-	loadedTool, err := OpenTool(context.Background(), toolConfig)
+	loadedTool, err := openToolDefault(context.Background(), toolConfig)
 	if err != nil {
 		var extensionErr *Error
 		if errors.As(err, &extensionErr) {
@@ -454,7 +454,7 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 		}
 		t.Fatalf("OpenTool error = %v", err)
 	}
-	defer func() { _ = loadedTool.Close() }()
+	defer func() { _ = loadedTool.close() }()
 	definition, err := loadedTool.Definition()
 	if err != nil {
 		t.Fatal(err)
@@ -483,7 +483,7 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadPermissionsPolicy error = %v", err)
 	}
-	defer func() { _ = policy.Close() }()
+	defer func() { _ = policy.close() }()
 	for pattern, want := range map[string]permissions.Action{
 		"allow": permissions.ActionAllow,
 		"deny":  permissions.ActionDeny,
@@ -509,11 +509,11 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		{name: "oversized", input: `{"mode":"oversized"}`, kind: ErrorSize},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			loaded, err := OpenTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+			loaded, err := openToolDefault(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = loaded.Close() }()
+			defer func() { _ = loaded.close() }()
 			definition, definitionErr := loaded.Definition()
 			if definitionErr != nil {
 				t.Fatal(definitionErr)
@@ -529,11 +529,11 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		cfg := checkedInFixtureConfig(t, root, "tool.wasm")
 		cfg.Limits.Timeout = 25 * time.Millisecond
 		cfg.Limits.CloseDrain = time.Second
-		loaded, err := OpenTool(context.Background(), cfg)
+		loaded, err := openToolDefault(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = loaded.Close() }()
+		defer func() { _ = loaded.close() }()
 		started := time.Now()
 		definition, definitionErr := loaded.Definition()
 		if definitionErr != nil {
@@ -562,7 +562,7 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 	cfg.Limits.Timeout = 5 * time.Second
 	cfg.Limits.CloseDrain = time.Second
 	cfg.Observer = einoobs.New(einoobs.Config{Exporter: exporter})
-	loaded, err := OpenTool(context.Background(), cfg)
+	loaded, err := openToolDefault(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,7 +580,7 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("guest did not enter execute")
 	}
-	if err := loaded.Close(); err != nil {
+	if err := loaded.close(); err != nil {
 		t.Fatalf("Close error = %v", err)
 	}
 	select {
@@ -600,11 +600,11 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 func TestCheckedInToolConcurrentUse(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
-	loaded, err := OpenTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+	loaded, err := openToolDefault(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = loaded.Close() }()
+	defer func() { _ = loaded.close() }()
 	definition, err := loaded.Definition()
 	if err != nil {
 		t.Fatal(err)
@@ -718,7 +718,7 @@ type wasmTestPlanProvider struct{ registry *tools.Registry }
 
 func (p wasmTestPlanProvider) AcquireRunPlan(context.Context, runtime.RunPlanRequest) (*runtime.RunPlan, error) {
 	return runtime.NewRunPlan(runtime.RunPlanSpec{Tools: []runtime.PlanTool{{
-		Identity: session.ExtensionPlanEntry{InstanceID: "wasm-test", Kind: session.ExtensionTool, Artifact: session.ArtifactIdentity{Name: "wasm-test", Version: "1", Hash: "hash", SourceKind: string(extension.SourceNative)}, Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: "wasm_echo/tool"},
+		Identity: session.ExtensionPlanEntry{InstanceID: "wasm-test", Artifact: session.ArtifactIdentity{Name: "wasm-test", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: string(extension.SourceNative)}, Tool: &session.ToolPlanIdentity{Name: "wasm_echo", RegistrationID: "tool", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, SchemaHash: "schema", ExecutorHash: "executor"}},
 		Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 			resolved, err := p.registry.ResolveTools(ctx, scope)
 			if err != nil {

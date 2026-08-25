@@ -2,31 +2,18 @@ package session
 
 import "testing"
 
-func TestExtensionPlanFingerprintCanonicalizesFullyTiedEntriesAndRegistrations(t *testing.T) {
+func TestExtensionPlanFingerprintCanonicalizesEntriesAndRegistrations(t *testing.T) {
 	descriptor := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Entries: []ExtensionPlanEntry{
-		{
-			InstanceID: "component", Kind: ExtensionGuard, CapabilityID: "guard", Required: true,
-			Scope: ExtensionScope{Kind: "session", Key: "session-b"}, Order: 20,
-			Artifact:   ArtifactIdentity{Name: "artifact", Version: "2", Hash: "hash-b", ConfigHash: "config-b", SourceKind: "native"},
-			SchemaHash: "schema-b", ExecutorHash: "executor-b",
-		},
-		{
-			InstanceID: "component", Kind: ExtensionGuard, CapabilityID: "guard", Required: true,
-			Scope: ExtensionScope{Kind: "global"}, Order: 10,
-			Artifact:   ArtifactIdentity{Name: "artifact", Version: "1", Hash: "hash-a", ConfigHash: "config-a", SourceKind: "native"},
-			SchemaHash: "schema-a", ExecutorHash: "executor-a",
-		},
-		{
-			InstanceID: "component", Kind: ExtensionHandlers, Required: true,
-			Registrations: []RegistrationIdentity{
-				{ID: "same", Contract: "contract", Version: "2", Order: 0, Scope: ExtensionScope{Kind: "session", Key: "session-b"}},
-				{ID: "same", Contract: "contract", Version: "1", Order: 0, Scope: ExtensionScope{Kind: "global"}},
-			},
-		},
+		{InstanceID: "guard-session", Artifact: testArtifact("b"), Guard: &GuardPlanIdentity{RegistrationID: "guard", Scope: ExtensionScope{Kind: "session", Key: "session-b"}, Order: 20}},
+		{InstanceID: "guard-global", Artifact: testArtifact("a"), Guard: &GuardPlanIdentity{RegistrationID: "guard", Scope: ExtensionScope{Kind: "global"}, Order: 10}},
+		{InstanceID: "component", Artifact: testArtifact("handlers"), Handlers: &HandlerPlanIdentity{Registrations: []RegistrationIdentity{
+			{ID: "same", Contract: "contract", Version: "2", Scope: ExtensionScope{Kind: "session", Key: "session-b"}, Kind: HandlerNotification},
+			{ID: "same", Contract: "contract", Version: "1", Scope: ExtensionScope{Kind: "global"}, Kind: HandlerInterceptor},
+		}}},
 	}}
 	reordered := descriptor.Clone()
 	reordered.Entries[0], reordered.Entries[2] = reordered.Entries[2], reordered.Entries[0]
-	reordered.Entries[0].Registrations[0], reordered.Entries[0].Registrations[1] = reordered.Entries[0].Registrations[1], reordered.Entries[0].Registrations[0]
+	reordered.Entries[0].Handlers.Registrations[0], reordered.Entries[0].Handlers.Registrations[1] = reordered.Entries[0].Handlers.Registrations[1], reordered.Entries[0].Handlers.Registrations[0]
 
 	first, err := FingerprintExtensionPlan(descriptor)
 	if err != nil {
@@ -39,4 +26,28 @@ func TestExtensionPlanFingerprintCanonicalizesFullyTiedEntriesAndRegistrations(t
 	if first != second {
 		t.Fatalf("permuted canonical descriptor fingerprints differ: %s != %s", first, second)
 	}
+}
+
+func TestExtensionPlanRejectsMalformedTaggedIdentity(t *testing.T) {
+	entry := ExtensionPlanEntry{InstanceID: "tool", Artifact: testArtifact("tool"), Tool: &ToolPlanIdentity{Name: "tool", RegistrationID: "registration", Scope: ExtensionScope{Kind: "global"}, SchemaHash: "schema", ExecutorHash: "executor"}}
+	for name, mutate := range map[string]func(*ExtensionPlanEntry){
+		"missing config hash": func(value *ExtensionPlanEntry) { value.Artifact.ConfigHash = "" },
+		"invalid source":      func(value *ExtensionPlanEntry) { value.Artifact.SourceKind = "remote" },
+		"multiple payloads": func(value *ExtensionPlanEntry) {
+			value.Guard = &GuardPlanIdentity{RegistrationID: "guard", Scope: ExtensionScope{Kind: "global"}}
+		},
+		"missing executor": func(value *ExtensionPlanEntry) { value.Tool.ExecutorHash = "" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := entry.Clone()
+			mutate(&candidate)
+			if _, err := FingerprintExtensionPlan(ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Entries: []ExtensionPlanEntry{candidate}}); err == nil {
+				t.Fatal("FingerprintExtensionPlan succeeded")
+			}
+		})
+	}
+}
+
+func testArtifact(suffix string) ArtifactIdentity {
+	return ArtifactIdentity{Name: "artifact-" + suffix, Version: "1", Hash: "hash-" + suffix, ConfigHash: "config-" + suffix, SourceKind: "native"}
 }

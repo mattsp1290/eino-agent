@@ -12,6 +12,8 @@ The `tools` package owns:
 - registration-time validation for tool definitions;
 - stale-registration protection using monotonically increasing generations;
 - typed decoding of model-provided JSON input;
+- deterministic normalization to a non-null JSON object;
+- explicit permission-pattern derivation from typed normalized input;
 - typed execution context carrying the durable runtime tool call and bounded,
   content-free turn metadata;
 - structured output encoding;
@@ -50,6 +52,11 @@ Every tool definition provides:
 - a `Decoder` from raw model JSON into a typed host value;
 - an `Executor` over that typed value and runtime call context;
 - an `Encoder` from typed output into structured JSON.
+
+A definition may provide `Pattern` to derive permission identity from its typed
+input. Runtime invokes it after the final prepare interceptor and persists the
+result with the canonical object input. Runtime never probes generic JSON for
+permission field names. Definitions without a callback use the tool name.
 
 Malformed model input is returned as `tools.ErrMalformedInput`, allowing runtime
 settlement to distinguish bad tool-call arguments from host execution failures.

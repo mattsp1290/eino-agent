@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 )
 
@@ -34,7 +33,7 @@ func TestAdapterResolverResolvesAdapterAndClonesRuntime(t *testing.T) {
 	if adapter.runtime.Auth["token"] != "secret" || adapter.runtime.Options["temperature"] != "0" {
 		t.Fatalf("adapter runtime leaked caller mutation: %#v", adapter.runtime)
 	}
-	if resolved.Provider.ID != "fake" || resolved.Model.ID != "m1" || resolved.Client == nil {
+	if resolved.Provider.ID != "fake" || resolved.Model.ID != "m1" || resolved.Streamer == nil {
 		t.Fatalf("resolved = %#v", resolved)
 	}
 	if _, ok := resolved.Provider.Options["token"]; ok {
@@ -183,9 +182,9 @@ func (a *testAdapter) Models(context.Context) ([]Descriptor, error) {
 	return a.models, nil
 }
 
-func (a *testAdapter) Build(_ context.Context, _ Selection, runtime Runtime) (einomodel.ToolCallingChatModel, error) {
+func (a *testAdapter) Build(_ context.Context, _ Selection, runtime Runtime) (Streamer, error) {
 	a.runtime = runtime
-	return testModel{}, nil
+	return a, nil
 }
 
 func (a *testAdapter) Available(context.Context, Runtime) error {
@@ -214,18 +213,4 @@ func (c testCatalog) GetModel(context.Context, ProviderID, ID) (Descriptor, erro
 
 func (c testCatalog) DefaultModel(context.Context) (Selection, error) {
 	return Selection{ProviderID: c.descriptor.ProviderID, ModelID: c.descriptor.ID}, nil
-}
-
-type testModel struct{}
-
-func (testModel) Generate(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.Message, error) {
-	return einoschema.AssistantMessage("", nil), nil
-}
-
-func (testModel) Stream(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
-	return einoschema.StreamReaderFromArray([]*einoschema.Message{}), nil
-}
-
-func (testModel) WithTools([]*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
-	return testModel{}, nil
 }

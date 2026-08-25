@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/extension"
@@ -160,30 +159,15 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 }
 
 func openStream(ctx context.Context, resolved model.Resolved, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	if resolved.Streamer != nil {
-		if request.IdempotencyKey != "" {
-			if streamer, ok := resolved.Streamer.(model.IdempotentStreamer); ok {
-				return streamer.StreamProviderWithIdempotencyKey(ctx, request, request.IdempotencyKey)
-			}
+	if resolved.Streamer == nil {
+		return nil, model.Error{Code: "model_streamer_missing", Message: "resolved model has no streamer", Cause: model.ErrProviderUnavailable}
+	}
+	if request.IdempotencyKey != "" {
+		if streamer, ok := resolved.Streamer.(model.IdempotentStreamer); ok {
+			return streamer.StreamProviderWithIdempotencyKey(ctx, request, request.IdempotencyKey)
 		}
-		return resolved.Streamer.StreamProvider(ctx, request)
 	}
-	client := resolved.Client
-	if client == nil {
-		return nil, model.Error{Code: "model_client_missing", Message: "resolved model has no client", Cause: model.ErrProviderUnavailable}
-	}
-	if len(request.Tools) > 0 {
-		withTools, err := client.WithTools(request.Tools)
-		if err != nil {
-			return nil, err
-		}
-		client = withTools
-	}
-	messages := cloneMessages(request.Messages)
-	if request.System != "" {
-		messages = append([]*einoschema.Message{einoschema.SystemMessage(request.System)}, messages...)
-	}
-	return client.Stream(ctx, messages, einomodel.WithTools(request.Tools))
+	return resolved.Streamer.StreamProvider(ctx, request)
 }
 
 type streamObserver struct {

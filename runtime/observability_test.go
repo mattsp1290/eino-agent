@@ -277,13 +277,14 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 			Type: "function",
 			Function: einoschema.FunctionCall{
 				Name:      "echo",
-				Arguments: `{"permission_pattern":"SECRET danger pattern"}`,
+				Arguments: `{"target":"SECRET danger pattern"}`,
 			},
 		}})}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
-		Name: "echo",
+		Name:    "echo",
+		Pattern: permissionPatternField("target"),
 		Scope: ToolScope{
 			Permissions: []string{"shell"},
 		},

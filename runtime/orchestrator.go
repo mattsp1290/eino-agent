@@ -23,9 +23,6 @@ import (
 var (
 	// ErrInvalidOrchestrator reports a missing dependency or invalid request.
 	ErrInvalidOrchestrator = errors.New("invalid orchestrator")
-	// ErrUnsupportedOperation reports lifecycle behavior reserved for a later
-	// runtime bead.
-	ErrUnsupportedOperation = errors.New("unsupported orchestrator operation")
 )
 
 // IDGenerator creates durable identifiers for records owned by the
@@ -508,22 +505,6 @@ func withToolStatus(payload any, status session.ToolCallStatus) (map[string]any,
 	return result, nil
 }
 
-func toolPattern(input json.RawMessage, fallback string) string {
-	var payload struct {
-		PermissionPattern string `json:"permission_pattern"`
-		Pattern           string `json:"pattern"`
-	}
-	if json.Unmarshal(input, &payload) == nil {
-		if payload.PermissionPattern != "" {
-			return payload.PermissionPattern
-		}
-		if payload.Pattern != "" {
-			return payload.Pattern
-		}
-	}
-	return fallback
-}
-
 func (o *StreamingOrchestrator) validate(request Request) error {
 	if err := o.validateConfigured(); err != nil {
 		return err
@@ -608,15 +589,30 @@ func normalizedToolArguments(arguments string) (json.RawMessage, error) {
 	if arguments == "" {
 		return json.RawMessage(`{}`), nil
 	}
-	raw := json.RawMessage(arguments)
-	if !json.Valid(raw) {
+	raw, err := canonicalToolObject(json.RawMessage(arguments))
+	if err != nil {
 		return nil, model.Error{
 			Code:    "malformed_provider_tool_call",
-			Message: "provider returned invalid tool call arguments",
+			Message: "provider returned tool call arguments that are not a JSON object",
 			Cause:   model.ErrProviderRejected,
 		}
 	}
-	return cloneJSON(raw), nil
+	return raw, nil
+}
+
+func canonicalToolObject(raw json.RawMessage) (json.RawMessage, error) {
+	if !json.Valid(raw) {
+		return nil, errors.New("invalid JSON")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, errors.New("tool input must be a non-null JSON object")
+	}
+	canonical, err := json.Marshal(object)
+	if err != nil {
+		return nil, err
+	}
+	return canonical, nil
 }
 
 func normalizeToolCallIDs(msg *einoschema.Message, ids IDGenerator) {
@@ -659,7 +655,4 @@ func (h *streamingHandle) Interrupt(_ context.Context, reason string) error {
 		h.cancel()
 	})
 	return nil
-}
-func (h *streamingHandle) FollowUp(context.Context, []*einoschema.Message) error {
-	return ErrUnsupportedOperation
 }

@@ -136,18 +136,20 @@ func clonePreparedToolCallChecked(value PreparedToolCall) (PreparedToolCall, err
 func validatePreparedToolCallInput(original, candidate PreparedToolCall) error {
 	leftCall, rightCall := cloneToolCall(original.Call), cloneToolCall(candidate.Call)
 	leftCall.Input, rightCall.Input = nil, nil
-	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(leftCall, rightCall) || !json.Valid(candidate.Call.Input) {
+	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(leftCall, rightCall) || !validToolObject(candidate.Call.Input) {
 		return extension.ErrProtectedMutation
 	}
 	return nil
 }
 
 func validatePreparedToolCall(value PreparedToolCall) error {
-	if value.Call.ID == "" || value.Call.Name == "" || !json.Valid(value.Call.Input) {
+	if value.Call.ID == "" || value.Call.Name == "" || !validToolObject(value.Call.Input) {
 		return errors.New("invalid prepared tool call")
 	}
 	return nil
 }
+
+func validToolObject(raw json.RawMessage) bool { _, err := canonicalToolObject(raw); return err == nil }
 
 func validatePreparedToolCallResult(original PreparedToolCall, output PreparedToolCall) error {
 	return validatePreparedToolCallInput(original, output)
@@ -179,11 +181,12 @@ func validateToolExecutionResult(original ToolExecution, output ToolOutcome) err
 
 func sameProtectedTool(left, right Tool) bool {
 	leftInfo, rightInfo := left.Info, right.Info
-	if left.Executor != nil || right.Executor != nil || left.InputDecoder != nil || right.InputDecoder != nil {
+	if left.Executor != nil || right.Executor != nil || left.InputDecoder != nil || right.InputDecoder != nil || left.Pattern != nil || right.Pattern != nil {
 		return false
 	}
 	left.Executor, right.Executor = nil, nil
 	left.InputDecoder, right.InputDecoder = nil, nil
+	left.Pattern, right.Pattern = nil, nil
 	left.Info, right.Info = nil, nil
 	return reflect.DeepEqual(left, right) && sameProtectedToolInfo(leftInfo, rightInfo)
 }
@@ -273,6 +276,7 @@ func cloneToolChecked(tool Tool) (Tool, error) {
 func extensionTool(tool Tool) Tool {
 	tool.Executor = nil
 	tool.InputDecoder = nil
+	tool.Pattern = nil
 	return tool
 }
 

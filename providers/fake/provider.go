@@ -5,7 +5,6 @@ import (
 	"errors"
 	"sync/atomic"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
@@ -53,13 +52,13 @@ func (p *Provider) Models(context.Context) ([]model.Descriptor, error) {
 	return models, nil
 }
 
-// Build returns an immutable fake Eino chat model.
-func (p *Provider) Build(_ context.Context, selection model.Selection, runtime model.Runtime) (einomodel.ToolCallingChatModel, error) {
+// Build returns an immutable fake provider streamer.
+func (p *Provider) Build(_ context.Context, selection model.Selection, runtime model.Runtime) (model.Streamer, error) {
 	if p == nil {
 		return nil, errors.New("fake provider is nil")
 	}
 	p.Builds.Add(1)
-	return &chatModel{
+	return &providerStreamer{
 		providerID: p.ID,
 		modelID:    selection.ModelID,
 		steps:      cloneSteps(p.Steps),
@@ -67,10 +66,17 @@ func (p *Provider) Build(_ context.Context, selection model.Selection, runtime m
 	}, nil
 }
 
+type providerStreamer struct {
+	providerID model.ProviderID
+	modelID    model.ID
+	steps      []Step
+	runtime    model.Runtime
+}
+
 // StreamProvider returns a fake stream and emits normalized observer callbacks.
-func (p *Provider) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	if p == nil {
-		return nil, errors.New("fake provider is nil")
+func (s *providerStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+	if s == nil {
+		return nil, errors.New("fake provider streamer is nil")
 	}
 	req, err := request.Clone()
 	if err != nil {
@@ -79,9 +85,9 @@ func (p *Provider) StreamProvider(ctx context.Context, request model.Request) (*
 	if req.Observer != nil {
 		req.Observer.OnProviderStart(ctx, req)
 	}
-	providerID := p.ID
-	modelID := req.Identity.ModelID
-	steps := cloneSteps(p.Steps)
+	providerID := s.providerID
+	modelID := s.modelID
+	steps := cloneSteps(s.steps)
 	reader, writer := einoschema.Pipe[*einoschema.Message](len(steps))
 	go func() {
 		defer writer.Close()
@@ -121,71 +127,6 @@ func (p *Provider) StreamProvider(ctx context.Context, request model.Request) (*
 		}
 	}()
 	return reader, nil
-}
-
-type chatModel struct {
-	providerID model.ProviderID
-	modelID    model.ID
-	steps      []Step
-	runtime    model.Runtime
-	tools      []*einoschema.ToolInfo
-}
-
-func (m *chatModel) Generate(ctx context.Context, input []*einoschema.Message, opts ...einomodel.Option) (*einoschema.Message, error) {
-	_ = input
-	_ = opts
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	var content string
-	var usage model.Usage
-	for _, step := range m.steps {
-		if step.Err != nil {
-			return nil, normalizeError(step.Err)
-		}
-		content += step.Content
-		usage = addUsage(usage, step.Usage)
-	}
-	msg := einoschema.AssistantMessage(content, nil)
-	msg.Extra = map[string]any{
-		"provider_id": string(m.providerID),
-		"model_id":    string(m.modelID),
-		"usage":       usage,
-	}
-	return msg, nil
-}
-
-func (m *chatModel) Stream(ctx context.Context, input []*einoschema.Message, opts ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
-	_ = input
-	_ = opts
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	reader, writer := einoschema.Pipe[*einoschema.Message](len(m.steps))
-	go func() {
-		defer writer.Close()
-		for _, step := range m.steps {
-			if err := ctx.Err(); err != nil {
-				writer.Send(nil, err)
-				return
-			}
-			if step.Err != nil {
-				writer.Send(nil, normalizeError(step.Err))
-				return
-			}
-			msg := messageForStep(m.providerID, m.modelID, step)
-			if writer.Send(msg, nil) {
-				return
-			}
-		}
-	}()
-	return reader, nil
-}
-
-func (m *chatModel) WithTools(tools []*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
-	next := *m
-	next.tools = cloneTools(tools)
-	return &next, nil
 }
 
 func notifyError(ctx context.Context, observer model.StreamObserver, err error) {
@@ -263,15 +204,6 @@ func cloneSteps(src []Step) []Step {
 		return nil
 	}
 	dst := make([]Step, len(src))
-	copy(dst, src)
-	return dst
-}
-
-func cloneTools(src []*einoschema.ToolInfo) []*einoschema.ToolInfo {
-	if src == nil {
-		return nil
-	}
-	dst := make([]*einoschema.ToolInfo, len(src))
 	copy(dst, src)
 	return dst
 }

@@ -59,6 +59,7 @@ func TestRegistryToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	preparedTool := materialized[0]
 	preparedTool.Executor = nil
 	preparedTool.InputDecoder = nil
+	preparedTool.Pattern = nil
 	prepared, err := extension.Invoke(plan, context.Background(), runtime.ToolPreparePoint, runtime.PreparedToolCall{Tool: preparedTool, Call: call}, func(_ context.Context, input runtime.PreparedToolCall) (runtime.PreparedToolCall, error) {
 		return input, nil
 	})

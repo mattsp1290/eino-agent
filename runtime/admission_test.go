@@ -10,6 +10,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -155,17 +156,25 @@ func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 	store := newAdmissionStore()
 	admitter := Admitter{Store: store}
 	request := admissionRequest()
-	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "first", Kind: session.ExtensionHandlers, Required: true}}}
+	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("first")}}
 	request.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(request.ExtensionPlan)
 	if _, err := admitter.Admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
 	}
 
 	retry := request
-	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "second", Kind: session.ExtensionHandlers, Required: true}}}
+	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("second")}}
 	retry.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(retry.ExtensionPlan)
 	if _, err := admitter.Admit(context.Background(), retry); !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("mismatched retry error = %v, want ErrExtensionPlanMismatch", err)
+	}
+}
+
+func testHandlerPlanEntry(instance string) session.ExtensionPlanEntry {
+	return session.ExtensionPlanEntry{
+		InstanceID: instance,
+		Artifact:   session.ArtifactIdentity{Name: instance, Version: "1", Hash: instance + "-hash", ConfigHash: instance + "-config", SourceKind: string(extension.SourceNative)},
+		Handlers:   &session.HandlerPlanIdentity{Registrations: []session.RegistrationIdentity{{ID: "handler", Contract: "test/handler", Version: "1", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, Kind: session.HandlerNotification}}},
 	}
 }
 
@@ -207,7 +216,7 @@ func TestMatchingExtensionPlansRejectsZeroAndWrongSchemaDescriptors(t *testing.T
 }
 
 func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{InstanceID: "original", Kind: session.ExtensionHandlers, Required: true}}}
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("original")}}
 	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 	corrupt := descriptor.Clone()
 	corrupt.Entries[0].InstanceID = "changed"

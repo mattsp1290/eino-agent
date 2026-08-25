@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -372,7 +373,7 @@ func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
 	}
 }
 
-func TestNormalizedToolArgumentsCompatibilityShapes(t *testing.T) {
+func TestNormalizedToolArgumentsRequiresObjects(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
@@ -383,9 +384,10 @@ func TestNormalizedToolArgumentsCompatibilityShapes(t *testing.T) {
 	}{
 		{name: "empty", input: "", want: `{}`},
 		{name: "object", input: `{"text":"hi"}`, want: `{"text":"hi"}`},
-		{name: "null", input: `null`, want: `null`},
-		{name: "array", input: `[]`, want: `[]`},
-		{name: "string", input: `"value"`, want: `"value"`},
+		{name: "canonical object", input: `{ "z": 1, "a": 2 }`, want: `{"a":2,"z":1}`},
+		{name: "null", input: `null`, wantErr: true},
+		{name: "array", input: `[]`, wantErr: true},
+		{name: "string", input: `"value"`, wantErr: true},
 		{name: "malformed", input: `{"text":`, wantErr: true},
 	}
 	for _, tt := range tests {
@@ -540,7 +542,7 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 	}
 }
 
-// TestResolveStreamUsage covers the client-path usage bridge: when no Streamer
+// TestResolveStreamUsage covers the Eino-streamer usage bridge: when no observer
 // adapter reported usage through the observer (the default resolved.Client
 // path), the token usage must be taken from the concatenated message's
 // ResponseMeta.Usage so run consumers still see non-zero tokens. When the
@@ -707,12 +709,13 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 			Type: "function",
 			Function: einoschema.FunctionCall{
 				Name:      "echo",
-				Arguments: `{"permission_pattern":"go"}`,
+				Arguments: `{"target":"go"}`,
 			},
 		}})}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name:      "echo",
+		Pattern:   permissionPatternField("target"),
 		Retention: RetentionPolicy{MaxInlineBytes: 4096},
 		Scope: ToolScope{
 			Permissions: []string{"agui.client_tool"},
@@ -1070,6 +1073,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		ResultMessageID: "result-message-resume",
 		ResultPartID:    "result-part-resume",
 		Name:            "echo",
+		Pattern:         "echo",
 		Input:           []byte(`{"text":"hi"}`),
 		Status:          session.ToolCallPending,
 	}); err != nil {
@@ -1327,6 +1331,7 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		ResultMessageID: "result-resume",
 		ResultPartID:    "part-resume",
 		Name:            "echo",
+		Pattern:         "echo",
 		Input:           []byte(`{"text":"hi"}`),
 		Status:          session.ToolCallPending,
 	}
@@ -1525,4 +1530,14 @@ type orchestratorToolExecutorFunc func(context.Context, ToolCall) (ToolResult, e
 
 func (f orchestratorToolExecutorFunc) Execute(ctx context.Context, call ToolCall) (ToolResult, error) {
 	return f(ctx, call)
+}
+
+func permissionPatternField(field string) PermissionPatternResolver {
+	return PermissionPatternResolverFunc(func(_ context.Context, input json.RawMessage) (string, error) {
+		var object map[string]string
+		if err := json.Unmarshal(input, &object); err != nil {
+			return "", err
+		}
+		return object[field], nil
+	})
 }

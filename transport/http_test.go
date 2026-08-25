@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	einoschema "github.com/cloudwego/eino/schema"
-
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
@@ -292,6 +290,3 @@ func (h resumeHandle) Done() <-chan runtime.Result {
 	return ch
 }
 func (h resumeHandle) Interrupt(context.Context, string) error { return nil }
-func (h resumeHandle) FollowUp(context.Context, []*einoschema.Message) error {
-	return nil
-}

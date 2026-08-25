@@ -592,7 +592,7 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
 		_ = st.Close()
 		t.Fatalf("append message: %v", err)
 	}
-	call := session.ToolCall{ID: "call-tool", SessionID: "session-tool", RunID: "run-tool", MessageID: "msg-tool", ResultMessageID: "result-tool", ResultPartID: "part-tool", Name: "tool", Input: []byte(`{"ok":true}`), Status: session.ToolCallPending}
+	call := session.ToolCall{ID: "call-tool", SessionID: "session-tool", RunID: "run-tool", MessageID: "msg-tool", ResultMessageID: "result-tool", ResultPartID: "part-tool", Name: "tool", Pattern: "resource/one", Input: []byte(`{"ok":true}`), Status: session.ToolCallPending}
 	if _, err := st.CreateToolCall(ctx, call); err != nil {
 		_ = st.Close()
 		t.Fatalf("create tool call: %v", err)
@@ -603,6 +603,10 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
 	if err != nil {
 		_ = st.Close()
 		t.Fatalf("claim tool call: %v", err)
+	}
+	if claimed.Pattern != "resource/one" {
+		_ = st.Close()
+		t.Fatalf("claimed pattern = %q", claimed.Pattern)
 	}
 	return st, claimed
 }

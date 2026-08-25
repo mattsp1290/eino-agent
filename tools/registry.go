@@ -36,6 +36,9 @@ type Encoder func(ctx context.Context, value any) (json.RawMessage, error)
 // storage and the later execution pass. If omitted, json.Marshal is used.
 type InputNormalizer func(ctx context.Context, input any) (json.RawMessage, error)
 
+// PermissionPattern derives permission identity from decoded canonical input.
+type PermissionPattern func(ctx context.Context, input any) (string, error)
+
 // Executor executes one typed tool invocation.
 type Executor func(ctx context.Context, execution Execution) (any, error)
 
@@ -49,6 +52,7 @@ type Definition struct {
 	Parameters  *einoschema.ParamsOneOf
 	Decode      Decoder
 	Normalize   InputNormalizer
+	Pattern     PermissionPattern
 	Encode      Encoder
 	Execute     Executor
 	RetrySafe   bool
@@ -346,9 +350,23 @@ func materialize(definition Definition, context runtime.ToolScopeContext) (runti
 		RetrySafe:    definition.RetrySafe,
 		Scope:        cloneScope(scope),
 		InputDecoder: &toolDecoder{definition: decoderDefinition},
+		Pattern:      &toolPatternResolver{definition: decoderDefinition},
 		Retention:    definition.Retention,
 		Metadata:     cloneStringMap(definition.Metadata),
 	}, nil
+}
+
+type toolPatternResolver struct{ definition Definition }
+
+func (r toolPatternResolver) ResolvePermissionPattern(ctx context.Context, raw json.RawMessage) (string, error) {
+	if r.definition.Pattern == nil {
+		return r.definition.Name, nil
+	}
+	decoded, err := r.definition.Decode(ctx, raw)
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrMalformedInput, err)
+	}
+	return r.definition.Pattern(ctx, decoded)
 }
 
 type toolDecoder struct {

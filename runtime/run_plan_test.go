@@ -50,25 +50,25 @@ func configureTestTools(orchestrator *StreamingOrchestrator, registry staticTool
 
 func testToolIdentity(name string) session.ExtensionPlanEntry {
 	return session.ExtensionPlanEntry{
-		InstanceID: "test-tools", Kind: session.ExtensionTool,
-		Artifact: session.ArtifactIdentity{Name: "test-tools", Version: "1", Hash: "test-tools-hash", ConfigHash: "test-tools-config", SourceKind: string(extension.SourceNative)},
-		Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: name + "/test",
+		InstanceID: "test-tools",
+		Artifact:   session.ArtifactIdentity{Name: "test-tools", Version: "1", Hash: "test-tools-hash", ConfigHash: "test-tools-config", SourceKind: string(extension.SourceNative)},
+		Tool:       &session.ToolPlanIdentity{Name: name, RegistrationID: "test", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, SchemaHash: "test-schema", ExecutorHash: "test-executor"},
 	}
 }
 
-func testPromptIdentity(name, instance string) session.ExtensionPlanEntry {
+func testPromptIdentity(name, instance string, order int) session.ExtensionPlanEntry {
 	return session.ExtensionPlanEntry{
-		InstanceID: instance, Kind: session.ExtensionPrompt,
-		Artifact: session.ArtifactIdentity{Name: "test-prompts", Version: "1", Hash: "test-prompts-hash", ConfigHash: "test-prompts-config", SourceKind: string(extension.SourceNative)},
-		Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: name + "/test",
+		InstanceID: instance,
+		Artifact:   session.ArtifactIdentity{Name: "test-prompts", Version: "1", Hash: "test-prompts-hash", ConfigHash: "test-prompts-config", SourceKind: string(extension.SourceNative)},
+		Prompt:     &session.PromptPlanIdentity{Name: name, RegistrationID: "test", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, Order: order},
 	}
 }
 
 func testGuardIdentity(id string) session.ExtensionPlanEntry {
 	return session.ExtensionPlanEntry{
-		InstanceID: "test-guards", Kind: session.ExtensionGuard,
-		Artifact: session.ArtifactIdentity{Name: "test-guards", Version: "1", Hash: "test-guards-hash", ConfigHash: "test-guards-config", SourceKind: string(extension.SourceNative)},
-		Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, CapabilityID: id + "/test",
+		InstanceID: "test-guards",
+		Artifact:   session.ArtifactIdentity{Name: "test-guards", Version: "1", Hash: "test-guards-hash", ConfigHash: "test-guards-config", SourceKind: string(extension.SourceNative)},
+		Guard:      &session.GuardPlanIdentity{RegistrationID: id, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}},
 	}
 }
 

@@ -92,8 +92,7 @@ handle, err := orchestrator.Start(ctx, runtime.Request{
 ```
 
 The returned `runtime.Handle` is the live control surface for that admitted
-run. Use `Done()` for terminal status, `Interrupt()` for cancellation, and
-`FollowUp()` only when the runtime and product workflow allow it.
+run. Use `Done()` for terminal status and `Interrupt()` for cancellation.
 
 ## HTTP and AG-UI
 
@@ -249,13 +248,16 @@ snapshot.Tools.Enabled = []string{"lookup_ticket"}
 snapshot.Tools.Disabled = []string{"shell"}
 ```
 
-To register the standard coding-agent leaf tools from `eino-tools`, call
-`tools/einotools.RegisterDefaults(ctx, registry, options)`. Mount server tools
-and AG-UI client tools into the same `composition.Registry`, pass it through
-`runtime.WithRunPlanProvider`, and publish each request generation with
-`tools/agui.MountClientTools`. The host closes the prior session mount before
-publishing a replacement and supplies a restart-stable dispatcher artifact ID
-that changes whenever dispatch behavior changes.
+Standard `eino-tools` leaf adapters are not yet composition-connected. The
+legacy `tools/einotools.RegisterDefaults` helper populates only a low-level
+`tools.Registry` and must not be presented as a production run-plan setup. The
+required neutral provider shape is recorded in the sibling `eino-tools`
+request. Mount server tools and AG-UI client tools into a
+`composition.Registry`, pass it through `runtime.WithRunPlanProvider`, and
+publish each request generation with `tools/agui.MountClientTools`. The host
+closes the prior session mount before publishing a replacement and supplies a
+restart-stable dispatcher artifact ID that changes whenever dispatch behavior
+changes.
 
 Runtime-controlled tools use this lifecycle:
 

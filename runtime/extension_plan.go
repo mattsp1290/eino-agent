@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/mattsp1290/eino-agent/config"
@@ -90,19 +92,17 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 				byInstance[diagnostic.InstanceID] = index
 				descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{
 					InstanceID: diagnostic.InstanceID,
-					Kind:       session.ExtensionHandlers,
 					Artifact: session.ArtifactIdentity{
 						Name: diagnostic.Artifact.Name, Version: diagnostic.Artifact.Version,
 						Hash: diagnostic.Artifact.Hash, ConfigHash: diagnostic.Artifact.ConfigHash,
 						SourceKind: string(diagnostic.Artifact.SourceKind),
 					},
-					Required: true,
-					Scope:    session.ExtensionScope{Kind: string(diagnostic.Scope.Kind), Key: diagnostic.Scope.Key},
+					Handlers: &session.HandlerPlanIdentity{},
 				})
 			}
-			descriptor.Entries[index].Registrations = append(descriptor.Entries[index].Registrations, session.RegistrationIdentity{
+			descriptor.Entries[index].Handlers.Registrations = append(descriptor.Entries[index].Handlers.Registrations, session.RegistrationIdentity{
 				ID: diagnostic.ID, Contract: diagnostic.Contract.ID, Version: diagnostic.Contract.Version,
-				Order: diagnostic.Order, Scope: session.ExtensionScope{Kind: string(diagnostic.Scope.Kind), Key: diagnostic.Scope.Key},
+				Order: diagnostic.Order, Scope: session.ExtensionScope{Kind: string(diagnostic.Scope.Kind), Key: diagnostic.Scope.Key}, Kind: session.HandlerKind(diagnostic.Kind),
 			})
 		}
 	}
@@ -126,6 +126,9 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			}
 			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
 		}
+		if capability.Identity.Prompt.Name != capability.Prompt.Name || capability.Identity.Prompt.Order != capability.Prompt.Order || capability.Identity.InstanceID != capability.Prompt.InstanceID {
+			return fail(fmt.Errorf("%w: prompt identity does not match behavior", ErrExtensionPlanMismatch))
+		}
 		prompts[index] = capability.Prompt
 		descriptor.Entries = append(descriptor.Entries, capability.Identity.Clone())
 	}
@@ -137,6 +140,9 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			}
 			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
 		}
+		if capability.Identity.Guard.RegistrationID != capability.Guard.ID || capability.Identity.Guard.Order != capability.Guard.Order || capability.Identity.InstanceID != capability.Guard.InstanceID {
+			return fail(fmt.Errorf("%w: guard identity does not match behavior", ErrExtensionPlanMismatch))
+		}
 		guards[index] = capability.Guard
 		descriptor.Entries = append(descriptor.Entries, capability.Identity.Clone())
 	}
@@ -144,6 +150,9 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	for index, capability := range spec.Restrictions {
 		if err := validatePlanIdentity(capability.Identity, session.ExtensionRestriction); err != nil {
 			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
+		}
+		if capability.Identity.Restriction.RulesHash != RestrictionRulesHash(capability.Allowed, capability.Denied) {
+			return fail(fmt.Errorf("%w: restriction identity does not match behavior", ErrExtensionPlanMismatch))
 		}
 		capability.Allowed = append([]string(nil), capability.Allowed...)
 		capability.Denied = append([]string(nil), capability.Denied...)
@@ -163,19 +172,21 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 }
 
 func validatePlanIdentity(identity session.ExtensionPlanEntry, kind session.ExtensionKind) error {
-	if identity.Kind != kind || identity.InstanceID == "" || identity.CapabilityID == "" || !identity.Required {
+	actual, err := identity.Kind()
+	if err != nil || actual != kind {
 		return errors.New("invalid capability identity")
 	}
-	if identity.Artifact.Name == "" || identity.Artifact.Version == "" || identity.Artifact.Hash == "" || identity.Artifact.SourceKind == "" {
-		return errors.New("invalid artifact identity")
+	return session.ValidateExtensionPlan(session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{identity}})
+}
+
+// RestrictionRulesHash returns the canonical identity of one restriction rule set.
+func RestrictionRulesHash(allowed, denied []string) string {
+	raw, err := json.Marshal(struct{ Allowed, Denied []string }{allowed, denied})
+	if err != nil {
+		panic(err)
 	}
-	if identity.Scope.Kind != string(extension.ScopeGlobal) && identity.Scope.Kind != string(extension.ScopeSession) {
-		return errors.New("invalid capability scope")
-	}
-	if identity.Scope.Kind == string(extension.ScopeGlobal) && identity.Scope.Key != "" || identity.Scope.Kind == string(extension.ScopeSession) && identity.Scope.Key == "" {
-		return errors.New("invalid capability scope key")
-	}
-	return nil
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
 }
 
 type sealedPlanTools struct {
@@ -191,9 +202,9 @@ func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContex
 		if err != nil {
 			return nil, err
 		}
-		expected := strings.SplitN(capability.Identity.CapabilityID, "/", 2)[0]
+		expected := capability.Identity.Tool.Name
 		if tool.Name == "" || tool.Name != expected || seen[tool.Name] {
-			return nil, fmt.Errorf("%w: sealed tool resolver returned %q for %q", ErrExtensionPlanMismatch, tool.Name, capability.Identity.CapabilityID)
+			return nil, fmt.Errorf("%w: sealed tool resolver returned %q for %q", ErrExtensionPlanMismatch, tool.Name, expected)
 		}
 		seen[tool.Name] = true
 		if planToolAllowed(tool.Name, s.restrictions) {

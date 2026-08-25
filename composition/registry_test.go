@@ -203,7 +203,7 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 			}
 			var descriptorTools int
 			for _, entry := range plan.Descriptor().Entries {
-				if entry.Kind == session.ExtensionTool {
+				if kind, _ := entry.Kind(); kind == session.ExtensionTool {
 					descriptorTools++
 				}
 			}
@@ -616,7 +616,7 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	}
 	defer second.Release()
 	secondDescriptor := second.Descriptor()
-	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].SchemaHash == secondDescriptor.Entries[0].SchemaHash {
+	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].Tool.SchemaHash == secondDescriptor.Entries[0].Tool.SchemaHash {
 		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 	}
 	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -675,7 +675,7 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			}
 			defer second.Release()
 			secondDescriptor := second.Descriptor()
-			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].SchemaHash == secondDescriptor.Entries[0].SchemaHash {
+			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].Tool.SchemaHash == secondDescriptor.Entries[0].Tool.SchemaHash {
 				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 			}
 			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -723,7 +723,7 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 	}
 	persisted := plan.Descriptor()
 	plan.Release()
-	if len(persisted.Entries) != 1 || persisted.Entries[0].Scope.Kind != string(extension.ScopeGlobal) || len(persisted.Entries[0].Registrations) != 2 {
+	if len(persisted.Entries) != 1 || persisted.Entries[0].Handlers == nil || len(persisted.Entries[0].Handlers.Registrations) != 2 {
 		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Entries)
 	}
 
@@ -737,11 +737,11 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 	registry := NewRegistry(nil)
 	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{
-		InstanceID: "mixed", Kind: session.ExtensionHandlers, Required: true, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)},
-		Registrations: []session.RegistrationIdentity{
-			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-a"}},
-			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-b"}},
-		},
+		InstanceID: "mixed", Artifact: session.ArtifactIdentity{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: string(extension.SourceNative)},
+		Handlers: &session.HandlerPlanIdentity{Registrations: []session.RegistrationIdentity{
+			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-a"}, Kind: session.HandlerNotification},
+			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-b"}, Kind: session.HandlerNotification},
+		}},
 	}}}
 	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
 	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -792,7 +792,11 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 	var kinds = map[session.ExtensionKind]bool{}
 	descriptor := plan.Descriptor()
 	for _, entry := range descriptor.Entries {
-		kinds[entry.Kind] = true
+		kind, err := entry.Kind()
+		if err != nil {
+			t.Fatal(err)
+		}
+		kinds[kind] = true
 	}
 	for _, kind := range []session.ExtensionKind{session.ExtensionTool, session.ExtensionPrompt, session.ExtensionGuard, session.ExtensionRestriction} {
 		if !kinds[kind] {
@@ -829,7 +833,13 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			}
 			persisted := first.Descriptor()
 			first.Release()
-			if len(persisted.Entries) != 1 || persisted.Entries[0].Order != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
+			entryOrder := 0
+			if kind == session.ExtensionPrompt {
+				entryOrder = persisted.Entries[0].Prompt.Order
+			} else {
+				entryOrder = persisted.Entries[0].Guard.Order
+			}
+			if len(persisted.Entries) != 1 || entryOrder != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
 				t.Fatalf("ordered descriptor = %#v", persisted)
 			}
 			if err := firstMount.Close(context.Background()); err != nil {
@@ -864,10 +874,6 @@ func TestUnsupportedVersionTwoPlanIsRejected(t *testing.T) {
 	persisted := plan.Descriptor()
 	plan.Release()
 	persisted.SchemaVersion = 2
-	persisted.Fingerprint, err = session.FingerprintExtensionPlan(persisted)
-	if err != nil {
-		t.Fatal(err)
-	}
 	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
 	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("AcquireResumePlan schema v2 callback/tool plan = %v, want mismatch", err)

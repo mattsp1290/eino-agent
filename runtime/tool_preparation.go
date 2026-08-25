@@ -95,9 +95,12 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			if err != nil {
 				return nil, err
 			}
-			input = decoded
+			input, err = canonicalToolObject(decoded)
+			if err != nil {
+				return nil, fmt.Errorf("malformed normalized tool input: %w", err)
+			}
 		}
-		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
+		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Pattern: schemaCall.Function.Name, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
 		input = cloneJSON(call.Input)
 		var prepareErr error
 		if execution.dispatch() != nil {
@@ -105,11 +108,23 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			if err != nil {
 				prepareErr = err
 			} else {
-				call.Input = cloneJSON(prepared.Call.Input)
-				input = cloneJSON(prepared.Call.Input)
+				input, err = canonicalToolObject(prepared.Call.Input)
+				if err != nil {
+					prepareErr = extension.ErrProtectedMutation
+				} else {
+					call.Input = cloneJSON(input)
+				}
 			}
 		}
-		call.Pattern = toolPattern(input, schemaCall.Function.Name)
+		if prepareErr == nil && tool.Pattern != nil {
+			call.Pattern, err = tool.Pattern.ResolvePermissionPattern(ctx, input)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if call.Pattern == "" || len(call.Pattern) > 4096 {
+			return nil, fmt.Errorf("invalid permission pattern for tool %q", call.Name)
+		}
 		schemaCall.Function.Arguments = string(input)
 		_ = extension.Notify(execution.dispatch(), ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
 		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: prepareErr})
@@ -124,7 +139,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		callID, input := call.ID, call.Input
 		resultMessageID := o.ids.NewMessageID()
 		resultPartID := o.ids.NewPartID()
-		record, err := execution.store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
+		record, err := execution.store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Pattern: call.Pattern, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
 		if err != nil {
 			return nil, err
 		}

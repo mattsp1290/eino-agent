@@ -42,10 +42,12 @@ committed under `wasmext/gen` and reproduced with `make wit`.
 
 `runtime.ToolPreparePoint` runs after typed input decoding and before any
 durable tool-call record is created. Each interceptor sees the output of the
-preceding interceptor. The final JSON input determines `ToolCall.Pattern` and is the only
-input copied into the assistant tool-call part, pending/running/settled events,
-the durable tool-call record, permission and approval requests, and execution.
-Permissions therefore evaluate what will execute.
+preceding interceptor. Runtime normalizes the final value to a deterministic,
+non-null JSON object, then the tool definition's explicit pattern resolver
+derives `ToolCall.Pattern` from that same input. Both input and pattern are
+persisted; permissions, approval, execution, settlement, and resume reuse them
+without generic JSON-key probing. A failed prepare keeps the validated tool-name
+fallback so its durable failure can settle without masking the original error.
 
 `runtime.ToolResultTransformPoint` runs after execution and before encoding or
 settlement. Around interceptors unwind in reverse registration order, producing

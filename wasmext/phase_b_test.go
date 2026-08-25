@@ -39,7 +39,7 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := &LoadedContextSource{module: module, component: component}
-	defer func() { _ = source.Close() }()
+	defer func() { _ = source.close() }()
 	messages, err := source.loadContext(context.Background(), runtime.TurnSnapshot{
 		RunID: "run-1", SessionID: "session-1", Messages: []*einoschema.Message{einoschema.UserMessage("SECRET content")},
 	})
@@ -62,7 +62,7 @@ func TestEventSinkUsesContentFreeSummary(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &LoadedEventSink{module: module, component: component}
-	defer func() { _ = sink.Close() }()
+	defer func() { _ = sink.close() }()
 	if err := sink.Emit(context.Background(), runtime.Event{Kind: runtime.EventMessageDelta, Payload: json.RawMessage(`{"content":"SECRET"}`), Time: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestHookCachesFullMetadataUntilAfterRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	hook := &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
-	defer func() { _ = hook.Close() }()
+	defer func() { _ = hook.close() }()
 	if err := hook.beforeRun(context.Background(), session.Run{ID: "run-1", SessionID: "session-1", Agent: "agent"}); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 		t.Fatal(err)
 	}
 	hook := &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
-	defer func() { _ = hook.Close() }()
+	defer func() { _ = hook.close() }()
 
 	registry := extension.NewRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "registered-hook", Artifact: extension.Artifact{Name: "registered-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
@@ -167,7 +167,7 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 		t.Fatal(err)
 	}
 	hook := &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
-	defer func() { _ = hook.Close() }()
+	defer func() { _ = hook.close() }()
 	registry := extension.NewRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "early-hook", Artifact: extension.Artifact{Name: "early-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -215,7 +215,7 @@ func TestFinishRegisteredHookRunsCleanupAndJoinsErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	hook := &LoadedHook{module: module, component: component, turns: map[session.RunID]wittypes.TurnMetadata{"run-1": {RunID: "run-1"}}}
-	defer func() { _ = hook.Close() }()
+	defer func() { _ = hook.close() }()
 	err = finishRegisteredHook(context.Background(), hook, runtime.RunSettledNotice{SessionID: "session-1", Result: runtime.Result{RunID: "run-1"}})
 	joined, ok := err.(interface{ Unwrap() []error })
 	if !ok || len(joined.Unwrap()) != 2 || !reflect.DeepEqual(operations, []string{"hook.after-turn", "hook.after-run"}) {
@@ -265,7 +265,7 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 			t.Fatal(err)
 		}
 		source := &LoadedContextSource{module: module, component: component}
-		t.Cleanup(func() { _ = source.Close() })
+		t.Cleanup(func() { _ = source.close() })
 		extensionComponent := extension.Component{InstanceID: instanceID, Artifact: extension.Artifact{Name: instanceID, Version: "1", Hash: instanceID + "-artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 		_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 			return RegisterContextSource(registrar, extension.Registration{ID: "context", InstanceID: instanceID, Scope: extension.GlobalScope()}, source)
@@ -308,7 +308,7 @@ func TestToolMiddlewareJSONMappingPreservesProtectedContainers(t *testing.T) {
 		t.Fatal(err)
 	}
 	middleware := &LoadedToolMiddleware{module: module, component: component}
-	defer func() { _ = middleware.Close() }()
+	defer func() { _ = middleware.close() }()
 	call := runtime.ToolCall{ID: "call-1", Input: json.RawMessage(`{"raw":true}`)}
 	input, err := middleware.beforeToolCall(context.Background(), runtime.Tool{Name: "echo"}, call)
 	if err != nil || string(input) != `{"normalized":true}` {
@@ -368,7 +368,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := &LoadedContextSource{module: contextModule, component: contextComponent}
-	defer func() { _ = source.Close() }()
+	defer func() { _ = source.close() }()
 	eventCalls := 0
 	eventComponent := &fakeComponent{call: func(_ context.Context, _ string, _ any, _ any) error { eventCalls++; return nil }}
 	eventModule, err := loadModule(context.Background(), fixtureConfig(t, []byte("point-event")), eventSinkContract, fakeFactory(eventComponent))
@@ -376,7 +376,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	sink := &LoadedEventSink{module: eventModule, component: eventComponent}
-	defer func() { _ = sink.Close() }()
+	defer func() { _ = sink.close() }()
 
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "wasm-points", Artifact: extension.Artifact{Name: "wasm-points", Version: "0.1.0", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}

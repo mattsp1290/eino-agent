@@ -27,7 +27,6 @@ type Handle interface {
 	RunID() session.RunID
 	Done() <-chan Result
 	Interrupt(ctx context.Context, reason string) error
-	FollowUp(ctx context.Context, messages []*einoschema.Message) error
 }
 
 // Result is the terminal outcome of a run.
@@ -85,6 +84,7 @@ type Tool struct {
 	RetrySafe    bool
 	Scope        ToolScope
 	InputDecoder InputDecoder
+	Pattern      PermissionPatternResolver
 	Retention    RetentionPolicy
 	Metadata     map[string]string
 }
@@ -150,6 +150,18 @@ type ToolScope struct {
 // InputDecoder validates and normalizes model-provided tool input.
 type InputDecoder interface {
 	DecodeToolInput(ctx context.Context, raw json.RawMessage) (json.RawMessage, error)
+}
+
+// PermissionPatternResolver derives deterministic permission identity from
+// final normalized tool input. Implementations must be side-effect free.
+type PermissionPatternResolver interface {
+	ResolvePermissionPattern(ctx context.Context, input json.RawMessage) (string, error)
+}
+
+type PermissionPatternResolverFunc func(context.Context, json.RawMessage) (string, error)
+
+func (fn PermissionPatternResolverFunc) ResolvePermissionPattern(ctx context.Context, input json.RawMessage) (string, error) {
+	return fn(ctx, input)
 }
 
 // RetentionPolicy describes runtime handling for large tool outputs.

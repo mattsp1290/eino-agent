@@ -244,7 +244,10 @@ func subagentDefinition(runner SubagentRunner) agenttools.Definition {
 		Description: "Request a host-provided subagent task for this session.",
 		Decode:      decodeJSON[subagentInput],
 		Normalize:   normalizeSubagentInput,
-		Encode:      encodeJSON,
+		Pattern: func(_ context.Context, input any) (string, error) {
+			return input.(subagentInput).Task, nil
+		},
+		Encode: encodeJSON,
 		Execute: func(ctx context.Context, execution agenttools.Execution) (any, error) {
 			input := execution.Input.(subagentInput)
 			if input.Task == "" {
@@ -265,7 +268,10 @@ func skillLoadDefinition(loader SkillLoader) agenttools.Definition {
 		Description: "Request host-provided skill loading for this session.",
 		Decode:      decodeJSON[skillInput],
 		Normalize:   normalizeSkillInput,
-		Encode:      encodeJSON,
+		Pattern: func(_ context.Context, input any) (string, error) {
+			return input.(skillInput).Name, nil
+		},
+		Encode: encodeJSON,
 		Execute: func(ctx context.Context, execution agenttools.Execution) (any, error) {
 			input := execution.Input.(skillInput)
 			if input.Name == "" {
@@ -374,10 +380,7 @@ func normalizeSubagentInput(_ context.Context, input any) (json.RawMessage, erro
 	if value.Task == "" {
 		return nil, fmt.Errorf("task required")
 	}
-	return json.Marshal(map[string]string{
-		"task":               value.Task,
-		"permission_pattern": value.Task,
-	})
+	return json.Marshal(value)
 }
 
 func normalizeSkillInput(_ context.Context, input any) (json.RawMessage, error) {
@@ -385,8 +388,5 @@ func normalizeSkillInput(_ context.Context, input any) (json.RawMessage, error) 
 	if value.Name == "" {
 		return nil, fmt.Errorf("name required")
 	}
-	return json.Marshal(map[string]string{
-		"name":               value.Name,
-		"permission_pattern": value.Name,
-	})
+	return json.Marshal(value)
 }

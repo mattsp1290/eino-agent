@@ -21,7 +21,7 @@ func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run ses
 	call := ToolCall{
 		ID: claimed.ID, SessionID: claimed.SessionID, RunID: claimed.RunID, MessageID: claimed.MessageID,
 		ResultMessageID: claimed.ResultMessageID, ResultPartID: claimed.ResultPartID, Name: claimed.Name,
-		Scope: tool.Scope, Pattern: toolPattern(claimed.Input, claimed.Name), Input: cloneJSON(claimed.Input),
+		Scope: tool.Scope, Pattern: claimed.Pattern, Input: cloneJSON(claimed.Input),
 	}
 	_, claimed = e.ensureToolResultIDs(call, claimed)
 	completedAt := e.host.now()

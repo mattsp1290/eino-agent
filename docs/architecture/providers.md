@@ -8,9 +8,11 @@ while still allowing Eino-compatible transports to be plugged in.
 ## Core Contracts
 
 `model.Adapter` exposes provider metadata, model descriptors, and a `Build`
-method that returns an immutable Eino `ToolCallingChatModel` for one runtime
-selection. `model.AdapterResolver` chooses an adapter by provider ID and returns
-the resolved provider, model descriptor, and client.
+method that returns one immutable `model.Streamer` for a runtime selection.
+`model.AdapterResolver` chooses an adapter by provider ID and returns the
+resolved provider, model descriptor, and that sole execution transport. An
+adapter wrapping an Eino `ToolCallingChatModel` uses `model.NewEinoStreamer`;
+the wrapper prepends the system message and binds tools exactly once.
 
 Provider request identity is represented by `model.Identity`, a model-layer
 shape that intentionally does not import `runtime`, `session`, or the
@@ -19,8 +21,8 @@ shape in `runtime.ProviderRequest`.
 
 ## Streaming Callbacks
 
-Adapters that can expose normalized stream callbacks implement
-`model.Streamer`. The callback shape reports:
+Every built adapter implements `model.Streamer`. Its optional observer callback
+shape reports:
 
 - provider start;
 - normalized message deltas;
@@ -42,6 +44,6 @@ selecting OpenAI, Codex-style, local, or other provider transports.
 ## Immutability
 
 Providers must treat Eino messages and tool info as immutable request values.
-Tool binding uses Eino's `ToolCallingChatModel.WithTools`, which returns a
-derived model instead of mutating the shared base model. This prevents one
-session's tools from racing with another session's provider request.
+The Eino streamer binds tools once with `ToolCallingChatModel.WithTools`, which
+returns a derived model instead of mutating the shared base model. This prevents
+one session's tools from racing with another session's provider request.

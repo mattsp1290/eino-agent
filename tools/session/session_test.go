@@ -167,8 +167,12 @@ func TestSessionHooksReceiveSessionID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DecodeToolInput skill error = %v", err)
 	}
-	if !strings.Contains(string(normalized), `"permission_pattern":"go"`) {
-		t.Fatalf("normalized skill input = %s", normalized)
+	if strings.Contains(string(normalized), "permission_pattern") {
+		t.Fatalf("normalized skill input leaked permission metadata = %s", normalized)
+	}
+	pattern, err := tools[NameSkillLoad].Pattern.ResolvePermissionPattern(context.Background(), normalized)
+	if err != nil || pattern != "go" {
+		t.Fatalf("permission pattern = %q err=%v", pattern, err)
 	}
 }
 

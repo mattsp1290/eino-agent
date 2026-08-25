@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
 )
@@ -136,11 +135,11 @@ func (e Error) Unwrap() error {
 	return e.Cause
 }
 
-// Adapter builds immutable Eino chat models for provider requests.
+// Adapter builds one immutable provider streamer for the selected model.
 type Adapter interface {
 	Provider() Provider
 	Models(ctx context.Context) ([]Descriptor, error)
-	Build(ctx context.Context, selection Selection, runtime Runtime) (einomodel.ToolCallingChatModel, error)
+	Build(ctx context.Context, selection Selection, runtime Runtime) (Streamer, error)
 }
 
 // OptionalAdapter describes adapter packages that may be registered by hosts or
@@ -151,8 +150,7 @@ type OptionalAdapter interface {
 	Available(ctx context.Context, runtime Runtime) error
 }
 
-// Streamer is an optional adapter capability for callers that want normalized
-// provider callbacks in addition to the raw Eino stream.
+// Streamer is the sole provider execution surface.
 type Streamer interface {
 	StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[*einoschema.Message], error)
 }
@@ -191,15 +189,17 @@ func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runti
 	if err != nil {
 		return Resolved{}, err
 	}
-	client, err := adapter.Build(ctx, selection, cloneRuntime(runtime))
+	streamer, err := adapter.Build(ctx, selection, cloneRuntime(runtime))
 	if err != nil {
 		return Resolved{}, err
+	}
+	if streamer == nil {
+		return Resolved{}, Error{Code: "provider_streamer_missing", Message: "provider adapter returned nil streamer", Cause: ErrProviderUnavailable}
 	}
 	return Resolved{
 		Provider: provider,
 		Model:    descriptor,
-		Client:   client,
-		Streamer: streamerFor(adapter),
+		Streamer: streamer,
 	}, nil
 }
 
@@ -250,14 +250,6 @@ func (r AdapterResolver) descriptorFor(ctx context.Context, adapter Adapter, sel
 		Message: "model descriptor not found",
 		Cause:   ErrProviderRejected,
 	}
-}
-
-func streamerFor(adapter Adapter) Streamer {
-	streamer, ok := adapter.(Streamer)
-	if !ok {
-		return nil
-	}
-	return streamer
 }
 
 func cloneRuntime(src Runtime) Runtime {

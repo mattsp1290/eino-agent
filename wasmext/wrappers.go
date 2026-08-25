@@ -18,8 +18,7 @@ import (
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
 
-// LoadedTool owns one Wasm-backed tool definition and implements io.Closer.
-// Register Definition through the ordinary tools.Registry path.
+// LoadedTool owns one Wasm-backed tool definition loaded by Loader.
 type LoadedTool struct {
 	module     *module
 	component  toolComponent
@@ -29,13 +28,7 @@ type LoadedTool struct {
 // Definition returns the native tool definition backed by this component.
 func (t *LoadedTool) Definition() (tools.Definition, error) { return t.definition.Clone() }
 
-// Close releases the compiled component and stops accepting calls.
-func (t *LoadedTool) Close() error { return t.module.Close() }
-
-// OpenTool loads a tool component while retaining an explicit close handle.
-func OpenTool(ctx context.Context, cfg ModuleConfig) (*LoadedTool, error) {
-	return openTool(ctx, cfg, newEngine)
-}
+func (t *LoadedTool) close() error { return t.module.Close() }
 
 func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedTool, error) {
 	module, err := loadModule(ctx, cfg, toolContract, factory)
@@ -62,6 +55,10 @@ func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 		return nil, err
 	}
 	return &LoadedTool{module: module, component: component, definition: definition}, nil
+}
+
+func openToolDefault(ctx context.Context, cfg ModuleConfig) (*LoadedTool, error) {
+	return openTool(ctx, cfg, newEngine)
 }
 
 func toolDefinition(module *module, component toolComponent, metadata wittypes.ToolMetadata) (tools.Definition, error) {
@@ -96,6 +93,22 @@ func toolDefinition(module *module, component toolComponent, metadata wittypes.T
 			return nil, extensionError(payloadErrorKind(err), module.identity, "tool.decode", err)
 		}
 		return append(json.RawMessage(nil), raw...), nil
+	}
+	definition.Pattern = func(_ context.Context, input any) (string, error) {
+		raw, ok := input.(json.RawMessage)
+		if !ok {
+			return "", extensionError(ErrorPayload, module.identity, "tool.permission-pattern", errors.New("decoded input is not JSON"))
+		}
+		var value struct {
+			PermissionPattern string `json:"permission_pattern"`
+		}
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return "", extensionError(ErrorPayload, module.identity, "tool.permission-pattern", err)
+		}
+		if value.PermissionPattern == "" {
+			return metadata.Name, nil
+		}
+		return value.PermissionPattern, nil
 	}
 	definition.Execute = func(ctx context.Context, execution tools.Execution) (any, error) {
 		raw, ok := execution.Input.(json.RawMessage)
@@ -143,8 +156,7 @@ type LoadedPermissionsPolicy struct {
 	component permissionsComponent
 }
 
-// Close releases the compiled policy component.
-func (p *LoadedPermissionsPolicy) Close() error { return p.module.Close() }
+func (p *LoadedPermissionsPolicy) close() error { return p.module.Close() }
 
 func (p *LoadedPermissionsPolicy) Decide(ctx context.Context, request permissions.Request) (permissions.Decision, error) {
 	input := wittypes.PermissionRequest{
@@ -177,11 +189,6 @@ func (p *LoadedPermissionsPolicy) Decide(ctx context.Context, request permission
 	return decision, nil
 }
 
-// OpenPermissionsPolicy loads a policy while retaining an explicit close handle.
-func OpenPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (*LoadedPermissionsPolicy, error) {
-	return loadPermissionsPolicy(ctx, cfg, newEngine)
-}
-
 func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedPermissionsPolicy, error) {
 	module, err := loadModule(ctx, cfg, permissionsPolicyContract, factory)
 	if err != nil {
@@ -201,7 +208,7 @@ type LoadedContextSource struct {
 	component contextComponent
 }
 
-func (s *LoadedContextSource) Close() error { return s.module.Close() }
+func (s *LoadedContextSource) close() error { return s.module.Close() }
 
 func (s *LoadedContextSource) loadContext(ctx context.Context, snapshot runtime.TurnSnapshot) ([]*einoschema.Message, error) {
 	return s.loadContextMetadata(ctx, turnMetadata(snapshot))
@@ -241,8 +248,8 @@ func (s *LoadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 	return messages, nil
 }
 
-func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error) {
-	module, err := loadModule(ctx, cfg, contextSourceContract, newEngine)
+func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedContextSource, error) {
+	module, err := loadModule(ctx, cfg, contextSourceContract, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -254,13 +261,17 @@ func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSou
 	return &LoadedContextSource{module: module, component: component}, nil
 }
 
+func openContextSourceDefault(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error) {
+	return openContextSource(ctx, cfg, newEngine)
+}
+
 // LoadedEventSink emits only a bounded, content-free projection.
 type LoadedEventSink struct {
 	module    *module
 	component eventComponent
 }
 
-func (s *LoadedEventSink) Close() error { return s.module.Close() }
+func (s *LoadedEventSink) close() error { return s.module.Close() }
 
 func (s *LoadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
 	input := wittypes.BoundedEvent{
@@ -273,8 +284,8 @@ func (s *LoadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
 	})
 }
 
-func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error) {
-	module, err := loadModule(ctx, cfg, eventSinkContract, newEngine)
+func openEventSink(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedEventSink, error) {
+	module, err := loadModule(ctx, cfg, eventSinkContract, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -286,6 +297,10 @@ func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, err
 	return &LoadedEventSink{module: module, component: component}, nil
 }
 
+func openEventSinkDefault(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error) {
+	return openEventSink(ctx, cfg, newEngine)
+}
+
 // LoadedHook caches full turn metadata by run for deterministic after hooks.
 type LoadedHook struct {
 	module    *module
@@ -294,11 +309,15 @@ type LoadedHook struct {
 	turns     map[session.RunID]wittypes.TurnMetadata
 }
 
-func (h *LoadedHook) Close() error {
+func (h *LoadedHook) close() error {
+	h.cleanup()
+	return h.module.Close()
+}
+
+func (h *LoadedHook) cleanup() {
 	h.mu.Lock()
 	h.turns = nil
 	h.mu.Unlock()
-	return h.module.Close()
 }
 
 func (h *LoadedHook) beforeRun(ctx context.Context, run session.Run) error {
@@ -369,8 +388,8 @@ func (h *LoadedHook) cachedTurn(runID session.RunID, fallback wittypes.TurnMetad
 	return fallback
 }
 
-func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
-	module, err := loadModule(ctx, cfg, hookContract, newEngine)
+func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedHook, error) {
+	module, err := loadModule(ctx, cfg, hookContract, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -382,13 +401,17 @@ func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
 	return &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
 }
 
+func openHookDefault(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
+	return openHook(ctx, cfg, newEngine)
+}
+
 // LoadedToolMiddleware preserves attachments and metadata on replacement.
 type LoadedToolMiddleware struct {
 	module    *module
 	component middlewareComponent
 }
 
-func (m *LoadedToolMiddleware) Close() error { return m.module.Close() }
+func (m *LoadedToolMiddleware) close() error { return m.module.Close() }
 
 func (m *LoadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall) (json.RawMessage, error) {
 	turn := middlewareTurn(call, tool)
@@ -433,8 +456,8 @@ type toolMiddlewareAfterRequest struct {
 	Turn                                        wittypes.TurnMetadata
 }
 
-func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error) {
-	module, err := loadModule(ctx, cfg, toolMiddlewareContract, newEngine)
+func openToolMiddleware(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedToolMiddleware, error) {
+	module, err := loadModule(ctx, cfg, toolMiddlewareContract, factory)
 	if err != nil {
 		return nil, err
 	}
@@ -444,4 +467,8 @@ func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddl
 		return nil, err
 	}
 	return &LoadedToolMiddleware{module: module, component: component}, nil
+}
+
+func openToolMiddlewareDefault(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error) {
+	return openToolMiddleware(ctx, cfg, newEngine)
 }
