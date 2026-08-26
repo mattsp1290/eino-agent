@@ -40,8 +40,8 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	}
 	source := &LoadedContextSource{module: module, component: component}
 	defer func() { _ = source.close() }()
-	messages, err := source.loadContext(context.Background(), runtime.TurnSnapshot{
-		RunID: "run-1", SessionID: "session-1", Messages: []*einoschema.Message{einoschema.UserMessage("SECRET content")},
+	messages, err := source.loadBoundedContext(context.Background(), runtime.BoundedTurnMetadata{
+		RunID: "run-1", SessionID: "session-1", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1},
 	})
 	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.System || messages[1].Content != "context" {
 		t.Fatalf("LoadContext = %#v, %v", messages, err)
@@ -68,40 +68,6 @@ func TestEventSinkUsesContentFreeSummary(t *testing.T) {
 	}
 }
 
-func TestHookCachesFullMetadataUntilAfterRun(t *testing.T) {
-	var mu sync.Mutex
-	seen := map[string]wittypes.TurnMetadata{}
-	component := &fakeComponent{}
-	component.call = func(_ context.Context, operation string, input, _ any) error {
-		mu.Lock()
-		seen[operation] = input.(wittypes.TurnMetadata)
-		mu.Unlock()
-		return nil
-	}
-	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("hook")), hookContract, fakeFactory(component))
-	if err != nil {
-		t.Fatal(err)
-	}
-	hook := &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
-	defer func() { _ = hook.close() }()
-	if err := hook.beforeRun(context.Background(), session.Run{ID: "run-1", SessionID: "session-1", Agent: "agent"}); err != nil {
-		t.Fatal(err)
-	}
-	snapshot := runtime.TurnSnapshot{RunID: "run-1", SessionID: "session-1", Tools: []runtime.Tool{{Name: "echo"}}, Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
-	if _, err := hook.beforeTurn(context.Background(), snapshot); err != nil {
-		t.Fatal(err)
-	}
-	if err := hook.afterTurn(context.Background(), runtime.TurnSnapshot{RunID: "run-1"}, runtime.Result{}); err != nil {
-		t.Fatal(err)
-	}
-	if err := hook.afterRun(context.Background(), runtime.Result{RunID: "run-1"}); err != nil {
-		t.Fatal(err)
-	}
-	if seen["hook.before-run"].MessageCount != 0 || seen["hook.after-turn"].MessageCount != 1 || seen["hook.after-run"].ToolNames.Len() != 1 {
-		t.Fatalf("hook metadata = %#v", seen)
-	}
-}
-
 func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string]wittypes.TurnMetadata{}
@@ -121,7 +87,7 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "registered-hook", Artifact: extension.Artifact{Name: "registered-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return RegisterHook(registrar, extension.Registration{ID: "hook", InstanceID: extensionComponent.InstanceID, Scope: extension.GlobalScope()}, hook)
+		return RegisterHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +137,7 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 	registry := extension.NewRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "early-hook", Artifact: extension.Artifact{Name: "early-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return RegisterHook(registrar, extension.Registration{ID: "hook", InstanceID: extensionComponent.InstanceID, Scope: extension.GlobalScope()}, hook)
+		return RegisterHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -227,26 +193,29 @@ func TestFinishRegisteredHookRunsCleanupAndJoinsErrors(t *testing.T) {
 			t.Fatalf("joined error %d = %#v", index, joined.Unwrap()[index])
 		}
 	}
-	hook.mu.RLock()
+	hook.mu.Lock()
 	_, cached := hook.turns["run-1"]
-	hook.mu.RUnlock()
+	hook.mu.Unlock()
 	if cached {
 		t.Fatal("after-run did not remove cached metadata")
 	}
 }
 
 func TestContextContributionSourceIsUnambiguousAcrossInstancesAndScopes(t *testing.T) {
-	specs := []extension.Registration{
-		{ID: "c", InstanceID: "a/b", Scope: extension.GlobalScope()},
-		{ID: "b/c", InstanceID: "a", Scope: extension.GlobalScope()},
-		{ID: "c", InstanceID: "a/b", Scope: extension.SessionScope("session")},
-		{ID: "c", InstanceID: "other", Scope: extension.GlobalScope()},
+	tests := []struct {
+		instanceID string
+		spec       extension.Registration
+	}{
+		{instanceID: "a/b", spec: extension.Registration{ID: "c", Scope: extension.GlobalScope()}},
+		{instanceID: "a", spec: extension.Registration{ID: "b/c", Scope: extension.GlobalScope()}},
+		{instanceID: "a/b", spec: extension.Registration{ID: "c", Scope: extension.SessionScope("session")}},
+		{instanceID: "other", spec: extension.Registration{ID: "c", Scope: extension.GlobalScope()}},
 	}
 	seen := map[string]bool{}
-	for _, spec := range specs {
-		source := contextContributionSource(spec, 0)
+	for _, test := range tests {
+		source := contextContributionSource(test.instanceID, test.spec, 0)
 		if seen[source] {
-			t.Fatalf("duplicate source %q for %#v", source, spec)
+			t.Fatalf("duplicate source %q for %#v", source, test)
 		}
 		seen[source] = true
 	}
@@ -268,7 +237,7 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 		t.Cleanup(func() { _ = source.close() })
 		extensionComponent := extension.Component{InstanceID: instanceID, Artifact: extension.Artifact{Name: instanceID, Version: "1", Hash: instanceID + "-artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 		_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-			return RegisterContextSource(registrar, extension.Registration{ID: "context", InstanceID: instanceID, Scope: extension.GlobalScope()}, source)
+			return RegisterContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source)
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -381,10 +350,10 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "wasm-points", Artifact: extension.Artifact{Name: "wasm-points", Version: "0.1.0", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := RegisterContextSource(registrar, extension.Registration{ID: "context", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, source); err != nil {
+		if err := RegisterContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source); err != nil {
 			return err
 		}
-		return RegisterEventSink(registrar, extension.Registration{ID: "events", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, sink)
+		return RegisterEventSink(registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, sink)
 	}))
 	if err != nil {
 		t.Fatal(err)

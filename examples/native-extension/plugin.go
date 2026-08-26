@@ -31,15 +31,15 @@ func Mount(ctx context.Context, registry *composition.Registry, sessionID sessio
 				return err
 			}
 		}
-		if err := registrar.Tool(composition.ToolRegistration{ID: "tool/echo", InstanceID: instanceID, Order: runtime.OrderApplication, Scope: scope, Definition: echoDefinition()}); err != nil {
+		if err := registrar.Tool(composition.ToolRegistration{ID: "tool/echo", Order: runtime.OrderApplication, Scope: scope, Definition: echoDefinition()}); err != nil {
 			return err
 		}
-		if err := registrar.Prompt(composition.PromptRegistration{ID: "prompt/policy", InstanceID: instanceID, Name: "example/policy", Order: runtime.OrderApplication, Scope: scope, Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) {
+		if err := registrar.Prompt(composition.PromptRegistration{ID: "prompt/policy", Name: "example/policy", Order: runtime.OrderApplication, Scope: scope, Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) {
 			return "Use the session echo tool only for explicitly requested text.", nil
 		})}); err != nil {
 			return err
 		}
-		if err := registrar.Guard(composition.GuardRegistration{ID: "guard/blocked-input", InstanceID: instanceID, Order: runtime.OrderApplication, Scope: scope, Guard: runtime.ToolGuardFunc(func(_ context.Context, request runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
+		if err := registrar.Guard(composition.GuardRegistration{ID: "guard/blocked-input", Order: runtime.OrderApplication, Scope: scope, Guard: runtime.ToolGuardFunc(func(_ context.Context, request runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
 			if jsonContainsTrue(request.Call.Input, "blocked") {
 				return runtime.ToolGuardResult{Decision: runtime.ToolGuardDeny, Code: "example_blocked", Message: "example plugin blocked this input"}, nil
 			}
@@ -47,13 +47,13 @@ func Mount(ctx context.Context, registry *composition.Registry, sessionID sessio
 		})}); err != nil {
 			return err
 		}
-		if err := extension.Use(registrar.Extensions(), runtime.ContextAssemblePoint, extension.Registration{ID: "context/session", InstanceID: instanceID, Order: runtime.OrderApplication, Scope: scope}, func(ctx context.Context, assembly runtime.ContextAssembly, next extension.Next[runtime.ContextAssembly, runtime.ContextAssembly]) (runtime.ContextAssembly, error) {
+		if err := extension.Use(registrar.Extensions(), runtime.ContextAssemblePoint, extension.Registration{ID: "context/session", Order: runtime.OrderApplication, Scope: scope}, func(ctx context.Context, assembly runtime.ContextAssembly, next extension.Next[runtime.ContextAssembly, runtime.ContextAssembly]) (runtime.ContextAssembly, error) {
 			assembly.Contributions = append(assembly.Contributions, runtime.ContextContribution{Source: instanceID + "/context", Order: runtime.OrderApplication, Message: einoschema.SystemMessage("Native example extension is active for this session.")})
 			return next(ctx, assembly)
 		}); err != nil {
 			return err
 		}
-		if err := extension.Use(registrar.Extensions(), runtime.ToolPreparePoint, extension.Registration{ID: "tool/prepare", InstanceID: instanceID, Order: runtime.OrderApplication, Scope: scope}, func(ctx context.Context, prepared runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
+		if err := extension.Use(registrar.Extensions(), runtime.ToolPreparePoint, extension.Registration{ID: "tool/prepare", Order: runtime.OrderApplication, Scope: scope}, func(ctx context.Context, prepared runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
 			var input map[string]any
 			if err := json.Unmarshal(prepared.Call.Input, &input); err != nil {
 				return runtime.PreparedToolCall{}, err
@@ -64,7 +64,7 @@ func Mount(ctx context.Context, registry *composition.Registry, sessionID sessio
 		}); err != nil {
 			return err
 		}
-		return extension.On(registrar.Extensions(), runtime.ToolSettledPoint, extension.Registration{ID: "tool/settled", InstanceID: instanceID, Order: runtime.OrderApplication, Scope: scope}, func(context.Context, runtime.ToolSettledNotice) error {
+		return extension.On(registrar.Extensions(), runtime.ToolSettledPoint, extension.Registration{ID: "tool/settled", Order: runtime.OrderApplication, Scope: scope}, func(context.Context, runtime.ToolSettledNotice) error {
 			return nil
 		})
 	}))

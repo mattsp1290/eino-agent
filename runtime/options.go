@@ -148,11 +148,6 @@ func WithQueueSize(value int) Option {
 	return positiveIntOption("QueueSize", value, func(o *StreamingOrchestrator, value int) { o.queueSize = value })
 }
 
-// WithModelRequestLedger enables the optional durable provider-attempt ledger.
-func WithModelRequestLedger(enabled bool) Option {
-	return func(o *StreamingOrchestrator) error { o.modelRequestLedger = enabled; return nil }
-}
-
 // WithModelRequestSafeOptions allowlists model option keys that may be copied
 // into audit records. No options are recorded by default.
 func WithModelRequestSafeOptions(keys ...string) Option {

@@ -57,10 +57,6 @@ func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 	return &LoadedTool{module: module, component: component, definition: definition}, nil
 }
 
-func openToolDefault(ctx context.Context, cfg ModuleConfig) (*LoadedTool, error) {
-	return openTool(ctx, cfg, newEngine)
-}
-
 func toolDefinition(module *module, component toolComponent, metadata wittypes.ToolMetadata) (tools.Definition, error) {
 	if strings.TrimSpace(metadata.Name) == "" || len(metadata.Name) > 128 || int64(len(metadata.Description)) > module.limits.MaxOutputBytes {
 		return tools.Definition{}, extensionError(ErrorContract, module.identity, "tool.metadata", errors.New("invalid tool metadata"))
@@ -210,10 +206,6 @@ type LoadedContextSource struct {
 
 func (s *LoadedContextSource) close() error { return s.module.Close() }
 
-func (s *LoadedContextSource) loadContext(ctx context.Context, snapshot runtime.TurnSnapshot) ([]*einoschema.Message, error) {
-	return s.loadContextMetadata(ctx, turnMetadata(snapshot))
-}
-
 func (s *LoadedContextSource) loadBoundedContext(ctx context.Context, metadata runtime.BoundedTurnMetadata) ([]*einoschema.Message, error) {
 	return s.loadContextMetadata(ctx, turnMetadataFromBounded(metadata))
 }
@@ -261,10 +253,6 @@ func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFact
 	return &LoadedContextSource{module: module, component: component}, nil
 }
 
-func openContextSourceDefault(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error) {
-	return openContextSource(ctx, cfg, newEngine)
-}
-
 // LoadedEventSink emits only a bounded, content-free projection.
 type LoadedEventSink struct {
 	module    *module
@@ -297,15 +285,11 @@ func openEventSink(ctx context.Context, cfg ModuleConfig, factory engineFactory)
 	return &LoadedEventSink{module: module, component: component}, nil
 }
 
-func openEventSinkDefault(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error) {
-	return openEventSink(ctx, cfg, newEngine)
-}
-
-// LoadedHook caches full turn metadata by run for deterministic after hooks.
+// LoadedHook caches bounded turn metadata by run for deterministic after hooks.
 type LoadedHook struct {
 	module    *module
 	component hookComponent
-	mu        sync.RWMutex
+	mu        sync.Mutex
 	turns     map[session.RunID]wittypes.TurnMetadata
 }
 
@@ -318,17 +302,6 @@ func (h *LoadedHook) cleanup() {
 	h.mu.Lock()
 	h.turns = nil
 	h.mu.Unlock()
-}
-
-func (h *LoadedHook) beforeRun(ctx context.Context, run session.Run) error {
-	return h.beforeRunMetadata(ctx, partialTurnMetadata(run))
-}
-
-func (h *LoadedHook) beforeTurn(ctx context.Context, snapshot runtime.TurnSnapshot) (runtime.TurnSnapshot, error) {
-	if err := h.beforeTurnMetadata(ctx, turnMetadata(snapshot)); err != nil {
-		return runtime.TurnSnapshot{}, err
-	}
-	return snapshot.Clone(), nil
 }
 
 func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
@@ -362,12 +335,7 @@ func (h *LoadedHook) cacheTurn(turn wittypes.TurnMetadata) {
 	h.mu.Unlock()
 }
 
-func (h *LoadedHook) afterTurn(ctx context.Context, snapshot runtime.TurnSnapshot, _ runtime.Result) error {
-	turn := h.cachedTurn(snapshot.RunID, turnMetadata(snapshot))
-	return h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterTurn(callCtx, turn) })
-}
-
-func (h *LoadedHook) afterRun(ctx context.Context, result runtime.Result) error {
+func (h *LoadedHook) finish(ctx context.Context, result runtime.Result) error {
 	h.mu.Lock()
 	turn, ok := h.turns[result.RunID]
 	delete(h.turns, result.RunID)
@@ -375,17 +343,10 @@ func (h *LoadedHook) afterRun(ctx context.Context, result runtime.Result) error 
 	if !ok {
 		turn = wittypes.TurnMetadata{RunID: string(result.RunID)}
 	}
-	return h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterRun(callCtx, turn) })
-}
-
-func (h *LoadedHook) cachedTurn(runID session.RunID, fallback wittypes.TurnMetadata) wittypes.TurnMetadata {
-	h.mu.RLock()
-	turn, ok := h.turns[runID]
-	h.mu.RUnlock()
-	if ok {
-		return turn
-	}
-	return fallback
+	return errors.Join(
+		h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterTurn(callCtx, turn) }),
+		h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterRun(callCtx, turn) }),
+	)
 }
 
 func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedHook, error) {
@@ -399,10 +360,6 @@ func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 		return nil, err
 	}
 	return &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
-}
-
-func openHookDefault(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error) {
-	return openHook(ctx, cfg, newEngine)
 }
 
 // LoadedToolMiddleware preserves attachments and metadata on replacement.
@@ -467,8 +424,4 @@ func openToolMiddleware(ctx context.Context, cfg ModuleConfig, factory engineFac
 		return nil, err
 	}
 	return &LoadedToolMiddleware{module: module, component: component}, nil
-}
-
-func openToolMiddlewareDefault(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error) {
-	return openToolMiddleware(ctx, cfg, newEngine)
 }

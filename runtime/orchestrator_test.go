@@ -69,7 +69,7 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	component := extension.Component{InstanceID: "admission-events", Artifact: extension.Artifact{Name: "admission-events", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var published []EventKind
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
 			published = append(published, event.Kind)
 			return nil
 		})
@@ -956,14 +956,14 @@ func transformedPermissionRunPlan(t *testing.T, tools staticToolRegistry, notice
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "permission-transform", Artifact: extension.Artifact{Name: "permission-transform", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolOutcome, next extension.Next[ToolOutcome, ToolOutcome]) (ToolOutcome, error) {
+		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolOutcome, next extension.Next[ToolOutcome, ToolOutcome]) (ToolOutcome, error) {
 			outcome, err := next(ctx, input)
 			outcome.Result = ToolResult{Output: "transformed denial"}
 			return outcome, err
 		}); err != nil {
 			return err
 		}
-		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
 			*notices = append(*notices, notice)
 			return nil
 		})
@@ -995,13 +995,13 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			component := extension.Component{InstanceID: "resume-lifecycle", Artifact: extension.Artifact{Name: "resume-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 			var notices []string
 			mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-				if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ToolStartedNotice) error {
+				if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", Scope: extension.GlobalScope()}, func(context.Context, ToolStartedNotice) error {
 					notices = append(notices, "started")
 					return nil
 				}); err != nil {
 					return err
 				}
-				return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ToolSettledNotice) error {
+				return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(context.Context, ToolSettledNotice) error {
 					notices = append(notices, "settled")
 					return nil
 				})

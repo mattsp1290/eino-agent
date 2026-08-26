@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -428,19 +429,21 @@ type admissionStore struct {
 	events            map[session.EventID]session.EventRecord
 	toolCalls         map[session.ToolCallID]session.ToolCall
 	epochs            map[session.EpochID]session.ContextEpoch
+	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	appendEventErr    error
 	settleToolCallErr error
 }
 
 func newAdmissionStore() *admissionStore {
 	return &admissionStore{
-		sessions:  map[session.ID]session.Session{},
-		runs:      map[session.RunID]session.Run{},
-		messages:  map[session.MessageID]session.Message{},
-		parts:     map[session.PartID]session.Part{},
-		events:    map[session.EventID]session.EventRecord{},
-		toolCalls: map[session.ToolCallID]session.ToolCall{},
-		epochs:    map[session.EpochID]session.ContextEpoch{},
+		sessions:      map[session.ID]session.Session{},
+		runs:          map[session.RunID]session.Run{},
+		messages:      map[session.MessageID]session.Message{},
+		parts:         map[session.PartID]session.Part{},
+		events:        map[session.EventID]session.EventRecord{},
+		toolCalls:     map[session.ToolCallID]session.ToolCall{},
+		epochs:        map[session.EpochID]session.ContextEpoch{},
+		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
 	}
 }
 
@@ -456,6 +459,7 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.events = tx.events
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
+	s.modelRequests = tx.modelRequests
 	return nil
 }
 
@@ -468,6 +472,7 @@ func (s *admissionStore) clone() *admissionStore {
 		events:            cloneMap(s.events),
 		toolCalls:         cloneMap(s.toolCalls),
 		epochs:            cloneMap(s.epochs),
+		modelRequests:     cloneMap(s.modelRequests),
 		appendEventErr:    s.appendEventErr,
 		settleToolCallErr: s.settleToolCallErr,
 	}
@@ -774,7 +779,19 @@ type fakeExecutionStore struct {
 }
 
 func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Context, session.ExecutionStore) error) error {
-	return fn(ctx, s)
+	tx := s.clone()
+	if err := fn(ctx, &fakeExecutionStore{admissionStore: tx, fence: s.fence}); err != nil {
+		return err
+	}
+	s.sessions = tx.sessions
+	s.runs = tx.runs
+	s.messages = tx.messages
+	s.parts = tx.parts
+	s.events = tx.events
+	s.toolCalls = tx.toolCalls
+	s.epochs = tx.epochs
+	s.modelRequests = tx.modelRequests
+	return nil
 }
 
 func (s *fakeExecutionStore) valid() bool {
@@ -825,20 +842,96 @@ func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, call session.Too
 	return s.admissionStore.ClaimToolCall(ctx, call)
 }
 
-func (s *fakeExecutionStore) CreateModelRequest(context.Context, session.ModelRequestRecord) (session.ModelRequestRecord, error) {
-	return session.ModelRequestRecord{}, session.ErrNotFound
+func (s *fakeExecutionStore) CreateModelRequest(_ context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
+	if !s.valid() || record.ID == "" || record.RunID != s.fence.RunID || record.State != session.ModelRequestPrepared {
+		return session.ModelRequestRecord{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	if record.SessionID != run.SessionID {
+		return session.ModelRequestRecord{}, session.ErrConflict
+	}
+	if existing, ok := s.modelRequests[record.ID]; ok {
+		if !reflect.DeepEqual(existing, record) {
+			return session.ModelRequestRecord{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.modelRequests[record.ID] = record
+	return record, nil
 }
 
-func (s *fakeExecutionStore) UpdateModelRequest(context.Context, session.ModelRequestRecord) error {
-	return session.ErrNotFound
+func (s *fakeExecutionStore) UpdateModelRequest(_ context.Context, record session.ModelRequestRecord) error {
+	if !s.valid() || record.RunID != s.fence.RunID {
+		return session.ErrConflict
+	}
+	current, ok := s.modelRequests[record.ID]
+	if !ok {
+		return session.ErrNotFound
+	}
+	left, right := current, record
+	left.State, right.State = "", ""
+	left.ErrorCode, right.ErrorCode = "", ""
+	left.UpdatedAt, right.UpdatedAt = time.Time{}, time.Time{}
+	if !reflect.DeepEqual(left, right) {
+		return session.ErrConflict
+	}
+	if current.State == record.State {
+		if reflect.DeepEqual(current, record) {
+			return nil
+		}
+		return session.ErrConflict
+	}
+	if !session.ValidModelRequestTransition(current.State, record.State) {
+		return session.ErrConflict
+	}
+	s.modelRequests[record.ID] = record
+	return nil
 }
 
-func (s *admissionStore) GetModelRequest(context.Context, session.ModelRequestID) (session.ModelRequestRecord, error) {
-	return session.ModelRequestRecord{}, session.ErrNotFound
+func (s *admissionStore) GetModelRequest(_ context.Context, id session.ModelRequestID) (session.ModelRequestRecord, error) {
+	record, ok := s.modelRequests[id]
+	if !ok {
+		return session.ModelRequestRecord{}, session.ErrNotFound
+	}
+	return record, nil
 }
 
-func (s *admissionStore) ListModelRequests(context.Context, session.RunID, session.ModelRequestCursor) (session.ModelRequestBatch, error) {
-	return session.ModelRequestBatch{}, nil
+func (s *admissionStore) ListModelRequests(_ context.Context, runID session.RunID, cursor session.ModelRequestCursor) (session.ModelRequestBatch, error) {
+	limit := cursor.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	var records []session.ModelRequestRecord
+	for _, record := range s.modelRequests {
+		if record.RunID == runID {
+			records = append(records, record)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if !records[i].CreatedAt.Equal(records[j].CreatedAt) {
+			return records[i].CreatedAt.Before(records[j].CreatedAt)
+		}
+		return records[i].ID < records[j].ID
+	})
+	if cursor.AfterID != "" {
+		after, ok := s.modelRequests[cursor.AfterID]
+		if !ok {
+			return session.ModelRequestBatch{}, session.ErrNotFound
+		}
+		filtered := records[:0]
+		for _, record := range records {
+			if record.CreatedAt.After(after.CreatedAt) || record.CreatedAt.Equal(after.CreatedAt) && record.ID > after.ID {
+				filtered = append(filtered, record)
+			}
+		}
+		records = filtered
+	}
+	next := session.ModelRequestCursor{}
+	if len(records) > limit {
+		next = session.ModelRequestCursor{AfterID: records[limit-1].ID, Limit: limit}
+		records = records[:limit]
+	}
+	return session.ModelRequestBatch{Records: records, Next: next}, nil
 }
 
 var _ session.ExecutionStore = (*fakeExecutionStore)(nil)

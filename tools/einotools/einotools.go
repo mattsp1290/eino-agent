@@ -91,7 +91,7 @@ func translateCatalog(ctx context.Context, component extension.Component, option
 			return nil, fmt.Errorf("translate catalog definition %q: %w", source.ID, err)
 		}
 		registrations = append(registrations, composition.ToolRegistration{
-			ID: source.ID, InstanceID: component.InstanceID,
+			ID:    source.ID,
 			Order: runtime.OrderApplication + index, Scope: options.Scope,
 			SourceSchemaHash: source.SchemaHash, SourceExecutorHash: source.ExecutorHash,
 			Definition: definition,

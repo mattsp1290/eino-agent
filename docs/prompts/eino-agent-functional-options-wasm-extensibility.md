@@ -424,7 +424,7 @@ policy, err := loader.LoadPermissionsPolicy(ctx, wasmext.ModuleConfig{ /* ... */
 def, err := loader.LoadTool(ctx, wasmext.ModuleConfig{ /* ... */ })
 registry := composition.NewRegistry(nil)
 mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-    return registrar.Tool(composition.ToolRegistration{ID: "wasm-tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: def})
+    return registrar.Tool(composition.ToolRegistration{ID: "wasm-tool", Scope: extension.GlobalScope(), Definition: def})
 }))
 defer mount.Close(context.Background())
 

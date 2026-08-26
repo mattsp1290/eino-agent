@@ -338,6 +338,6 @@ resolves an exact current-schema fingerprint match before any durable state
 change. The authoritative point catalog and model and tool pipeline diagrams are in
 [`extension-points.md`](extension-points.md).
 
-The optional model-request ledger assigns one `(attempt, step)` record per
+The model-request ledger assigns one `(attempt, step)` record per
 adapter invocation. Here, a step is a provider request plus its resulting tool
 batch; it does not add a user-visible turn abstraction.

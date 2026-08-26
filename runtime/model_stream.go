@@ -21,8 +21,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
 	var streamUsage model.Usage
 	var streamErr error
-	var requestRecord *session.ModelRequestRecord
-	var requestStore session.ModelRequestWriter
+	var requestRecord session.ModelRequestRecord
 	var modelRequested bool
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -34,12 +33,12 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			*usage = addUsage(*usage, streamUsage)
 		}
 		ledgerTransitionOK := true
-		if requestRecord != nil {
+		if requestRecord.ID != "" {
 			state := session.ModelRequestCompleted
 			if streamErr != nil {
 				state = session.ModelRequestFailed
 			}
-			if transitionErr := updateModelRequest(ctx, requestStore, requestRecord, state, streamErr, o.now()); transitionErr != nil {
+			if transitionErr := updateModelRequest(ctx, execution.store, &requestRecord, state, streamErr, o.now()); transitionErr != nil {
 				streamErr = transitionErr
 				err = transitionErr
 				message = nil
@@ -73,24 +72,18 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		streamErr = err
 		return nil, err
 	}
-	requestRecord, requestStore, err = o.prepareModelRequest(ctx, execution, snapshot, request, audited, contentHash, messageID, attempt, step)
+	requestRecord, err = o.prepareModelRequest(ctx, execution, snapshot, request, audited, contentHash, messageID, attempt, step)
 	if err != nil {
 		streamErr = err
 		return nil, err
 	}
-	if requestRecord != nil {
-		request.IdempotencyKey = string(requestRecord.ID)
-		if err = updateModelRequest(ctx, requestStore, requestRecord, session.ModelRequestDispatchStarted, nil, o.now()); err != nil {
-			streamErr = err
-			return nil, err
-		}
+	request.IdempotencyKey = string(requestRecord.ID)
+	if err = updateModelRequest(ctx, execution.store, &requestRecord, session.ModelRequestDispatchStarted, nil, o.now()); err != nil {
+		streamErr = err
+		return nil, err
 	}
 	if execution.dispatch() != nil {
-		requestRecordID := session.ModelRequestID("")
-		if requestRecord != nil {
-			requestRecordID = requestRecord.ID
-		}
-		_ = extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecordID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
+		_ = extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecord.ID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
 		modelRequested = true
 	}
 	var reader *einoschema.StreamReader[*einoschema.Message]

@@ -129,7 +129,7 @@ func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "stream-test", Artifact: extension.Artifact{Name: "stream-test", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "replace", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "replace", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
 			delegated, err := next(ctx, input)
 			if delegated != nil {
 				delegated.Close()
@@ -165,7 +165,7 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "stream-swallow", Artifact: extension.Artifact{Name: "stream-swallow", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
 			_, _ = next(ctx, input)
 			return nil, nil
 		})
@@ -190,7 +190,7 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "unrelated", Artifact: extension.Artifact{Name: "unrelated", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "notice", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
+		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -233,7 +233,7 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "stream-nested-mutation", Artifact: extension.Artifact{Name: "stream-nested-mutation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
 			input.Audited.Messages[0].Canonical[0] = '['
 			return next(ctx, input)
 		})
@@ -285,13 +285,13 @@ func TestToolSettledObserversReceiveDeepClonedAttachmentMetadata(t *testing.T) {
 	component := extension.Component{InstanceID: "settled-copy", Artifact: extension.Artifact{Name: "settled-copy", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var secondValue string
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "first", InstanceID: component.InstanceID, Order: 0, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+		if err := extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "first", Order: 0, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
 			notice.Result.Attachments[0].Metadata["owner"] = "mutated"
 			return nil
 		}); err != nil {
 			return err
 		}
-		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "second", InstanceID: component.InstanceID, Order: 1, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
+		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "second", Order: 1, Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
 			secondValue = notice.Result.Attachments[0].Metadata["owner"]
 			return nil
 		})
@@ -316,7 +316,7 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	component := extension.Component{InstanceID: "turn-order", Artifact: extension.Artifact{Name: "turn-order", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var seen BoundedTurnMetadata
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, TurnPreparePoint, extension.Registration{ID: "observe", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, metadata BoundedTurnMetadata, next extension.Next[BoundedTurnMetadata, BoundedTurnMetadata]) (BoundedTurnMetadata, error) {
+		return extension.Use(registrar, TurnPreparePoint, extension.Registration{ID: "observe", Scope: extension.GlobalScope()}, func(ctx context.Context, metadata BoundedTurnMetadata, next extension.Next[BoundedTurnMetadata, BoundedTurnMetadata]) (BoundedTurnMetadata, error) {
 			seen = cloneBoundedTurnMetadata(metadata)
 			return next(ctx, metadata)
 		})
@@ -378,14 +378,14 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	component := extension.Component{InstanceID: "clone-failure", Artifact: extension.Artifact{Name: "clone-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var contextEntered, toolEntered bool
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, ContextAssemblePoint, extension.Registration{ID: "context", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input ContextAssembly, next extension.Next[ContextAssembly, ContextAssembly]) (ContextAssembly, error) {
+		if err := extension.Use(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(ctx context.Context, input ContextAssembly, next extension.Next[ContextAssembly, ContextAssembly]) (ContextAssembly, error) {
 			contextEntered = true
 			input.Base[0].Extra["nested"].(map[string]any)["value"] = "mutated"
 			return next(ctx, input)
 		}); err != nil {
 			return err
 		}
-		return extension.Use(registrar, ToolPreparePoint, extension.Registration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input PreparedToolCall, next extension.Next[PreparedToolCall, PreparedToolCall]) (PreparedToolCall, error) {
+		return extension.Use(registrar, ToolPreparePoint, extension.Registration{ID: "tool", Scope: extension.GlobalScope()}, func(ctx context.Context, input PreparedToolCall, next extension.Next[PreparedToolCall, PreparedToolCall]) (PreparedToolCall, error) {
 			toolEntered = true
 			input.Tool.Info.Extra["nested"].(map[string]any)["value"] = "mutated"
 			return next(ctx, input)
@@ -638,7 +638,7 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	component := extension.Component{InstanceID: "resume-duration", Artifact: extension.Artifact{Name: "resume-duration", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var duration time.Duration
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
+		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
 			duration = notice.Duration
 			return nil
 		})
@@ -815,7 +815,7 @@ func settledNoticePlan(t *testing.T, notices *[]RunSettledNotice) (*RunPlan, fun
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "settlement-gate", Artifact: extension.Artifact{Name: "settlement-gate", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
+		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
 			*notices = append(*notices, notice)
 			return nil
 		})

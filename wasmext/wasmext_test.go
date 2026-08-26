@@ -369,52 +369,40 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	ctx := context.Background()
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
 
-	source, err := openContextSourceDefault(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"))
+	source, err := loader.LoadContextSource(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	messages, err := source.loadContext(ctx, runtime.TurnSnapshot{RunID: "run", SessionID: "session"})
+	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}}
+	messages, err := source.loadBoundedContext(ctx, metadata)
 	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
 	}
-	if err := source.close(); err != nil {
-		t.Fatal(err)
-	}
-
-	sink, err := openEventSinkDefault(ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
+	sink, err := loader.LoadEventSink(ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := sink.Emit(ctx, runtime.Event{Kind: runtime.EventRunStarted, SessionID: "session", RunID: "run", Payload: json.RawMessage(`{"secret":"credential-sentinel"}`), Time: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.close(); err != nil {
-		t.Fatal(err)
-	}
-
-	hook, err := openHookDefault(ctx, checkedInFixtureConfig(t, root, "hook.wasm"))
+	hook, err := loader.LoadHook(ctx, checkedInFixtureConfig(t, root, "hook.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.beforeRun(ctx, session.Run{ID: "run", SessionID: "session"}); err != nil {
+	if err := hook.beforeRunBounded(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := runtime.TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
-	if _, err := hook.beforeTurn(ctx, snapshot); err != nil {
+	if err := hook.beforeTurnBounded(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.afterTurn(ctx, snapshot, runtime.Result{RunID: "run"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := hook.afterRun(ctx, runtime.Result{RunID: "run"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := hook.close(); err != nil {
+	if err := hook.finish(ctx, runtime.Result{RunID: "run"}); err != nil {
 		t.Fatal(err)
 	}
 
-	middleware, err := openToolMiddlewareDefault(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"))
+	middleware, err := loader.LoadToolMiddleware(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -431,9 +419,6 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
 		t.Fatalf("middleware result = %#v, %v", result, err)
 	}
-	if err := middleware.close(); err != nil {
-		t.Fatal(err)
-	}
 }
 
 func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
@@ -442,18 +427,15 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	toolConfig := checkedInFixtureConfig(t, root, "tool.wasm")
 	observer := einoobs.New(einoobs.Config{})
 	toolConfig.Observer = observer
-	loadedTool, err := openToolDefault(context.Background(), toolConfig)
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+	definition, err := loader.LoadTool(context.Background(), toolConfig)
 	if err != nil {
 		var extensionErr *Error
 		if errors.As(err, &extensionErr) {
 			t.Fatalf("OpenTool error = %v (cause: %v)", err, extensionErr.cause)
 		}
 		t.Fatalf("OpenTool error = %v", err)
-	}
-	defer func() { _ = loadedTool.close() }()
-	definition, err := loadedTool.Definition()
-	if err != nil {
-		t.Fatal(err)
 	}
 	decoded, err := definition.Decode(context.Background(), json.RawMessage(`{"value":1}`))
 	if err != nil {
@@ -475,11 +457,10 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	}
 
 	policyConfig := checkedInFixtureConfig(t, root, "permissions-policy.wasm")
-	policy, err := loadPermissionsPolicy(context.Background(), policyConfig, newWasmtimeEngine)
+	policy, err := loader.LoadPermissionsPolicy(context.Background(), policyConfig)
 	if err != nil {
 		t.Fatalf("LoadPermissionsPolicy error = %v", err)
 	}
-	defer func() { _ = policy.close() }()
 	for pattern, want := range map[string]permissions.Action{
 		"allow": permissions.ActionAllow,
 		"deny":  permissions.ActionDeny,
@@ -505,14 +486,11 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		{name: "oversized", input: `{"mode":"oversized"}`, kind: ErrorSize},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			loaded, err := openToolDefault(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+			loader := NewLoader()
+			defer func() { _ = loader.Close(context.Background()) }()
+			definition, err := loader.LoadTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 			if err != nil {
 				t.Fatal(err)
-			}
-			defer func() { _ = loaded.close() }()
-			definition, definitionErr := loaded.Definition()
-			if definitionErr != nil {
-				t.Fatal(definitionErr)
 			}
 			_, err = executeLoadedDefinition(context.Background(), definition, test.input)
 			if !IsKind(err, test.kind) {
@@ -525,24 +503,16 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		cfg := checkedInFixtureConfig(t, root, "tool.wasm")
 		cfg.Limits.Timeout = 25 * time.Millisecond
 		cfg.Limits.CloseDrain = time.Second
-		loaded, err := openToolDefault(context.Background(), cfg)
+		loader := NewLoader()
+		defer func() { _ = loader.Close(context.Background()) }()
+		definition, err := loader.LoadTool(context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer func() { _ = loaded.close() }()
 		started := time.Now()
-		definition, definitionErr := loaded.Definition()
-		if definitionErr != nil {
-			t.Error(definitionErr)
-			return
-		}
 		_, err = executeLoadedDefinition(context.Background(), definition, `{"mode":"hang"}`)
 		if !IsKind(err, ErrorTimeout) || time.Since(started) > time.Second {
 			t.Fatalf("Execute error = %v after %s", err, time.Since(started))
-		}
-		definition, definitionErr = loaded.Definition()
-		if definitionErr != nil {
-			t.Fatal(definitionErr)
 		}
 		if _, err := executeLoadedDefinition(context.Background(), definition, `{"value":1}`); err != nil {
 			t.Fatalf("call after interrupted guest = %v", err)
@@ -558,11 +528,8 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 	cfg.Limits.Timeout = 5 * time.Second
 	cfg.Limits.CloseDrain = time.Second
 	cfg.Observer = einoobs.New(einoobs.Config{Exporter: exporter})
-	loaded, err := openToolDefault(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	definition, err := loaded.Definition()
+	loader := NewLoader()
+	definition, err := loader.LoadTool(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +543,7 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("guest did not enter execute")
 	}
-	if err := loaded.close(); err != nil {
+	if err := loader.Close(context.Background()); err != nil {
 		t.Fatalf("Close error = %v", err)
 	}
 	select {
@@ -596,12 +563,9 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 func TestCheckedInToolConcurrentUse(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
-	loaded, err := openToolDefault(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = loaded.close() }()
-	definition, err := loaded.Definition()
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+	definition, err := loader.LoadTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -646,7 +610,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	registry := composition.NewRegistry(nil)
 	component := extension.Component{InstanceID: "wasm-test", Artifact: extension.Artifact{Name: "wasm-test", Version: "1", Hash: "wasm-test-artifact", ConfigHash: "wasm-test-config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-		return registrar.Tool(composition.ToolRegistration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: definition})
+		return registrar.Tool(composition.ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition})
 	}))
 	if err != nil {
 		t.Fatal(err)

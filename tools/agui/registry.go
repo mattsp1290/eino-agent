@@ -44,7 +44,7 @@ func MountClientTools(ctx context.Context, registry *composition.Registry, snaps
 	return registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
 		for _, definition := range definitions {
 			if err := registrar.Tool(composition.ToolRegistration{
-				ID: definition.Name, InstanceID: component.InstanceID,
+				ID:    definition.Name,
 				Scope: extension.SessionScope(string(snapshot.SessionID)), Definition: definition,
 			}); err != nil {
 				return err

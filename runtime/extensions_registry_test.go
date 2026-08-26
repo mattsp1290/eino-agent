@@ -31,12 +31,12 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "tool-validation", Artifact: extension.Artifact{Name: "tool-validation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, runtime.ToolPreparePoint, extension.Registration{ID: "prepare", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
+		if err := extension.Use(registrar, runtime.ToolPreparePoint, extension.Registration{ID: "prepare", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
 			return next(ctx, input)
 		}); err != nil {
 			return err
 		}
-		return extension.Use(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolOutcome]) (runtime.ToolOutcome, error) {
+		return extension.Use(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolOutcome]) (runtime.ToolOutcome, error) {
 			return next(ctx, input)
 		})
 	}))

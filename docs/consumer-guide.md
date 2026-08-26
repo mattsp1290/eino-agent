@@ -193,7 +193,7 @@ component := extension.Component{
 mount, err := plans.Mount(ctx, component, composition.InstallerFunc(
     func(_ context.Context, registrar *composition.Registrar) error {
         return registrar.Tool(composition.ToolRegistration{
-            ID: "review-tool", InstanceID: component.InstanceID,
+            ID: "review-tool",
             Scope: extension.GlobalScope(), Definition: wasmDefinition,
         })
     },
@@ -392,7 +392,7 @@ Pass the registry via `runtime.WithRunPlanProvider`. The configured agent
 prompt is always materialized at `runtime.OrderRuntime`; named mounted prompt
 sections are evaluated per provider step around it. `session.Store` exposes
 model-request reads, and its run-fenced `ExecutionStore` owns model-request
-writes. Enable `WithModelRequestLedger(true)` only after setting a retention
-policy, and allowlist only non-secret option keys. See the
+writes for every provider attempt. Set a retention policy for those records,
+and allowlist only non-secret option keys. See the
 [`extension point catalog`](architecture/extension-points.md) and the
 [`native extension example`](../examples/native-extension).

@@ -54,7 +54,6 @@ type StreamingOrchestrator struct {
 	history                 history.Options
 	permissions             permissions.Policy
 	observer                *einoobs.Observer
-	modelRequestLedger      bool
 	modelRequestSafeOptions []string
 	modelRequestMaxBytes    int
 }

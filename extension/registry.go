@@ -48,8 +48,8 @@ func (s *stagingRegistrar) register(entry registrationEntry) error {
 	if s.closed {
 		return ErrMountClosed
 	}
-	if entry.spec.InstanceID != s.component.InstanceID || !identifierPattern.MatchString(entry.spec.ID) {
-		return fmt.Errorf("%w: registration identity does not match mount", ErrInvalidRegistration)
+	if !identifierPattern.MatchString(entry.spec.ID) {
+		return fmt.Errorf("%w: registration identity is invalid", ErrInvalidRegistration)
 	}
 	if err := validateScope(entry.spec.Scope); err != nil {
 		return err
@@ -62,6 +62,8 @@ func (s *stagingRegistrar) register(entry registrationEntry) error {
 	s.entries = append(s.entries, entry)
 	return nil
 }
+
+func (s *stagingRegistrar) InstanceID() string { return s.component.InstanceID }
 
 func (s *stagingRegistrar) Defer(cleanup Cleanup) error {
 	if s.closed {
@@ -386,7 +388,7 @@ func (p *Plan) Diagnostics() []PlanEntryDiagnostic {
 		if entry.kind == entryInterceptor {
 			kind = "interceptor"
 		}
-		result = append(result, PlanEntryDiagnostic{InstanceID: entry.spec.InstanceID, Artifact: entry.component.Artifact, ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: kind})
+		result = append(result, PlanEntryDiagnostic{InstanceID: entry.component.InstanceID, Artifact: entry.component.Artifact, ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: kind})
 	}
 	return result
 }
@@ -409,8 +411,8 @@ func entryLess(left, right plannedEntry) bool {
 	if leftRank != rightRank {
 		return leftRank < rightRank
 	}
-	if left.spec.InstanceID != right.spec.InstanceID {
-		return left.spec.InstanceID < right.spec.InstanceID
+	if left.component.InstanceID != right.component.InstanceID {
+		return left.component.InstanceID < right.component.InstanceID
 	}
 	return left.spec.ID < right.spec.ID
 }

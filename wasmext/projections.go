@@ -4,22 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"strings"
 
-	einoschema "github.com/cloudwego/eino/schema"
 	"go.bytecodealliance.org/cm"
 
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
-	"github.com/mattsp1290/eino-agent/session"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
-
-func partialTurnMetadata(run session.Run) wittypes.TurnMetadata {
-	return wittypes.TurnMetadata{RunID: string(run.ID), SessionID: string(run.SessionID), EpochID: string(run.ContextEpoch), AgentName: run.Agent, ProviderID: run.ProviderID, ModelID: run.ModelID}
-}
 
 func middlewareTurn(call runtime.ToolCall, tool runtime.Tool) wittypes.TurnMetadata {
 	return wittypes.TurnMetadata{RunID: string(call.RunID), SessionID: string(call.SessionID), ToolNames: cm.ToList([]string{tool.Name})}
@@ -121,40 +114,6 @@ func structuredGuestError(input wittypes.StructuredError) error {
 	return model.Error{Code: code, Message: message, Retryable: input.Retryable}
 }
 
-func turnMetadata(snapshot runtime.TurnSnapshot) wittypes.TurnMetadata {
-	toolNames := make([]string, 0, len(snapshot.Tools))
-	for _, tool := range snapshot.Tools {
-		toolNames = append(toolNames, tool.Name)
-	}
-	counts := wittypes.RoleCounts{}
-	for _, message := range snapshot.Messages {
-		if message == nil {
-			continue
-		}
-		switch message.Role {
-		case einoschema.System:
-			counts.System = saturatingIncrement(counts.System)
-		case einoschema.User:
-			counts.User = saturatingIncrement(counts.User)
-		case einoschema.Assistant:
-			counts.Assistant = saturatingIncrement(counts.Assistant)
-		case einoschema.Tool:
-			counts.Tool = saturatingIncrement(counts.Tool)
-		}
-	}
-	messageCount := len(snapshot.Messages)
-	if messageCount > math.MaxUint32 {
-		messageCount = math.MaxUint32
-	}
-	return wittypes.TurnMetadata{
-		RunID: string(snapshot.RunID), SessionID: string(snapshot.SessionID), EpochID: string(snapshot.EpochID),
-		AgentName: snapshot.Config.Agent.Name, AgentMode: snapshot.Config.Agent.Mode,
-		ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID),
-		ToolNames: cm.ToList(toolNames), MessageCount: uint32(messageCount), RoleCounts: counts,
-		HasSystemPrompt: snapshot.SystemPrompt != "" || snapshot.Config.Agent.SystemPrompt != "",
-	}
-}
-
 func turnMetadataFromBounded(metadata runtime.BoundedTurnMetadata) wittypes.TurnMetadata {
 	return wittypes.TurnMetadata{
 		RunID: string(metadata.RunID), SessionID: string(metadata.SessionID), EpochID: string(metadata.EpochID),
@@ -167,13 +126,6 @@ func turnMetadataFromBounded(metadata runtime.BoundedTurnMetadata) wittypes.Turn
 		},
 		HasSystemPrompt: metadata.HasSystemPrompt,
 	}
-}
-
-func saturatingIncrement(value uint32) uint32 {
-	if value == math.MaxUint32 {
-		return value
-	}
-	return value + 1
 }
 
 func payloadErrorKind(err error) ErrorKind {

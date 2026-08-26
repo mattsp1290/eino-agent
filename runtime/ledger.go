@@ -35,7 +35,7 @@ type AuditedModelInput struct {
 }
 
 // AuditModelRequest derives the canonical, credential-free subset persisted by
-// the optional request ledger.
+// the request ledger.
 func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes int) (AuditedModelInput, string, error) {
 	if maxBytes <= 0 {
 		maxBytes = defaultModelRequestMaxBytes
@@ -134,25 +134,21 @@ func rejectCanonicalExtra(raw json.RawMessage) error {
 	return visit(value)
 }
 
-func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestWriter, error) {
-	if !o.modelRequestLedger {
-		return nil, nil, nil
-	}
+func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (session.ModelRequestRecord, error) {
 	if execution == nil || execution.store == nil {
-		return nil, nil, fmt.Errorf("%w: model request ledger requires an execution store", ErrInvalidOrchestrator)
+		return session.ModelRequestRecord{}, fmt.Errorf("%w: model request ledger requires an execution store", ErrInvalidOrchestrator)
 	}
-	store := session.ModelRequestWriter(execution.store)
 	messages, err := json.Marshal(audited.Messages)
 	if err != nil {
-		return nil, nil, fmt.Errorf("encode audited messages: %w", err)
+		return session.ModelRequestRecord{}, fmt.Errorf("encode audited messages: %w", err)
 	}
 	tools, err := json.Marshal(audited.Tools)
 	if err != nil {
-		return nil, nil, fmt.Errorf("encode audited tools: %w", err)
+		return session.ModelRequestRecord{}, fmt.Errorf("encode audited tools: %w", err)
 	}
 	safeConfig, err := json.Marshal(audited.SafeCallConfig)
 	if err != nil {
-		return nil, nil, fmt.Errorf("encode audited call config: %w", err)
+		return session.ModelRequestRecord{}, fmt.Errorf("encode audited call config: %w", err)
 	}
 	now := o.now()
 	planHash := ""
@@ -167,17 +163,14 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 		SafeCallConfig: safeConfig, ContentSHA256: contentHash, ExtensionPlanHash: planHash,
 		CreatedAt: now, UpdatedAt: now,
 	}
-	created, err := store.CreateModelRequest(ctx, record)
+	created, err := execution.store.CreateModelRequest(ctx, record)
 	if err != nil {
-		return nil, nil, err
+		return session.ModelRequestRecord{}, err
 	}
-	return &created, store, nil
+	return created, nil
 }
 
-func updateModelRequest(ctx context.Context, store session.ModelRequestWriter, record *session.ModelRequestRecord, state session.ModelRequestState, err error, now time.Time) error {
-	if store == nil || record == nil {
-		return nil
-	}
+func updateModelRequest(ctx context.Context, store session.ExecutionStore, record *session.ModelRequestRecord, state session.ModelRequestState, err error, now time.Time) error {
 	next := *record
 	next.State = state
 	next.UpdatedAt = now

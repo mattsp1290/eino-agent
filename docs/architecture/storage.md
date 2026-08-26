@@ -80,7 +80,7 @@ Transaction boundaries matter for:
 - creating, claiming, and writing the first tool-call part;
 - finishing a run together with its final durable event;
 - creating a context epoch and writing compaction summary/tail metadata.
-- creating and transitioning an enabled model-request ledger record.
+- creating and transitioning a model-request ledger record.
 
 ## Replay Ordering
 
@@ -135,12 +135,11 @@ to mark a call interrupted or retry it when `RetrySafe` is true.
 
 ## Model-Request Ledger
 
-When `runtime.WithModelRequestLedger(true)` is enabled, each provider attempt
-creates a bounded `prepared` record through `ExecutionStore`, transitions it to
+Each provider attempt creates a bounded `prepared` record through
+`ExecutionStore`, transitions it to
 `dispatch_started` before the provider call, and settles it `completed` or
 `failed`. These writes validate the owning run fence atomically. Top-level
 `Store` readers expose individual records and stable run-scoped pagination.
-With the option disabled, the runtime persists no request records.
 
 ## Idempotency
 

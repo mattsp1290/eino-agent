@@ -182,6 +182,6 @@ func mountGlobalTool(registry *composition.Registry, name string) (*composition.
 			Encode:  func(context.Context, any) (json.RawMessage, error) { return json.RawMessage(`{}`), nil },
 			Execute: func(context.Context, agenttools.Execution) (any, error) { return json.RawMessage(`{}`), nil },
 		}
-		return registrar.Tool(composition.ToolRegistration{ID: name, InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: definition})
+		return registrar.Tool(composition.ToolRegistration{ID: name, Scope: extension.GlobalScope(), Definition: definition})
 	}))
 }

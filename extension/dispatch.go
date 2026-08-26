@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync/atomic"
 )
 
 type delegatedError struct{ cause error }
@@ -107,23 +106,19 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 		if !ok {
 			return zero, fmt.Errorf("extension interceptor type mismatch")
 		}
-		var calls atomic.Int32
-		var delegation atomic.Uint32
-		delegationDone := make(chan struct{})
+		calls := 0
+		callbackOpen := true
 		var delegatedOutput O
 		var delegatedSucceeded bool
 		var delegatedFailure error
 		next := func(nextCtx context.Context, nextInput I) (O, error) {
-			if calls.Add(1) != 1 {
+			calls++
+			if calls != 1 {
 				return zero, ErrNextCalledTwice
 			}
-			if !delegation.CompareAndSwap(delegationOpen, delegationRunning) {
+			if !callbackOpen {
 				return zero, ErrNextNotCalled
 			}
-			defer func() {
-				delegation.Store(delegationComplete)
-				close(delegationDone)
-			}()
 			if nextCtx == nil {
 				nextCtx = currentCtx
 			}
@@ -146,26 +141,12 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 			return zero, cloneErr
 		}
 		out, err := callAround(context.WithValue(currentCtx, callbackMountKey{}, entry.state), around, cloned, next)
-	sealDelegation:
-		for {
-			switch delegation.Load() {
-			case delegationOpen:
-				if delegation.CompareAndSwap(delegationOpen, delegationSealed) {
-					break sealDelegation
-				}
-			case delegationRunning:
-				<-delegationDone
-				break sealDelegation
-			default:
-				break sealDelegation
-			}
-		}
-		count := calls.Load()
-		if count > 1 {
+		callbackOpen = false
+		if calls > 1 {
 			return zero, ErrNextCalledTwice
 		}
 		if err == nil && (point.requireNext || entry.requireNext) {
-			if count != 1 {
+			if calls != 1 {
 				return zero, ErrNextNotCalled
 			}
 			if !delegatedSucceeded {
@@ -208,13 +189,6 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 	return invoke(0, ctx, cloned)
 }
 
-const (
-	delegationOpen uint32 = iota
-	delegationRunning
-	delegationSealed
-	delegationComplete
-)
-
 func callAround[I, O any](ctx context.Context, around Around[I, O], input I, next Next[I, O]) (out O, err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -232,7 +206,7 @@ func cloneInput[T any](clone CloneFunc[T], input T) (T, error) {
 }
 
 func callbackFailure(entry plannedEntry, code string, cause error) Failure {
-	return Failure{Point: entry.contract, InstanceID: entry.spec.InstanceID, HandlerID: entry.spec.ID, Code: code, Cause: cause}
+	return Failure{Point: entry.contract, InstanceID: entry.component.InstanceID, HandlerID: entry.spec.ID, Code: code, Cause: cause}
 }
 
 func failureCode(err error) string {

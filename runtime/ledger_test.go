@@ -36,7 +36,7 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
-		WithModelRequestLedger(true), WithModelRequestSafeOptions("temperature"),
+		WithModelRequestSafeOptions("temperature"),
 		WithClock(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) }),
 	)
 	if err != nil {
@@ -73,7 +73,7 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	}
 }
 
-func TestModelRequestLedgerDisabledDoesNotPersistOrSetIdempotencyKey(t *testing.T) {
+func TestModelRequestLedgerPersistsAndSetsIdempotencyKeyByDefault(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -88,12 +88,12 @@ func TestModelRequestLedgerDisabledDoesNotPersistOrSetIdempotencyKey(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-disabled-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
-	if result.Error != nil || submitted.IdempotencyKey != "" {
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-default-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if result.Error != nil || submitted.IdempotencyKey == "" {
 		t.Fatalf("result=%#v idempotency_key=%q", result, submitted.IdempotencyKey)
 	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
-	if err != nil || len(batch.Records) != 0 {
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].ID != session.ModelRequestID(submitted.IdempotencyKey) || batch.Records[0].State != session.ModelRequestCompleted {
 		t.Fatalf("records=%#v error=%v", batch.Records, err)
 	}
 }
@@ -115,7 +115,7 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 		}
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true), WithAttempts(2))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithAttempts(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		panic("provider panic")
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,8 +181,7 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(failingStore), WithModelResolver(resolvedModel{streamer: streamer}),
-		WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true),
-	)
+		WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,6 +189,10 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "dispatch-start-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
 	if !errors.Is(result.Error, updateErr) || called || len(sequence) != 0 || len(completed) != 0 {
 		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed {
+		t.Fatalf("failed dispatch-start records=%#v error=%v", batch.Records, err)
 	}
 }
 
@@ -206,7 +209,7 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +244,7 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Desc: "echo"}, Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: runtimeToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		return ToolResult{Output: string(call.Input)}, nil
 	})}
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})}), WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +273,7 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 		called = true
 		return nil, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +304,7 @@ func TestLedgerAuditFailureAfterAdmissionSettlesRunWithoutDispatch(t *testing.T)
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
-		WithModelRequestLedger(true), WithModelRequestMaxBytes(1),
+		WithModelRequestMaxBytes(1),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -352,13 +355,13 @@ func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]Mod
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "model-lifecycle", Artifact: extension.Artifact{Name: "model-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "requested", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error {
+		if err := extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "requested", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error {
 			*sequence = append(*sequence, "requested")
 			return nil
 		}); err != nil {
 			return err
 		}
-		return extension.On(registrar, ModelCompletedPoint, extension.Registration{ID: "completed", InstanceID: component.InstanceID, Scope: extension.GlobalScope()}, func(_ context.Context, notice ModelCompletedNotice) error {
+		return extension.On(registrar, ModelCompletedPoint, extension.Registration{ID: "completed", Scope: extension.GlobalScope()}, func(_ context.Context, notice ModelCompletedNotice) error {
 			*sequence = append(*sequence, "completed")
 			*completed = append(*completed, notice)
 			return nil
@@ -417,7 +420,7 @@ func TestAuditModelRequestRejectsEveryNestedExtraCategory(t *testing.T) {
 }
 
 func TestLedgerUsesExecutionScopedWriterCapability(t *testing.T) {
-	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, errors.New("unused") })}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, errors.New("unused") })}), WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatalf("construction error = %v", err)
 	}
@@ -430,7 +433,7 @@ func TestLedgerPassesDurableRecordIDToIdempotentStreamer(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 	streamer := &recordingIdempotentStreamer{}
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
 	if err != nil {
 		t.Fatal(err)
 	}

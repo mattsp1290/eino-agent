@@ -139,7 +139,7 @@ func Mount(ctx context.Context, registry *composition.Registry, component extens
 				return err
 			}
 			if err := registrar.Tool(composition.ToolRegistration{
-				ID: definition.Name, InstanceID: component.InstanceID, Order: runtime.OrderApplication + index,
+				ID: definition.Name, Order: runtime.OrderApplication + index,
 				Scope: scope, Definition: definition,
 			}); err != nil {
 				return err

@@ -2,7 +2,6 @@ package wasmext
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/mattsp1290/eino-agent/extension"
@@ -15,13 +14,14 @@ func RegisterContextSource(registrar extension.Registrar, spec extension.Registr
 	if source == nil {
 		return fmt.Errorf("nil Wasm context source")
 	}
+	instanceID := registrar.InstanceID()
 	return extension.Use(registrar, runtime.ContextAssemblePoint, spec, func(ctx context.Context, assembly runtime.ContextAssembly, next extension.Next[runtime.ContextAssembly, runtime.ContextAssembly]) (runtime.ContextAssembly, error) {
 		messages, err := source.loadBoundedContext(ctx, assembly.Metadata)
 		if err != nil {
 			return runtime.ContextAssembly{}, err
 		}
 		for index, message := range messages {
-			assembly.Contributions = append(assembly.Contributions, runtime.ContextContribution{Source: contextContributionSource(spec, index), Order: spec.Order, Message: message})
+			assembly.Contributions = append(assembly.Contributions, runtime.ContextContribution{Source: contextContributionSource(instanceID, spec, index), Order: spec.Order, Message: message})
 		}
 		return next(ctx, assembly)
 	})
@@ -66,14 +66,13 @@ func RegisterHook(registrar extension.Registrar, spec extension.Registration, ho
 	})
 }
 
-func contextContributionSource(spec extension.Registration, index int) string {
-	parts := []string{spec.InstanceID, spec.ID, string(spec.Scope.Kind), spec.Scope.Key}
+func contextContributionSource(instanceID string, spec extension.Registration, index int) string {
+	parts := []string{instanceID, spec.ID, string(spec.Scope.Kind), spec.Scope.Key}
 	return fmt.Sprintf("wasm-context/%d:%s/%d:%s/%d:%s/%d:%s/%06d", len(parts[0]), parts[0], len(parts[1]), parts[1], len(parts[2]), parts[2], len(parts[3]), parts[3], index)
 }
 
 func finishRegisteredHook(ctx context.Context, hook *LoadedHook, notice runtime.RunSettledNotice) error {
-	snapshot := runtime.TurnSnapshot{RunID: notice.Result.RunID, SessionID: notice.SessionID}
-	return errors.Join(hook.afterTurn(ctx, snapshot, notice.Result), hook.afterRun(ctx, notice.Result))
+	return hook.finish(ctx, notice.Result)
 }
 
 // RegisterToolMiddleware maps tool-middleware@0.1.0 only to prepare and result

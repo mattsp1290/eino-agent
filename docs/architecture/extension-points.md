@@ -25,8 +25,10 @@ session or a later same-session mount cannot keep a component alive.
 ## Ordering and failure
 
 Entries sort by `(order, global-before-session, instance ID, registration ID)`.
-Around interceptors form an onion in that order. Their guarded `next` may be
-called once; required-delegation points reject a successful short circuit.
+Around interceptors form an onion in that order. Their guarded `next` is
+synchronous: it may be called at most once, must complete before the callback
+returns, and must not be retained or called concurrently. Required-delegation
+points reject a successful short circuit.
 Point-owned validators defend immutable identity and outcome fields.
 
 Callback-facing model, tool, and call values are data-only projections.
@@ -51,7 +53,7 @@ Order constants reserve broad bands: `runtime.OrderHostPolicy` (`-1000`),
 | `eino-agent/runtime/run-admitted` | admission | contained notice to run observers | contained | after durable admission; fresh runs only | hook adapter |
 | `eino-agent/runtime/run-started` | execution start | contained notice | contained | run is already running; fresh runs only | native |
 | `eino-agent/runtime/run-settled` | run settlement | contained notice | contained | after `FinishRun`; fresh/resumed nonterminal runs | hook adapter |
-| `eino-agent/runtime/model-requested` | model dispatch | contained notice | contained | ledger is `dispatch_started` when enabled | native |
+| `eino-agent/runtime/model-requested` | model dispatch | contained notice | contained | ledger is `dispatch_started` | native |
 | `eino-agent/runtime/model-completed` | stream terminal | contained notice | contained | after ledger terminal commit; every attempt | native |
 | `eino-agent/runtime/tool-prepared` | tool preparation | contained notice | contained | before durable tool admission; fresh calls | native |
 | `eino-agent/runtime/tool-started` | tool claim | contained notice | contained | call is durably running | native |
@@ -131,13 +133,12 @@ prevent in-process ABA but are not durable identity.
 
 ## Request ledger and privacy
 
-`runtime.WithModelRequestLedger(true)` persists through the current run's
+Every provider attempt is persisted through the current run's
 `session.ExecutionStore`; the top-level `session.Store` exposes read-only model
 request access. The current SQLite schema stores bounded canonical messages,
 rendered system prompt, JSON tool schemas, and an explicit allowlist of string
 call options. The default cap is 4 MiB and oversize content fails before
-provider dispatch; content is never silently truncated. With the option
-disabled, no request record or provider idempotency key is created.
+provider dispatch; content is never silently truncated.
 
 Credentials, endpoints, provider runtime objects, opaque options, clients,
 callbacks, observers, and trace attributes are excluded. Disallowed message or

@@ -57,10 +57,9 @@ func GlobalScope() Scope           { return Scope{Kind: ScopeGlobal} }
 func SessionScope(id string) Scope { return Scope{Kind: ScopeSession, Key: id} }
 
 type Registration struct {
-	ID         string
-	InstanceID string
-	Order      int
-	Scope      Scope
+	ID    string
+	Order int
+	Scope Scope
 }
 
 type Contract struct {
@@ -80,7 +79,14 @@ type ValidateFunc[T any] func(T) error
 type OutputValidator[I, O any] func(original I, output O) error
 type DelegatedOutputValidator[O any] func(delegated, returned O) error
 type NextValidator[I any] func(original, candidate I) error
+
+// Next synchronously delegates to the remainder of an interceptor chain.
+// It may be called at most once, must finish before the Around callback returns,
+// and does not support concurrent use.
 type Next[I, O any] func(context.Context, I) (O, error)
+
+// Around intercepts a point and may synchronously call next at most once. A
+// callback must not retain next or call it concurrently.
 type Around[I, O any] func(context.Context, I, Next[I, O]) (O, error)
 type Observer[T any] func(context.Context, T) error
 type Cleanup func(context.Context) error
@@ -221,6 +227,7 @@ func (f InstallerFunc) Install(ctx context.Context, registrar Registrar) error {
 
 type Registrar interface {
 	register(registrationEntry) error
+	InstanceID() string
 	Defer(Cleanup) error
 	Lease(Scope) error
 }

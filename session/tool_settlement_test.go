@@ -88,7 +88,7 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 			ClaimedBy:  "worker",
 			ClaimToken: "token",
 			Status:     ToolCallCompleted,
-			Output:     json.RawMessage(`{"content":"different"}`),
+			Output:     json.RawMessage(`{"content":"ok"}`),
 			Metadata:   map[string]string{"output_status": "completed"},
 		},
 	}
@@ -101,7 +101,7 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 	}
 }
 
-func TestToolSettlementApplyPopulatesMissingCompletionTime(t *testing.T) {
+func TestToolSettlementApplyRejectsMissingCompletionTimeForRunningCall(t *testing.T) {
 	settlement := ToolSettlement{
 		ID:         "call-1",
 		ClaimedBy:  "worker",
@@ -110,15 +110,8 @@ func TestToolSettlementApplyPopulatesMissingCompletionTime(t *testing.T) {
 		Output:     json.RawMessage(`{"content":"ok"}`),
 		Metadata:   map[string]string{"output_status": "completed"},
 	}
-	settled, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning, ClaimedBy: "worker", ClaimToken: "token"})
-	if err != nil {
-		t.Fatalf("apply settlement: %v", err)
-	}
-	if settled.CompletedAt.IsZero() {
-		t.Fatalf("CompletedAt was not populated")
-	}
-	if _, err := settlement.Apply(settled); err != nil {
-		t.Fatalf("repeat zero-time settlement: %v", err)
+	if _, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning, ClaimedBy: "worker", ClaimToken: "token"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("missing completion time error = %v, want ErrConflict", err)
 	}
 }
 

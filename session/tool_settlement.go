@@ -34,6 +34,9 @@ type ToolClaimIdentity struct {
 // settlement to an already terminal call is idempotent; applying a different
 // terminal settlement reports ErrConflict.
 func (s ToolSettlement) Apply(call ToolCall) (ToolCall, error) {
+	if s.CompletedAt.IsZero() {
+		return ToolCall{}, ErrConflict
+	}
 	if s.ID != "" && call.ID != s.ID {
 		return ToolCall{}, ErrConflict
 	}
@@ -41,9 +44,6 @@ func (s ToolSettlement) Apply(call ToolCall) (ToolCall, error) {
 		return ToolCall{}, ErrConflict
 	}
 	if callTerminal(call.Status) {
-		if s.CompletedAt.IsZero() {
-			s.CompletedAt = call.CompletedAt
-		}
 		if settlementMatches(call, s) {
 			return call, nil
 		}
@@ -51,9 +51,6 @@ func (s ToolSettlement) Apply(call ToolCall) (ToolCall, error) {
 	}
 	if !settlementTerminal(s.Status) {
 		return ToolCall{}, ErrConflict
-	}
-	if s.CompletedAt.IsZero() {
-		s.CompletedAt = time.Now().UTC()
 	}
 	call.Status = s.Status
 	call.Output = cloneRawMessage(s.Output)
