@@ -131,11 +131,13 @@ prevent in-process ABA but are not durable identity.
 
 ## Request ledger and privacy
 
-`runtime.WithModelRequestLedger(true)` requires a
-`session.ModelRequestStore`. The current SQLite schema stores bounded canonical
-messages, rendered system prompt, JSON tool schemas, and an explicit allowlist
-of string call options. The default cap is 4 MiB and oversize content fails
-before provider dispatch; content is never silently truncated.
+`runtime.WithModelRequestLedger(true)` persists through the current run's
+`session.ExecutionStore`; the top-level `session.Store` exposes read-only model
+request access. The current SQLite schema stores bounded canonical messages,
+rendered system prompt, JSON tool schemas, and an explicit allowlist of string
+call options. The default cap is 4 MiB and oversize content fails before
+provider dispatch; content is never silently truncated. With the option
+disabled, no request record or provider idempotency key is created.
 
 Credentials, endpoints, provider runtime objects, opaque options, clients,
 callbacks, observers, and trace attributes are excluded. Disallowed message or

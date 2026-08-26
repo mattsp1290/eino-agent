@@ -109,8 +109,8 @@ Evidence:
 - `runtime.TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak`
 - `runtime.TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure`
 - `runtime.TestStreamingOrchestratorRecordsOperationalToolFailure`
-- `tools.TestEncodeModelOutputRedactsRawAndStructuredPayload`
-- `tools.TestEncodeModelOutputSuppressesToolControlledFieldsWhenTruncated`
+- `runtime.TestEncodeToolOutputRedactsRawAndStructuredPayload`
+- `runtime.TestEncodeToolOutputSuppressesToolControlledFieldsWhenTruncated`
 - `obs.TestDefaultFieldsForbidRawContent`
 - `config.TestObservabilityRedactionDefaultsAreSafe`
 
@@ -137,14 +137,14 @@ Evidence:
 ## Tool Output Bounds
 
 Tool output is never allowed to grow unbounded in replayable model context.
-Runtime and tool package encoders enforce UTF-8-safe truncation, structured
+The runtime's canonical encoder enforces UTF-8-safe truncation, structured
 payload bounds, redaction, and external-retention signaling.
 
 Evidence:
 
 - `runtime.TestStreamingOrchestratorBoundsToolOutput`
-- `tools.TestEncodeModelOutputTruncatesOversizedContent`
-- `tools.TestEncodeModelOutputBoundsStructuredPayload`
+- `runtime.TestEncodeToolOutputTruncatesOversizedContent`
+- `runtime.TestEncodeToolOutputBoundsStructuredPayload`
 - `tools/session.TestRetainedOutputIsBoundedAndSessionScoped`
 - `tools/session.TestRetainedOutputHonorsAggregateSessionLimitAndZeroLimit`
 - `tools/einotools.TestMountStandardPublishesCatalogOrderAndExecutesFileRead`

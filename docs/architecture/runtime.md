@@ -326,7 +326,7 @@ can build directly against them:
 - durable store interfaces and transaction boundaries;
 - minimal agent/model/provider/config implementation;
 - runtime context and context-source boundaries;
-- typed tool registry and scoped materialization;
+- typed tool definitions, composition-owned selection, and scoped materialization;
 - AG-UI event durability and replay rules;
 - Datadog observability redaction policy.
 

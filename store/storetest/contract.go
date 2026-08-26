@@ -226,6 +226,67 @@ func Run(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("model request writes are fenced and reads are top-level", func(t *testing.T) {
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-model-requests")
+		r := admitRun(t, ctx, subject.Store, run("run-model-requests", s.ID, "owner"))
+		execution := executionFor(subject.Store, r)
+		first := modelRequest("request-1", s.ID, r.ID, 1)
+		created, err := execution.CreateModelRequest(ctx, first)
+		if err != nil {
+			t.Fatalf("create model request: %v", err)
+		}
+		created.State = session.ModelRequestDispatchStarted
+		created.UpdatedAt = created.UpdatedAt.Add(time.Second)
+		if err := execution.UpdateModelRequest(ctx, created); err != nil {
+			t.Fatalf("start model dispatch: %v", err)
+		}
+		created.State = session.ModelRequestCompleted
+		created.UpdatedAt = created.UpdatedAt.Add(time.Second)
+		if err := execution.UpdateModelRequest(ctx, created); err != nil {
+			t.Fatalf("complete model request: %v", err)
+		}
+		if _, err := execution.CreateModelRequest(ctx, modelRequest("request-2", s.ID, r.ID, 2)); err != nil {
+			t.Fatalf("create second model request: %v", err)
+		}
+		got, err := subject.Store.GetModelRequest(ctx, first.ID)
+		if err != nil || got.State != session.ModelRequestCompleted {
+			t.Fatalf("get model request = %#v, %v", got, err)
+		}
+		page, err := subject.Store.ListModelRequests(ctx, r.ID, session.ModelRequestCursor{Limit: 1})
+		if err != nil || len(page.Records) != 1 || page.Next.AfterID == "" {
+			t.Fatalf("first model request page = %#v, %v", page, err)
+		}
+		next, err := subject.Store.ListModelRequests(ctx, r.ID, page.Next)
+		if err != nil || len(next.Records) != 1 || next.Records[0].ID == page.Records[0].ID {
+			t.Fatalf("second model request page = %#v, %v", next, err)
+		}
+		invalid := created
+		invalid.State = session.ModelRequestPrepared
+		if err := execution.UpdateModelRequest(ctx, invalid); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("invalid model request transition = %v, want ErrConflict", err)
+		}
+		stale := subject.Store.Execution(session.RunFence{RunID: r.ID, ClaimToken: "stale"})
+		if _, err := stale.CreateModelRequest(ctx, modelRequest("request-stale", s.ID, r.ID, 3)); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("stale model request create = %v, want ErrConflict", err)
+		}
+		errRollback := errors.New("rollback model request")
+		err = subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+			_, createErr := tx.Execution(session.RunFence{RunID: r.ID, ClaimToken: r.ClaimToken}).CreateModelRequest(ctx, modelRequest("request-rollback", s.ID, r.ID, 4))
+			if createErr != nil {
+				return createErr
+			}
+			return errRollback
+		})
+		if !errors.Is(err, errRollback) {
+			t.Fatalf("model request rollback = %v", err)
+		}
+		if _, err := subject.Store.GetModelRequest(ctx, "request-rollback"); !errors.Is(err, session.ErrNotFound) {
+			t.Fatalf("rolled back model request = %v, want ErrNotFound", err)
+		}
+	})
+
 	t.Run("tool call create claim and settlement are single owner", func(t *testing.T) {
 		subject := setup(t, factory)
 		ctx := context.Background()
@@ -545,5 +606,15 @@ func eventRecord(id session.EventID, sessionID session.ID, runID session.RunID, 
 		Kind:      "event",
 		Payload:   json.RawMessage(`{"ok":true}`),
 		CreatedAt: time.Now().UTC().Add(time.Duration(offset) * time.Second),
+	}
+}
+
+func modelRequest(id session.ModelRequestID, sessionID session.ID, runID session.RunID, attempt int) session.ModelRequestRecord {
+	now := time.Now().UTC().Add(time.Duration(attempt) * time.Second)
+	return session.ModelRequestRecord{
+		ID: id, SessionID: sessionID, RunID: runID, AssistantMessageID: "assistant-model-request",
+		Attempt: attempt, Step: 1, State: session.ModelRequestPrepared,
+		Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`),
+		ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
 	}
 }

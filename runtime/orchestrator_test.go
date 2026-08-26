@@ -1067,11 +1067,12 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 	time.Sleep(2 * time.Millisecond)
-	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := store.CreateToolCall(ctx, session.ToolCall{
+	if _, err := execution.CreateToolCall(ctx, session.ToolCall{
 		ID:              "call-resume",
 		SessionID:       run.SessionID,
 		RunID:           run.ID,
@@ -1325,8 +1326,9 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 	time.Sleep(2 * time.Millisecond)
-	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
 	call := session.ToolCall{
@@ -1341,7 +1343,7 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		Input:           []byte(`{"text":"hi"}`),
 		Status:          session.ToolCallPending,
 	}
-	created, err := store.CreateToolCall(ctx, call)
+	created, err := execution.CreateToolCall(ctx, call)
 	if err != nil {
 		t.Fatalf("create tool call: %v", err)
 	}
@@ -1350,9 +1352,10 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		created.ClaimedBy = owner
 		created.ClaimToken = "claim-resume"
 		created.StartedAt = now
-		if _, err := store.ClaimToolCall(ctx, created); err != nil {
+		if _, err := execution.ClaimToolCall(ctx, created, time.Millisecond); err != nil {
 			t.Fatalf("claim tool call: %v", err)
 		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	return store, run
 }

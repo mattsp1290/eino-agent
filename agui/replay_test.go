@@ -163,13 +163,15 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-replay", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "run-1", SessionID: "session-replay", OwnerID: "owner", ClaimToken: "claim-replay", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-1", SessionID: "session-replay", OwnerID: "owner", ClaimToken: "claim-replay", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
-	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := store.AppendPart(ctx, session.Part{ID: "part-text", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartText, Ordinal: 10, Payload: []byte(`{"text":"settled"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-text", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartText, Ordinal: 10, Payload: []byte(`{"text":"settled"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append part: %v", err)
 	}
 	events := []session.EventRecord{
@@ -178,7 +180,7 @@ func replayStore(t *testing.T) session.Store {
 		{ID: "evt-finished", SessionID: "session-replay", RunID: "run-1", MessageID: "assistant-1", Kind: string(runtime.EventRunFinished), CreatedAt: now.Add(2 * time.Second)},
 	}
 	for _, event := range events {
-		if _, err := store.AppendEvent(ctx, event); err != nil {
+		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("append event %s: %v", event.ID, err)
 		}
 	}

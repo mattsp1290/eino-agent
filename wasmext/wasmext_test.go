@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -21,6 +20,7 @@ import (
 	einoobs "github.com/mattsp1290/eino-obs"
 	"go.bytecodealliance.org/cm"
 
+	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
@@ -61,10 +61,6 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry := tools.NewRegistry()
-	if _, err := registry.Register(definition); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
 	snapshot := runtime.TurnSnapshot{
 		RunID: "run-1", SessionID: "session-1", EpochID: "epoch-1",
 		Config: config.Snapshot{
@@ -74,15 +70,15 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.Message{einoschema.SystemMessage("secret conversation"), einoschema.UserMessage("secret user")},
 		SystemPrompt: "secret system prompt",
 	}
-	materialized, err := registry.ResolveTools(context.Background(), runtime.NewToolScopeContext(snapshot))
-	if err != nil || len(materialized) != 1 {
-		t.Fatalf("ResolveTools = %v, %v", materialized, err)
+	materialized, err := tools.Materialize(context.Background(), definition, runtime.NewToolScopeContext(snapshot))
+	if err != nil {
+		t.Fatalf("Materialize = %v", err)
 	}
-	decoded, err := materialized[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"value":1}`))
+	decoded, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"value":1}`))
 	if err != nil {
 		t.Fatalf("DecodeToolInput error = %v", err)
 	}
-	result, err := materialized[0].Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: decoded, Context: runtime.ToolContext{Turn: runtime.BoundedTurnMetadata{
+	result, err := materialized.Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: decoded, Context: runtime.ToolContext{Turn: runtime.BoundedTurnMetadata{
 		RunID: "run-1", SessionID: "session-1", EpochID: "epoch-1", AgentName: "agent", AgentMode: "primary",
 		ToolNames: []string{"wasm_echo"}, MessageCount: 2, RoleCounts: runtime.MessageRoleCounts{System: 1, User: 1}, HasSystemPrompt: true,
 	}}})
@@ -647,10 +643,15 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry := tools.NewRegistry()
-	if _, err := registry.Register(definition); err != nil {
+	registry := composition.NewRegistry(nil)
+	component := extension.Component{InstanceID: "wasm-test", Artifact: extension.Artifact{Name: "wasm-test", Version: "1", Hash: "wasm-test-artifact", ConfigHash: "wasm-test-config", SourceKind: extension.SourceNative}}
+	mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+		return registrar.Tool(composition.ToolRegistration{ID: "tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: definition})
+	}))
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = mount.Close(context.Background()) }()
 	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -683,7 +684,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 			}, nil
 		})),
 		runtime.WithIDGenerator(&wasmTestIDs{}),
-		runtime.WithRunPlanProvider(wasmTestPlanProvider{registry: registry}),
+		runtime.WithRunPlanProvider(registry),
 		runtime.WithPermissions(policy),
 		runtime.WithOwnerID("wasm-blackbox"),
 	)
@@ -712,28 +713,6 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if toolCall.Status != session.ToolCallCompleted || !strings.Contains(string(toolCall.Input), `"permission_pattern":"allow"`) || !strings.Contains(string(toolCall.Output), `"echo"`) {
 		t.Fatalf("durable tool call = %+v", toolCall)
 	}
-}
-
-type wasmTestPlanProvider struct{ registry *tools.Registry }
-
-func (p wasmTestPlanProvider) AcquireRunPlan(context.Context, runtime.RunPlanRequest) (*runtime.RunPlan, error) {
-	return runtime.NewRunPlan(runtime.RunPlanSpec{Tools: []runtime.PlanTool{{
-		Identity: session.ExtensionPlanEntry{InstanceID: "wasm-test", Artifact: session.ArtifactIdentity{Name: "wasm-test", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: string(extension.SourceNative)}, Tool: &session.ToolPlanIdentity{Name: "wasm_echo", RegistrationID: "tool", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, SchemaHash: "schema", ExecutorHash: "executor"}},
-		Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
-			resolved, err := p.registry.ResolveTools(ctx, scope)
-			if err != nil {
-				return runtime.Tool{}, err
-			}
-			if len(resolved) != 1 {
-				return runtime.Tool{}, fmt.Errorf("resolved %d tools", len(resolved))
-			}
-			return resolved[0], nil
-		},
-	}}})
-}
-
-func (p wasmTestPlanProvider) AcquireResumePlan(ctx context.Context, _ session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
-	return p.AcquireRunPlan(ctx, runtime.RunPlanRequest{})
 }
 
 func executeLoadedDefinition(ctx context.Context, definition tools.Definition, input string) (any, error) {

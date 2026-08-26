@@ -7,6 +7,8 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/mattsp1290/eino-agent/composition"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
@@ -112,9 +114,10 @@ func (s *State) ListRetainedOutputs(sessionID session.ID) []RetainedOutput {
 	return result
 }
 
-func Register(ctx context.Context, registry *agenttools.Registry, options Options) ([]agenttools.Registration, error) {
+// Mount publishes the session tools atomically through the canonical composition registry.
+func Mount(ctx context.Context, registry *composition.Registry, component extension.Component, scope extension.Scope, options Options) (*composition.Mount, error) {
 	if registry == nil {
-		return nil, fmt.Errorf("%w: registry required", agenttools.ErrInvalidDefinition)
+		return nil, fmt.Errorf("%w: composition registry required", agenttools.ErrInvalidDefinition)
 	}
 	if options.State == nil {
 		options.State = NewState()
@@ -130,18 +133,20 @@ func Register(ctx context.Context, registry *agenttools.Registry, options Option
 	if options.Skills != nil {
 		definitions = append(definitions, skillLoadDefinition(options.Skills))
 	}
-	registrations := make([]agenttools.Registration, 0, len(definitions))
-	for _, definition := range definitions {
-		if err := ctx.Err(); err != nil {
-			return nil, err
+	return registry.Mount(ctx, component, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
+		for index, definition := range definitions {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := registrar.Tool(composition.ToolRegistration{
+				ID: definition.Name, InstanceID: component.InstanceID, Order: runtime.OrderApplication + index,
+				Scope: scope, Definition: definition,
+			}); err != nil {
+				return err
+			}
 		}
-		registration, err := registry.Register(definition)
-		if err != nil {
-			return nil, err
-		}
-		registrations = append(registrations, registration)
-	}
-	return registrations, nil
+		return nil
+	}))
 }
 
 func planSetDefinition(state *State) agenttools.Definition {

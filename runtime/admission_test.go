@@ -833,11 +833,11 @@ func (s *fakeExecutionStore) UpdateModelRequest(context.Context, session.ModelRe
 	return session.ErrNotFound
 }
 
-func (s *fakeExecutionStore) GetModelRequest(context.Context, session.ModelRequestID) (session.ModelRequestRecord, error) {
+func (s *admissionStore) GetModelRequest(context.Context, session.ModelRequestID) (session.ModelRequestRecord, error) {
 	return session.ModelRequestRecord{}, session.ErrNotFound
 }
 
-func (s *fakeExecutionStore) ListModelRequests(context.Context, session.RunID, session.ModelRequestCursor) (session.ModelRequestBatch, error) {
+func (s *admissionStore) ListModelRequests(context.Context, session.RunID, session.ModelRequestCursor) (session.ModelRequestBatch, error) {
 	return session.ModelRequestBatch{}, nil
 }
 

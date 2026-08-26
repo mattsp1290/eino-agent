@@ -85,7 +85,7 @@ least:
   this option: hosts compose native adapters with
   `model.AdapterResolver{Adapters: ..., Catalog: ...}` (`model/provider.go`)
   and pass the resolver here.
-- `WithToolRegistry(ToolRegistry)`
+- `WithRunPlanProvider(RunPlanProvider)`
 - `WithContextSource(ContextSource)` — appendable, may be given multiple times
 - `WithEventSink(EventSink)`
 - `WithHook(Hook)` — appendable
@@ -111,7 +111,7 @@ Rules:
   deferring failure to `Start`. Supply the same defaults the zero-value struct
   currently receives for optional fields.
 - A nil value passed to an interface-typed option (`WithStore`,
-  `WithModelResolver`, `WithToolRegistry`,
+  `WithModelResolver`, `WithRunPlanProvider`,
   `WithContextSource`, `WithEventSink`, `WithHook`, `WithPermissions`,
   `WithToolMiddleware`, `WithIDGenerator`) is a construction error, not a
   silent no-op. Func-,
@@ -122,17 +122,15 @@ Rules:
   (`runtime/orchestrator.go` fallbacks).
 - Keep orchestrator dependencies private and use the constructor as the sole
   validated path.
-- Apply the same pattern to `tools.NewRegistry` only if it needs new
-  configuration for this work; do not gratuitously convert existing
-  constructors.
+- Keep `composition.NewRegistry` as the sole registry constructor and publish
+  tool definitions through component mounts.
 
 ### 2. Function Adapters For Single-Method Seams
 
 Add `http.HandlerFunc`-style adapters so plain Go functions satisfy the
 single-method interfaces that participate in options. Net-new adapters:
 
-- `runtime.EventSinkFunc`, `runtime.ContextSourceFunc`,
-  `runtime.ToolRegistryFunc`
+- `runtime.EventSinkFunc`
 - `model.ResolverFunc`
 
 Already exist — do not re-add; add compile-time interface assertions and reuse
@@ -397,7 +395,8 @@ non-secret guest configuration. Wrapper semantics:
   interface) whose `Execute` performs the guest call and whose `Decode` and
   `Encode` are JSON passthroughs validating size bounds; `Normalize` is unset.
   It reaches the orchestrator the same way native definitions do:
-  `tools.NewRegistry()` → `Register(definition)` → `WithToolRegistry(registry)`.
+  `composition.Registry.Mount` → `Registrar.Tool` →
+  `runtime.WithRunPlanProvider(registry)`.
 - The Wasm-backed `runtime.Hook` echoes its input snapshot unmodified from
   `BeforeTurn`. This is a wrapper-implementation policy, not a change to
   `runtime.Hook` — the interface's `BeforeTurn(ctx, TurnSnapshot)
@@ -423,14 +422,17 @@ policy, err := loader.LoadPermissionsPolicy(ctx, wasmext.ModuleConfig{ /* ... */
 // or: policy := permissions.PolicyFunc(func(ctx context.Context, req permissions.Request) (permissions.Decision, error) { /* ... */ })
 
 def, err := loader.LoadTool(ctx, wasmext.ModuleConfig{ /* ... */ })
-registry := tools.NewRegistry()
-_, err = registry.Register(def) // same registration path as a native tools.Definition
+registry := composition.NewRegistry(nil)
+mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+    return registrar.Tool(composition.ToolRegistration{ID: "wasm-tool", InstanceID: component.InstanceID, Scope: extension.GlobalScope(), Definition: def})
+}))
+defer mount.Close(context.Background())
 
 orch, err := runtime.NewStreamingOrchestrator(
     runtime.WithStore(store),
     runtime.WithModelResolver(resolver),
     runtime.WithIDGenerator(ids),
-    runtime.WithToolRegistry(registry),
+    runtime.WithRunPlanProvider(registry),
     runtime.WithPermissions(policy),
 )
 // The embedder, not the orchestrator, later closes what it loaded:

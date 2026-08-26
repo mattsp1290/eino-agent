@@ -134,14 +134,14 @@ func rejectCanonicalExtra(raw json.RawMessage) error {
 	return visit(value)
 }
 
-func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestStore, error) {
+func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (*session.ModelRequestRecord, session.ModelRequestWriter, error) {
 	if !o.modelRequestLedger {
 		return nil, nil, nil
 	}
 	if execution == nil || execution.store == nil {
-		return nil, nil, fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
+		return nil, nil, fmt.Errorf("%w: model request ledger requires an execution store", ErrInvalidOrchestrator)
 	}
-	store := session.ModelRequestStore(execution.store)
+	store := session.ModelRequestWriter(execution.store)
 	messages, err := json.Marshal(audited.Messages)
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode audited messages: %w", err)
@@ -174,7 +174,7 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	return &created, store, nil
 }
 
-func updateModelRequest(ctx context.Context, store session.ModelRequestStore, record *session.ModelRequestRecord, state session.ModelRequestState, err error, now time.Time) error {
+func updateModelRequest(ctx context.Context, store session.ModelRequestWriter, record *session.ModelRequestRecord, state session.ModelRequestState, err error, now time.Time) error {
 	if store == nil || record == nil {
 		return nil
 	}

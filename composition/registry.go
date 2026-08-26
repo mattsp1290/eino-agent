@@ -502,25 +502,13 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			dispatch.Release()
 			return nil, cloneErr
 		}
-		frozen, freezeErr := tools.NewSnapshot([]tools.SnapshotEntry{{Registration: tools.Registration{Name: entry.Definition.Name, Generation: 1}, Definition: definition}})
-		if freezeErr != nil {
-			dispatch.Release()
-			return nil, freezeErr
-		}
 		planTools[index] = runtime.PlanTool{
 			Identity: session.ExtensionPlanEntry{
 				InstanceID: entry.InstanceID, Artifact: artifactIdentity(entry.component.Artifact),
 				Tool: &session.ToolPlanIdentity{Name: entry.Definition.Name, RegistrationID: entry.ID, Scope: scopeIdentity(entry.Scope), SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash},
 			},
 			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
-				resolved, resolveErr := frozen.ResolveTools(ctx, scope)
-				if resolveErr != nil {
-					return runtime.Tool{}, resolveErr
-				}
-				if len(resolved) != 1 {
-					return runtime.Tool{}, fmt.Errorf("sealed tool %q did not materialize", entry.Definition.Name)
-				}
-				return resolved[0], nil
+				return tools.Materialize(ctx, definition, scope)
 			},
 		}
 	}

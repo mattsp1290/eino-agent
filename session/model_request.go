@@ -49,11 +49,16 @@ type ModelRequestBatch struct {
 	Next    ModelRequestCursor
 }
 
-type ModelRequestStore interface {
-	CreateModelRequest(context.Context, ModelRequestRecord) (ModelRequestRecord, error)
-	UpdateModelRequest(context.Context, ModelRequestRecord) error
+// ModelRequestReader exposes durable provider-attempt records without granting mutation authority.
+type ModelRequestReader interface {
 	GetModelRequest(context.Context, ModelRequestID) (ModelRequestRecord, error)
 	ListModelRequests(context.Context, RunID, ModelRequestCursor) (ModelRequestBatch, error)
+}
+
+// ModelRequestWriter mutates provider-attempt records through a run-fenced execution store.
+type ModelRequestWriter interface {
+	CreateModelRequest(context.Context, ModelRequestRecord) (ModelRequestRecord, error)
+	UpdateModelRequest(context.Context, ModelRequestRecord) error
 }
 
 func ValidModelRequestTransition(from, to ModelRequestState) bool {

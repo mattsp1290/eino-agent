@@ -73,6 +73,31 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	}
 }
 
+func TestModelRequestLedgerDisabledDoesNotPersistOrSetIdempotencyKey(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var submitted model.Request
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		submitted = request
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-disabled-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if result.Error != nil || submitted.IdempotencyKey != "" {
+		t.Fatalf("result=%#v idempotency_key=%q", result, submitted.IdempotencyKey)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 0 {
+		t.Fatalf("records=%#v error=%v", batch.Records, err)
+	}
+}
+
 func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -144,7 +169,7 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 	updateErr := errors.New("dispatch start update failed")
-	failingStore := &dispatchStartFailingStore{Store: store, ModelRequestStore: store, err: updateErr}
+	failingStore := &dispatchStartFailingStore{Store: store, err: updateErr}
 	var sequence []string
 	var completed []ModelCompletedNotice
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
@@ -263,19 +288,46 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 	}
 }
 
+func TestLedgerAuditFailureAfterAdmissionSettlesRunWithoutDispatch(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	called := false
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		called = true
+		return []*einoschema.Message{einoschema.AssistantMessage("unexpected", nil)}, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithModelRequestLedger(true), WithModelRequestMaxBytes(1),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "audit-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if !errors.Is(result.Error, session.ErrModelRequestTooLarge) || result.Status != session.RunFailed || called {
+		t.Fatalf("result=%#v provider_called=%t", result, called)
+	}
+	run, err := store.GetRun(context.Background(), result.RunID)
+	if err != nil || run.Status != session.RunFailed {
+		t.Fatalf("durable run=%#v error=%v", run, err)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 0 {
+		t.Fatalf("model request records=%#v error=%v", batch.Records, err)
+	}
+}
+
 type dispatchStartFailingStore struct {
 	session.Store
-	session.ModelRequestStore
 	err error
 }
 
 func (s *dispatchStartFailingStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
 	return s.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
-		modelRequests, ok := tx.(session.ModelRequestStore)
-		if !ok {
-			return session.ErrConflict
-		}
-		return fn(ctx, &dispatchStartFailingStore{Store: tx, ModelRequestStore: modelRequests, err: s.err})
+		return fn(ctx, &dispatchStartFailingStore{Store: tx, err: s.err})
 	})
 }
 
@@ -293,13 +345,6 @@ func (s *dispatchStartFailingExecution) UpdateModelRequest(ctx context.Context, 
 		return s.err
 	}
 	return s.ExecutionStore.UpdateModelRequest(ctx, record)
-}
-
-func (s *dispatchStartFailingStore) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
-	if record.State == session.ModelRequestDispatchStarted {
-		return s.err
-	}
-	return s.ModelRequestStore.UpdateModelRequest(ctx, record)
 }
 
 func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]ModelCompletedNotice) (*RunPlan, func()) {
@@ -371,9 +416,9 @@ func TestAuditModelRequestRejectsEveryNestedExtraCategory(t *testing.T) {
 	}
 }
 
-func TestLedgerOptionRequiresCapability(t *testing.T) {
+func TestLedgerUsesExecutionScopedWriterCapability(t *testing.T) {
 	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, errors.New("unused") })}), WithIDGenerator(&sequenceIDs{}), WithModelRequestLedger(true))
-	if !errors.Is(err, ErrInvalidOrchestrator) {
+	if err != nil {
 		t.Fatalf("construction error = %v", err)
 	}
 }

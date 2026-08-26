@@ -48,7 +48,7 @@ type ToolSettlementInput struct {
 }
 
 // BuildToolSettlement builds the canonical terminal call, result message, and
-// result part envelope used by runtime execution and public tools helpers.
+// result part envelope used by runtime execution.
 func BuildToolSettlement(input ToolSettlementInput) (session.ToolSettlement, ToolOutput, error) {
 	if err := validateSettlementInput(input); err != nil {
 		return session.ToolSettlement{}, ToolOutput{}, err

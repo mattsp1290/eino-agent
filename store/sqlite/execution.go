@@ -128,7 +128,7 @@ func (e *executionStore) SettleRun(ctx context.Context, run session.Run, finalEv
 			return err
 		}
 		if finalEvent != nil {
-			_, err := store.AppendEvent(ctx, *finalEvent)
+			_, err := store.appendEvent(ctx, *finalEvent)
 			return err
 		}
 		return nil
@@ -145,7 +145,7 @@ func (e *executionStore) AppendMessage(ctx context.Context, record session.Messa
 			return session.ErrConflict
 		}
 		var err error
-		result, err = store.AppendMessage(ctx, record)
+		result, err = store.appendMessage(ctx, record)
 		return err
 	})
 	return result, err
@@ -161,7 +161,7 @@ func (e *executionStore) AppendPart(ctx context.Context, record session.Part) (s
 			return session.ErrConflict
 		}
 		var err error
-		result, err = store.AppendPart(ctx, record)
+		result, err = store.appendPart(ctx, record)
 		return err
 	})
 	return result, err
@@ -175,7 +175,7 @@ func (e *executionStore) UpdatePart(ctx context.Context, record session.Part) er
 		if record.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		return store.UpdatePart(ctx, record)
+		return store.updatePart(ctx, record)
 	})
 }
 
@@ -189,7 +189,7 @@ func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRe
 			return session.ErrConflict
 		}
 		var err error
-		result, err = store.AppendEvent(ctx, record)
+		result, err = store.appendEvent(ctx, record)
 		return err
 	})
 	return result, err
@@ -205,7 +205,7 @@ func (e *executionStore) CreateToolCall(ctx context.Context, record session.Tool
 			return session.ErrConflict
 		}
 		var err error
-		result, err = store.CreateToolCall(ctx, record)
+		result, err = store.createToolCall(ctx, record)
 		return err
 	})
 	return result, err
@@ -225,7 +225,7 @@ func (e *executionStore) ClaimToolCall(ctx context.Context, record session.ToolC
 			return err
 		}
 		record.LeaseUntil = runLease.LeaseUntil
-		result, err = store.ClaimToolCall(ctx, record)
+		result, err = store.claimToolCall(ctx, record)
 		return err
 	})
 	return result, err
@@ -240,7 +240,7 @@ func (e *executionStore) SettleToolCall(ctx context.Context, settlement session.
 		if call.RunID != e.fence.RunID || call.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		return store.SettleToolCall(ctx, settlement)
+		return store.settleToolCall(ctx, settlement)
 	})
 }
 
@@ -251,7 +251,7 @@ func (e *executionStore) StartContextEpoch(ctx context.Context, record session.C
 			return session.ErrConflict
 		}
 		var err error
-		result, err = store.StartContextEpoch(ctx, record)
+		result, err = store.startContextEpoch(ctx, record)
 		return err
 	})
 	return result, err
@@ -262,7 +262,7 @@ func (e *executionStore) FinishContextEpoch(ctx context.Context, record session.
 		if record.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		return store.FinishContextEpoch(ctx, record)
+		return store.finishContextEpoch(ctx, record)
 	})
 }
 
@@ -276,7 +276,7 @@ func (e *executionStore) CreateModelRequest(ctx context.Context, record session.
 			return session.ErrConflict
 		}
 		var err error
-		result, err = store.CreateModelRequest(ctx, record)
+		result, err = store.createModelRequest(ctx, record)
 		return err
 	})
 	return result, err
@@ -290,23 +290,8 @@ func (e *executionStore) UpdateModelRequest(ctx context.Context, record session.
 		if record.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		return store.UpdateModelRequest(ctx, record)
+		return store.updateModelRequest(ctx, record)
 	})
-}
-
-func (e *executionStore) GetModelRequest(ctx context.Context, id session.ModelRequestID) (session.ModelRequestRecord, error) {
-	record, err := e.store.GetModelRequest(ctx, id)
-	if err == nil && record.RunID != e.fence.RunID {
-		return session.ModelRequestRecord{}, session.ErrConflict
-	}
-	return record, err
-}
-
-func (e *executionStore) ListModelRequests(ctx context.Context, runID session.RunID, cursor session.ModelRequestCursor) (session.ModelRequestBatch, error) {
-	if runID != e.fence.RunID {
-		return session.ModelRequestBatch{}, session.ErrConflict
-	}
-	return e.store.ListModelRequests(ctx, runID, cursor)
 }
 
 var _ session.ExecutionStore = (*executionStore)(nil)

@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
-	"sync"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
@@ -20,8 +18,6 @@ var (
 	ErrInvalidDefinition = errors.New("invalid tool definition")
 	// ErrDuplicateRegistration reports a second registration for the same tool name.
 	ErrDuplicateRegistration = errors.New("duplicate tool registration")
-	// ErrStaleRegistration reports an update based on an older registration generation.
-	ErrStaleRegistration = errors.New("stale tool registration")
 	// ErrMalformedInput reports model tool input that cannot be decoded.
 	ErrMalformedInput = errors.New("malformed tool input")
 )
@@ -82,193 +78,6 @@ type Execution struct {
 	Context runtime.ToolContext
 }
 
-// Registration identifies one active tool registration generation.
-type Registration struct {
-	Name       string
-	Generation uint64
-}
-
-// Registry stores typed tool definitions and materializes them per bounded
-// scope context.
-type Registry struct {
-	mu   sync.RWMutex
-	defs map[string]registered
-	next uint64
-}
-
-type registered struct {
-	definition Definition
-	generation uint64
-}
-
-// NewRegistry returns an empty typed tool registry.
-func NewRegistry() *Registry {
-	return &Registry{
-		defs: make(map[string]registered),
-	}
-}
-
-// Register adds one new tool definition.
-func (r *Registry) Register(definition Definition) (Registration, error) {
-	if err := ValidateDefinition(definition); err != nil {
-		return Registration{}, err
-	}
-	frozen, err := definition.Clone()
-	if err != nil {
-		return Registration{}, fmt.Errorf("%w: freeze %s: %v", ErrInvalidDefinition, definition.Name, err)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.defs == nil {
-		r.defs = make(map[string]registered)
-	}
-	if _, exists := r.defs[definition.Name]; exists {
-		return Registration{}, fmt.Errorf("%w: %s", ErrDuplicateRegistration, definition.Name)
-	}
-	r.next++
-	registration := Registration{Name: definition.Name, Generation: r.next}
-	r.defs[definition.Name] = registered{definition: frozen, generation: registration.Generation}
-	return registration, nil
-}
-
-// Replace updates an existing definition if registration still names the active
-// generation. This prevents stale plugin reloads from overwriting newer tools.
-func (r *Registry) Replace(registration Registration, definition Definition) (Registration, error) {
-	if err := ValidateDefinition(definition); err != nil {
-		return Registration{}, err
-	}
-	if registration.Name != definition.Name {
-		return Registration{}, fmt.Errorf("%w: registration %s cannot replace %s", ErrStaleRegistration, registration.Name, definition.Name)
-	}
-	frozen, err := definition.Clone()
-	if err != nil {
-		return Registration{}, fmt.Errorf("%w: freeze %s: %v", ErrInvalidDefinition, definition.Name, err)
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	current, ok := r.defs[registration.Name]
-	if !ok || current.generation != registration.Generation {
-		return Registration{}, fmt.Errorf("%w: %s", ErrStaleRegistration, registration.Name)
-	}
-	r.next++
-	next := Registration{Name: definition.Name, Generation: r.next}
-	r.defs[definition.Name] = registered{definition: frozen, generation: next.Generation}
-	return next, nil
-}
-
-// Unregister removes only the exact active registration generation.
-func (r *Registry) Unregister(registration Registration) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	current, ok := r.defs[registration.Name]
-	if !ok || current.generation != registration.Generation {
-		return fmt.Errorf("%w: %s", ErrStaleRegistration, registration.Name)
-	}
-	delete(r.defs, registration.Name)
-	return nil
-}
-
-// SnapshotEntry is one exact generation in a deterministic registry snapshot.
-type SnapshotEntry struct {
-	Registration Registration
-	Definition   Definition
-}
-
-// Snapshot is an immutable set of exact tool generations. Materialization
-// applies run enable/disable selection without consulting the live registry.
-type Snapshot struct{ entries []SnapshotEntry }
-
-// Snapshot returns every active definition ordered by registration generation.
-func (r *Registry) Snapshot() (Snapshot, error) {
-	if r == nil {
-		return Snapshot{}, nil
-	}
-	r.mu.RLock()
-	entries := make([]SnapshotEntry, 0, len(r.defs))
-	for name, entry := range r.defs {
-		definition, err := entry.definition.Clone()
-		if err != nil {
-			r.mu.RUnlock()
-			return Snapshot{}, fmt.Errorf("freeze snapshot tool %q: %w", name, err)
-		}
-		entries = append(entries, SnapshotEntry{Registration: Registration{Name: name, Generation: entry.generation}, Definition: definition})
-	}
-	r.mu.RUnlock()
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Registration.Generation != entries[j].Registration.Generation {
-			return entries[i].Registration.Generation < entries[j].Registration.Generation
-		}
-		return entries[i].Registration.Name < entries[j].Registration.Name
-	})
-	return Snapshot{entries: entries}, nil
-}
-
-// Entries returns a defensive copy of the frozen generations.
-func (s Snapshot) Entries() ([]SnapshotEntry, error) {
-	result := make([]SnapshotEntry, len(s.entries))
-	for index, entry := range s.entries {
-		definition, err := entry.Definition.Clone()
-		if err != nil {
-			return nil, fmt.Errorf("clone snapshot tool %q: %w", entry.Registration.Name, err)
-		}
-		result[index] = SnapshotEntry{Registration: entry.Registration, Definition: definition}
-	}
-	return result, nil
-}
-
-// NewSnapshot builds a frozen snapshot from entries supplied by a composition
-// coordinator. Entries are sorted by generation and name.
-func NewSnapshot(entries []SnapshotEntry) (Snapshot, error) {
-	next := make([]SnapshotEntry, len(entries))
-	for index, entry := range entries {
-		definition, err := entry.Definition.Clone()
-		if err != nil {
-			return Snapshot{}, fmt.Errorf("freeze snapshot tool %q: %w", entry.Registration.Name, err)
-		}
-		next[index] = SnapshotEntry{Registration: entry.Registration, Definition: definition}
-	}
-	sort.Slice(next, func(i, j int) bool {
-		if next[i].Registration.Generation != next[j].Registration.Generation {
-			return next[i].Registration.Generation < next[j].Registration.Generation
-		}
-		return next[i].Registration.Name < next[j].Registration.Name
-	})
-	return Snapshot{entries: next}, nil
-}
-
-// ResolveTools materializes from the immutable snapshot.
-func (s Snapshot) ResolveTools(ctx context.Context, scope runtime.ToolScopeContext) ([]runtime.Tool, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	enabled := enabledSet(scope)
-	disabled := disabledSet(scope)
-	result := make([]runtime.Tool, 0, len(s.entries))
-	for _, entry := range s.entries {
-		if includeTool(entry.Definition.Name, enabled, disabled) {
-			definition, err := entry.Definition.Clone()
-			if err != nil {
-				return nil, fmt.Errorf("clone snapshot tool %q: %w", entry.Definition.Name, err)
-			}
-			tool, err := materialize(definition, scope.Clone())
-			if err != nil {
-				return nil, fmt.Errorf("materialize snapshot tool %q: %w", entry.Definition.Name, err)
-			}
-			result = append(result, tool)
-		}
-	}
-	return result, nil
-}
-
-// ResolveTools materializes enabled tools for a bounded scope context.
-func (r *Registry) ResolveTools(ctx context.Context, scope runtime.ToolScopeContext) ([]runtime.Tool, error) {
-	snapshot, err := r.Snapshot()
-	if err != nil {
-		return nil, err
-	}
-	return snapshot.ResolveTools(ctx, scope)
-}
-
 // Clone returns a defensive copy of definition containers.
 func (d Definition) Clone() (Definition, error) {
 	next := d
@@ -282,8 +91,8 @@ func (d Definition) Clone() (Definition, error) {
 	return next, nil
 }
 
-// ValidateDefinition reports whether definition can be safely registered and
-// materialized by a tool registry.
+// ValidateDefinition reports whether definition can be safely composed and
+// materialized.
 func ValidateDefinition(definition Definition) error {
 	if strings.TrimSpace(definition.Name) == "" {
 		return fmt.Errorf("%w: name required", ErrInvalidDefinition)
@@ -311,6 +120,21 @@ func validateParameters(parameters *einoschema.ParamsOneOf) (err error) {
 	}()
 	_, err = cloneParamsOneOfChecked(parameters)
 	return err
+}
+
+// Materialize creates one runtime tool from a validated definition and bounded scope.
+func Materialize(ctx context.Context, definition Definition, context runtime.ToolScopeContext) (runtime.Tool, error) {
+	if err := ctx.Err(); err != nil {
+		return runtime.Tool{}, err
+	}
+	if err := ValidateDefinition(definition); err != nil {
+		return runtime.Tool{}, err
+	}
+	frozen, err := definition.Clone()
+	if err != nil {
+		return runtime.Tool{}, fmt.Errorf("freeze tool %q: %w", definition.Name, err)
+	}
+	return materialize(frozen, context.Clone())
 }
 
 func materialize(definition Definition, context runtime.ToolScopeContext) (runtime.Tool, error) {
@@ -425,38 +249,6 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 		Structured: cloneRaw(encoded),
 		Metadata:   cloneStringMap(e.definition.Metadata),
 	}, nil
-}
-
-func enabledSet(scope runtime.ToolScopeContext) map[string]bool {
-	if scope.EnabledTools == nil {
-		return nil
-	}
-	result := make(map[string]bool, len(scope.EnabledTools))
-	for _, name := range scope.EnabledTools {
-		result[name] = true
-	}
-	return result
-}
-
-func disabledSet(scope runtime.ToolScopeContext) map[string]bool {
-	if len(scope.DisabledTools) == 0 {
-		return nil
-	}
-	result := make(map[string]bool, len(scope.DisabledTools))
-	for _, name := range scope.DisabledTools {
-		result[name] = true
-	}
-	return result
-}
-
-func includeTool(name string, enabled map[string]bool, disabled map[string]bool) bool {
-	if disabled[name] {
-		return false
-	}
-	if enabled == nil {
-		return true
-	}
-	return enabled[name]
 }
 
 func normalizeInput(ctx context.Context, definition Definition, decoded any) (json.RawMessage, error) {

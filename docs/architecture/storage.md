@@ -35,6 +35,8 @@ Stores persist these durable facts:
 - `session.ToolCall`: pending, claimed, completed, failed, and interrupted tool
   calls.
 - `session.ContextEpoch`: compaction and context-history boundaries.
+- `session.ModelRequestRecord`: optional provider-attempt audit records and
+  their lifecycle state.
 
 Live AG-UI SSE frames are not durable facts. Replay is projected from messages,
 parts, context epochs, and durable events.
@@ -57,6 +59,8 @@ Required behavior:
   an expired nonterminal lease.
 - `Store.Execution(RunFence)` returns the only execution mutation capability;
   every write validates the current run token in the same transaction.
+- `Store` exposes `ModelRequestReader`; model-request creates and updates are
+  available only from the `ModelRequestWriter` embedded in `ExecutionStore`.
 
 `ActiveRun` returns the current nonterminal owner or `session.ErrNotFound`.
 `ListUnfinishedRuns` returns every nonterminal run so process startup can mark
@@ -76,6 +80,7 @@ Transaction boundaries matter for:
 - creating, claiming, and writing the first tool-call part;
 - finishing a run together with its final durable event;
 - creating a context epoch and writing compaction summary/tail metadata.
+- creating and transitioning an enabled model-request ledger record.
 
 ## Replay Ordering
 
@@ -128,6 +133,15 @@ Tool calls use a create, claim, atomic-settlement lifecycle:
 This prevents double execution and gives recovery enough data to decide whether
 to mark a call interrupted or retry it when `RetrySafe` is true.
 
+## Model-Request Ledger
+
+When `runtime.WithModelRequestLedger(true)` is enabled, each provider attempt
+creates a bounded `prepared` record through `ExecutionStore`, transitions it to
+`dispatch_started` before the provider call, and settles it `completed` or
+`failed`. These writes validate the owning run fence atomically. Top-level
+`Store` readers expose individual records and stable run-scoped pagination.
+With the option disabled, the runtime persists no request records.
+
 ## Idempotency
 
 Stores must make caller-supplied IDs idempotent:
@@ -173,10 +187,10 @@ journaling for provider responses or tool execution.
   conflicts;
 - pending tool-call creation, single-owner claim, conflict on second claim,
   claim-token fencing, and terminal settlement;
+- model-request creation and state transitions through a valid execution fence,
+  top-level reads and pagination, invalid-transition rejection, and rollback;
 - unfinished run discovery and durable event listing with paged reads.
 
-Transactional backends should also call `storetest.RunTransactional`, which
-requires a non-nil transactor and repeats the transaction-specific contract.
 
 Every backend should run the contract suite in its own package and add
 backend-specific tests for ID generation, migrations, persistence across

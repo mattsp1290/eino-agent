@@ -87,7 +87,7 @@ make lint
 - `stream`: bounded live-tail implementation for active runtime events.
 - `model`: provider/model catalog and Eino model resolution contracts.
 - `config`: immutable runtime config snapshot and validation contracts.
-- `tools`: typed tool registry and materialization helpers.
+- `tools`: typed tool definitions and per-run materialization helpers.
 - `permissions`: tool permission policy primitives.
 - `agui`: AG-UI durability and replay policy definitions; protocol mechanics
   stay in `eino-agui`.

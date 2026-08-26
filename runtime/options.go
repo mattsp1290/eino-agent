@@ -51,11 +51,6 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 	if len(missing) != 0 {
 		return nil, fmt.Errorf("%w: missing required dependencies: %s", ErrInvalidOrchestrator, strings.Join(missing, ", "))
 	}
-	if o.modelRequestLedger {
-		if _, ok := o.store.(session.ModelRequestStore); !ok {
-			return nil, fmt.Errorf("%w: model request ledger requires session.ModelRequestStore", ErrInvalidOrchestrator)
-		}
-	}
 	o.configured = true
 	return o, nil
 }

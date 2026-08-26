@@ -1,16 +1,16 @@
-# Tool Registry Boundary
+# Tool Definition Boundary
 
 Date: 2026-06-27
 
-The typed tool registry turns host or adapter tool definitions into
-`runtime.Tool` values from a bounded `runtime.ToolScopeContext`.
+The `tools` package turns one host or adapter definition into a `runtime.Tool`
+from a bounded `runtime.ToolScopeContext`. `composition.Registry` is the only
+registry and selects and seals definitions into immutable run plans.
 
 ## Responsibilities
 
 The `tools` package owns:
 
 - registration-time validation for tool definitions;
-- stale-registration protection using monotonically increasing generations;
 - typed decoding of model-provided JSON input;
 - deterministic normalization to a non-null JSON object;
 - explicit permission-pattern derivation from typed normalized input;
@@ -33,10 +33,10 @@ owner.
 
 ## Materialization
 
-Materialization happens per bounded scope context. Enabled and disabled tool names from
-`config.ToolConfig` are applied at resolve time, so a config reload affects
-future runs without mutating tools already retained by an in-flight
-run.
+Materialization happens per bounded scope context. `composition.Registry`
+applies enabled and disabled names from `config.ToolConfig` when it acquires a
+run plan, so a config reload affects future runs without mutating tools already
+retained by an in-flight run.
 
 Default scopes derive from bounded workspace metadata:
 
@@ -72,20 +72,22 @@ settlement to distinguish bad tool-call arguments from host execution failures.
 
 ## Mutability
 
-The registry defensively copies definition slices/maps and returns fresh
-`runtime.Tool` containers for every materialization. Host metadata stays on
-`runtime.Tool`; provider-facing `schema.ToolInfo.Extra` is empty. Tool schemas
-and all remaining containers are copied so one session cannot mutate another
-session's model request state.
+`composition.Registry` defensively freezes definitions at mount and run-plan
+acquisition. `tools.Materialize` returns fresh `runtime.Tool` containers for
+one already-selected definition. Host metadata stays on `runtime.Tool`;
+provider-facing `schema.ToolInfo.Extra` is empty. Tool schemas and all remaining
+containers are copied so one session cannot mutate another session's model
+request state.
 
 ## Reversible and strict-plan tools
 
-`tools.Registry.Snapshot` freezes definitions in deterministic generation
-order. `Unregister` removes only the exact active generation, preventing stale
-reload handles from deleting replacements. `composition.Registry` adds global
-and exact-session layers. Applicable global and session tools may not share a
-name, preventing request-scoped behavior from shadowing a trusted server tool;
-restrictions only intersect.
+`composition.Registry` freezes deterministic global and exact-session layers.
+Applicable global and session tools may not share a name, preventing
+request-scoped behavior from shadowing a trusted server tool; restrictions only
+intersect. Mount deactivation removes capabilities from future plans while
+leased plans remain valid until release. `tools/session.Mount` publishes the
+built-in session tools through the same component identity, scope, and resume
+path as native, catalog, AG-UI, and Wasm tools.
 
 Catalog source schema/executor hashes are composed with host definition order
 and component artifact identity before they enter `session.ToolPlanIdentity`.
@@ -94,8 +96,8 @@ rejects strict resume. Non-concurrent standard definitions share one
 process-wide, ref-counted lock coordinator; workspace keys are canonical roots
 and static keys are catalog IDs.
 
-Registry-backed calls reserve result message and part IDs at admission.
-`session.Store.SettleToolCall` commits terminal tool state
+Run-plan-backed calls reserve result message and part IDs at admission.
+`session.ExecutionStore.SettleToolCall` commits terminal tool state
 and the model-visible result atomically and idempotently. Each settlement must
 present the owner and token of the durable tool claim whose work it commits;
 missing or stale claim identities conflict before terminal state is applied.
@@ -104,15 +106,13 @@ The protected stage order is documented in
 
 ## Canonical result encoding
 
-The runtime owns the single tool-output encoder and settlement builder.
+The runtime exclusively owns the tool-output encoder and settlement builder.
 `runtime.ToolOutput` contains only bounded model-visible fields: call ID,
 status, inline content/structured data, truncation sizes, and external/redacted
 flags. Tool-controlled attachment locations and arbitrary metadata are never
 copied into provider history.
 
-`tools.ModelOutput` aliases that runtime type, while
-`tools.EncodeModelOutput` and `tools.BuildToolSettlement` are thin adapters over
-the runtime implementation. Callers building a settlement supply the
+Callers building a settlement through `runtime.BuildToolSettlement` supply the
 authoritative claimed `session.ToolCall` and one explicit completion time; the
 builder does not read a clock or store. Runtime persists host-owned output
 classification and size metadata alongside the fenced terminal call.

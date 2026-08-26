@@ -22,7 +22,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	var streamUsage model.Usage
 	var streamErr error
 	var requestRecord *session.ModelRequestRecord
-	var requestStore session.ModelRequestStore
+	var requestStore session.ModelRequestWriter
 	var modelRequested bool
 	defer func() {
 		if recovered := recover(); recovered != nil {

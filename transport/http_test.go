@@ -223,13 +223,15 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-http", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "run-http", SessionID: "session-http", OwnerID: "owner", ClaimToken: "claim-http", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-http", SessionID: "session-http", OwnerID: "owner", ClaimToken: "claim-http", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
-	if _, err := store.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := store.AppendPart(ctx, session.Part{ID: "part-http", MessageID: "msg-http", SessionID: "session-http", RunID: "run-http", Kind: session.PartText, Payload: []byte(`{"text":"hello"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-http", MessageID: "msg-http", SessionID: "session-http", RunID: "run-http", Kind: session.PartText, Payload: []byte(`{"text":"hello"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append part: %v", err)
 	}
 	events := []session.EventRecord{
@@ -237,7 +239,7 @@ func replayStore(t *testing.T) session.Store {
 		{ID: "evt-finished", SessionID: "session-http", RunID: "run-http", MessageID: "msg-http", Kind: string(runtime.EventRunFinished), CreatedAt: now.Add(time.Second)},
 	}
 	for _, event := range events {
-		if _, err := store.AppendEvent(ctx, event); err != nil {
+		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("append event: %v", err)
 		}
 	}

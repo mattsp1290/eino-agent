@@ -3,21 +3,20 @@ package sessiontools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/mattsp1290/eino-agent/composition"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	agenttools "github.com/mattsp1290/eino-agent/tools"
 )
 
 func TestSessionPlanIsScopedPerSession(t *testing.T) {
 	t.Parallel()
 
-	registry := agenttools.NewRegistry()
-	if _, err := Register(context.Background(), registry, Options{}); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{})
 	toolsA := resolve(t, registry, "session-a")
 	toolsB := resolve(t, registry, "session-b")
 	execute(t, toolsA[NamePlanSet], `{"items":[{"id":"1","text":"ship","status":"doing"}]}`)
@@ -36,10 +35,7 @@ func TestRetainedOutputIsBoundedAndSessionScoped(t *testing.T) {
 
 	state := NewState()
 	state.MaxRetainedBytes = 4
-	registry := agenttools.NewRegistry()
-	if _, err := Register(context.Background(), registry, Options{State: state}); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
 	toolsA := resolve(t, registry, "session-a")
 	result := execute(t, toolsA[NameRetainedOutput], `{"id":"out-1","content":"abcdef"}`)
 	if !strings.Contains(result.Output, `"content":"abcd"`) || !strings.Contains(result.Output, `"truncated":true`) {
@@ -66,10 +62,7 @@ func TestRetainedOutputTruncatesAtUTF8Boundary(t *testing.T) {
 
 	state := NewState()
 	state.MaxRetainedBytes = 4
-	registry := agenttools.NewRegistry()
-	if _, err := Register(context.Background(), registry, Options{State: state}); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
 	tools := resolve(t, registry, "session-a")
 	result := execute(t, tools[NameRetainedOutput], `{"id":"out-utf8","content":"ééé"}`)
 	if !strings.Contains(result.Output, `"content":"éé"`) || strings.Contains(result.Output, "�") {
@@ -83,10 +76,7 @@ func TestRetainedOutputHonorsAggregateSessionLimitAndZeroLimit(t *testing.T) {
 	state := NewState()
 	state.SetMaxRetainedBytes(0)
 	state.MaxSessionBytes = 3
-	registry := agenttools.NewRegistry()
-	if _, err := Register(context.Background(), registry, Options{State: state}); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
 	tools := resolve(t, registry, "session-a")
 	execute(t, tools[NameRetainedOutput], `{"id":"first","content":"abcdef"}`)
 	if first, ok := state.GetRetainedOutput("session-a", "first"); !ok || first.Content != "" || !first.Truncated {
@@ -106,10 +96,7 @@ func TestRetainedOutputHonorsAggregateSessionLimitAndZeroLimit(t *testing.T) {
 func TestSessionToolsExposePermissionsAndDoNotDuplicateLeafTools(t *testing.T) {
 	t.Parallel()
 
-	registry := agenttools.NewRegistry()
-	if _, err := Register(context.Background(), registry, Options{}); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{})
 	tools := resolve(t, registry, "session")
 	forbidden := map[string]bool{
 		"apply_patch":   true,
@@ -152,10 +139,7 @@ func TestSessionHooksReceiveSessionID(t *testing.T) {
 		}
 		return SkillResult{Name: request.Name, Status: "loaded"}, nil
 	})
-	registry := agenttools.NewRegistry()
-	if _, err := Register(context.Background(), registry, Options{Subagent: subagent, Skills: skills}); err != nil {
-		t.Fatalf("Register error = %v", err)
-	}
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{Subagent: subagent, Skills: skills})
 	tools := resolve(t, registry, "session-hooks")
 	if result := execute(t, tools[NameSubagent], `{"task":"test"}`); !strings.Contains(result.Output, "queued") {
 		t.Fatalf("subagent result = %s", result.Output)
@@ -176,9 +160,141 @@ func TestSessionHooksReceiveSessionID(t *testing.T) {
 	}
 }
 
-func resolve(t *testing.T, registry *agenttools.Registry, id session.ID) map[string]runtime.Tool {
+func TestSessionToolMountDeactivationPreservesAcquiredPlan(t *testing.T) {
+	registry := composition.NewRegistry(nil)
+	component := sessionToolComponent()
+	mount, err := Mount(context.Background(), registry, component, extension.GlobalScope(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount.Deactivate()
+	future, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedFuture, err := future.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
+	future.Release()
+	if err != nil || len(resolvedFuture) != 0 {
+		t.Fatalf("future tools = %#v, %v", resolvedFuture, err)
+	}
+	resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
+	if err != nil || len(resolved) != 3 {
+		t.Fatalf("acquired plan tools = %#v, %v", resolved, err)
+	}
+	plan.Release()
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSessionToolMountRoutesExactSessionScope(t *testing.T) {
+	registry := mountSessionTools(t, extension.SessionScope("session-a"), Options{})
+	if got := resolve(t, registry, "session-a"); len(got) != 3 {
+		t.Fatalf("session-a tools = %d, want 3", len(got))
+	}
+	if got := resolve(t, registry, "session-b"); len(got) != 0 {
+		t.Fatalf("session-b tools = %d, want 0", len(got))
+	}
+}
+
+func TestSessionToolMountResumesAcrossEquivalentRegistry(t *testing.T) {
+	component := sessionToolComponent()
+	first := composition.NewRegistry(nil)
+	firstMount, err := Mount(context.Background(), first, component, extension.GlobalScope(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := first.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := plan.Descriptor()
+	plan.Release()
+	if err := firstMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	second := composition.NewRegistry(nil)
+	secondMount, err := Mount(context.Background(), second, component, extension.GlobalScope(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = secondMount.Close(context.Background()) }()
+	resumed, err := second.AcquireResumePlan(context.Background(), descriptor)
+	if err != nil {
+		t.Fatalf("AcquireResumePlan error = %v", err)
+	}
+	defer resumed.Release()
+	tools, err := resumed.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
+	if err != nil || len(tools) != 3 {
+		t.Fatalf("resumed tools = %#v, %v", tools, err)
+	}
+}
+
+func TestSessionToolMountResumeRejectsIdentityDrift(t *testing.T) {
+	subagent := subagentFunc(func(context.Context, SubagentRequest) (SubagentResult, error) {
+		return SubagentResult{ID: "task", Status: "queued"}, nil
+	})
+	component := sessionToolComponent()
+	original := composition.NewRegistry(nil)
+	originalMount, err := Mount(context.Background(), original, component, extension.GlobalScope(), Options{Subagent: subagent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := original.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := plan.Descriptor()
+	plan.Release()
+	if err := originalMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name      string
+		component extension.Component
+		scope     extension.Scope
+		options   Options
+	}{
+		{name: "missing optional definition", component: component, scope: extension.GlobalScope(), options: Options{}},
+		{name: "component config", component: func() extension.Component {
+			changed := component
+			changed.Artifact.ConfigHash = "changed"
+			return changed
+		}(), scope: extension.GlobalScope(), options: Options{Subagent: subagent}},
+		{name: "scope", component: component, scope: extension.SessionScope("session-a"), options: Options{Subagent: subagent}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			registry := composition.NewRegistry(nil)
+			mount, err := Mount(context.Background(), registry, test.component, test.scope, test.options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = mount.Close(context.Background()) }()
+			if resumed, err := registry.AcquireResumePlan(context.Background(), descriptor); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+				if resumed != nil {
+					resumed.Release()
+				}
+				t.Fatalf("AcquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
+			}
+		})
+	}
+}
+
+func resolve(t *testing.T, registry *composition.Registry, id session.ID) map[string]runtime.Tool {
 	t.Helper()
-	materialized, err := registry.ResolveTools(context.Background(), runtime.ToolScopeContext{
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: id})
+	if err != nil {
+		t.Fatalf("AcquireRunPlan error = %v", err)
+	}
+	defer plan.Release()
+	materialized, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{
 		SessionID: id, WorkspaceID: "workspace-" + string(id), WorkspaceRoot: "/workspace/" + string(id),
 	})
 	if err != nil {
@@ -189,6 +305,31 @@ func resolve(t *testing.T, registry *agenttools.Registry, id session.ID) map[str
 		result[tool.Name] = tool
 	}
 	return result
+}
+
+func mountSessionTools(t *testing.T, scope extension.Scope, options Options) *composition.Registry {
+	t.Helper()
+	registry := composition.NewRegistry(nil)
+	component := sessionToolComponent()
+	mount, err := Mount(context.Background(), registry, component, scope, options)
+	if err != nil {
+		t.Fatalf("Mount error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := mount.Close(context.Background()); err != nil {
+			t.Errorf("close mount: %v", err)
+		}
+	})
+	return registry
+}
+
+func sessionToolComponent() extension.Component {
+	return extension.Component{
+		InstanceID: "session-tools",
+		Artifact: extension.Artifact{
+			Name: "session-tools", Version: "1", Hash: "session-tools-artifact", ConfigHash: "session-tools-config", SourceKind: extension.SourceNative,
+		},
+	}
 }
 
 func execute(t *testing.T, tool runtime.Tool, input string) runtime.ToolResult {

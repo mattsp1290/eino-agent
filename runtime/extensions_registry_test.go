@@ -11,9 +11,8 @@ import (
 	"github.com/mattsp1290/eino-agent/tools"
 )
 
-func TestRegistryToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
-	toolRegistry := tools.NewRegistry()
-	_, err := toolRegistry.Register(tools.Definition{
+func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
+	materialized, err := tools.Materialize(context.Background(), tools.Definition{
 		Name: "echo",
 		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
 			return append(json.RawMessage(nil), raw...), nil
@@ -24,13 +23,9 @@ func TestRegistryToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 		Execute: func(_ context.Context, execution tools.Execution) (any, error) {
 			return execution.Input, nil
 		},
-	})
+	}, runtime.ToolScopeContext{SessionID: "session"})
 	if err != nil {
 		t.Fatal(err)
-	}
-	materialized, err := toolRegistry.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session"})
-	if err != nil || len(materialized) != 1 {
-		t.Fatalf("ResolveTools = %#v, %v", materialized, err)
 	}
 
 	registry := extension.NewRegistry(nil)
@@ -56,7 +51,7 @@ func TestRegistryToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	defer plan.Release()
 
 	call := runtime.ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{"value":1}`)}
-	preparedTool := materialized[0]
+	preparedTool := materialized
 	preparedTool.Executor = nil
 	preparedTool.InputDecoder = nil
 	preparedTool.Pattern = nil

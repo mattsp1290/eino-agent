@@ -334,6 +334,7 @@ type EventBatch struct {
 // provide locking and transactions; callers should not infer durability from
 // live AG-UI transport delivery.
 type Store interface {
+	ModelRequestReader
 	WithinTx(ctx context.Context, fn func(context.Context, Store) error) error
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSession(ctx context.Context, id ID) (Session, error)
@@ -369,7 +370,7 @@ type ExecutionStore interface {
 	SettleToolCall(ctx context.Context, settlement ToolSettlement) error
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
-	ModelRequestStore
+	ModelRequestWriter
 }
 
 // ContextEpochReader replays durable context epoch records for audit and

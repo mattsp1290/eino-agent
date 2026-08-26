@@ -50,14 +50,16 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 	if _, err := st.CreateSession(ctx, session.Session{ID: "session-claim", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := st.AdmitRun(ctx, session.Run{ID: "run-claim", SessionID: "session-claim", OwnerID: "owner", ClaimToken: "claim-run", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
+	run, err := st.AdmitRun(ctx, session.Run{ID: "run-claim", SessionID: "session-claim", OwnerID: "owner", ClaimToken: "claim-run", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
-	if _, err := st.AppendMessage(ctx, session.Message{ID: "msg-claim", SessionID: "session-claim", RunID: "run-claim", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-claim", SessionID: "session-claim", RunID: "run-claim", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
 	call := session.ToolCall{ID: "call-claim", SessionID: "session-claim", RunID: "run-claim", MessageID: "msg-claim", Name: "tool", Status: session.ToolCallPending}
-	if _, err := st.CreateToolCall(ctx, call); err != nil {
+	if _, err := execution.CreateToolCall(ctx, call); err != nil {
 		t.Fatalf("create tool call: %v", err)
 	}
 
@@ -73,7 +75,7 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 			claim := call
 			claim.ClaimedBy = fmt.Sprintf("worker-%d", i)
 			claim.ClaimToken = fmt.Sprintf("token-%d", i)
-			_, err := st.ClaimToolCall(ctx, claim)
+			_, err := execution.ClaimToolCall(ctx, claim, time.Minute)
 			errs <- err
 		}(i)
 	}
@@ -98,7 +100,7 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 }
 
 func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing.T) {
-	st, call := setupClaimedToolCall(t)
+	st, execution, call := setupClaimedToolCall(t)
 	defer func() { _ = st.Close() }()
 	ctx := context.Background()
 	now := time.Now().UTC()
@@ -108,10 +110,10 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
 		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
 	}
-	if err := st.SettleToolCall(ctx, settlement); err != nil {
+	if err := execution.SettleToolCall(ctx, settlement); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SettleToolCall(ctx, settlement); err != nil {
+	if err := execution.SettleToolCall(ctx, settlement); err != nil {
 		t.Fatalf("idempotent settlement = %v", err)
 	}
 	settled, err := st.GetToolCall(ctx, call.ID)
@@ -124,12 +126,12 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	conflict := settlement
 	conflict.Output = json.RawMessage(`{"different":true}`)
 	conflict.ResultPart.Payload = conflict.Output
-	if err := st.SettleToolCall(ctx, conflict); !errors.Is(err, session.ErrConflict) {
+	if err := execution.SettleToolCall(ctx, conflict); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("conflicting settlement = %v", err)
 	}
 	stale := settlement
 	stale.ClaimToken = "stale"
-	if err := st.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
+	if err := execution.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("terminal stale settlement = %v", err)
 	}
 }
@@ -137,7 +139,7 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.T) {
 	for _, table := range []string{"messages", "parts"} {
 		t.Run(table, func(t *testing.T) {
-			st, call := setupClaimedToolCall(t)
+			st, execution, call := setupClaimedToolCall(t)
 			defer func() { _ = st.Close() }()
 			ctx := context.Background()
 			now := time.Now().UTC()
@@ -155,7 +157,7 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 			if _, err = st.db.ExecContext(ctx, trigger); err != nil {
 				t.Fatal(err)
 			}
-			if err := st.SettleToolCall(ctx, settlement); err == nil {
+			if err := execution.SettleToolCall(ctx, settlement); err == nil {
 				t.Fatal("SettleToolCall succeeded despite injected persistence failure")
 			}
 			current, err := st.GetToolCall(ctx, call.ID)
@@ -172,7 +174,7 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 			if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_settlement`); err != nil {
 				t.Fatal(err)
 			}
-			if err := st.SettleToolCall(ctx, settlement); err != nil {
+			if err := execution.SettleToolCall(ctx, settlement); err != nil {
 				t.Fatalf("retry after rollback = %v", err)
 			}
 		})
@@ -195,7 +197,7 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
-			st, call := setupClaimedToolCall(t)
+			st, execution, call := setupClaimedToolCall(t)
 			defer func() { _ = st.Close() }()
 			ctx := context.Background()
 			call, err := st.GetToolCall(ctx, call.ID)
@@ -210,7 +212,7 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 				ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
 			}
 			mutate(&settlement)
-			if err := st.SettleToolCall(ctx, settlement); !errors.Is(err, session.ErrConflict) {
+			if err := execution.SettleToolCall(ctx, settlement); !errors.Is(err, session.ErrConflict) {
 				t.Fatalf("SettleToolCall error = %v, want ErrConflict", err)
 			}
 			current, err := st.GetToolCall(ctx, call.ID)
@@ -229,7 +231,7 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 }
 
 func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
-	st, call := setupClaimedToolCall(t)
+	st, execution, call := setupClaimedToolCall(t)
 	defer func() { _ = st.Close() }()
 	ctx := context.Background()
 	stale := session.ToolSettlement{
@@ -248,7 +250,7 @@ func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	if _, err := st.exec(ctx, `UPDATE tool_calls SET claimed_by = ?, claim_token = ?, record = ? WHERE id = ?`, current.ClaimedBy, current.ClaimToken, raw, current.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := st.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
+	if err := execution.SettleToolCall(ctx, stale); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale settlement = %v, want ErrConflict", err)
 	}
 	if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
@@ -427,7 +429,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 }
 
 func TestCreateToolCallDuplicateRequiresFullRecordMatch(t *testing.T) {
-	st, call := setupClaimedToolCall(t)
+	st, execution, call := setupClaimedToolCall(t)
 	defer func() {
 		_ = st.Close()
 	}()
@@ -435,7 +437,7 @@ func TestCreateToolCallDuplicateRequiresFullRecordMatch(t *testing.T) {
 	ctx := context.Background()
 	conflict := call
 	conflict.Input = []byte(`{"changed":true}`)
-	if _, err := st.CreateToolCall(ctx, conflict); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.CreateToolCall(ctx, conflict); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("duplicate tool input err = %v, want ErrConflict", err)
 	}
 }
@@ -534,26 +536,28 @@ func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "ledger-session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "ledger-run", SessionID: "ledger-session", OwnerID: "owner", ClaimToken: "claim-ledger", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
+	run, err := store.AdmitRun(ctx, session.Run{ID: "ledger-run", SessionID: "ledger-session", OwnerID: "owner", ClaimToken: "claim-ledger", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		t.Fatal(err)
 	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 	for index := 1; index <= 2; index++ {
 		record := session.ModelRequestRecord{ID: session.ModelRequestID(fmt.Sprintf("request-%d", index)), SessionID: "ledger-session", RunID: "ledger-run", AssistantMessageID: "assistant", Attempt: index, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now.Add(time.Duration(index) * time.Second), UpdatedAt: now}
-		created, err := store.CreateModelRequest(ctx, record)
+		created, err := execution.CreateModelRequest(ctx, record)
 		if err != nil {
 			t.Fatal(err)
 		}
 		created.State = session.ModelRequestDispatchStarted
 		created.UpdatedAt = now.Add(time.Minute)
-		if err := store.UpdateModelRequest(ctx, created); err != nil {
+		if err := execution.UpdateModelRequest(ctx, created); err != nil {
 			t.Fatal(err)
 		}
 		created.State = session.ModelRequestCompleted
 		created.UpdatedAt = now.Add(2 * time.Minute)
-		if err := store.UpdateModelRequest(ctx, created); err != nil {
+		if err := execution.UpdateModelRequest(ctx, created); err != nil {
 			t.Fatal(err)
 		}
-		if err := store.UpdateModelRequest(ctx, created); err != nil {
+		if err := execution.UpdateModelRequest(ctx, created); err != nil {
 			t.Fatalf("idempotent terminal update: %v", err)
 		}
 	}
@@ -567,12 +571,12 @@ func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
 	}
 	invalid := second.Records[0]
 	invalid.State = session.ModelRequestPrepared
-	if err := store.UpdateModelRequest(ctx, invalid); !errors.Is(err, session.ErrConflict) {
+	if err := execution.UpdateModelRequest(ctx, invalid); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("backward transition = %v", err)
 	}
 }
 
-func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
+func setupClaimedToolCall(t testing.TB) (*Store, session.ExecutionStore, session.ToolCall) {
 	t.Helper()
 	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -584,22 +588,24 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
 		_ = st.Close()
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := st.AdmitRun(ctx, session.Run{ID: "run-tool", SessionID: "session-tool", OwnerID: "owner", ClaimToken: "claim-tool-run", Status: session.RunPending, CreatedAt: now}, time.Minute); err != nil {
+	run, err := st.AdmitRun(ctx, session.Run{ID: "run-tool", SessionID: "session-tool", OwnerID: "owner", ClaimToken: "claim-tool-run", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		_ = st.Close()
 		t.Fatalf("admit run: %v", err)
 	}
-	if _, err := st.AppendMessage(ctx, session.Message{ID: "msg-tool", SessionID: "session-tool", RunID: "run-tool", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-tool", SessionID: "session-tool", RunID: "run-tool", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		_ = st.Close()
 		t.Fatalf("append message: %v", err)
 	}
 	call := session.ToolCall{ID: "call-tool", SessionID: "session-tool", RunID: "run-tool", MessageID: "msg-tool", ResultMessageID: "result-tool", ResultPartID: "part-tool", Name: "tool", Pattern: "resource/one", Input: []byte(`{"ok":true}`), Status: session.ToolCallPending}
-	if _, err := st.CreateToolCall(ctx, call); err != nil {
+	if _, err := execution.CreateToolCall(ctx, call); err != nil {
 		_ = st.Close()
 		t.Fatalf("create tool call: %v", err)
 	}
 	call.ClaimedBy = "worker"
 	call.ClaimToken = "token"
-	claimed, err := st.ClaimToolCall(ctx, call)
+	claimed, err := execution.ClaimToolCall(ctx, call, time.Minute)
 	if err != nil {
 		_ = st.Close()
 		t.Fatalf("claim tool call: %v", err)
@@ -608,5 +614,5 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ToolCall) {
 		_ = st.Close()
 		t.Fatalf("claimed pattern = %q", claimed.Pattern)
 	}
-	return st, claimed
+	return st, execution, claimed
 }

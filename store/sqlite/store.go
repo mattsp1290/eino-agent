@@ -272,7 +272,7 @@ func (s *Store) writeRun(ctx context.Context, record session.Run) error {
 	return nil
 }
 
-func (s *Store) AppendMessage(ctx context.Context, record session.Message) (session.Message, error) {
+func (s *Store) appendMessage(ctx context.Context, record session.Message) (session.Message, error) {
 	var existing session.Message
 	if err := s.getJSON(ctx, "SELECT record FROM messages WHERE id = ?", []any{record.ID}, &existing); err == nil {
 		if !sameRecord(existing, record) {
@@ -291,7 +291,7 @@ func (s *Store) AppendMessage(ctx context.Context, record session.Message) (sess
 	return record, mapErr(err)
 }
 
-func (s *Store) AppendPart(ctx context.Context, record session.Part) (session.Part, error) {
+func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Part, error) {
 	var existing session.Part
 	if err := s.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{record.ID}, &existing); err == nil {
 		if !sameRecord(existing, record) {
@@ -310,7 +310,7 @@ func (s *Store) AppendPart(ctx context.Context, record session.Part) (session.Pa
 	return record, mapErr(err)
 }
 
-func (s *Store) UpdatePart(ctx context.Context, record session.Part) error {
+func (s *Store) updatePart(ctx context.Context, record session.Part) error {
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -366,7 +366,7 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 	return session.ReplayBatch{Messages: messages, Parts: parts, Next: next}, nil
 }
 
-func (s *Store) AppendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
+func (s *Store) appendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
 	var existing session.EventRecord
 	if err := s.getJSON(ctx, "SELECT record FROM events WHERE id = ?", []any{record.ID}, &existing); err == nil {
 		if !sameRecord(existing, record) {
@@ -414,7 +414,7 @@ func (s *Store) ListEvents(ctx context.Context, sessionID session.ID, cursor ses
 	return session.EventBatch{Events: events, Next: next}, nil
 }
 
-func (s *Store) CreateToolCall(ctx context.Context, record session.ToolCall) (session.ToolCall, error) {
+func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (session.ToolCall, error) {
 	var existing session.ToolCall
 	if err := s.getJSON(ctx, "SELECT record FROM tool_calls WHERE id = ?", []any{record.ID}, &existing); err == nil {
 		if !sameRecord(existing, record) {
@@ -443,7 +443,7 @@ func (s *Store) ListUnfinishedToolCalls(ctx context.Context, runID session.RunID
 	return listJSON[session.ToolCall](ctx, s, `SELECT record FROM tool_calls WHERE run_id = ? AND status IN (?, ?) ORDER BY id`, runID, session.ToolCallPending, session.ToolCallRunning)
 }
 
-func (s *Store) ClaimToolCall(ctx context.Context, record session.ToolCall) (session.ToolCall, error) {
+func (s *Store) claimToolCall(ctx context.Context, record session.ToolCall) (session.ToolCall, error) {
 	current, err := s.GetToolCall(ctx, record.ID)
 	if err != nil {
 		return session.ToolCall{}, err
@@ -516,16 +516,16 @@ func (s *Store) finishToolCall(ctx context.Context, record session.ToolCall) err
 	return nil
 }
 
-// SettleToolCall atomically commits a terminal call and its reserved result
+// settleToolCall atomically commits a terminal call and its reserved result
 // message/part. Repeating the identical settlement is idempotent.
-func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettlement) error {
+func (s *Store) settleToolCall(ctx context.Context, settlement session.ToolSettlement) error {
 	if s.tx == nil {
 		return s.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 			store, ok := tx.(*Store)
 			if !ok {
 				return session.ErrConflict
 			}
-			return store.SettleToolCall(ctx, settlement)
+			return store.settleToolCall(ctx, settlement)
 		})
 	}
 	call, err := s.GetToolCall(ctx, settlement.ID)
@@ -542,10 +542,10 @@ func (s *Store) SettleToolCall(ctx context.Context, settlement session.ToolSettl
 	if err := s.finishToolCall(ctx, settled); err != nil {
 		return err
 	}
-	if _, err := s.AppendMessage(ctx, settlement.ResultMessage); err != nil {
+	if _, err := s.appendMessage(ctx, settlement.ResultMessage); err != nil {
 		return err
 	}
-	if _, err := s.AppendPart(ctx, settlement.ResultPart); err != nil {
+	if _, err := s.appendPart(ctx, settlement.ResultPart); err != nil {
 		return err
 	}
 	return nil
@@ -574,7 +574,7 @@ func rawJSONEqual(left, right json.RawMessage) bool {
 	return bytes.Equal(left, right)
 }
 
-func (s *Store) StartContextEpoch(ctx context.Context, record session.ContextEpoch) (session.ContextEpoch, error) {
+func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpoch) (session.ContextEpoch, error) {
 	var existing session.ContextEpoch
 	if err := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &existing); err == nil {
 		if !sameRecord(existing, record) {
@@ -598,7 +598,7 @@ func (s *Store) StartContextEpoch(ctx context.Context, record session.ContextEpo
 	return record, mapErr(err)
 }
 
-func (s *Store) FinishContextEpoch(ctx context.Context, record session.ContextEpoch) error {
+func (s *Store) finishContextEpoch(ctx context.Context, record session.ContextEpoch) error {
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return err
@@ -626,7 +626,7 @@ func (s *Store) GetMessage(ctx context.Context, id session.MessageID) (session.M
 
 const maxModelRequestRecordBytes = 4 << 20
 
-func (s *Store) CreateModelRequest(ctx context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
+func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
 	if record.ID == "" || record.RunID == "" || record.State != session.ModelRequestPrepared {
 		return session.ModelRequestRecord{}, session.ErrConflict
 	}
@@ -650,7 +650,7 @@ func (s *Store) CreateModelRequest(ctx context.Context, record session.ModelRequ
 	return record, mapErr(err)
 }
 
-func (s *Store) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
+func (s *Store) updateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
 	current, err := s.GetModelRequest(ctx, record.ID)
 	if err != nil {
 		return err
@@ -774,6 +774,8 @@ func (s *Store) getRun(ctx context.Context, query string, args ...any) (session.
 	}
 	return record, err
 }
+
+var _ session.Store = (*Store)(nil)
 
 func scanRun(row rowScanner) (session.Run, error) {
 	var (
