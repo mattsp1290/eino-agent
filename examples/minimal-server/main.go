@@ -16,6 +16,7 @@ import (
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -79,11 +80,13 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	tail := stream.NewTail(64)
 	sink := eventSink{tail: tail}
 	snapshot := minimalConfig()
+	plans := composition.NewRegistry(nil)
 	orchestrator, err := runtime.NewStreamingOrchestrator(
 		runtime.WithStore(store),
 		runtime.WithModelResolver(scriptedResolver{}),
 		runtime.WithEventSink(sink),
 		runtime.WithIDGenerator(ids),
+		runtime.WithRunPlanProvider(plans),
 		runtime.WithOwnerID("minimal-server"),
 		runtime.WithQueueSize(16),
 	)

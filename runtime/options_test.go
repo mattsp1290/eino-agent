@@ -24,6 +24,7 @@ func TestNewStreamingOrchestratorMinimalAndOrderedOptions(t *testing.T) {
 		WithStore(store),
 		WithModelResolver(resolvedModel{}),
 		WithIDGenerator(ids),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
 		WithAttempts(2),
 		WithAttempts(4),
 		WithOwnerID("first"),
@@ -59,6 +60,7 @@ func TestNewStreamingOrchestratorRejectsInvalidExplicitBounds(t *testing.T) {
 				WithStore(newAdmissionStore()),
 				WithModelResolver(resolvedModel{}),
 				WithIDGenerator(&sequenceIDs{}),
+				WithRunPlanProvider(emptyTestRunPlanProvider()),
 				option,
 			)
 			if !errors.Is(err, ErrInvalidOrchestrator) {
@@ -77,6 +79,7 @@ func TestNewStreamingOrchestratorCopiesMutableOptionsAndExportsNoConfigurationFi
 		WithStore(newAdmissionStore()),
 		WithModelResolver(resolvedModel{}),
 		WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
 		WithTrace(agentcontext.TraceContext{Attributes: attributes}),
 		WithHistory(history.Options{Epoch: &epoch}),
 		WithModelRequestSafeOptions(safeOptions...),
@@ -104,7 +107,7 @@ func TestNewStreamingOrchestratorReportsEveryMissingDependency(t *testing.T) {
 	if !errors.Is(err, ErrInvalidOrchestrator) {
 		t.Fatalf("error = %v", err)
 	}
-	for _, name := range []string{"Store", "Model", "IDs"} {
+	for _, name := range []string{"Store", "Model", "IDs", "RunPlanProvider"} {
 		if !strings.Contains(err.Error(), name) {
 			t.Errorf("error %q does not name %s", err, name)
 		}

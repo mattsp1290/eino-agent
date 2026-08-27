@@ -1419,6 +1419,7 @@ func mustConfiguredOrchestrator(extra ...Option) *StreamingOrchestrator {
 		WithStore(newAdmissionStore()),
 		WithModelResolver(resolvedModel{}),
 		WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
 	}
 	orchestrator, err := NewStreamingOrchestrator(append(options, extra...)...)
 	if err != nil {

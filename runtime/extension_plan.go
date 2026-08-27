@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/mattsp1290/eino-agent/config"
@@ -27,25 +29,25 @@ type RunPlanProvider interface {
 }
 
 type PlanTool struct {
-	Identity session.ExtensionPlanEntry
+	Identity session.ToolPlanIdentity
 	Resolve  func(context.Context, ToolScopeContext) (Tool, error)
 }
 
 // PlanPrompt binds one prompt implementation to its persisted identity.
 type PlanPrompt struct {
-	Identity session.ExtensionPlanEntry
+	Identity session.PromptPlanIdentity
 	Prompt   MountedPrompt
 }
 
 // PlanGuard binds one tool guard implementation to its persisted identity.
 type PlanGuard struct {
-	Identity session.ExtensionPlanEntry
+	Identity session.GuardPlanIdentity
 	Guard    MountedToolGuard
 }
 
 // PlanRestriction binds one tool restriction policy to its persisted identity.
 type PlanRestriction struct {
-	Identity session.ExtensionPlanEntry
+	Identity session.RestrictionPlanIdentity
 	Allowed  []string
 	Denied   []string
 }
@@ -88,19 +90,18 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			}
 			index, ok := byInstance[diagnostic.InstanceID]
 			if !ok {
-				index = len(descriptor.Entries)
+				index = len(descriptor.Handlers)
 				byInstance[diagnostic.InstanceID] = index
-				descriptor.Entries = append(descriptor.Entries, session.ExtensionPlanEntry{
+				descriptor.Handlers = append(descriptor.Handlers, session.HandlerPlanIdentity{
 					InstanceID: diagnostic.InstanceID,
 					Artifact: session.ArtifactIdentity{
 						Name: diagnostic.Artifact.Name, Version: diagnostic.Artifact.Version,
 						Hash: diagnostic.Artifact.Hash, ConfigHash: diagnostic.Artifact.ConfigHash,
 						SourceKind: string(diagnostic.Artifact.SourceKind),
 					},
-					Handlers: &session.HandlerPlanIdentity{},
 				})
 			}
-			descriptor.Entries[index].Handlers.Registrations = append(descriptor.Entries[index].Handlers.Registrations, session.RegistrationIdentity{
+			descriptor.Handlers[index].Registrations = append(descriptor.Handlers[index].Registrations, session.RegistrationIdentity{
 				ID: diagnostic.ID, Contract: diagnostic.Contract.ID, Version: diagnostic.Contract.Version,
 				Order: diagnostic.Order, Scope: session.ExtensionScope{Kind: string(diagnostic.Scope.Kind), Key: diagnostic.Scope.Key}, Kind: session.HandlerKind(diagnostic.Kind),
 			})
@@ -109,55 +110,47 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 
 	tools := make([]PlanTool, len(spec.Tools))
 	for index, capability := range spec.Tools {
-		if err := validatePlanIdentity(capability.Identity, session.ExtensionTool); err != nil || capability.Resolve == nil {
-			if err == nil {
-				err = errors.New("tool resolver required")
-			}
-			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
+		if capability.Resolve == nil {
+			return fail(fmt.Errorf("%w: tool resolver required", ErrExtensionPlanMismatch))
 		}
 		tools[index] = capability
-		descriptor.Entries = append(descriptor.Entries, capability.Identity.Clone())
+		descriptor.Tools = append(descriptor.Tools, capability.Identity)
 	}
 	prompts := make([]MountedPrompt, len(spec.Prompts))
 	for index, capability := range spec.Prompts {
-		if err := validatePlanIdentity(capability.Identity, session.ExtensionPrompt); err != nil || capability.Prompt.Provider == nil || capability.Prompt.Name == "" {
-			if err == nil {
-				err = errors.New("prompt behavior required")
-			}
-			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
+		if capability.Prompt.Provider == nil || capability.Prompt.Name == "" {
+			return fail(fmt.Errorf("%w: prompt behavior required", ErrExtensionPlanMismatch))
 		}
-		if capability.Identity.Prompt.Name != capability.Prompt.Name || capability.Identity.Prompt.Order != capability.Prompt.Order || capability.Identity.InstanceID != capability.Prompt.InstanceID {
+		if capability.Identity.Name != capability.Prompt.Name || capability.Identity.Order != capability.Prompt.Order || capability.Identity.InstanceID != capability.Prompt.InstanceID {
 			return fail(fmt.Errorf("%w: prompt identity does not match behavior", ErrExtensionPlanMismatch))
 		}
 		prompts[index] = capability.Prompt
-		descriptor.Entries = append(descriptor.Entries, capability.Identity.Clone())
+		descriptor.Prompts = append(descriptor.Prompts, capability.Identity)
 	}
 	guards := make([]MountedToolGuard, len(spec.Guards))
 	for index, capability := range spec.Guards {
-		if err := validatePlanIdentity(capability.Identity, session.ExtensionGuard); err != nil || capability.Guard.Guard == nil || capability.Guard.ID == "" {
-			if err == nil {
-				err = errors.New("guard behavior required")
-			}
-			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
+		if capability.Guard.Guard == nil || capability.Guard.ID == "" {
+			return fail(fmt.Errorf("%w: guard behavior required", ErrExtensionPlanMismatch))
 		}
-		if capability.Identity.Guard.RegistrationID != capability.Guard.ID || capability.Identity.Guard.Order != capability.Guard.Order || capability.Identity.InstanceID != capability.Guard.InstanceID {
+		if capability.Identity.RegistrationID != capability.Guard.ID || capability.Identity.Order != capability.Guard.Order || capability.Identity.InstanceID != capability.Guard.InstanceID {
 			return fail(fmt.Errorf("%w: guard identity does not match behavior", ErrExtensionPlanMismatch))
 		}
 		guards[index] = capability.Guard
-		descriptor.Entries = append(descriptor.Entries, capability.Identity.Clone())
+		descriptor.Guards = append(descriptor.Guards, capability.Identity)
 	}
 	restrictions := make([]PlanRestriction, len(spec.Restrictions))
 	for index, capability := range spec.Restrictions {
-		if err := validatePlanIdentity(capability.Identity, session.ExtensionRestriction); err != nil {
+		rules, err := CanonicalizeRestrictionRules(capability.Allowed, capability.Denied)
+		if err != nil {
 			return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
 		}
-		if capability.Identity.Restriction.RulesHash != RestrictionRulesHash(capability.Allowed, capability.Denied) {
+		if capability.Identity.RulesHash != rules.Hash {
 			return fail(fmt.Errorf("%w: restriction identity does not match behavior", ErrExtensionPlanMismatch))
 		}
-		capability.Allowed = append([]string(nil), capability.Allowed...)
-		capability.Denied = append([]string(nil), capability.Denied...)
+		capability.Allowed = rules.Allowed
+		capability.Denied = rules.Denied
 		restrictions[index] = capability
-		descriptor.Entries = append(descriptor.Entries, capability.Identity.Clone())
+		descriptor.Restrictions = append(descriptor.Restrictions, capability.Identity)
 	}
 	fingerprint, err := session.FingerprintExtensionPlan(descriptor)
 	if err != nil {
@@ -171,22 +164,60 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	return plan, nil
 }
 
-func validatePlanIdentity(identity session.ExtensionPlanEntry, kind session.ExtensionKind) error {
-	actual, err := identity.Kind()
-	if err != nil || actual != kind {
-		return errors.New("invalid capability identity")
-	}
-	return session.ValidateExtensionPlan(session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{identity}})
+// RestrictionRules is the canonical identity and executable representation of
+// one tool-restriction policy.
+type RestrictionRules struct {
+	Allowed []string
+	Denied  []string
+	Hash    string
 }
 
-// RestrictionRulesHash returns the canonical identity of one restriction rule set.
-func RestrictionRulesHash(allowed, denied []string) string {
+// CanonicalizeRestrictionRules validates and canonicalizes one restriction set.
+func CanonicalizeRestrictionRules(allowed, denied []string) (RestrictionRules, error) {
+	canonicalize := func(values []string) ([]string, error) {
+		seen := make(map[string]bool, len(values))
+		for _, value := range values {
+			if strings.TrimSpace(value) == "" {
+				return nil, errors.New("restriction tool name required")
+			}
+			seen[value] = true
+		}
+		if len(seen) == 0 {
+			return nil, nil
+		}
+		result := make([]string, 0, len(seen))
+		for value := range seen {
+			result = append(result, value)
+		}
+		sort.Strings(result)
+		return result, nil
+	}
+	allowed, err := canonicalize(allowed)
+	if err != nil {
+		return RestrictionRules{}, err
+	}
+	denied, err = canonicalize(denied)
+	if err != nil {
+		return RestrictionRules{}, err
+	}
+	if len(allowed) == 0 && len(denied) == 0 {
+		return RestrictionRules{}, errors.New("restriction rules required")
+	}
+	deniedSet := make(map[string]bool, len(denied))
+	for _, name := range denied {
+		deniedSet[name] = true
+	}
+	for _, name := range allowed {
+		if deniedSet[name] {
+			return RestrictionRules{}, fmt.Errorf("restriction tool %q is both allowed and denied", name)
+		}
+	}
 	raw, err := json.Marshal(struct{ Allowed, Denied []string }{allowed, denied})
 	if err != nil {
-		panic(err)
+		return RestrictionRules{}, err
 	}
 	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:])
+	return RestrictionRules{Allowed: allowed, Denied: denied, Hash: hex.EncodeToString(digest[:])}, nil
 }
 
 type sealedPlanTools struct {
@@ -202,7 +233,7 @@ func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContex
 		if err != nil {
 			return nil, err
 		}
-		expected := capability.Identity.Tool.Name
+		expected := capability.Identity.Name
 		if tool.Name == "" || tool.Name != expected || seen[tool.Name] {
 			return nil, fmt.Errorf("%w: sealed tool resolver returned %q for %q", ErrExtensionPlanMismatch, tool.Name, expected)
 		}
@@ -287,9 +318,6 @@ func (p *RunPlan) release() {
 }
 
 func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunPlanRequest) (*RunPlan, error) {
-	if o.plans == nil {
-		return NewRunPlan(RunPlanSpec{})
-	}
 	plan, err := o.plans.AcquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config.Clone()})
 	if err != nil {
 		return nil, err
@@ -311,13 +339,6 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 	if err != nil || fingerprint != descriptor.Fingerprint {
 		return nil, ErrExtensionPlanMismatch
 	}
-	if o.plans == nil {
-		empty, emptyErr := NewRunPlan(RunPlanSpec{})
-		if emptyErr == nil && descriptor.Fingerprint == empty.descriptor.Fingerprint && len(descriptor.Entries) == 0 {
-			return empty, nil
-		}
-		return nil, fmt.Errorf("%w: run requires a plan provider", ErrExtensionPlanMismatch)
-	}
 	plan, err := o.plans.AcquireResumePlan(ctx, descriptor.Clone())
 	if err != nil {
 		return nil, err
@@ -329,12 +350,4 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 		return nil, ErrExtensionPlanMismatch
 	}
 	return plan, nil
-}
-
-func emptyExtensionPlanDescriptor() session.ExtensionPlanDescriptor {
-	plan, err := NewRunPlan(RunPlanSpec{})
-	if err != nil {
-		panic(err)
-	}
-	return plan.Descriptor()
 }

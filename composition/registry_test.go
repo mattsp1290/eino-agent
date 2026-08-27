@@ -35,6 +35,116 @@ func definition(name, marker string) tools.Definition {
 	}
 }
 
+func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
+	guard := runtime.ToolGuardFunc(func(context.Context, runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
+		return runtime.ToolGuardResult{Decision: runtime.ToolGuardAbstain}, nil
+	})
+	tests := map[string]struct {
+		duplicate func(*Registrar) error
+		valid     func(*Registrar) error
+		count     func(session.ExtensionPlanDescriptor) int
+	}{
+		"guard": {
+			duplicate: func(registrar *Registrar) error {
+				if err := registrar.Guard(GuardRegistration{ID: "policy", Order: 1, Scope: extension.GlobalScope(), Guard: guard}); err != nil {
+					return err
+				}
+				return registrar.Guard(GuardRegistration{ID: "policy", Order: 2, Scope: extension.GlobalScope(), Guard: guard})
+			},
+			valid: func(registrar *Registrar) error {
+				return registrar.Guard(GuardRegistration{ID: "policy", Scope: extension.GlobalScope(), Guard: guard})
+			},
+			count: func(descriptor session.ExtensionPlanDescriptor) int { return len(descriptor.Guards) },
+		},
+		"restriction": {
+			duplicate: func(registrar *Registrar) error {
+				if err := registrar.RestrictTools(RestrictionRegistration{ID: "policy", Scope: extension.GlobalScope(), Allowed: []string{"echo"}}); err != nil {
+					return err
+				}
+				return registrar.RestrictTools(RestrictionRegistration{ID: "policy", Scope: extension.GlobalScope(), Denied: []string{"shell"}})
+			},
+			valid: func(registrar *Registrar) error {
+				return registrar.RestrictTools(RestrictionRegistration{ID: "policy", Scope: extension.GlobalScope(), Allowed: []string{"echo"}})
+			},
+			count: func(descriptor session.ExtensionPlanDescriptor) int { return len(descriptor.Restrictions) },
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			registry := NewRegistry(nil)
+			mountedComponent := component("atomic-" + name)
+			cleanups := 0
+			_, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+				if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
+					return err
+				}
+				if err := registrar.Tool(ToolRegistration{ID: "echo", Scope: extension.GlobalScope(), Definition: definition("echo", "staged")}); err != nil {
+					return err
+				}
+				return test.duplicate(registrar)
+			}))
+			if !errors.Is(err, extension.ErrDuplicateRegistration) || cleanups != 1 {
+				t.Fatalf("Mount error=%v cleanups=%d", err, cleanups)
+			}
+			diagnostics := registry.Diagnostics()
+			if len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
+				t.Fatalf("failed mount published diagnostics: %#v", diagnostics)
+			}
+			plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			descriptor := plan.Descriptor()
+			plan.Release()
+			if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+				t.Fatalf("failed mount published plan: %#v", descriptor)
+			}
+
+			mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+				if err := registrar.Tool(ToolRegistration{ID: "echo", Scope: extension.GlobalScope(), Definition: definition("echo", "valid")}); err != nil {
+					return err
+				}
+				return test.valid(registrar)
+			}))
+			if err != nil {
+				t.Fatalf("component identity was not reusable: %v", err)
+			}
+			defer func() { _ = mount.Close(context.Background()) }()
+			plan, err = registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			descriptor = plan.Descriptor()
+			plan.Release()
+			if len(descriptor.Tools) != 1 || test.count(descriptor) != 1 {
+				t.Fatalf("valid remount descriptor = %#v", descriptor)
+			}
+		})
+	}
+}
+
+func TestRestrictionRegistrationRejectsInvalidRuleSets(t *testing.T) {
+	tests := map[string]RestrictionRegistration{
+		"empty":   {ID: "policy", Scope: extension.GlobalScope()},
+		"blank":   {ID: "policy", Scope: extension.GlobalScope(), Allowed: []string{" "}},
+		"overlap": {ID: "policy", Scope: extension.GlobalScope(), Allowed: []string{"echo"}, Denied: []string{"echo"}},
+	}
+	for name, registration := range tests {
+		t.Run(name, func(t *testing.T) {
+			registry := NewRegistry(nil)
+			_, err := registry.Mount(context.Background(), component("invalid-restriction-"+name), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+				return registrar.RestrictTools(registration)
+			}))
+			if !errors.Is(err, extension.ErrInvalidRegistration) {
+				t.Fatalf("Mount error = %v, want ErrInvalidRegistration", err)
+			}
+			if diagnostics := registry.Diagnostics(); len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
+				t.Fatalf("invalid restriction mount published: %#v", diagnostics)
+			}
+		})
+	}
+}
+
 func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -67,8 +177,9 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 				t.Fatalf("AcquireRunPlan error = %v", planErr)
 			}
 			defer plan.Release()
-			if len(plan.Descriptor().Entries) != 0 {
-				t.Fatalf("plan entries = %#v, want none", plan.Descriptor().Entries)
+			descriptor := plan.Descriptor()
+			if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+				t.Fatalf("plan descriptor = %#v, want no identities", descriptor)
 			}
 		})
 	}
@@ -201,12 +312,7 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 			if !reflect.DeepEqual(gotTools, test.wantTools) {
 				t.Fatalf("resolved tools = %v, want %v", gotTools, test.wantTools)
 			}
-			var descriptorTools int
-			for _, entry := range plan.Descriptor().Entries {
-				if kind, _ := entry.Kind(); kind == session.ExtensionTool {
-					descriptorTools++
-				}
-			}
+			descriptorTools := len(plan.Descriptor().Tools)
 			if descriptorTools != len(test.wantTools) {
 				t.Fatalf("descriptor tools=%d, want %d", descriptorTools, len(test.wantTools))
 			}
@@ -495,8 +601,14 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	for _, entry := range plan.Descriptor().Entries {
-		if entry.InstanceID == "rejected" {
+	descriptor := plan.Descriptor()
+	for _, identity := range descriptor.Handlers {
+		if identity.InstanceID == "rejected" {
+			t.Fatal("rejected mount handler was published")
+		}
+	}
+	for _, identity := range descriptor.Tools {
+		if identity.InstanceID == "rejected" {
 			t.Fatal("rejected mount handler was published")
 		}
 	}
@@ -596,7 +708,7 @@ func TestCapabilityPlanIdentityComesFromMountedComponent(t *testing.T) {
 	}
 	defer plan.Release()
 	descriptor := plan.Descriptor()
-	if len(descriptor.Entries) != 1 || descriptor.Entries[0].InstanceID != mounted.InstanceID {
+	if len(descriptor.Tools) != 1 || descriptor.Tools[0].InstanceID != mounted.InstanceID {
 		t.Fatalf("plan descriptor = %#v", descriptor)
 	}
 	diagnostics := registry.Diagnostics()
@@ -641,7 +753,7 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	}
 	defer second.Release()
 	secondDescriptor := second.Descriptor()
-	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].Tool.SchemaHash == secondDescriptor.Entries[0].Tool.SchemaHash {
+	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Tools[0].SchemaHash == secondDescriptor.Tools[0].SchemaHash {
 		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 	}
 	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -700,13 +812,75 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			}
 			defer second.Release()
 			secondDescriptor := second.Descriptor()
-			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Entries[0].Tool.SchemaHash == secondDescriptor.Entries[0].Tool.SchemaHash {
+			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Tools[0].SchemaHash == secondDescriptor.Tools[0].SchemaHash {
 				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 			}
 			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 				t.Fatalf("changed policy resume = %v, want ErrExtensionPlanMismatch", err)
 			}
 		})
+	}
+}
+
+func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
+	registry := NewRegistry(nil)
+	mountedComponent := component("restriction-canonical")
+	mountRules := func(allowed, denied []string) *Mount {
+		mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			return registrar.RestrictTools(RestrictionRegistration{ID: "policy", Scope: extension.GlobalScope(), Allowed: allowed, Denied: denied})
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return mount
+	}
+
+	firstMount := mountRules([]string{"zeta", "alpha", "zeta"}, nil)
+	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := first.Descriptor()
+	first.Release()
+	if err := firstMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	equivalentMount := mountRules([]string{"alpha", "zeta"}, []string{})
+	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	if err != nil {
+		t.Fatalf("equivalent reordered rules did not resume: %v", err)
+	}
+	resumed.Release()
+	if err := equivalentMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	changedMount := mountRules([]string{"alpha"}, nil)
+	defer func() { _ = changedMount.Close(context.Background()) }()
+	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("changed restriction rules resumed: %v", err)
+	}
+}
+
+func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *testing.T) {
+	registry := NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), component("tamper-check"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "echo", Scope: extension.GlobalScope(), Definition: definition("echo", "stable")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := plan.Descriptor()
+	plan.Release()
+	persisted.Tools[0].Artifact.Hash = "tampered"
+	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("tampered descriptor resume = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
 
@@ -832,8 +1006,8 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 	}
 	persisted := plan.Descriptor()
 	plan.Release()
-	if len(persisted.Entries) != 1 || persisted.Entries[0].Handlers == nil || len(persisted.Entries[0].Handlers.Registrations) != 2 {
-		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Entries)
+	if len(persisted.Handlers) != 1 || len(persisted.Handlers[0].Registrations) != 2 {
+		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Handlers)
 	}
 
 	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
@@ -845,12 +1019,12 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 
 func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 	registry := NewRegistry(nil)
-	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{{
+	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{{
 		InstanceID: "mixed", Artifact: session.ArtifactIdentity{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: string(extension.SourceNative)},
-		Handlers: &session.HandlerPlanIdentity{Registrations: []session.RegistrationIdentity{
+		Registrations: []session.RegistrationIdentity{
 			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-a"}, Kind: session.HandlerNotification},
 			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: session.ExtensionScope{Kind: string(extension.ScopeSession), Key: "session-b"}, Kind: session.HandlerNotification},
-		}},
+		},
 	}}}
 	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
 	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -898,30 +1072,20 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 	if err != nil || len(resolved) != 1 || resolved[0].Name != "b" || len(prompts) != 1 || prompts[0].InstanceID != "cap-session" || len(guards) != 1 {
 		t.Fatalf("plan tools=%#v prompts=%#v guards=%#v err=%v", resolved, prompts, guards, err)
 	}
-	var kinds = map[session.ExtensionKind]bool{}
 	descriptor := plan.Descriptor()
-	for _, entry := range descriptor.Entries {
-		kind, err := entry.Kind()
-		if err != nil {
-			t.Fatal(err)
-		}
-		kinds[kind] = true
-	}
-	for _, kind := range []session.ExtensionKind{session.ExtensionTool, session.ExtensionPrompt, session.ExtensionGuard, session.ExtensionRestriction} {
-		if !kinds[kind] {
-			t.Fatalf("descriptor missing %s: %#v", kind, descriptor)
-		}
+	if len(descriptor.Tools) != 2 || len(descriptor.Prompts) != 1 || len(descriptor.Guards) != 1 || len(descriptor.Restrictions) != 1 {
+		t.Fatalf("descriptor is missing a typed capability collection: %#v", descriptor)
 	}
 }
 
 func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
-	for _, kind := range []session.ExtensionKind{session.ExtensionPrompt, session.ExtensionGuard} {
-		t.Run(string(kind), func(t *testing.T) {
+	for _, kind := range []string{"prompt", "guard"} {
+		t.Run(kind, func(t *testing.T) {
 			registry := NewRegistry(nil)
 			mountOrdered := func(order int) *Mount {
 				mount, err := registry.Mount(context.Background(), component("ordered"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 					switch kind {
-					case session.ExtensionPrompt:
+					case "prompt":
 						return registrar.Prompt(PromptRegistration{ID: "prompt", Name: "policy", Order: order, Scope: extension.GlobalScope(), Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) { return "policy", nil })})
 					default:
 						return registrar.Guard(GuardRegistration{ID: "guard", Order: order, Scope: extension.GlobalScope(), Guard: runtime.ToolGuardFunc(func(context.Context, runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
@@ -943,12 +1107,12 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			persisted := first.Descriptor()
 			first.Release()
 			entryOrder := 0
-			if kind == session.ExtensionPrompt {
-				entryOrder = persisted.Entries[0].Prompt.Order
+			if kind == "prompt" {
+				entryOrder = persisted.Prompts[0].Order
 			} else {
-				entryOrder = persisted.Entries[0].Guard.Order
+				entryOrder = persisted.Guards[0].Order
 			}
-			if len(persisted.Entries) != 1 || entryOrder != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
+			if entryOrder != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
 				t.Fatalf("ordered descriptor = %#v", persisted)
 			}
 			if err := firstMount.Close(context.Background()); err != nil {

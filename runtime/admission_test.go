@@ -205,25 +205,25 @@ func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 	store := newAdmissionStore()
 	admitter := Admitter{Store: store}
 	request := admissionRequest()
-	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("first")}}
+	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("first")}}
 	request.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(request.ExtensionPlan)
 	if _, err := admitter.Admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
 	}
 
 	retry := request
-	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("second")}}
+	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("second")}}
 	retry.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(retry.ExtensionPlan)
 	if _, err := admitter.Admit(context.Background(), retry); !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("mismatched retry error = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
 
-func testHandlerPlanEntry(instance string) session.ExtensionPlanEntry {
-	return session.ExtensionPlanEntry{
-		InstanceID: instance,
-		Artifact:   session.ArtifactIdentity{Name: instance, Version: "1", Hash: instance + "-hash", ConfigHash: instance + "-config", SourceKind: string(extension.SourceNative)},
-		Handlers:   &session.HandlerPlanIdentity{Registrations: []session.RegistrationIdentity{{ID: "handler", Contract: "test/handler", Version: "1", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, Kind: session.HandlerNotification}}},
+func testHandlerPlanEntry(instance string) session.HandlerPlanIdentity {
+	return session.HandlerPlanIdentity{
+		InstanceID:    instance,
+		Artifact:      session.ArtifactIdentity{Name: instance, Version: "1", Hash: instance + "-hash", ConfigHash: instance + "-config", SourceKind: string(extension.SourceNative)},
+		Registrations: []session.RegistrationIdentity{{ID: "handler", Contract: "test/handler", Version: "1", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, Kind: session.HandlerNotification}},
 	}
 }
 
@@ -245,7 +245,7 @@ func TestAdmitRejectsZeroPersistedPlanOnRetry(t *testing.T) {
 }
 
 func TestMatchingExtensionPlansRejectsZeroAndWrongSchemaDescriptors(t *testing.T) {
-	current := emptyExtensionPlanDescriptor()
+	current := emptyTestPlanDescriptor()
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"zero":         {},
 		"wrong schema": {SchemaVersion: session.ExtensionPlanSchemaVersion - 1},
@@ -265,10 +265,10 @@ func TestMatchingExtensionPlansRejectsZeroAndWrongSchemaDescriptors(t *testing.T
 }
 
 func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("original")}}
+	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("original")}}
 	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
 	corrupt := descriptor.Clone()
-	corrupt.Entries[0].InstanceID = "changed"
+	corrupt.Handlers[0].InstanceID = "changed"
 	if err := validateMatchingExtensionPlans(corrupt, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("persisted stale fingerprint error = %v", err)
 	}
@@ -400,7 +400,7 @@ func admissionRequest() AdmissionRequest {
 		OwnerID:       "owner-1",
 		LeaseDuration: time.Minute,
 		Metadata:      map[string]string{"request": "admission"},
-		ExtensionPlan: emptyExtensionPlanDescriptor(),
+		ExtensionPlan: emptyTestPlanDescriptor(),
 	}
 }
 

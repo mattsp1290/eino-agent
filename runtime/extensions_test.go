@@ -534,7 +534,7 @@ func testExecutor(marker string) ToolExecutor {
 	return &executor
 }
 
-func TestEmptyPlanAcquiresAndResumesWithoutProvider(t *testing.T) {
+func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 	orchestrator := mustConfiguredOrchestrator()
 	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{})
 	if err != nil {
@@ -549,19 +549,19 @@ func TestEmptyPlanAcquiresAndResumesWithoutProvider(t *testing.T) {
 		t.Fatalf("resume empty strict plan = %v", err)
 	}
 	resumedDescriptor := resumed.Descriptor()
-	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || resumedDescriptor.SchemaVersion != descriptor.SchemaVersion || len(resumedDescriptor.Entries) != 0 {
+	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || resumedDescriptor.SchemaVersion != descriptor.SchemaVersion || len(resumedDescriptor.Handlers)+len(resumedDescriptor.Tools)+len(resumedDescriptor.Prompts)+len(resumedDescriptor.Guards)+len(resumedDescriptor.Restrictions) != 0 {
 		t.Fatalf("resumed descriptor = %#v, want %#v", resumedDescriptor, descriptor)
 	}
 }
 
 func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
-	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Entries: []session.ExtensionPlanEntry{testHandlerPlanEntry("callbacks")}}
+	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("callbacks")}}
 	valid.Fingerprint, _ = session.FingerprintExtensionPlan(valid)
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
 		"stale": func() session.ExtensionPlanDescriptor {
 			next := valid.Clone()
-			next.Entries[0].InstanceID = "corrupt"
+			next.Handlers[0].InstanceID = "corrupt"
 			return next
 		}(),
 	} {

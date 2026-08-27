@@ -88,12 +88,12 @@ func TestMountStandardPublishesCatalogOrderAndExecutesFileRead(t *testing.T) {
 	}
 
 	descriptor := plan.Descriptor()
-	if len(descriptor.Entries) != 10 {
-		t.Fatalf("descriptor entries = %d", len(descriptor.Entries))
+	if len(descriptor.Tools) != 10 {
+		t.Fatalf("descriptor tools = %d", len(descriptor.Tools))
 	}
-	for _, entry := range descriptor.Entries {
-		if entry.Tool == nil || len(entry.Tool.SchemaHash) != 64 || len(entry.Tool.ExecutorHash) != 64 || entry.Artifact.ConfigHash != component.Artifact.ConfigHash {
-			t.Fatalf("invalid tool identity = %#v", entry)
+	for _, identity := range descriptor.Tools {
+		if len(identity.SchemaHash) != 64 || len(identity.ExecutorHash) != 64 || identity.Artifact.ConfigHash != component.Artifact.ConfigHash {
+			t.Fatalf("invalid tool identity = %#v", identity)
 		}
 	}
 }

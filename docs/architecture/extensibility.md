@@ -13,8 +13,9 @@ catalog, exact pipelines, and request-ledger privacy are documented in
 
 ## Construction and seams
 
-`runtime.NewStreamingOrchestrator` accepts infrastructure dependencies and one
-`runtime.RunPlanProvider`. `composition.Registry` is the standard provider: a
+`runtime.NewStreamingOrchestrator` requires infrastructure dependencies and one
+`runtime.RunPlanProvider`, including for a zero-capability application.
+`composition.Registry` is the standard provider: a
 mount atomically stages typed callback registrations, tools, prompts, guards,
 restrictions, and cleanup. Each executable behavior carries its identity in
 the same plan record, so descriptor state cannot drift from execution state.

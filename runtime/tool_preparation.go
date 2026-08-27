@@ -103,17 +103,15 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Pattern: schemaCall.Function.Name, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
 		input = cloneJSON(call.Input)
 		var prepareErr error
-		if execution.dispatch() != nil {
-			prepared, err := extension.Invoke(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(_ context.Context, value PreparedToolCall) (PreparedToolCall, error) { return value, nil })
+		preparedCall, err := extension.Invoke(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(_ context.Context, value PreparedToolCall) (PreparedToolCall, error) { return value, nil })
+		if err != nil {
+			prepareErr = err
+		} else {
+			input, err = canonicalToolObject(preparedCall.Call.Input)
 			if err != nil {
-				prepareErr = err
+				prepareErr = extension.ErrProtectedMutation
 			} else {
-				input, err = canonicalToolObject(prepared.Call.Input)
-				if err != nil {
-					prepareErr = extension.ErrProtectedMutation
-				} else {
-					call.Input = cloneJSON(input)
-				}
+				call.Input = cloneJSON(input)
 			}
 		}
 		if prepareErr == nil && tool.Pattern != nil {

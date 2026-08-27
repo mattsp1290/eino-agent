@@ -123,13 +123,19 @@ increase authority.
 Each admitted run stores one canonical `session.ExtensionPlanDescriptor`.
 `runtime.NewRunPlan` derives it from identity-bound dispatch handlers, tools,
 prompts, guards, and restrictions; callers cannot supply a separate descriptor.
+The descriptor stores each capability kind in its own typed collection rather
+than a nullable tagged union. Tool restriction lists are canonical sets: blank,
+empty, or overlapping policies are rejected, while duplicates and ordering do
+not affect identity or enforcement.
 Artifact, configuration, scope, capability, schema, executor, and ordered
 registration identity all participate in the fingerprint. Resume requires an
 exact current-schema fingerprint match before changing run or tool state.
 
-Resume acquires the persisted instances and fingerprint before changing run or
-tool state. Unrelated mounts added later are ignored. Local tool generations
-prevent in-process ABA but are not durable identity.
+Resume first verifies that the persisted descriptor matches its own fingerprint,
+then acquires only the persisted instances and independently compares the live
+plan fingerprint before changing run or tool state. Unrelated mounts added later
+are ignored. Local tool generations prevent in-process ABA but are not durable
+identity.
 
 ## Request ledger and privacy
 

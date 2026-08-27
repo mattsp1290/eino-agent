@@ -48,6 +48,9 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 	if nilInterface(o.ids) {
 		missing = append(missing, "IDs")
 	}
+	if nilInterface(o.plans) {
+		missing = append(missing, "RunPlanProvider")
+	}
 	if len(missing) != 0 {
 		return nil, fmt.Errorf("%w: missing required dependencies: %s", ErrInvalidOrchestrator, strings.Join(missing, ", "))
 	}

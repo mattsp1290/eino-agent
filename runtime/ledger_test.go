@@ -36,6 +36,7 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
 		WithModelRequestSafeOptions("temperature"),
 		WithClock(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) }),
 	)
@@ -84,7 +85,7 @@ func TestModelRequestLedgerPersistsAndSetsIdempotencyKeyByDefault(t *testing.T) 
 		submitted = request
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +116,7 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 		}
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithAttempts(2))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()), WithAttempts(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +145,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		panic("provider panic")
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +182,7 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(failingStore), WithModelResolver(resolvedModel{streamer: streamer}),
-		WithIDGenerator(&sequenceIDs{}))
+		WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +210,7 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,7 +274,7 @@ func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 		called = true
 		return nil, nil
 	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +305,7 @@ func TestLedgerAuditFailureAfterAdmissionSettlesRunWithoutDispatch(t *testing.T)
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
 		WithModelRequestMaxBytes(1),
 	)
 	if err != nil {
@@ -420,7 +422,7 @@ func TestAuditModelRequestRejectsEveryNestedExtraCategory(t *testing.T) {
 }
 
 func TestLedgerUsesExecutionScopedWriterCapability(t *testing.T) {
-	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, errors.New("unused") })}), WithIDGenerator(&sequenceIDs{}))
+	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, errors.New("unused") })}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatalf("construction error = %v", err)
 	}
@@ -433,7 +435,7 @@ func TestLedgerPassesDurableRecordIDToIdempotentStreamer(t *testing.T) {
 	}
 	defer func() { _ = store.Close() }()
 	streamer := &recordingIdempotentStreamer{}
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}))
+	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
 	}

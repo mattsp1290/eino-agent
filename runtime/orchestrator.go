@@ -201,16 +201,14 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
-	if execution.dispatch() != nil {
-		assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
-		assembled, err := extension.Invoke(execution.dispatch(), ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
-		if err != nil {
-			return TurnSnapshot{}, err
-		}
-		snapshot.Messages, err = materializeContextAssembly(assembled)
-		if err != nil {
-			return TurnSnapshot{}, err
-		}
+	assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
+	assembled, err := extension.Invoke(execution.dispatch(), ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
+	if err != nil {
+		return TurnSnapshot{}, err
+	}
+	snapshot.Messages, err = materializeContextAssembly(assembled)
+	if err != nil {
+		return TurnSnapshot{}, err
 	}
 	if len(execution.plan.tools.capabilities) != 0 {
 		planned, err := execution.plan.ResolveTools(ctx, NewToolScopeContext(snapshot))
@@ -229,11 +227,9 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 			snapshot.Tools = append(snapshot.Tools, tool)
 		}
 	}
-	if execution.dispatch() != nil {
-		_, err := extension.Invoke(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
-		if err != nil {
-			return TurnSnapshot{}, err
-		}
+	_, err = extension.Invoke(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
+	if err != nil {
+		return TurnSnapshot{}, err
 	}
 	o.observeToolsResolved(ctx, snapshot.Clone(), snapshot.Tools)
 	_ = messageID
@@ -328,9 +324,6 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 		return ToolOutcome{Call: cloneToolCall(call), Disposition: ToolFailed, RawError: cloneErr, Error: classifyExtensionError(cloneErr)}
 	}
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		if execution.dispatch() == nil {
-			return tool.Executor.Execute(ctx, cloneToolCall(call))
-		}
 		outcome, err := extension.Invoke(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolOutcome, error) {
 			result, execErr := tool.Executor.Execute(ctx, cloneToolCall(call))
 			disposition := ToolExecuted
@@ -375,23 +368,21 @@ func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool,
 
 func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, execution *runExecution, outcome ToolOutcome) ToolOutcome {
 	outcome = sealToolOutcome(outcome)
-	if execution.dispatch() != nil {
-		transformed, err := extension.Invoke(execution.dispatch(), ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
-		if err != nil {
-			outcome.RawError = errors.Join(outcome.RawError, err)
-			outcome.Error = classifyExtensionError(outcome.RawError)
-			outcome.Disposition = dispositionForError(outcome.RawError)
-			return outcome
+	transformed, err := extension.Invoke(execution.dispatch(), ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
+	if err != nil {
+		outcome.RawError = errors.Join(outcome.RawError, err)
+		outcome.Error = classifyExtensionError(outcome.RawError)
+		outcome.Disposition = dispositionForError(outcome.RawError)
+		return outcome
+	}
+	outcome = transformed
+	outcome.Result = cloneRuntimeToolResult(outcome.Result)
+	if len(outcome.PermissionMetadata) != 0 {
+		if outcome.Result.Metadata == nil {
+			outcome.Result.Metadata = make(map[string]string)
 		}
-		outcome = transformed
-		outcome.Result = cloneRuntimeToolResult(outcome.Result)
-		if len(outcome.PermissionMetadata) != 0 {
-			if outcome.Result.Metadata == nil {
-				outcome.Result.Metadata = make(map[string]string)
-			}
-			for key, value := range outcome.PermissionMetadata {
-				outcome.Result.Metadata[key] = value
-			}
+		for key, value := range outcome.PermissionMetadata {
+			outcome.Result.Metadata[key] = value
 		}
 	}
 	return outcome

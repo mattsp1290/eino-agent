@@ -215,7 +215,12 @@ Every executable extension enters through a `runtime.RunPlanProvider` and is
 bound to stable artifact, scope, and capability identity before its descriptor
 is fingerprinted. Native `tools.Definition` values use the same
 `composition.Registrar.Tool` path with a `SourceNative` component. Runs with no
-extensions use a fingerprinted empty plan.
+extensions use a fingerprinted empty plan from an explicitly configured
+provider; omitting `runtime.WithRunPlanProvider` is a constructor error.
+
+Tool restriction `Allowed` and `Denied` values are sets. Registration rejects
+blank names, a completely empty policy, or a name present in both sets, and
+canonicalizes duplicates and ordering before the plan is fingerprinted.
 
 Set `ModuleConfig.Observer` when guest log lines should be exported through an
 `einoobs.Observer`; `wasmext` attaches the configured module name and verified

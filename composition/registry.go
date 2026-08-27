@@ -92,6 +92,11 @@ func (r *Registrar) Guard(registration GuardRegistration) error {
 		}
 		return fmt.Errorf("%w: invalid guard registration", extension.ErrInvalidRegistration)
 	}
+	for _, existing := range r.guards {
+		if existing.ID == registration.ID && existing.Scope == registration.Scope {
+			return fmt.Errorf("%w: guard %s", extension.ErrDuplicateRegistration, registration.ID)
+		}
+	}
 	if err := r.extensions.Lease(registration.Scope); err != nil {
 		return err
 	}
@@ -103,8 +108,17 @@ func (r *Registrar) RestrictTools(registration RestrictionRegistration) error {
 	if err := validateCapabilityIdentity(registration.ID, registration.Scope); err != nil {
 		return err
 	}
-	registration.Allowed = append([]string(nil), registration.Allowed...)
-	registration.Denied = append([]string(nil), registration.Denied...)
+	rules, err := runtime.CanonicalizeRestrictionRules(registration.Allowed, registration.Denied)
+	if err != nil {
+		return fmt.Errorf("%w: %v", extension.ErrInvalidRegistration, err)
+	}
+	for _, existing := range r.restrictions {
+		if existing.ID == registration.ID && existing.Scope == registration.Scope {
+			return fmt.Errorf("%w: restriction %s", extension.ErrDuplicateRegistration, registration.ID)
+		}
+	}
+	registration.Allowed = rules.Allowed
+	registration.Denied = rules.Denied
 	if err := r.extensions.Lease(registration.Scope); err != nil {
 		return err
 	}
@@ -399,6 +413,10 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	if err := session.ValidateExtensionPlan(persisted); err != nil || persisted.Fingerprint == "" {
 		return nil, runtime.ErrExtensionPlanMismatch
 	}
+	fingerprint, err := session.FingerprintExtensionPlan(persisted)
+	if err != nil || fingerprint != persisted.Fingerprint {
+		return nil, runtime.ErrExtensionPlanMismatch
+	}
 	instances := make(map[string]bool)
 	toolIdentities := make(map[planToolIdentity]bool)
 	var sessionID session.ID
@@ -412,39 +430,37 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 		sessionID = session.ID(scope.Key)
 		return nil
 	}
-	for _, entry := range persisted.Entries {
-		instances[entry.InstanceID] = true
-		kind, kindErr := entry.Kind()
-		if kindErr != nil {
-			return nil, runtime.ErrExtensionPlanMismatch
-		}
-		switch kind {
-		case session.ExtensionTool:
-			toolIdentities[planToolIdentity{InstanceID: entry.InstanceID, Scope: entry.Tool.Scope, RegistrationID: entry.Tool.RegistrationID, ToolName: entry.Tool.Name}] = true
-			if err := recoverSessionID(entry.Tool.Scope); err != nil {
-				return nil, err
-			}
-		case session.ExtensionPrompt:
-			if err := recoverSessionID(entry.Prompt.Scope); err != nil {
-				return nil, err
-			}
-		case session.ExtensionGuard:
-			if err := recoverSessionID(entry.Guard.Scope); err != nil {
-				return nil, err
-			}
-		case session.ExtensionRestriction:
-			if err := recoverSessionID(entry.Restriction.Scope); err != nil {
-				return nil, err
-			}
-		case session.ExtensionHandlers:
-		}
-		if entry.Handlers == nil {
-			continue
-		}
-		for _, registration := range entry.Handlers.Registrations {
+	for _, identity := range persisted.Handlers {
+		instances[identity.InstanceID] = true
+		for _, registration := range identity.Registrations {
 			if err := recoverSessionID(registration.Scope); err != nil {
 				return nil, err
 			}
+		}
+	}
+	for _, identity := range persisted.Tools {
+		instances[identity.InstanceID] = true
+		toolIdentities[planToolIdentity{InstanceID: identity.InstanceID, Scope: identity.Scope, RegistrationID: identity.RegistrationID, ToolName: identity.Name}] = true
+		if err := recoverSessionID(identity.Scope); err != nil {
+			return nil, err
+		}
+	}
+	for _, identity := range persisted.Prompts {
+		instances[identity.InstanceID] = true
+		if err := recoverSessionID(identity.Scope); err != nil {
+			return nil, err
+		}
+	}
+	for _, identity := range persisted.Guards {
+		instances[identity.InstanceID] = true
+		if err := recoverSessionID(identity.Scope); err != nil {
+			return nil, err
+		}
+	}
+	for _, identity := range persisted.Restrictions {
+		instances[identity.InstanceID] = true
+		if err := recoverSessionID(identity.Scope); err != nil {
+			return nil, err
 		}
 	}
 	plan, err := r.acquire(ctx, sessionID, instances, persistedToolSelector(toolIdentities))
@@ -499,9 +515,9 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			return nil, cloneErr
 		}
 		planTools[index] = runtime.PlanTool{
-			Identity: session.ExtensionPlanEntry{
-				InstanceID: entry.component.InstanceID, Artifact: artifactIdentity(entry.component.Artifact),
-				Tool: &session.ToolPlanIdentity{Name: entry.Definition.Name, RegistrationID: entry.ID, Scope: scopeIdentity(entry.Scope), SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash},
+			Identity: session.ToolPlanIdentity{
+				InstanceID: entry.component.InstanceID, Artifact: artifactIdentity(entry.component.Artifact), Name: entry.Definition.Name,
+				RegistrationID: entry.ID, Scope: scopeIdentity(entry.Scope), SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
 			},
 			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 				return tools.Materialize(ctx, definition, scope)
@@ -511,22 +527,27 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	planPrompts := make([]runtime.PlanPrompt, len(prompts))
 	for index, prompt := range prompts {
 		planPrompts[index] = runtime.PlanPrompt{
-			Identity: session.ExtensionPlanEntry{InstanceID: prompt.component.InstanceID, Artifact: artifactIdentity(prompt.component.Artifact), Prompt: &session.PromptPlanIdentity{Name: prompt.Name, RegistrationID: prompt.ID, Scope: scopeIdentity(prompt.Scope), Order: prompt.Order}},
+			Identity: session.PromptPlanIdentity{InstanceID: prompt.component.InstanceID, Artifact: artifactIdentity(prompt.component.Artifact), Name: prompt.Name, RegistrationID: prompt.ID, Scope: scopeIdentity(prompt.Scope), Order: prompt.Order},
 			Prompt:   runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.component.InstanceID, Provider: prompt.Provider},
 		}
 	}
 	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
 		planGuards[index] = runtime.PlanGuard{
-			Identity: session.ExtensionPlanEntry{InstanceID: guard.component.InstanceID, Artifact: artifactIdentity(guard.component.Artifact), Guard: &session.GuardPlanIdentity{RegistrationID: guard.ID, Scope: scopeIdentity(guard.Scope), Order: guard.Order}},
+			Identity: session.GuardPlanIdentity{InstanceID: guard.component.InstanceID, Artifact: artifactIdentity(guard.component.Artifact), RegistrationID: guard.ID, Scope: scopeIdentity(guard.Scope), Order: guard.Order},
 			Guard:    runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.component.InstanceID, Guard: guard.Guard},
 		}
 	}
 	planRestrictions := make([]runtime.PlanRestriction, len(restrictions))
 	for index, restriction := range restrictions {
+		rules, rulesErr := runtime.CanonicalizeRestrictionRules(restriction.Allowed, restriction.Denied)
+		if rulesErr != nil {
+			dispatch.Release()
+			return nil, rulesErr
+		}
 		planRestrictions[index] = runtime.PlanRestriction{
-			Identity: session.ExtensionPlanEntry{InstanceID: restriction.component.InstanceID, Artifact: artifactIdentity(restriction.component.Artifact), Restriction: &session.RestrictionPlanIdentity{RegistrationID: restriction.ID, Scope: scopeIdentity(restriction.Scope), RulesHash: runtime.RestrictionRulesHash(restriction.Allowed, restriction.Denied)}},
-			Allowed:  append([]string(nil), restriction.Allowed...), Denied: append([]string(nil), restriction.Denied...),
+			Identity: session.RestrictionPlanIdentity{InstanceID: restriction.component.InstanceID, Artifact: artifactIdentity(restriction.component.Artifact), RegistrationID: restriction.ID, Scope: scopeIdentity(restriction.Scope), RulesHash: rules.Hash},
+			Allowed:  rules.Allowed, Denied: rules.Denied,
 		}
 	}
 	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: dispatch, Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})
