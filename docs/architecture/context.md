@@ -25,10 +25,11 @@ The propagated identity includes:
 - model ID;
 - trace/span IDs and bounded attributes.
 
-`runtime.TurnSnapshot.ContextIdentity` derives provider/model identity from the
-resolved model when available, and falls back to the validated config selection
-before model resolution. This keeps context sources, tools, hooks, AG-UI
-adapters, and observability adapters aligned on the same identifiers.
+`runtime.TurnSnapshot.ContextIdentity` derives provider/model identity only from
+the resolved model. Fresh runs validate that resolution against the requested
+selection before history reads or admission; no downstream layer reconstructs
+identity from configuration. This keeps context sources, tools, hooks, AG-UI
+adapters, durable records, and observability aligned on the same identifiers.
 
 ## Context Source Kinds
 

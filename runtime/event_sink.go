@@ -33,7 +33,7 @@ func (s runEventSink) Emit(ctx context.Context, event Event) error {
 	if s.infrastructure != nil {
 		err = s.infrastructure.Emit(ctx, cloneEvent(event))
 	}
-	_ = extension.Notify(s.plan, ctx, EventPublishedPoint, event)
+	extension.Notify(s.plan, ctx, EventPublishedPoint, event)
 	return err
 }
 

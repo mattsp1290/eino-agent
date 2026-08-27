@@ -71,6 +71,40 @@ func TestAdapterResolverReportsMissingProvider(t *testing.T) {
 	}
 }
 
+func TestValidateResolved(t *testing.T) {
+	t.Parallel()
+
+	selection := Selection{ProviderID: "fake", ModelID: "m1"}
+	valid := Resolved{
+		Provider: Provider{ID: "fake"},
+		Model:    Descriptor{ID: "m1", ProviderID: "fake"},
+		Streamer: &testAdapter{},
+	}
+	tests := []struct {
+		name     string
+		resolved Resolved
+	}{
+		{name: "provider missing", resolved: Resolved{Model: valid.Model, Streamer: valid.Streamer}},
+		{name: "model missing", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ProviderID: "fake"}, Streamer: valid.Streamer}},
+		{name: "descriptor provider missing", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ID: "m1"}, Streamer: valid.Streamer}},
+		{name: "descriptor provider mismatch", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ID: "m1", ProviderID: "other"}, Streamer: valid.Streamer}},
+		{name: "selected provider mismatch", resolved: Resolved{Provider: Provider{ID: "other"}, Model: Descriptor{ID: "m1", ProviderID: "other"}, Streamer: valid.Streamer}},
+		{name: "selected model mismatch", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ID: "other", ProviderID: "fake"}, Streamer: valid.Streamer}},
+		{name: "streamer missing", resolved: Resolved{Provider: valid.Provider, Model: valid.Model}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := ValidateResolved(selection, test.resolved); !errors.Is(err, ErrInvalidResolution) {
+				t.Fatalf("ValidateResolved error = %v, want ErrInvalidResolution", err)
+			}
+		})
+	}
+	if err := ValidateResolved(selection, valid); err != nil {
+		t.Fatalf("ValidateResolved(valid) error = %v", err)
+	}
+}
+
 func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
 	t.Parallel()
 

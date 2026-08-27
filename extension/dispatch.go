@@ -11,11 +11,10 @@ type delegatedError struct{ cause error }
 func (e *delegatedError) Error() string { return e.cause.Error() }
 func (e *delegatedError) Unwrap() error { return e.cause }
 
-func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value T) Failures {
+func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value T) {
 	if plan == nil || point.key == nil {
-		return nil
+		return
 	}
-	var failures Failures
 	for _, entry := range plan.entries {
 		if entry.point != point.key || entry.kind != entryNotification {
 			continue
@@ -23,7 +22,6 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 		observer, ok := entry.callback.(Observer[T])
 		if !ok {
 			failure := callbackFailure(entry, "callback_type", fmt.Errorf("observer type mismatch"))
-			failures = appendBounded(failures, failure)
 			report(plan.reporter, ctx, failure)
 			continue
 		}
@@ -34,9 +32,6 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 			if err != nil {
 				failure := callbackFailure(entry, "clone_failed", err)
 				report(plan.reporter, ctx, failure)
-				if point.policy == NotificationReturnFailures {
-					failures = appendBounded(failures, failure)
-				}
 				continue
 			}
 		}
@@ -46,11 +41,7 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 		}
 		failure := callbackFailure(entry, failureCode(err), err)
 		report(plan.reporter, ctx, failure)
-		if point.policy == NotificationReturnFailures {
-			failures = appendBounded(failures, failure)
-		}
 	}
-	return failures
 }
 
 func callObserver[T any](ctx context.Context, observer Observer[T], value T) (err error) {
@@ -205,8 +196,8 @@ func cloneInput[T any](clone CloneFunc[T], input T) (T, error) {
 	return clone(input)
 }
 
-func callbackFailure(entry plannedEntry, code string, cause error) Failure {
-	return Failure{Point: entry.contract, InstanceID: entry.component.InstanceID, HandlerID: entry.spec.ID, Code: code, Cause: cause}
+func callbackFailure(entry plannedEntry, code string, cause error) Diagnostic {
+	return Diagnostic{Point: entry.contract, InstanceID: entry.component.InstanceID, HandlerID: entry.spec.ID, Code: code, Cause: cause}
 }
 
 func failureCode(err error) string {
@@ -216,17 +207,10 @@ func failureCode(err error) string {
 	return "callback_failed"
 }
 
-func appendBounded(failures Failures, failure Failure) Failures {
-	if len(failures) >= maxReportedFailures {
-		return failures
-	}
-	return append(failures, failure)
-}
-
-func report(reporter Reporter, ctx context.Context, failure Failure) {
+func report(reporter Reporter, ctx context.Context, failure Diagnostic) {
 	if reporter == nil {
 		return
 	}
 	defer func() { _ = recover() }()
-	reporter.Report(ctx, Diagnostic(failure))
+	reporter.Report(ctx, failure)
 }

@@ -8,6 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+
+	"github.com/mattsp1290/eino-agent/extension"
 )
 
 // ExtensionPlanSchemaVersion is the only supported durable plan descriptor schema.
@@ -23,63 +26,50 @@ const (
 	HandlerInterceptor  HandlerKind = "interceptor"
 )
 
-type ArtifactIdentity struct {
-	Name       string
-	Version    string
-	Hash       string
-	ConfigHash string
-	SourceKind string
-}
-
-type ExtensionScope struct {
-	Kind string
-	Key  string
-}
-
 type RegistrationIdentity struct {
 	ID       string
 	Contract string
 	Version  string
 	Order    int
-	Scope    ExtensionScope
+	Scope    extension.Scope
 	Kind     HandlerKind
 }
 
 type HandlerPlanIdentity struct {
 	InstanceID    string
-	Artifact      ArtifactIdentity
+	Artifact      extension.Artifact
 	Registrations []RegistrationIdentity
 }
 
 type ToolPlanIdentity struct {
 	InstanceID               string
-	Artifact                 ArtifactIdentity
+	Artifact                 extension.Artifact
 	Name, RegistrationID     string
-	Scope                    ExtensionScope
+	Scope                    extension.Scope
 	SchemaHash, ExecutorHash string
 }
 
 type PromptPlanIdentity struct {
 	InstanceID           string
-	Artifact             ArtifactIdentity
+	Artifact             extension.Artifact
 	Name, RegistrationID string
-	Scope                ExtensionScope
+	Scope                extension.Scope
 	Order                int
 }
 
 type GuardPlanIdentity struct {
 	InstanceID     string
-	Artifact       ArtifactIdentity
+	Artifact       extension.Artifact
 	RegistrationID string
-	Scope          ExtensionScope
+	Scope          extension.Scope
 	Order          int
 }
 
 type RestrictionPlanIdentity struct {
 	InstanceID                string
-	Artifact                  ArtifactIdentity
+	Artifact                  extension.Artifact
 	RegistrationID, RulesHash string
-	Scope                     ExtensionScope
+	Scope                     extension.Scope
 }
 
 // ExtensionPlanDescriptor is the complete current durable identity of one
@@ -114,16 +104,17 @@ func ValidateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
 	if descriptor.SchemaVersion != ExtensionPlanSchemaVersion {
 		return fmt.Errorf("unsupported extension plan schema %d", descriptor.SchemaVersion)
 	}
-	seen := make(map[string]bool)
-	artifacts := make(map[string]ArtifactIdentity)
+	seenHandlers := make(map[handlerIdentityKey]bool)
+	seenTools := make(map[toolIdentityKey]bool)
+	seenPrompts := make(map[promptIdentityKey]bool)
+	seenGuards := make(map[guardIdentityKey]bool)
+	seenRestrictions := make(map[restrictionIdentityKey]bool)
+	artifacts := make(map[string]extension.Artifact)
 	handlerInstances := make(map[string]bool)
 	var sessionKey string
-	checkComponent := func(instanceID string, artifact ArtifactIdentity) error {
-		if instanceID == "" || artifact.Name == "" || artifact.Version == "" || artifact.Hash == "" || artifact.ConfigHash == "" {
-			return errors.New("invalid extension component identity")
-		}
-		if artifact.SourceKind != "native" && artifact.SourceKind != "wasm" {
-			return errors.New("invalid extension artifact source kind")
+	checkComponent := func(instanceID string, artifact extension.Artifact) error {
+		if err := extension.ValidateComponent(extension.Component{InstanceID: instanceID, Artifact: artifact}); err != nil {
+			return fmt.Errorf("invalid extension component identity: %w", err)
 		}
 		if existing, ok := artifacts[instanceID]; ok && existing != artifact {
 			return errors.New("extension instance has conflicting artifact identities")
@@ -131,22 +122,17 @@ func ValidateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
 		artifacts[instanceID] = artifact
 		return nil
 	}
-	checkScope := func(scope ExtensionScope) error {
+	checkScope := func(scope extension.Scope) error {
+		if err := extension.ValidateScope(scope); err != nil {
+			return err
+		}
 		switch scope.Kind {
-		case "global":
-			if scope.Key != "" {
-				return errors.New("global extension scope has key")
-			}
-		case "session":
-			if scope.Key == "" {
-				return errors.New("session extension scope missing key")
-			}
+		case extension.ScopeGlobal:
+		case extension.ScopeSession:
 			if sessionKey != "" && sessionKey != scope.Key {
 				return errors.New("extension plan contains multiple session keys")
 			}
 			sessionKey = scope.Key
-		default:
-			return errors.New("invalid extension scope")
 		}
 		return nil
 	}
@@ -163,84 +149,110 @@ func ValidateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
 			return errors.New("handler identity missing registrations")
 		}
 		for _, registration := range identity.Registrations {
-			if registration.ID == "" || registration.Contract == "" || registration.Version == "" || registration.Kind != HandlerNotification && registration.Kind != HandlerInterceptor {
+			if extension.ValidateIdentifier(registration.ID) != nil || extension.ValidateContract(extension.Contract{ID: registration.Contract, Version: registration.Version}) != nil || registration.Kind != HandlerNotification && registration.Kind != HandlerInterceptor {
 				return errors.New("invalid handler registration identity")
 			}
 			if err := checkScope(registration.Scope); err != nil {
 				return err
 			}
-			key := identity.InstanceID + "\x00handlers\x00" + registration.ID + "\x00" + registration.Contract + "\x00" + registration.Version + "\x00" + string(registration.Kind) + "\x00" + registration.Scope.Kind + "\x00" + registration.Scope.Key
-			if seen[key] {
+			key := handlerIdentityKey{InstanceID: identity.InstanceID, RegistrationID: registration.ID, Contract: registration.Contract, Version: registration.Version, Kind: registration.Kind, Scope: registration.Scope}
+			if seenHandlers[key] {
 				return errors.New("duplicate handler registration identity")
 			}
-			seen[key] = true
+			seenHandlers[key] = true
 		}
 	}
 	for _, identity := range descriptor.Tools {
 		if err := checkComponent(identity.InstanceID, identity.Artifact); err != nil {
 			return err
 		}
-		if identity.Name == "" || identity.RegistrationID == "" || identity.SchemaHash == "" || identity.ExecutorHash == "" {
+		if extension.ValidateIdentifier(identity.Name) != nil || extension.ValidateIdentifier(identity.RegistrationID) != nil || identity.SchemaHash == "" || identity.ExecutorHash == "" {
 			return errors.New("invalid tool plan identity")
 		}
 		if err := checkScope(identity.Scope); err != nil {
 			return err
 		}
-		if err := addPlanIdentity(seen, identity.InstanceID+"\x00tool\x00"+identity.RegistrationID+"\x00"+identity.Name+"\x00"+identity.Scope.Kind+"\x00"+identity.Scope.Key); err != nil {
-			return err
+		key := toolIdentityKey{InstanceID: identity.InstanceID, RegistrationID: identity.RegistrationID, Name: identity.Name, Scope: identity.Scope}
+		if seenTools[key] {
+			return errors.New("duplicate extension plan identity")
 		}
+		seenTools[key] = true
 	}
 	for _, identity := range descriptor.Prompts {
 		if err := checkComponent(identity.InstanceID, identity.Artifact); err != nil {
 			return err
 		}
-		if identity.Name == "" || identity.RegistrationID == "" {
+		if extension.ValidateIdentifier(identity.Name) != nil || extension.ValidateIdentifier(identity.RegistrationID) != nil {
 			return errors.New("invalid prompt plan identity")
 		}
 		if err := checkScope(identity.Scope); err != nil {
 			return err
 		}
-		if err := addPlanIdentity(seen, identity.InstanceID+"\x00prompt\x00"+identity.RegistrationID+"\x00"+identity.Name+"\x00"+identity.Scope.Kind+"\x00"+identity.Scope.Key); err != nil {
-			return err
+		key := promptIdentityKey{InstanceID: identity.InstanceID, RegistrationID: identity.RegistrationID, Name: identity.Name, Scope: identity.Scope}
+		if seenPrompts[key] {
+			return errors.New("duplicate extension plan identity")
 		}
+		seenPrompts[key] = true
 	}
 	for _, identity := range descriptor.Guards {
 		if err := checkComponent(identity.InstanceID, identity.Artifact); err != nil {
 			return err
 		}
-		if identity.RegistrationID == "" {
+		if extension.ValidateIdentifier(identity.RegistrationID) != nil {
 			return errors.New("invalid guard plan identity")
 		}
 		if err := checkScope(identity.Scope); err != nil {
 			return err
 		}
-		if err := addPlanIdentity(seen, identity.InstanceID+"\x00guard\x00"+identity.RegistrationID+"\x00"+identity.Scope.Kind+"\x00"+identity.Scope.Key); err != nil {
-			return err
+		key := guardIdentityKey{InstanceID: identity.InstanceID, RegistrationID: identity.RegistrationID, Scope: identity.Scope}
+		if seenGuards[key] {
+			return errors.New("duplicate extension plan identity")
 		}
+		seenGuards[key] = true
 	}
 	for _, identity := range descriptor.Restrictions {
 		if err := checkComponent(identity.InstanceID, identity.Artifact); err != nil {
 			return err
 		}
-		if identity.RegistrationID == "" || identity.RulesHash == "" {
+		if extension.ValidateIdentifier(identity.RegistrationID) != nil || strings.TrimSpace(identity.RulesHash) == "" {
 			return errors.New("invalid restriction plan identity")
 		}
 		if err := checkScope(identity.Scope); err != nil {
 			return err
 		}
-		if err := addPlanIdentity(seen, identity.InstanceID+"\x00restriction\x00"+identity.RegistrationID+"\x00"+identity.Scope.Kind+"\x00"+identity.Scope.Key); err != nil {
-			return err
+		key := restrictionIdentityKey{InstanceID: identity.InstanceID, RegistrationID: identity.RegistrationID, Scope: identity.Scope}
+		if seenRestrictions[key] {
+			return errors.New("duplicate extension plan identity")
 		}
+		seenRestrictions[key] = true
 	}
 	return nil
 }
 
-func addPlanIdentity(seen map[string]bool, key string) error {
-	if seen[key] {
-		return errors.New("duplicate extension plan identity")
-	}
-	seen[key] = true
-	return nil
+type handlerIdentityKey struct {
+	InstanceID, RegistrationID, Contract, Version string
+	Kind                                          HandlerKind
+	Scope                                         extension.Scope
+}
+
+type toolIdentityKey struct {
+	InstanceID, RegistrationID, Name string
+	Scope                            extension.Scope
+}
+
+type promptIdentityKey struct {
+	InstanceID, RegistrationID, Name string
+	Scope                            extension.Scope
+}
+
+type guardIdentityKey struct {
+	InstanceID, RegistrationID string
+	Scope                      extension.Scope
+}
+
+type restrictionIdentityKey struct {
+	InstanceID, RegistrationID string
+	Scope                      extension.Scope
 }
 
 // FingerprintExtensionPlan validates and hashes a canonical restart-stable descriptor.
@@ -362,7 +374,7 @@ func compareRestrictionPlanIdentity(left, right RestrictionPlanIdentity) int {
 	return cmp.Compare(left.RulesHash, right.RulesHash)
 }
 
-func compareComponentIdentity(leftID string, left ArtifactIdentity, rightID string, right ArtifactIdentity) int {
+func compareComponentIdentity(leftID string, left extension.Artifact, rightID string, right extension.Artifact) int {
 	if result := cmp.Compare(leftID, rightID); result != 0 {
 		return result
 	}
@@ -400,7 +412,7 @@ func compareRegistrationIdentity(left, right RegistrationIdentity) int {
 	return compareScope(left.Scope, right.Scope)
 }
 
-func compareScope(left, right ExtensionScope) int {
+func compareScope(left, right extension.Scope) int {
 	if result := cmp.Compare(left.Kind, right.Kind); result != 0 {
 		return result
 	}

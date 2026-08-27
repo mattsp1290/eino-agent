@@ -67,13 +67,6 @@ type Contract struct {
 	Version string
 }
 
-type NotificationPolicy uint8
-
-const (
-	NotificationContained NotificationPolicy = iota
-	NotificationReturnFailures
-)
-
 type CloneFunc[T any] func(T) (T, error)
 type ValidateFunc[T any] func(T) error
 type OutputValidator[I, O any] func(original I, output O) error
@@ -98,12 +91,11 @@ type pointKey [1]byte
 type Notification[T any] struct {
 	key      *pointKey
 	contract Contract
-	policy   NotificationPolicy
 	clone    CloneFunc[T]
 }
 
-func NewNotification[T any](contract Contract, policy NotificationPolicy, clone CloneFunc[T]) Notification[T] {
-	return Notification[T]{key: &pointKey{}, contract: contract, policy: policy, clone: clone}
+func NewNotification[T any](contract Contract, clone CloneFunc[T]) Notification[T] {
+	return Notification[T]{key: &pointKey{}, contract: contract, clone: clone}
 }
 
 func (p Notification[T]) Contract() Contract { return p.contract }
@@ -156,14 +148,6 @@ func NewRequiredInterceptor[I, O any](contract Contract, clone CloneFunc[I], val
 
 func (p Interceptor[I, O]) Contract() Contract { return p.contract }
 
-type Failure struct {
-	Point      Contract
-	InstanceID string
-	HandlerID  string
-	Code       string
-	Cause      error
-}
-
 // CallbackError is the bounded public error returned when an interceptor
 // itself fails. The raw cause remains available through errors.Is/errors.As
 // for trusted in-process diagnostics, while Error deliberately contains only
@@ -190,15 +174,6 @@ func (e *CallbackError) Unwrap() error {
 		return nil
 	}
 	return e.cause
-}
-
-type Failures []Failure
-
-func (f Failures) Error() string {
-	if len(f) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("%d extension callback failure(s)", len(f))
 }
 
 type Diagnostic struct {
@@ -245,7 +220,6 @@ type registrationEntry struct {
 	spec        Registration
 	kind        entryKind
 	callback    any
-	policy      NotificationPolicy
 	requireNext bool
 }
 
@@ -256,7 +230,7 @@ func On[T any](registrar Registrar, point Notification[T], spec Registration, fn
 	if err := validatePoint(point.key, point.contract); err != nil {
 		return err
 	}
-	return registrar.register(registrationEntry{point: point.key, contract: point.contract, spec: spec, kind: entryNotification, callback: fn, policy: point.policy})
+	return registrar.register(registrationEntry{point: point.key, contract: point.contract, spec: spec, kind: entryNotification, callback: fn})
 }
 
 func Use[I, O any](registrar Registrar, point Interceptor[I, O], spec Registration, fn Around[I, O]) error {
@@ -271,14 +245,32 @@ func Use[I, O any](registrar Registrar, point Interceptor[I, O], spec Registrati
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 
-func validatePoint(key *pointKey, contract Contract) error {
-	if key == nil || !identifierPattern.MatchString(contract.ID) || strings.TrimSpace(contract.Version) == "" || len(contract.Version) > 64 {
+// ValidateIdentifier verifies one stable extension-owned identifier.
+func ValidateIdentifier(id string) error {
+	if !identifierPattern.MatchString(id) {
+		return fmt.Errorf("%w: stable identifier required", ErrInvalidRegistration)
+	}
+	return nil
+}
+
+// ValidateContract verifies the stable identity of an extension point.
+func ValidateContract(contract Contract) error {
+	if err := ValidateIdentifier(contract.ID); err != nil || strings.TrimSpace(contract.Version) == "" || len(contract.Version) > 64 {
 		return fmt.Errorf("%w: stable id and version required", ErrInvalidContract)
 	}
 	return nil
 }
 
-func validateScope(scope Scope) error {
+func validatePoint(key *pointKey, contract Contract) error {
+	if key == nil {
+		return fmt.Errorf("%w: stable id and version required", ErrInvalidContract)
+	}
+	return ValidateContract(contract)
+}
+
+// ValidateScope verifies one global or session extension scope. Session keys
+// are opaque and are deliberately not parsed as identifiers.
+func ValidateScope(scope Scope) error {
 	switch scope.Kind {
 	case ScopeGlobal:
 		if scope.Key != "" {
@@ -294,25 +286,10 @@ func validateScope(scope Scope) error {
 	return nil
 }
 
-func validateTargetScope(scope Scope) error {
-	switch scope.Kind {
-	case ScopeGlobal:
-		if scope.Key != "" {
-			return fmt.Errorf("%w: global scope key must be empty", ErrInvalidRegistration)
-		}
-	case ScopeSession:
-		if scope.Key == "" {
-			return fmt.Errorf("%w: session key required", ErrInvalidRegistration)
-		}
-	default:
-		return fmt.Errorf("%w: unsupported scope", ErrInvalidRegistration)
-	}
-	return nil
-}
-
-func validateArtifact(component Component) error {
+// ValidateComponent verifies one extension instance and its artifact identity.
+func ValidateComponent(component Component) error {
 	artifact := component.Artifact
-	if !identifierPattern.MatchString(component.InstanceID) || !identifierPattern.MatchString(artifact.Name) || strings.TrimSpace(artifact.Version) == "" || artifact.Hash == "" || artifact.ConfigHash == "" {
+	if ValidateIdentifier(component.InstanceID) != nil || ValidateIdentifier(artifact.Name) != nil || strings.TrimSpace(artifact.Version) == "" || artifact.Hash == "" || artifact.ConfigHash == "" {
 		return fmt.Errorf("%w: stable instance and artifact identity required", ErrInvalidComponent)
 	}
 	if artifact.SourceKind != SourceNative && artifact.SourceKind != SourceWasm {

@@ -83,7 +83,7 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *ru
 		result = o.finishResume(ctx, execution, run, result, &settled)
 	}
 	if settled && !run.Terminal() {
-		_ = extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(resumeStartedAt), Error: classifyExtensionError(result.Error)})
+		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(resumeStartedAt), Error: classifyExtensionError(result.Error)})
 	}
 	done <- result
 }
@@ -150,7 +150,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 			}
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
-		_ = extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Time: claimed.StartedAt})
+		extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Time: claimed.StartedAt})
 		toolCall := ToolCall{
 			ID:              claimed.ID,
 			SessionID:       claimed.SessionID,

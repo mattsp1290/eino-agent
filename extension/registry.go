@@ -51,7 +51,7 @@ func (s *stagingRegistrar) register(entry registrationEntry) error {
 	if !identifierPattern.MatchString(entry.spec.ID) {
 		return fmt.Errorf("%w: registration identity is invalid", ErrInvalidRegistration)
 	}
-	if err := validateScope(entry.spec.Scope); err != nil {
+	if err := ValidateScope(entry.spec.Scope); err != nil {
 		return err
 	}
 	for _, existing := range s.entries {
@@ -82,7 +82,7 @@ func (s *stagingRegistrar) Lease(scope Scope) error {
 	if s.closed {
 		return ErrMountClosed
 	}
-	if err := validateScope(scope); err != nil {
+	if err := ValidateScope(scope); err != nil {
 		return err
 	}
 	for _, existing := range s.leases {
@@ -121,7 +121,7 @@ func (r *Registry) PrepareMount(ctx context.Context, component Component, instal
 	if r == nil || installer == nil {
 		return nil, fmt.Errorf("%w: registry and installer required", ErrInvalidComponent)
 	}
-	if err := validateArtifact(component); err != nil {
+	if err := ValidateComponent(component); err != nil {
 		return nil, err
 	}
 	stage := &stagingRegistrar{component: component}
@@ -324,7 +324,7 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 	if r == nil {
 		return &Plan{}, nil
 	}
-	if err := validateTargetScope(target); err != nil {
+	if err := ValidateScope(target); err != nil {
 		return nil, err
 	}
 	r.mu.Lock()

@@ -10,8 +10,8 @@ func admissionContextEpoch(request AdmissionRequest, sessionID session.ID, now t
 	return session.ContextEpoch{
 		ID:         request.IDs.ContextEpochID,
 		SessionID:  sessionID,
-		ModelID:    admissionModelID(request),
-		ProviderID: admissionProviderID(request),
+		ModelID:    string(request.Model.Model.ID),
+		ProviderID: string(request.Model.Provider.ID),
 		Trigger:    "turn",
 		Reason:     "run_admission",
 		NextAction: session.EpochNextStop,

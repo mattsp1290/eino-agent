@@ -4,7 +4,6 @@ import (
 	"context"
 
 	agentcontext "github.com/mattsp1290/eino-agent/context"
-	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -28,15 +27,14 @@ func ContextIdentityFrom(ctx context.Context) (agentcontext.Identity, bool) {
 // ContextIdentity builds the identity visible to tools, model adapters, hooks,
 // observability, and context sources for this turn snapshot.
 func (s TurnSnapshot) ContextIdentity(messageID session.MessageID, toolCallID session.ToolCallID, trace agentcontext.TraceContext) agentcontext.Identity {
-	providerID, modelID := snapshotModelIdentity(s)
 	return agentcontext.Identity{
 		SessionID:          s.SessionID,
 		RunID:              s.RunID,
 		AgentID:            s.Config.Agent.Name,
 		AssistantMessageID: messageID,
 		ToolCallID:         toolCallID,
-		ProviderID:         providerID,
-		ModelID:            modelID,
+		ProviderID:         s.Model.Provider.ID,
+		ModelID:            s.Model.Model.ID,
 		Trace:              trace,
 	}
 }
@@ -55,13 +53,6 @@ func (s TurnSnapshot) ContextRequest(sourceName string, kind agentcontext.Kind, 
 		Bounds:   bounds,
 		Metadata: cloneStringMap(metadata),
 	}
-}
-
-func snapshotModelIdentity(snapshot TurnSnapshot) (model.ProviderID, model.ID) {
-	if snapshot.Model.Provider.ID != "" || snapshot.Model.Model.ID != "" {
-		return snapshot.Model.Provider.ID, snapshot.Model.Model.ID
-	}
-	return snapshot.Config.Model.ProviderID, snapshot.Config.Model.ModelID
 }
 
 func cloneStringMap(src map[string]string) map[string]string {

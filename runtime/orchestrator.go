@@ -80,6 +80,9 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
+	if err := model.ValidateResolved(request.Config.Model, resolved); err != nil {
+		return nil, err
+	}
 	input, err := o.providerInput(ctx, request)
 	if err != nil {
 		return nil, err
@@ -141,7 +144,7 @@ func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecu
 	defer execution.release()
 	result, settled := o.run(ctx, execution, admitted)
 	if settled {
-		_ = extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
+		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
 	}
 	done <- result
 }
@@ -189,7 +192,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 		return result, false
 	}
 	run = started
-	_ = extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
+	extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
 	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot, admitted.AssistantMessage.ID)
 	if err != nil {
 		result.Status = statusForError(err)

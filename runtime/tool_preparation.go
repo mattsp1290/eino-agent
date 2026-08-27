@@ -124,7 +124,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			return nil, fmt.Errorf("invalid permission pattern for tool %q", call.Name)
 		}
 		schemaCall.Function.Arguments = string(input)
-		_ = extension.Notify(execution.dispatch(), ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
+		extension.Notify(execution.dispatch(), ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
 		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: prepareErr})
 	}
 	return prepared, nil
@@ -150,7 +150,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 			return nil, err
 		}
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
-		_ = extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
+		extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
 		_ = o.emitToolCall(ctx, execution, snapshot, messageID, callID, session.ToolCallRunning, toolCallPayload{ID: string(callID), Name: call.Name, Arguments: cloneJSON(input)})
 		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, call, record, prepared.middlewareErr)
 		if err != nil {

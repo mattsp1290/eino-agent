@@ -18,6 +18,8 @@ var (
 	ErrProviderRateLimited = errors.New("model provider rate limited")
 	// ErrProviderRejected reports a non-retryable provider request rejection.
 	ErrProviderRejected = errors.New("model provider rejected request")
+	// ErrInvalidResolution reports an incomplete or inconsistent resolved model.
+	ErrInvalidResolution = errors.New("invalid resolved model")
 )
 
 // StreamDelta is one normalized chunk from a provider stream.
@@ -179,6 +181,29 @@ func (fn ResolverFunc) Resolve(ctx context.Context, selection Selection, runtime
 
 var _ Resolver = ResolverFunc(nil)
 
+// ValidateResolved verifies that one resolution completely and consistently
+// satisfies the requested provider/model selection.
+func ValidateResolved(selection Selection, resolved Resolved) error {
+	switch {
+	case resolved.Provider.ID == "":
+		return fmt.Errorf("%w: provider id required", ErrInvalidResolution)
+	case resolved.Model.ID == "":
+		return fmt.Errorf("%w: model id required", ErrInvalidResolution)
+	case resolved.Model.ProviderID == "":
+		return fmt.Errorf("%w: model provider id required", ErrInvalidResolution)
+	case resolved.Model.ProviderID != resolved.Provider.ID:
+		return fmt.Errorf("%w: model provider %q does not match provider %q", ErrInvalidResolution, resolved.Model.ProviderID, resolved.Provider.ID)
+	case selection.ProviderID != "" && resolved.Provider.ID != selection.ProviderID:
+		return fmt.Errorf("%w: provider %q does not match selection %q", ErrInvalidResolution, resolved.Provider.ID, selection.ProviderID)
+	case selection.ModelID != "" && resolved.Model.ID != selection.ModelID:
+		return fmt.Errorf("%w: model %q does not match selection %q", ErrInvalidResolution, resolved.Model.ID, selection.ModelID)
+	case resolved.Streamer == nil:
+		return fmt.Errorf("%w: streamer required", ErrInvalidResolution)
+	default:
+		return nil
+	}
+}
+
 // Resolve builds an immutable model client for the selected provider/model.
 func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runtime Runtime) (Resolved, error) {
 	adapter, provider, err := r.adapterFor(ctx, selection.ProviderID, runtime)
@@ -196,11 +221,15 @@ func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runti
 	if streamer == nil {
 		return Resolved{}, Error{Code: "provider_streamer_missing", Message: "provider adapter returned nil streamer", Cause: ErrProviderUnavailable}
 	}
-	return Resolved{
+	resolved := Resolved{
 		Provider: provider,
 		Model:    descriptor,
 		Streamer: streamer,
-	}, nil
+	}
+	if err := ValidateResolved(selection, resolved); err != nil {
+		return Resolved{}, err
+	}
+	return resolved, nil
 }
 
 func (r AdapterResolver) adapterFor(ctx context.Context, providerID ProviderID, runtime Runtime) (Adapter, Provider, error) {

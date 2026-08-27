@@ -113,9 +113,9 @@ against the checked-in guests.
 | --- | --- | --- | --- |
 | `customTools` | Tool plan | `tools.Definition`, `composition.Registrar.Tool` | `wasmext.Loader.LoadTool`, `tool` world |
 | `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.Loader.LoadPermissionsPolicy`, `permissions-policy` world |
-| `tool_call` argument rewrite | Tool prepare point | `extension.Use` with `runtime.ToolPreparePoint` | `wasmext.RegisterToolMiddleware` |
-| `tool_result` patch | Tool result point | `extension.Use` with `runtime.ToolResultTransformPoint` | `wasmext.RegisterToolMiddleware` |
-| `before_agent_start` / context | Typed lifecycle points | `runtime.RunBeforeExecutePoint`, `runtime.ContextAssemblePoint` | `wasmext.RegisterContextSource`, `wasmext.RegisterHook` |
+| `tool_call` argument rewrite | Tool prepare point | `extension.Use` with `runtime.ToolPreparePoint` | `wasmext.Loader.RegisterToolMiddleware` |
+| `tool_result` patch | Tool result point | `extension.Use` with `runtime.ToolResultTransformPoint` | `wasmext.Loader.RegisterToolMiddleware` |
+| `before_agent_start` / context | Typed lifecycle points | `runtime.RunBeforeExecutePoint`, `runtime.ContextAssemblePoint` | `wasmext.Loader.RegisterContextSource`, `wasmext.Loader.RegisterHook` |
 | `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world and wrapper |
 | `sessionManager` | Session persistence | `session.Store`, `runtime.WithStore` | No Wasm path by design |
 | `registerProvider` | Model resolver | `model.AdapterResolver`, `runtime.WithModelResolver` | No Wasm path by design; models and credentials stay native |

@@ -18,19 +18,17 @@ import (
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
 
-// LoadedTool owns one Wasm-backed tool definition loaded by Loader.
-type LoadedTool struct {
+type loadedTool struct {
 	module     *module
 	component  toolComponent
 	definition tools.Definition
 }
 
-// Definition returns the native tool definition backed by this component.
-func (t *LoadedTool) Definition() (tools.Definition, error) { return t.definition.Clone() }
+func (t *loadedTool) definitionCopy() (tools.Definition, error) { return t.definition.Clone() }
 
-func (t *LoadedTool) close() error { return t.module.Close() }
+func (t *loadedTool) close() error { return t.module.Close() }
 
-func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedTool, error) {
+func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedTool, error) {
 	module, err := loadModule(ctx, cfg, toolContract, factory)
 	if err != nil {
 		return nil, err
@@ -54,7 +52,7 @@ func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedTool{module: module, component: component, definition: definition}, nil
+	return &loadedTool{module: module, component: component, definition: definition}, nil
 }
 
 func toolDefinition(module *module, component toolComponent, metadata wittypes.ToolMetadata) (tools.Definition, error) {
@@ -146,15 +144,14 @@ type toolExecuteRequest struct {
 	Turn       wittypes.TurnMetadata
 }
 
-// LoadedPermissionsPolicy owns one Wasm-backed permission policy.
-type LoadedPermissionsPolicy struct {
+type loadedPermissionsPolicy struct {
 	module    *module
 	component permissionsComponent
 }
 
-func (p *LoadedPermissionsPolicy) close() error { return p.module.Close() }
+func (p *loadedPermissionsPolicy) close() error { return p.module.Close() }
 
-func (p *LoadedPermissionsPolicy) Decide(ctx context.Context, request permissions.Request) (permissions.Decision, error) {
+func (p *loadedPermissionsPolicy) Decide(ctx context.Context, request permissions.Request) (permissions.Decision, error) {
 	input := wittypes.PermissionRequest{
 		ToolName: request.ToolName, ToolCallID: request.ToolCallID, Permission: request.Permission,
 		ArgumentsSummary: request.Pattern, SessionID: request.SessionID, RunID: request.RunID,
@@ -185,7 +182,7 @@ func (p *LoadedPermissionsPolicy) Decide(ctx context.Context, request permission
 	return decision, nil
 }
 
-func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedPermissionsPolicy, error) {
+func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedPermissionsPolicy, error) {
 	module, err := loadModule(ctx, cfg, permissionsPolicyContract, factory)
 	if err != nil {
 		return nil, err
@@ -195,22 +192,21 @@ func loadPermissionsPolicy(ctx context.Context, cfg ModuleConfig, factory engine
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedPermissionsPolicy{module: module, component: component}, nil
+	return &loadedPermissionsPolicy{module: module, component: component}, nil
 }
 
-// LoadedContextSource adapts context-source@0.1.0 and owns its component.
-type LoadedContextSource struct {
+type loadedContextSource struct {
 	module    *module
 	component contextComponent
 }
 
-func (s *LoadedContextSource) close() error { return s.module.Close() }
+func (s *loadedContextSource) close() error { return s.module.Close() }
 
-func (s *LoadedContextSource) loadBoundedContext(ctx context.Context, metadata runtime.BoundedTurnMetadata) ([]*einoschema.Message, error) {
+func (s *loadedContextSource) loadBoundedContext(ctx context.Context, metadata runtime.BoundedTurnMetadata) ([]*einoschema.Message, error) {
 	return s.loadContextMetadata(ctx, turnMetadataFromBounded(metadata))
 }
 
-func (s *LoadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.Message, error) {
+func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.Message, error) {
 	var output []wittypes.TextMessage
 	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), func(callCtx context.Context) error {
 		var callErr error
@@ -240,7 +236,7 @@ func (s *LoadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 	return messages, nil
 }
 
-func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedContextSource, error) {
+func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedContextSource, error) {
 	module, err := loadModule(ctx, cfg, contextSourceContract, factory)
 	if err != nil {
 		return nil, err
@@ -250,18 +246,17 @@ func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFact
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedContextSource{module: module, component: component}, nil
+	return &loadedContextSource{module: module, component: component}, nil
 }
 
-// LoadedEventSink emits only a bounded, content-free projection.
-type LoadedEventSink struct {
+type loadedEventSink struct {
 	module    *module
 	component eventComponent
 }
 
-func (s *LoadedEventSink) close() error { return s.module.Close() }
+func (s *loadedEventSink) close() error { return s.module.Close() }
 
-func (s *LoadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
+func (s *loadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
 	input := wittypes.BoundedEvent{
 		Kind: string(event.Kind), SessionID: string(event.SessionID), RunID: string(event.RunID),
 		MessageID: string(event.MessageID), ToolCallID: string(event.ToolCallID), EpochID: string(event.EpochID),
@@ -272,7 +267,7 @@ func (s *LoadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
 	})
 }
 
-func openEventSink(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedEventSink, error) {
+func openEventSink(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedEventSink, error) {
 	module, err := loadModule(ctx, cfg, eventSinkContract, factory)
 	if err != nil {
 		return nil, err
@@ -282,43 +277,42 @@ func openEventSink(ctx context.Context, cfg ModuleConfig, factory engineFactory)
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedEventSink{module: module, component: component}, nil
+	return &loadedEventSink{module: module, component: component}, nil
 }
 
-// LoadedHook caches bounded turn metadata by run for deterministic after hooks.
-type LoadedHook struct {
+type loadedHook struct {
 	module    *module
 	component hookComponent
 	mu        sync.Mutex
 	turns     map[session.RunID]wittypes.TurnMetadata
 }
 
-func (h *LoadedHook) close() error {
+func (h *loadedHook) close() error {
 	h.cleanup()
 	return h.module.Close()
 }
 
-func (h *LoadedHook) cleanup() {
+func (h *loadedHook) cleanup() {
 	h.mu.Lock()
 	h.turns = nil
 	h.mu.Unlock()
 }
 
-func (h *LoadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
+func (h *loadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
 	turn := turnMetadataFromBounded(metadata)
 	h.cacheTurn(turn)
 	return h.beforeRunMetadata(ctx, turn)
 }
 
-func (h *LoadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
+func (h *loadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
 	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.BeforeRun(callCtx, turn) })
 }
 
-func (h *LoadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
+func (h *loadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
 	return h.beforeTurnMetadata(ctx, turnMetadataFromBounded(metadata))
 }
 
-func (h *LoadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
+func (h *loadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
 	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.BeforeTurn(callCtx, turn) }); err != nil {
 		return err
 	}
@@ -326,7 +320,7 @@ func (h *LoadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnM
 	return nil
 }
 
-func (h *LoadedHook) cacheTurn(turn wittypes.TurnMetadata) {
+func (h *loadedHook) cacheTurn(turn wittypes.TurnMetadata) {
 	h.mu.Lock()
 	if h.turns == nil {
 		h.turns = make(map[session.RunID]wittypes.TurnMetadata)
@@ -335,7 +329,7 @@ func (h *LoadedHook) cacheTurn(turn wittypes.TurnMetadata) {
 	h.mu.Unlock()
 }
 
-func (h *LoadedHook) finish(ctx context.Context, result runtime.Result) error {
+func (h *loadedHook) finish(ctx context.Context, result runtime.Result) error {
 	h.mu.Lock()
 	turn, ok := h.turns[result.RunID]
 	delete(h.turns, result.RunID)
@@ -349,7 +343,7 @@ func (h *LoadedHook) finish(ctx context.Context, result runtime.Result) error {
 	)
 }
 
-func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedHook, error) {
+func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedHook, error) {
 	module, err := loadModule(ctx, cfg, hookContract, factory)
 	if err != nil {
 		return nil, err
@@ -359,18 +353,18 @@ func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*Lo
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
+	return &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
 }
 
-// LoadedToolMiddleware preserves attachments and metadata on replacement.
-type LoadedToolMiddleware struct {
+// loadedToolMiddleware preserves attachments and metadata on replacement.
+type loadedToolMiddleware struct {
 	module    *module
 	component middlewareComponent
 }
 
-func (m *LoadedToolMiddleware) close() error { return m.module.Close() }
+func (m *loadedToolMiddleware) close() error { return m.module.Close() }
 
-func (m *LoadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall) (json.RawMessage, error) {
+func (m *loadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall) (json.RawMessage, error) {
 	turn := middlewareTurn(call, tool)
 	request := toolMiddlewareBeforeRequest{ToolName: tool.Name, ToolCallID: string(call.ID), InputJSON: string(call.Input), Turn: turn}
 	var replacement wittypes.Replacement
@@ -384,7 +378,7 @@ func (m *LoadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.
 	return applyInputReplacement(m.module, "tool-middleware.before-tool-call", call.Input, replacement)
 }
 
-func (m *LoadedToolMiddleware) afterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, _ error) (runtime.ToolResult, error) {
+func (m *loadedToolMiddleware) afterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, _ error) (runtime.ToolResult, error) {
 	encoded, err := toolResultJSON(result)
 	if err != nil {
 		return runtime.ToolResult{}, extensionError(ErrorPayload, m.module.identity, "tool-middleware.after-tool-call", err)
@@ -413,7 +407,7 @@ type toolMiddlewareAfterRequest struct {
 	Turn                                        wittypes.TurnMetadata
 }
 
-func openToolMiddleware(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*LoadedToolMiddleware, error) {
+func openToolMiddleware(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedToolMiddleware, error) {
 	module, err := loadModule(ctx, cfg, toolMiddlewareContract, factory)
 	if err != nil {
 		return nil, err
@@ -423,5 +417,5 @@ func openToolMiddleware(ctx context.Context, cfg ModuleConfig, factory engineFac
 		_ = module.Close()
 		return nil, err
 	}
-	return &LoadedToolMiddleware{module: module, component: component}, nil
+	return &loadedToolMiddleware{module: module, component: component}, nil
 }

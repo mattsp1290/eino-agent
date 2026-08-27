@@ -8,9 +8,7 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 )
 
-// RegisterContextSource adapts context-source@0.1.0 to the native context
-// assembly point.
-func RegisterContextSource(registrar extension.Registrar, spec extension.Registration, source *LoadedContextSource) error {
+func registerContextSource(registrar extension.Registrar, spec extension.Registration, source *loadedContextSource) error {
 	if source == nil {
 		return fmt.Errorf("nil Wasm context source")
 	}
@@ -36,9 +34,9 @@ func RegisterEventSink(registrar extension.Registrar, spec extension.Registratio
 	return extension.On(registrar, runtime.EventPublishedPoint, spec, sink.Emit)
 }
 
-// RegisterHook maps the curated hook world to run admission, context assembly,
-// and settled-run points. It reuses LoadedHook's bounded per-run metadata cache.
-func RegisterHook(registrar extension.Registrar, spec extension.Registration, hook *LoadedHook) error {
+// registerHook maps the curated hook world to run admission, context assembly,
+// and settled-run points. It reuses the bounded per-run metadata cache.
+func registerHook(registrar extension.Registrar, spec extension.Registration, hook *loadedHook) error {
 	if hook == nil {
 		return fmt.Errorf("nil Wasm hook")
 	}
@@ -71,13 +69,13 @@ func contextContributionSource(instanceID string, spec extension.Registration, i
 	return fmt.Sprintf("wasm-context/%d:%s/%d:%s/%d:%s/%d:%s/%06d", len(parts[0]), parts[0], len(parts[1]), parts[1], len(parts[2]), parts[2], len(parts[3]), parts[3], index)
 }
 
-func finishRegisteredHook(ctx context.Context, hook *LoadedHook, notice runtime.RunSettledNotice) error {
+func finishRegisteredHook(ctx context.Context, hook *loadedHook, notice runtime.RunSettledNotice) error {
 	return hook.finish(ctx, notice.Result)
 }
 
-// RegisterToolMiddleware maps tool-middleware@0.1.0 only to prepare and result
+// registerToolMiddleware maps tool-middleware@0.1.0 only to prepare and result
 // transformation. Around execution remains native-only.
-func RegisterToolMiddleware(registrar extension.Registrar, spec extension.Registration, middleware *LoadedToolMiddleware) error {
+func registerToolMiddleware(registrar extension.Registrar, spec extension.Registration, middleware *loadedToolMiddleware) error {
 	if middleware == nil {
 		return fmt.Errorf("nil Wasm tool middleware")
 	}

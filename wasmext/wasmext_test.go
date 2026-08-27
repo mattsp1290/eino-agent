@@ -57,7 +57,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		t.Fatalf("openTool error = %v", err)
 	}
 	defer func() { _ = loaded.close() }()
-	definition, err := loaded.Definition()
+	definition, err := loaded.definitionCopy()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -372,10 +372,11 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	loader := NewLoader()
 	defer func() { _ = loader.Close(context.Background()) }()
 
-	source, err := loader.LoadContextSource(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"))
+	source, err := openContextSource(ctx, checkedInFixtureConfig(t, root, "context-source.wasm"), loader.engineFactory())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = source.close() }()
 	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}}
 	messages, err := source.loadBoundedContext(ctx, metadata)
 	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
@@ -388,10 +389,11 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err := sink.Emit(ctx, runtime.Event{Kind: runtime.EventRunStarted, SessionID: "session", RunID: "run", Payload: json.RawMessage(`{"secret":"credential-sentinel"}`), Time: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
-	hook, err := loader.LoadHook(ctx, checkedInFixtureConfig(t, root, "hook.wasm"))
+	hook, err := openHook(ctx, checkedInFixtureConfig(t, root, "hook.wasm"), loader.engineFactory())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = hook.close() }()
 	if err := hook.beforeRunBounded(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
@@ -402,10 +404,11 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	middleware, err := loader.LoadToolMiddleware(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"))
+	middleware, err := openToolMiddleware(ctx, checkedInFixtureConfig(t, root, "tool-middleware.wasm"), loader.engineFactory())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = middleware.close() }()
 	call := runtime.ToolCall{ID: "call", RunID: "run", SessionID: "session", Input: json.RawMessage(`{"replace":true}`)}
 	input, err := middleware.beforeToolCall(ctx, runtime.Tool{Name: "echo"}, call)
 	if err != nil || string(input) != `{"from":"wasm"}` {
@@ -796,6 +799,7 @@ type fakeComponent struct {
 	call       func(context.Context, string, any, any) error
 	lastInput  any
 	closed     atomic.Bool
+	closeCalls atomic.Int32
 	interrupts atomic.Int64
 }
 
@@ -844,8 +848,12 @@ func (c *fakeComponent) AfterToolCall(ctx context.Context, input toolMiddlewareA
 	err = c.invoke(ctx, "tool-middleware.after-tool-call", input, &output)
 	return
 }
-func (c *fakeComponent) Interrupt()   { c.interrupts.Add(1) }
-func (c *fakeComponent) Close() error { c.closed.Store(true); return nil }
+func (c *fakeComponent) Interrupt() { c.interrupts.Add(1) }
+func (c *fakeComponent) Close() error {
+	c.closeCalls.Add(1)
+	c.closed.Store(true)
+	return nil
+}
 
 type blockingComponent struct {
 	fakeComponent

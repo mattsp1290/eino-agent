@@ -67,10 +67,16 @@ type Registrar struct {
 }
 
 func (r *Registrar) Prompt(registration PromptRegistration) error {
-	if err := validateCapabilityIdentity(registration.ID, registration.Scope); err != nil || registration.Name == "" || registration.Provider == nil {
-		if err != nil {
-			return err
-		}
+	if err := extension.ValidateIdentifier(registration.ID); err != nil {
+		return err
+	}
+	if err := extension.ValidateIdentifier(registration.Name); err != nil {
+		return err
+	}
+	if err := extension.ValidateScope(registration.Scope); err != nil {
+		return err
+	}
+	if registration.Provider == nil {
 		return fmt.Errorf("%w: invalid prompt registration", extension.ErrInvalidRegistration)
 	}
 	for _, existing := range r.prompts {
@@ -86,10 +92,13 @@ func (r *Registrar) Prompt(registration PromptRegistration) error {
 }
 
 func (r *Registrar) Guard(registration GuardRegistration) error {
-	if err := validateCapabilityIdentity(registration.ID, registration.Scope); err != nil || registration.Guard == nil {
-		if err != nil {
-			return err
-		}
+	if err := extension.ValidateIdentifier(registration.ID); err != nil {
+		return err
+	}
+	if err := extension.ValidateScope(registration.Scope); err != nil {
+		return err
+	}
+	if registration.Guard == nil {
 		return fmt.Errorf("%w: invalid guard registration", extension.ErrInvalidRegistration)
 	}
 	for _, existing := range r.guards {
@@ -105,7 +114,10 @@ func (r *Registrar) Guard(registration GuardRegistration) error {
 }
 
 func (r *Registrar) RestrictTools(registration RestrictionRegistration) error {
-	if err := validateCapabilityIdentity(registration.ID, registration.Scope); err != nil {
+	if err := extension.ValidateIdentifier(registration.ID); err != nil {
+		return err
+	}
+	if err := extension.ValidateScope(registration.Scope); err != nil {
 		return err
 	}
 	rules, err := runtime.CanonicalizeRestrictionRules(registration.Allowed, registration.Denied)
@@ -126,28 +138,18 @@ func (r *Registrar) RestrictTools(registration RestrictionRegistration) error {
 	return nil
 }
 
-func validateCapabilityIdentity(id string, scope extension.Scope) error {
-	if id == "" {
-		return fmt.Errorf("%w: invalid capability identity", extension.ErrInvalidRegistration)
-	}
-	if scope.Kind != extension.ScopeGlobal && scope.Kind != extension.ScopeSession || scope.Kind == extension.ScopeGlobal && scope.Key != "" || scope.Kind == extension.ScopeSession && scope.Key == "" {
-		return fmt.Errorf("%w: invalid capability scope", extension.ErrInvalidRegistration)
-	}
-	return nil
-}
-
 func (r *Registrar) Extensions() extension.Registrar       { return r.extensions }
 func (r *Registrar) Defer(cleanup extension.Cleanup) error { return r.extensions.Defer(cleanup) }
 
 func (r *Registrar) Tool(registration ToolRegistration) error {
-	if registration.ID == "" || registration.Definition.Name == "" {
-		return fmt.Errorf("%w: invalid composed tool identity", extension.ErrInvalidRegistration)
+	if err := extension.ValidateIdentifier(registration.ID); err != nil {
+		return err
 	}
-	if registration.Scope.Kind != extension.ScopeGlobal && registration.Scope.Kind != extension.ScopeSession {
-		return fmt.Errorf("%w: invalid composed tool scope", extension.ErrInvalidRegistration)
+	if err := extension.ValidateIdentifier(registration.Definition.Name); err != nil {
+		return err
 	}
-	if registration.Scope.Kind == extension.ScopeGlobal && registration.Scope.Key != "" || registration.Scope.Kind == extension.ScopeSession && registration.Scope.Key == "" {
-		return fmt.Errorf("%w: invalid composed tool scope key", extension.ErrInvalidRegistration)
+	if err := extension.ValidateScope(registration.Scope); err != nil {
+		return err
 	}
 	if err := tools.ValidateDefinition(registration.Definition); err != nil {
 		return err
@@ -420,8 +422,8 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	instances := make(map[string]bool)
 	toolIdentities := make(map[planToolIdentity]bool)
 	var sessionID session.ID
-	recoverSessionID := func(scope session.ExtensionScope) error {
-		if scope.Kind != string(extension.ScopeSession) || scope.Key == "" {
+	recoverSessionID := func(scope extension.Scope) error {
+		if scope.Kind != extension.ScopeSession || scope.Key == "" {
 			return nil
 		}
 		if sessionID != "" && sessionID != session.ID(scope.Key) {
@@ -516,8 +518,8 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 		}
 		planTools[index] = runtime.PlanTool{
 			Identity: session.ToolPlanIdentity{
-				InstanceID: entry.component.InstanceID, Artifact: artifactIdentity(entry.component.Artifact), Name: entry.Definition.Name,
-				RegistrationID: entry.ID, Scope: scopeIdentity(entry.Scope), SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
+				InstanceID: entry.component.InstanceID, Artifact: entry.component.Artifact, Name: entry.Definition.Name,
+				RegistrationID: entry.ID, Scope: entry.Scope, SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
 			},
 			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 				return tools.Materialize(ctx, definition, scope)
@@ -527,14 +529,14 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	planPrompts := make([]runtime.PlanPrompt, len(prompts))
 	for index, prompt := range prompts {
 		planPrompts[index] = runtime.PlanPrompt{
-			Identity: session.PromptPlanIdentity{InstanceID: prompt.component.InstanceID, Artifact: artifactIdentity(prompt.component.Artifact), Name: prompt.Name, RegistrationID: prompt.ID, Scope: scopeIdentity(prompt.Scope), Order: prompt.Order},
+			Identity: session.PromptPlanIdentity{InstanceID: prompt.component.InstanceID, Artifact: prompt.component.Artifact, Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
 			Prompt:   runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.component.InstanceID, Provider: prompt.Provider},
 		}
 	}
 	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
 		planGuards[index] = runtime.PlanGuard{
-			Identity: session.GuardPlanIdentity{InstanceID: guard.component.InstanceID, Artifact: artifactIdentity(guard.component.Artifact), RegistrationID: guard.ID, Scope: scopeIdentity(guard.Scope), Order: guard.Order},
+			Identity: session.GuardPlanIdentity{InstanceID: guard.component.InstanceID, Artifact: guard.component.Artifact, RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
 			Guard:    runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.component.InstanceID, Guard: guard.Guard},
 		}
 	}
@@ -546,7 +548,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			return nil, rulesErr
 		}
 		planRestrictions[index] = runtime.PlanRestriction{
-			Identity: session.RestrictionPlanIdentity{InstanceID: restriction.component.InstanceID, Artifact: artifactIdentity(restriction.component.Artifact), RegistrationID: restriction.ID, Scope: scopeIdentity(restriction.Scope), RulesHash: rules.Hash},
+			Identity: session.RestrictionPlanIdentity{InstanceID: restriction.component.InstanceID, Artifact: restriction.component.Artifact, RegistrationID: restriction.ID, Scope: restriction.Scope, RulesHash: rules.Hash},
 			Allowed:  rules.Allowed, Denied: rules.Denied,
 		}
 	}
@@ -557,7 +559,7 @@ type planToolSelector func(mountedTool) bool
 
 type planToolIdentity struct {
 	InstanceID     string
-	Scope          session.ExtensionScope
+	Scope          extension.Scope
 	RegistrationID string
 	ToolName       string
 }
@@ -582,7 +584,7 @@ func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
 func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelector {
 	return func(entry mountedTool) bool {
 		return identities[planToolIdentity{
-			InstanceID: entry.component.InstanceID, Scope: scopeIdentity(entry.Scope), RegistrationID: entry.ID, ToolName: entry.Definition.Name,
+			InstanceID: entry.component.InstanceID, Scope: entry.Scope, RegistrationID: entry.ID, ToolName: entry.Definition.Name,
 		}]
 	}
 }
@@ -679,14 +681,6 @@ func capabilityApplies(instanceID string, scope, target extension.Scope, instanc
 		return false
 	}
 	return scope.Kind == extension.ScopeGlobal || scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && scope.Key == target.Key
-}
-
-func artifactIdentity(artifact extension.Artifact) session.ArtifactIdentity {
-	return session.ArtifactIdentity{Name: artifact.Name, Version: artifact.Version, Hash: artifact.Hash, ConfigHash: artifact.ConfigHash, SourceKind: string(artifact.SourceKind)}
-}
-
-func scopeIdentity(scope extension.Scope) session.ExtensionScope {
-	return session.ExtensionScope{Kind: string(scope.Kind), Key: scope.Key}
 }
 
 func toolSchemaHash(definition tools.Definition) (string, error) {

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -182,8 +183,11 @@ func TestAdmitRejectsMismatchedIdempotentRequestState(t *testing.T) {
 		"assistant message": func(r *AdmissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
 		"parent message":    func(r *AdmissionRequest) { r.ParentMessageID = "other-parent" },
 		"config":            func(r *AdmissionRequest) { r.Config.Agent.Mode = "other-mode" },
-		"model":             func(r *AdmissionRequest) { r.Model.Model.ID = "other-model" },
-		"input":             func(r *AdmissionRequest) { r.Input = []*einoschema.Message{{Role: "user", Content: "other-input"}} },
+		"model": func(r *AdmissionRequest) {
+			r.Config.Model.ModelID = "other-model"
+			r.Model.Model.ID = "other-model"
+		},
+		"input": func(r *AdmissionRequest) { r.Input = []*einoschema.Message{{Role: "user", Content: "other-input"}} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -222,8 +226,8 @@ func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
 func testHandlerPlanEntry(instance string) session.HandlerPlanIdentity {
 	return session.HandlerPlanIdentity{
 		InstanceID:    instance,
-		Artifact:      session.ArtifactIdentity{Name: instance, Version: "1", Hash: instance + "-hash", ConfigHash: instance + "-config", SourceKind: string(extension.SourceNative)},
-		Registrations: []session.RegistrationIdentity{{ID: "handler", Contract: "test/handler", Version: "1", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, Kind: session.HandlerNotification}},
+		Artifact:      extension.Artifact{Name: instance, Version: "1", Hash: instance + "-hash", ConfigHash: instance + "-config", SourceKind: extension.SourceNative},
+		Registrations: []session.RegistrationIdentity{{ID: "handler", Contract: "test/handler", Version: "1", Scope: extension.GlobalScope(), Kind: session.HandlerNotification}},
 	}
 }
 
@@ -331,18 +335,18 @@ func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
 	}
 }
 
-func TestAdmitFallsBackToConfigModelIdentity(t *testing.T) {
+func TestAdmitRejectsIncompleteResolvedModelBeforeStoreUse(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
 	request := admissionRequest()
 	request.Model = model.Resolved{}
-	admitted, err := (Admitter{Store: store}).Admit(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Admit error = %v", err)
+	_, err := (Admitter{Store: store}).Admit(context.Background(), request)
+	if !errors.Is(err, ErrInvalidAdmission) {
+		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
-	if admitted.Run.ProviderID != "openai" || admitted.Run.ModelID != "gpt-4.1" {
-		t.Fatalf("run model identity = %q/%q", admitted.Run.ProviderID, admitted.Run.ModelID)
+	if store.getRunCalls.Load() != 0 || len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.events) != 0 {
+		t.Fatalf("invalid admission touched store: sessions=%d runs=%d messages=%d events=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.events))
 	}
 }
 
@@ -395,6 +399,7 @@ func admissionRequest() AdmissionRequest {
 		Model: model.Resolved{
 			Provider: model.Provider{ID: "openai"},
 			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
+			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }),
 		},
 		Input:         []*einoschema.Message{{Role: "user", Content: "hello"}},
 		OwnerID:       "owner-1",
@@ -432,6 +437,8 @@ type admissionStore struct {
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	appendEventErr    error
 	settleToolCallErr error
+	listMessagesCalls atomic.Int32
+	getRunCalls       atomic.Int32
 }
 
 func newAdmissionStore() *admissionStore {
@@ -537,6 +544,7 @@ func (s *admissionStore) Execution(fence session.RunFence) session.ExecutionStor
 }
 
 func (s *admissionStore) GetRun(_ context.Context, id session.RunID) (session.Run, error) {
+	s.getRunCalls.Add(1)
 	run, ok := s.runs[id]
 	if !ok {
 		return session.Run{}, session.ErrNotFound
@@ -606,6 +614,7 @@ func (s *admissionStore) UpdatePart(_ context.Context, part session.Part) error 
 }
 
 func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _ session.ReplayCursor) (session.ReplayBatch, error) {
+	s.listMessagesCalls.Add(1)
 	var messages []session.Message
 	for _, message := range s.messages {
 		if message.SessionID == sessionID {

@@ -305,7 +305,7 @@ func TestToolSettledObserversReceiveDeepClonedAttachmentMetadata(t *testing.T) {
 	}
 	defer plan.Release()
 	source := ToolSettledNotice{Result: ToolResult{Attachments: []Attachment{{Metadata: map[string]string{"owner": "original"}}}}}
-	_ = extension.Notify(plan, context.Background(), ToolSettledPoint, source)
+	extension.Notify(plan, context.Background(), ToolSettledPoint, source)
 	if secondValue != "original" || source.Result.Attachments[0].Metadata["owner"] != "original" {
 		t.Fatalf("attachment metadata leaked: second=%q source=%q", secondValue, source.Result.Attachments[0].Metadata["owner"])
 	}

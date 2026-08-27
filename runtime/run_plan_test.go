@@ -54,24 +54,24 @@ func configureTestTools(orchestrator *StreamingOrchestrator, registry staticTool
 func testToolIdentity(name string) session.ToolPlanIdentity {
 	return session.ToolPlanIdentity{
 		InstanceID: "test-tools",
-		Artifact:   session.ArtifactIdentity{Name: "test-tools", Version: "1", Hash: "test-tools-hash", ConfigHash: "test-tools-config", SourceKind: string(extension.SourceNative)},
-		Name:       name, RegistrationID: "test", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, SchemaHash: "test-schema", ExecutorHash: "test-executor",
+		Artifact:   extension.Artifact{Name: "test-tools", Version: "1", Hash: "test-tools-hash", ConfigHash: "test-tools-config", SourceKind: extension.SourceNative},
+		Name:       name, RegistrationID: "test", Scope: extension.GlobalScope(), SchemaHash: "test-schema", ExecutorHash: "test-executor",
 	}
 }
 
 func testPromptIdentity(name, instance string, order int) session.PromptPlanIdentity {
 	return session.PromptPlanIdentity{
 		InstanceID: instance,
-		Artifact:   session.ArtifactIdentity{Name: "test-prompts", Version: "1", Hash: "test-prompts-hash", ConfigHash: "test-prompts-config", SourceKind: string(extension.SourceNative)},
-		Name:       name, RegistrationID: "test", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)}, Order: order,
+		Artifact:   extension.Artifact{Name: "test-prompts", Version: "1", Hash: "test-prompts-hash", ConfigHash: "test-prompts-config", SourceKind: extension.SourceNative},
+		Name:       name, RegistrationID: "test", Scope: extension.GlobalScope(), Order: order,
 	}
 }
 
 func testGuardIdentity(id string) session.GuardPlanIdentity {
 	return session.GuardPlanIdentity{
 		InstanceID:     "test-guards",
-		Artifact:       session.ArtifactIdentity{Name: "test-guards", Version: "1", Hash: "test-guards-hash", ConfigHash: "test-guards-config", SourceKind: string(extension.SourceNative)},
-		RegistrationID: id, Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)},
+		Artifact:       extension.Artifact{Name: "test-guards", Version: "1", Hash: "test-guards-hash", ConfigHash: "test-guards-config", SourceKind: extension.SourceNative},
+		RegistrationID: id, Scope: extension.GlobalScope(),
 	}
 }
 
@@ -124,10 +124,10 @@ func TestCanonicalizeRestrictionRulesRejectsInvalidPolicies(t *testing.T) {
 func TestNewRunPlanRejectsRestrictionHashThatDoesNotMatchCanonicalRules(t *testing.T) {
 	identity := session.RestrictionPlanIdentity{
 		InstanceID: "restrictions",
-		Artifact: session.ArtifactIdentity{
-			Name: "restrictions", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: string(extension.SourceNative),
+		Artifact: extension.Artifact{
+			Name: "restrictions", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative,
 		},
-		RegistrationID: "policy", RulesHash: "stale", Scope: session.ExtensionScope{Kind: string(extension.ScopeGlobal)},
+		RegistrationID: "policy", RulesHash: "stale", Scope: extension.GlobalScope(),
 	}
 	_, err := NewRunPlan(RunPlanSpec{Restrictions: []PlanRestriction{{Identity: identity, Allowed: []string{"echo"}}}})
 	if !errors.Is(err, ErrExtensionPlanMismatch) {

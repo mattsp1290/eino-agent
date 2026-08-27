@@ -31,3 +31,24 @@ the typed points documented in
 The tool-middleware guest reaches prepare and protected result transformation
 only; around tool execution remains native-only. No guest receives credentials,
 clients, callbacks, raw event payloads, or authority to name arbitrary points.
+
+Register extension-backed guests directly while mounting their component; no
+opaque loaded handle is exposed:
+
+```go
+loader := wasmext.NewLoader()
+mount, err := registry.Mount(ctx, component, composition.InstallerFunc(
+    func(ctx context.Context, registrar *composition.Registrar) error {
+        return loader.RegisterHook(
+            ctx,
+            registrar.Extensions(),
+            extension.Registration{ID: "lifecycle", Scope: extension.GlobalScope()},
+            moduleConfig,
+        )
+    },
+))
+```
+
+Keep `Loader` alive while its mounts are active. Failed preparation or commit
+rolls the module back, `mount.Close` releases it, and `Loader.Close` remains an
+idempotent host shutdown fallback.

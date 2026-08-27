@@ -133,6 +133,12 @@ captures:
 - resolved system prompt;
 - creation time.
 
+Fresh-run resolver output is complete and authoritative: admission validates
+the nested provider and model descriptor identities and never substitutes the
+configured selection. Resume paths that only settle recorded tool work do not
+invent a live streamer; any future resumed model dispatch must resolve and
+validate again first.
+
 Config reloads, composition mount changes, and user follow-ups affect future
 turn snapshots only. They do not mutate an in-flight model call.
 

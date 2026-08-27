@@ -12,6 +12,7 @@ import (
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -38,7 +39,7 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := &LoadedContextSource{module: module, component: component}
+	source := &loadedContextSource{module: module, component: component}
 	defer func() { _ = source.close() }()
 	messages, err := source.loadBoundedContext(context.Background(), runtime.BoundedTurnMetadata{
 		RunID: "run-1", SessionID: "session-1", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1},
@@ -61,7 +62,7 @@ func TestEventSinkUsesContentFreeSummary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &LoadedEventSink{module: module, component: component}
+	sink := &loadedEventSink{module: module, component: component}
 	defer func() { _ = sink.close() }()
 	if err := sink.Emit(context.Background(), runtime.Event{Kind: runtime.EventMessageDelta, Payload: json.RawMessage(`{"content":"SECRET"}`), Time: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
@@ -81,13 +82,13 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook := &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
+	hook := &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
 	defer func() { _ = hook.close() }()
 
 	registry := extension.NewRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "registered-hook", Artifact: extension.Artifact{Name: "registered-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return RegisterHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
+		return registerHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -103,13 +104,13 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 		ProviderID: "provider", ModelID: "model", ToolNames: []string{"echo"}, MessageCount: 2,
 		RoleCounts: runtime.MessageRoleCounts{System: 1, User: 1}, HasSystemPrompt: true,
 	}
-	_ = extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
+	extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
 	if _, err := extension.Invoke(plan, context.Background(), runtime.TurnPreparePoint, metadata, func(_ context.Context, value runtime.BoundedTurnMetadata) (runtime.BoundedTurnMetadata, error) {
 		return value, nil
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_ = extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
+	extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
 
 	for _, operation := range []string{"hook.before-run", "hook.before-turn", "hook.after-turn", "hook.after-run"} {
 		turn := seen[operation]
@@ -132,12 +133,12 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook := &LoadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
+	hook := &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
 	defer func() { _ = hook.close() }()
 	registry := extension.NewRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "early-hook", Artifact: extension.Artifact{Name: "early-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return RegisterHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
+		return registerHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -148,8 +149,8 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 	}
 	defer plan.Release()
 	metadata := runtime.BoundedTurnMetadata{RunID: "run-early", SessionID: "session-early", EpochID: "epoch-early", AgentName: "agent", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true}
-	_ = extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
-	_ = extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
+	extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
+	extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
 	for _, operation := range []string{"hook.after-turn", "hook.after-run"} {
 		turn := seen[operation]
 		if turn.SessionID != "session-early" || turn.EpochID != "epoch-early" || turn.AgentName != "agent" || turn.ProviderID != "provider" || turn.ModelID != "model" || turn.MessageCount != 1 || !turn.HasSystemPrompt {
@@ -180,7 +181,7 @@ func TestFinishRegisteredHookRunsCleanupAndJoinsErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook := &LoadedHook{module: module, component: component, turns: map[session.RunID]wittypes.TurnMetadata{"run-1": {RunID: "run-1"}}}
+	hook := &loadedHook{module: module, component: component, turns: map[session.RunID]wittypes.TurnMetadata{"run-1": {RunID: "run-1"}}}
 	defer func() { _ = hook.close() }()
 	err = finishRegisteredHook(context.Background(), hook, runtime.RunSettledNotice{SessionID: "session-1", Result: runtime.Result{RunID: "run-1"}})
 	joined, ok := err.(interface{ Unwrap() []error })
@@ -233,11 +234,11 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 		if err != nil {
 			t.Fatal(err)
 		}
-		source := &LoadedContextSource{module: module, component: component}
+		source := &loadedContextSource{module: module, component: component}
 		t.Cleanup(func() { _ = source.close() })
 		extensionComponent := extension.Component{InstanceID: instanceID, Artifact: extension.Artifact{Name: instanceID, Version: "1", Hash: instanceID + "-artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 		_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-			return RegisterContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source)
+			return registerContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source)
 		}))
 		if err != nil {
 			t.Fatal(err)
@@ -276,7 +277,7 @@ func TestToolMiddlewareJSONMappingPreservesProtectedContainers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	middleware := &LoadedToolMiddleware{module: module, component: component}
+	middleware := &loadedToolMiddleware{module: module, component: component}
 	defer func() { _ = middleware.close() }()
 	call := runtime.ToolCall{ID: "call-1", Input: json.RawMessage(`{"raw":true}`)}
 	input, err := middleware.beforeToolCall(context.Background(), runtime.Tool{Name: "echo"}, call)
@@ -305,17 +306,27 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
 	cfg := fixtureConfig(t, []byte("all phase b"))
-	if _, err := loader.LoadContextSource(context.Background(), cfg); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := loader.LoadEventSink(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loader.LoadHook(context.Background(), cfg); err != nil {
+	registry := extension.NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "phase-b", Artifact: extension.Artifact{Name: "phase-b", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+		if err := loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg); err != nil {
+			return err
+		}
+		if err := loader.RegisterHook(ctx, registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, cfg); err != nil {
+			return err
+		}
+		return loader.RegisterToolMiddleware(ctx, registrar, extension.Registration{ID: "middleware", Scope: extension.GlobalScope()}, cfg)
+	}))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := loader.LoadToolMiddleware(context.Background(), cfg); err != nil {
+	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	if len(loader.modules) != 1 {
+		t.Fatalf("loader modules after mount close = %d, want only event sink", len(loader.modules))
 	}
 	if err := loader.Close(context.Background()); err != nil || !component.closed.Load() {
 		t.Fatalf("Close = %v, closed=%t", err, component.closed.Load())
@@ -323,6 +334,85 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	if len(contextSourceContract.functions) != 1 || len(eventSinkContract.functions) != 1 || len(hookContract.functions) != 4 || len(toolMiddlewareContract.functions) != 2 {
 		t.Fatal("phase B contract declarations incomplete")
 	}
+}
+
+func TestDirectRegistrationRollsBackOnCompositionInstallerFailure(t *testing.T) {
+	component := contextSourceFakeComponent()
+	loader := NewLoader()
+	loader.factory = fakeFactory(component)
+	registry := composition.NewRegistry(nil)
+	cfg := fixtureConfig(t, []byte("composition rollback"))
+	mountedComponent := extension.Component{InstanceID: "wasm-rollback", Artifact: extension.Artifact{Name: "wasm-rollback", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
+	_, err := registry.Mount(context.Background(), mountedComponent, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
+		if err := loader.RegisterContextSource(ctx, registrar.Extensions(), extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg); err != nil {
+			return err
+		}
+		return registrar.Guard(composition.GuardRegistration{ID: "invalid guard id", Scope: extension.GlobalScope()})
+	}))
+	if err == nil {
+		t.Fatal("Mount succeeded after invalid later capability")
+	}
+	if len(loader.modules) != 0 || !component.closed.Load() {
+		t.Fatalf("failed composition mount retained module: modules=%d closed=%t", len(loader.modules), component.closed.Load())
+	}
+}
+
+func TestDirectRegistrationRollsBackOnCommitFailure(t *testing.T) {
+	component := contextSourceFakeComponent()
+	loader := NewLoader()
+	loader.factory = fakeFactory(component)
+	registry := extension.NewRegistry(nil)
+	mountedComponent := extension.Component{InstanceID: "duplicate", Artifact: extension.Artifact{Name: "duplicate", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
+	if _, err := registry.Mount(context.Background(), mountedComponent, extension.InstallerFunc(func(context.Context, extension.Registrar) error { return nil })); err != nil {
+		t.Fatal(err)
+	}
+	cfg := fixtureConfig(t, []byte("commit rollback"))
+	_, err := registry.Mount(context.Background(), mountedComponent, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+		return loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg)
+	}))
+	if !errors.Is(err, extension.ErrDuplicateInstance) {
+		t.Fatalf("Mount error = %v, want duplicate instance", err)
+	}
+	if len(loader.modules) != 0 || !component.closed.Load() {
+		t.Fatalf("failed commit retained module: modules=%d closed=%t", len(loader.modules), component.closed.Load())
+	}
+}
+
+func TestDirectRegistrationRollbackRacesLoaderClose(t *testing.T) {
+	component := contextSourceFakeComponent()
+	loader := NewLoader()
+	loader.factory = fakeFactory(component)
+	registry := extension.NewRegistry(nil)
+	cfg := fixtureConfig(t, []byte("close race"))
+	prepared, err := registry.PrepareMount(context.Background(), extension.Component{InstanceID: "close-race", Artifact: extension.Artifact{Name: "close-race", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+		return loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	go func() { <-start; errs <- loader.Close(context.Background()) }()
+	go func() { <-start; errs <- prepared.Rollback(context.Background()) }()
+	close(start)
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-errs; err != nil {
+		t.Fatal(err)
+	}
+	if len(loader.modules) != 0 || component.closeCalls.Load() != 1 {
+		t.Fatalf("close race ownership: modules=%d close calls=%d", len(loader.modules), component.closeCalls.Load())
+	}
+}
+
+func contextSourceFakeComponent() *fakeComponent {
+	return &fakeComponent{call: func(_ context.Context, operation string, _ any, output any) error {
+		if operation == "context-source.load-context" {
+			*output.(*[]wittypes.TextMessage) = nil
+		}
+		return nil
+	}}
 }
 
 func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
@@ -336,7 +426,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := &LoadedContextSource{module: contextModule, component: contextComponent}
+	source := &loadedContextSource{module: contextModule, component: contextComponent}
 	defer func() { _ = source.close() }()
 	eventCalls := 0
 	eventComponent := &fakeComponent{call: func(_ context.Context, _ string, _ any, _ any) error { eventCalls++; return nil }}
@@ -344,13 +434,13 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sink := &LoadedEventSink{module: eventModule, component: eventComponent}
+	sink := &loadedEventSink{module: eventModule, component: eventComponent}
 	defer func() { _ = sink.close() }()
 
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "wasm-points", Artifact: extension.Artifact{Name: "wasm-points", Version: "0.1.0", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := RegisterContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source); err != nil {
+		if err := registerContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source); err != nil {
 			return err
 		}
 		return RegisterEventSink(registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, sink)
@@ -375,7 +465,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	if contextTurn.AgentName != "agent" || contextTurn.AgentMode != "primary" || contextTurn.ProviderID != "provider" || contextTurn.ModelID != "model" || !contextTurn.HasSystemPrompt || contextTurn.RoleCounts.User != 1 {
 		t.Fatalf("registered context metadata = %#v", contextTurn)
 	}
-	_ = extension.Notify(plan, context.Background(), runtime.EventPublishedPoint, runtime.Event{Kind: runtime.EventRunStarted})
+	extension.Notify(plan, context.Background(), runtime.EventPublishedPoint, runtime.Event{Kind: runtime.EventRunStarted})
 	if eventCalls != 1 {
 		t.Fatalf("event calls = %d", eventCalls)
 	}

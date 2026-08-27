@@ -14,6 +14,11 @@ resolved provider, model descriptor, and that sole execution transport. An
 adapter wrapping an Eino `ToolCallingChatModel` uses `model.NewEinoStreamer`;
 the wrapper prepends the system message and binds tools exactly once.
 
+`model.ValidateResolved` is the canonical boundary for resolver output. It
+requires the provider, descriptor provider, selected model, and non-nil
+streamer to agree before runtime reads history or performs admission. Runtime
+does not fall back to configured IDs after resolution.
+
 Provider request identity is represented by `model.Identity`, a model-layer
 shape that intentionally does not import `runtime`, `session`, or the
 `context` package. Runtime maps its richer turn identity into this provider

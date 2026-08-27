@@ -67,6 +67,9 @@ func (a Admitter) Admit(ctx context.Context, request AdmissionRequest) (Admitted
 	if a.Store == nil {
 		return AdmittedRun{}, fmt.Errorf("%w: store required", ErrInvalidAdmission)
 	}
+	if err := model.ValidateResolved(request.Config.Model, request.Model); err != nil {
+		return AdmittedRun{}, fmt.Errorf("%w: %w", ErrInvalidAdmission, err)
+	}
 	if err := validateAdmissionIDs(request.IDs); err != nil {
 		return AdmittedRun{}, err
 	}
@@ -141,7 +144,7 @@ func (a Admitter) existingAdmission(ctx context.Context, request AdmissionReques
 		}
 		return AdmittedRun{}, err
 	}
-	if sessionRecord.ID != request.IDs.SessionID || assistantMessage.ID != request.IDs.AssistantMessageID || assistantMessage.SessionID != sessionRecord.ID || assistantMessage.RunID != runRecord.ID || assistantMessage.ParentID != request.ParentMessageID || assistantMessage.Agent != request.Config.Agent.Name || assistantMessage.ModelID != admissionModelID(request) {
+	if sessionRecord.ID != request.IDs.SessionID || assistantMessage.ID != request.IDs.AssistantMessageID || assistantMessage.SessionID != sessionRecord.ID || assistantMessage.RunID != runRecord.ID || assistantMessage.ParentID != request.ParentMessageID || assistantMessage.Agent != request.Config.Agent.Name || assistantMessage.ModelID != string(request.Model.Model.ID) {
 		return AdmittedRun{}, session.ErrConflict
 	}
 	return buildAdmittedRun(sessionRecord, runRecord, assistantMessage, snapshot, now), nil
@@ -206,7 +209,7 @@ func (a Admitter) afterDurableAdmission(ctx context.Context, admitted AdmittedRu
 		})
 	}
 	if a.Extensions != nil {
-		_ = extension.Notify(a.Extensions, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: request.ExtensionPlan, Metadata: boundedTurnMetadata(admitted.Snapshot), Time: now})
+		extension.Notify(a.Extensions, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: request.ExtensionPlan, Metadata: boundedTurnMetadata(admitted.Snapshot), Time: now})
 	}
 	return nil
 }
@@ -278,7 +281,7 @@ func canonicalAdmissionWorkspace(root string) (string, error) {
 }
 
 func validateExistingAdmission(run session.Run, request AdmissionRequest) error {
-	if run.ID != request.IDs.RunID || run.ClaimToken != request.IDs.RunClaimToken || run.SessionID != request.IDs.SessionID || run.ContextEpoch != request.IDs.ContextEpochID || run.ParentMsgID != request.ParentMessageID || run.Agent != request.Config.Agent.Name || run.ProviderID != admissionProviderID(request) || run.ModelID != admissionModelID(request) || run.Config[admissionFingerprintKey] != request.admissionFingerprint {
+	if run.ID != request.IDs.RunID || run.ClaimToken != request.IDs.RunClaimToken || run.SessionID != request.IDs.SessionID || run.ContextEpoch != request.IDs.ContextEpochID || run.ParentMsgID != request.ParentMessageID || run.Agent != request.Config.Agent.Name || run.ProviderID != string(request.Model.Provider.ID) || run.ModelID != string(request.Model.Model.ID) || run.Config[admissionFingerprintKey] != request.admissionFingerprint {
 		return session.ErrConflict
 	}
 	return nil
@@ -343,8 +346,8 @@ func admissionRun(request AdmissionRequest, sessionID session.ID, now time.Time)
 		OwnerID:       request.OwnerID,
 		ClaimToken:    request.IDs.RunClaimToken,
 		Agent:         request.Config.Agent.Name,
-		ProviderID:    admissionProviderID(request),
-		ModelID:       admissionModelID(request),
+		ProviderID:    string(request.Model.Provider.ID),
+		ModelID:       string(request.Model.Model.ID),
 		ContextEpoch:  request.IDs.ContextEpochID,
 		Status:        session.RunPending,
 		Config:        admissionConfig(request),
@@ -362,7 +365,7 @@ func admissionAssistantMessage(request AdmissionRequest, sessionID session.ID, r
 		ParentID:  request.ParentMessageID,
 		Role:      session.RoleAssistant,
 		Agent:     request.Config.Agent.Name,
-		ModelID:   admissionModelID(request),
+		ModelID:   string(request.Model.Model.ID),
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -371,8 +374,8 @@ func admissionAssistantMessage(request AdmissionRequest, sessionID session.ID, r
 func admissionEvent(request AdmissionRequest, sessionID session.ID, runID session.RunID, messageID session.MessageID, now time.Time) session.EventRecord {
 	payload := mustJSON(map[string]string{
 		"agent":       request.Config.Agent.Name,
-		"provider_id": admissionProviderID(request),
-		"model_id":    admissionModelID(request),
+		"provider_id": string(request.Model.Provider.ID),
+		"model_id":    string(request.Model.Model.ID),
 	})
 	return session.EventRecord{
 		ID:         request.IDs.EventID,
@@ -380,27 +383,13 @@ func admissionEvent(request AdmissionRequest, sessionID session.ID, runID sessio
 		RunID:      runID,
 		MessageID:  messageID,
 		EpochID:    request.IDs.ContextEpochID,
-		ProviderID: admissionProviderID(request),
-		ModelID:    admissionModelID(request),
+		ProviderID: string(request.Model.Provider.ID),
+		ModelID:    string(request.Model.Model.ID),
 		Kind:       string(EventRunStarted),
 		Payload:    payload,
 		Redaction:  session.RedactionMetadata,
 		CreatedAt:  now,
 	}
-}
-
-func admissionProviderID(request AdmissionRequest) string {
-	if request.Model.Provider.ID != "" {
-		return string(request.Model.Provider.ID)
-	}
-	return string(request.Config.Model.ProviderID)
-}
-
-func admissionModelID(request AdmissionRequest) string {
-	if request.Model.Model.ID != "" {
-		return string(request.Model.Model.ID)
-	}
-	return string(request.Config.Model.ModelID)
 }
 
 func admissionConfig(request AdmissionRequest) map[string]string {

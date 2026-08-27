@@ -136,5 +136,5 @@ func payloadErrorKind(err error) ErrorKind {
 }
 
 var (
-	_ permissions.Policy = (*LoadedPermissionsPolicy)(nil)
+	_ permissions.Policy = (*loadedPermissionsPolicy)(nil)
 )

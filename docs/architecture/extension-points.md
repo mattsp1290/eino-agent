@@ -161,4 +161,9 @@ session tool, prompt, context contribution, guard, prepare interceptor,
 settled observer, and cleanup effect. Its test demonstrates concurrent session
 visibility and quiescent unmount. Curated Wasm guests live under
 [`examples/wasm-extensions`](../../examples/wasm-extensions); their adapters
-register the same runtime points without exposing a generic string bus.
+register the same runtime points without exposing a generic string bus. Inside
+a composition installer, direct registration uses the extension registrar, for
+example `loader.RegisterHook(ctx, registrar.Extensions(), spec, moduleConfig)`.
+Preparation/commit rollback and mount close untrack and finalize the module;
+`Loader.Close` safely races those cleanup paths and remains the host-wide
+shutdown boundary.

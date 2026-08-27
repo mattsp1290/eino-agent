@@ -85,7 +85,7 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if spec.Dispatch != nil {
 		byInstance := make(map[string]int)
 		for _, diagnostic := range spec.Dispatch.Diagnostics() {
-			if diagnostic.InstanceID == "" || diagnostic.ID == "" || diagnostic.Contract.ID == "" || diagnostic.Contract.Version == "" {
+			if extension.ValidateComponent(extension.Component{InstanceID: diagnostic.InstanceID, Artifact: diagnostic.Artifact}) != nil || extension.ValidateIdentifier(diagnostic.ID) != nil || extension.ValidateContract(diagnostic.Contract) != nil || extension.ValidateScope(diagnostic.Scope) != nil {
 				return fail(fmt.Errorf("%w: invalid dispatch diagnostic", ErrExtensionPlanMismatch))
 			}
 			index, ok := byInstance[diagnostic.InstanceID]
@@ -94,16 +94,12 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 				byInstance[diagnostic.InstanceID] = index
 				descriptor.Handlers = append(descriptor.Handlers, session.HandlerPlanIdentity{
 					InstanceID: diagnostic.InstanceID,
-					Artifact: session.ArtifactIdentity{
-						Name: diagnostic.Artifact.Name, Version: diagnostic.Artifact.Version,
-						Hash: diagnostic.Artifact.Hash, ConfigHash: diagnostic.Artifact.ConfigHash,
-						SourceKind: string(diagnostic.Artifact.SourceKind),
-					},
+					Artifact:   diagnostic.Artifact,
 				})
 			}
 			descriptor.Handlers[index].Registrations = append(descriptor.Handlers[index].Registrations, session.RegistrationIdentity{
 				ID: diagnostic.ID, Contract: diagnostic.Contract.ID, Version: diagnostic.Contract.Version,
-				Order: diagnostic.Order, Scope: session.ExtensionScope{Kind: string(diagnostic.Scope.Kind), Key: diagnostic.Scope.Key}, Kind: session.HandlerKind(diagnostic.Kind),
+				Order: diagnostic.Order, Scope: diagnostic.Scope, Kind: session.HandlerKind(diagnostic.Kind),
 			})
 		}
 	}

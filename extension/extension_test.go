@@ -3,6 +3,7 @@ package extension
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -18,7 +19,7 @@ type testPayload struct {
 }
 
 var (
-	testNotice = NewNotification(Contract{ID: "test/notice", Version: "1"}, NotificationContained, clonePayload)
+	testNotice = NewNotification(Contract{ID: "test/notice", Version: "1"}, clonePayload)
 	testAround = NewRequiredInterceptor(Contract{ID: "test/around", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
 		if original.Protected != candidate.Protected {
 			return ErrProtectedMutation
@@ -156,9 +157,7 @@ func TestCallbackIdentityDistinguishesReusedInstanceID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if failures := Notify(plan, context.Background(), testNotice, testPayload{}); len(failures) != 0 {
-		t.Fatalf("closing replacement from old callback failed: %v", failures)
-	}
+	Notify(plan, context.Background(), testNotice, testPayload{})
 	plan.Release()
 	if err := old.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -204,11 +203,46 @@ func TestScopedOrderingDefensiveCopyAndContainedFailures(t *testing.T) {
 	}
 	defer plan.Release()
 	payload := testPayload{Protected: "fixed", Values: []string{"original"}}
-	if failures := Notify(plan, context.Background(), testNotice, payload); len(failures) != 0 {
-		t.Fatalf("contained failures = %#v", failures)
-	}
+	Notify(plan, context.Background(), testNotice, payload)
 	if !reflect.DeepEqual(sequence, []string{"a", "z", "b"}) || payload.Values[0] != "original" || diagnostics.Load() != 1 {
 		t.Fatalf("sequence=%v payload=%v diagnostics=%d", sequence, payload, diagnostics.Load())
+	}
+}
+
+func TestNotifyReportsEveryFailureAndContinues(t *testing.T) {
+	const failureCount = maxReportedFailures + 5
+	var diagnostics atomic.Int32
+	var completed atomic.Int32
+	registry := NewRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))
+	_, err := registry.Mount(context.Background(), testComponent("many-failures"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		for index := 0; index < failureCount; index++ {
+			id := fmt.Sprintf("failure-%d", index)
+			if err := On(registrar, testNotice, spec("many-failures", id, index, GlobalScope()), func(context.Context, testPayload) error {
+				return errors.New("observer failed")
+			}); err != nil {
+				return err
+			}
+		}
+		return On(registrar, testNotice, spec("many-failures", "tail", failureCount, GlobalScope()), func(context.Context, testPayload) error {
+			completed.Add(1)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+
+	Notify(plan, context.Background(), testNotice, testPayload{})
+	if got := diagnostics.Load(); got != failureCount {
+		t.Fatalf("reported failures = %d, want %d", got, failureCount)
+	}
+	if completed.Load() != 1 {
+		t.Fatal("notification stopped before the final observer")
 	}
 }
 
@@ -260,9 +294,7 @@ func TestRegistrationAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Snapshot(%q) = %v", key, err)
 		}
-		if failures := Notify(plan, context.Background(), testNotice, testPayload{}); len(failures) != 0 {
-			t.Fatalf("Notify(%q) = %v", key, failures)
-		}
+		Notify(plan, context.Background(), testNotice, testPayload{})
 		plan.Release()
 		if counts[index] != 1 {
 			t.Fatalf("callback count for %q = %d, want 1", key, counts[index])
@@ -568,7 +600,7 @@ func BenchmarkSnapshot(b *testing.B) {
 func BenchmarkNotifyZero(b *testing.B) {
 	plan := &Plan{}
 	for range b.N {
-		_ = Notify(plan, context.Background(), testNotice, testPayload{})
+		Notify(plan, context.Background(), testNotice, testPayload{})
 	}
 }
 
@@ -586,7 +618,7 @@ func BenchmarkNotifyTen(b *testing.B) {
 	defer plan.Release()
 	b.ResetTimer()
 	for range b.N {
-		_ = Notify(plan, context.Background(), testNotice, testPayload{})
+		Notify(plan, context.Background(), testNotice, testPayload{})
 	}
 }
 

@@ -51,7 +51,7 @@ func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run ses
 	if err := e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement); err != nil {
 		return session.ToolSettlement{}, err
 	}
-	_ = extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
+	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
 		SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name,
 		Status: settlement.Status, Result: result, Error: classifyExtensionError(context.Canceled),
 	})
@@ -76,7 +76,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 		e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, session.ToolCallFailed, completedAt.Sub(claimed.StartedAt), err, nil)
 		return settledTool{}, err
 	}
-	_ = extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
+	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: claimed.ID, ToolName: claimed.Name,
 		Status: settlement.Status, Result: outcome.Result, Error: classifyExtensionError(outcome.RawError),
 	})

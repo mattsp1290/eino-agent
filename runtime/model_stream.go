@@ -51,7 +51,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			o.endObservedStream(obsStream, streamUsage)
 		}
 		if modelRequested && ledgerTransitionOK {
-			_ = extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
+			extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
 		}
 	}()
 	observer := &streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
@@ -82,7 +82,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		streamErr = err
 		return nil, err
 	}
-	_ = extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecord.ID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
+	extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecord.ID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
 	modelRequested = true
 	reader, err := extension.Invoke(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), Audited: audited, ContentHash: contentHash}, func(ctx context.Context, _ ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		return openStream(ctx, snapshot.Model, request)
