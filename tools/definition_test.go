@@ -72,7 +72,7 @@ func TestMaterializeDecodeAndExecuteTypedTool(t *testing.T) {
 	}
 }
 
-func TestMaterializeDecodeDoesNotUseOutputEncoder(t *testing.T) {
+func TestMaterializeTypedExecutorEncodesOutput(t *testing.T) {
 	t.Parallel()
 	type input struct {
 		Query string `json:"query"`
@@ -82,20 +82,9 @@ func TestMaterializeDecodeDoesNotUseOutputEncoder(t *testing.T) {
 	}
 	definition := Definition{
 		Name: "search",
-		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-			var value input
-			return value, json.Unmarshal(raw, &value)
-		},
-		Encode: func(_ context.Context, value any) (json.RawMessage, error) {
-			result, ok := value.(output)
-			if !ok {
-				return nil, fmt.Errorf("expected output, got %T", value)
-			}
-			return json.Marshal(result)
-		},
-		Execute: func(_ context.Context, execution Execution) (any, error) {
-			return output{Results: []string{execution.Input.(input).Query}}, nil
-		},
+		Execute: TypedExecutor[input, output](func(_ context.Context, execution TypedExecution[input]) (output, error) {
+			return output{Results: []string{execution.Input.Query}}, nil
+		}),
 	}
 	tool, err := Materialize(context.Background(), definition, toolScope("session"))
 	if err != nil {
@@ -151,22 +140,23 @@ func TestMaterializeClonesParameterSchemas(t *testing.T) {
 }
 
 func testDefinition(name string) Definition {
+	type input struct {
+		Text string `json:"text"`
+	}
 	return Definition{
 		Name: name, Description: "echo input",
-		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-			var value struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(raw, &value); err != nil {
-				return nil, err
-			}
+		Normalize: TypedNormalizer(func(_ context.Context, value input) (input, error) {
 			if value.Text == "" {
-				return nil, errors.New("text required")
+				return input{}, errors.New("text required")
 			}
 			return value, nil
-		},
-		Encode:    func(_ context.Context, value any) (json.RawMessage, error) { return json.Marshal(value) },
-		Execute:   func(_ context.Context, execution Execution) (any, error) { return execution.Input, nil },
+		}),
+		Execute: TypedExecutor[input, input](func(_ context.Context, execution TypedExecution[input]) (input, error) {
+			if execution.Input.Text == "" {
+				return input{}, fmt.Errorf("%w: text required", ErrMalformedInput)
+			}
+			return execution.Input, nil
+		}),
 		RetrySafe: true, Permissions: []string{"workspace:read"}, Metadata: map[string]string{"kind": "test"},
 	}
 }

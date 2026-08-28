@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strconv"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -92,20 +91,7 @@ func (s ClientToolSnapshot) Definitions(dispatcher ClientToolDispatcher) ([]agen
 		}
 		result = append(result, agenttools.Definition{
 			Name: info.Name, Description: info.Desc, Parameters: info.ParamsOneOf,
-			Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-				if !json.Valid(raw) {
-					return nil, fmt.Errorf("%w: invalid json", agenttools.ErrMalformedInput)
-				}
-				return cloneRaw(raw), nil
-			},
-			Encode: func(_ context.Context, value any) (json.RawMessage, error) {
-				raw, ok := value.(json.RawMessage)
-				if !ok || !json.Valid(raw) {
-					return nil, fmt.Errorf("invalid client tool json result")
-				}
-				return cloneRaw(raw), nil
-			},
-			Execute: func(ctx context.Context, execution agenttools.Execution) (any, error) {
+			Execute: func(ctx context.Context, execution agenttools.Execution) (json.RawMessage, error) {
 				if dispatcher == nil {
 					return nil, ErrClientToolDispatchRequired
 				}

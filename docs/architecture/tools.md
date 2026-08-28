@@ -11,12 +11,12 @@ registry and selects and seals definitions into immutable run plans.
 The `tools` package owns:
 
 - registration-time validation for tool definitions;
-- typed decoding of model-provided JSON input;
+- validation and canonicalization of model-provided JSON-object input;
 - deterministic normalization to a non-null JSON object;
-- explicit permission-pattern derivation from typed normalized input;
-- typed execution context carrying the durable runtime tool call and bounded,
+- explicit permission-pattern derivation from canonical normalized input;
+- JSON-native execution context carrying the durable runtime tool call and bounded,
   content-free turn metadata;
-- structured output encoding;
+- JSON output validation and runtime-owned result encoding;
 - per-session authority scope;
 - model-facing `schema.ToolInfo` assembly without reusing mutable containers.
 
@@ -26,7 +26,7 @@ Concrete leaf behavior remains outside this package.
 complete set atomically through `composition.Registry`.
 
 `wasmext.Loader.LoadTool` also returns an ordinary `tools.Definition`. Its
-decode and encode functions validate bounded JSON and its executor invokes the
+normalizer and executor validate bounded JSON, and the executor invokes the
 versioned `tool` WIT world. Mount it through `composition.Registrar.Tool` like
 a native definition; the Loader remains the single `Close(ctx)` lifecycle
 owner.
@@ -49,14 +49,14 @@ graph, provider clients, or executable definition.
 
 ## Input And Output
 
-Every tool definition provides:
+Every tool definition provides one JSON-native `Executor`. It receives
+canonical object input plus the durable runtime call context and returns valid
+JSON. A definition may provide `Normalize` and `Pattern` callbacks over that
+same JSON boundary. Hosts that prefer typed functions use `TypedNormalizer`,
+`TypedPermissionPattern`, and `TypedExecutor`; those adapters do not create a
+second runtime contract.
 
-- a `Decoder` from raw model JSON into a typed host value;
-- an `Executor` over that typed value and runtime call context;
-- an `Encoder` from typed output into structured JSON.
-
-A definition may provide `Pattern` to derive permission identity from its typed
-input. Runtime invokes it after the final prepare interceptor and persists the
+Runtime invokes `Pattern` after the final prepare interceptor and persists the
 result with the canonical object input. Runtime never probes generic JSON for
 permission field names. Definitions without a callback use the tool name.
 

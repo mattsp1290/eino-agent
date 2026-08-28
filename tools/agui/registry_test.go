@@ -178,9 +178,9 @@ func mountGlobalTool(registry *composition.Registry, name string) (*composition.
 	return registry.Mount(context.Background(), component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
 		definition := agenttools.Definition{
 			Name: name, Description: "server", Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
-			Decode:  func(context.Context, json.RawMessage) (any, error) { return struct{}{}, nil },
-			Encode:  func(context.Context, any) (json.RawMessage, error) { return json.RawMessage(`{}`), nil },
-			Execute: func(context.Context, agenttools.Execution) (any, error) { return json.RawMessage(`{}`), nil },
+			Execute: func(context.Context, agenttools.Execution) (json.RawMessage, error) {
+				return json.RawMessage(`{}`), nil
+			},
 		}
 		return registrar.Tool(composition.ToolRegistration{ID: name, Scope: extension.GlobalScope(), Definition: definition})
 	}))

@@ -72,22 +72,21 @@ type ToolExecution struct {
 	Call ToolCall
 }
 
-type ToolOutcome struct {
-	Call               ToolCall
-	Disposition        ToolDisposition
-	Result             ToolResult
-	RawError           error
-	Error              ClassifiedError
-	PermissionMetadata map[string]string
-	seal               *toolOutcomeSeal
+// ToolResultTransform is the data-only input for result middleware. It omits
+// every executable tool and approval capability.
+type ToolResultTransform struct {
+	ToolName string
+	Call     ToolCall
+	Result   ToolResult
 }
 
-type toolOutcomeSeal struct {
-	Call               ToolCall
-	Disposition        ToolDisposition
-	RawError           error
-	Error              ClassifiedError
-	PermissionMetadata map[string]string
+type toolOutcome struct {
+	Call        ToolCall
+	Disposition ToolDisposition
+	Result      ToolResult
+	RawError    error
+	Error       ClassifiedError
+	Permission  toolPermissionState
 }
 
 func evaluateToolGuards(ctx context.Context, plan *RunPlan, tool Tool, call ToolCall) (ToolGuardResult, error) {
@@ -172,11 +171,8 @@ func validateToolExecutionInput(original, candidate ToolExecution) error {
 	return nil
 }
 
-func validateToolExecutionResult(original ToolExecution, output ToolOutcome) error {
-	if output.seal == nil || !sameProtectedToolCall(original.Call, output.Call) {
-		return extension.ErrProtectedMutation
-	}
-	return validateToolOutcome(output)
+func validateToolExecutionResult(_ ToolExecution, output ToolResult) error {
+	return validateToolResult(output)
 }
 
 func sameProtectedTool(left, right Tool) bool {
@@ -210,45 +206,28 @@ func sameProtectedToolCall(left, right ToolCall) bool {
 	return reflect.DeepEqual(cloneToolCall(left), cloneToolCall(right))
 }
 
-func cloneToolOutcome(value ToolOutcome) ToolOutcome {
-	value.Call = cloneToolCall(value.Call)
-	value.Result = cloneRuntimeToolResult(value.Result)
-	value.PermissionMetadata = cloneStringMap(value.PermissionMetadata)
-	return value
-}
-
-func sealToolOutcome(value ToolOutcome) ToolOutcome {
+func cloneToolResultTransformChecked(value ToolResultTransform) (ToolResultTransform, error) {
 	value.Call = extensionToolCall(value.Call)
-	value.seal = &toolOutcomeSeal{Call: cloneToolCall(value.Call), Disposition: value.Disposition, RawError: value.RawError, Error: value.Error, PermissionMetadata: cloneStringMap(value.PermissionMetadata)}
-	return value
+	value.Result = cloneRuntimeToolResult(value.Result)
+	return value, nil
 }
 
-func validateToolOutcome(value ToolOutcome) error {
-	switch value.Disposition {
-	case ToolExecuted, ToolDenied, ToolApprovalRequired, ToolInterrupted, ToolFailed:
-	default:
-		return errors.New("invalid tool outcome disposition")
-	}
-	if value.seal != nil {
-		protected := toolOutcomeSeal{Call: value.Call, Disposition: value.Disposition, RawError: value.RawError, Error: value.Error, PermissionMetadata: value.PermissionMetadata}
-		if !reflect.DeepEqual(*value.seal, protected) {
-			return extension.ErrProtectedMutation
-		}
+func validateToolResultTransformInput(original, candidate ToolResultTransform) error {
+	if original.ToolName != candidate.ToolName || !sameProtectedToolCall(original.Call, candidate.Call) {
+		return extension.ErrProtectedMutation
 	}
 	return nil
 }
 
-func validateToolOutcomeInput(original, candidate ToolOutcome) error {
-	left, right := cloneToolOutcome(original), cloneToolOutcome(candidate)
-	left.Result, right.Result = ToolResult{}, ToolResult{}
-	if !reflect.DeepEqual(left, right) {
-		return extension.ErrProtectedMutation
+func validateToolResult(result ToolResult) error {
+	if len(result.Structured) != 0 && !json.Valid(result.Structured) {
+		return errors.New("invalid structured tool result")
 	}
-	return validateToolOutcome(candidate)
+	return nil
 }
 
-func validateToolOutcomeResult(original ToolOutcome, output ToolOutcome) error {
-	return validateToolOutcomeInput(original, output)
+func validateToolResultTransformResult(_ ToolResultTransform, output ToolResult) error {
+	return validateToolResult(output)
 }
 
 func cloneToolChecked(tool Tool) (Tool, error) {

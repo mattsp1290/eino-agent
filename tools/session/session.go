@@ -2,7 +2,6 @@ package sessiontools
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sync"
 	"unicode/utf8"
@@ -153,17 +152,15 @@ func planSetDefinition(state *State) agenttools.Definition {
 	return agenttools.Definition{
 		Name:        NamePlanSet,
 		Description: "Replace the current session plan state.",
-		Decode:      decodeJSON[planSetInput],
-		Encode:      encodeJSON,
-		Execute: func(_ context.Context, execution agenttools.Execution) (any, error) {
-			input := execution.Input.(planSetInput)
+		Execute: agenttools.TypedExecutor[planSetInput, map[string]any](func(_ context.Context, execution agenttools.TypedExecution[planSetInput]) (map[string]any, error) {
+			input := execution.Input
 			items := clonePlan(input.Items)
 			state.mu.Lock()
 			state.ensure()
 			state.plans[execution.Context.Turn.SessionID] = items
 			state.mu.Unlock()
 			return map[string]any{"items": items}, nil
-		},
+		}),
 		RetrySafe:   true,
 		Scope:       sessionScope("plan"),
 		Permissions: []string{"session.plan"},
@@ -176,14 +173,12 @@ func planGetDefinition(state *State) agenttools.Definition {
 	return agenttools.Definition{
 		Name:        NamePlanGet,
 		Description: "Read the current session plan state.",
-		Decode:      decodeJSON[struct{}],
-		Encode:      encodeJSON,
-		Execute: func(_ context.Context, execution agenttools.Execution) (any, error) {
+		Execute: agenttools.TypedExecutor[struct{}, map[string]any](func(_ context.Context, execution agenttools.TypedExecution[struct{}]) (map[string]any, error) {
 			state.mu.RLock()
 			items := clonePlan(state.plans[execution.Context.Turn.SessionID])
 			state.mu.RUnlock()
 			return map[string]any{"items": items}, nil
-		},
+		}),
 		RetrySafe:   true,
 		Scope:       sessionScope("plan"),
 		Permissions: []string{"session.plan"},
@@ -196,12 +191,10 @@ func retainOutputDefinition(state *State) agenttools.Definition {
 	return agenttools.Definition{
 		Name:        NameRetainedOutput,
 		Description: "Retain bounded session output for later host retrieval.",
-		Decode:      decodeJSON[retainInput],
-		Encode:      encodeJSON,
-		Execute: func(_ context.Context, execution agenttools.Execution) (any, error) {
-			input := execution.Input.(retainInput)
+		Execute: agenttools.TypedExecutor[retainInput, RetainedOutput](func(_ context.Context, execution agenttools.TypedExecution[retainInput]) (RetainedOutput, error) {
+			input := execution.Input
 			if input.ID == "" {
-				return nil, fmt.Errorf("id required")
+				return RetainedOutput{}, fmt.Errorf("id required")
 			}
 			limit := state.maxRetainedBytes()
 			output := RetainedOutput{ID: input.ID, OriginalSize: int64(len(input.Content))}
@@ -234,7 +227,7 @@ func retainOutputDefinition(state *State) agenttools.Definition {
 			state.outputBytes[sessionID] += output.InlineSize
 			state.mu.Unlock()
 			return output, nil
-		},
+		}),
 		RetrySafe:   true,
 		Scope:       sessionScope("retained_output"),
 		Permissions: []string{"session.retained_output"},
@@ -247,19 +240,17 @@ func subagentDefinition(runner SubagentRunner) agenttools.Definition {
 	return agenttools.Definition{
 		Name:        NameSubagent,
 		Description: "Request a host-provided subagent task for this session.",
-		Decode:      decodeJSON[subagentInput],
-		Normalize:   normalizeSubagentInput,
-		Pattern: func(_ context.Context, input any) (string, error) {
-			return input.(subagentInput).Task, nil
-		},
-		Encode: encodeJSON,
-		Execute: func(ctx context.Context, execution agenttools.Execution) (any, error) {
-			input := execution.Input.(subagentInput)
+		Normalize:   agenttools.TypedNormalizer(normalizeSubagentInput),
+		Pattern: agenttools.TypedPermissionPattern(func(_ context.Context, input subagentInput) (string, error) {
+			return input.Task, nil
+		}),
+		Execute: agenttools.TypedExecutor[subagentInput, SubagentResult](func(ctx context.Context, execution agenttools.TypedExecution[subagentInput]) (SubagentResult, error) {
+			input := execution.Input
 			if input.Task == "" {
-				return nil, fmt.Errorf("task required")
+				return SubagentResult{}, fmt.Errorf("task required")
 			}
 			return runner.RunSubagent(ctx, SubagentRequest{SessionID: execution.Context.Turn.SessionID, Task: input.Task})
-		},
+		}),
 		Scope:       sessionScope("subagent"),
 		Permissions: []string{"session.subagent"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
@@ -271,19 +262,17 @@ func skillLoadDefinition(loader SkillLoader) agenttools.Definition {
 	return agenttools.Definition{
 		Name:        NameSkillLoad,
 		Description: "Request host-provided skill loading for this session.",
-		Decode:      decodeJSON[skillInput],
-		Normalize:   normalizeSkillInput,
-		Pattern: func(_ context.Context, input any) (string, error) {
-			return input.(skillInput).Name, nil
-		},
-		Encode: encodeJSON,
-		Execute: func(ctx context.Context, execution agenttools.Execution) (any, error) {
-			input := execution.Input.(skillInput)
+		Normalize:   agenttools.TypedNormalizer(normalizeSkillInput),
+		Pattern: agenttools.TypedPermissionPattern(func(_ context.Context, input skillInput) (string, error) {
+			return input.Name, nil
+		}),
+		Execute: agenttools.TypedExecutor[skillInput, SkillResult](func(ctx context.Context, execution agenttools.TypedExecution[skillInput]) (SkillResult, error) {
+			input := execution.Input
 			if input.Name == "" {
-				return nil, fmt.Errorf("name required")
+				return SkillResult{}, fmt.Errorf("name required")
 			}
 			return loader.LoadSkill(ctx, SkillRequest{SessionID: execution.Context.Turn.SessionID, Name: input.Name})
-		},
+		}),
 		Scope:       sessionScope("skill"),
 		Permissions: []string{"session.skill"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
@@ -306,18 +295,6 @@ type subagentInput struct {
 
 type skillInput struct {
 	Name string `json:"name"`
-}
-
-func decodeJSON[T any](_ context.Context, raw json.RawMessage) (any, error) {
-	var value T
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return nil, err
-	}
-	return value, nil
-}
-
-func encodeJSON(_ context.Context, value any) (json.RawMessage, error) {
-	return json.Marshal(value)
 }
 
 func sessionScope(_ string) agenttools.ScopeResolver {
@@ -380,18 +357,16 @@ func validUTF8Prefix(content string, limit int) string {
 	return content[:limit]
 }
 
-func normalizeSubagentInput(_ context.Context, input any) (json.RawMessage, error) {
-	value := input.(subagentInput)
+func normalizeSubagentInput(_ context.Context, value subagentInput) (subagentInput, error) {
 	if value.Task == "" {
-		return nil, fmt.Errorf("task required")
+		return subagentInput{}, fmt.Errorf("task required")
 	}
-	return json.Marshal(value)
+	return value, nil
 }
 
-func normalizeSkillInput(_ context.Context, input any) (json.RawMessage, error) {
-	value := input.(skillInput)
+func normalizeSkillInput(_ context.Context, value skillInput) (skillInput, error) {
 	if value.Name == "" {
-		return nil, fmt.Errorf("name required")
+		return skillInput{}, fmt.Errorf("name required")
 	}
-	return json.Marshal(value)
+	return value, nil
 }

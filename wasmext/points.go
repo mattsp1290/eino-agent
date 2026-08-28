@@ -93,12 +93,12 @@ func registerToolMiddleware(registrar extension.Registrar, spec extension.Regist
 	}
 	result := spec
 	result.ID += "/result"
-	return extension.Use(registrar, runtime.ToolResultTransformPoint, result, func(ctx context.Context, outcome runtime.ToolOutcome, next extension.Next[runtime.ToolOutcome, runtime.ToolOutcome]) (runtime.ToolOutcome, error) {
-		transformed, err := middleware.afterToolCall(ctx, runtime.Tool{Name: outcome.Call.Name}, outcome.Call, outcome.Result, outcome.RawError)
+	return extension.Use(registrar, runtime.ToolResultTransformPoint, result, func(ctx context.Context, input runtime.ToolResultTransform, next extension.Next[runtime.ToolResultTransform, runtime.ToolResult]) (runtime.ToolResult, error) {
+		transformed, err := middleware.afterToolCall(ctx, runtime.Tool{Name: input.ToolName}, input.Call, input.Result, nil)
 		if err != nil {
-			return runtime.ToolOutcome{}, err
+			return runtime.ToolResult{}, err
 		}
-		outcome.Result = transformed
-		return next(ctx, outcome)
+		input.Result = transformed
+		return next(ctx, input)
 	})
 }

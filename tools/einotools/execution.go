@@ -13,11 +13,8 @@ import (
 )
 
 func executeDefinition(definition catalog.Definition) agenttools.Executor {
-	return func(ctx context.Context, execution agenttools.Execution) (any, error) {
-		input, ok := execution.Input.(json.RawMessage)
-		if !ok {
-			return nil, fmt.Errorf("%w: expected raw JSON, got %T", agenttools.ErrMalformedInput, execution.Input)
-		}
+	return func(ctx context.Context, execution agenttools.Execution) (json.RawMessage, error) {
+		input := execution.Input
 		instance := catalog.Instance{}
 		lockKey := "registration:" + definition.ID
 		if definition.Binding == catalog.BindingWorkspace {

@@ -49,6 +49,8 @@ a lease duration; the store clock stamps the absolute deadline.
 Required behavior:
 
 - The operation is atomic for one `SessionID`.
+- Every pre-existing run ID returns `session.ErrConflict`, regardless of
+  whether the submitted record is identical.
 - Exactly one nonterminal run may own a session.
 - A second nonterminal admission returns `session.ErrSessionBusy`.
 - Terminal statuses are `RunInterrupted`, `RunFailed`, and `RunCompleted`.
@@ -143,14 +145,15 @@ Each provider attempt creates a bounded `prepared` record through
 
 ## Idempotency
 
-Stores must make caller-supplied IDs idempotent:
+Stores make most caller-supplied record IDs idempotent, with admission as an
+intentional exception:
 
 - repeating `CreateSession`, `AppendMessage`, `AppendPart`, `AppendEvent`, or
   `CreateToolCall` with identical IDs and compatible payloads returns the
   existing record;
-- repeating `AdmitRun` with the same run ID and compatible payload returns the
-  existing run when it is already the active owner, or its terminal record after
-  finish;
+- repeating `AdmitRun` with any existing run ID returns
+  `session.ErrConflict`; a start request is a one-shot admission attempt, not a
+  replay command;
 - repeating those calls with incompatible payloads must return
   `session.ErrConflict`;
 - finishing an already-terminal run or tool call with the same terminal payload
@@ -182,8 +185,8 @@ journaling for provider responses or tool execution.
   `ErrSessionBusy`;
 - transaction commit and rollback behavior when a transactor is exposed;
 - stable replay ordering by message and part order, including paged reads;
-- mandatory compatible duplicate idempotency and incompatible duplicate
-  conflicts;
+- compatible duplicate idempotency and incompatible duplicate conflicts for
+  ordinary durable records, plus insert-only `AdmitRun` conflicts;
 - pending tool-call creation, single-owner claim, conflict on second claim,
   claim-token fencing, and terminal settlement;
 - model-request creation and state transitions through a valid execution fence,

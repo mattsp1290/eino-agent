@@ -14,7 +14,6 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
-	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -25,9 +24,9 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	store := newAdmissionStore()
 	sink := &capturingSink{}
 	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
-	admitter := Admitter{Store: store, Events: sink, Clock: func() time.Time { return now }}
-	request := admissionRequest()
-	admitted, err := admitter.Admit(context.Background(), request)
+	admitter := admitter{Store: store, Events: sink, Clock: func() time.Time { return now }}
+	request := testRunAdmission()
+	admitted, err := admitter.admit(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
@@ -80,9 +79,9 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 func TestAdmitRequiresContextEpochID(t *testing.T) {
 	t.Parallel()
 
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.IDs.ContextEpochID = ""
-	_, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
+	_, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
@@ -102,9 +101,9 @@ func TestAdmitPersistsResolvedWorkspaceAcrossSymlinkRetarget(t *testing.T) {
 	if err := os.Symlink(first, alias); err != nil {
 		t.Fatal(err)
 	}
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.Config.Metadata["workspace_root"] = alias
-	admitted, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
+	admitted, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,9 +126,9 @@ func TestAdmitPersistsResolvedWorkspaceAcrossSymlinkRetarget(t *testing.T) {
 }
 
 func TestAdmitRejectsNonexistentWorkspace(t *testing.T) {
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.Config.Metadata["workspace_root"] = filepath.Join(t.TempDir(), "missing")
-	if _, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request); err == nil {
+	if _, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request); err == nil {
 		t.Fatal("expected nonexistent workspace rejection")
 	}
 }
@@ -139,35 +138,26 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 
 	store := newAdmissionStore()
 	sink := &capturingSink{}
-	admitter := Admitter{Store: store, Events: sink, Clock: func() time.Time { return time.Unix(1, 0) }}
-	request := admissionRequest()
-	if _, err := admitter.Admit(context.Background(), request); err != nil {
+	admitter := admitter{Store: store, Events: sink, Clock: func() time.Time { return time.Unix(1, 0) }}
+	request := testRunAdmission()
+	if _, err := admitter.admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
 	}
-	again, err := admitter.Admit(context.Background(), request)
-	if err == nil {
-		if again.Run.ID != "run-1" || again.AssistantMessage.ID != "assistant-1" {
-			t.Fatalf("idempotent duplicate identity = %+v", again)
-		}
-		if !again.AlreadyAdmitted {
-			t.Fatal("duplicate admission did not report AlreadyAdmitted")
-		}
-		if len(sink.events) != 1 {
-			t.Fatalf("duplicate replayed side effects: sink=%d", len(sink.events))
-		}
-		return
+	_, err := admitter.admit(context.Background(), request)
+	if !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("duplicate Admit error = %v, want ErrConflict", err)
 	}
-	if !errors.Is(err, session.ErrSessionBusy) && !errors.Is(err, session.ErrConflict) {
-		t.Fatalf("duplicate Admit error = %v, want idempotent or explicit busy/conflict", err)
+	if len(sink.events) != 1 {
+		t.Fatalf("duplicate replayed side effects: sink=%d", len(sink.events))
 	}
 }
 
 func TestAdmitCloneFailureHasNoDurableOrLiveSideEffects(t *testing.T) {
 	store := newAdmissionStore()
 	sink := &capturingSink{}
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.Input[0].Extra = map[string]any{"unsupported": make(chan int)}
-	_, err := (Admitter{Store: store, Events: sink}).Admit(context.Background(), request)
+	_, err := (admitter{Store: store, Events: sink}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
@@ -176,108 +166,32 @@ func TestAdmitCloneFailureHasNoDurableOrLiveSideEffects(t *testing.T) {
 	}
 }
 
-func TestAdmitRejectsMismatchedIdempotentRequestState(t *testing.T) {
-	tests := map[string]func(*AdmissionRequest){
-		"session":           func(r *AdmissionRequest) { r.IDs.SessionID = "other-session" },
-		"epoch":             func(r *AdmissionRequest) { r.IDs.ContextEpochID = "other-epoch" },
-		"assistant message": func(r *AdmissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
-		"parent message":    func(r *AdmissionRequest) { r.ParentMessageID = "other-parent" },
-		"config":            func(r *AdmissionRequest) { r.Config.Agent.Mode = "other-mode" },
-		"model": func(r *AdmissionRequest) {
+func TestAdmitRejectsEveryRepeatedRunID(t *testing.T) {
+	tests := map[string]func(*admissionRequest){
+		"session":           func(r *admissionRequest) { r.IDs.SessionID = "other-session" },
+		"epoch":             func(r *admissionRequest) { r.IDs.ContextEpochID = "other-epoch" },
+		"assistant message": func(r *admissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
+		"parent message":    func(r *admissionRequest) { r.ParentMessageID = "other-parent" },
+		"config":            func(r *admissionRequest) { r.Config.Agent.Mode = "other-mode" },
+		"model": func(r *admissionRequest) {
 			r.Config.Model.ModelID = "other-model"
 			r.Model.Model.ID = "other-model"
 		},
-		"input": func(r *AdmissionRequest) { r.Input = []*einoschema.Message{{Role: "user", Content: "other-input"}} },
+		"input": func(r *admissionRequest) { r.Input = []*einoschema.Message{{Role: "user", Content: "other-input"}} },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			store := newAdmissionStore()
-			admitter := Admitter{Store: store}
-			request := admissionRequest()
-			if _, err := admitter.Admit(context.Background(), request); err != nil {
+			admitter := admitter{Store: store}
+			request := testRunAdmission()
+			if _, err := admitter.admit(context.Background(), request); err != nil {
 				t.Fatal(err)
 			}
 			mutate(&request)
-			if _, err := admitter.Admit(context.Background(), request); !errors.Is(err, session.ErrConflict) {
+			if _, err := admitter.admit(context.Background(), request); !errors.Is(err, session.ErrConflict) {
 				t.Fatalf("retry error = %v, want ErrConflict", err)
 			}
 		})
-	}
-}
-
-func TestAdmitRejectsIdempotentExtensionPlanMismatch(t *testing.T) {
-	store := newAdmissionStore()
-	admitter := Admitter{Store: store}
-	request := admissionRequest()
-	request.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("first")}}
-	request.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(request.ExtensionPlan)
-	if _, err := admitter.Admit(context.Background(), request); err != nil {
-		t.Fatalf("first Admit error = %v", err)
-	}
-
-	retry := request
-	retry.ExtensionPlan = session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("second")}}
-	retry.ExtensionPlan.Fingerprint, _ = session.FingerprintExtensionPlan(retry.ExtensionPlan)
-	if _, err := admitter.Admit(context.Background(), retry); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("mismatched retry error = %v, want ErrExtensionPlanMismatch", err)
-	}
-}
-
-func testHandlerPlanEntry(instance string) session.HandlerPlanIdentity {
-	return session.HandlerPlanIdentity{
-		InstanceID:    instance,
-		Artifact:      extension.Artifact{Name: instance, Version: "1", Hash: instance + "-hash", ConfigHash: instance + "-config", SourceKind: extension.SourceNative},
-		Registrations: []session.RegistrationIdentity{{ID: "handler", Contract: "test/handler", Version: "1", Scope: extension.GlobalScope(), Kind: session.HandlerNotification}},
-	}
-}
-
-func TestAdmitRejectsZeroPersistedPlanOnRetry(t *testing.T) {
-	store := newAdmissionStore()
-	admitter := Admitter{Store: store}
-	request := admissionRequest()
-	if _, err := admitter.Admit(context.Background(), request); err != nil {
-		t.Fatalf("first Admit error = %v", err)
-	}
-
-	stored := store.runs[request.IDs.RunID]
-	stored.ExtensionPlan = session.ExtensionPlanDescriptor{}
-	store.runs[stored.ID] = stored
-
-	if _, err := admitter.Admit(context.Background(), request); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("zero persisted retry error = %v, want ErrExtensionPlanMismatch", err)
-	}
-}
-
-func TestMatchingExtensionPlansRejectsZeroAndWrongSchemaDescriptors(t *testing.T) {
-	current := emptyTestPlanDescriptor()
-	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
-		"zero":         {},
-		"wrong schema": {SchemaVersion: session.ExtensionPlanSchemaVersion - 1},
-	} {
-		descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-		t.Run(name+" persisted", func(t *testing.T) {
-			if err := validateMatchingExtensionPlans(descriptor, current); !errors.Is(err, ErrExtensionPlanMismatch) {
-				t.Fatalf("error = %v, want ErrExtensionPlanMismatch", err)
-			}
-		})
-		t.Run(name+" requested", func(t *testing.T) {
-			if err := validateMatchingExtensionPlans(current, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
-				t.Fatalf("error = %v, want ErrExtensionPlanMismatch", err)
-			}
-		})
-	}
-}
-
-func TestMatchingExtensionPlansRejectsStaleFingerprint(t *testing.T) {
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("original")}}
-	descriptor.Fingerprint, _ = session.FingerprintExtensionPlan(descriptor)
-	corrupt := descriptor.Clone()
-	corrupt.Handlers[0].InstanceID = "changed"
-	if err := validateMatchingExtensionPlans(corrupt, descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("persisted stale fingerprint error = %v", err)
-	}
-	if err := validateMatchingExtensionPlans(descriptor, corrupt); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("requested stale fingerprint error = %v", err)
 	}
 }
 
@@ -286,8 +200,8 @@ func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.
 
 	store := newAdmissionStore()
 	store.appendEventErr = errors.New("append event failed")
-	admitter := Admitter{Store: store}
-	_, err := admitter.Admit(context.Background(), admissionRequest())
+	admitter := admitter{Store: store}
+	_, err := admitter.admit(context.Background(), testRunAdmission())
 	if !errors.Is(err, store.appendEventErr) {
 		t.Fatalf("Admit error = %v, want append event failure", err)
 	}
@@ -307,8 +221,8 @@ func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	admitter := Admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
-	admitted, err := admitter.Admit(context.Background(), admissionRequest())
+	admitter := admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
+	admitted, err := admitter.admit(context.Background(), testRunAdmission())
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
@@ -339,9 +253,9 @@ func TestAdmitRejectsIncompleteResolvedModelBeforeStoreUse(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.Model = model.Resolved{}
-	_, err := (Admitter{Store: store}).Admit(context.Background(), request)
+	_, err := (admitter{Store: store}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
@@ -355,8 +269,8 @@ func TestLiveSinkFailureDoesNotFailAdmission(t *testing.T) {
 
 	store := newAdmissionStore()
 	errSink := errors.New("sink failed")
-	admitter := Admitter{Store: store, Events: failingSink{err: errSink}}
-	admitted, err := admitter.Admit(context.Background(), admissionRequest())
+	admitter := admitter{Store: store, Events: failingSink{err: errSink}}
+	admitted, err := admitter.admit(context.Background(), testRunAdmission())
 	if err != nil {
 		t.Fatalf("Admit error = %v, want success despite live sink failure", err)
 	}
@@ -365,10 +279,10 @@ func TestLiveSinkFailureDoesNotFailAdmission(t *testing.T) {
 	}
 }
 
-func admissionRequest() AdmissionRequest {
+func testRunAdmission() admissionRequest {
 	selection := model.Selection{ProviderID: "openai", ModelID: "gpt-4.1"}
-	return AdmissionRequest{
-		IDs: AdmissionIDs{
+	return admissionRequest{
+		IDs: admissionIDs{
 			SessionID:          "session-1",
 			RunID:              "run-1",
 			AssistantMessageID: "assistant-1",
@@ -507,10 +421,7 @@ func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.S
 func (s *admissionStore) UpdateSession(context.Context, session.Session) error { return nil }
 
 func (s *admissionStore) AdmitRun(_ context.Context, run session.Run, leaseDuration time.Duration) (session.Run, error) {
-	if existing, ok := s.runs[run.ID]; ok {
-		if sameRun(existing, run) {
-			return existing, nil
-		}
+	if _, ok := s.runs[run.ID]; ok {
 		return session.Run{}, session.ErrConflict
 	}
 	for _, existing := range s.runs {
@@ -752,19 +663,6 @@ func (s *admissionStore) ListContextEpochs(_ context.Context, sessionID session.
 		return epochs[i].ID < epochs[j].ID
 	})
 	return epochs, nil
-}
-
-func sameRun(left session.Run, right session.Run) bool {
-	return left.ID == right.ID &&
-		left.SessionID == right.SessionID &&
-		left.ParentMsgID == right.ParentMsgID &&
-		left.OwnerID == right.OwnerID &&
-		left.ClaimToken == right.ClaimToken &&
-		left.Agent == right.Agent &&
-		left.ProviderID == right.ProviderID &&
-		left.ModelID == right.ModelID &&
-		left.ContextEpoch == right.ContextEpoch &&
-		left.Status == right.Status
 }
 
 func sameEpoch(left session.ContextEpoch, right session.ContextEpoch) bool {

@@ -340,8 +340,8 @@ type Store interface {
 	GetSession(ctx context.Context, id ID) (Session, error)
 	UpdateSession(ctx context.Context, session Session) error
 	// AdmitRun atomically creates a run and makes it the active owner for its
-	// session. Implementations return ErrSessionBusy when another nonterminal
-	// run owns the session.
+	// session. Every existing run ID returns ErrConflict; implementations return
+	// ErrSessionBusy when another nonterminal run owns the session.
 	AdmitRun(ctx context.Context, run Run, leaseDuration time.Duration) (Run, error)
 	ClaimRun(ctx context.Context, claim RunClaim) (Run, error)
 	Execution(fence RunFence) ExecutionStore

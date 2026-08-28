@@ -117,12 +117,95 @@ func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 	}
 }
 
-func TestToolOutcomeSealRejectsDispositionMutation(t *testing.T) {
-	outcome := sealToolOutcome(ToolOutcome{Call: ToolCall{ID: "call"}, Disposition: ToolExecuted})
-	outcome.Disposition = ToolDenied
-	if err := validateToolOutcome(outcome); !errors.Is(err, extension.ErrProtectedMutation) {
+func TestToolResultTransformRejectsCallMutation(t *testing.T) {
+	original := ToolResultTransform{ToolName: "echo", Call: ToolCall{ID: "call", Name: "echo"}}
+	candidate := original
+	candidate.Call.ID = "other"
+	if err := validateToolResultTransformInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
 		t.Fatalf("validation = %v", err)
 	}
+}
+
+func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
+	executorErr := errors.New("executor failed")
+	callbackErr := errors.New("middleware failed")
+	registry := extension.NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-errors"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.Use(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
+			result, err := next(ctx, input)
+			if err != nil {
+				return ToolResult{}, err
+			}
+			return result, callbackErr
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := mustTestRunPlan(RunPlanSpec{Dispatch: dispatch})
+	defer func() {
+		plan.Release()
+		_ = mount.Close(context.Background())
+	}()
+	host := mustConfiguredOrchestrator()
+	tool := Tool{Name: "echo", Executor: runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		return ToolResult{Output: "partial"}, executorErr
+	})}
+	outcome := host.executeToolOutcome(context.Background(), newRunExecution(host, plan), tool, ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`)})
+	if !errors.Is(outcome.RawError, executorErr) || !errors.Is(outcome.RawError, callbackErr) || outcome.Disposition != ToolFailed {
+		t.Fatalf("outcome = %#v", outcome)
+	}
+}
+
+func TestToolMiddlewareCannotForgePermissionStateOrReceiveApproval(t *testing.T) {
+	registry := extension.NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-permission-state"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		if err := extension.Use(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
+			result, err := next(ctx, input)
+			result.Metadata = map[string]string{"permission_status": "denied", "permission_forged": "true"}
+			return result, err
+		}); err != nil {
+			return err
+		}
+		return extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "result", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolResultTransform, next extension.Next[ToolResultTransform, ToolResult]) (ToolResult, error) {
+			if input.Call.Approval != nil {
+				return ToolResult{}, errors.New("result middleware received approval capability")
+			}
+			result, err := next(ctx, input)
+			result.Metadata = map[string]string{"permission_status": "approval_required", "permission_forged": "true"}
+			return result, err
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := mustTestRunPlan(RunPlanSpec{Dispatch: dispatch})
+	defer func() {
+		plan.Release()
+		_ = mount.Close(context.Background())
+	}()
+	host := mustConfiguredOrchestrator()
+	tool := Tool{Name: "echo", Executor: runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		return ToolResult{Output: "ok", Metadata: map[string]string{"permission_status": "interrupted"}}, nil
+	})}
+	call := ToolCall{ID: "call", Name: "echo", Input: json.RawMessage(`{}`), Approval: approvalFunc(func(context.Context, ApprovalRequest) error { return nil })}
+	outcome := host.executeToolOutcome(context.Background(), newRunExecution(host, plan), tool, call)
+	outcome = host.transformToolOutcome(context.Background(), newRunExecution(host, plan), outcome)
+	if outcome.Disposition != ToolExecuted || outcome.Result.Metadata["permission_status"] != "" || outcome.Result.Metadata["permission_forged"] != "" {
+		t.Fatalf("outcome = %#v", outcome)
+	}
+}
+
+func testExtensionComponent(id string) extension.Component {
+	return extension.Component{InstanceID: id, Artifact: extension.Artifact{Name: id, Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 }
 
 func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
@@ -555,7 +638,7 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 }
 
 func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
-	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{testHandlerPlanEntry("callbacks")}}
+	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{handlerPlanEntryForTest("callbacks")}}
 	valid.Fingerprint, _ = session.FingerprintExtensionPlan(valid)
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
@@ -575,6 +658,20 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 				t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
 			}
 		})
+	}
+}
+
+func handlerPlanEntryForTest(instance string) session.HandlerPlanIdentity {
+	return session.HandlerPlanIdentity{
+		InstanceID: instance,
+		Artifact: extension.Artifact{
+			Name: instance, Version: "1", Hash: instance + "-hash",
+			ConfigHash: instance + "-config", SourceKind: extension.SourceNative,
+		},
+		Registrations: []session.RegistrationIdentity{{
+			ID: "handler", Contract: "test/handler", Version: "1",
+			Scope: extension.GlobalScope(), Kind: session.HandlerNotification,
+		}},
 	}
 }
 

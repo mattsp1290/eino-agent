@@ -61,10 +61,9 @@ func transformedPermissionRunPlan(t *testing.T, tools staticToolRegistry, notice
 	registry := extension.NewRegistry(nil)
 	component := extension.Component{InstanceID: "permission-transform", Artifact: extension.Artifact{Name: "permission-transform", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolOutcome, next extension.Next[ToolOutcome, ToolOutcome]) (ToolOutcome, error) {
-			outcome, err := next(ctx, input)
-			outcome.Result = ToolResult{Output: "transformed denial"}
-			return outcome, err
+		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolResultTransform, next extension.Next[ToolResultTransform, ToolResult]) (ToolResult, error) {
+			_, err := next(ctx, input)
+			return ToolResult{Output: "transformed denial"}, err
 		}); err != nil {
 			return err
 		}

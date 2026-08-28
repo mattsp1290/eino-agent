@@ -116,27 +116,11 @@ func translateDefinition(source catalog.Definition, retention runtime.RetentionP
 	}
 	return agenttools.Definition{
 		Name: source.Name, Description: info.Desc, Parameters: info.ParamsOneOf,
-		Decode: decodeRaw,
-		Normalize: func(_ context.Context, input any) (json.RawMessage, error) {
-			raw, ok := input.(json.RawMessage)
-			if !ok {
-				return nil, fmt.Errorf("%w: expected raw JSON, got %T", agenttools.ErrMalformedInput, input)
-			}
-			return normalizeCatalogInput(source.ID, raw)
+		Normalize: func(_ context.Context, input json.RawMessage) (json.RawMessage, error) {
+			return normalizeCatalogInput(source.ID, input)
 		},
-		Pattern: func(_ context.Context, input any) (string, error) {
-			raw, ok := input.(json.RawMessage)
-			if !ok {
-				return "", fmt.Errorf("%w: expected raw JSON, got %T", agenttools.ErrMalformedInput, input)
-			}
-			return permissionPattern(source.ID, raw)
-		},
-		Encode: func(_ context.Context, value any) (json.RawMessage, error) {
-			raw, ok := value.(json.RawMessage)
-			if !ok || !json.Valid(raw) {
-				return nil, fmt.Errorf("eino-tools returned invalid JSON")
-			}
-			return cloneRaw(raw), nil
+		Pattern: func(_ context.Context, input json.RawMessage) (string, error) {
+			return permissionPattern(source.ID, input)
 		},
 		Execute: executeDefinition(source), RetrySafe: source.RetrySafe,
 		Retention: retention, Permissions: append([]string(nil), permissions...), Metadata: cloneStringMap(metadata),

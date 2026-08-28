@@ -2,8 +2,11 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -12,7 +15,70 @@ import (
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
+	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
+
+func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var dispatches atomic.Int32
+	newOrchestrator := func(sink *blockingSink) *StreamingOrchestrator {
+		return mustConfiguredOrchestrator(
+			WithStore(store),
+			WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+				dispatches.Add(1)
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			})}),
+			WithIDGenerator(&sequenceIDs{}),
+			WithRunPlanProvider(emptyTestRunPlanProvider()),
+			WithEventSink(sink),
+			WithClock(func() time.Time { return time.Date(2026, 8, 28, 1, 0, 0, 0, time.UTC) }),
+		)
+	}
+	sinks := []*blockingSink{{}, {}}
+	orchestrators := []*StreamingOrchestrator{newOrchestrator(sinks[0]), newOrchestrator(sinks[1])}
+	type startResult struct {
+		handle Handle
+		err    error
+	}
+	results := make(chan startResult, len(orchestrators))
+	ready := make(chan struct{})
+	var wait sync.WaitGroup
+	for _, orchestrator := range orchestrators {
+		wait.Add(1)
+		go func(orchestrator *StreamingOrchestrator) {
+			defer wait.Done()
+			<-ready
+			handle, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", ParentID: "user", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+			results <- startResult{handle: handle, err: err}
+		}(orchestrator)
+	}
+	close(ready)
+	wait.Wait()
+	close(results)
+	var successes, conflicts int
+	for result := range results {
+		if result.err == nil {
+			successes++
+			completed := <-result.handle.Done()
+			if completed.Error != nil {
+				t.Fatalf("successful run = %+v", completed)
+			}
+			continue
+		}
+		if errors.Is(result.err, session.ErrConflict) {
+			conflicts++
+			continue
+		}
+		t.Fatalf("Start error = %v, want ErrConflict", result.err)
+	}
+	if successes != 1 || conflicts != 1 || dispatches.Load() != 1 || sinks[0].count(EventRunStarted)+sinks[1].count(EventRunStarted) != 1 {
+		t.Fatalf("successes=%d conflicts=%d dispatches=%d starts=%d", successes, conflicts, dispatches.Load(), sinks[0].count(EventRunStarted)+sinks[1].count(EventRunStarted))
+	}
+}
 
 func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	t.Parallel()

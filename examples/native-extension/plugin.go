@@ -5,7 +5,6 @@ package nativeextension
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -73,21 +72,9 @@ func Mount(ctx context.Context, registry *composition.Registry, sessionID sessio
 func echoDefinition() tools.Definition {
 	return tools.Definition{
 		Name: "example_echo", Description: "Echo text from the session-scoped native extension.",
-		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-			var input map[string]any
-			if err := json.Unmarshal(raw, &input); err != nil {
-				return nil, err
-			}
-			return input, nil
-		},
-		Encode: func(_ context.Context, value any) (json.RawMessage, error) { return json.Marshal(value) },
-		Execute: func(_ context.Context, execution tools.Execution) (any, error) {
-			input, ok := execution.Input.(map[string]any)
-			if !ok {
-				return nil, fmt.Errorf("unexpected echo input")
-			}
-			return map[string]any{"text": input["text"]}, nil
-		},
+		Execute: tools.TypedExecutor[map[string]any, map[string]any](func(_ context.Context, execution tools.TypedExecution[map[string]any]) (map[string]any, error) {
+			return map[string]any{"text": execution.Input["text"]}, nil
+		}),
 		Permissions: []string{"example.echo"},
 	}
 }

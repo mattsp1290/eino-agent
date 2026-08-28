@@ -88,7 +88,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		return nil, err
 	}
 	execution := newRunExecution(o, plan)
-	ids := AdmissionIDs{
+	ids := admissionIDs{
 		SessionID:          request.SessionID,
 		RunID:              o.ids.NewRunID(),
 		AssistantMessageID: o.ids.NewMessageID(),
@@ -99,7 +99,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	admitter := o.admitter()
 	admitter.Events = execution.eventSink(admitter.Events)
 	admitter.Extensions = execution.dispatch()
-	admitted, err := admitter.Admit(ctx, AdmissionRequest{
+	admitted, err := admitter.admit(ctx, admissionRequest{
 		IDs:             ids,
 		ParentMessageID: request.ParentID,
 		Config:          request.Config,
@@ -139,7 +139,7 @@ func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID
 	return o.store.ActiveRun(ctx, sessionID)
 }
 
-func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecution, admitted AdmittedRun, done chan<- Result) {
+func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecution, admitted admittedRun, done chan<- Result) {
 	defer close(done)
 	defer execution.release()
 	result, settled := o.run(ctx, execution, admitted)
@@ -149,7 +149,7 @@ func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecu
 	done <- result
 }
 
-func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution, admitted AdmittedRun) (result Result, settled bool) {
+func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution, admitted admittedRun) (result Result, settled bool) {
 	run := admitted.Run
 	ctx = execution.startLease(ctx, o.lease())
 	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
@@ -313,94 +313,71 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runEx
 	}
 }
 
-func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, execution *runExecution, tool Tool, call ToolCall) ToolOutcome {
+func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, execution *runExecution, tool Tool, call ToolCall) toolOutcome {
 	guard, guardErr := evaluateToolGuards(ctx, execution.plan, tool, call)
 	if guardErr != nil {
-		return ToolOutcome{Call: cloneToolCall(call), Disposition: dispositionForError(guardErr), RawError: guardErr, Error: classifyExtensionError(guardErr)}
+		return newToolOutcome(call, ToolResult{}, toolPermissionAllowed, guardErr)
 	}
 	if guard.Decision == ToolGuardDeny {
 		result := modelVisiblePermissionResult("denied", guard.Message)
-		return ToolOutcome{Call: cloneToolCall(call), Disposition: ToolDenied, Result: result, PermissionMetadata: cloneStringMap(result.Metadata)}
+		return newToolOutcome(call, result, toolPermissionDenied, nil)
 	}
 	wrapped, cloneErr := cloneToolChecked(tool)
 	if cloneErr != nil {
-		return ToolOutcome{Call: cloneToolCall(call), Disposition: ToolFailed, RawError: cloneErr, Error: classifyExtensionError(cloneErr)}
+		return newToolOutcome(call, ToolResult{}, toolPermissionAllowed, cloneErr)
 	}
+	var executorErr error
+	var callbackErr error
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		outcome, err := extension.Invoke(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolOutcome, error) {
-			result, execErr := tool.Executor.Execute(ctx, cloneToolCall(call))
-			disposition := ToolExecuted
-			if execErr != nil {
-				disposition = dispositionForError(execErr)
-			}
-			return sealToolOutcome(ToolOutcome{Call: extensionToolCall(call), Disposition: disposition, Result: result, RawError: execErr, Error: classifyExtensionError(execErr)}), nil
+		result, err := extension.Invoke(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolResult, error) {
+			var result ToolResult
+			result, executorErr = tool.Executor.Execute(ctx, cloneToolCall(call))
+			return result, nil
 		})
 		if err != nil {
-			return ToolResult{}, err
+			callbackErr = errors.Join(callbackErr, err)
 		}
-		return outcome.Result, outcome.RawError
+		return result, nil
 	})
-	var result ToolResult
-	var err error
-	if o.permissions == nil {
-		result, err = wrapped.Executor.Execute(ctx, call)
-	} else {
-		result, err = ExecuteToolWithPermissions(ctx, wrapped, call, o.permissions)
-	}
-	disposition := dispositionForResult(result, err)
-	permissionMetadata := map[string]string(nil)
-	if result.Metadata["permission_status"] != "" {
-		permissionMetadata = cloneStringMap(result.Metadata)
-	}
-	return ToolOutcome{Call: cloneToolCall(call), Disposition: disposition, Result: cloneRuntimeToolResult(result), RawError: err, Error: classifyExtensionError(err), PermissionMetadata: permissionMetadata}
+	permission, permissionErr := executeToolWithPermissions(ctx, wrapped, call, o.permissions)
+	return newToolOutcome(call, permission.Result, permission.State, errors.Join(executorErr, callbackErr, permissionErr))
 }
 
-func (o *StreamingOrchestrator) afterToolOutcome(ctx context.Context, tool Tool, outcome ToolOutcome) ToolOutcome {
-	result := outcome.Result
-	if len(outcome.PermissionMetadata) != 0 {
-		if result.Metadata == nil {
-			result.Metadata = make(map[string]string)
-		}
-		for key, value := range outcome.PermissionMetadata {
-			result.Metadata[key] = value
-		}
-	}
-	outcome.Result = cloneRuntimeToolResult(result)
+func newToolOutcome(call ToolCall, result ToolResult, permission toolPermissionState, rawErr error) toolOutcome {
+	return finalizeToolOutcome(toolOutcome{Call: extensionToolCall(call), Result: result, RawError: rawErr, Permission: permission})
+}
+
+func finalizeToolOutcome(outcome toolOutcome) toolOutcome {
+	outcome.Call = extensionToolCall(outcome.Call)
+	outcome.Result = protectPermissionResult(outcome.Result, outcome.Permission)
+	outcome.Disposition = dispositionForOutcome(outcome.Permission, outcome.RawError)
+	outcome.Error = classifyExtensionError(outcome.RawError)
 	return outcome
 }
 
-func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, execution *runExecution, outcome ToolOutcome) ToolOutcome {
-	outcome = sealToolOutcome(outcome)
-	transformed, err := extension.Invoke(execution.dispatch(), ctx, ToolResultTransformPoint, outcome, func(_ context.Context, value ToolOutcome) (ToolOutcome, error) { return value, nil })
+func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, execution *runExecution, outcome toolOutcome) toolOutcome {
+	input := ToolResultTransform{ToolName: outcome.Call.Name, Call: extensionToolCall(outcome.Call), Result: cloneRuntimeToolResult(outcome.Result)}
+	transformed, err := extension.Invoke(execution.dispatch(), ctx, ToolResultTransformPoint, input, func(_ context.Context, value ToolResultTransform) (ToolResult, error) {
+		return value.Result, nil
+	})
 	if err != nil {
 		outcome.RawError = errors.Join(outcome.RawError, err)
-		outcome.Error = classifyExtensionError(outcome.RawError)
-		outcome.Disposition = dispositionForError(outcome.RawError)
-		return outcome
+		return finalizeToolOutcome(outcome)
 	}
-	outcome = transformed
-	outcome.Result = cloneRuntimeToolResult(outcome.Result)
-	if len(outcome.PermissionMetadata) != 0 {
-		if outcome.Result.Metadata == nil {
-			outcome.Result.Metadata = make(map[string]string)
-		}
-		for key, value := range outcome.PermissionMetadata {
-			outcome.Result.Metadata[key] = value
-		}
-	}
-	return outcome
+	outcome.Result = transformed
+	return finalizeToolOutcome(outcome)
 }
 
-func dispositionForResult(result ToolResult, err error) ToolDisposition {
+func dispositionForOutcome(permission toolPermissionState, err error) ToolDisposition {
 	if err != nil {
 		return dispositionForError(err)
 	}
-	switch result.Metadata["permission_status"] {
-	case "denied":
+	switch permission {
+	case toolPermissionDenied:
 		return ToolDenied
-	case "approval_required":
+	case toolPermissionApprovalRequired:
 		return ToolApprovalRequired
-	case "interrupted":
+	case toolPermissionInterrupted:
 		return ToolInterrupted
 	default:
 		return ToolExecuted
@@ -524,8 +501,8 @@ func (o *StreamingOrchestrator) providerInput(ctx context.Context, request Reque
 	return messages, nil
 }
 
-func (o *StreamingOrchestrator) admitter() Admitter {
-	return Admitter{Store: o.store, Events: o.events, Clock: o.clock}
+func (o *StreamingOrchestrator) admitter() admitter {
+	return admitter{Store: o.store, Events: o.events, Clock: o.clock}
 }
 
 func (o *StreamingOrchestrator) now() time.Time {

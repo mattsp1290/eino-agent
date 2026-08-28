@@ -219,8 +219,10 @@ The `model` package separates metadata from concrete clients:
 
 - `Catalog` lists providers, models, capabilities, and defaults.
 - `AuthResolver` resolves credentials at request time.
-- `Resolver` builds an Eino `ToolCallingChatModel` for one selected model and
-  runtime environment.
+- `Resolver` returns one immutable `model.Resolved` value whose execution
+  surface is a `model.Streamer` for the selected model and runtime environment.
+  Provider adapters may bind an Eino chat model internally, but that SDK type
+  does not cross the `model` package boundary.
 
 Runtime captures the selected provider/model in `session.Run` and captures
 component versions in the run metadata. Provider-specific SDK concerns stay

@@ -163,8 +163,8 @@ func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
 	if !errors.Is(err, tools.ErrDuplicateRegistration) {
 		t.Fatalf("Mount error = %v, want ErrDuplicateRegistration", err)
 	}
-	if len(registry.tools) != 0 {
-		t.Fatalf("collision mount published %d tools", len(registry.tools))
+	if len(registry.components) != 0 {
+		t.Fatalf("collision mount published %d components", len(registry.components))
 	}
 }
 
@@ -209,7 +209,7 @@ func TestMountedToolCallbacksReceiveMountContext(t *testing.T) {
 	mountedComponent := component("callback-context")
 	var mounted *Mount
 	definition := definition("probe", "probe")
-	definition.Decode = func(ctx context.Context, raw json.RawMessage) (any, error) {
+	definition.Normalize = func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
 		if mounted == nil {
 			return nil, errors.New("mount unavailable")
 		}
@@ -449,10 +449,10 @@ func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
 	registry := NewRegistry(nil)
 	var mount *Mount
 	definition := definition("self-close", "self-close")
-	definition.Normalize = func(ctx context.Context, _ any) (json.RawMessage, error) {
+	definition.Normalize = func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
 		return nil, mount.Close(ctx)
 	}
-	definition.Execute = func(ctx context.Context, _ tools.Execution) (any, error) {
+	definition.Execute = func(ctx context.Context, _ tools.Execution) (json.RawMessage, error) {
 		return nil, mount.Close(ctx)
 	}
 	var err error

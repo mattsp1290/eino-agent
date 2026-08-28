@@ -14,13 +14,7 @@ import (
 func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	materialized, err := tools.Materialize(context.Background(), tools.Definition{
 		Name: "echo",
-		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-			return append(json.RawMessage(nil), raw...), nil
-		},
-		Encode: func(_ context.Context, value any) (json.RawMessage, error) {
-			return value.(json.RawMessage), nil
-		},
-		Execute: func(_ context.Context, execution tools.Execution) (any, error) {
+		Execute: func(_ context.Context, execution tools.Execution) (json.RawMessage, error) {
 			return execution.Input, nil
 		},
 	}, runtime.ToolScopeContext{SessionID: "session"})
@@ -36,7 +30,7 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		return extension.Use(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolOutcome]) (runtime.ToolOutcome, error) {
+		return extension.Use(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolResult]) (runtime.ToolResult, error) {
 			return next(ctx, input)
 		})
 	}))
@@ -64,9 +58,9 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 
 	terminalErr := errors.New("terminal reached")
 	terminalCalled := false
-	_, err = extension.Invoke(plan, context.Background(), runtime.ToolExecutePoint, runtime.ToolExecution(prepared), func(_ context.Context, _ runtime.ToolExecution) (runtime.ToolOutcome, error) {
+	_, err = extension.Invoke(plan, context.Background(), runtime.ToolExecutePoint, runtime.ToolExecution(prepared), func(_ context.Context, _ runtime.ToolExecution) (runtime.ToolResult, error) {
 		terminalCalled = true
-		return runtime.ToolOutcome{}, terminalErr
+		return runtime.ToolResult{}, terminalErr
 	})
 	if !terminalCalled || !errors.Is(err, terminalErr) {
 		t.Fatalf("ToolExecutePoint did not reach terminal: called=%t err=%v", terminalCalled, err)

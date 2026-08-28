@@ -440,19 +440,20 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 		}
 		t.Fatalf("OpenTool error = %v", err)
 	}
-	decoded, err := definition.Decode(context.Background(), json.RawMessage(`{"value":1}`))
+	materialized, err := tools.Materialize(context.Background(), definition, runtime.ToolScopeContext{})
+	if err != nil {
+		t.Fatalf("Materialize error = %v", err)
+	}
+	decoded, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"value":1}`))
 	if err != nil {
 		t.Fatalf("Decode error = %v", err)
 	}
-	output, err := definition.Execute(context.Background(), tools.Execution{
-		Call: runtime.ToolCall{ID: "call-1"}, Input: decoded,
-	})
+	output, err := materialized.Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: decoded})
 	if err != nil {
 		t.Fatalf("Execute error = %v", err)
 	}
-	raw, err := definition.Encode(context.Background(), output)
-	if err != nil || string(raw) != `{"echo":{"value":1}}` {
-		t.Fatalf("Encode = %s, %v", raw, err)
+	if string(output.Structured) != `{"echo":{"value":1}}` {
+		t.Fatalf("Execute = %s", output.Structured)
 	}
 	observations := observer.Snapshot().Observations
 	if len(observations) != 1 || observations[0].Attributes["wasm.module.name"] != "tool.wasm" || observations[0].Attributes["log.level"] != "info" {
@@ -584,7 +585,7 @@ func TestCheckedInToolConcurrentUse(t *testing.T) {
 				errorsChannel <- callErr
 				return
 			}
-			if !strings.Contains(string(output.(json.RawMessage)), `"echo"`) {
+			if !strings.Contains(string(output.Structured), `"echo"`) {
 				errorsChannel <- errors.New("missing echo output for call " + strconv.Itoa(index))
 			}
 		}(index)
@@ -682,12 +683,16 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 }
 
-func executeLoadedDefinition(ctx context.Context, definition tools.Definition, input string) (any, error) {
-	decoded, err := definition.Decode(ctx, json.RawMessage(input))
+func executeLoadedDefinition(ctx context.Context, definition tools.Definition, input string) (runtime.ToolResult, error) {
+	materialized, err := tools.Materialize(ctx, definition, runtime.ToolScopeContext{})
 	if err != nil {
-		return nil, err
+		return runtime.ToolResult{}, err
 	}
-	return definition.Execute(ctx, tools.Execution{Call: runtime.ToolCall{ID: "fixture-call"}, Input: decoded})
+	decoded, err := materialized.InputDecoder.DecodeToolInput(ctx, json.RawMessage(input))
+	if err != nil {
+		return runtime.ToolResult{}, err
+	}
+	return materialized.Executor.Execute(ctx, runtime.ToolCall{ID: "fixture-call", Input: decoded})
 }
 
 type signalExporter struct {

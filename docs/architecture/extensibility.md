@@ -20,8 +20,9 @@ mount atomically stages typed callback registrations, tools, prompts, guards,
 restrictions, and cleanup. Each executable behavior carries its identity in
 the same plan record, so descriptor state cannot drift from execution state.
 
-`Admit` has no option. It is derived from the orchestrator's private store,
-event sink, extension plan, and clock.
+Admission has no option or public service object. The orchestrator constructs
+its private one-shot admission pipeline from the store, event sink, extension
+plan, and clock.
 
 | Seam | Native path | Wasm contract | Wrapper status |
 | --- | --- | --- | --- |

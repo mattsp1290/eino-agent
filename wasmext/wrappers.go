@@ -82,17 +82,13 @@ func toolDefinition(module *module, component toolComponent, metadata wittypes.T
 		Metadata:  map[string]string{"wasm_module": module.identity.name, "wasm_sha256": module.identity.hash},
 		Retention: runtime.RetentionPolicy{MaxInlineBytes: module.limits.MaxOutputBytes},
 	}
-	definition.Decode = func(_ context.Context, raw json.RawMessage) (any, error) {
+	definition.Normalize = func(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
 		if err := validateBoundedJSON(raw, module.limits.MaxInputBytes); err != nil {
-			return nil, extensionError(payloadErrorKind(err), module.identity, "tool.decode", err)
+			return nil, extensionError(payloadErrorKind(err), module.identity, "tool.normalize", err)
 		}
 		return append(json.RawMessage(nil), raw...), nil
 	}
-	definition.Pattern = func(_ context.Context, input any) (string, error) {
-		raw, ok := input.(json.RawMessage)
-		if !ok {
-			return "", extensionError(ErrorPayload, module.identity, "tool.permission-pattern", errors.New("decoded input is not JSON"))
-		}
+	definition.Pattern = func(_ context.Context, raw json.RawMessage) (string, error) {
 		var value struct {
 			PermissionPattern string `json:"permission_pattern"`
 		}
@@ -104,11 +100,8 @@ func toolDefinition(module *module, component toolComponent, metadata wittypes.T
 		}
 		return value.PermissionPattern, nil
 	}
-	definition.Execute = func(ctx context.Context, execution tools.Execution) (any, error) {
-		raw, ok := execution.Input.(json.RawMessage)
-		if !ok {
-			return nil, extensionError(ErrorPayload, module.identity, "tool.execute", errors.New("decoded input is not JSON"))
-		}
+	definition.Execute = func(ctx context.Context, execution tools.Execution) (json.RawMessage, error) {
+		raw := execution.Input
 		request := toolExecuteRequest{
 			ToolCallID: string(execution.Call.ID), InputJSON: string(raw), Turn: turnMetadataFromBounded(execution.Context.Turn),
 		}
@@ -124,16 +117,6 @@ func toolDefinition(module *module, component toolComponent, metadata wittypes.T
 			return nil, extensionError(payloadErrorKind(err), module.identity, "tool.execute", err)
 		}
 		return json.RawMessage(output), nil
-	}
-	definition.Encode = func(_ context.Context, value any) (json.RawMessage, error) {
-		raw, ok := value.(json.RawMessage)
-		if !ok {
-			return nil, extensionError(ErrorPayload, module.identity, "tool.encode", errors.New("guest output is not JSON"))
-		}
-		if err := validateBoundedJSON(raw, module.limits.MaxOutputBytes); err != nil {
-			return nil, extensionError(payloadErrorKind(err), module.identity, "tool.encode", err)
-		}
-		return append(json.RawMessage(nil), raw...), nil
 	}
 	return definition, nil
 }

@@ -79,6 +79,26 @@ func Run(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("run admission is insert only", func(t *testing.T) {
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-insert-only")
+		candidate := run("run-insert-only", s.ID, "owner")
+		admitted := admitRun(t, ctx, subject.Store, candidate)
+		if _, err := subject.Store.AdmitRun(ctx, candidate, time.Minute); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("duplicate active admission err = %v, want ErrConflict", err)
+		}
+		admitted.Status = session.RunCompleted
+		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
+		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		if err := execution.SettleRun(ctx, admitted, nil); err != nil {
+			t.Fatalf("settle run: %v", err)
+		}
+		if _, err := subject.Store.AdmitRun(ctx, candidate, time.Minute); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("duplicate terminal admission err = %v, want ErrConflict", err)
+		}
+	})
+
 	t.Run("transaction rollback hides writes", func(t *testing.T) {
 		subject := setup(t, factory)
 		ctx := context.Background()

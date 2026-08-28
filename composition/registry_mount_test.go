@@ -23,11 +23,9 @@ func component(id string) extension.Component {
 func definition(name, marker string) tools.Definition {
 	return tools.Definition{
 		Name: name, Description: marker,
-		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-			return append(json.RawMessage(nil), raw...), nil
+		Execute: func(context.Context, tools.Execution) (json.RawMessage, error) {
+			return json.RawMessage(`{"ok":true}`), nil
 		},
-		Encode:  func(_ context.Context, value any) (json.RawMessage, error) { return value.(json.RawMessage), nil },
-		Execute: func(context.Context, tools.Execution) (any, error) { return json.RawMessage(`{"ok":true}`), nil },
 	}
 }
 
@@ -146,8 +144,6 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 		name   string
 		mutate func(*tools.Definition)
 	}{
-		{name: "missing decoder", mutate: func(definition *tools.Definition) { definition.Decode = nil }},
-		{name: "missing encoder", mutate: func(definition *tools.Definition) { definition.Encode = nil }},
 		{name: "missing executor", mutate: func(definition *tools.Definition) { definition.Execute = nil }},
 		{name: "malformed schema", mutate: func(definition *tools.Definition) {
 			definition.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"broken": nil})
@@ -165,8 +161,8 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 			if !errors.Is(err, tools.ErrInvalidDefinition) {
 				t.Fatalf("Mount error = %v, want ErrInvalidDefinition", err)
 			}
-			if len(registry.tools) != 0 {
-				t.Fatalf("mounted tools = %d, want 0", len(registry.tools))
+			if len(registry.components) != 0 {
+				t.Fatalf("mounted components = %d, want 0", len(registry.components))
 			}
 			plan, planErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
 			if planErr != nil {

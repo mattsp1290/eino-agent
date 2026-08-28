@@ -31,8 +31,10 @@ configuration cannot silently grant access.
 
 ## Runtime Behavior
 
-`runtime.ExecuteToolWithPermissions` applies policy and approval hooks around a
-`runtime.ToolExecutor`.
+The orchestrator's private tool-permission pipeline applies policy and approval
+hooks around a tool executor. Permission disposition is runtime-owned state:
+callbacks receive only data needed for their phase and cannot supply approval
+capabilities or forge the final permission status through result metadata.
 
 Model-visible outcomes:
 

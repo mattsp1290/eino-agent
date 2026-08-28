@@ -184,36 +184,22 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 }
 
 type Registry struct {
-	mu           sync.Mutex
-	extensions   *extension.Registry
-	tools        []mountedTool
-	prompts      []mountedPrompt
-	guards       []mountedGuard
-	restrictions []mountedRestriction
+	mu         sync.Mutex
+	extensions *extension.Registry
+	components map[string]*mountedComponent
 }
 
-type mountedTool struct {
-	ToolRegistration
-	component extension.Component
-}
-
-type mountedPrompt struct {
-	PromptRegistration
-	component extension.Component
-}
-
-type mountedGuard struct {
-	GuardRegistration
-	component extension.Component
-}
-
-type mountedRestriction struct {
-	RestrictionRegistration
-	component extension.Component
+type mountedComponent struct {
+	component    extension.Component
+	extension    *extension.Mount
+	tools        []ToolRegistration
+	prompts      []PromptRegistration
+	guards       []GuardRegistration
+	restrictions []RestrictionRegistration
 }
 
 func NewRegistry(reporter extension.Reporter) *Registry {
-	return &Registry{extensions: extension.NewRegistry(reporter)}
+	return &Registry{extensions: extension.NewRegistry(reporter), components: make(map[string]*mountedComponent)}
 }
 
 type Mount struct {
@@ -243,6 +229,10 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 		return errors.Join(primary, prepared.Rollback(context.WithoutCancel(ctx)))
 	}
 	r.mu.Lock()
+	if _, exists := r.components[component.InstanceID]; exists {
+		r.mu.Unlock()
+		return nil, rollback(fmt.Errorf("%w: component instance %s", extension.ErrDuplicateInstance, component.InstanceID))
+	}
 	if err := r.validateTools(staged.tools); err != nil {
 		r.mu.Unlock()
 		return nil, rollback(err)
@@ -256,23 +246,37 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 		r.mu.Unlock()
 		return nil, rollback(err)
 	}
-	for _, registration := range staged.tools {
+	r.publishMountedComponentLocked(ctx, component, extensionMount, staged)
+	return &Mount{registry: r, extension: extensionMount, instance: component.InstanceID}, nil
+}
+
+func (r *Registry) publishMountedComponentLocked(ctx context.Context, component extension.Component, extensionMount *extension.Mount, staged *Registrar) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			delete(r.components, component.InstanceID)
+			extensionMount.Deactivate()
+			r.mu.Unlock()
+			_ = extensionMount.Close(context.WithoutCancel(ctx))
+			panic(recovered)
+		}
+	}()
+	for index, registration := range staged.tools {
 		registration.Definition = mountToolDefinition(extensionMount, registration.Definition)
-		r.tools = append(r.tools, mountedTool{ToolRegistration: registration, component: component})
+		staged.tools[index] = registration
 	}
-	for _, registration := range staged.prompts {
+	for index, registration := range staged.prompts {
 		registration.Provider = mountedPromptProvider{mount: extensionMount, next: registration.Provider}
-		r.prompts = append(r.prompts, mountedPrompt{PromptRegistration: registration, component: component})
+		staged.prompts[index] = registration
 	}
-	for _, registration := range staged.guards {
+	for index, registration := range staged.guards {
 		registration.Guard = mountedToolGuard{mount: extensionMount, next: registration.Guard}
-		r.guards = append(r.guards, mountedGuard{GuardRegistration: registration, component: component})
+		staged.guards[index] = registration
 	}
-	for _, registration := range staged.restrictions {
-		r.restrictions = append(r.restrictions, mountedRestriction{RestrictionRegistration: registration, component: component})
+	r.components[component.InstanceID] = &mountedComponent{
+		component: component, extension: extensionMount,
+		tools: staged.tools, prompts: staged.prompts, guards: staged.guards, restrictions: staged.restrictions,
 	}
 	r.mu.Unlock()
-	return &Mount{registry: r, extension: extensionMount, instance: component.InstanceID}, nil
 }
 
 type mountedPromptProvider struct {
@@ -295,28 +299,18 @@ func (g mountedToolGuard) GuardTool(ctx context.Context, request runtime.ToolGua
 
 func mountToolDefinition(mount *extension.Mount, definition tools.Definition) tools.Definition {
 	next := definition
-	if callback := next.Decode; callback != nil {
-		next.Decode = func(ctx context.Context, raw json.RawMessage) (any, error) {
-			return callback(mount.CallbackContext(ctx), raw)
-		}
-	}
 	if callback := next.Normalize; callback != nil {
-		next.Normalize = func(ctx context.Context, input any) (json.RawMessage, error) {
+		next.Normalize = func(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
 			return callback(mount.CallbackContext(ctx), input)
 		}
 	}
 	if callback := next.Pattern; callback != nil {
-		next.Pattern = func(ctx context.Context, input any) (string, error) {
+		next.Pattern = func(ctx context.Context, input json.RawMessage) (string, error) {
 			return callback(mount.CallbackContext(ctx), input)
 		}
 	}
-	if callback := next.Encode; callback != nil {
-		next.Encode = func(ctx context.Context, value any) (json.RawMessage, error) {
-			return callback(mount.CallbackContext(ctx), value)
-		}
-	}
 	if callback := next.Execute; callback != nil {
-		next.Execute = func(ctx context.Context, execution tools.Execution) (any, error) {
+		next.Execute = func(ctx context.Context, execution tools.Execution) (json.RawMessage, error) {
 			return callback(mount.CallbackContext(ctx), execution)
 		}
 	}
@@ -330,9 +324,11 @@ func (r *Registry) validateTools(staged []ToolRegistration) error {
 				return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
 			}
 		}
-		for _, existing := range r.tools {
-			if existing.Definition.Name == candidate.Definition.Name && toolScopesOverlap(existing.Scope, candidate.Scope) {
-				return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
+		for _, mounted := range r.components {
+			for _, existing := range mounted.tools {
+				if existing.Definition.Name == candidate.Definition.Name && toolScopesOverlap(existing.Scope, candidate.Scope) {
+					return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
+				}
 			}
 		}
 	}
@@ -348,9 +344,11 @@ func toolScopesOverlap(left, right extension.Scope) bool {
 
 func (r *Registry) validatePrompts(staged []PromptRegistration) error {
 	for _, candidate := range staged {
-		for _, existing := range r.prompts {
-			if existing.Scope == candidate.Scope && existing.Name == candidate.Name {
-				return fmt.Errorf("%w: prompt %s", extension.ErrDuplicateRegistration, candidate.Name)
+		for _, mounted := range r.components {
+			for _, existing := range mounted.prompts {
+				if existing.Scope == candidate.Scope && existing.Name == candidate.Name {
+					return fmt.Errorf("%w: prompt %s", extension.ErrDuplicateRegistration, candidate.Name)
+				}
 			}
 		}
 	}
@@ -363,35 +361,13 @@ func (m *Mount) Deactivate() {
 	}
 	m.once.Do(func() {
 		m.registry.mu.Lock()
-		filtered := m.registry.tools[:0]
-		for _, entry := range m.registry.tools {
-			if entry.component.InstanceID != m.instance {
-				filtered = append(filtered, entry)
-			}
+		mounted := m.registry.components[m.instance]
+		delete(m.registry.components, m.instance)
+		if mounted != nil {
+			mounted.extension.Deactivate()
+		} else {
+			m.extension.Deactivate()
 		}
-		m.registry.tools = filtered
-		prompts := m.registry.prompts[:0]
-		for _, entry := range m.registry.prompts {
-			if entry.component.InstanceID != m.instance {
-				prompts = append(prompts, entry)
-			}
-		}
-		m.registry.prompts = prompts
-		guards := m.registry.guards[:0]
-		for _, entry := range m.registry.guards {
-			if entry.component.InstanceID != m.instance {
-				guards = append(guards, entry)
-			}
-		}
-		m.registry.guards = guards
-		restrictions := m.registry.restrictions[:0]
-		for _, entry := range m.registry.restrictions {
-			if entry.component.InstanceID != m.instance {
-				restrictions = append(restrictions, entry)
-			}
-		}
-		m.registry.restrictions = restrictions
-		m.extension.Deactivate()
 		m.registry.mu.Unlock()
 	})
 }
@@ -500,10 +476,10 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	if err != nil {
 		return nil, err
 	}
-	selected := selectTools(r.tools, target, instances, selectTool)
-	prompts := selectPrompts(r.prompts, target, instances)
-	guards := selectGuards(r.guards, target, instances)
-	restrictions := selectRestrictions(r.restrictions, target, instances)
+	selected := selectTools(r.components, target, instances, selectTool)
+	prompts := selectPrompts(r.components, target, instances)
+	guards := selectGuards(r.components, target, instances)
+	restrictions := selectRestrictions(r.components, target, instances)
 	planTools := make([]runtime.PlanTool, len(selected))
 	for index, entry := range selected {
 		schemaHash, hashErr := composedToolSchemaHash(entry.ToolRegistration)
@@ -555,7 +531,27 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: dispatch, Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})
 }
 
-type planToolSelector func(mountedTool) bool
+type selectedTool struct {
+	ToolRegistration
+	component extension.Component
+}
+
+type selectedPrompt struct {
+	PromptRegistration
+	component extension.Component
+}
+
+type selectedGuard struct {
+	GuardRegistration
+	component extension.Component
+}
+
+type selectedRestriction struct {
+	RestrictionRegistration
+	component extension.Component
+}
+
+type planToolSelector func(selectedTool) bool
 
 type planToolIdentity struct {
 	InstanceID     string
@@ -573,7 +569,7 @@ func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
 	for _, name := range toolConfig.Disabled {
 		disabled[name] = true
 	}
-	return func(entry mountedTool) bool {
+	return func(entry selectedTool) bool {
 		if disabled[entry.Definition.Name] {
 			return false
 		}
@@ -582,21 +578,24 @@ func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
 }
 
 func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelector {
-	return func(entry mountedTool) bool {
+	return func(entry selectedTool) bool {
 		return identities[planToolIdentity{
 			InstanceID: entry.component.InstanceID, Scope: entry.Scope, RegistrationID: entry.ID, ToolName: entry.Definition.Name,
 		}]
 	}
 }
 
-func selectTools(entries []mountedTool, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []mountedTool {
-	result := make([]mountedTool, 0, len(entries))
-	for _, entry := range entries {
-		if instances != nil && !instances[entry.component.InstanceID] || selectTool != nil && !selectTool(entry) {
-			continue
-		}
-		if entry.Scope.Kind == extension.ScopeGlobal || entry.Scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && entry.Scope.Key == target.Key {
-			result = append(result, entry)
+func selectTools(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []selectedTool {
+	var result []selectedTool
+	for _, mounted := range components {
+		for _, registration := range mounted.tools {
+			entry := selectedTool{ToolRegistration: registration, component: mounted.component}
+			if instances != nil && !instances[entry.component.InstanceID] || selectTool != nil && !selectTool(entry) {
+				continue
+			}
+			if entry.Scope.Kind == extension.ScopeGlobal || entry.Scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && entry.Scope.Key == target.Key {
+				result = append(result, entry)
+			}
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -614,18 +613,21 @@ func selectTools(entries []mountedTool, target extension.Scope, instances map[st
 	return result
 }
 
-func selectPrompts(entries []mountedPrompt, target extension.Scope, instances map[string]bool) []mountedPrompt {
-	selected := make(map[string]mountedPrompt)
-	for _, entry := range entries {
-		if !capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
-			continue
-		}
-		current, exists := selected[entry.Name]
-		if !exists || current.Scope.Kind == extension.ScopeGlobal && entry.Scope.Kind == extension.ScopeSession {
-			selected[entry.Name] = entry
+func selectPrompts(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool) []selectedPrompt {
+	selected := make(map[string]selectedPrompt)
+	for _, mounted := range components {
+		for _, registration := range mounted.prompts {
+			entry := selectedPrompt{PromptRegistration: registration, component: mounted.component}
+			if !capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
+				continue
+			}
+			current, exists := selected[entry.Name]
+			if !exists || current.Scope.Kind == extension.ScopeGlobal && entry.Scope.Kind == extension.ScopeSession {
+				selected[entry.Name] = entry
+			}
 		}
 	}
-	result := make([]mountedPrompt, 0, len(selected))
+	result := make([]selectedPrompt, 0, len(selected))
 	for _, entry := range selected {
 		result = append(result, entry)
 	}
@@ -641,11 +643,14 @@ func selectPrompts(entries []mountedPrompt, target extension.Scope, instances ma
 	return result
 }
 
-func selectGuards(entries []mountedGuard, target extension.Scope, instances map[string]bool) []mountedGuard {
-	var result []mountedGuard
-	for _, entry := range entries {
-		if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
-			result = append(result, entry)
+func selectGuards(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool) []selectedGuard {
+	var result []selectedGuard
+	for _, mounted := range components {
+		for _, registration := range mounted.guards {
+			entry := selectedGuard{GuardRegistration: registration, component: mounted.component}
+			if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
+				result = append(result, entry)
+			}
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -660,11 +665,14 @@ func selectGuards(entries []mountedGuard, target extension.Scope, instances map[
 	return result
 }
 
-func selectRestrictions(entries []mountedRestriction, target extension.Scope, instances map[string]bool) []mountedRestriction {
-	var result []mountedRestriction
-	for _, entry := range entries {
-		if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
-			result = append(result, entry)
+func selectRestrictions(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool) []selectedRestriction {
+	var result []selectedRestriction
+	for _, mounted := range components {
+		for _, registration := range mounted.restrictions {
+			entry := selectedRestriction{RestrictionRegistration: registration, component: mounted.component}
+			if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
+				result = append(result, entry)
+			}
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {
@@ -725,8 +733,10 @@ func (r *Registry) Diagnostics() Diagnostics {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	result := Diagnostics{Components: r.extensions.Diagnostics()}
-	for _, entry := range r.tools {
-		result.Tools = append(result.Tools, ToolDiagnostic{InstanceID: entry.component.InstanceID, ID: entry.ID, Name: entry.Definition.Name, Order: entry.Order, Scope: entry.Scope})
+	for _, mounted := range r.components {
+		for _, entry := range mounted.tools {
+			result.Tools = append(result.Tools, ToolDiagnostic{InstanceID: mounted.component.InstanceID, ID: entry.ID, Name: entry.Definition.Name, Order: entry.Order, Scope: entry.Scope})
+		}
 	}
 	sort.Slice(result.Tools, func(i, j int) bool {
 		if result.Tools[i].InstanceID != result.Tools[j].InstanceID {

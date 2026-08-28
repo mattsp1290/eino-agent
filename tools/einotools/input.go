@@ -1,7 +1,6 @@
 package einotools
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -12,13 +11,6 @@ import (
 	"github.com/mattsp1290/eino-agent/internal/jsonobject"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
 )
-
-func decodeRaw(_ context.Context, raw json.RawMessage) (any, error) {
-	if _, err := decodeJSONObject(raw); err != nil {
-		return nil, err
-	}
-	return cloneRaw(raw), nil
-}
 
 func normalizeCatalogInput(id string, raw json.RawMessage) (json.RawMessage, error) {
 	object, err := decodeJSONObject(raw)

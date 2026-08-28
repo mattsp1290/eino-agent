@@ -99,8 +99,9 @@ least:
 - `WithHistory(history.Options)`
 - `WithObserver(*einoobs.Observer)`
 
-`Admit *Admitter` is intentionally excluded: it is derived from the
-orchestrator's canonical private dependencies, not an independent dependency.
+Admission is intentionally not an option or public dependency. The
+orchestrator constructs its private one-shot admission pipeline from the
+canonical store, event sink, extension plan, and clock.
 
 Rules:
 

@@ -10,6 +10,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
 
+	"github.com/mattsp1290/eino-agent/internal/jsonobject"
 	"github.com/mattsp1290/eino-agent/runtime"
 )
 
@@ -22,34 +23,26 @@ var (
 	ErrMalformedInput = errors.New("malformed tool input")
 )
 
-// Decoder converts model-provided JSON input into a typed host value.
-type Decoder func(ctx context.Context, raw json.RawMessage) (any, error)
+// InputNormalizer converts model input into canonical JSON for durable storage
+// and execution. If omitted, the canonical input is used unchanged.
+type InputNormalizer func(ctx context.Context, input json.RawMessage) (json.RawMessage, error)
 
-// Encoder converts a typed tool result into bounded structured JSON.
-type Encoder func(ctx context.Context, value any) (json.RawMessage, error)
+// PermissionPattern derives permission identity from canonical input.
+type PermissionPattern func(ctx context.Context, input json.RawMessage) (string, error)
 
-// InputNormalizer converts decoded model input into canonical JSON for durable
-// storage and the later execution pass. If omitted, json.Marshal is used.
-type InputNormalizer func(ctx context.Context, input any) (json.RawMessage, error)
-
-// PermissionPattern derives permission identity from decoded canonical input.
-type PermissionPattern func(ctx context.Context, input any) (string, error)
-
-// Executor executes one typed tool invocation.
-type Executor func(ctx context.Context, execution Execution) (any, error)
+// Executor executes one JSON-native tool invocation.
+type Executor func(ctx context.Context, execution Execution) (json.RawMessage, error)
 
 // ScopeResolver returns runtime authority from bounded, data-only scope input.
 type ScopeResolver func(runtime.ToolScopeContext) runtime.ToolScope
 
-// Definition is a typed tool declaration registered by host code or adapters.
+// Definition is a JSON-native tool declaration registered by host code or adapters.
 type Definition struct {
 	Name        string
 	Description string
 	Parameters  *einoschema.ParamsOneOf
-	Decode      Decoder
 	Normalize   InputNormalizer
 	Pattern     PermissionPattern
-	Encode      Encoder
 	Execute     Executor
 	RetrySafe   bool
 	Scope       ScopeResolver
@@ -71,11 +64,76 @@ type Provenance struct {
 	ExecutorHash    string
 }
 
-// Execution is the decoded input and durable runtime context for one call.
+// Execution is canonical JSON input and durable runtime context for one call.
 type Execution struct {
-	Input   any
+	Input   json.RawMessage
 	Call    runtime.ToolCall
 	Context runtime.ToolContext
+}
+
+// TypedExecution presents canonical input as a host type while preserving the
+// durable call context.
+type TypedExecution[I any] struct {
+	Input   I
+	Call    runtime.ToolCall
+	Context runtime.ToolContext
+}
+
+// TypedNormalizer adapts a typed input normalizer to the JSON-native boundary.
+func TypedNormalizer[I any](normalize func(context.Context, I) (I, error)) InputNormalizer {
+	return func(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+		input, err := decodeTyped[I](raw)
+		if err != nil {
+			return nil, err
+		}
+		input, err = normalize(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(input)
+		if err != nil {
+			return nil, fmt.Errorf("encode normalized tool input: %w", err)
+		}
+		return encoded, nil
+	}
+}
+
+// TypedPermissionPattern adapts typed permission identity to canonical JSON.
+func TypedPermissionPattern[I any](pattern func(context.Context, I) (string, error)) PermissionPattern {
+	return func(ctx context.Context, raw json.RawMessage) (string, error) {
+		input, err := decodeTyped[I](raw)
+		if err != nil {
+			return "", err
+		}
+		return pattern(ctx, input)
+	}
+}
+
+// TypedExecutor adapts typed input and output to the JSON-native boundary.
+func TypedExecutor[I, O any](execute func(context.Context, TypedExecution[I]) (O, error)) Executor {
+	return func(ctx context.Context, execution Execution) (json.RawMessage, error) {
+		input, err := decodeTyped[I](execution.Input)
+		if err != nil {
+			return nil, err
+		}
+		output, err := execute(ctx, TypedExecution[I]{Input: input, Call: execution.Call, Context: execution.Context})
+		if err != nil {
+			return nil, err
+		}
+		encoded, err := json.Marshal(output)
+		if err != nil {
+			return nil, fmt.Errorf("encode tool result: %w", err)
+		}
+		return encoded, nil
+	}
+}
+
+func decodeTyped[T any](raw json.RawMessage) (T, error) {
+	var value T
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return value, fmt.Errorf("%w: %v", ErrMalformedInput, err)
+	}
+	return value, nil
 }
 
 // Clone returns a defensive copy of definition containers.
@@ -96,12 +154,6 @@ func (d Definition) Clone() (Definition, error) {
 func ValidateDefinition(definition Definition) error {
 	if strings.TrimSpace(definition.Name) == "" {
 		return fmt.Errorf("%w: name required", ErrInvalidDefinition)
-	}
-	if definition.Decode == nil {
-		return fmt.Errorf("%w: decoder required for %s", ErrInvalidDefinition, definition.Name)
-	}
-	if definition.Encode == nil {
-		return fmt.Errorf("%w: encoder required for %s", ErrInvalidDefinition, definition.Name)
 	}
 	if definition.Execute == nil {
 		return fmt.Errorf("%w: executor required for %s", ErrInvalidDefinition, definition.Name)
@@ -186,11 +238,7 @@ func (r toolPatternResolver) ResolvePermissionPattern(ctx context.Context, raw j
 	if r.definition.Pattern == nil {
 		return r.definition.Name, nil
 	}
-	decoded, err := r.definition.Decode(ctx, raw)
-	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrMalformedInput, err)
-	}
-	return r.definition.Pattern(ctx, decoded)
+	return r.definition.Pattern(ctx, cloneRaw(raw))
 }
 
 type toolDecoder struct {
@@ -198,18 +246,19 @@ type toolDecoder struct {
 }
 
 func (d toolDecoder) DecodeToolInput(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
-	if !json.Valid(raw) {
-		return nil, fmt.Errorf("%w: invalid json", ErrMalformedInput)
-	}
-	decoded, err := d.definition.Decode(ctx, raw)
+	canonical, err := canonicalInput(raw)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrMalformedInput, err)
 	}
-	encoded, err := normalizeInput(ctx, d.definition, decoded)
+	encoded, err := normalizeInput(ctx, d.definition, canonical)
 	if err != nil {
 		return nil, err
 	}
-	return cloneRaw(encoded), nil
+	canonical, err = canonicalInput(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("%w: normalized input: %v", ErrMalformedInput, err)
+	}
+	return canonical, nil
 }
 
 type toolExecutor struct {
@@ -218,10 +267,6 @@ type toolExecutor struct {
 }
 
 func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runtime.ToolResult, error) {
-	decoded, err := e.definition.Decode(ctx, call.Input)
-	if err != nil {
-		return runtime.ToolResult{}, fmt.Errorf("%w: %v", ErrMalformedInput, err)
-	}
 	executionContext := call.Context.Clone()
 	if executionContext.Turn.SessionID == "" {
 		executionContext.Turn.SessionID = e.scope.SessionID
@@ -233,33 +278,40 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 		executionContext.WorkspaceRoot = e.scope.WorkspaceRoot
 	}
 	output, err := e.definition.Execute(ctx, Execution{
-		Input:   decoded,
+		Input:   cloneRaw(call.Input),
 		Call:    call,
 		Context: executionContext,
 	})
 	if err != nil {
 		return runtime.ToolResult{}, err
 	}
-	encoded, err := e.definition.Encode(ctx, output)
-	if err != nil {
-		return runtime.ToolResult{}, err
+	if !json.Valid(output) {
+		return runtime.ToolResult{}, fmt.Errorf("%w: executor returned invalid JSON", ErrInvalidDefinition)
 	}
 	return runtime.ToolResult{
-		Output:     string(encoded),
-		Structured: cloneRaw(encoded),
+		Output:     string(output),
+		Structured: cloneRaw(output),
 		Metadata:   cloneStringMap(e.definition.Metadata),
 	}, nil
 }
 
-func normalizeInput(ctx context.Context, definition Definition, decoded any) (json.RawMessage, error) {
+func normalizeInput(ctx context.Context, definition Definition, raw json.RawMessage) (json.RawMessage, error) {
 	if definition.Normalize != nil {
-		encoded, err := definition.Normalize(ctx, decoded)
+		encoded, err := definition.Normalize(ctx, cloneRaw(raw))
 		if err != nil {
 			return nil, err
 		}
 		return cloneRaw(encoded), nil
 	}
-	encoded, err := json.Marshal(decoded)
+	return cloneRaw(raw), nil
+}
+
+func canonicalInput(raw json.RawMessage) (json.RawMessage, error) {
+	object, err := jsonobject.Decode(raw)
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(object)
 	if err != nil {
 		return nil, err
 	}

@@ -31,17 +31,20 @@ func TestClientToolSnapshotBuildsCanonicalDefinitions(t *testing.T) {
 	if len(definition.Permissions) != 1 || definition.Permissions[0] != PermissionClientTool {
 		t.Fatalf("permissions = %#v", definition.Permissions)
 	}
-	decoded, err := definition.Decode(context.Background(), json.RawMessage(`{"query":"hi"}`))
+	materialized, err := agenttools.Materialize(context.Background(), definition, runtime.ToolScopeContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	output, err := definition.Execute(context.Background(), agenttools.Execution{Input: decoded, Call: runtime.ToolCall{ID: "call-1"}})
+	decoded, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"query":"hi"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	encoded, err := definition.Encode(context.Background(), output)
-	if err != nil || string(encoded) != `{"client":true}` {
-		t.Fatalf("encoded = %s, %v", encoded, err)
+	output, err := materialized.Executor.Execute(context.Background(), runtime.ToolCall{Input: decoded, ID: "call-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(output.Structured) != `{"client":true}` {
+		t.Fatalf("encoded = %s", output.Structured)
 	}
 }
 
@@ -50,14 +53,14 @@ func TestClientToolDefinitionRejectsMalformedInputAndResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := definitions[0].Decode(context.Background(), json.RawMessage(`{`)); !errors.Is(err, agenttools.ErrMalformedInput) {
-		t.Fatalf("decode error = %v", err)
-	}
-	output, err := definitions[0].Execute(context.Background(), agenttools.Execution{Call: runtime.ToolCall{ID: "call"}})
+	materialized, err := agenttools.Materialize(context.Background(), definitions[0], runtime.ToolScopeContext{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := definitions[0].Encode(context.Background(), output); err == nil {
+	if _, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{`)); !errors.Is(err, agenttools.ErrMalformedInput) {
+		t.Fatalf("decode error = %v", err)
+	}
+	if _, err := materialized.Executor.Execute(context.Background(), runtime.ToolCall{ID: "call", Input: json.RawMessage(`{}`)}); err == nil {
 		t.Fatal("invalid dispatcher JSON result accepted")
 	}
 }

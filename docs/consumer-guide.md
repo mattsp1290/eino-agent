@@ -150,10 +150,13 @@ contract. Every backend should run `store/storetest.Run` from its tests.
 Required semantics:
 
 - `AdmitRun` atomically creates a run and acquires per-session ownership.
+- Every existing run ID is rejected with `session.ErrConflict`; starting a run
+  is one-shot and never resumes or replays prior admission side effects.
 - A second nonterminal run for the same session returns `session.ErrSessionBusy`.
 - `FinishRun` records one terminal state: completed, failed, or interrupted.
 - Replay ordering is deterministic and cursor-based.
-- Duplicate writes with identical caller-supplied IDs are idempotent.
+- Duplicate ordinary records with identical caller-supplied IDs are
+  idempotent; `AdmitRun` is the explicit exception above.
 - Duplicate writes with incompatible payloads return `session.ErrConflict`.
 - Tool calls are created pending, claimed with owner/token fencing, and settled
   exactly once.

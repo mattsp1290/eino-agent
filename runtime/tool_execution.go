@@ -12,7 +12,7 @@ import (
 var errToolExecutionPanic = errors.New("tool execution panicked")
 
 type settledTool struct {
-	Outcome    ToolOutcome
+	Outcome    toolOutcome
 	Settlement session.ToolSettlement
 	Output     ToolOutput
 }
@@ -85,18 +85,17 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	return settledTool{Outcome: outcome, Settlement: settlement, Output: output}, nil
 }
 
-func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error) (outcome ToolOutcome) {
+func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error) (outcome toolOutcome) {
 	defer func() {
 		if recover() != nil {
-			outcome = ToolOutcome{Call: extensionToolCall(call), Disposition: ToolFailed, RawError: errToolExecutionPanic, Error: classifyExtensionError(errToolExecutionPanic)}
+			outcome = newToolOutcome(call, ToolResult{}, toolPermissionAllowed, errToolExecutionPanic)
 		}
 	}()
 	if prepareErr != nil {
-		outcome = ToolOutcome{Call: extensionToolCall(call), Disposition: ToolFailed, RawError: prepareErr, Error: classifyExtensionError(prepareErr)}
+		outcome = newToolOutcome(call, ToolResult{}, toolPermissionAllowed, prepareErr)
 		return e.host.transformToolOutcome(ctx, e, outcome)
 	}
 	outcome = e.host.executeToolOutcome(ctx, e, tool, call)
-	outcome = e.host.afterToolOutcome(ctx, tool, outcome)
 	return e.host.transformToolOutcome(ctx, e, outcome)
 }
 
