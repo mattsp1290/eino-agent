@@ -28,7 +28,7 @@ func TestValidateDefinitionRejectsIncompleteAndMalformedDefinitions(t *testing.T
 func TestMaterializeUsesBoundedScopeAndReturnsIndependentContainers(t *testing.T) {
 	t.Parallel()
 	definition := testDefinition("echo")
-	definition.Scope = func(scope runtime.ToolScopeContext) runtime.ToolScope {
+	definition.Scope = func(_ context.Context, scope runtime.ToolScopeContext) runtime.ToolScope {
 		return runtime.ToolScope{WorkspaceID: scope.WorkspaceID, Root: "session://" + string(scope.SessionID)}
 	}
 	first, err := Materialize(context.Background(), definition, toolScope("session-a"))

@@ -35,7 +35,7 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 				continue
 			}
 		}
-		err := callObserver(context.WithValue(ctx, callbackMountKey{}, entry.state), observer, input)
+		err := callObserver(callbackContext(ctx, entry.token), observer, input)
 		if err == nil {
 			continue
 		}
@@ -131,7 +131,7 @@ func Invoke[I, O any](plan *Plan, ctx context.Context, point Interceptor[I, O], 
 		if cloneErr != nil {
 			return zero, cloneErr
 		}
-		out, err := callAround(context.WithValue(currentCtx, callbackMountKey{}, entry.state), around, cloned, next)
+		out, err := callAround(callbackContext(currentCtx, entry.token), around, cloned, next)
 		callbackOpen = false
 		if calls > 1 {
 			return zero, ErrNextCalledTwice

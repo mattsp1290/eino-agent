@@ -67,6 +67,24 @@ No runtime API wraps cancellation in a custom token. That keeps provider
 adapters, tools, and host integrations compatible with standard Go cancellation
 and future tracing middleware.
 
+## Runtime Extension Contributions
+
+The runtime context-assembly point accepts only text-only system and user
+messages. Contributions are sorted by order and source, then materialized in
+three fixed regions:
+
+```text
+system contribution prelude
+durable base history (unchanged)
+user contribution suffix
+```
+
+Assistant and tool roles are not context-source material. Tool calls,
+multimodal fields, names, reasoning, response metadata, `Extra`, and deprecated
+`MultiContent` are also rejected. This keeps extension-provided instructions
+from appearing after conversation history and prevents a context source from
+manufacturing durable dialogue or tool transitions.
+
 ## Portable References
 
 Context items may carry URIs for attachments or references, but runtime context

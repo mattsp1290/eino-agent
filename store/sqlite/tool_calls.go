@@ -1,12 +1,11 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"reflect"
 
+	"github.com/mattsp1290/eino-agent/internal/jsonequal"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -153,19 +152,5 @@ func validToolResultEnvelope(call session.ToolCall, settlement session.ToolSettl
 	return call.ResultMessageID != "" && call.ResultPartID != "" &&
 		message.ID == call.ResultMessageID && message.SessionID == call.SessionID && message.RunID == call.RunID && message.ParentID == call.MessageID && message.Role == session.RoleTool &&
 		part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && part.SessionID == call.SessionID && part.RunID == call.RunID && part.Kind == session.PartToolResult &&
-		rawJSONEqual(part.Payload, settlement.Output)
-}
-
-func rawJSONEqual(left, right json.RawMessage) bool {
-	left = bytes.TrimSpace(left)
-	right = bytes.TrimSpace(right)
-	if len(left) == 0 || len(right) == 0 {
-		return len(left) == len(right)
-	}
-	var leftValue any
-	var rightValue any
-	if json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil {
-		return reflect.DeepEqual(leftValue, rightValue)
-	}
-	return bytes.Equal(left, right)
+		jsonequal.Equal(part.Payload, settlement.Output)
 }

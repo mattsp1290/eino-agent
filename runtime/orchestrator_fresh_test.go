@@ -121,7 +121,7 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	store := newAdmissionStore()
 	runtimeSink := &capturingSink{}
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "admission-events", Artifact: extension.Artifact{Name: "admission-events", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var published []EventKind
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {

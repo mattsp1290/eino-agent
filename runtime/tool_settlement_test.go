@@ -11,8 +11,8 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func TestEncodeToolOutputTruncatesOversizedContent(t *testing.T) {
-	raw, output := EncodeToolOutput("call-1", ToolResult{Output: "abcdef", Structured: json.RawMessage(`{"raw":"abcdef"}`)}, RetentionPolicy{MaxInlineBytes: 3, StoreExternal: true}, ToolExecuted, nil)
+func TestToolOutputTruncatesOversizedContentInternally(t *testing.T) {
+	raw, output, _, _ := encodeToolOutput("call-1", ToolResult{Output: "abcdef", Structured: json.RawMessage(`{"raw":"abcdef"}`)}, RetentionPolicy{MaxInlineBytes: 3, StoreExternal: true}, ToolExecuted, nil)
 	if output.Content != "abc" || !output.Truncated || !output.External {
 		t.Fatalf("output = %+v", output)
 	}
@@ -21,8 +21,8 @@ func TestEncodeToolOutputTruncatesOversizedContent(t *testing.T) {
 	}
 }
 
-func TestEncodeToolOutputRedactsRawAndStructuredPayload(t *testing.T) {
-	raw, output := EncodeToolOutput("call-1", ToolResult{
+func TestToolOutputRedactsRawAndStructuredPayloadInternally(t *testing.T) {
+	raw, output, _, _ := encodeToolOutput("call-1", ToolResult{
 		Output: "secret-output", Structured: json.RawMessage(`{"secret":"output"}`), Metadata: map[string]string{"token": "secret-output"},
 		Attachments: []Attachment{{ID: "attachment-1", MIMEType: "text/plain", Name: "secret-output", URL: "file:///private/secret-output", Metadata: map[string]string{"token": "secret-output"}}},
 	}, RetentionPolicy{MaxInlineBytes: 20, StoreExternal: true, Redact: true}, ToolExecuted, nil)
@@ -34,8 +34,8 @@ func TestEncodeToolOutputRedactsRawAndStructuredPayload(t *testing.T) {
 	}
 }
 
-func TestEncodeToolOutputBoundsStructuredPayload(t *testing.T) {
-	raw, output := EncodeToolOutput("call-1", ToolResult{Output: "ok", Structured: json.RawMessage(`{"secret":"oversized-structured-payload"}`)}, RetentionPolicy{MaxInlineBytes: 10, StoreExternal: true}, ToolExecuted, nil)
+func TestToolOutputBoundsStructuredPayloadInternally(t *testing.T) {
+	raw, output, _, _ := encodeToolOutput("call-1", ToolResult{Output: "ok", Structured: json.RawMessage(`{"secret":"oversized-structured-payload"}`)}, RetentionPolicy{MaxInlineBytes: 10, StoreExternal: true}, ToolExecuted, nil)
 	if !output.Truncated || !output.External || output.Structured != nil {
 		t.Fatalf("output = %+v", output)
 	}
@@ -44,8 +44,8 @@ func TestEncodeToolOutputBoundsStructuredPayload(t *testing.T) {
 	}
 }
 
-func TestEncodeToolOutputSuppressesToolControlledFieldsWhenTruncated(t *testing.T) {
-	raw, _ := EncodeToolOutput("call-1", ToolResult{
+func TestToolOutputSuppressesToolControlledFieldsWhenTruncatedInternally(t *testing.T) {
+	raw, _, _, _ := encodeToolOutput("call-1", ToolResult{
 		Output: "abcdef", Metadata: map[string]string{"permission_status": "denied", "token": "abcdef"},
 		Attachments: []Attachment{{ID: "attachment-1", MIMEType: "text/plain", Name: "abcdef", URL: "file:///private/abcdef", Metadata: map[string]string{"token": "abcdef"}}},
 	}, RetentionPolicy{MaxInlineBytes: 3, StoreExternal: true}, ToolExecuted, nil)

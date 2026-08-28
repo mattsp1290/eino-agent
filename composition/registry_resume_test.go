@@ -27,7 +27,7 @@ func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("resume mismatch = %v", err)
 	}
 }
@@ -50,10 +50,6 @@ func TestCapabilityPlanIdentityComesFromMountedComponent(t *testing.T) {
 	descriptor := plan.Descriptor()
 	if len(descriptor.Tools) != 1 || descriptor.Tools[0].InstanceID != mounted.InstanceID {
 		t.Fatalf("plan descriptor = %#v", descriptor)
-	}
-	diagnostics := registry.Diagnostics()
-	if len(diagnostics.Tools) != 1 || diagnostics.Tools[0].InstanceID != mounted.InstanceID {
-		t.Fatalf("registry diagnostics = %#v", diagnostics)
 	}
 }
 
@@ -96,7 +92,7 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Tools[0].SchemaHash == secondDescriptor.Tools[0].SchemaHash {
 		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 	}
-	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("changed schema resume = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
@@ -155,7 +151,7 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Tools[0].SchemaHash == secondDescriptor.Tools[0].SchemaHash {
 				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 			}
-			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+			if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 				t.Fatalf("changed policy resume = %v, want ErrExtensionPlanMismatch", err)
 			}
 		})
@@ -187,7 +183,7 @@ func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
 	}
 
 	equivalentMount := mountRules([]string{"alpha", "zeta"}, []string{})
-	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
 	if err != nil {
 		t.Fatalf("equivalent reordered rules did not resume: %v", err)
 	}
@@ -198,7 +194,7 @@ func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
 
 	changedMount := mountRules([]string{"alpha"}, nil)
 	defer func() { _ = changedMount.Close(context.Background()) }()
-	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("changed restriction rules resumed: %v", err)
 	}
 }
@@ -219,8 +215,31 @@ func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *t
 	persisted := plan.Descriptor()
 	plan.Release()
 	persisted.Tools[0].Artifact.Hash = "tampered"
-	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("tampered descriptor resume = %v, want ErrExtensionPlanMismatch", err)
+	}
+}
+
+func TestAcquireResumePlanRejectsDurableSessionMismatch(t *testing.T) {
+	registry := NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), component("resume-session"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "session-tool", Scope: extension.SessionScope("session-a"), Definition: definition("session-tool", "ok")})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := plan.Descriptor()
+	plan.Release()
+	if resumed, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-b", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		if resumed != nil {
+			resumed.Release()
+		}
+		t.Fatalf("AcquireResumePlan = %v, want mismatch", err)
 	}
 }
 
@@ -248,7 +267,7 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Handlers)
 	}
 
-	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
 	if err != nil {
 		t.Fatalf("AcquireResumePlan = %v", err)
 	}
@@ -265,7 +284,7 @@ func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 		},
 	}}}
 	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
-	if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("conflicting nested scopes = %v", err)
 	}
 }
@@ -358,7 +377,7 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			}
 			secondMount := mountOrdered(20)
 			defer func() { _ = secondMount.Close(context.Background()) }()
-			if _, err := registry.AcquireResumePlan(context.Background(), persisted); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+			if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 				t.Fatalf("changed order resume = %v, want mismatch", err)
 			}
 		})
@@ -385,7 +404,7 @@ func TestUnsupportedVersionTwoPlanIsRejected(t *testing.T) {
 	persisted := plan.Descriptor()
 	plan.Release()
 	persisted.SchemaVersion = 2
-	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
 	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("AcquireResumePlan schema v2 callback/tool plan = %v, want mismatch", err)
 	}

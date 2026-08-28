@@ -10,17 +10,20 @@ The extension system has three deliberately separate planes:
 - typed extension points are in-process interception and contained
   observation. They never replace durable writes or transport delivery.
 
-`extension.Registry` owns generic typed registration, deterministic snapshots,
-leases, and cleanup. `composition.Registry` atomically mounts callbacks with
-tools, prompts, guards, and restrictions and implements
-`runtime.RunPlanProvider`. A run acquires one immutable plan. Deactivation
-blocks new snapshots immediately; `Close` waits for frozen plans to release and
-then runs effects in reverse order.
+`extension.Registry[T]` owns typed registration, the host's immutable component
+payload, deterministic snapshots, references, and cleanup. `composition.Registry`
+atomically commits callbacks with tools, prompts, guards, and restrictions and
+implements `runtime.RunPlanProvider`; it has no second component map or mount
+lifecycle. A run acquires one immutable snapshot. Its dispatch plan is the sole
+release authority for handlers and capability-only payloads. Deactivation blocks
+new snapshots immediately; `Close` waits for that one reference set to release
+and then runs effects in reverse order.
 
-Non-callback composition artifacts declare their lease scope directly through
-`extension.Registrar.Lease`. Snapshot target and instance filters apply to
-those leases exactly as they do to callback registrations, so an unrelated
-session or a later same-session mount cannot keep a component alive.
+Non-callback selection scopes are derived from the frozen tool, prompt, guard,
+and restriction registrations during commit. There is no public lease-only
+registration. Snapshot target and instance filters apply atomically to handler
+registrations and those capability scopes, so fresh and resumed plans cannot
+disagree about an unpersisted lifecycle-only mount.
 
 ## Ordering and failure
 
@@ -36,6 +39,9 @@ Provider clients, streamers, observers, tool executors, input decoders, and
 approval requesters are always nil at the extension boundary; attempts to
 inject callable values fail closed. Runtime keeps the authoritative callables
 outside the callback graph and closes over them only in the terminal adapter.
+Every mounted executable callback, including tool scope resolution, receives
+the canonical callback context so closing its own mount fails with
+`extension.ErrSelfClose` instead of waiting on its own plan reference.
 
 Notification handlers receive defensive copies. A handler error or panic is
 reported locally and never changes the run result or prevents later handlers.
@@ -132,10 +138,19 @@ registration identity all participate in the fingerprint. Resume requires an
 exact current-schema fingerprint match before changing run or tool state.
 
 Resume first verifies that the persisted descriptor matches its own fingerprint,
-then acquires only the persisted instances and independently compares the live
-plan fingerprint before changing run or tool state. Unrelated mounts added later
-are ignored. Local tool generations prevent in-process ABA but are not durable
-identity.
+then passes the durable run's session ID explicitly to plan acquisition. The
+provider validates every session-scoped identity against that ID, acquires only
+the persisted instances, and independently compares the live plan fingerprint
+before changing run or tool state. It never reconstructs the session from scope
+records. Unrelated mounts added later are ignored. Local tool generations
+prevent in-process ABA but are not durable identity.
+
+Context contributions are text-only system or user messages. They sort by
+`(order, source)`, system contributions form a prelude before durable base
+history, and user contributions form a suffix after it. Assistant, tool,
+multimodal, tool-call-bearing, reasoning, response-metadata, and `Extra` shapes
+fail before provider dispatch. Contributions cannot interleave with durable
+history in the first release.
 
 ## Request ledger and privacy
 
@@ -148,7 +163,8 @@ provider dispatch; content is never silently truncated.
 
 Credentials, endpoints, provider runtime objects, opaque options, clients,
 callbacks, observers, and trace attributes are excluded. Disallowed message or
-tool `Extra` fields fail closed. Records move through `prepared`,
+tool `Extra` fields fail closed. The dependency's deprecated message
+`MultiContent` field is rejected rather than converted. Records move through `prepared`,
 `dispatch_started`, and `completed`/`failed`; orphaned nonterminal records are
 valid evidence of an uncertain dispatch. A record ID is offered only to
 adapters implementing `model.IdempotentStreamer` and is not an exactly-once

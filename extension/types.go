@@ -204,7 +204,6 @@ type Registrar interface {
 	register(registrationEntry) error
 	InstanceID() string
 	Defer(Cleanup) error
-	Lease(Scope) error
 }
 
 type entryKind uint8

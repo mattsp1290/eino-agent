@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"sync"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -84,9 +83,6 @@ func (r *Registrar) Prompt(registration PromptRegistration) error {
 			return fmt.Errorf("%w: prompt %s", extension.ErrDuplicateRegistration, registration.Name)
 		}
 	}
-	if err := r.extensions.Lease(registration.Scope); err != nil {
-		return err
-	}
 	r.prompts = append(r.prompts, registration)
 	return nil
 }
@@ -105,9 +101,6 @@ func (r *Registrar) Guard(registration GuardRegistration) error {
 		if existing.ID == registration.ID && existing.Scope == registration.Scope {
 			return fmt.Errorf("%w: guard %s", extension.ErrDuplicateRegistration, registration.ID)
 		}
-	}
-	if err := r.extensions.Lease(registration.Scope); err != nil {
-		return err
 	}
 	r.guards = append(r.guards, registration)
 	return nil
@@ -131,9 +124,6 @@ func (r *Registrar) RestrictTools(registration RestrictionRegistration) error {
 	}
 	registration.Allowed = rules.Allowed
 	registration.Denied = rules.Denied
-	if err := r.extensions.Lease(registration.Scope); err != nil {
-		return err
-	}
 	r.restrictions = append(r.restrictions, registration)
 	return nil
 }
@@ -176,22 +166,15 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 		ArtifactVersion: r.component.Artifact.Version, ArtifactHash: r.component.Artifact.Hash,
 		ConfigHash: r.component.Artifact.ConfigHash, ExecutorHash: executorHash,
 	}
-	if err := r.extensions.Lease(registration.Scope); err != nil {
-		return err
-	}
 	r.tools = append(r.tools, registration)
 	return nil
 }
 
 type Registry struct {
-	mu         sync.Mutex
-	extensions *extension.Registry
-	components map[string]*mountedComponent
+	extensions *extension.Registry[componentPayload]
 }
 
-type mountedComponent struct {
-	component    extension.Component
-	extension    *extension.Mount
+type componentPayload struct {
 	tools        []ToolRegistration
 	prompts      []PromptRegistration
 	guards       []GuardRegistration
@@ -199,14 +182,11 @@ type mountedComponent struct {
 }
 
 func NewRegistry(reporter extension.Reporter) *Registry {
-	return &Registry{extensions: extension.NewRegistry(reporter), components: make(map[string]*mountedComponent)}
+	return &Registry{extensions: extension.NewRegistry[componentPayload](reporter)}
 }
 
 type Mount struct {
-	registry  *Registry
-	extension *extension.Mount
-	instance  string
-	once      sync.Once
+	extension *extension.Mount[componentPayload]
 }
 
 func (r *Registry) Mount(ctx context.Context, component extension.Component, installer Installer) (*Mount, error) {
@@ -228,106 +208,98 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 	rollback := func(primary error) error {
 		return errors.Join(primary, prepared.Rollback(context.WithoutCancel(ctx)))
 	}
-	r.mu.Lock()
-	if _, exists := r.components[component.InstanceID]; exists {
-		r.mu.Unlock()
-		return nil, rollback(fmt.Errorf("%w: component instance %s", extension.ErrDuplicateInstance, component.InstanceID))
+	payload := componentPayload{
+		tools: append([]ToolRegistration(nil), staged.tools...), prompts: append([]PromptRegistration(nil), staged.prompts...),
+		guards: append([]GuardRegistration(nil), staged.guards...), restrictions: append([]RestrictionRegistration(nil), staged.restrictions...),
 	}
-	if err := r.validateTools(staged.tools); err != nil {
-		r.mu.Unlock()
-		return nil, rollback(err)
-	}
-	if err := r.validatePrompts(staged.prompts); err != nil {
-		r.mu.Unlock()
-		return nil, rollback(err)
-	}
-	extensionMount, err := r.extensions.CommitMount(prepared)
+	extensionMount, err := r.extensions.CommitMount(prepared, payload, payloadScopes(payload), validateComponentPayload)
 	if err != nil {
-		r.mu.Unlock()
 		return nil, rollback(err)
 	}
-	r.publishMountedComponentLocked(ctx, component, extensionMount, staged)
-	return &Mount{registry: r, extension: extensionMount, instance: component.InstanceID}, nil
+	return &Mount{extension: extensionMount}, nil
 }
 
-func (r *Registry) publishMountedComponentLocked(ctx context.Context, component extension.Component, extensionMount *extension.Mount, staged *Registrar) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			delete(r.components, component.InstanceID)
-			extensionMount.Deactivate()
-			r.mu.Unlock()
-			_ = extensionMount.Close(context.WithoutCancel(ctx))
-			panic(recovered)
-		}
-	}()
-	for index, registration := range staged.tools {
-		registration.Definition = mountToolDefinition(extensionMount, registration.Definition)
-		staged.tools[index] = registration
+func payloadScopes(payload componentPayload) []extension.Scope {
+	result := make([]extension.Scope, 0, len(payload.tools)+len(payload.prompts)+len(payload.guards)+len(payload.restrictions))
+	for _, registration := range payload.tools {
+		result = append(result, registration.Scope)
 	}
-	for index, registration := range staged.prompts {
-		registration.Provider = mountedPromptProvider{mount: extensionMount, next: registration.Provider}
-		staged.prompts[index] = registration
+	for _, registration := range payload.prompts {
+		result = append(result, registration.Scope)
 	}
-	for index, registration := range staged.guards {
-		registration.Guard = mountedToolGuard{mount: extensionMount, next: registration.Guard}
-		staged.guards[index] = registration
+	for _, registration := range payload.guards {
+		result = append(result, registration.Scope)
 	}
-	r.components[component.InstanceID] = &mountedComponent{
-		component: component, extension: extensionMount,
-		tools: staged.tools, prompts: staged.prompts, guards: staged.guards, restrictions: staged.restrictions,
+	for _, registration := range payload.restrictions {
+		result = append(result, registration.Scope)
 	}
-	r.mu.Unlock()
+	return result
 }
 
 type mountedPromptProvider struct {
-	mount *extension.Mount
-	next  runtime.PromptProvider
+	callbackContext func(context.Context) context.Context
+	next            runtime.PromptProvider
 }
 
 func (p mountedPromptProvider) ProvidePrompt(ctx context.Context, prompt runtime.PromptContext) (string, error) {
-	return p.next.ProvidePrompt(p.mount.CallbackContext(ctx), prompt)
+	return p.next.ProvidePrompt(p.callbackContext(ctx), prompt)
 }
 
 type mountedToolGuard struct {
-	mount *extension.Mount
-	next  runtime.ToolGuard
+	callbackContext func(context.Context) context.Context
+	next            runtime.ToolGuard
 }
 
 func (g mountedToolGuard) GuardTool(ctx context.Context, request runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
-	return g.next.GuardTool(g.mount.CallbackContext(ctx), request)
+	return g.next.GuardTool(g.callbackContext(ctx), request)
 }
 
-func mountToolDefinition(mount *extension.Mount, definition tools.Definition) tools.Definition {
+func mountToolDefinition(callbackContext func(context.Context) context.Context, definition tools.Definition) tools.Definition {
 	next := definition
 	if callback := next.Normalize; callback != nil {
 		next.Normalize = func(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-			return callback(mount.CallbackContext(ctx), input)
+			return callback(callbackContext(ctx), input)
 		}
 	}
 	if callback := next.Pattern; callback != nil {
 		next.Pattern = func(ctx context.Context, input json.RawMessage) (string, error) {
-			return callback(mount.CallbackContext(ctx), input)
+			return callback(callbackContext(ctx), input)
 		}
 	}
 	if callback := next.Execute; callback != nil {
 		next.Execute = func(ctx context.Context, execution tools.Execution) (json.RawMessage, error) {
-			return callback(mount.CallbackContext(ctx), execution)
+			return callback(callbackContext(ctx), execution)
+		}
+	}
+	if callback := next.Scope; callback != nil {
+		next.Scope = func(ctx context.Context, scope runtime.ToolScopeContext) runtime.ToolScope {
+			return callback(callbackContext(ctx), scope)
 		}
 	}
 	return next
 }
 
-func (r *Registry) validateTools(staged []ToolRegistration) error {
-	for index, candidate := range staged {
-		for _, other := range staged[index+1:] {
-			if other.Definition.Name == candidate.Definition.Name && toolScopesOverlap(other.Scope, candidate.Scope) {
-				return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
+func validateComponentPayload(active []extension.CommitValue[componentPayload], candidate extension.CommitValue[componentPayload]) error {
+	payload := candidate.Value()
+	for index, tool := range payload.tools {
+		for _, other := range payload.tools[index+1:] {
+			if other.Definition.Name == tool.Definition.Name && toolScopesOverlap(other.Scope, tool.Scope) {
+				return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, tool.Definition.Name)
 			}
 		}
-		for _, mounted := range r.components {
-			for _, existing := range mounted.tools {
-				if existing.Definition.Name == candidate.Definition.Name && toolScopesOverlap(existing.Scope, candidate.Scope) {
-					return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, candidate.Definition.Name)
+		for _, mounted := range active {
+			for _, existing := range mounted.Value().tools {
+				if existing.Definition.Name == tool.Definition.Name && toolScopesOverlap(existing.Scope, tool.Scope) {
+					return fmt.Errorf("%w: %s", tools.ErrDuplicateRegistration, tool.Definition.Name)
+				}
+			}
+		}
+	}
+	for _, prompt := range payload.prompts {
+		for _, mounted := range active {
+			for _, existing := range mounted.Value().prompts {
+				if existing.Scope == prompt.Scope && existing.Name == prompt.Name {
+					return fmt.Errorf("%w: prompt %s", extension.ErrDuplicateRegistration, prompt.Name)
 				}
 			}
 		}
@@ -342,44 +314,17 @@ func toolScopesOverlap(left, right extension.Scope) bool {
 	return left.Kind == extension.ScopeSession && right.Kind == extension.ScopeSession && left.Key == right.Key
 }
 
-func (r *Registry) validatePrompts(staged []PromptRegistration) error {
-	for _, candidate := range staged {
-		for _, mounted := range r.components {
-			for _, existing := range mounted.prompts {
-				if existing.Scope == candidate.Scope && existing.Name == candidate.Name {
-					return fmt.Errorf("%w: prompt %s", extension.ErrDuplicateRegistration, candidate.Name)
-				}
-			}
-		}
-	}
-	return nil
-}
-
 func (m *Mount) Deactivate() {
-	if m == nil || m.registry == nil {
+	if m == nil || m.extension == nil {
 		return
 	}
-	m.once.Do(func() {
-		m.registry.mu.Lock()
-		mounted := m.registry.components[m.instance]
-		delete(m.registry.components, m.instance)
-		if mounted != nil {
-			mounted.extension.Deactivate()
-		} else {
-			m.extension.Deactivate()
-		}
-		m.registry.mu.Unlock()
-	})
+	m.extension.Deactivate()
 }
 
 func (m *Mount) Close(ctx context.Context) error {
 	if m == nil {
 		return nil
 	}
-	if err := m.extension.CheckClose(ctx); err != nil {
-		return err
-	}
-	m.Deactivate()
 	return m.extension.Close(ctx)
 }
 
@@ -387,7 +332,11 @@ func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRe
 	return r.acquire(ctx, request.SessionID, nil, requestedToolSelector(request.Config.Tools))
 }
 
-func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.ExtensionPlanDescriptor) (*runtime.RunPlan, error) {
+func (r *Registry) AcquireResumePlan(ctx context.Context, request runtime.ResumePlanRequest) (*runtime.RunPlan, error) {
+	if request.SessionID == "" {
+		return nil, runtime.ErrExtensionPlanMismatch
+	}
+	persisted := request.Descriptor
 	if err := session.ValidateExtensionPlan(persisted); err != nil || persisted.Fingerprint == "" {
 		return nil, runtime.ErrExtensionPlanMismatch
 	}
@@ -397,21 +346,10 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	}
 	instances := make(map[string]bool)
 	toolIdentities := make(map[planToolIdentity]bool)
-	var sessionID session.ID
-	recoverSessionID := func(scope extension.Scope) error {
-		if scope.Kind != extension.ScopeSession || scope.Key == "" {
-			return nil
-		}
-		if sessionID != "" && sessionID != session.ID(scope.Key) {
-			return runtime.ErrExtensionPlanMismatch
-		}
-		sessionID = session.ID(scope.Key)
-		return nil
-	}
 	for _, identity := range persisted.Handlers {
 		instances[identity.InstanceID] = true
 		for _, registration := range identity.Registrations {
-			if err := recoverSessionID(registration.Scope); err != nil {
+			if err := validateResumeScope(request.SessionID, registration.Scope); err != nil {
 				return nil, err
 			}
 		}
@@ -419,29 +357,29 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	for _, identity := range persisted.Tools {
 		instances[identity.InstanceID] = true
 		toolIdentities[planToolIdentity{InstanceID: identity.InstanceID, Scope: identity.Scope, RegistrationID: identity.RegistrationID, ToolName: identity.Name}] = true
-		if err := recoverSessionID(identity.Scope); err != nil {
+		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
 			return nil, err
 		}
 	}
 	for _, identity := range persisted.Prompts {
 		instances[identity.InstanceID] = true
-		if err := recoverSessionID(identity.Scope); err != nil {
+		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
 			return nil, err
 		}
 	}
 	for _, identity := range persisted.Guards {
 		instances[identity.InstanceID] = true
-		if err := recoverSessionID(identity.Scope); err != nil {
+		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
 			return nil, err
 		}
 	}
 	for _, identity := range persisted.Restrictions {
 		instances[identity.InstanceID] = true
-		if err := recoverSessionID(identity.Scope); err != nil {
+		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
 			return nil, err
 		}
 	}
-	plan, err := r.acquire(ctx, sessionID, instances, persistedToolSelector(toolIdentities))
+	plan, err := r.acquire(ctx, request.SessionID, instances, persistedToolSelector(toolIdentities))
 	if err != nil {
 		return nil, err
 	}
@@ -452,44 +390,50 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, persisted session.Exte
 	return plan, nil
 }
 
+func validateResumeScope(sessionID session.ID, scope extension.Scope) error {
+	if scope.Kind == extension.ScopeSession && scope.Key != string(sessionID) {
+		return runtime.ErrExtensionPlanMismatch
+	}
+	return nil
+}
+
 func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, selectTool planToolSelector) (*runtime.RunPlan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	target := extension.GlobalScope()
 	if sessionID != "" {
 		target = extension.SessionScope(string(sessionID))
 	}
-	var dispatch *extension.Plan
+	var snapshot *extension.Snapshot[componentPayload]
 	var err error
 	if instances == nil {
-		dispatch, err = r.extensions.Snapshot(target)
+		snapshot, err = r.extensions.Snapshot(target)
 	} else {
 		ids := make([]string, 0, len(instances))
 		for id := range instances {
 			ids = append(ids, id)
 		}
-		dispatch, err = r.extensions.SnapshotInstances(target, ids)
+		snapshot, err = r.extensions.SnapshotInstances(target, ids)
 	}
 	if err != nil {
 		return nil, err
 	}
-	selected := selectTools(r.components, target, instances, selectTool)
-	prompts := selectPrompts(r.components, target, instances)
-	guards := selectGuards(r.components, target, instances)
-	restrictions := selectRestrictions(r.components, target, instances)
+	components := snapshotComponents(snapshot.Values())
+	selected := selectTools(components, target, instances, selectTool)
+	prompts := selectPrompts(components, target, instances)
+	guards := selectGuards(components, target, instances)
+	restrictions := selectRestrictions(components, target, instances)
 	planTools := make([]runtime.PlanTool, len(selected))
 	for index, entry := range selected {
 		schemaHash, hashErr := composedToolSchemaHash(entry.ToolRegistration)
 		if hashErr != nil {
-			dispatch.Release()
+			snapshot.Release()
 			return nil, hashErr
 		}
-		definition, cloneErr := entry.Definition.Clone()
+		definition, cloneErr := mountToolDefinition(entry.callbackContext, entry.Definition).Clone()
 		if cloneErr != nil {
-			dispatch.Release()
+			snapshot.Release()
 			return nil, cloneErr
 		}
 		planTools[index] = runtime.PlanTool{
@@ -506,21 +450,25 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	for index, prompt := range prompts {
 		planPrompts[index] = runtime.PlanPrompt{
 			Identity: session.PromptPlanIdentity{InstanceID: prompt.component.InstanceID, Artifact: prompt.component.Artifact, Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
-			Prompt:   runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.component.InstanceID, Provider: prompt.Provider},
+			Prompt: runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.component.InstanceID, Provider: mountedPromptProvider{
+				callbackContext: prompt.callbackContext, next: prompt.Provider,
+			}},
 		}
 	}
 	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
 		planGuards[index] = runtime.PlanGuard{
 			Identity: session.GuardPlanIdentity{InstanceID: guard.component.InstanceID, Artifact: guard.component.Artifact, RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
-			Guard:    runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.component.InstanceID, Guard: guard.Guard},
+			Guard: runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.component.InstanceID, Guard: mountedToolGuard{
+				callbackContext: guard.callbackContext, next: guard.Guard,
+			}},
 		}
 	}
 	planRestrictions := make([]runtime.PlanRestriction, len(restrictions))
 	for index, restriction := range restrictions {
 		rules, rulesErr := runtime.CanonicalizeRestrictionRules(restriction.Allowed, restriction.Denied)
 		if rulesErr != nil {
-			dispatch.Release()
+			snapshot.Release()
 			return nil, rulesErr
 		}
 		planRestrictions[index] = runtime.PlanRestriction{
@@ -528,22 +476,42 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			Allowed:  rules.Allowed, Denied: rules.Denied,
 		}
 	}
-	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: dispatch, Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})
+	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: snapshot.Dispatch(), Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})
+}
+
+type selectedComponent struct {
+	component       extension.Component
+	payload         componentPayload
+	callbackContext func(context.Context) context.Context
+}
+
+func snapshotComponents(values []extension.MountedValue[componentPayload]) []selectedComponent {
+	result := make([]selectedComponent, len(values))
+	for index, value := range values {
+		mounted := value
+		result[index] = selectedComponent{
+			component: mounted.Component(), payload: mounted.Value(), callbackContext: mounted.CallbackContext,
+		}
+	}
+	return result
 }
 
 type selectedTool struct {
 	ToolRegistration
-	component extension.Component
+	component       extension.Component
+	callbackContext func(context.Context) context.Context
 }
 
 type selectedPrompt struct {
 	PromptRegistration
-	component extension.Component
+	component       extension.Component
+	callbackContext func(context.Context) context.Context
 }
 
 type selectedGuard struct {
 	GuardRegistration
-	component extension.Component
+	component       extension.Component
+	callbackContext func(context.Context) context.Context
 }
 
 type selectedRestriction struct {
@@ -585,11 +553,11 @@ func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelecto
 	}
 }
 
-func selectTools(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []selectedTool {
+func selectTools(components []selectedComponent, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []selectedTool {
 	var result []selectedTool
 	for _, mounted := range components {
-		for _, registration := range mounted.tools {
-			entry := selectedTool{ToolRegistration: registration, component: mounted.component}
+		for _, registration := range mounted.payload.tools {
+			entry := selectedTool{ToolRegistration: registration, component: mounted.component, callbackContext: mounted.callbackContext}
 			if instances != nil && !instances[entry.component.InstanceID] || selectTool != nil && !selectTool(entry) {
 				continue
 			}
@@ -613,11 +581,11 @@ func selectTools(components map[string]*mountedComponent, target extension.Scope
 	return result
 }
 
-func selectPrompts(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool) []selectedPrompt {
+func selectPrompts(components []selectedComponent, target extension.Scope, instances map[string]bool) []selectedPrompt {
 	selected := make(map[string]selectedPrompt)
 	for _, mounted := range components {
-		for _, registration := range mounted.prompts {
-			entry := selectedPrompt{PromptRegistration: registration, component: mounted.component}
+		for _, registration := range mounted.payload.prompts {
+			entry := selectedPrompt{PromptRegistration: registration, component: mounted.component, callbackContext: mounted.callbackContext}
 			if !capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
 				continue
 			}
@@ -643,11 +611,11 @@ func selectPrompts(components map[string]*mountedComponent, target extension.Sco
 	return result
 }
 
-func selectGuards(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool) []selectedGuard {
+func selectGuards(components []selectedComponent, target extension.Scope, instances map[string]bool) []selectedGuard {
 	var result []selectedGuard
 	for _, mounted := range components {
-		for _, registration := range mounted.guards {
-			entry := selectedGuard{GuardRegistration: registration, component: mounted.component}
+		for _, registration := range mounted.payload.guards {
+			entry := selectedGuard{GuardRegistration: registration, component: mounted.component, callbackContext: mounted.callbackContext}
 			if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
 				result = append(result, entry)
 			}
@@ -665,10 +633,10 @@ func selectGuards(components map[string]*mountedComponent, target extension.Scop
 	return result
 }
 
-func selectRestrictions(components map[string]*mountedComponent, target extension.Scope, instances map[string]bool) []selectedRestriction {
+func selectRestrictions(components []selectedComponent, target extension.Scope, instances map[string]bool) []selectedRestriction {
 	var result []selectedRestriction
 	for _, mounted := range components {
-		for _, registration := range mounted.restrictions {
+		for _, registration := range mounted.payload.restrictions {
 			entry := selectedRestriction{RestrictionRegistration: registration, component: mounted.component}
 			if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
 				result = append(result, entry)
@@ -714,37 +682,6 @@ func toolSchemaHash(definition tools.Definition) (string, error) {
 	}
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:]), nil
-}
-
-type Diagnostics struct {
-	Components []extension.ComponentDiagnostic
-	Tools      []ToolDiagnostic
-}
-
-type ToolDiagnostic struct {
-	InstanceID string
-	ID         string
-	Name       string
-	Order      int
-	Scope      extension.Scope
-}
-
-func (r *Registry) Diagnostics() Diagnostics {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	result := Diagnostics{Components: r.extensions.Diagnostics()}
-	for _, mounted := range r.components {
-		for _, entry := range mounted.tools {
-			result.Tools = append(result.Tools, ToolDiagnostic{InstanceID: mounted.component.InstanceID, ID: entry.ID, Name: entry.Definition.Name, Order: entry.Order, Scope: entry.Scope})
-		}
-	}
-	sort.Slice(result.Tools, func(i, j int) bool {
-		if result.Tools[i].InstanceID != result.Tools[j].InstanceID {
-			return result.Tools[i].InstanceID < result.Tools[j].InstanceID
-		}
-		return result.Tools[i].ID < result.Tools[j].ID
-	})
-	return result
 }
 
 var _ runtime.RunPlanProvider = (*Registry)(nil)

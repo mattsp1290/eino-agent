@@ -188,6 +188,8 @@ func TestRequestCloneRejectsUnsupportedMetadata(t *testing.T) {
 	tests := map[string]Request{
 		"message extra": {Messages: []*einoschema.Message{{Extra: map[string]any{"value": 1}}}},
 		"tool extra":    {Tools: []*einoschema.ToolInfo{{Name: "tool", Extra: map[string]any{"value": 1}}}},
+		//nolint:staticcheck // The clone boundary must reject the deprecated field.
+		"deprecated MultiContent": {Messages: []*einoschema.Message{{MultiContent: []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}}}},
 		"streaming metadata": {Messages: []*einoschema.Message{{AssistantGenMultiContent: []einoschema.MessageOutputPart{{
 			Type: einoschema.ChatMessagePartTypeText, Text: "chunk", StreamingMeta: &einoschema.MessageStreamingMeta{Index: 1},
 		}}}}},

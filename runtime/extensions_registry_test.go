@@ -22,7 +22,7 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "tool-validation", Artifact: extension.Artifact{Name: "tool-validation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := extension.Use(registrar, runtime.ToolPreparePoint, extension.Registration{ID: "prepare", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {

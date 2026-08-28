@@ -5,7 +5,6 @@ import (
 	"errors"
 	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,11 +96,10 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	var releases atomic.Int64
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("executor secret")
 	})}}}
-	plan := newTestToolPlanWithDispatch(toolRegistry, nil, func() { releases.Add(1) })
+	plan := newTestToolPlanWithDispatch(toolRegistry, nil)
 	sink := &capturingSink{}
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store),
@@ -116,9 +114,6 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		t.Fatalf("result = %+v", result)
 	}
 	assertDurableToolResult(t, store, "panic-session", "call-panic", session.ToolCallFailed, "operational_failure")
-	if releases.Load() != 1 {
-		t.Fatalf("plan releases = %d, want 1", releases.Load())
-	}
 	var toolEvents []Event
 	for _, event := range sink.events {
 		if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
@@ -132,12 +127,11 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 
 func TestPendingResumeToolPanicSettlesWithoutTransportEvent(t *testing.T) {
 	store, run := resumeStoreWithTool(t, "old-owner", session.ToolCallPending)
-	var releases atomic.Int64
 	sink := &capturingSink{}
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("resume executor secret")
 	})}}}
-	plan := newTestToolPlanWithDispatch(toolRegistry, nil, func() { releases.Add(1) })
+	plan := newTestToolPlanWithDispatch(toolRegistry, nil)
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store), WithEventSink(sink), WithOwnerID("owner-1"),
 		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
@@ -149,9 +143,6 @@ func TestPendingResumeToolPanicSettlesWithoutTransportEvent(t *testing.T) {
 		t.Fatalf("result = %+v", result)
 	}
 	assertDurableToolResult(t, store, run.SessionID, "call-resume", session.ToolCallFailed, "operational_failure")
-	if releases.Load() != 1 {
-		t.Fatalf("plan releases = %d, want 1", releases.Load())
-	}
 	for _, event := range sink.events {
 		if event.Kind == EventToolCallUpdated {
 			t.Fatalf("resume emitted fresh-only tool transport event: %+v", event)

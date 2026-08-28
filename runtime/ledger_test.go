@@ -354,7 +354,7 @@ func (s *dispatchStartFailingExecution) UpdateModelRequest(ctx context.Context, 
 
 func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]ModelCompletedNotice) (*RunPlan, func()) {
 	t.Helper()
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "model-lifecycle", Artifact: extension.Artifact{Name: "model-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "requested", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error {
@@ -384,7 +384,7 @@ func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]Mod
 	}
 }
 
-func TestAuditModelRequestRejectsEveryNestedExtraCategory(t *testing.T) {
+func TestAuditModelRequestRejectsUnsafeAndDeprecatedMessageShapes(t *testing.T) {
 	unsafe := map[string]any{"credential": "sentinel"}
 	tests := []struct {
 		name   string
@@ -393,9 +393,9 @@ func TestAuditModelRequestRejectsEveryNestedExtraCategory(t *testing.T) {
 		{name: "tool call", mutate: func(message *einoschema.Message) {
 			message.ToolCalls = []einoschema.ToolCall{{Extra: unsafe}}
 		}},
-		{name: "legacy multimodal media", mutate: func(message *einoschema.Message) {
-			//nolint:staticcheck // The audit boundary must remain safe for legacy persisted message shapes.
-			message.MultiContent = []einoschema.ChatMessagePart{{ImageURL: &einoschema.ChatMessageImageURL{Extra: unsafe}}}
+		{name: "deprecated MultiContent", mutate: func(message *einoschema.Message) {
+			//nolint:staticcheck // The audit boundary must reject the deprecated field.
+			message.MultiContent = []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}
 		}},
 		{name: "input part", mutate: func(message *einoschema.Message) {
 			message.UserInputMultiContent = []einoschema.MessageInputPart{{Extra: unsafe}}

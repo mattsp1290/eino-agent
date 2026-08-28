@@ -224,7 +224,7 @@ func TestSessionToolMountResumesAcrossEquivalentRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = secondMount.Close(context.Background()) }()
-	resumed, err := second.AcquireResumePlan(context.Background(), descriptor)
+	resumed, err := second.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor})
 	if err != nil {
 		t.Fatalf("AcquireResumePlan error = %v", err)
 	}
@@ -277,7 +277,7 @@ func TestSessionToolMountResumeRejectsIdentityDrift(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = mount.Close(context.Background()) }()
-			if resumed, err := registry.AcquireResumePlan(context.Background(), descriptor); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+			if resumed, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 				if resumed != nil {
 					resumed.Release()
 				}

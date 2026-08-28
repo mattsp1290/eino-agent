@@ -101,6 +101,15 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 	}
 }
 
+func TestToolSettlementApplyDistinguishesLargeJSONIntegers(t *testing.T) {
+	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
+	call := ToolCall{ID: "call-1", Status: ToolCallCompleted, Output: json.RawMessage(`9007199254740992`), CompletedAt: now, ClaimedBy: "worker", ClaimToken: "token"}
+	settlement := ToolSettlement{ID: call.ID, Status: call.Status, Output: json.RawMessage(`9007199254740993`), CompletedAt: now, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken}
+	if _, err := settlement.Apply(call); !errors.Is(err, ErrConflict) {
+		t.Fatalf("large integer collision = %v, want ErrConflict", err)
+	}
+}
+
 func TestToolSettlementApplyRejectsMissingCompletionTimeForRunningCall(t *testing.T) {
 	settlement := ToolSettlement{
 		ID:         "call-1",

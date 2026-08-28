@@ -23,9 +23,14 @@ type RunPlanRequest struct {
 	Config    config.Snapshot
 }
 
+type ResumePlanRequest struct {
+	SessionID  session.ID
+	Descriptor session.ExtensionPlanDescriptor
+}
+
 type RunPlanProvider interface {
 	AcquireRunPlan(context.Context, RunPlanRequest) (*RunPlan, error)
-	AcquireResumePlan(context.Context, session.ExtensionPlanDescriptor) (*RunPlan, error)
+	AcquireResumePlan(context.Context, ResumePlanRequest) (*RunPlan, error)
 }
 
 type PlanTool struct {
@@ -60,23 +65,21 @@ type RunPlanSpec struct {
 	Prompts      []PlanPrompt
 	Guards       []PlanGuard
 	Restrictions []PlanRestriction
-	Release      func()
 }
 
 // RunPlan is the immutable executable state for one run.
 type RunPlan struct {
-	dispatch     *extension.Plan
-	tools        sealedPlanTools
-	prompts      []MountedPrompt
-	guards       []MountedToolGuard
-	descriptor   session.ExtensionPlanDescriptor
-	releaseExtra func()
-	once         sync.Once
+	dispatch   *extension.Plan
+	tools      sealedPlanTools
+	prompts    []MountedPrompt
+	guards     []MountedToolGuard
+	descriptor session.ExtensionPlanDescriptor
+	once       sync.Once
 }
 
 // NewRunPlan validates identity-bound behavior and seals its descriptor.
 func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
-	plan := &RunPlan{dispatch: spec.Dispatch, releaseExtra: spec.Release}
+	plan := &RunPlan{dispatch: spec.Dispatch}
 	fail := func(err error) (*RunPlan, error) {
 		plan.release()
 		return nil, err
@@ -307,9 +310,6 @@ func (p *RunPlan) release() {
 		if p.dispatch != nil {
 			p.dispatch.Release()
 		}
-		if p.releaseExtra != nil {
-			p.releaseExtra()
-		}
 	})
 }
 
@@ -327,7 +327,11 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 	return plan, nil
 }
 
-func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descriptor session.ExtensionPlanDescriptor) (*RunPlan, error) {
+func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, request ResumePlanRequest) (*RunPlan, error) {
+	if request.SessionID == "" {
+		return nil, ErrExtensionPlanMismatch
+	}
+	descriptor := request.Descriptor
 	if descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || descriptor.Fingerprint == "" {
 		return nil, ErrExtensionPlanMismatch
 	}
@@ -335,7 +339,7 @@ func (o *StreamingOrchestrator) acquireResumePlan(ctx context.Context, descripto
 	if err != nil || fingerprint != descriptor.Fingerprint {
 		return nil, ErrExtensionPlanMismatch
 	}
-	plan, err := o.plans.AcquireResumePlan(ctx, descriptor.Clone())
+	plan, err := o.plans.AcquireResumePlan(ctx, ResumePlanRequest{SessionID: request.SessionID, Descriptor: descriptor.Clone()})
 	if err != nil {
 		return nil, err
 	}

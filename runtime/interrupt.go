@@ -28,7 +28,7 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	}
 	var plan *RunPlan
 	if !run.Terminal() {
-		plan, err = o.acquireResumePlan(ctx, run.ExtensionPlan)
+		plan, err = o.acquireResumePlan(ctx, ResumePlanRequest{SessionID: run.SessionID, Descriptor: run.ExtensionPlan.Clone()})
 		if err != nil {
 			return nil, err
 		}

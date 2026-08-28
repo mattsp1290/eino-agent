@@ -74,7 +74,7 @@ func TestDispatcherArtifactIdentityParticipatesInResumeFingerprint(t *testing.T)
 		t.Fatal(err)
 	}
 	defer func() { _ = second.Close(context.Background()) }()
-	if _, err := registry.AcquireResumePlan(context.Background(), descriptor); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("resume error = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
@@ -102,7 +102,7 @@ func TestClientGenerationParticipatesInResumeFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = second.Close(context.Background()) }()
-	if _, err := registry.AcquireResumePlan(context.Background(), descriptor); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if _, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("resume error = %v, want ErrExtensionPlanMismatch", err)
 	}
 }

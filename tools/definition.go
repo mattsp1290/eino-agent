@@ -34,7 +34,7 @@ type PermissionPattern func(ctx context.Context, input json.RawMessage) (string,
 type Executor func(ctx context.Context, execution Execution) (json.RawMessage, error)
 
 // ScopeResolver returns runtime authority from bounded, data-only scope input.
-type ScopeResolver func(runtime.ToolScopeContext) runtime.ToolScope
+type ScopeResolver func(context.Context, runtime.ToolScopeContext) runtime.ToolScope
 
 // Definition is a JSON-native tool declaration registered by host code or adapters.
 type Definition struct {
@@ -186,13 +186,13 @@ func Materialize(ctx context.Context, definition Definition, context runtime.Too
 	if err != nil {
 		return runtime.Tool{}, fmt.Errorf("freeze tool %q: %w", definition.Name, err)
 	}
-	return materialize(frozen, context.Clone())
+	return materialize(ctx, frozen, context.Clone())
 }
 
-func materialize(definition Definition, context runtime.ToolScopeContext) (runtime.Tool, error) {
+func materialize(ctx context.Context, definition Definition, context runtime.ToolScopeContext) (runtime.Tool, error) {
 	scope := runtime.ToolScope{}
 	if definition.Scope != nil {
-		scope = definition.Scope(context.Clone())
+		scope = definition.Scope(ctx, context.Clone())
 	}
 	if scope.WorkspaceID == "" {
 		scope.WorkspaceID = context.WorkspaceID

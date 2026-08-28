@@ -10,14 +10,16 @@ import (
 
 const maxReportedFailures = 64
 
-type Registry struct {
+// Registry owns the complete lifecycle and immutable payload of mounted
+// components. T is supplied by the production host composing those payloads.
+type Registry[T any] struct {
 	mu       sync.Mutex
 	reporter Reporter
-	mounts   map[string]*mountState
+	mounts   map[string]*mountState[T]
 }
 
-func NewRegistry(reporter Reporter) *Registry {
-	return &Registry{reporter: reporter, mounts: make(map[string]*mountState)}
+func NewRegistry[T any](reporter Reporter) *Registry[T] {
+	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T])}
 }
 
 type cleanupState struct {
@@ -25,21 +27,24 @@ type cleanupState struct {
 	done bool
 }
 
-type mountState struct {
-	component Component
-	entries   []registrationEntry
-	leases    []Scope
-	effects   []cleanupState
-	active    bool
-	refs      int
-	drained   chan struct{}
-	cleanMu   sync.Mutex
+type callbackToken struct{}
+
+type mountState[T any] struct {
+	component       Component
+	entries         []registrationEntry
+	selectionScopes []Scope
+	value           T
+	effects         []cleanupState
+	active          bool
+	refs            int
+	drained         chan struct{}
+	token           *callbackToken
+	cleanMu         sync.Mutex
 }
 
 type stagingRegistrar struct {
 	component Component
 	entries   []registrationEntry
-	leases    []Scope
 	effects   []cleanupState
 	closed    bool
 }
@@ -76,48 +81,17 @@ func (s *stagingRegistrar) Defer(cleanup Cleanup) error {
 	return nil
 }
 
-// Lease retains the mounted component while a frozen plan for scope is active.
-// Lease scopes are lifecycle metadata; they are not dispatched or fingerprinted.
-func (s *stagingRegistrar) Lease(scope Scope) error {
-	if s.closed {
-		return ErrMountClosed
-	}
-	if err := ValidateScope(scope); err != nil {
-		return err
-	}
-	for _, existing := range s.leases {
-		if existing == scope {
-			return nil
-		}
-	}
-	s.leases = append(s.leases, scope)
-	return nil
-}
-
-func (r *Registry) Mount(ctx context.Context, component Component, installer Installer) (*Mount, error) {
-	prepared, err := r.PrepareMount(ctx, component, installer)
-	if err != nil {
-		return nil, err
-	}
-	mount, err := r.CommitMount(prepared)
-	if err != nil {
-		return nil, errors.Join(err, prepared.Rollback(context.WithoutCancel(ctx)))
-	}
-	return mount, nil
-}
-
 // PreparedMount contains validated registrations and cleanup effects that have
-// not yet been published. Preparing executes installer code without holding a
-// registry lock; CommitMount performs only the atomic publication step.
-type PreparedMount struct {
+// not yet been published.
+type PreparedMount[T any] struct {
 	mu         sync.Mutex
-	registry   *Registry
-	state      *mountState
+	registry   *Registry[T]
+	state      *mountState[T]
 	committed  bool
 	rolledBack bool
 }
 
-func (r *Registry) PrepareMount(ctx context.Context, component Component, installer Installer) (prepared *PreparedMount, err error) {
+func (r *Registry[T]) PrepareMount(ctx context.Context, component Component, installer Installer) (prepared *PreparedMount[T], err error) {
 	if r == nil || installer == nil {
 		return nil, fmt.Errorf("%w: registry and installer required", ErrInvalidComponent)
 	}
@@ -131,28 +105,45 @@ func (r *Registry) PrepareMount(ctx context.Context, component Component, instal
 		}
 		if err != nil {
 			stage.closed = true
-			err = errors.Join(err, cleanupReverse(ctx, stage.effects))
+			err = errors.Join(err, cleanupReverse(context.WithoutCancel(ctx), stage.effects))
 		}
 	}()
 	if err = installer.Install(ctx, stage); err != nil {
 		return nil, err
 	}
 	stage.closed = true
-	state := &mountState{
+	state := &mountState[T]{
 		component: component,
 		entries:   append([]registrationEntry(nil), stage.entries...),
-		leases:    append([]Scope(nil), stage.leases...),
 		effects:   append([]cleanupState(nil), stage.effects...),
 		drained:   make(chan struct{}),
+		token:     &callbackToken{},
 	}
-	return &PreparedMount{registry: r, state: state}, nil
+	return &PreparedMount[T]{registry: r, state: state}, nil
 }
 
-// CommitMount atomically publishes a prepared mount. A failed commit leaves the
-// preparation available for Rollback, which always runs cleanup outside locks.
-func (r *Registry) CommitMount(prepared *PreparedMount) (*Mount, error) {
+// CommitValue is an immutable validator-only view of one component payload.
+// Validators run synchronously under the publication lock and must not retain
+// these values.
+type CommitValue[T any] struct {
+	component Component
+	value     T
+}
+
+func (v CommitValue[T]) Component() Component { return v.component }
+func (v CommitValue[T]) Value() T             { return v.value }
+
+type CommitValidator[T any] func(active []CommitValue[T], candidate CommitValue[T]) error
+
+// CommitMount atomically validates and publishes a prepared mount. A failed
+// commit leaves the preparation available for Rollback.
+func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selectionScopes []Scope, validate CommitValidator[T]) (*Mount[T], error) {
 	if r == nil || prepared == nil {
 		return nil, fmt.Errorf("%w: registry and prepared mount required", ErrInvalidComponent)
+	}
+	scopes, err := freezeScopes(selectionScopes)
+	if err != nil {
+		return nil, err
 	}
 	prepared.mu.Lock()
 	defer prepared.mu.Unlock()
@@ -161,23 +152,60 @@ func (r *Registry) CommitMount(prepared *PreparedMount) (*Mount, error) {
 	}
 	state := prepared.state
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.mounts == nil {
-		r.mounts = make(map[string]*mountState)
+		r.mounts = make(map[string]*mountState[T])
 	}
 	if _, exists := r.mounts[state.component.InstanceID]; exists {
-		r.mu.Unlock()
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateInstance, state.component.InstanceID)
 	}
+	candidate := CommitValue[T]{component: state.component, value: value}
+	if validate != nil {
+		active := make([]CommitValue[T], 0, len(r.mounts))
+		for _, mounted := range r.mounts {
+			if mounted.active {
+				active = append(active, CommitValue[T]{component: mounted.component, value: mounted.value})
+			}
+		}
+		if err := callCommitValidator(validate, active, candidate); err != nil {
+			return nil, err
+		}
+	}
+	state.value = value
+	state.selectionScopes = scopes
 	state.active = true
 	r.mounts[state.component.InstanceID] = state
-	r.mu.Unlock()
 	prepared.committed = true
-	return &Mount{registry: r, state: state}, nil
+	return &Mount[T]{registry: r, state: state}, nil
 }
 
-// Rollback discards an uncommitted preparation and runs its cleanup effects in
-// reverse order. It is idempotent.
-func (p *PreparedMount) Rollback(ctx context.Context) error {
+func callCommitValidator[T any](validate CommitValidator[T], active []CommitValue[T], candidate CommitValue[T]) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("extension commit validator panic: %v", recovered)
+		}
+	}()
+	return validate(active, candidate)
+}
+
+func freezeScopes(scopes []Scope) ([]Scope, error) {
+	result := make([]Scope, 0, len(scopes))
+	seen := make(map[Scope]bool, len(scopes))
+	for _, scope := range scopes {
+		if err := ValidateScope(scope); err != nil {
+			return nil, err
+		}
+		if !seen[scope] {
+			seen[scope] = true
+			result = append(result, scope)
+		}
+	}
+	return result, nil
+}
+
+// Rollback discards an uncommitted preparation and runs cleanup effects in
+// reverse order. It is idempotent and cleanup cannot inherit cancellation.
+func (p *PreparedMount[T]) Rollback(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
@@ -189,15 +217,15 @@ func (p *PreparedMount) Rollback(ctx context.Context) error {
 	p.rolledBack = true
 	effects := p.state.effects
 	p.mu.Unlock()
-	return cleanupReverse(ctx, effects)
+	return cleanupReverse(context.WithoutCancel(ctx), effects)
 }
 
-type Mount struct {
-	registry *Registry
-	state    *mountState
+type Mount[T any] struct {
+	registry *Registry[T]
+	state    *mountState[T]
 }
 
-func (m *Mount) Deactivate() {
+func (m *Mount[T]) Deactivate() {
 	if m == nil || m.registry == nil || m.state == nil {
 		return
 	}
@@ -206,7 +234,7 @@ func (m *Mount) Deactivate() {
 	m.registry.mu.Unlock()
 }
 
-func (m *Mount) deactivateLocked() {
+func (m *Mount[T]) deactivateLocked() {
 	if !m.state.active {
 		return
 	}
@@ -219,27 +247,32 @@ func (m *Mount) deactivateLocked() {
 
 type callbackMountKey struct{}
 
+func callbackContext(ctx context.Context, token *callbackToken) context.Context {
+	if token == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, callbackMountKey{}, token)
+}
+
 // CallbackContext marks ctx as executing a callback owned by this mount.
-func (m *Mount) CallbackContext(ctx context.Context) context.Context {
+func (m *Mount[T]) CallbackContext(ctx context.Context) context.Context {
 	if m == nil || m.state == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, callbackMountKey{}, m.state)
+	return callbackContext(ctx, m.state.token)
 }
 
-// CheckClose reports whether closing this mount from ctx would wait on the
-// callback currently using its own lease.
-func (m *Mount) CheckClose(ctx context.Context) error {
+func (m *Mount[T]) CheckClose(ctx context.Context) error {
 	if m == nil || m.state == nil {
 		return nil
 	}
-	if state, _ := ctx.Value(callbackMountKey{}).(*mountState); state == m.state {
+	if token, _ := ctx.Value(callbackMountKey{}).(*callbackToken); token == m.state.token {
 		return ErrSelfClose
 	}
 	return nil
 }
 
-func (m *Mount) Close(ctx context.Context) error {
+func (m *Mount[T]) Close(ctx context.Context) error {
 	if m == nil || m.registry == nil || m.state == nil {
 		return nil
 	}
@@ -303,16 +336,56 @@ type Plan struct {
 type plannedEntry struct {
 	registrationEntry
 	component Component
-	state     *mountState
+	token     *callbackToken
 }
 
-func (r *Registry) Snapshot(target Scope) (*Plan, error) {
+// MountedValue is an immutable, lease-protected payload selected into a
+// snapshot.
+type MountedValue[T any] struct {
+	component Component
+	value     T
+	token     *callbackToken
+}
+
+func (v MountedValue[T]) Component() Component { return v.component }
+func (v MountedValue[T]) Value() T             { return v.value }
+func (v MountedValue[T]) CallbackContext(ctx context.Context) context.Context {
+	return callbackContext(ctx, v.token)
+}
+
+// Snapshot couples typed payloads to the exact dispatch plan that owns their
+// canonical mount references.
+type Snapshot[T any] struct {
+	dispatch *Plan
+	values   []MountedValue[T]
+}
+
+func (s *Snapshot[T]) Dispatch() *Plan {
+	if s == nil {
+		return nil
+	}
+	return s.dispatch
+}
+
+func (s *Snapshot[T]) Values() []MountedValue[T] {
+	if s == nil {
+		return nil
+	}
+	return append([]MountedValue[T](nil), s.values...)
+}
+
+func (s *Snapshot[T]) Release() {
+	if s != nil && s.dispatch != nil {
+		s.dispatch.Release()
+	}
+}
+
+func (r *Registry[T]) Snapshot(target Scope) (*Snapshot[T], error) {
 	return r.snapshot(target, nil)
 }
 
-// SnapshotInstances freezes only the named active mount instances. It is used
-// for descriptor-driven resume so unrelated mounts added later are ignored.
-func (r *Registry) SnapshotInstances(target Scope, instanceIDs []string) (*Plan, error) {
+// SnapshotInstances freezes only the named active mount instances.
+func (r *Registry[T]) SnapshotInstances(target Scope, instanceIDs []string) (*Snapshot[T], error) {
 	allowed := make(map[string]bool, len(instanceIDs))
 	for _, id := range instanceIDs {
 		allowed[id] = true
@@ -320,21 +393,19 @@ func (r *Registry) SnapshotInstances(target Scope, instanceIDs []string) (*Plan,
 	return r.snapshot(target, allowed)
 }
 
-func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error) {
+func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot[T], error) {
 	if r == nil {
-		return &Plan{}, nil
+		return &Snapshot[T]{dispatch: &Plan{}}, nil
 	}
 	if err := ValidateScope(target); err != nil {
 		return nil, err
 	}
 	r.mu.Lock()
 	entries := make([]plannedEntry, 0)
-	leased := make(map[*mountState]struct{})
+	leased := make(map[*mountState[T]]struct{})
+	values := make([]MountedValue[T], 0)
 	for _, state := range r.mounts {
-		if !state.active {
-			continue
-		}
-		if allowed != nil && !allowed[state.component.InstanceID] {
+		if !state.active || allowed != nil && !allowed[state.component.InstanceID] {
 			continue
 		}
 		applies := false
@@ -342,10 +413,10 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 			if !scopeApplies(entry.spec.Scope, target) {
 				continue
 			}
-			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component, state: state})
+			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component, token: state.token})
 			applies = true
 		}
-		for _, scope := range state.leases {
+		for _, scope := range state.selectionScopes {
 			if scopeApplies(scope, target) {
 				applies = true
 				break
@@ -353,6 +424,7 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 		}
 		if applies {
 			leased[state] = struct{}{}
+			values = append(values, MountedValue[T]{component: state.component, value: state.value, token: state.token})
 		}
 	}
 	releases := make([]func(), 0, len(leased))
@@ -363,7 +435,9 @@ func (r *Registry) snapshot(target Scope, allowed map[string]bool) (*Plan, error
 	}
 	r.mu.Unlock()
 	sort.Slice(entries, func(i, j int) bool { return entryLess(entries[i], entries[j]) })
-	return &Plan{entries: entries, reporter: r.reporter, releases: releases}, nil
+	sort.Slice(values, func(i, j int) bool { return values[i].component.InstanceID < values[j].component.InstanceID })
+	dispatch := &Plan{entries: entries, reporter: r.reporter, releases: releases}
+	return &Snapshot[T]{dispatch: dispatch, values: values}, nil
 }
 
 // PlanEntryDiagnostic describes a callback identity frozen into a plan.
@@ -417,10 +491,12 @@ func entryLess(left, right plannedEntry) bool {
 	return left.spec.ID < right.spec.ID
 }
 
-func (r *Registry) release(state *mountState) {
+func (r *Registry[T]) release(state *mountState[T]) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state.refs--
+	if state.refs > 0 {
+		state.refs--
+	}
 	if state.refs == 0 && !state.active {
 		select {
 		case <-state.drained:
@@ -439,47 +515,4 @@ func (p *Plan) Release() {
 			release()
 		}
 	})
-}
-
-type RegistrationDiagnostic struct {
-	ID       string
-	Contract Contract
-	Order    int
-	Scope    Scope
-	Kind     string
-}
-
-type ComponentDiagnostic struct {
-	InstanceID    string
-	Artifact      Artifact
-	Registrations []RegistrationDiagnostic
-}
-
-func (r *Registry) Diagnostics() []ComponentDiagnostic {
-	if r == nil {
-		return nil
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	result := make([]ComponentDiagnostic, 0, len(r.mounts))
-	for _, state := range r.mounts {
-		item := ComponentDiagnostic{InstanceID: state.component.InstanceID, Artifact: state.component.Artifact}
-		for _, entry := range state.entries {
-			kind := "notification"
-			if entry.kind == entryInterceptor {
-				kind = "interceptor"
-			}
-			item.Registrations = append(item.Registrations, RegistrationDiagnostic{ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: kind})
-		}
-		sort.Slice(item.Registrations, func(i, j int) bool {
-			left, right := item.Registrations[i], item.Registrations[j]
-			if left.Order != right.Order {
-				return left.Order < right.Order
-			}
-			return left.ID < right.ID
-		})
-		result = append(result, item)
-	}
-	sort.Slice(result, func(i, j int) bool { return result[i].InstanceID < result[j].InstanceID })
-	return result
 }

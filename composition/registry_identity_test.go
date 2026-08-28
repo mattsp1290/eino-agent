@@ -36,9 +36,7 @@ func TestCapabilityRegistrarsShareCanonicalIdentifierValidation(t *testing.T) {
 			if !errors.Is(err, extension.ErrInvalidRegistration) {
 				t.Fatalf("Mount error = %v, want ErrInvalidRegistration", err)
 			}
-			if diagnostics := registry.Diagnostics(); len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
-				t.Fatalf("invalid identity published: %#v", diagnostics)
-			}
+			assertRegistryEmpty(t, registry)
 		})
 	}
 }
@@ -95,10 +93,7 @@ func TestToolSourceIdentityValidationIsAtomic(t *testing.T) {
 	if !errors.Is(err, extension.ErrInvalidRegistration) {
 		t.Fatalf("partial source identity = %v", err)
 	}
-	diagnostics := registry.Diagnostics()
-	if len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
-		t.Fatalf("failed source identity published = %#v", diagnostics)
-	}
+	assertRegistryEmpty(t, registry)
 }
 
 func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
@@ -134,7 +129,7 @@ func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
 			mutate.fn(&registration)
 			secondMount := mount(registration)
 			defer func() { _ = secondMount.Close(context.Background()) }()
-			resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+			resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
 			if resumed != nil {
 				resumed.Release()
 			}

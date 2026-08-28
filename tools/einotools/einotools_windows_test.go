@@ -11,6 +11,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/runtime"
 )
 
 func TestMountStandardPreservesUnsupportedPlatformError(t *testing.T) {
@@ -22,7 +23,13 @@ func TestMountStandardPreservesUnsupportedPlatformError(t *testing.T) {
 	if !errors.Is(err, catalog.ErrUnsupportedPlatform) {
 		t.Fatalf("MountStandard error = %v, want ErrUnsupportedPlatform", err)
 	}
-	if diagnostics := registry.Diagnostics(); len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
-		t.Fatalf("unsupported mount published diagnostics: %#v", diagnostics)
+	plan, planErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if planErr != nil {
+		t.Fatal(planErr)
+	}
+	defer plan.Release()
+	descriptor := plan.Descriptor()
+	if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+		t.Fatalf("unsupported mount published plan: %#v", descriptor)
 	}
 }

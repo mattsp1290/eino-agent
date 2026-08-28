@@ -13,9 +13,12 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/composition"
+	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
+	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
 
@@ -46,6 +49,62 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	})
 	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.System || messages[1].Content != "context" {
 		t.Fatalf("LoadContext = %#v, %v", messages, err)
+	}
+}
+
+func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
+	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{
+			{Role: wittypes.TextRoleUser, Text: "wasm-user"},
+			{Role: wittypes.TextRoleSystem, Text: "wasm-system"},
+		}
+		return nil
+	}}
+	loader := NewLoader()
+	loader.factory = fakeFactory(component)
+	registry := composition.NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "wasm-context-provider", Artifact: extension.Artifact{Name: "wasm-context-provider", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
+		return loader.RegisterContextSource(ctx, registrar.Extensions(), extension.Registration{ID: "context", Scope: extension.GlobalScope()}, fixtureConfig(t, []byte("provider-order")))
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	store, err := sqlitestore.Open(context.Background(), t.TempDir()+"/wasm-context.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var messages []string
+	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, message := range request.Messages {
+			messages = append(messages, message.Content)
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	})
+	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
+	orchestrator, err := runtime.NewStreamingOrchestrator(
+		runtime.WithStore(store), runtime.WithRunPlanProvider(registry), runtime.WithIDGenerator(&wasmTestIDs{}),
+		runtime.WithOwnerID("wasm-test"), runtime.WithModelResolver(model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+			return model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: streamer}, nil
+		})),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := orchestrator.Start(context.Background(), runtime.Request{
+		SessionID: "session-a", Input: []*einoschema.Message{einoschema.UserMessage("base-user")},
+		Config: config.Snapshot{Agent: config.Agent{Name: "agent", Model: selection, Options: map[string]string{}}, Model: selection, Metadata: map[string]string{"workspace_root": t.TempDir()}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result := <-handle.Done(); result.Error != nil {
+		t.Fatal(result.Error)
+	}
+	want := []string{"wasm-system", "base-user", "wasm-user"}
+	if !reflect.DeepEqual(messages, want) {
+		t.Fatalf("provider messages = %v, want %v", messages, want)
 	}
 }
 
@@ -85,7 +144,7 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 	hook := &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
 	defer func() { _ = hook.close() }()
 
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "registered-hook", Artifact: extension.Artifact{Name: "registered-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return registerHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
@@ -135,7 +194,7 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 	}
 	hook := &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
 	defer func() { _ = hook.close() }()
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "early-hook", Artifact: extension.Artifact{Name: "early-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err = registry.Mount(context.Background(), extensionComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return registerHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
@@ -223,7 +282,7 @@ func TestContextContributionSourceIsUnambiguousAcrossInstancesAndScopes(t *testi
 }
 
 func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	for _, instanceID := range []string{"context-one", "context-two"} {
 		instanceID := instanceID
 		component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
@@ -255,6 +314,40 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 	})
 	if err != nil || len(assembled.Contributions) != 2 || assembled.Contributions[0].Source == assembled.Contributions[1].Source {
 		t.Fatalf("assembled contributions = %#v, %v", assembled.Contributions, err)
+	}
+}
+
+func TestRegisteredContextSourceRejectsAssistantContribution(t *testing.T) {
+	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleAssistant, Text: "invented history"}}
+		return nil
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("assistant-context")), contextSourceContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &loadedContextSource{module: module, component: component}
+	defer func() { _ = source.close() }()
+	registry := newTestExtensionRegistry(nil)
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "assistant-context", Artifact: extension.Artifact{Name: "assistant-context", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return registerContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = extension.Invoke(plan, context.Background(), runtime.ContextAssemblePoint, runtime.ContextAssembly{}, func(_ context.Context, value runtime.ContextAssembly) (runtime.ContextAssembly, error) {
+		return value, nil
+	})
+	plan.Release()
+	if err == nil || !strings.Contains(err.Error(), "unsupported role") {
+		t.Fatalf("assistant context error = %v", err)
+	}
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -309,7 +402,7 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	if _, err := loader.LoadEventSink(context.Background(), cfg); err != nil {
 		t.Fatal(err)
 	}
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "phase-b", Artifact: extension.Artifact{Name: "phase-b", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
 		if err := loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg); err != nil {
 			return err
@@ -361,7 +454,7 @@ func TestDirectRegistrationRollsBackOnCommitFailure(t *testing.T) {
 	component := contextSourceFakeComponent()
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	mountedComponent := extension.Component{InstanceID: "duplicate", Artifact: extension.Artifact{Name: "duplicate", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	if _, err := registry.Mount(context.Background(), mountedComponent, extension.InstallerFunc(func(context.Context, extension.Registrar) error { return nil })); err != nil {
 		t.Fatal(err)
@@ -382,7 +475,7 @@ func TestDirectRegistrationRollbackRacesLoaderClose(t *testing.T) {
 	component := contextSourceFakeComponent()
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	cfg := fixtureConfig(t, []byte("close race"))
 	prepared, err := registry.PrepareMount(context.Background(), extension.Component{InstanceID: "close-race", Artifact: extension.Artifact{Name: "close-race", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
 		return loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg)
@@ -437,7 +530,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	sink := &loadedEventSink{module: eventModule, component: eventComponent}
 	defer func() { _ = sink.close() }()
 
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "wasm-points", Artifact: extension.Artifact{Name: "wasm-points", Version: "0.1.0", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := registerContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source); err != nil {

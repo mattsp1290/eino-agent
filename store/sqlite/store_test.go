@@ -195,6 +195,10 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 		"part run":        func(value *session.ToolSettlement) { value.ResultPart.RunID = "wrong" },
 		"part kind":       func(value *session.ToolSettlement) { value.ResultPart.Kind = session.PartText },
 		"part payload":    func(value *session.ToolSettlement) { value.ResultPart.Payload = json.RawMessage(`{"different":true}`) },
+		"part numeric precision": func(value *session.ToolSettlement) {
+			value.Output = json.RawMessage(`9007199254740992`)
+			value.ResultPart.Payload = json.RawMessage(`9007199254740993`)
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

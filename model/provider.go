@@ -327,6 +327,10 @@ func cloneMessages(src []*einoschema.Message) ([]*einoschema.Message, error) {
 		if message == nil {
 			continue
 		}
+		//nolint:staticcheck // The canonical boundary rejects the deprecated field.
+		if len(message.MultiContent) != 0 {
+			return nil, fmt.Errorf("clone message %d: deprecated MultiContent is unsupported", index)
+		}
 		for _, part := range message.AssistantGenMultiContent {
 			if part.StreamingMeta != nil {
 				return nil, fmt.Errorf("message %d contains non-copyable streaming metadata", index)

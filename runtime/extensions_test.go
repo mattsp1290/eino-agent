@@ -129,7 +129,7 @@ func TestToolResultTransformRejectsCallMutation(t *testing.T) {
 func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 	executorErr := errors.New("executor failed")
 	callbackErr := errors.New("middleware failed")
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-errors"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.Use(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
 			result, err := next(ctx, input)
@@ -162,7 +162,7 @@ func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 }
 
 func TestToolMiddlewareCannotForgePermissionStateOrReceiveApproval(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-permission-state"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := extension.Use(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
 			result, err := next(ctx, input)
@@ -209,7 +209,7 @@ func testExtensionComponent(id string) extension.Component {
 }
 
 func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-test", Artifact: extension.Artifact{Name: "stream-test", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "replace", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
@@ -245,7 +245,7 @@ func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
 
 func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 	providerErr := errors.New("provider failure")
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-swallow", Artifact: extension.Artifact{Name: "stream-swallow", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
@@ -270,7 +270,7 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 }
 
 func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "unrelated", Artifact: extension.Artifact{Name: "unrelated", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
@@ -313,7 +313,7 @@ func TestModelStreamValidationRejectsCanonicalDataReplacement(t *testing.T) {
 }
 
 func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-nested-mutation", Artifact: extension.Artifact{Name: "stream-nested-mutation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
@@ -364,7 +364,7 @@ func TestPublishedExtensionPointsAppearInCatalog(t *testing.T) {
 }
 
 func TestToolSettledObserversReceiveDeepClonedAttachmentMetadata(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "settled-copy", Artifact: extension.Artifact{Name: "settled-copy", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var secondValue string
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -395,7 +395,7 @@ func TestToolSettledObserversReceiveDeepClonedAttachmentMetadata(t *testing.T) {
 }
 
 func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "turn-order", Artifact: extension.Artifact{Name: "turn-order", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var seen BoundedTurnMetadata
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -457,7 +457,7 @@ func TestProtectedViewsRejectCallableInjection(t *testing.T) {
 }
 
 func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "clone-failure", Artifact: extension.Artifact{Name: "clone-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var contextEntered, toolEntered bool
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -619,7 +619,7 @@ func testExecutor(marker string) ToolExecutor {
 
 func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 	orchestrator := mustConfiguredOrchestrator()
-	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{})
+	plan, err := orchestrator.acquireRunPlan(context.Background(), RunPlanRequest{SessionID: "session"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +627,7 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 	if descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || descriptor.Fingerprint == "" {
 		t.Fatalf("empty descriptor = %#v", descriptor)
 	}
-	resumed, err := orchestrator.acquireResumePlan(context.Background(), descriptor)
+	resumed, err := orchestrator.acquireResumePlan(context.Background(), ResumePlanRequest{SessionID: "session", Descriptor: descriptor})
 	if err != nil {
 		t.Fatalf("resume empty strict plan = %v", err)
 	}
@@ -651,13 +651,28 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 		t.Run(name, func(t *testing.T) {
 			resumeCalls := 0
 			orchestrator := mustConfiguredOrchestrator(WithRunPlanProvider(staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{}), resumeCalls: &resumeCalls}))
-			if _, err := orchestrator.acquireResumePlan(context.Background(), descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
+			if _, err := orchestrator.acquireResumePlan(context.Background(), ResumePlanRequest{SessionID: "session", Descriptor: descriptor}); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
 			}
 			if resumeCalls != 0 {
 				t.Fatalf("AcquireResumePlan calls = %d, want 0", resumeCalls)
 			}
 		})
+	}
+}
+
+func TestAcquireResumePlanPropagatesDurableSessionIdentity(t *testing.T) {
+	plan := mustTestRunPlan(RunPlanSpec{})
+	provider := &capturingResumePlanProvider{plan: plan}
+	orchestrator := mustConfiguredOrchestrator(WithRunPlanProvider(provider))
+	descriptor := plan.Descriptor()
+	resumed, err := orchestrator.acquireResumePlan(context.Background(), ResumePlanRequest{SessionID: "durable-session", Descriptor: descriptor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumed.Release()
+	if provider.request.SessionID != "durable-session" || provider.request.Descriptor.Fingerprint != descriptor.Fingerprint {
+		t.Fatalf("resume request = %#v", provider.request)
 	}
 }
 
@@ -676,8 +691,18 @@ func handlerPlanEntryForTest(instance string) session.HandlerPlanIdentity {
 }
 
 func TestStartReleasesAcquiredPlanWhenResolverPanics(t *testing.T) {
-	releases := 0
-	plan, err := NewRunPlan(RunPlanSpec{Release: func() { releases++ }})
+	registry := newTestExtensionRegistry(nil)
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "release-on-panic", Artifact: extension.Artifact{Name: "release-on-panic", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "release", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewRunPlan(RunPlanSpec{Dispatch: dispatch})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -691,8 +716,10 @@ func TestStartReleasesAcquiredPlanWhenResolverPanics(t *testing.T) {
 		if recovered := recover(); recovered != "resolver failed" {
 			t.Fatalf("recovered = %#v", recovered)
 		}
-		if releases != 1 {
-			t.Fatalf("plan releases = %d, want 1", releases)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		if err := mount.Close(ctx); err != nil {
+			t.Fatalf("mount remained leased after panic: %v", err)
 		}
 	}()
 	_, _ = orchestrator.Start(context.Background(), Request{SessionID: "session", Config: orchestratorConfig()})
@@ -731,7 +758,7 @@ func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 }
 
 func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "resume-duration", Artifact: extension.Artifact{Name: "resume-duration", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var duration time.Duration
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -909,7 +936,7 @@ func (s *runLifecycleStore) ListUnfinishedToolCalls(ctx context.Context, runID s
 
 func settledNoticePlan(t *testing.T, notices *[]RunSettledNotice) (*RunPlan, func()) {
 	t.Helper()
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "settlement-gate", Artifact: extension.Artifact{Name: "settlement-gate", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.On(registrar, RunSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(_ context.Context, notice RunSettledNotice) error {
@@ -936,11 +963,25 @@ type staticRunPlanProvider struct {
 	resumeCalls *int
 }
 
+type capturingResumePlanProvider struct {
+	plan    *RunPlan
+	request ResumePlanRequest
+}
+
+func (p *capturingResumePlanProvider) AcquireRunPlan(context.Context, RunPlanRequest) (*RunPlan, error) {
+	return p.plan, nil
+}
+
+func (p *capturingResumePlanProvider) AcquireResumePlan(_ context.Context, request ResumePlanRequest) (*RunPlan, error) {
+	p.request = request
+	return p.plan, nil
+}
+
 func (p staticRunPlanProvider) AcquireRunPlan(context.Context, RunPlanRequest) (*RunPlan, error) {
 	return p.plan, nil
 }
 
-func (p staticRunPlanProvider) AcquireResumePlan(context.Context, session.ExtensionPlanDescriptor) (*RunPlan, error) {
+func (p staticRunPlanProvider) AcquireResumePlan(context.Context, ResumePlanRequest) (*RunPlan, error) {
 	if p.resumeCalls != nil {
 		(*p.resumeCalls)++
 	}

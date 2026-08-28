@@ -67,13 +67,6 @@ func BuildToolSettlement(input ToolSettlementInput) (session.ToolSettlement, Too
 	return settlement, output, err
 }
 
-// EncodeToolOutput returns the canonical bounded model-visible payload for a
-// tool outcome. Durable settlements should normally use BuildToolSettlement.
-func EncodeToolOutput(callID session.ToolCallID, result ToolResult, policy RetentionPolicy, disposition ToolDisposition, err error) (json.RawMessage, ToolOutput) {
-	raw, output, _, _ := encodeToolOutput(callID, result, policy, disposition, err)
-	return raw, output
-}
-
 type terminalToolEnvelopeInput struct {
 	Claimed     session.ToolCall
 	Status      session.ToolCallStatus

@@ -93,6 +93,10 @@ func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes 
 }
 
 func validateAuditSafeMessage(message *einoschema.Message) error {
+	//nolint:staticcheck // The audit boundary rejects the deprecated field.
+	if len(message.MultiContent) != 0 {
+		return fmt.Errorf("model message contains unsupported deprecated MultiContent")
+	}
 	for _, part := range message.AssistantGenMultiContent {
 		if part.StreamingMeta != nil {
 			return fmt.Errorf("model message contains streaming metadata")

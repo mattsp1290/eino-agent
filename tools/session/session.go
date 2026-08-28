@@ -298,7 +298,7 @@ type skillInput struct {
 }
 
 func sessionScope(_ string) agenttools.ScopeResolver {
-	return func(context runtime.ToolScopeContext) runtime.ToolScope {
+	return func(_ context.Context, context runtime.ToolScopeContext) runtime.ToolScope {
 		return runtime.ToolScope{
 			WorkspaceID: context.WorkspaceID,
 			Root:        "session://" + string(context.SessionID),

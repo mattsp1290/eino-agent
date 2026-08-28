@@ -1,10 +1,11 @@
 package session
 
 import (
-	"bytes"
 	"encoding/json"
 	"reflect"
 	"time"
+
+	"github.com/mattsp1290/eino-agent/internal/jsonequal"
 )
 
 // ToolSettlement is the terminal state produced by executing a durable tool
@@ -21,13 +22,6 @@ type ToolSettlement struct {
 	CompletedAt   time.Time
 	ResultMessage Message
 	ResultPart    Part
-}
-
-// ToolClaimIdentity is the fencing identity a settlement must present for the
-// durable claim whose work it is committing.
-type ToolClaimIdentity struct {
-	ClaimedBy  string
-	ClaimToken string
 }
 
 // Apply returns call with this terminal settlement applied. Applying the same
@@ -77,7 +71,7 @@ func settlementMatches(call ToolCall, settlement ToolSettlement) bool {
 	if call.Status != settlement.Status || call.Error != settlement.Error {
 		return false
 	}
-	if !rawMessageEqual(call.Output, settlement.Output) {
+	if !jsonequal.Equal(call.Output, settlement.Output) {
 		return false
 	}
 	if !reflect.DeepEqual(call.Metadata, settlement.Metadata) {
@@ -87,20 +81,6 @@ func settlementMatches(call ToolCall, settlement ToolSettlement) bool {
 		return false
 	}
 	return true
-}
-
-func rawMessageEqual(left json.RawMessage, right json.RawMessage) bool {
-	left = bytes.TrimSpace(left)
-	right = bytes.TrimSpace(right)
-	if len(left) == 0 || len(right) == 0 {
-		return len(left) == len(right)
-	}
-	var leftValue any
-	var rightValue any
-	if json.Unmarshal(left, &leftValue) == nil && json.Unmarshal(right, &rightValue) == nil {
-		return reflect.DeepEqual(leftValue, rightValue)
-	}
-	return bytes.Equal(left, right)
 }
 
 func cloneRawMessage(raw json.RawMessage) json.RawMessage {

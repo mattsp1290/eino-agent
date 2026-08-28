@@ -97,7 +97,7 @@ func (s ClientToolSnapshot) Definitions(dispatcher ClientToolDispatcher) ([]agen
 				}
 				return dispatcher.ExecuteClientTool(ctx, execution.Call)
 			},
-			Scope: func(runtime.ToolScopeContext) runtime.ToolScope {
+			Scope: func(context.Context, runtime.ToolScopeContext) runtime.ToolScope {
 				return runtime.ToolScope{Permissions: cloneStrings(permissions)}
 			},
 			Permissions: permissions, Retention: runtime.RetentionPolicy{MaxInlineBytes: 4096}, Metadata: metadata,

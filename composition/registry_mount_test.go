@@ -80,10 +80,7 @@ func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
 			if !errors.Is(err, extension.ErrDuplicateRegistration) || cleanups != 1 {
 				t.Fatalf("Mount error=%v cleanups=%d", err, cleanups)
 			}
-			diagnostics := registry.Diagnostics()
-			if len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
-				t.Fatalf("failed mount published diagnostics: %#v", diagnostics)
-			}
+			assertRegistryEmpty(t, registry)
 			plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
 			if err != nil {
 				t.Fatal(err)
@@ -132,9 +129,7 @@ func TestRestrictionRegistrationRejectsInvalidRuleSets(t *testing.T) {
 			if !errors.Is(err, extension.ErrInvalidRegistration) {
 				t.Fatalf("Mount error = %v, want ErrInvalidRegistration", err)
 			}
-			if diagnostics := registry.Diagnostics(); len(diagnostics.Components) != 0 || len(diagnostics.Tools) != 0 {
-				t.Fatalf("invalid restriction mount published: %#v", diagnostics)
-			}
+			assertRegistryEmpty(t, registry)
 		})
 	}
 }
@@ -161,9 +156,7 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 			if !errors.Is(err, tools.ErrInvalidDefinition) {
 				t.Fatalf("Mount error = %v, want ErrInvalidDefinition", err)
 			}
-			if len(registry.components) != 0 {
-				t.Fatalf("mounted components = %d, want 0", len(registry.components))
-			}
+			assertRegistryEmpty(t, registry)
 			plan, planErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
 			if planErr != nil {
 				t.Fatalf("AcquireRunPlan error = %v", planErr)

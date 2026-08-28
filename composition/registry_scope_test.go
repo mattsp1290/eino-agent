@@ -57,7 +57,7 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 	}
 	planB.Release()
 
-	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
 	if err != nil || resumed.Descriptor().Fingerprint != persisted.Fingerprint {
 		t.Fatalf("AcquireResumePlan = %#v, %v", resumed, err)
 	}
@@ -163,9 +163,7 @@ func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
 	if !errors.Is(err, tools.ErrDuplicateRegistration) {
 		t.Fatalf("Mount error = %v, want ErrDuplicateRegistration", err)
 	}
-	if len(registry.components) != 0 {
-		t.Fatalf("collision mount published %d components", len(registry.components))
-	}
+	assertRegistryEmpty(t, registry)
 }
 
 func TestMountRejectsCrossMountToolCollisionAndRemainsReusable(t *testing.T) {
@@ -325,7 +323,7 @@ func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := registry.AcquireResumePlan(context.Background(), persisted)
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +346,6 @@ func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		_, err := registry.Mount(context.Background(), component("outer"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
-			_ = registry.Diagnostics()
 			plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
 			if err != nil {
 				return err
@@ -361,7 +358,6 @@ func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
 				return err
 			}
 			if err := registrar.Defer(func(context.Context) error {
-				_ = registry.Diagnostics()
 				plan, acquireErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
 				if acquireErr == nil {
 					plan.Release()
@@ -404,7 +400,6 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 	go func() {
 		_, mountErr := registry.Mount(context.Background(), component("rejected"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 			if err := registrar.Defer(func(context.Context) error {
-				_ = registry.Diagnostics()
 				cleaned = true
 				return nil
 			}); err != nil {
@@ -494,9 +489,14 @@ func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
 	if _, err := resolved[0].Executor.Execute(context.Background(), runtime.ToolCall{Input: json.RawMessage(`{}`)}); !errors.Is(err, extension.ErrSelfClose) {
 		t.Fatalf("executor self-close = %v", err)
 	}
-	diagnostics := registry.Diagnostics()
-	if len(diagnostics.Tools) != 1 {
-		t.Fatalf("self-close deactivated mount: %#v", diagnostics)
+	activePlan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	activeTools, err := activePlan.ResolveTools(context.Background(), runtime.ToolScopeContext{})
+	activePlan.Release()
+	if err != nil || len(activeTools) != 1 {
+		t.Fatalf("self-close deactivated mount: tools=%d err=%v", len(activeTools), err)
 	}
 	plan.Release()
 	if err := mount.Close(context.Background()); err != nil {

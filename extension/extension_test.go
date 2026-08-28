@@ -47,7 +47,7 @@ func spec(_ string, id string, order int, scope Scope) Registration {
 }
 
 func TestRegistrarOwnsMountedIdentity(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	component := testComponent("canonical-instance")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if got := registrar.InstanceID(); got != component.InstanceID {
@@ -70,7 +70,7 @@ func TestRegistrarOwnsMountedIdentity(t *testing.T) {
 }
 
 func TestMountIsAtomicAndRollsBackEffects(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	var cleanup []int
 	_, err := registry.Mount(context.Background(), testComponent("failed"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		_ = registrar.Defer(func(context.Context) error { cleanup = append(cleanup, 1); return nil })
@@ -80,13 +80,13 @@ func TestMountIsAtomicAndRollsBackEffects(t *testing.T) {
 		}
 		return errors.New("install failed")
 	}))
-	if err == nil || !reflect.DeepEqual(cleanup, []int{2, 1}) || len(registry.Diagnostics()) != 0 {
-		t.Fatalf("Mount = %v, cleanup=%v diagnostics=%v", err, cleanup, registry.Diagnostics())
+	if err == nil || !reflect.DeepEqual(cleanup, []int{2, 1}) || activeMountCount(registry) != 0 {
+		t.Fatalf("Mount = %v, cleanup=%v active=%d", err, cleanup, activeMountCount(registry))
 	}
 }
 
 func TestPreparedMountIsInvisibleUntilCommitAndRollbackCleansOnce(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	cleanups := 0
 	prepared, err := registry.PrepareMount(context.Background(), testComponent("prepared"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
@@ -101,8 +101,8 @@ func TestPreparedMountIsInvisibleUntilCommitAndRollbackCleansOnce(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.entries) != 0 || len(registry.Diagnostics()) != 0 {
-		t.Fatalf("prepared mount published early: entries=%d diagnostics=%v", len(plan.entries), registry.Diagnostics())
+	if len(plan.entries) != 0 || activeMountCount(registry) != 0 {
+		t.Fatalf("prepared mount published early: entries=%d active=%d", len(plan.entries), activeMountCount(registry))
 	}
 	plan.Release()
 	if err := prepared.Rollback(context.Background()); err != nil {
@@ -114,7 +114,7 @@ func TestPreparedMountIsInvisibleUntilCommitAndRollbackCleansOnce(t *testing.T) 
 }
 
 func TestPreparedMountCommitTransfersCleanupToMount(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	cleanups := 0
 	prepared, err := registry.PrepareMount(context.Background(), testComponent("commit"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
@@ -138,8 +138,8 @@ func TestPreparedMountCommitTransfersCleanupToMount(t *testing.T) {
 }
 
 func TestCallbackIdentityDistinguishesReusedInstanceID(t *testing.T) {
-	registry := NewRegistry(nil)
-	var replacement *Mount
+	registry := newTestRegistry(nil)
+	var replacement *Mount[struct{}]
 	old, err := registry.Mount(context.Background(), testComponent("reused"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return On(registrar, testNotice, spec("reused", "old", 0, GlobalScope()), func(ctx context.Context, _ testPayload) error {
 			return replacement.Close(ctx)
@@ -166,7 +166,7 @@ func TestCallbackIdentityDistinguishesReusedInstanceID(t *testing.T) {
 
 func TestScopedOrderingDefensiveCopyAndContainedFailures(t *testing.T) {
 	var diagnostics atomic.Int32
-	registry := NewRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))
+	registry := newTestRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))
 	var mu sync.Mutex
 	var sequence []string
 	for _, item := range []struct {
@@ -213,7 +213,7 @@ func TestNotifyReportsEveryFailureAndContinues(t *testing.T) {
 	const failureCount = maxReportedFailures + 5
 	var diagnostics atomic.Int32
 	var completed atomic.Int32
-	registry := NewRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))
+	registry := newTestRegistry(ReporterFunc(func(context.Context, Diagnostic) { diagnostics.Add(1) }))
 	_, err := registry.Mount(context.Background(), testComponent("many-failures"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		for index := 0; index < failureCount; index++ {
 			id := fmt.Sprintf("failure-%d", index)
@@ -247,7 +247,7 @@ func TestNotifyReportsEveryFailureAndContinues(t *testing.T) {
 }
 
 func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	component := testComponent("opaque-target")
 	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return On(registrar, testNotice, spec(component.InstanceID, "global", 0, GlobalScope()), func(context.Context, testPayload) error { return nil })
@@ -274,7 +274,7 @@ func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
 
 func TestRegistrationAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 	keys := []string{"user@example.com", "dXNlcg==", "  spaced session  ", strings.Repeat("x", 300) + "=="}
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	counts := make([]int, len(keys))
 	for index, key := range keys {
 		component := testComponent("opaque-registration-" + strconv.Itoa(index))
@@ -303,7 +303,7 @@ func TestRegistrationAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 }
 
 func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	var sequence []string
 	for index, id := range []string{"outer", "inner"} {
 		id, order := id, index
@@ -329,7 +329,7 @@ func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 		t.Fatalf("Invoke = %q, %v; sequence=%v", output, err, sequence)
 	}
 
-	badRegistry := NewRegistry(nil)
+	badRegistry := newTestRegistry(nil)
 	_, _ = badRegistry.Mount(context.Background(), testComponent("bad"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return Use(registrar, testAround, spec("bad", "bad", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
 			if _, err := next(ctx, input); err != nil {
@@ -360,7 +360,7 @@ func TestProtectedMutationAndRequiredDelegation(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			registry := NewRegistry(nil)
+			registry := newTestRegistry(nil)
 			_, _ = registry.Mount(context.Background(), testComponent("instance"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 				return Use(registrar, testAround, spec("instance", "handler", 0, GlobalScope()), test.fn)
 			}))
@@ -376,7 +376,7 @@ func TestProtectedMutationAndRequiredDelegation(t *testing.T) {
 
 func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 	delegatedErr := errors.New("delegated failure")
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	component := testComponent("swallow")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return Use(registrar, testAround, spec(component.InstanceID, "swallow", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
@@ -401,7 +401,7 @@ func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 }
 
 func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	component := testComponent("late-next")
 	savedNext := make(chan Next[testPayload, string], 1)
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
@@ -434,7 +434,7 @@ func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
 }
 
 func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	component := testComponent("context")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return Use(registrar, testAround, spec(component.InstanceID, "deadline", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
@@ -457,7 +457,7 @@ func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
 }
 
 func TestDeactivateSnapshotIsolationAndCloseDrain(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	cleanup := make(chan struct{})
 	mount, err := registry.Mount(context.Background(), testComponent("lease"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if err := registrar.Defer(func(context.Context) error { close(cleanup); return nil }); err != nil {
@@ -494,12 +494,14 @@ func TestDeactivateSnapshotIsolationAndCloseDrain(t *testing.T) {
 	}
 }
 
-func TestExplicitLeaseScopesRespectTargetAndInstanceFilters(t *testing.T) {
-	newLeaseMount := func(t *testing.T, registry *Registry, instance string) *Mount {
+func TestCapabilitySelectionScopesRespectTargetAndInstanceFilters(t *testing.T) {
+	newLeaseMount := func(t *testing.T, registry *testRegistry, instance string) *Mount[struct{}] {
 		t.Helper()
-		mount, err := registry.Mount(context.Background(), testComponent(instance), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-			return registrar.Lease(SessionScope("session-a"))
-		}))
+		prepared, err := registry.PrepareMount(context.Background(), testComponent(instance), InstallerFunc(func(context.Context, Registrar) error { return nil }))
+		if err != nil {
+			t.Fatal(err)
+		}
+		mount, err := registry.Registry.CommitMount(prepared, struct{}{}, []Scope{SessionScope("session-a")}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -507,7 +509,7 @@ func TestExplicitLeaseScopesRespectTargetAndInstanceFilters(t *testing.T) {
 	}
 
 	t.Run("included instance drains", func(t *testing.T) {
-		registry := NewRegistry(nil)
+		registry := newTestRegistry(nil)
 		mount := newLeaseMount(t, registry, "included-lease")
 		plan, err := registry.SnapshotInstances(SessionScope("session-a"), []string{"included-lease"})
 		if err != nil {
@@ -535,7 +537,7 @@ func TestExplicitLeaseScopesRespectTargetAndInstanceFilters(t *testing.T) {
 			{name: "target", target: SessionScope("session-b"), ids: []string{"excluded-lease"}},
 		} {
 			t.Run(test.name, func(t *testing.T) {
-				registry := NewRegistry(nil)
+				registry := newTestRegistry(nil)
 				mount := newLeaseMount(t, registry, "excluded-lease")
 				plan, err := registry.SnapshotInstances(test.target, test.ids)
 				if err != nil {
@@ -552,7 +554,7 @@ func TestExplicitLeaseScopesRespectTargetAndInstanceFilters(t *testing.T) {
 }
 
 func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	secret := errors.New("credential-sentinel-do-not-persist")
 	component := testComponent("bounded-error")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
@@ -581,7 +583,7 @@ func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
 }
 
 func BenchmarkSnapshot(b *testing.B) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	_, _ = registry.Mount(context.Background(), testComponent("bench"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		for index := 0; index < 10; index++ {
 			if err := On(registrar, testNotice, spec("bench", string(rune('a'+index)), index, GlobalScope()), func(context.Context, testPayload) error { return nil }); err != nil {
@@ -605,7 +607,7 @@ func BenchmarkNotifyZero(b *testing.B) {
 }
 
 func BenchmarkNotifyTen(b *testing.B) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	_, _ = registry.Mount(context.Background(), testComponent("bench"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		for index := 0; index < 10; index++ {
 			if err := On(registrar, testNotice, spec("bench", string(rune('a'+index)), index, GlobalScope()), func(context.Context, testPayload) error { return nil }); err != nil {
@@ -623,7 +625,7 @@ func BenchmarkNotifyTen(b *testing.B) {
 }
 
 func BenchmarkInvokeTen(b *testing.B) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	for index := 0; index < 10; index++ {
 		id := string(rune('a' + index))
 		_, _ = registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
@@ -641,7 +643,7 @@ func BenchmarkInvokeTen(b *testing.B) {
 }
 
 func BenchmarkConcurrentMountSnapshotClose(b *testing.B) {
-	registry := NewRegistry(nil)
+	registry := newTestRegistry(nil)
 	b.RunParallel(func(parallel *testing.PB) {
 		var sequence atomic.Uint64
 		for parallel.Next() {

@@ -223,9 +223,7 @@ func TestMountStandardErrorsDoNotPublish(t *testing.T) {
 	if !errors.Is(err, catalog.ErrUnsupportedPlatform) {
 		t.Fatalf("unsupported error = %v", err)
 	}
-	if diagnostics := registry.Diagnostics(); len(diagnostics.Tools) != 0 || len(diagnostics.Components) != 0 {
-		t.Fatalf("published diagnostics = %#v", diagnostics)
-	}
+	assertNoPlanCapabilities(t, registry)
 
 	_, err = MountStandard(context.Background(), registry, standardComponent("unknown-policy"), Options{
 		Scope: extension.GlobalScope(), Permissions: map[string][]string{"standard.missing": {"read"}},
@@ -233,9 +231,7 @@ func TestMountStandardErrorsDoNotPublish(t *testing.T) {
 	if !errors.Is(err, agenttools.ErrInvalidDefinition) {
 		t.Fatalf("unknown permissions error = %v", err)
 	}
-	if diagnostics := registry.Diagnostics(); len(diagnostics.Tools) != 0 || len(diagnostics.Components) != 0 {
-		t.Fatalf("published after translation error = %#v", diagnostics)
-	}
+	assertNoPlanCapabilities(t, registry)
 
 	for _, test := range []struct {
 		name   string
@@ -264,10 +260,21 @@ func TestMountStandardErrorsDoNotPublish(t *testing.T) {
 			if err == nil {
 				t.Fatal("expected mount error")
 			}
-			if diagnostics := registry.Diagnostics(); len(diagnostics.Tools) != 0 || len(diagnostics.Components) != 0 {
-				t.Fatalf("published after %s = %#v", test.name, diagnostics)
-			}
+			assertNoPlanCapabilities(t, registry)
 		})
+	}
+}
+
+func assertNoPlanCapabilities(t *testing.T, registry *composition.Registry) {
+	t.Helper()
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	descriptor := plan.Descriptor()
+	if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+		t.Fatalf("unexpected published plan: %#v", descriptor)
 	}
 }
 

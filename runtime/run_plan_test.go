@@ -39,8 +39,8 @@ func testPlanTools(registry staticToolRegistry) []PlanTool {
 	return capabilities
 }
 
-func newTestToolPlanWithDispatch(registry staticToolRegistry, dispatch *extension.Plan, release func()) *RunPlan {
-	return mustTestRunPlan(RunPlanSpec{Tools: testPlanTools(registry), Dispatch: dispatch, Release: release})
+func newTestToolPlanWithDispatch(registry staticToolRegistry, dispatch *extension.Plan) *RunPlan {
+	return mustTestRunPlan(RunPlanSpec{Tools: testPlanTools(registry), Dispatch: dispatch})
 }
 
 func newTestDispatchPlan(dispatch *extension.Plan) *RunPlan {

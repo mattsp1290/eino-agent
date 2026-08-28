@@ -301,7 +301,7 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	}
 }
 
-func TestEncodeToolOutputUsesProtectedDisposition(t *testing.T) {
+func TestToolOutputUsesProtectedDisposition(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		disposition ToolDisposition

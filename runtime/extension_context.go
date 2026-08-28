@@ -32,7 +32,7 @@ type PromptContext struct {
 	ModelID    string
 }
 
-type PromptSection struct {
+type promptSection struct {
 	Name       string
 	Order      int
 	Text       string
@@ -116,9 +116,9 @@ type MessageRoleCounts struct {
 }
 
 func (o *StreamingOrchestrator) renderSystemPrompt(ctx context.Context, plan *RunPlan, snapshot TurnSnapshot, attempt, step int) (string, error) {
-	sections := make([]PromptSection, 0)
+	sections := make([]promptSection, 0)
 	if snapshot.SystemPrompt != "" {
-		sections = append(sections, PromptSection{Name: "agent/system", Order: OrderRuntime, Text: snapshot.SystemPrompt, InstanceID: "runtime"})
+		sections = append(sections, promptSection{Name: "agent/system", Order: OrderRuntime, Text: snapshot.SystemPrompt, InstanceID: "runtime"})
 	}
 	if plan != nil {
 		promptContext := PromptContext{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Attempt: attempt, Step: step, AgentName: snapshot.Config.Agent.Name, ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID)}
@@ -131,7 +131,7 @@ func (o *StreamingOrchestrator) renderSystemPrompt(ctx context.Context, plan *Ru
 				return "", err
 			}
 			if text != "" {
-				sections = append(sections, PromptSection{Name: mounted.Name, Order: mounted.Order, Text: text, InstanceID: mounted.InstanceID})
+				sections = append(sections, promptSection{Name: mounted.Name, Order: mounted.Order, Text: text, InstanceID: mounted.InstanceID})
 			}
 		}
 	}
@@ -214,6 +214,9 @@ func validateContextAssembly(value ContextAssembly) error {
 		if contribution.Message == nil {
 			return fmt.Errorf("context contribution %q message required", contribution.Source)
 		}
+		if err := validateContextContributionMessage(contribution.Message); err != nil {
+			return fmt.Errorf("context contribution %q: %w", contribution.Source, err)
+		}
 		if _, err := cloneMessageDeep(contribution.Message); err != nil {
 			return err
 		}
@@ -221,6 +224,23 @@ func validateContextAssembly(value ContextAssembly) error {
 			return fmt.Errorf("duplicate context contribution %q", contribution.Source)
 		}
 		seen[contribution.Source] = true
+	}
+	return nil
+}
+
+func validateContextContributionMessage(message *einoschema.Message) error {
+	if message == nil {
+		return errors.New("message required")
+	}
+	if message.Role != einoschema.System && message.Role != einoschema.User {
+		return fmt.Errorf("unsupported role %q", message.Role)
+	}
+	if message.Name != "" || len(message.ToolCalls) != 0 || message.ToolCallID != "" || message.ToolName != "" || message.ResponseMeta != nil || message.ReasoningContent != "" || len(message.Extra) != 0 || len(message.UserInputMultiContent) != 0 || len(message.AssistantGenMultiContent) != 0 {
+		return errors.New("only role and text content are supported")
+	}
+	//nolint:staticcheck // This boundary rejects the dependency's deprecated field.
+	if len(message.MultiContent) != 0 {
+		return errors.New("deprecated MultiContent is unsupported")
 	}
 	return nil
 }
@@ -311,22 +331,36 @@ func validateBoundedTurnMetadataResult(original, output BoundedTurnMetadata) err
 }
 
 func materializeContextAssembly(value ContextAssembly) ([]*einoschema.Message, error) {
-	sort.Slice(value.Contributions, func(i, j int) bool {
-		if value.Contributions[i].Order != value.Contributions[j].Order {
-			return value.Contributions[i].Order < value.Contributions[j].Order
+	if err := validateContextAssembly(value); err != nil {
+		return nil, err
+	}
+	contributions := append([]ContextContribution(nil), value.Contributions...)
+	sort.Slice(contributions, func(i, j int) bool {
+		if contributions[i].Order != contributions[j].Order {
+			return contributions[i].Order < contributions[j].Order
 		}
-		return value.Contributions[i].Source < value.Contributions[j].Source
+		return contributions[i].Source < contributions[j].Source
 	})
-	messages, err := cloneProtectedMessages(value.Base)
+	prelude := make([]*einoschema.Message, 0, len(contributions))
+	suffix := make([]*einoschema.Message, 0, len(contributions))
+	for _, contribution := range contributions {
+		message, err := cloneMessageDeep(contribution.Message)
+		if err != nil {
+			return nil, err
+		}
+		if message.Role == einoschema.System {
+			prelude = append(prelude, message)
+		} else {
+			suffix = append(suffix, message)
+		}
+	}
+	base, err := cloneProtectedMessages(value.Base)
 	if err != nil {
 		return nil, err
 	}
-	for _, contribution := range value.Contributions {
-		message, cloneErr := cloneMessageDeep(contribution.Message)
-		if cloneErr != nil {
-			return nil, cloneErr
-		}
-		messages = append(messages, message)
-	}
+	messages := make([]*einoschema.Message, 0, len(prelude)+len(base)+len(suffix))
+	messages = append(messages, prelude...)
+	messages = append(messages, base...)
+	messages = append(messages, suffix...)
 	return messages, nil
 }

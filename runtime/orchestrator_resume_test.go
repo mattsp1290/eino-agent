@@ -58,7 +58,7 @@ func TestResumePreservesDeniedDispositionAfterFreshResultTransform(t *testing.T)
 
 func transformedPermissionRunPlan(t *testing.T, tools staticToolRegistry, notices *[]ToolSettledNotice) *RunPlan {
 	t.Helper()
-	registry := extension.NewRegistry(nil)
+	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "permission-transform", Artifact: extension.Artifact{Name: "permission-transform", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolResultTransform, next extension.Next[ToolResultTransform, ToolResult]) (ToolResult, error) {
@@ -79,7 +79,7 @@ func transformedPermissionRunPlan(t *testing.T, tools staticToolRegistry, notice
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := newTestToolPlanWithDispatch(tools, dispatch, nil)
+	plan := newTestToolPlanWithDispatch(tools, dispatch)
 	t.Cleanup(func() { _ = mount.Close(context.Background()) })
 	t.Cleanup(func() { plan.release() })
 	return plan
@@ -95,7 +95,7 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 		{name: "running", call: session.ToolCallRunning, want: []string{"settled"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			registry := extension.NewRegistry(nil)
+			registry := newTestExtensionRegistry(nil)
 			component := extension.Component{InstanceID: "resume-lifecycle", Artifact: extension.Artifact{Name: "resume-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 			var notices []string
 			mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
@@ -129,7 +129,7 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 				WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
 				WithOwnerID("new-owner"),
 			)
-			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, newTestToolPlanWithDispatch(toolRegistry, dispatch, nil)), run, nil)
+			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, newTestToolPlanWithDispatch(toolRegistry, dispatch)), run, nil)
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
 			}
