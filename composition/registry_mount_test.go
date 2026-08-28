@@ -48,7 +48,9 @@ func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
 			valid: func(registrar *Registrar) error {
 				return registrar.Guard(GuardRegistration{ID: "policy", Scope: extension.GlobalScope(), Guard: guard})
 			},
-			count: func(descriptor session.ExtensionPlanDescriptor) int { return len(descriptor.Guards) },
+			count: func(descriptor session.ExtensionPlanDescriptor) int {
+				return len(descriptorComponent(descriptor, "atomic-guard").Guards)
+			},
 		},
 		"restriction": {
 			duplicate: func(registrar *Registrar) error {
@@ -60,7 +62,9 @@ func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
 			valid: func(registrar *Registrar) error {
 				return registrar.RestrictTools(RestrictionRegistration{ID: "policy", Scope: extension.GlobalScope(), Allowed: []string{"echo"}})
 			},
-			count: func(descriptor session.ExtensionPlanDescriptor) int { return len(descriptor.Restrictions) },
+			count: func(descriptor session.ExtensionPlanDescriptor) int {
+				return len(descriptorComponent(descriptor, "atomic-restriction").Restrictions)
+			},
 		},
 	}
 	for name, test := range tests {
@@ -87,7 +91,7 @@ func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
 			}
 			descriptor := plan.Descriptor()
 			plan.Release()
-			if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+			if descriptorCapabilityCount(descriptor) != 0 {
 				t.Fatalf("failed mount published plan: %#v", descriptor)
 			}
 
@@ -107,7 +111,7 @@ func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
 			}
 			descriptor = plan.Descriptor()
 			plan.Release()
-			if len(descriptor.Tools) != 1 || test.count(descriptor) != 1 {
+			if owned := descriptorComponent(descriptor, mountedComponent.InstanceID); owned == nil || len(owned.Tools) != 1 || test.count(descriptor) != 1 {
 				t.Fatalf("valid remount descriptor = %#v", descriptor)
 			}
 		})
@@ -163,7 +167,7 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 			}
 			defer plan.Release()
 			descriptor := plan.Descriptor()
-			if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+			if descriptorCapabilityCount(descriptor) != 0 {
 				t.Fatalf("plan descriptor = %#v, want no identities", descriptor)
 			}
 		})

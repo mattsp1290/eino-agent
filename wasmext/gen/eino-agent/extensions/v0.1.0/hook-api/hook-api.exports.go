@@ -13,16 +13,6 @@ var Exports struct {
 	//	before-run: func(snapshot: turn-metadata) -> result<_, structured-error>
 	BeforeRun func(snapshot TurnMetadata) (result cm.Result[StructuredError, struct{}, StructuredError])
 
-	// BeforeTurn represents the caller-defined, exported function "before-turn".
-	//
-	//	before-turn: func(snapshot: turn-metadata) -> result<_, structured-error>
-	BeforeTurn func(snapshot TurnMetadata) (result cm.Result[StructuredError, struct{}, StructuredError])
-
-	// AfterTurn represents the caller-defined, exported function "after-turn".
-	//
-	//	after-turn: func(snapshot: turn-metadata) -> result<_, structured-error>
-	AfterTurn func(snapshot TurnMetadata) (result cm.Result[StructuredError, struct{}, StructuredError])
-
 	// AfterRun represents the caller-defined, exported function "after-run".
 	//
 	//	after-run: func(snapshot: turn-metadata) -> result<_, structured-error>

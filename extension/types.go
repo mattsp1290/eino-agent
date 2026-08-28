@@ -69,18 +69,21 @@ type Contract struct {
 
 type CloneFunc[T any] func(T) (T, error)
 type ValidateFunc[T any] func(T) error
-type OutputValidator[I, O any] func(original I, output O) error
 type DelegatedOutputValidator[O any] func(delegated, returned O) error
 type NextValidator[I any] func(original, candidate I) error
+type ContinueFunc[D any] func(D) bool
 
-// Next synchronously delegates to the remainder of an interceptor chain.
+// Next synchronously delegates to the remainder of an around-callback chain.
 // It may be called at most once, must finish before the Around callback returns,
 // and does not support concurrent use.
 type Next[I, O any] func(context.Context, I) (O, error)
 
-// Around intercepts a point and may synchronously call next at most once. A
-// callback must not retain next or call it concurrently.
+// Around wraps a point and may synchronously call next at most once. A callback
+// must not retain next or call it concurrently.
 type Around[I, O any] func(context.Context, I, Next[I, O]) (O, error)
+type HookFunc[T any] func(context.Context, T) error
+type TransformFunc[T any] func(context.Context, T) (T, error)
+type GateFunc[I, D any] func(context.Context, I) (D, error)
 type Observer[T any] func(context.Context, T) error
 type Cleanup func(context.Context) error
 
@@ -100,56 +103,65 @@ func NewNotification[T any](contract Contract, clone CloneFunc[T]) Notification[
 
 func (p Notification[T]) Contract() Contract { return p.contract }
 
-type Interceptor[I, O any] struct {
+type Hook[T any] struct {
+	key      *pointKey
+	contract Contract
+	clone    CloneFunc[T]
+	validate NextValidator[T]
+}
+
+func NewHook[T any](contract Contract, clone CloneFunc[T], validate NextValidator[T]) Hook[T] {
+	return Hook[T]{key: &pointKey{}, contract: contract, clone: clone, validate: validate}
+}
+
+func (p Hook[T]) Contract() Contract { return p.contract }
+
+type Transform[T any] struct {
+	key      *pointKey
+	contract Contract
+	clone    CloneFunc[T]
+	validate NextValidator[T]
+}
+
+func NewTransform[T any](contract Contract, clone CloneFunc[T], validate NextValidator[T]) Transform[T] {
+	return Transform[T]{key: &pointKey{}, contract: contract, clone: clone, validate: validate}
+}
+
+func (p Transform[T]) Contract() Contract { return p.contract }
+
+type Gate[I, D any] struct {
+	key              *pointKey
+	contract         Contract
+	clone            CloneFunc[I]
+	validateInput    NextValidator[I]
+	validateDecision ValidateFunc[D]
+	continueDecision D
+	shouldContinue   ContinueFunc[D]
+}
+
+func NewGate[I, D any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateDecision ValidateFunc[D], continueDecision D, shouldContinue ContinueFunc[D]) Gate[I, D] {
+	return Gate[I, D]{key: &pointKey{}, contract: contract, clone: clone, validateInput: validateInput, validateDecision: validateDecision, continueDecision: continueDecision, shouldContinue: shouldContinue}
+}
+
+func (p Gate[I, D]) Contract() Contract { return p.contract }
+
+type RequiredAround[I, O any] struct {
 	key               *pointKey
 	contract          Contract
 	clone             CloneFunc[I]
-	validateIn        NextValidator[I]
-	validateOut       ValidateFunc[O]
-	validateResult    OutputValidator[I, O]
+	validateInput     NextValidator[I]
+	validateOutput    ValidateFunc[O]
 	validateDelegated DelegatedOutputValidator[O]
-	requireNext       bool
 }
 
-// NewInterceptorWithResultValidation additionally validates each returned
-// value against the original protected input.
-func NewInterceptorWithResultValidation[I, O any](contract Contract, clone CloneFunc[I], validateNext NextValidator[I], validateOut ValidateFunc[O], validateResult OutputValidator[I, O]) Interceptor[I, O] {
-	point := NewInterceptor(contract, clone, validateNext, validateOut)
-	point.validateResult = validateResult
-	return point
+func NewRequiredAround[I, O any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateOutput ValidateFunc[O], validateDelegated DelegatedOutputValidator[O]) RequiredAround[I, O] {
+	return RequiredAround[I, O]{key: &pointKey{}, contract: contract, clone: clone, validateInput: validateInput, validateOutput: validateOutput, validateDelegated: validateDelegated}
 }
 
-// NewRequiredInterceptorWithResultValidation combines successful-delegation
-// enforcement with protected return-value validation.
-func NewRequiredInterceptorWithResultValidation[I, O any](contract Contract, clone CloneFunc[I], validateNext NextValidator[I], validateOut ValidateFunc[O], validateResult OutputValidator[I, O]) Interceptor[I, O] {
-	point := NewInterceptorWithResultValidation(contract, clone, validateNext, validateOut, validateResult)
-	point.requireNext = true
-	return point
-}
+func (p RequiredAround[I, O]) Contract() Contract { return p.contract }
 
-// NewRequiredDelegatingInterceptor requires one successful delegation and
-// lets the point verify that an interceptor returned the delegated value. It
-// is intended for opaque outputs such as provider stream handles.
-func NewRequiredDelegatingInterceptor[I, O any](contract Contract, clone CloneFunc[I], validateNext NextValidator[I], validateOut ValidateFunc[O], validateDelegated DelegatedOutputValidator[O]) Interceptor[I, O] {
-	point := NewRequiredInterceptor(contract, clone, validateNext, validateOut)
-	point.validateDelegated = validateDelegated
-	return point
-}
-
-func NewInterceptor[I, O any](contract Contract, clone CloneFunc[I], validateNext NextValidator[I], validateOut ValidateFunc[O]) Interceptor[I, O] {
-	return Interceptor[I, O]{key: &pointKey{}, contract: contract, clone: clone, validateIn: validateNext, validateOut: validateOut}
-}
-
-func NewRequiredInterceptor[I, O any](contract Contract, clone CloneFunc[I], validateNext NextValidator[I], validateOut ValidateFunc[O]) Interceptor[I, O] {
-	point := NewInterceptor(contract, clone, validateNext, validateOut)
-	point.requireNext = true
-	return point
-}
-
-func (p Interceptor[I, O]) Contract() Contract { return p.contract }
-
-// CallbackError is the bounded public error returned when an interceptor
-// itself fails. The raw cause remains available through errors.Is/errors.As
+// CallbackError is the bounded public error returned when a callback itself
+// fails. The raw cause remains available through errors.Is/errors.As
 // for trusted in-process diagnostics, while Error deliberately contains only
 // host-owned point and registration identities.
 type CallbackError struct {
@@ -210,16 +222,18 @@ type entryKind uint8
 
 const (
 	entryNotification entryKind = iota
-	entryInterceptor
+	entryHook
+	entryTransform
+	entryGate
+	entryAround
 )
 
 type registrationEntry struct {
-	point       *pointKey
-	contract    Contract
-	spec        Registration
-	kind        entryKind
-	callback    any
-	requireNext bool
+	point    *pointKey
+	contract Contract
+	spec     Registration
+	kind     entryKind
+	callback any
 }
 
 func On[T any](registrar Registrar, point Notification[T], spec Registration, fn Observer[T]) error {
@@ -232,14 +246,42 @@ func On[T any](registrar Registrar, point Notification[T], spec Registration, fn
 	return registrar.register(registrationEntry{point: point.key, contract: point.contract, spec: spec, kind: entryNotification, callback: fn})
 }
 
-func Use[I, O any](registrar Registrar, point Interceptor[I, O], spec Registration, fn Around[I, O]) error {
-	if registrar == nil || fn == nil {
-		return fmt.Errorf("%w: nil registrar or interceptor", ErrInvalidRegistration)
+func OnHook[T any](registrar Registrar, point Hook[T], spec Registration, fn HookFunc[T]) error {
+	if fn == nil {
+		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
 	}
-	if err := validatePoint(point.key, point.contract); err != nil {
+	return registerCallback(registrar, point.key, point.contract, spec, entryHook, fn)
+}
+
+func OnTransform[T any](registrar Registrar, point Transform[T], spec Registration, fn TransformFunc[T]) error {
+	if fn == nil {
+		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
+	}
+	return registerCallback(registrar, point.key, point.contract, spec, entryTransform, fn)
+}
+
+func OnGate[I, D any](registrar Registrar, point Gate[I, D], spec Registration, fn GateFunc[I, D]) error {
+	if fn == nil {
+		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
+	}
+	return registerCallback(registrar, point.key, point.contract, spec, entryGate, fn)
+}
+
+func OnAround[I, O any](registrar Registrar, point RequiredAround[I, O], spec Registration, fn Around[I, O]) error {
+	if fn == nil {
+		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
+	}
+	return registerCallback(registrar, point.key, point.contract, spec, entryAround, fn)
+}
+
+func registerCallback(registrar Registrar, key *pointKey, contract Contract, spec Registration, kind entryKind, callback any) error {
+	if registrar == nil || callback == nil {
+		return fmt.Errorf("%w: nil registrar or callback", ErrInvalidRegistration)
+	}
+	if err := validatePoint(key, contract); err != nil {
 		return err
 	}
-	return registrar.register(registrationEntry{point: point.key, contract: point.contract, spec: spec, kind: entryInterceptor, callback: fn, requireNext: point.requireNext})
+	return registrar.register(registrationEntry{point: key, contract: contract, spec: spec, kind: kind, callback: callback})
 }
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)

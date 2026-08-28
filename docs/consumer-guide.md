@@ -158,8 +158,9 @@ Required semantics:
 - Duplicate ordinary records with identical caller-supplied IDs are
   idempotent; `AdmitRun` is the explicit exception above.
 - Duplicate writes with incompatible payloads return `session.ErrConflict`.
-- Tool calls are created pending, claimed with owner/token fencing, and settled
-  exactly once.
+- `CreateToolCall`, `ClaimToolCall`, and `SettleToolCall` accept typed request
+  envelopes and atomically commit each tool phase with its canonical event;
+  claims use owner/token fencing and terminal settlement happens exactly once.
 - Startup recovery can list unfinished runs and unfinished tool calls.
 
 SQLite is available as an embedded implementation. Hosted or multi-region
@@ -215,8 +216,10 @@ orchestrator, err := runtime.NewStreamingOrchestrator(
 ```
 
 Every executable extension enters through a `runtime.RunPlanProvider` and is
-bound to stable artifact, scope, and capability identity before its descriptor
-is fingerprinted. Native `tools.Definition` values use the same
+bound to one explicit component owner plus stable scope and capability identity
+before its descriptor is fingerprinted. The durable descriptor records the
+component instance and artifact once around its nested typed handler, tool,
+prompt, guard, and restriction identities. Native `tools.Definition` values use the same
 `composition.Registrar.Tool` path with a `SourceNative` component. Runs with no
 extensions use a fingerprinted empty plan from an explicitly configured
 provider; omitting `runtime.WithRunPlanProvider` is a constructor error.
@@ -300,16 +303,41 @@ changes.
 Runtime-controlled tools use this lifecycle:
 
 1. Select and scope tools from a data-only `runtime.ToolScopeContext`.
-2. Persist a pending `session.ToolCall` before execution.
-3. Claim the call with owner, claim token, and lease.
+2. Atomically persist a pending `session.ToolCall` and its canonical pending event.
+3. Atomically claim the call with owner, claim token, lease renewal, and its
+   canonical running event.
 4. Execute with `context.Context`, durable IDs, scope, approval requester, and
    a bounded `runtime.ToolContext` containing content-free turn metadata.
-5. Settle output, structured output, attachments, metadata, or error.
-6. Append tool-result message/part records for the next provider turn.
-7. Emit observability and audit events.
+5. Atomically settle output or error with the reserved tool-result message,
+   part, and canonical terminal event.
+6. Best-effort publish the exact already-committed phase events to live and
+   extension sinks; publication failure never reverses durable state.
+7. Emit observability from the committed result.
 
-Tool-call state transitions can also emit runtime/AG-UI events around pending,
-running, and terminal states when the bridge policy enables them.
+Tool-call state transitions publish runtime/AG-UI events only after the matching
+pending, running, or terminal event is durably committed and when the bridge
+policy enables live delivery.
+
+Register native tool transforms through their semantic point API while mounting
+the component. Each transform returns the value consumed by the next
+registration:
+
+```go
+err := extension.OnTransform(
+    registrar.Extensions(),
+    runtime.ToolResultTransformPoint,
+    extension.Registration{
+        ID: "tool/result-metadata", Order: runtime.OrderApplication, Scope: scope,
+    },
+    func(_ context.Context, value runtime.ToolResultTransform) (runtime.ToolResultTransform, error) {
+        if value.Result.Metadata == nil {
+            value.Result.Metadata = map[string]string{}
+        }
+        value.Result.Metadata["reviewed"] = "true"
+        return value, nil
+    },
+)
+```
 
 Non-idempotent tools must not be retried automatically after interruption or
 restart. Retry requires both `runtime.Tool.RetrySafe` and store evidence that

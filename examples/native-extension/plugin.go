@@ -46,20 +46,20 @@ func Mount(ctx context.Context, registry *composition.Registry, sessionID sessio
 		})}); err != nil {
 			return err
 		}
-		if err := extension.Use(registrar.Extensions(), runtime.ContextAssemblePoint, extension.Registration{ID: "context/session", Order: runtime.OrderApplication, Scope: scope}, func(ctx context.Context, assembly runtime.ContextAssembly, next extension.Next[runtime.ContextAssembly, runtime.ContextAssembly]) (runtime.ContextAssembly, error) {
+		if err := extension.OnTransform(registrar.Extensions(), runtime.ContextAssemblePoint, extension.Registration{ID: "context/session", Order: runtime.OrderApplication, Scope: scope}, func(_ context.Context, assembly runtime.ContextAssembly) (runtime.ContextAssembly, error) {
 			assembly.Contributions = append(assembly.Contributions, runtime.ContextContribution{Source: instanceID + "/context", Order: runtime.OrderApplication, Message: einoschema.SystemMessage("Native example extension is active for this session.")})
-			return next(ctx, assembly)
+			return assembly, nil
 		}); err != nil {
 			return err
 		}
-		if err := extension.Use(registrar.Extensions(), runtime.ToolPreparePoint, extension.Registration{ID: "tool/prepare", Order: runtime.OrderApplication, Scope: scope}, func(ctx context.Context, prepared runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
+		if err := extension.OnTransform(registrar.Extensions(), runtime.ToolPreparePoint, extension.Registration{ID: "tool/prepare", Order: runtime.OrderApplication, Scope: scope}, func(_ context.Context, prepared runtime.PreparedToolCall) (runtime.PreparedToolCall, error) {
 			var input map[string]any
 			if err := json.Unmarshal(prepared.Call.Input, &input); err != nil {
 				return runtime.PreparedToolCall{}, err
 			}
 			input["prepared_by"] = instanceID
 			prepared.Call.Input, _ = json.Marshal(input)
-			return next(ctx, prepared)
+			return prepared, nil
 		}); err != nil {
 			return err
 		}

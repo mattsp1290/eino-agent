@@ -144,7 +144,13 @@ func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecu
 	defer execution.release()
 	result, settled := o.run(ctx, execution, admitted)
 	if settled {
-		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: admitted.Run.SessionID, Result: result, Duration: o.now().Sub(admitted.Run.CreatedAt), Error: classifyExtensionError(result.Error)})
+		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
+			SessionID: admitted.Run.SessionID,
+			Result:    result,
+			Metadata:  boundedTurnMetadata(admitted.Snapshot),
+			Duration:  o.now().Sub(admitted.Run.CreatedAt),
+			Error:     classifyExtensionError(result.Error),
+		})
 	}
 	done <- result
 }
@@ -169,9 +175,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 		o.finishObservedRun(observed, result, o.now())
 	}()
 	{
-		decision, err := extension.Invoke(execution.dispatch(), ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID}, func(context.Context, RunGateInput) (RunDecision, error) {
-			return RunDecision{Kind: RunContinue}, nil
-		})
+		decision, err := extension.EvaluateGate(execution.dispatch(), ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID})
 		if err != nil {
 			result.Status = session.RunFailed
 			result.Error = err
@@ -205,7 +209,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
 	assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
-	assembled, err := extension.Invoke(execution.dispatch(), ctx, ContextAssemblePoint, assembly, func(_ context.Context, value ContextAssembly) (ContextAssembly, error) { return value, nil })
+	assembled, err := extension.ApplyTransforms(execution.dispatch(), ctx, ContextAssemblePoint, assembly)
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
@@ -230,7 +234,7 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 			snapshot.Tools = append(snapshot.Tools, tool)
 		}
 	}
-	_, err = extension.Invoke(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot), func(_ context.Context, value BoundedTurnMetadata) (BoundedTurnMetadata, error) { return value, nil })
+	err = extension.RunHooks(execution.dispatch(), ctx, TurnPreparePoint, boundedTurnMetadata(snapshot))
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
@@ -329,7 +333,7 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 	var executorErr error
 	var callbackErr error
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		result, err := extension.Invoke(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolResult, error) {
+		result, err := extension.InvokeAround(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolResult, error) {
 			var result ToolResult
 			result, executorErr = tool.Executor.Execute(ctx, cloneToolCall(call))
 			return result, nil
@@ -357,14 +361,12 @@ func finalizeToolOutcome(outcome toolOutcome) toolOutcome {
 
 func (o *StreamingOrchestrator) transformToolOutcome(ctx context.Context, execution *runExecution, outcome toolOutcome) toolOutcome {
 	input := ToolResultTransform{ToolName: outcome.Call.Name, Call: extensionToolCall(outcome.Call), Result: cloneRuntimeToolResult(outcome.Result)}
-	transformed, err := extension.Invoke(execution.dispatch(), ctx, ToolResultTransformPoint, input, func(_ context.Context, value ToolResultTransform) (ToolResult, error) {
-		return value.Result, nil
-	})
+	transformed, err := extension.ApplyTransforms(execution.dispatch(), ctx, ToolResultTransformPoint, input)
 	if err != nil {
 		outcome.RawError = errors.Join(outcome.RawError, err)
 		return finalizeToolOutcome(outcome)
 	}
-	outcome.Result = transformed
+	outcome.Result = transformed.Result
 	return finalizeToolOutcome(outcome)
 }
 
@@ -451,27 +453,6 @@ func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, executio
 			Payload: cloneJSON(event.Payload), Time: event.CreatedAt,
 		})
 	}
-}
-
-func toolCallEventPayload(output json.RawMessage, name string, input json.RawMessage) map[string]any {
-	payload := map[string]any{}
-	_ = json.Unmarshal(output, &payload)
-	payload["name"] = name
-	payload["arguments"] = cloneJSON(input)
-	return payload
-}
-
-func withToolStatus(payload any, status session.ToolCallStatus) (map[string]any, error) {
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return nil, fmt.Errorf("encode tool event payload: %w", err)
-	}
-	result := map[string]any{}
-	if err := json.Unmarshal(raw, &result); err != nil {
-		return nil, fmt.Errorf("decode tool event payload: %w", err)
-	}
-	result["status"] = string(status)
-	return result, nil
 }
 
 func (o *StreamingOrchestrator) validate(request Request) error {

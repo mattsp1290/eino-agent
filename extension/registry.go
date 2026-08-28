@@ -458,9 +458,18 @@ func (p *Plan) Diagnostics() []PlanEntryDiagnostic {
 	}
 	result := make([]PlanEntryDiagnostic, 0, len(p.entries))
 	for _, entry := range p.entries {
-		kind := "notification"
-		if entry.kind == entryInterceptor {
-			kind = "interceptor"
+		kind := ""
+		switch entry.kind {
+		case entryNotification:
+			kind = "notification"
+		case entryHook:
+			kind = "hook"
+		case entryTransform:
+			kind = "transform"
+		case entryGate:
+			kind = "gate"
+		case entryAround:
+			kind = "around"
 		}
 		result = append(result, PlanEntryDiagnostic{InstanceID: entry.component.InstanceID, Artifact: entry.component.Artifact, ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: kind})
 	}

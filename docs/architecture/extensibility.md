@@ -7,7 +7,7 @@ functions, native structs, and Wasm-backed wrappers are mounted into a
 `composition.Registry`, which supplies one immutable `runtime.RunPlan` per run.
 The orchestrator does not branch on implementation kind.
 
-Typed interception, frozen capability plans, lifecycle, the producer/consumer
+Typed semantic callbacks, frozen capability plans, lifecycle, the producer/consumer
 catalog, exact pipelines, and request-ledger privacy are documented in
 [`extension-points.md`](extension-points.md).
 
@@ -28,7 +28,7 @@ plan, and clock.
 | --- | --- | --- | --- |
 | Tool | `composition.Registrar.Tool` with a `tools.Definition` | `tool` | Phase A wrapper and fixture |
 | Permission policy | `permissions.Policy` / `PolicyFunc` via `runtime.WithPermissions` | `permissions-policy` | Phase A wrapper and fixture |
-| Context source | `extension.Use` with `runtime.ContextAssemblePoint` | `context-source` | Implemented |
+| Context source | `extension.OnTransform` with `runtime.ContextAssemblePoint` | `context-source` | Implemented |
 | Event sink | `runtime.EventSink` / `EventSinkFunc` | `event-sink` | Implemented |
 | Hook | Typed lifecycle points in `runtime` | `hook` | Implemented |
 | Tool middleware | `runtime.ToolPreparePoint` and `runtime.ToolResultTransformPoint` | `tool-middleware` | Implemented |
@@ -36,15 +36,15 @@ plan, and clock.
 | Models/providers | `model.Resolver`, normally `model.AdapterResolver` | none | Native only by design |
 | Durable IDs | `runtime.IDGenerator` | none | Native only by design |
 
-The WIT package is `eino-agent:extensions@0.1.0`. Published packages are
-immutable; see `wit/README.md` for evolution rules. Generated bindings are
-committed under `wasmext/gen` and reproduced with `make wit`.
+The current pre-release WIT package is `eino-agent:extensions@0.1.0`; see
+`wit/README.md` for regeneration rules. Generated bindings are committed under
+`wasmext/gen` and reproduced with `make wit`.
 
-## Tool interception
+## Tool transforms
 
 `runtime.ToolPreparePoint` runs after typed input decoding and before any
-durable tool-call record is created. Each interceptor sees the output of the
-preceding interceptor. Runtime normalizes the final value to a deterministic,
+durable tool-call record is created. Each transform sees the output of the
+preceding transform. Runtime normalizes the final value to a deterministic,
 non-null JSON object, then the tool definition's explicit pattern resolver
 derives `ToolCall.Pattern` from that same input. Both input and pattern are
 persisted; permissions, approval, execution, settlement, and resume reuse them
@@ -52,8 +52,8 @@ without generic JSON-key probing. A failed prepare keeps the validated tool-name
 fallback so its durable failure can settle without masking the original error.
 
 `runtime.ToolResultTransformPoint` runs after execution and before encoding or
-settlement. Around interceptors unwind in reverse registration order, producing
-an onion lifecycle. The final result
+settlement. Transforms run in registration order, and each receives the value
+returned by its predecessor. The final result
 is used by durable output, the settled event, `PartToolResult`, and the next
 model-visible tool message. The executor error is informational and cannot be
 removed; a middleware error can turn a success into failure but cannot turn an
@@ -62,7 +62,7 @@ executor failure into success.
 Pending calls resumed from storage already contain rewritten input, so resume
 does not run `ToolPreparePoint` again. `ToolResultTransformPoint` runs when a
 pending call is actually re-executed. A call found running is settled
-interrupted without execution and skips both interception phases.
+interrupted without execution and skips both transformation phases.
 
 ## Wasm trust and lifecycle
 
@@ -114,8 +114,8 @@ against the checked-in guests.
 | --- | --- | --- | --- |
 | `customTools` | Tool plan | `tools.Definition`, `composition.Registrar.Tool` | `wasmext.Loader.LoadTool`, `tool` world |
 | `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.Loader.LoadPermissionsPolicy`, `permissions-policy` world |
-| `tool_call` argument rewrite | Tool prepare point | `extension.Use` with `runtime.ToolPreparePoint` | `wasmext.Loader.RegisterToolMiddleware` |
-| `tool_result` patch | Tool result point | `extension.Use` with `runtime.ToolResultTransformPoint` | `wasmext.Loader.RegisterToolMiddleware` |
+| `tool_call` argument rewrite | Tool prepare point | `extension.OnTransform` with `runtime.ToolPreparePoint` | `wasmext.Loader.RegisterToolMiddleware` |
+| `tool_result` patch | Tool result point | `extension.OnTransform` with `runtime.ToolResultTransformPoint` | `wasmext.Loader.RegisterToolMiddleware` |
 | `before_agent_start` / context | Typed lifecycle points | `runtime.RunBeforeExecutePoint`, `runtime.ContextAssemblePoint` | `wasmext.Loader.RegisterContextSource`, `wasmext.Loader.RegisterHook` |
 | `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world and wrapper |
 | `sessionManager` | Session persistence | `session.Store`, `runtime.WithStore` | No Wasm path by design |

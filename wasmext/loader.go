@@ -108,7 +108,7 @@ func (l *Loader) RegisterHook(ctx context.Context, registrar extension.Registrar
 	if err != nil {
 		return err
 	}
-	owned := &ownedModule{module: loaded.module, cleanup: loaded.cleanup}
+	owned := &ownedModule{module: loaded.module}
 	return l.registerOwned(ctx, registrar, owned, func() error { return registerHook(registrar, spec, loaded) })
 }
 

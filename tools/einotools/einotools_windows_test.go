@@ -29,7 +29,7 @@ func TestMountStandardPreservesUnsupportedPlatformError(t *testing.T) {
 	}
 	defer plan.Release()
 	descriptor := plan.Descriptor()
-	if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+	if len(descriptor.Components) != 0 {
 		t.Fatalf("unsupported mount published plan: %#v", descriptor)
 	}
 }

@@ -56,7 +56,7 @@ same JSON boundary. Hosts that prefer typed functions use `TypedNormalizer`,
 `TypedPermissionPattern`, and `TypedExecutor`; those adapters do not create a
 second runtime contract.
 
-Runtime invokes `Pattern` after the final prepare interceptor and persists the
+Runtime invokes `Pattern` after the final prepare transform and persists the
 result with the canonical object input. Runtime never probes generic JSON for
 permission field names. Definitions without a callback use the tool name.
 
@@ -97,8 +97,9 @@ process-wide, ref-counted lock coordinator; workspace keys are canonical roots
 and static keys are catalog IDs.
 
 Run-plan-backed calls reserve result message and part IDs at admission.
-`session.ExecutionStore.SettleToolCall` commits terminal tool state
-and the model-visible result atomically and idempotently. Each settlement must
+`session.ExecutionStore.SettleToolCall(session.SettleToolCallRequest)` commits
+terminal tool state, the reserved model-visible result envelope, and the
+canonical terminal event atomically and idempotently. Each settlement must
 present the owner and token of the durable tool claim whose work it commits;
 missing or stale claim identities conflict before terminal state is applied.
 The protected stage order is documented in

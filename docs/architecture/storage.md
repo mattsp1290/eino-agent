@@ -79,7 +79,8 @@ Transaction boundaries matter for:
 
 - admitting a run and writing its first durable event;
 - appending a message and its initial parts;
-- creating, claiming, and writing the first tool-call part;
+- creating, claiming, and settling a tool call together with its canonical
+  pending, running, or terminal event;
 - finishing a run together with its final durable event;
 - creating a context epoch and writing compaction summary/tail metadata.
 - creating and transitioning a model-request ledger record.
@@ -118,19 +119,31 @@ projections rather than old transport frames.
 
 Tool calls use a create, claim, atomic-settlement lifecycle:
 
-1. `CreateToolCall` writes a pending call before execution.
-2. Scoped `ClaimToolCall` atomically changes pending to running, records
+1. `CreateToolCall(CreateToolCallRequest)` writes a pending call and its
+   canonical pending event in one fenced transaction.
+2. Scoped `ClaimToolCall(ClaimToolCallRequest)` atomically changes pending to running, records
    `ClaimedBy`, `ClaimToken`, and a store-clock deadline, and extends the owning
-   run lease to at least the same deadline.
+   run lease to at least the same deadline. The running event commits in that
+   same transaction.
 3. A second claim for the same pending/running call returns
    `session.ErrConflict`.
-4. `SettleToolCall` atomically records completed, failed, or interrupted state
-   together with the reserved tool-result message and part.
+4. `SettleToolCall(SettleToolCallRequest)` atomically records completed, failed,
+   or interrupted state together with the reserved tool-result message, part,
+   and one canonical terminal event.
 5. `SettleToolCall` verifies both the successful tool claim and current run
    claim token, and returns
    `session.ErrConflict` for stale or stolen settlement attempts. Repeating an
    identical settlement is idempotent; contradictory state or envelopes conflict.
 6. `ListUnfinishedToolCalls` returns pending/running calls for a run.
+
+Tool transition events have a caller-supplied non-empty event ID and a distinct
+`pending`, `running`, or `terminal` phase. The event payload and correlation
+fields are derived from the authoritative request state. Replaying the same
+phase, event ID, and state is idempotent. A different ID for an already
+committed phase, or the same ID with different state, returns
+`session.ErrConflict`. `AppendEvent` rejects tool transitions; only the three
+typed mutations can persist them. Runtime publishes the already-committed event
+to live sinks and extensions afterward, on a best-effort basis.
 
 This prevents double execution and gives recovery enough data to decide whether
 to mark a call interrupted or retry it when `RetrySafe` is true.
@@ -148,8 +161,8 @@ Each provider attempt creates a bounded `prepared` record through
 Stores make most caller-supplied record IDs idempotent, with admission as an
 intentional exception:
 
-- repeating `CreateSession`, `AppendMessage`, `AppendPart`, `AppendEvent`, or
-  `CreateToolCall` with identical IDs and compatible payloads returns the
+- repeating `CreateSession`, `AppendMessage`, `AppendPart`, `AppendEvent`, or a
+  typed tool transition with identical IDs and compatible payloads returns the
   existing record;
 - repeating `AdmitRun` with any existing run ID returns
   `session.ErrConflict`; a start request is a one-shot admission attempt, not a
@@ -188,7 +201,9 @@ journaling for provider responses or tool execution.
 - compatible duplicate idempotency and incompatible duplicate conflicts for
   ordinary durable records, plus insert-only `AdmitRun` conflicts;
 - pending tool-call creation, single-owner claim, conflict on second claim,
-  claim-token fencing, and terminal settlement;
+  claim-token fencing, atomic canonical events for every phase,
+  event-ID/phase idempotency, generic append bypass rejection, and atomic
+  terminal result-envelope persistence;
 - model-request creation and state transitions through a valid execution fence,
   top-level reads and pagination, invalid-transition rejection, and rollback;
 - unfinished run discovery and durable event listing with paged reads.

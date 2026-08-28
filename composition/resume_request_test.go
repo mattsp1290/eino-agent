@@ -20,7 +20,24 @@ func assertRegistryEmpty(t *testing.T, registry *Registry) {
 	}
 	defer plan.Release()
 	descriptor := plan.Descriptor()
-	if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+	if descriptorCapabilityCount(descriptor) != 0 {
 		t.Fatalf("registry published unexpected plan: %#v", descriptor)
 	}
+}
+
+func descriptorCapabilityCount(descriptor session.ExtensionPlanDescriptor) int {
+	count := 0
+	for _, component := range descriptor.Components {
+		count += len(component.Handlers) + len(component.Tools) + len(component.Prompts) + len(component.Guards) + len(component.Restrictions)
+	}
+	return count
+}
+
+func descriptorComponent(descriptor session.ExtensionPlanDescriptor, instanceID string) *session.ComponentPlan {
+	for index := range descriptor.Components {
+		if descriptor.Components[index].InstanceID == instanceID {
+			return &descriptor.Components[index]
+		}
+	}
+	return nil
 }

@@ -83,7 +83,13 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *ru
 		result = o.finishResume(ctx, execution, run, result, &settled)
 	}
 	if settled && !run.Terminal() {
-		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{SessionID: run.SessionID, Result: result, Duration: o.now().Sub(resumeStartedAt), Error: classifyExtensionError(result.Error)})
+		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
+			SessionID: run.SessionID,
+			Result:    result,
+			Metadata:  boundedTurnMetadata(o.resumeSnapshot(run)),
+			Duration:  o.now().Sub(resumeStartedAt),
+			Error:     classifyExtensionError(result.Error),
+		})
 	}
 	done <- result
 }
@@ -136,14 +142,15 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 			}
 			continue
 		}
-		claimed := call
-		claimed.Status = session.ToolCallRunning
-		claimed.ClaimedBy = o.ownerID()
-		if claimed.ClaimToken == "" || claimed.ClaimedBy != call.ClaimedBy {
-			claimed.ClaimToken = string(o.ids.NewEventID())
+		startedAt := o.now()
+		claimToken := call.ClaimToken
+		if claimToken == "" || call.ClaimedBy != o.ownerID() {
+			claimToken = string(o.ids.NewEventID())
 		}
-		claimed.StartedAt = o.now()
-		claimed, err = execution.store.ClaimToolCall(ctx, claimed, o.lease())
+		claimed, err := execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+			ID: call.ID, ClaimedBy: o.ownerID(), ClaimToken: claimToken, StartedAt: startedAt,
+			LeaseDuration: o.lease(), Event: toolTransitionEnvelope(o, snapshot, startedAt),
+		})
 		if err != nil {
 			if errors.Is(err, session.ErrConflict) {
 				return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrSessionBusy}

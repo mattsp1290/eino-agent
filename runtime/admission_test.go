@@ -351,6 +351,7 @@ type admissionStore struct {
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	appendEventErr    error
 	settleToolCallErr error
+	toolTransitionErr error
 	listMessagesCalls atomic.Int32
 	getRunCalls       atomic.Int32
 }
@@ -396,6 +397,7 @@ func (s *admissionStore) clone() *admissionStore {
 		modelRequests:     cloneMap(s.modelRequests),
 		appendEventErr:    s.appendEventErr,
 		settleToolCallErr: s.settleToolCallErr,
+		toolTransitionErr: s.toolTransitionErr,
 	}
 }
 
@@ -557,6 +559,9 @@ func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecor
 	if s.appendEventErr != nil {
 		return session.EventRecord{}, s.appendEventErr
 	}
+	if event.ToolTransition != "" || (event.Kind == session.ToolTransitionEventKind && event.ToolCallID != "") {
+		return session.EventRecord{}, session.ErrConflict
+	}
 	if existing, ok := s.events[event.ID]; ok {
 		if existing.Kind != event.Kind {
 			return session.EventRecord{}, session.ErrConflict
@@ -585,14 +590,23 @@ func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ s
 	return session.EventBatch{Events: events}, nil
 }
 
-func (s *admissionStore) CreateToolCall(_ context.Context, call session.ToolCall) (session.ToolCall, error) {
+func (s *admissionStore) CreateToolCall(_ context.Context, request session.CreateToolCallRequest) (session.ToolCall, error) {
+	if s.toolTransitionErr != nil {
+		return session.ToolCall{}, s.toolTransitionErr
+	}
+	call := request.Call
 	if existing, ok := s.toolCalls[call.ID]; ok {
 		if existing.Name != call.Name {
 			return session.ToolCall{}, session.ErrConflict
 		}
 		return existing, nil
 	}
+	event, err := session.ToolTransitionRecord(call, request.Event)
+	if err != nil {
+		return session.ToolCall{}, err
+	}
 	s.toolCalls[call.ID] = call
+	s.events[event.ID] = event
 	return call, nil
 }
 func (s *admissionStore) GetToolCall(_ context.Context, id session.ToolCallID) (session.ToolCall, error) {
@@ -611,14 +625,31 @@ func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID sessio
 	}
 	return calls, nil
 }
-func (s *admissionStore) ClaimToolCall(_ context.Context, call session.ToolCall) (session.ToolCall, error) {
-	if _, ok := s.toolCalls[call.ID]; !ok {
+func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimToolCallRequest) (session.ToolCall, error) {
+	if s.toolTransitionErr != nil {
+		return session.ToolCall{}, s.toolTransitionErr
+	}
+	call, ok := s.toolCalls[request.ID]
+	if !ok {
 		return session.ToolCall{}, session.ErrNotFound
 	}
+	call.Status = session.ToolCallRunning
+	call.ClaimedBy = request.ClaimedBy
+	call.ClaimToken = request.ClaimToken
+	call.StartedAt = request.StartedAt
+	event, err := session.ToolTransitionRecord(call, request.Event)
+	if err != nil {
+		return session.ToolCall{}, err
+	}
 	s.toolCalls[call.ID] = call
+	s.events[event.ID] = event
 	return call, nil
 }
-func (s *admissionStore) SettleToolCall(_ context.Context, settlement session.ToolSettlement) error {
+func (s *admissionStore) SettleToolCall(_ context.Context, request session.SettleToolCallRequest) error {
+	if s.toolTransitionErr != nil {
+		return s.toolTransitionErr
+	}
+	settlement := request.Settlement
 	if s.settleToolCallErr != nil {
 		return s.settleToolCallErr
 	}
@@ -630,9 +661,14 @@ func (s *admissionStore) SettleToolCall(_ context.Context, settlement session.To
 	if err != nil {
 		return err
 	}
+	event, err := session.ToolTransitionRecord(terminal, request.Event)
+	if err != nil {
+		return err
+	}
 	s.toolCalls[terminal.ID] = terminal
 	s.messages[settlement.ResultMessage.ID] = settlement.ResultMessage
 	s.parts[settlement.ResultPart.ID] = settlement.ResultPart
+	s.events[event.ID] = event
 	return nil
 }
 func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.ContextEpoch) (session.ContextEpoch, error) {
@@ -741,12 +777,17 @@ func (s *fakeExecutionStore) SettleRun(ctx context.Context, run session.Run, eve
 	return nil
 }
 
-func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, call session.ToolCall, duration time.Duration) (session.ToolCall, error) {
+func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolCall, error) {
 	if !s.valid() {
 		return session.ToolCall{}, session.ErrConflict
 	}
-	call.LeaseUntil = time.Now().UTC().Add(duration)
-	return s.admissionStore.ClaimToolCall(ctx, call)
+	claimed, err := s.admissionStore.ClaimToolCall(ctx, request)
+	if err != nil {
+		return session.ToolCall{}, err
+	}
+	claimed.LeaseUntil = time.Now().UTC().Add(request.LeaseDuration)
+	s.toolCalls[claimed.ID] = claimed
+	return claimed, nil
 }
 
 func (s *fakeExecutionStore) CreateModelRequest(_ context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {

@@ -315,33 +315,73 @@ func Run(t *testing.T, factory Factory) {
 		execution := executionFor(subject.Store, r)
 		msg := appendMessage(t, ctx, execution, message("msg-tools", s.ID, r.ID, session.RoleAssistant))
 		call := session.ToolCall{
-			ID:        "call-1",
-			SessionID: s.ID,
-			RunID:     r.ID,
-			MessageID: msg.ID,
-			Name:      "file_read",
-			Status:    session.ToolCallPending,
-			RetrySafe: true,
+			ID: "call-1", SessionID: s.ID, RunID: r.ID, MessageID: msg.ID,
+			ResultMessageID: "result-message-1", ResultPartID: "result-part-1",
+			Name: "file_read", Status: session.ToolCallPending, RetrySafe: true,
 		}
-		if _, err := execution.CreateToolCall(ctx, call); err != nil {
+		createdAt := time.Now().UTC()
+		createRequest := session.CreateToolCallRequest{Call: call, Event: toolEvent("event-create", createdAt)}
+		if _, err := execution.CreateToolCall(ctx, createRequest); err != nil {
 			t.Fatalf("create tool call: %v", err)
 		}
-		call.ClaimedBy = "worker-1"
-		call.ClaimToken = "claim-1"
-		claimed, err := execution.ClaimToolCall(ctx, call, time.Minute)
+		if _, err := execution.CreateToolCall(ctx, createRequest); err != nil {
+			t.Fatalf("idempotent create replay: %v", err)
+		}
+		createRequest.Event.ID = "event-create-new-id"
+		if _, err := execution.CreateToolCall(ctx, createRequest); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("new event id for pending phase err = %v, want ErrConflict", err)
+		}
+		createRequest.Event.ID = "event-create"
+		createRequest.Call.Input = json.RawMessage(`{"different":true}`)
+		if _, err := execution.CreateToolCall(ctx, createRequest); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("same event id with conflicting pending state err = %v, want ErrConflict", err)
+		}
+		startedAt := time.Now().UTC()
+		claimed, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: call.ID, ClaimedBy: "worker-1", ClaimToken: "claim-1", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolEvent("event-claim-1", startedAt)})
 		if err != nil {
 			t.Fatalf("claim tool call: %v", err)
 		}
 		if claimed.Status != session.ToolCallRunning {
 			t.Fatalf("claimed status = %q, want %q", claimed.Status, session.ToolCallRunning)
 		}
-		call.ClaimedBy = "worker-2"
-		call.ClaimToken = "claim-2"
-		if _, err := execution.ClaimToolCall(ctx, call, time.Minute); !errors.Is(err, session.ErrConflict) {
+		if _, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: call.ID, ClaimedBy: "worker-2", ClaimToken: "claim-2", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolEvent("event-claim-2", startedAt)}); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("second claim err = %v, want ErrConflict", err)
 		}
-		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 1 {
-			t.Fatalf("unfinished calls = %d, err = %v; want claimed call", len(unfinished), err)
+		claimReplay := session.ClaimToolCallRequest{ID: call.ID, ClaimedBy: "worker-1", ClaimToken: "claim-1", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolEvent("event-claim-1", startedAt)}
+		if _, err := execution.ClaimToolCall(ctx, claimReplay); err != nil {
+			t.Fatalf("idempotent claim replay: %v", err)
+		}
+		claimReplay.Event.ID = "event-claim-new-id"
+		if _, err := execution.ClaimToolCall(ctx, claimReplay); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("new event id for running phase err = %v, want ErrConflict", err)
+		}
+		if _, err := execution.AppendEvent(ctx, session.EventRecord{ID: "tool-bypass", SessionID: s.ID, RunID: r.ID, ToolCallID: call.ID, ToolTransition: session.ToolTransitionRunning, Kind: session.ToolTransitionEventKind, CreatedAt: startedAt}); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("generic tool transition append err = %v, want ErrConflict", err)
+		}
+		completedAt := startedAt.Add(time.Second)
+		output := json.RawMessage(`{"tool_call_id":"call-1","status":"completed","content":"ok"}`)
+		settlement := session.ToolSettlement{
+			ID: claimed.ID, ClaimedBy: claimed.ClaimedBy, ClaimToken: claimed.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
+			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, ParentID: msg.ID, Role: session.RoleTool, CreatedAt: completedAt, UpdatedAt: completedAt},
+			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolResult, Payload: output, CreatedAt: completedAt, UpdatedAt: completedAt},
+		}
+		settleRequest := session.SettleToolCallRequest{Settlement: settlement, Event: toolEvent("event-terminal", completedAt)}
+		if err := execution.SettleToolCall(ctx, settleRequest); err != nil {
+			t.Fatalf("settle tool call: %v", err)
+		}
+		if err := execution.SettleToolCall(ctx, settleRequest); err != nil {
+			t.Fatalf("idempotent settlement replay: %v", err)
+		}
+		settleRequest.Event.ID = "event-terminal-new-id"
+		if err := execution.SettleToolCall(ctx, settleRequest); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("new event id for terminal phase err = %v, want ErrConflict", err)
+		}
+		events, err := subject.Store.ListEvents(ctx, s.ID, session.EventCursor{Limit: 10})
+		if err != nil || len(events.Events) != 3 {
+			t.Fatalf("tool transition events = %d, err = %v; want pending/running/terminal", len(events.Events), err)
+		}
+		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 0 {
+			t.Fatalf("unfinished calls = %d, err = %v; want none after settlement", len(unfinished), err)
 		}
 	})
 
@@ -453,6 +493,10 @@ func Run(t *testing.T, factory Factory) {
 			t.Fatalf("epochs = %#v, want chronological epoch-1 then finished epoch-2", epochs)
 		}
 	})
+}
+
+func toolEvent(id session.EventID, at time.Time) session.ToolTransitionEvent {
+	return session.ToolTransitionEvent{ID: id, CreatedAt: at.UTC()}
 }
 
 func setup(t testing.TB, factory Factory) Subject {

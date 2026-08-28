@@ -25,7 +25,7 @@ func TestRunEventSinkPersistsOnlyIntermediateDurableEventsThroughFence(t *testin
 	execution.bindRun(run)
 	sink := execution.eventSink(infrastructure)
 
-	if err := sink.Emit(ctx, Event{Kind: EventToolCallUpdated, SessionID: run.SessionID, RunID: run.ID}); err != nil {
+	if err := sink.Emit(ctx, Event{Kind: EventContextEpochChanged, SessionID: run.SessionID, RunID: run.ID}); err != nil {
 		t.Fatalf("emit durable event: %v", err)
 	}
 	if len(store.events) != 1 {

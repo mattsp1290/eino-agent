@@ -74,12 +74,12 @@ func TestContextContributionRejectsNonTextSystemOrUserMessages(t *testing.T) {
 func TestContextContributionReachesProviderInCanonicalOrder(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "context-order", Artifact: extension.Artifact{Name: "context-order", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(ctx context.Context, assembly ContextAssembly, next extension.Next[ContextAssembly, ContextAssembly]) (ContextAssembly, error) {
+		return extension.OnTransform(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, assembly ContextAssembly) (ContextAssembly, error) {
 			assembly.Contributions = append(assembly.Contributions,
 				ContextContribution{Source: "native/system", Order: 10, Message: einoschema.SystemMessage("extension-system")},
 				ContextContribution{Source: "native/user", Order: 20, Message: einoschema.UserMessage("extension-user")},
 			)
-			return next(ctx, assembly)
+			return assembly, nil
 		})
 	}))
 	if err != nil {

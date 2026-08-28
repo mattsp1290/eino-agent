@@ -7,21 +7,30 @@ import (
 	"github.com/mattsp1290/eino-agent/extension"
 )
 
-func TestExtensionPlanFingerprintCanonicalizesTypedCollections(t *testing.T) {
+func TestExtensionPlanFingerprintCanonicalizesComponentsAndTypedCollections(t *testing.T) {
 	descriptor := ExtensionPlanDescriptor{
 		SchemaVersion: ExtensionPlanSchemaVersion,
-		Handlers: []HandlerPlanIdentity{{InstanceID: "component", Artifact: testArtifact("handlers"), Registrations: []RegistrationIdentity{
-			{ID: "same", Contract: "contract", Version: "2", Scope: extension.SessionScope("session-b"), Kind: HandlerNotification},
-			{ID: "same", Contract: "contract", Version: "1", Scope: extension.GlobalScope(), Kind: HandlerInterceptor},
-		}}},
-		Guards: []GuardPlanIdentity{
-			{InstanceID: "guard-session", Artifact: testArtifact("b"), RegistrationID: "guard", Scope: extension.SessionScope("session-b"), Order: 20},
-			{InstanceID: "guard-global", Artifact: testArtifact("a"), RegistrationID: "guard", Scope: extension.GlobalScope(), Order: 10},
+		Components: []ComponentPlan{
+			{
+				InstanceID: "handlers", Artifact: testArtifact("handlers"),
+				Handlers: []RegistrationIdentity{
+					{ID: "same", Contract: "contract", Version: "2", Scope: extension.SessionScope("session-b"), Kind: HandlerNotification},
+					{ID: "same", Contract: "contract", Version: "1", Scope: extension.GlobalScope(), Kind: HandlerAround},
+				},
+			},
+			{
+				InstanceID: "guards", Artifact: testArtifact("guards"),
+				Guards: []GuardPlanIdentity{
+					{RegistrationID: "session", Scope: extension.SessionScope("session-b"), Order: 20},
+					{RegistrationID: "global", Scope: extension.GlobalScope(), Order: 10},
+				},
+			},
 		},
 	}
 	reordered := descriptor.Clone()
-	reordered.Guards[0], reordered.Guards[1] = reordered.Guards[1], reordered.Guards[0]
-	reordered.Handlers[0].Registrations[0], reordered.Handlers[0].Registrations[1] = reordered.Handlers[0].Registrations[1], reordered.Handlers[0].Registrations[0]
+	reordered.Components[0], reordered.Components[1] = reordered.Components[1], reordered.Components[0]
+	reordered.Components[1].Handlers[0], reordered.Components[1].Handlers[1] = reordered.Components[1].Handlers[1], reordered.Components[1].Handlers[0]
+	reordered.Components[0].Guards[0], reordered.Components[0].Guards[1] = reordered.Components[0].Guards[1], reordered.Components[0].Guards[0]
 
 	first, err := FingerprintExtensionPlan(descriptor)
 	if err != nil {
@@ -36,16 +45,9 @@ func TestExtensionPlanFingerprintCanonicalizesTypedCollections(t *testing.T) {
 	}
 }
 
-func TestExtensionPlanFingerprintCanonicalizesEmptyCollections(t *testing.T) {
+func TestExtensionPlanFingerprintCanonicalizesEmptyComponentCollection(t *testing.T) {
 	nilCollections := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion}
-	emptyCollections := ExtensionPlanDescriptor{
-		SchemaVersion: ExtensionPlanSchemaVersion,
-		Handlers:      []HandlerPlanIdentity{},
-		Tools:         []ToolPlanIdentity{},
-		Prompts:       []PromptPlanIdentity{},
-		Guards:        []GuardPlanIdentity{},
-		Restrictions:  []RestrictionPlanIdentity{},
-	}
+	emptyCollections := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{}}
 	first, err := FingerprintExtensionPlan(nilCollections)
 	if err != nil {
 		t.Fatal(err)
@@ -62,15 +64,13 @@ func TestExtensionPlanFingerprintCanonicalizesEmptyCollections(t *testing.T) {
 func TestExtensionPlanSchemaV1JSONAndFingerprintGolden(t *testing.T) {
 	descriptor := ExtensionPlanDescriptor{
 		SchemaVersion: ExtensionPlanSchemaVersion,
-		Tools: []ToolPlanIdentity{{
+		Components: []ComponentPlan{{
 			InstanceID: "component",
-			Artifact: extension.Artifact{
-				Name: "artifact", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative,
-			},
-			Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor",
+			Artifact:   extension.Artifact{Name: "artifact", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
+			Tools:      []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 		}},
 	}
-	const expectedJSON = `{"SchemaVersion":1,"Fingerprint":"","Handlers":null,"Tools":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor"}],"Prompts":null,"Guards":null,"Restrictions":null}`
+	const expectedJSON = `{"SchemaVersion":1,"Fingerprint":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor"}],"Prompts":null,"Guards":null,"Restrictions":null}]}`
 	raw, err := json.Marshal(descriptor)
 	if err != nil {
 		t.Fatal(err)
@@ -82,118 +82,113 @@ func TestExtensionPlanSchemaV1JSONAndFingerprintGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fingerprint != "08a8b8ee8061dded490f494a81338aa104da43619a88f3c778b1867df0d68df8" {
+	const expectedFingerprint = "742812920d63d81402765a211f9fef270b4d75bec632427adb5c1048f8dfb660"
+	if fingerprint != expectedFingerprint {
 		t.Fatalf("schema-v1 fingerprint = %s", fingerprint)
 	}
 }
 
 func TestExtensionPlanRejectsDelimiterBearingIdentifiersButKeepsScopeKeysOpaque(t *testing.T) {
-	artifact := testArtifact("delimiter")
-	invalid := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Tools: []ToolPlanIdentity{{
-		InstanceID: "component", Artifact: artifact, Name: "tool", RegistrationID: "bad\x00registration",
-		Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor",
+	invalid := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+		InstanceID: "component", Artifact: testArtifact("delimiter"),
+		Tools: []ToolPlanIdentity{{Name: "tool", RegistrationID: "bad\x00registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 	}}}
 	if err := ValidateExtensionPlan(invalid); err == nil {
 		t.Fatal("delimiter-bearing registration id was accepted")
 	}
 
-	valid := invalid
-	valid.Tools = append([]ToolPlanIdentity(nil), invalid.Tools...)
-	valid.Tools[0].RegistrationID = "registration"
-	valid.Tools[0].Scope = extension.SessionScope("tenant\x00workspace")
+	valid := invalid.Clone()
+	valid.Components[0].Tools[0].RegistrationID = "registration"
+	valid.Components[0].Tools[0].Scope = extension.SessionScope("tenant\x00workspace")
 	if err := ValidateExtensionPlan(valid); err != nil {
 		t.Fatalf("opaque scope key rejected: %v", err)
 	}
 }
 
-func TestExtensionPlanRejectsMalformedTypedIdentity(t *testing.T) {
-	valid := ToolPlanIdentity{
-		InstanceID: "tool", Artifact: testArtifact("tool"), Name: "tool", RegistrationID: "registration",
-		Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor",
-	}
-	for name, mutate := range map[string]func(*ToolPlanIdentity){
-		"missing config hash": func(value *ToolPlanIdentity) { value.Artifact.ConfigHash = "" },
-		"invalid source":      func(value *ToolPlanIdentity) { value.Artifact.SourceKind = "remote" },
-		"missing executor":    func(value *ToolPlanIdentity) { value.ExecutorHash = "" },
+func TestExtensionPlanRejectsMalformedComponentAndTypedIdentity(t *testing.T) {
+	valid := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+		InstanceID: "tool", Artifact: testArtifact("tool"),
+		Tools: []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
+	}}}
+	for name, mutate := range map[string]func(*ExtensionPlanDescriptor){
+		"missing config hash": func(value *ExtensionPlanDescriptor) { value.Components[0].Artifact.ConfigHash = "" },
+		"invalid source":      func(value *ExtensionPlanDescriptor) { value.Components[0].Artifact.SourceKind = "remote" },
+		"missing executor":    func(value *ExtensionPlanDescriptor) { value.Components[0].Tools[0].ExecutorHash = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			candidate := valid
+			candidate := valid.Clone()
 			mutate(&candidate)
-			if _, err := FingerprintExtensionPlan(ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Tools: []ToolPlanIdentity{candidate}}); err == nil {
+			if _, err := FingerprintExtensionPlan(candidate); err == nil {
 				t.Fatal("FingerprintExtensionPlan succeeded")
 			}
 		})
 	}
 }
 
-func TestExtensionPlanRejectsConflictingComponentArtifacts(t *testing.T) {
-	descriptor := ExtensionPlanDescriptor{
-		SchemaVersion: ExtensionPlanSchemaVersion,
-		Tools: []ToolPlanIdentity{{
-			InstanceID: "component", Artifact: testArtifact("first"), Name: "tool", RegistrationID: "tool",
-			Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor",
-		}},
-		Guards: []GuardPlanIdentity{{
-			InstanceID: "component", Artifact: testArtifact("second"), RegistrationID: "guard", Scope: extension.GlobalScope(),
-		}},
-	}
-	if _, err := FingerprintExtensionPlan(descriptor); err == nil {
-		t.Fatal("FingerprintExtensionPlan accepted conflicting artifacts")
+func TestExtensionPlanRejectsDuplicateAndEmptyComponents(t *testing.T) {
+	component := ComponentPlan{InstanceID: "component", Artifact: testArtifact("component"), Guards: []GuardPlanIdentity{{RegistrationID: "guard", Scope: extension.GlobalScope()}}}
+	for name, components := range map[string][]ComponentPlan{
+		"duplicate": {component, component},
+		"empty":     {{InstanceID: "empty", Artifact: testArtifact("empty")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := FingerprintExtensionPlan(ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: components}); err == nil {
+				t.Fatal("FingerprintExtensionPlan accepted invalid components")
+			}
+		})
 	}
 }
 
-func TestExtensionPlanRejectsMultipleHandlerAggregatesForInstance(t *testing.T) {
-	artifact := testArtifact("handlers")
-	descriptor := ExtensionPlanDescriptor{
-		SchemaVersion: ExtensionPlanSchemaVersion,
-		Handlers: []HandlerPlanIdentity{
-			{InstanceID: "component", Artifact: artifact, Registrations: []RegistrationIdentity{{ID: "first", Contract: "contract", Version: "1", Scope: extension.GlobalScope(), Kind: HandlerNotification}}},
-			{InstanceID: "component", Artifact: artifact, Registrations: []RegistrationIdentity{{ID: "second", Contract: "contract", Version: "1", Scope: extension.GlobalScope(), Kind: HandlerNotification}}},
-		},
+func TestExtensionPlanValidatesSemanticHandlerKinds(t *testing.T) {
+	base := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+		InstanceID: "handlers", Artifact: testArtifact("handlers"),
+		Handlers: []RegistrationIdentity{{ID: "handler", Contract: "contract", Version: "1", Scope: extension.GlobalScope()}},
+	}}}
+	for _, kind := range []HandlerKind{HandlerNotification, HandlerHook, HandlerTransform, HandlerGate, HandlerAround} {
+		candidate := base.Clone()
+		candidate.Components[0].Handlers[0].Kind = kind
+		if err := ValidateExtensionPlan(candidate); err != nil {
+			t.Fatalf("semantic kind %q rejected: %v", kind, err)
+		}
 	}
-	if _, err := FingerprintExtensionPlan(descriptor); err == nil {
-		t.Fatal("FingerprintExtensionPlan accepted split handler aggregates")
+	invalid := base.Clone()
+	invalid.Components[0].Handlers[0].Kind = "interceptor"
+	if err := ValidateExtensionPlan(invalid); err == nil {
+		t.Fatal("legacy interceptor handler kind was accepted")
 	}
 }
 
 func TestExtensionPlanRejectsDuplicateLogicalIdentitiesDespiteFingerprintFields(t *testing.T) {
-	artifact := testArtifact("duplicates")
 	global := extension.GlobalScope()
-	tests := map[string]ExtensionPlanDescriptor{
+	tests := map[string]ComponentPlan{
 		"handler order": {
-			Handlers: []HandlerPlanIdentity{{InstanceID: "component", Artifact: artifact, Registrations: []RegistrationIdentity{
+			Handlers: []RegistrationIdentity{
 				{ID: "handler", Contract: "contract", Version: "1", Order: 1, Scope: global, Kind: HandlerNotification},
 				{ID: "handler", Contract: "contract", Version: "1", Order: 2, Scope: global, Kind: HandlerNotification},
-			}}},
-		},
-		"tool hashes": {
-			Tools: []ToolPlanIdentity{
-				{InstanceID: "component", Artifact: artifact, Name: "tool", RegistrationID: "tool", Scope: global, SchemaHash: "schema-a", ExecutorHash: "executor-a"},
-				{InstanceID: "component", Artifact: artifact, Name: "tool", RegistrationID: "tool", Scope: global, SchemaHash: "schema-b", ExecutorHash: "executor-b"},
 			},
 		},
-		"prompt order": {
-			Prompts: []PromptPlanIdentity{
-				{InstanceID: "component", Artifact: artifact, Name: "prompt", RegistrationID: "prompt", Scope: global, Order: 1},
-				{InstanceID: "component", Artifact: artifact, Name: "prompt", RegistrationID: "prompt", Scope: global, Order: 2},
-			},
-		},
-		"guard order": {
-			Guards: []GuardPlanIdentity{
-				{InstanceID: "component", Artifact: artifact, RegistrationID: "guard", Scope: global, Order: 1},
-				{InstanceID: "component", Artifact: artifact, RegistrationID: "guard", Scope: global, Order: 2},
-			},
-		},
-		"restriction rules": {
-			Restrictions: []RestrictionPlanIdentity{
-				{InstanceID: "component", Artifact: artifact, RegistrationID: "restriction", Scope: global, RulesHash: "rules-a"},
-				{InstanceID: "component", Artifact: artifact, RegistrationID: "restriction", Scope: global, RulesHash: "rules-b"},
-			},
-		},
+		"tool hashes": {Tools: []ToolPlanIdentity{
+			{Name: "tool", RegistrationID: "tool", Scope: global, SchemaHash: "schema-a", ExecutorHash: "executor-a"},
+			{Name: "tool", RegistrationID: "tool", Scope: global, SchemaHash: "schema-b", ExecutorHash: "executor-b"},
+		}},
+		"prompt order": {Prompts: []PromptPlanIdentity{
+			{Name: "prompt", RegistrationID: "prompt", Scope: global, Order: 1},
+			{Name: "prompt", RegistrationID: "prompt", Scope: global, Order: 2},
+		}},
+		"guard order": {Guards: []GuardPlanIdentity{
+			{RegistrationID: "guard", Scope: global, Order: 1},
+			{RegistrationID: "guard", Scope: global, Order: 2},
+		}},
+		"restriction rules": {Restrictions: []RestrictionPlanIdentity{
+			{RegistrationID: "restriction", Scope: global, RulesHash: "rules-a"},
+			{RegistrationID: "restriction", Scope: global, RulesHash: "rules-b"},
+		}},
 	}
-	for name, descriptor := range tests {
+	for name, component := range tests {
 		t.Run(name, func(t *testing.T) {
-			descriptor.SchemaVersion = ExtensionPlanSchemaVersion
+			component.InstanceID = "component"
+			component.Artifact = testArtifact("duplicates")
+			descriptor := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{component}}
 			if _, err := FingerprintExtensionPlan(descriptor); err == nil {
 				t.Fatal("FingerprintExtensionPlan accepted duplicate logical identities")
 			}

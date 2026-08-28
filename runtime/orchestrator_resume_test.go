@@ -61,9 +61,9 @@ func transformedPermissionRunPlan(t *testing.T, tools staticToolRegistry, notice
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "permission-transform", Artifact: extension.Artifact{Name: "permission-transform", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolResultTransform, next extension.Next[ToolResultTransform, ToolResult]) (ToolResult, error) {
-			_, err := next(ctx, input)
-			return ToolResult{Output: "transformed denial"}, err
+		if err := extension.OnTransform(registrar, ToolResultTransformPoint, extension.Registration{ID: "transform", Scope: extension.GlobalScope()}, func(_ context.Context, input ToolResultTransform) (ToolResultTransform, error) {
+			input.Result = ToolResult{Output: "transformed denial"}
+			return input, nil
 		}); err != nil {
 			return err
 		}
@@ -176,7 +176,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-resume", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := execution.CreateToolCall(ctx, session.ToolCall{
+	if _, err := execution.CreateToolCall(ctx, testCreateToolRequest(session.ToolCall{
 		ID:              "call-resume",
 		SessionID:       run.SessionID,
 		RunID:           run.ID,
@@ -187,7 +187,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		Pattern:         "echo",
 		Input:           []byte(`{"text":"hi"}`),
 		Status:          session.ToolCallPending,
-	}); err != nil {
+	}, "event-create-resume", now)); err != nil {
 		t.Fatalf("create tool call: %v", err)
 	}
 	var executions atomic.Int64
@@ -447,16 +447,15 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		Input:           []byte(`{"text":"hi"}`),
 		Status:          session.ToolCallPending,
 	}
-	created, err := execution.CreateToolCall(ctx, call)
+	created, err := execution.CreateToolCall(ctx, testCreateToolRequest(call, "event-create-resume", now))
 	if err != nil {
 		t.Fatalf("create tool call: %v", err)
 	}
 	if status == session.ToolCallRunning {
-		created.Status = session.ToolCallRunning
 		created.ClaimedBy = owner
 		created.ClaimToken = "claim-resume"
 		created.StartedAt = now
-		if _, err := execution.ClaimToolCall(ctx, created, time.Millisecond); err != nil {
+		if _, err := execution.ClaimToolCall(ctx, testClaimToolRequest(created, "event-claim-resume", time.Millisecond, now)); err != nil {
 			t.Fatalf("claim tool call: %v", err)
 		}
 		time.Sleep(2 * time.Millisecond)

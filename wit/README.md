@@ -1,13 +1,12 @@
 # eino-agent extension contracts
 
-`eino-agent:extensions@0.1.0` is the public Component Model contract for
+`eino-agent:extensions@0.1.0` is the current Component Model contract for
 eino-agent extensions. The Go interfaces remain the source of truth; these WIT
 worlds define the bounded data that their Wasm-backed implementations may see.
 
-Published packages are immutable. Compatible additions may be introduced in a
-new package version, while a breaking change requires an `@0.2.0` package that
-lives alongside `@0.1.0` support. Existing WIT files are never edited in place
-after publication.
+The project is pre-release and supports only this current schema. Regenerate
+the checked-in Go bindings with `make wit` after changing the WIT contract, then
+rebuild the checked-in guest components with `make wasm-fixtures`.
 
 Phase A includes host wrappers and example components for the `tool` and
 `permissions-policy` worlds. The `context-source`, `event-sink`, `hook`, and
@@ -23,12 +22,11 @@ are byte-bounded and carry the configured module name plus verified digest.
 
 ## Native point adapters
 
-The published `@0.1.0` signatures remain immutable. `wasmext` maps
-`context-source` to `runtime/context-assemble`, `event-sink` to
-`runtime/event-published`, `hook` to bounded `runtime/run-admitted`,
-`runtime/turn-prepare`, and `runtime/run-settled` observations, and
+`wasmext` maps `context-source` to the `runtime/context-assemble` transform,
+`event-sink` to the contained `runtime/event-published` notification, `hook`
+`before-run` and `after-run` to bounded `runtime/run-admitted` and
+`runtime/run-settled` notifications, and
 `tool-middleware` to `runtime/tool-prepare` plus
 `runtime/tool-result-transform`. It does not expose native around execution or
-a generic name-and-JSON event bus. Prompt contribution and around execution do
-not justify a `@0.2.0` package yet; a separate security/design review is
-required before adding either.
+a generic name-and-JSON event bus. The hook world has no turn callbacks; adding
+new guest authority requires a separate security and design review.

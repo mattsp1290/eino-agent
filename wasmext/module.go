@@ -40,13 +40,6 @@ func loadModule(ctx context.Context, cfg ModuleConfig, contract worldContract, f
 	if identity.name == "" || len(identity.name) > 128 {
 		return nil, extensionError(ErrorConfig, identity, "load", errors.New("invalid module name"))
 	}
-	var configBytes int64
-	for key, value := range cfg.GuestConfig {
-		configBytes += int64(len(key) + len(value))
-	}
-	if configBytes > limits.MaxInputBytes {
-		return nil, extensionError(ErrorSize, identity, "load", errors.New("guest configuration exceeds bound"))
-	}
 	expected, err := hex.DecodeString(identity.hash)
 	if err != nil || len(expected) != sha256.Size {
 		return nil, extensionError(ErrorConfig, identity, "load", errors.New("invalid sha256"))

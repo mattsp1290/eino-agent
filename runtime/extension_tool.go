@@ -135,10 +135,10 @@ func clonePreparedToolCallChecked(value PreparedToolCall) (PreparedToolCall, err
 func validatePreparedToolCallInput(original, candidate PreparedToolCall) error {
 	leftCall, rightCall := cloneToolCall(original.Call), cloneToolCall(candidate.Call)
 	leftCall.Input, rightCall.Input = nil, nil
-	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(leftCall, rightCall) || !validToolObject(candidate.Call.Input) {
+	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(leftCall, rightCall) {
 		return extension.ErrProtectedMutation
 	}
-	return nil
+	return validatePreparedToolCall(candidate)
 }
 
 func validatePreparedToolCall(value PreparedToolCall) error {
@@ -149,10 +149,6 @@ func validatePreparedToolCall(value PreparedToolCall) error {
 }
 
 func validToolObject(raw json.RawMessage) bool { _, err := canonicalToolObject(raw); return err == nil }
-
-func validatePreparedToolCallResult(original PreparedToolCall, output PreparedToolCall) error {
-	return validatePreparedToolCallInput(original, output)
-}
 
 func cloneToolExecutionChecked(value ToolExecution) (ToolExecution, error) {
 	var err error
@@ -169,10 +165,6 @@ func validateToolExecutionInput(original, candidate ToolExecution) error {
 		return extension.ErrProtectedMutation
 	}
 	return nil
-}
-
-func validateToolExecutionResult(_ ToolExecution, output ToolResult) error {
-	return validateToolResult(output)
 }
 
 func sameProtectedTool(left, right Tool) bool {
@@ -216,7 +208,7 @@ func validateToolResultTransformInput(original, candidate ToolResultTransform) e
 	if original.ToolName != candidate.ToolName || !sameProtectedToolCall(original.Call, candidate.Call) {
 		return extension.ErrProtectedMutation
 	}
-	return nil
+	return validateToolResult(candidate.Result)
 }
 
 func validateToolResult(result ToolResult) error {
@@ -224,10 +216,6 @@ func validateToolResult(result ToolResult) error {
 		return errors.New("invalid structured tool result")
 	}
 	return nil
-}
-
-func validateToolResultTransformResult(_ ToolResultTransform, output ToolResult) error {
-	return validateToolResult(output)
 }
 
 func cloneToolChecked(tool Tool) (Tool, error) {

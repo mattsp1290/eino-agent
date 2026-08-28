@@ -245,10 +245,6 @@ func validateContextContributionMessage(message *einoschema.Message) error {
 	return nil
 }
 
-func validateContextAssemblyResult(original ContextAssembly, output ContextAssembly) error {
-	return validateContextAssemblyInput(original, output)
-}
-
 func cloneBoundedTurnMetadata(value BoundedTurnMetadata) BoundedTurnMetadata {
 	value.ToolNames = cloneSlice(value.ToolNames)
 	return value
@@ -322,12 +318,6 @@ func validateBoundedTurnMetadataInput(original, candidate BoundedTurnMetadata) e
 		return extension.ErrProtectedMutation
 	}
 	return nil
-}
-
-func validateBoundedTurnMetadata(BoundedTurnMetadata) error { return nil }
-
-func validateBoundedTurnMetadataResult(original, output BoundedTurnMetadata) error {
-	return validateBoundedTurnMetadataInput(original, output)
 }
 
 func materializeContextAssembly(value ContextAssembly) ([]*einoschema.Message, error) {

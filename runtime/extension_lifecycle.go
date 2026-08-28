@@ -33,6 +33,7 @@ type RunStartedNotice struct {
 type RunSettledNotice struct {
 	SessionID session.ID
 	Result    Result
+	Metadata  BoundedTurnMetadata
 	Duration  time.Duration
 	Error     ClassifiedError
 }
@@ -90,13 +91,17 @@ type ToolSettledNotice struct {
 }
 
 var (
-	RunBeforeExecutePoint    = extension.NewInterceptor(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, infallibleClone(func(value RunGateInput) RunGateInput { return value }), validateRunGateInput, validateRunDecision)
-	ContextAssemblePoint     = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput, validateContextAssembly, validateContextAssemblyResult)
-	TurnPreparePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, infallibleClone(cloneBoundedTurnMetadata), validateBoundedTurnMetadataInput, validateBoundedTurnMetadata, validateBoundedTurnMetadataResult)
-	ModelStreamPoint         = extension.NewRequiredDelegatingInterceptor(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateModelStreamInput, validateStreamReader, validateDelegatedStreamReader)
-	ToolPreparePoint         = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCallChecked, validatePreparedToolCallInput, validatePreparedToolCall, validatePreparedToolCallResult)
-	ToolExecutePoint         = extension.NewRequiredInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecutionChecked, validateToolExecutionInput, validateToolResult, validateToolExecutionResult)
-	ToolResultTransformPoint = extension.NewInterceptorWithResultValidation(extension.Contract{ID: "eino-agent/runtime/tool-result-transform", Version: "1"}, cloneToolResultTransformChecked, validateToolResultTransformInput, validateToolResult, validateToolResultTransformResult)
+	RunBeforeExecutePoint = extension.NewGate(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, infallibleClone(func(value RunGateInput) RunGateInput { return value }), validateRunGateInput, validateRunDecision, RunDecision{Kind: RunContinue}, func(decision RunDecision) bool {
+		return decision.Kind == RunContinue
+	})
+	ContextAssemblePoint = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput)
+	TurnPreparePoint     = extension.NewHook(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, infallibleClone(cloneBoundedTurnMetadata), validateBoundedTurnMetadataInput)
+	ModelStreamPoint     = extension.NewRequiredAround(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateModelStreamInput, validateStreamReader, validateDelegatedStreamReader)
+	ToolPreparePoint     = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCallChecked, validatePreparedToolCallInput)
+	ToolExecutePoint     = extension.NewRequiredAround(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecutionChecked, validateToolExecutionInput, validateToolResult, func(_ ToolResult, returned ToolResult) error {
+		return validateToolResult(returned)
+	})
+	ToolResultTransformPoint = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/tool-result-transform", Version: "1"}, cloneToolResultTransformChecked, validateToolResultTransformInput)
 
 	RunAdmittedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-admitted", Version: "1"}, infallibleClone(cloneRunAdmittedNotice))
 	RunStartedPoint     = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-started", Version: "1"}, identityClone[RunStartedNotice])
@@ -121,7 +126,10 @@ func cloneRunAdmittedNotice(value RunAdmittedNotice) RunAdmittedNotice {
 	return value
 }
 
-func cloneRunSettledNotice(value RunSettledNotice) RunSettledNotice { return value }
+func cloneRunSettledNotice(value RunSettledNotice) RunSettledNotice {
+	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
+	return value
+}
 
 func cloneToolPreparedNotice(value ToolPreparedNotice) ToolPreparedNotice {
 	value.Input = cloneJSON(value.Input)

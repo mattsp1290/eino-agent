@@ -7,7 +7,7 @@ The extension system has three deliberately separate planes:
 - session records and the request ledger are durable facts;
 - `runtime.EventSink` carries live transport events with its existing
   backpressure behavior;
-- typed extension points are in-process interception and contained
+- typed extension points are in-process semantic callbacks and contained
   observation. They never replace durable writes or transport delivery.
 
 `extension.Registry[T]` owns typed registration, the host's immutable component
@@ -25,14 +25,26 @@ registration. Snapshot target and instance filters apply atomically to handler
 registrations and those capability scopes, so fresh and resumed plans cannot
 disagree about an unpersisted lifecycle-only mount.
 
-## Ordering and failure
+## Semantic modes, ordering, and failure
 
 Entries sort by `(order, global-before-session, instance ID, registration ID)`.
-Around interceptors form an onion in that order. Their guarded `next` is
-synchronous: it may be called at most once, must complete before the callback
-returns, and must not be retained or called concurrently. Required-delegation
-points reject a successful short circuit.
-Point-owned validators defend immutable identity and outcome fields.
+The point type fixes callback shape and failure behavior:
+
+- notifications registered with `extension.On` call every observer with a
+  defensive copy and contain failures;
+- hooks registered with `extension.OnHook` run in order and stop at the first
+  failure;
+- transforms registered with `extension.OnTransform` form an ordered waterfall
+  in which each callback returns the next value;
+- gates registered with `extension.OnGate` run in order until a decision
+  rejects further execution;
+- required-around callbacks registered with `extension.OnAround` form an onion
+  and must delegate exactly once.
+
+An around callback's guarded `next` is synchronous: it may be called at most
+once, must complete before the callback returns, and must not be retained or
+called concurrently. Point-owned validators defend immutable identity and
+outcome fields for every semantic mode.
 
 Callback-facing model, tool, and call values are data-only projections.
 Provider clients, streamers, observers, tool executors, input decoders, and
@@ -45,7 +57,8 @@ the canonical callback context so closing its own mount fails with
 
 Notification handlers receive defensive copies. A handler error or panic is
 reported locally and never changes the run result or prevents later handlers.
-Interceptor failures return a bounded `extension.CallbackError`; its raw cause
+Hook, transform, gate, and around failures return a bounded
+`extension.CallbackError`; its raw cause
 is available through `errors.Is`/`errors.As` for trusted diagnostics, but its
 text is not persisted.
 
@@ -65,13 +78,13 @@ Order constants reserve broad bands: `runtime.OrderHostPolicy` (`-1000`),
 | `eino-agent/runtime/tool-started` | tool claim | contained notice | contained | call is durably running | native |
 | `eino-agent/runtime/tool-settled` | atomic settlement | contained notice | contained | call and result are authoritative after one store commit | native |
 | `eino-agent/runtime/event-published` | event publication | contained notice to event observers | contained | after infrastructure sink handoff | event-sink adapter |
-| `eino-agent/runtime/run-before-execute` | post-admission execution gate | around decision | fail run/reject | after admission; fresh runs only | native |
-| `eino-agent/runtime/context-assemble` | snapshot preparation | around contribution waterfall | fail run | fresh preparation; persisted request sees materialized result | context-source adapter |
-| `eino-agent/runtime/turn-prepare` | post-tool snapshot preparation | required around observation | fail run | fresh preparation after frozen tools resolve | hook adapter |
+| `eino-agent/runtime/run-before-execute` | post-admission execution gate | ordered gate | fail run/reject | after admission; fresh runs only | native |
+| `eino-agent/runtime/context-assemble` | snapshot preparation | ordered transform waterfall | fail run | fresh preparation; persisted request sees materialized result | context-source adapter |
+| `eino-agent/runtime/turn-prepare` | post-tool snapshot preparation | fail-fast hook | fail run | fresh preparation after frozen tools resolve | native |
 | `eino-agent/runtime/model-stream` | provider boundary | required around stream | fail attempt | every adapter attempt; never replayed on tool resume | native |
-| `eino-agent/runtime/tool-prepare` | normalized tool input | around input waterfall | fail call | fresh only; final input is persisted | tool-middleware adapter |
+| `eino-agent/runtime/tool-prepare` | normalized tool input | ordered transform waterfall | fail call | fresh only; final input is persisted | tool-middleware adapter |
 | `eino-agent/runtime/tool-execute` | allowed tool body | required around execution | protected failure | fresh or pending-call re-execution | native |
-| `eino-agent/runtime/tool-result-transform` | protected tool outcome | around result waterfall | fail call | before atomic settlement; fresh/re-executed calls | tool-middleware adapter |
+| `eino-agent/runtime/tool-result-transform` | protected tool outcome | ordered transform waterfall | fail call | before atomic settlement; fresh/re-executed calls | tool-middleware adapter |
 
 The catalog is checked against every exported core point by
 `runtime.TestPublishedExtensionPointsAppearInCatalog`.
@@ -100,12 +113,14 @@ Tool execution and settlement:
 ```text
 decode/normalize
   -> runtime/tool-prepare
-  -> persist pending + claim running
+  -> persist pending + canonical pending event atomically
+  -> claim running + renew run lease + canonical running event atomically
   -> all deny-only guards
   -> unchanged permission/approval loop
   -> runtime/tool-execute -> body exactly once
   -> runtime/tool-result-transform (protected outcome)
-  -> SettleToolCall(call + reserved message + reserved part)
+  -> SettleToolCall(call + reserved message + reserved part + canonical terminal event)
+  -> best-effort publish the already-persisted terminal event
   -> runtime/tool-settled
 ```
 
@@ -113,9 +128,11 @@ Running calls found during resume are never re-executed. Pending calls
 reuse the persisted normalized input, so prepare transforms do not run twice.
 Fresh and pending-resume calls share one post-claim execution and settlement
 operation. It builds the bounded result payload, terminal call, result message,
-and result part at one completion time, commits them with a cancellation-free
-settlement context, and only then publishes the settled notice. Fresh execution
-alone publishes pending/running/terminal transport updates.
+result part, and canonical terminal event at one completion time, then commits
+them with a cancellation-free settlement context. Fresh execution publishes
+the exact persisted pending/running/terminal events only after commit. External
+delivery remains best-effort and never appends the durable event a second time;
+resume retains its no-live-tool-transport policy.
 
 ## Scope, provenance, and resume
 
@@ -127,20 +144,23 @@ intersect and guards can only deny or abstain, so session layers cannot
 increase authority.
 
 Each admitted run stores one canonical `session.ExtensionPlanDescriptor`.
-`runtime.NewRunPlan` derives it from identity-bound dispatch handlers, tools,
-prompts, guards, and restrictions; callers cannot supply a separate descriptor.
-The descriptor stores each capability kind in its own typed collection rather
-than a nullable tagged union. Tool restriction lists are canonical sets: blank,
-empty, or overlapping policies are rejected, while duplicates and ordering do
-not affect identity or enforcement.
+`runtime.NewRunPlan` derives it from explicitly component-owned dispatch
+handlers, tools, prompts, guards, and restrictions; callers cannot supply a
+separate descriptor. The descriptor stores one component record containing its
+instance and artifact identities, with separate nested typed collections for
+handlers, tools, prompts, guards, and restrictions. Empty component records are
+invalid. Tool restriction lists are canonical sets: blank, empty, or overlapping
+policies are rejected, while duplicates and ordering do not affect identity or
+enforcement.
 Artifact, configuration, scope, capability, schema, executor, and ordered
 registration identity all participate in the fingerprint. Resume requires an
 exact current-schema fingerprint match before changing run or tool state.
 
 Resume first verifies that the persisted descriptor matches its own fingerprint,
 then passes the durable run's session ID explicitly to plan acquisition. The
-provider validates every session-scoped identity against that ID, acquires only
-the persisted instances, and independently compares the live plan fingerprint
+provider validates every nested session-scoped identity against that ID, walks
+the component records once to acquire only the persisted instances and exact
+persisted tools, and independently compares the live plan fingerprint
 before changing run or tool state. It never reconstructs the session from scope
 records. Unrelated mounts added later are ignored. Local tool generations
 prevent in-process ABA but are not durable identity.
@@ -173,7 +193,7 @@ network claim. Retention and deletion remain host policy.
 ## Mount and shutdown example
 
 [`examples/native-extension`](../../examples/native-extension) mounts a
-session tool, prompt, context contribution, guard, prepare interceptor,
+session tool, prompt, context contribution, guard, prepare transform,
 settled observer, and cleanup effect. Its test demonstrates concurrent session
 visibility and quiescent unmount. Curated Wasm guests live under
 [`examples/wasm-extensions`](../../examples/wasm-extensions); their adapters

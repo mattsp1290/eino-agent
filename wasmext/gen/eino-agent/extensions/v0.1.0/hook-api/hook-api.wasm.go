@@ -17,24 +17,6 @@ func wasmexport_BeforeRun(snapshot *TurnMetadata) (result *cm.Result[StructuredE
 	return
 }
 
-//go:wasmexport eino-agent:extensions/hook-api@0.1.0#before-turn
-//export eino-agent:extensions/hook-api@0.1.0#before-turn
-func wasmexport_BeforeTurn(snapshot *TurnMetadata) (result *cm.Result[StructuredError, struct{}, StructuredError]) {
-	snapshot_ := *snapshot
-	result_ := Exports.BeforeTurn(snapshot_)
-	result = &result_
-	return
-}
-
-//go:wasmexport eino-agent:extensions/hook-api@0.1.0#after-turn
-//export eino-agent:extensions/hook-api@0.1.0#after-turn
-func wasmexport_AfterTurn(snapshot *TurnMetadata) (result *cm.Result[StructuredError, struct{}, StructuredError]) {
-	snapshot_ := *snapshot
-	result_ := Exports.AfterTurn(snapshot_)
-	result = &result_
-	return
-}
-
 //go:wasmexport eino-agent:extensions/hook-api@0.1.0#after-run
 //export eino-agent:extensions/hook-api@0.1.0#after-run
 func wasmexport_AfterRun(snapshot *TurnMetadata) (result *cm.Result[StructuredError, struct{}, StructuredError]) {

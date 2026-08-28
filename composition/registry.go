@@ -346,37 +346,33 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, request runtime.Resume
 	}
 	instances := make(map[string]bool)
 	toolIdentities := make(map[planToolIdentity]bool)
-	for _, identity := range persisted.Handlers {
-		instances[identity.InstanceID] = true
-		for _, registration := range identity.Registrations {
+	for _, component := range persisted.Components {
+		instances[component.InstanceID] = true
+		for _, registration := range component.Handlers {
 			if err := validateResumeScope(request.SessionID, registration.Scope); err != nil {
 				return nil, err
 			}
 		}
-	}
-	for _, identity := range persisted.Tools {
-		instances[identity.InstanceID] = true
-		toolIdentities[planToolIdentity{InstanceID: identity.InstanceID, Scope: identity.Scope, RegistrationID: identity.RegistrationID, ToolName: identity.Name}] = true
-		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-			return nil, err
+		for _, identity := range component.Tools {
+			toolIdentities[planToolIdentity{InstanceID: component.InstanceID, Scope: identity.Scope, RegistrationID: identity.RegistrationID, ToolName: identity.Name}] = true
+			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
+				return nil, err
+			}
 		}
-	}
-	for _, identity := range persisted.Prompts {
-		instances[identity.InstanceID] = true
-		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-			return nil, err
+		for _, identity := range component.Prompts {
+			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
+				return nil, err
+			}
 		}
-	}
-	for _, identity := range persisted.Guards {
-		instances[identity.InstanceID] = true
-		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-			return nil, err
+		for _, identity := range component.Guards {
+			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
+				return nil, err
+			}
 		}
-	}
-	for _, identity := range persisted.Restrictions {
-		instances[identity.InstanceID] = true
-		if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-			return nil, err
+		for _, identity := range component.Restrictions {
+			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
+				return nil, err
+			}
 		}
 	}
 	plan, err := r.acquire(ctx, request.SessionID, instances, persistedToolSelector(toolIdentities))
@@ -437,9 +433,10 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			return nil, cloneErr
 		}
 		planTools[index] = runtime.PlanTool{
+			Component: entry.component,
 			Identity: session.ToolPlanIdentity{
-				InstanceID: entry.component.InstanceID, Artifact: entry.component.Artifact, Name: entry.Definition.Name,
-				RegistrationID: entry.ID, Scope: entry.Scope, SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
+				Name: entry.Definition.Name, RegistrationID: entry.ID, Scope: entry.Scope,
+				SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
 			},
 			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 				return tools.Materialize(ctx, definition, scope)
@@ -449,7 +446,8 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	planPrompts := make([]runtime.PlanPrompt, len(prompts))
 	for index, prompt := range prompts {
 		planPrompts[index] = runtime.PlanPrompt{
-			Identity: session.PromptPlanIdentity{InstanceID: prompt.component.InstanceID, Artifact: prompt.component.Artifact, Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
+			Component: prompt.component,
+			Identity:  session.PromptPlanIdentity{Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
 			Prompt: runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.component.InstanceID, Provider: mountedPromptProvider{
 				callbackContext: prompt.callbackContext, next: prompt.Provider,
 			}},
@@ -458,7 +456,8 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
 		planGuards[index] = runtime.PlanGuard{
-			Identity: session.GuardPlanIdentity{InstanceID: guard.component.InstanceID, Artifact: guard.component.Artifact, RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
+			Component: guard.component,
+			Identity:  session.GuardPlanIdentity{RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
 			Guard: runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.component.InstanceID, Guard: mountedToolGuard{
 				callbackContext: guard.callbackContext, next: guard.Guard,
 			}},
@@ -472,8 +471,9 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			return nil, rulesErr
 		}
 		planRestrictions[index] = runtime.PlanRestriction{
-			Identity: session.RestrictionPlanIdentity{InstanceID: restriction.component.InstanceID, Artifact: restriction.component.Artifact, RegistrationID: restriction.ID, Scope: restriction.Scope, RulesHash: rules.Hash},
-			Allowed:  rules.Allowed, Denied: rules.Denied,
+			Component: restriction.component,
+			Identity:  session.RestrictionPlanIdentity{RegistrationID: restriction.ID, Scope: restriction.Scope, RulesHash: rules.Hash},
+			Allowed:   rules.Allowed, Denied: rules.Denied,
 		}
 	}
 	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: snapshot.Dispatch(), Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})

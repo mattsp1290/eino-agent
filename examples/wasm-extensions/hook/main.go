@@ -14,8 +14,6 @@ func ok(hookapi.TurnMetadata) cm.Result[hookapi.StructuredError, struct{}, hooka
 
 func init() {
 	hookapi.Exports.BeforeRun = ok
-	hookapi.Exports.BeforeTurn = ok
-	hookapi.Exports.AfterTurn = ok
 	hookapi.Exports.AfterRun = ok
 }
 

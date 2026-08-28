@@ -195,6 +195,16 @@ const (
 	ToolCallInterrupted ToolCallStatus = "interrupted"
 )
 
+// ToolTransitionPhase is the durable uniqueness domain for tool lifecycle
+// events. All terminal statuses intentionally share one phase.
+type ToolTransitionPhase string
+
+const (
+	ToolTransitionPending  ToolTransitionPhase = "pending"
+	ToolTransitionRunning  ToolTransitionPhase = "running"
+	ToolTransitionTerminal ToolTransitionPhase = "terminal"
+)
+
 // ToolCall is the durable execution envelope for one tool invocation.
 type ToolCall struct {
 	ID              ToolCallID
@@ -269,24 +279,27 @@ type EventID string
 // richer typed events into this durable envelope without making session depend
 // on the runtime package.
 type EventRecord struct {
-	ID          EventID
-	SessionID   ID
-	RunID       RunID
-	MessageID   MessageID
-	PartID      PartID
-	ToolCallID  ToolCallID
-	EpochID     EpochID
-	ProviderID  string
-	ModelID     string
-	ParentID    string
-	Kind        string
-	Correlation string
-	Usage       Usage
-	Error       EventError
-	Redaction   RedactionClass
-	Payload     json.RawMessage
-	LiveOnly    bool
-	CreatedAt   time.Time
+	ID         EventID
+	SessionID  ID
+	RunID      RunID
+	MessageID  MessageID
+	PartID     PartID
+	ToolCallID ToolCallID
+	// ToolTransition identifies a canonical tool state transition. Only the
+	// typed tool mutation methods may persist records with this field set.
+	ToolTransition ToolTransitionPhase
+	EpochID        EpochID
+	ProviderID     string
+	ModelID        string
+	ParentID       string
+	Kind           string
+	Correlation    string
+	Usage          Usage
+	Error          EventError
+	Redaction      RedactionClass
+	Payload        json.RawMessage
+	LiveOnly       bool
+	CreatedAt      time.Time
 }
 
 // Usage records provider usage data in a store-level event projection.
@@ -365,9 +378,9 @@ type ExecutionStore interface {
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
 	AppendEvent(ctx context.Context, event EventRecord) (EventRecord, error)
-	CreateToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
-	ClaimToolCall(ctx context.Context, call ToolCall, leaseDuration time.Duration) (ToolCall, error)
-	SettleToolCall(ctx context.Context, settlement ToolSettlement) error
+	CreateToolCall(ctx context.Context, request CreateToolCallRequest) (ToolCall, error)
+	ClaimToolCall(ctx context.Context, request ClaimToolCallRequest) (ToolCall, error)
+	SettleToolCall(ctx context.Context, request SettleToolCallRequest) error
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
 	ModelRequestWriter

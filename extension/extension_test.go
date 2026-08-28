@@ -20,13 +20,18 @@ type testPayload struct {
 
 var (
 	testNotice = NewNotification(Contract{ID: "test/notice", Version: "1"}, clonePayload)
-	testAround = NewRequiredInterceptor(Contract{ID: "test/around", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
+	testAround = NewRequiredAround(Contract{ID: "test/around", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
 		if original.Protected != candidate.Protected {
 			return ErrProtectedMutation
 		}
 		return nil
 	}, func(output string) error {
 		if output == "" {
+			return errors.New("empty output")
+		}
+		return nil
+	}, func(_, returned string) error {
+		if returned == "" {
 			return errors.New("empty output")
 		}
 		return nil
@@ -246,6 +251,199 @@ func TestNotifyReportsEveryFailureAndContinues(t *testing.T) {
 	}
 }
 
+func TestTransformChainFeedsValidatedOutputInOrder(t *testing.T) {
+	point := NewTransform(Contract{ID: "test/transform", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
+		if original.Protected != candidate.Protected {
+			return ErrProtectedMutation
+		}
+		return nil
+	})
+	registry := newTestRegistry(nil)
+	_, err := registry.Mount(context.Background(), testComponent("transforms"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		if err := OnTransform(registrar, point, spec("transforms", "first", 0, GlobalScope()), func(_ context.Context, value testPayload) (testPayload, error) {
+			value.Values = append(value.Values, "first")
+			return value, nil
+		}); err != nil {
+			return err
+		}
+		return OnTransform(registrar, point, spec("transforms", "second", 1, GlobalScope()), func(_ context.Context, value testPayload) (testPayload, error) {
+			if !reflect.DeepEqual(value.Values, []string{"first"}) {
+				return testPayload{}, errors.New("second transform did not receive first output")
+			}
+			value.Values = append(value.Values, "second")
+			return value, nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	original := testPayload{Protected: "fixed"}
+	result, err := ApplyTransforms(plan, context.Background(), point, original)
+	if err != nil || !reflect.DeepEqual(result.Values, []string{"first", "second"}) || len(original.Values) != 0 {
+		t.Fatalf("ApplyTransforms = %#v, %v; original=%#v", result, err, original)
+	}
+}
+
+func TestHookChainFailsFast(t *testing.T) {
+	point := NewHook(Contract{ID: "test/hook", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
+		if !reflect.DeepEqual(original, candidate) {
+			return ErrProtectedMutation
+		}
+		return nil
+	})
+	registry := newTestRegistry(nil)
+	var sequence []string
+	_, err := registry.Mount(context.Background(), testComponent("hooks"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		if err := OnHook(registrar, point, spec("hooks", "fail", 0, GlobalScope()), func(context.Context, testPayload) error {
+			sequence = append(sequence, "fail")
+			return errors.New("stop")
+		}); err != nil {
+			return err
+		}
+		return OnHook(registrar, point, spec("hooks", "tail", 1, GlobalScope()), func(context.Context, testPayload) error {
+			sequence = append(sequence, "tail")
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	err = RunHooks(plan, context.Background(), point, testPayload{Protected: "fixed"})
+	var callback *CallbackError
+	if !errors.As(err, &callback) || !reflect.DeepEqual(sequence, []string{"fail"}) {
+		t.Fatalf("RunHooks error=%v sequence=%v", err, sequence)
+	}
+}
+
+func TestGateStopsAtFirstRejectAndValidatesDecisions(t *testing.T) {
+	type decision string
+	const (
+		proceed decision = "proceed"
+		reject  decision = "reject"
+	)
+	point := NewGate(Contract{ID: "test/gate", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
+		if !reflect.DeepEqual(original, candidate) {
+			return ErrProtectedMutation
+		}
+		return nil
+	}, func(value decision) error {
+		if value != proceed && value != reject {
+			return errors.New("invalid decision")
+		}
+		return nil
+	}, proceed, func(value decision) bool { return value == proceed })
+	registry := newTestRegistry(nil)
+	var sequence []string
+	_, err := registry.Mount(context.Background(), testComponent("gates"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		for index, item := range []struct {
+			id       string
+			decision decision
+		}{{"first", proceed}, {"reject", reject}, {"tail", proceed}} {
+			item := item
+			if err := OnGate(registrar, point, spec("gates", item.id, index, GlobalScope()), func(context.Context, testPayload) (decision, error) {
+				sequence = append(sequence, item.id)
+				return item.decision, nil
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	got, err := EvaluateGate(plan, context.Background(), point, testPayload{Protected: "fixed"})
+	if err != nil || got != reject || !reflect.DeepEqual(sequence, []string{"first", "reject"}) {
+		t.Fatalf("EvaluateGate = %q, %v; sequence=%v", got, err, sequence)
+	}
+
+	invalidRegistry := newTestRegistry(nil)
+	_, err = invalidRegistry.Mount(context.Background(), testComponent("invalid-gate"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return OnGate(registrar, point, spec("invalid-gate", "invalid", 0, GlobalScope()), func(context.Context, testPayload) (decision, error) {
+			return "invalid", nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidPlan, _ := invalidRegistry.Snapshot(GlobalScope())
+	defer invalidPlan.Release()
+	if _, err := EvaluateGate(invalidPlan, context.Background(), point, testPayload{Protected: "fixed"}); err == nil {
+		t.Fatal("invalid gate decision was accepted")
+	}
+}
+
+func TestGateCallbackFailureIsBoundedAndStopsEvaluation(t *testing.T) {
+	type decision bool
+	point := NewGate(Contract{ID: "test/failing-gate", Version: "1"}, clonePayload, func(original, candidate testPayload) error {
+		if !reflect.DeepEqual(original, candidate) {
+			return ErrProtectedMutation
+		}
+		return nil
+	}, func(decision) error { return nil }, decision(true), func(value decision) bool { return bool(value) })
+	registry := newTestRegistry(nil)
+	called := false
+	secret := errors.New("secret gate failure")
+	_, err := registry.Mount(context.Background(), testComponent("failing-gate"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		if err := OnGate(registrar, point, spec("failing-gate", "failure", 0, GlobalScope()), func(context.Context, testPayload) (decision, error) {
+			return false, secret
+		}); err != nil {
+			return err
+		}
+		return OnGate(registrar, point, spec("failing-gate", "tail", 1, GlobalScope()), func(context.Context, testPayload) (decision, error) {
+			called = true
+			return true, nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	_, err = EvaluateGate(plan, context.Background(), point, testPayload{})
+	var callback *CallbackError
+	if !errors.As(err, &callback) || !errors.Is(err, secret) || called {
+		t.Fatalf("EvaluateGate error=%v tail_called=%t", err, called)
+	}
+}
+
+func TestRequiredAroundRejectsConcurrentNext(t *testing.T) {
+	registry := newTestRegistry(nil)
+	_, err := registry.Mount(context.Background(), testComponent("concurrent-next"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return OnAround(registrar, testAround, spec("concurrent-next", "around", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			start := make(chan struct{})
+			results := make(chan error, 2)
+			for range 2 {
+				go func() {
+					<-start
+					_, err := next(ctx, input)
+					results <- err
+				}()
+			}
+			close(start)
+			first, second := <-results, <-results
+			return "ok", errors.Join(first, second)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, _ := registry.Snapshot(GlobalScope())
+	defer plan.Release()
+	_, err = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		return "ok", nil
+	})
+	if !errors.Is(err, ErrNextCalledTwice) {
+		t.Fatalf("concurrent next error = %v", err)
+	}
+}
+
 func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
 	registry := newTestRegistry(nil)
 	component := testComponent("opaque-target")
@@ -308,7 +506,7 @@ func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 	for index, id := range []string{"outer", "inner"} {
 		id, order := id, index
 		_, err := registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-			return Use(registrar, testAround, spec(id, id, order, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			return OnAround(registrar, testAround, spec(id, id, order, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
 				sequence = append(sequence, id+"-before")
 				output, err := next(ctx, input)
 				sequence = append(sequence, id+"-after")
@@ -321,7 +519,7 @@ func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 	}
 	plan, _ := registry.Snapshot(GlobalScope())
 	defer plan.Release()
-	output, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+	output, err := InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
 		sequence = append(sequence, "terminal")
 		return "ok", nil
 	})
@@ -331,7 +529,7 @@ func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 
 	badRegistry := newTestRegistry(nil)
 	_, _ = badRegistry.Mount(context.Background(), testComponent("bad"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return Use(registrar, testAround, spec("bad", "bad", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+		return OnAround(registrar, testAround, spec("bad", "bad", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
 			if _, err := next(ctx, input); err != nil {
 				return "", err
 			}
@@ -340,7 +538,7 @@ func TestInterceptorOnionProtectedInputAndNextGuard(t *testing.T) {
 	}))
 	badPlan, _ := badRegistry.Snapshot(GlobalScope())
 	defer badPlan.Release()
-	if _, err := Invoke(badPlan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil }); !errors.Is(err, ErrNextCalledTwice) {
+	if _, err := InvokeAround(badPlan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil }); !errors.Is(err, ErrNextCalledTwice) {
 		t.Fatalf("double next error = %v", err)
 	}
 }
@@ -362,11 +560,11 @@ func TestProtectedMutationAndRequiredDelegation(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			registry := newTestRegistry(nil)
 			_, _ = registry.Mount(context.Background(), testComponent("instance"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-				return Use(registrar, testAround, spec("instance", "handler", 0, GlobalScope()), test.fn)
+				return OnAround(registrar, testAround, spec("instance", "handler", 0, GlobalScope()), test.fn)
 			}))
 			plan, _ := registry.Snapshot(GlobalScope())
 			defer plan.Release()
-			_, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
+			_, err := InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
 			if !errors.Is(err, test.want) {
 				t.Fatalf("error = %v, want %v", err, test.want)
 			}
@@ -379,7 +577,7 @@ func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 	registry := newTestRegistry(nil)
 	component := testComponent("swallow")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return Use(registrar, testAround, spec(component.InstanceID, "swallow", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+		return OnAround(registrar, testAround, spec(component.InstanceID, "swallow", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
 			_, _ = next(ctx, input)
 			return "fabricated", nil
 		})
@@ -392,7 +590,7 @@ func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	output, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+	output, err := InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
 		return "", delegatedErr
 	})
 	if output != "" || !errors.Is(err, delegatedErr) {
@@ -405,7 +603,7 @@ func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
 	component := testComponent("late-next")
 	savedNext := make(chan Next[testPayload, string], 1)
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return Use(registrar, testAround, spec(component.InstanceID, "late", 0, GlobalScope()), func(_ context.Context, _ testPayload, next Next[testPayload, string]) (string, error) {
+		return OnAround(registrar, testAround, spec(component.InstanceID, "late", 0, GlobalScope()), func(_ context.Context, _ testPayload, next Next[testPayload, string]) (string, error) {
 			savedNext <- next
 			return "fabricated", nil
 		})
@@ -419,7 +617,7 @@ func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
 	}
 	defer plan.Release()
 	var terminalCalls atomic.Int32
-	if _, err := Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+	if _, err := InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
 		terminalCalls.Add(1)
 		return "terminal", nil
 	}); !errors.Is(err, ErrNextNotCalled) {
@@ -437,7 +635,7 @@ func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
 	registry := newTestRegistry(nil)
 	component := testComponent("context")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return Use(registrar, testAround, spec(component.InstanceID, "deadline", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+		return OnAround(registrar, testAround, spec(component.InstanceID, "deadline", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
 			tightened, cancel := context.WithCancel(ctx)
 			cancel()
 			return next(tightened, input)
@@ -448,7 +646,7 @@ func TestInterceptorPropagatesTightenedNextContext(t *testing.T) {
 	}
 	plan, _ := registry.Snapshot(GlobalScope())
 	defer plan.Release()
-	_, err = Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(ctx context.Context, _ testPayload) (string, error) {
+	_, err = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(ctx context.Context, _ testPayload) (string, error) {
 		return "", ctx.Err()
 	})
 	if !errors.Is(err, context.Canceled) {
@@ -558,7 +756,7 @@ func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
 	secret := errors.New("credential-sentinel-do-not-persist")
 	component := testComponent("bounded-error")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return Use(registrar, testAround, spec(component.InstanceID, "failure", 0, GlobalScope()), func(context.Context, testPayload, Next[testPayload, string]) (string, error) {
+		return OnAround(registrar, testAround, spec(component.InstanceID, "failure", 0, GlobalScope()), func(context.Context, testPayload, Next[testPayload, string]) (string, error) {
 			return "", secret
 		})
 	}))
@@ -570,7 +768,7 @@ func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	_, err = Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+	_, err = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
 		return "unused", nil
 	})
 	var callback *CallbackError
@@ -629,7 +827,7 @@ func BenchmarkInvokeTen(b *testing.B) {
 	for index := 0; index < 10; index++ {
 		id := string(rune('a' + index))
 		_, _ = registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-			return Use(registrar, testAround, spec(id, id, index, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			return OnAround(registrar, testAround, spec(id, id, index, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
 				return next(ctx, input)
 			})
 		}))
@@ -638,7 +836,7 @@ func BenchmarkInvokeTen(b *testing.B) {
 	defer plan.Release()
 	b.ResetTimer()
 	for range b.N {
-		_, _ = Invoke(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
+		_, _ = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
 	}
 }
 

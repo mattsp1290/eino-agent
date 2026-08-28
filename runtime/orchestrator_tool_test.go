@@ -89,6 +89,65 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	}
 }
 
+func TestToolTransitionTransportFailureIsPostCommitBestEffort(t *testing.T) {
+	store := newAdmissionStore()
+	sink := &selectiveToolFailingSink{err: errors.New("transport unavailable")}
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		for _, msg := range request.Messages {
+			if msg.Role == einoschema.Tool {
+				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			}
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-transport", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+	}))
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		return ToolResult{Output: "ok"}, nil
+	})}}})
+	orch.events = sink
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted || result.Error != nil {
+		t.Fatalf("result = %+v, want completed despite transport failure", result)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-transport")
+	if err != nil || call.Status != session.ToolCallCompleted {
+		t.Fatalf("durable call = %+v, %v", call, err)
+	}
+	if sink.toolEvents != 3 {
+		t.Fatalf("tool event delivery attempts = %d, want 3", sink.toolEvents)
+	}
+}
+
+func TestToolTransitionPersistenceFailureFailsMutation(t *testing.T) {
+	store := newAdmissionStore()
+	store.toolTransitionErr = errors.New("persistent tool event failed")
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-persist", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+	}))
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		return ToolResult{Output: "should not run"}, nil
+	})}}})
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || result.Error == nil {
+		t.Fatalf("result = %+v, want failed persistence", result)
+	}
+	if _, err := store.GetToolCall(context.Background(), "call-persist"); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("tool call survived failed atomic create: %v", err)
+	}
+}
+
+type selectiveToolFailingSink struct {
+	err        error
+	toolEvents int
+}
+
+func (s *selectiveToolFailingSink) Emit(_ context.Context, event Event) error {
+	if event.Kind == EventToolCallUpdated {
+		s.toolEvents++
+		return s.err
+	}
+	return nil
+}
+
 // TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage pins that the
 // EventRunFinished event (and Result.Usage) carries the run-total provider
 // usage summed across every model stream in the run — here a two-stream

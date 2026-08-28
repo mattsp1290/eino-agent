@@ -88,11 +88,14 @@ func TestMountStandardPublishesCatalogOrderAndExecutesFileRead(t *testing.T) {
 	}
 
 	descriptor := plan.Descriptor()
-	if len(descriptor.Tools) != 10 {
-		t.Fatalf("descriptor tools = %d", len(descriptor.Tools))
+	if len(descriptor.Components) != 1 || len(descriptor.Components[0].Tools) != 10 {
+		t.Fatalf("descriptor = %#v", descriptor)
 	}
-	for _, identity := range descriptor.Tools {
-		if len(identity.SchemaHash) != 64 || len(identity.ExecutorHash) != 64 || identity.Artifact.ConfigHash != component.Artifact.ConfigHash {
+	if descriptor.Components[0].InstanceID != component.InstanceID || descriptor.Components[0].Artifact != component.Artifact {
+		t.Fatalf("invalid component identity = %#v", descriptor.Components[0])
+	}
+	for _, identity := range descriptor.Components[0].Tools {
+		if len(identity.SchemaHash) != 64 || len(identity.ExecutorHash) != 64 {
 			t.Fatalf("invalid tool identity = %#v", identity)
 		}
 	}
@@ -273,7 +276,7 @@ func assertNoPlanCapabilities(t *testing.T, registry *composition.Registry) {
 	}
 	defer plan.Release()
 	descriptor := plan.Descriptor()
-	if len(descriptor.Handlers)+len(descriptor.Tools)+len(descriptor.Prompts)+len(descriptor.Guards)+len(descriptor.Restrictions) != 0 {
+	if len(descriptor.Components) != 0 {
 		t.Fatalf("unexpected published plan: %#v", descriptor)
 	}
 }

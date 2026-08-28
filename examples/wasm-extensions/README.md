@@ -31,6 +31,8 @@ the typed points documented in
 The tool-middleware guest reaches prepare and protected result transformation
 only; around tool execution remains native-only. No guest receives credentials,
 clients, callbacks, raw event payloads, or authority to name arbitrary points.
+The hook world contains run-scoped `before-run` and `after-run` exports only;
+there is no separate Wasm turn lifecycle.
 
 Register extension-backed guests directly while mounting their component; no
 opaque loaded handle is exposed:

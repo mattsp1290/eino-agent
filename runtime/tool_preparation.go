@@ -103,7 +103,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Pattern: schemaCall.Function.Name, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
 		input = cloneJSON(call.Input)
 		var prepareErr error
-		preparedCall, err := extension.Invoke(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(_ context.Context, value PreparedToolCall) (PreparedToolCall, error) { return value, nil })
+		preparedCall, err := extension.ApplyTransforms(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)})
 		if err != nil {
 			prepareErr = err
 		} else {
@@ -137,27 +137,35 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		callID, input := call.ID, call.Input
 		resultMessageID := o.ids.NewMessageID()
 		resultPartID := o.ids.NewPartID()
-		record, err := execution.store.CreateToolCall(ctx, session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Pattern: call.Pattern, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)})
+		createdAt := o.now()
+		createEvent := toolTransitionEnvelope(o, snapshot, createdAt)
+		record, err := execution.store.CreateToolCall(ctx, session.CreateToolCallRequest{
+			Call:  session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Pattern: call.Pattern, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)},
+			Event: createEvent,
+		})
 		if err != nil {
 			return nil, err
 		}
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
-		_ = o.emitToolCall(ctx, execution, snapshot, messageID, callID, session.ToolCallPending, toolCallPayload{ID: string(callID), Name: call.Name, Arguments: cloneJSON(input)})
-		record.Status, record.ClaimedBy, record.ClaimToken = session.ToolCallRunning, o.ownerID(), string(o.ids.NewEventID())
-		record.StartedAt = o.now()
-		record, err = execution.store.ClaimToolCall(ctx, record, o.lease())
+		o.publishToolTransition(ctx, execution, record, createEvent)
+		startedAt := o.now()
+		claimEvent := toolTransitionEnvelope(o, snapshot, startedAt)
+		record, err = execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+			ID: record.ID, ClaimedBy: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), StartedAt: startedAt,
+			LeaseDuration: o.lease(), Event: claimEvent,
+		})
 		if err != nil {
 			return nil, err
 		}
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
-		_ = o.emitToolCall(ctx, execution, snapshot, messageID, callID, session.ToolCallRunning, toolCallPayload{ID: string(callID), Name: call.Name, Arguments: cloneJSON(input)})
+		o.publishToolTransition(ctx, execution, record, claimEvent)
 		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, call, record, prepared.middlewareErr)
 		if err != nil {
 			return nil, err
 		}
 		output := settled.Settlement.Output
-		_ = o.emitToolCall(ctx, execution, snapshot, messageID, callID, settled.Settlement.Status, toolCallEventPayload(output, schemaCall.Function.Name, input))
+		execution.publishPersisted(context.WithoutCancel(ctx), o.events, settled.Event)
 		messages = append(messages, einoschema.ToolMessage(string(output), string(callID), einoschema.WithToolName(schemaCall.Function.Name)))
 		if errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled) {
 			return messages, settled.Outcome.RawError
@@ -166,14 +174,10 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 	return messages, nil
 }
 
-func (o *StreamingOrchestrator) emitToolCall(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, callID session.ToolCallID, status session.ToolCallStatus, payload any) error {
-	sink := execution.eventSink(o.events)
-	if sink == nil {
-		return nil
-	}
-	withStatus, err := withToolStatus(payload, status)
+func (o *StreamingOrchestrator) publishToolTransition(ctx context.Context, execution *runExecution, call session.ToolCall, envelope session.ToolTransitionEvent) {
+	record, err := session.ToolTransitionRecord(call, envelope)
 	if err != nil {
-		return err
+		return
 	}
-	return sink.Emit(ctx, Event{Kind: EventToolCallUpdated, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: callID, EpochID: snapshot.EpochID, ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID), Payload: mustJSON(withStatus), Time: o.now()})
+	execution.publishPersisted(context.WithoutCancel(ctx), o.events, record)
 }

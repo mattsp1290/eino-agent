@@ -32,8 +32,8 @@ func mustClonePreparedToolCall(t *testing.T, value PreparedToolCall) PreparedToo
 func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", EpochID: "epoch", SystemPrompt: "configured"}
 	plan := mustTestRunPlan(RunPlanSpec{Prompts: []PlanPrompt{
-		{Identity: testPromptIdentity("z", "b", 10), Prompt: MountedPrompt{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })}},
-		{Identity: testPromptIdentity("a", "a", -10), Prompt: MountedPrompt{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })}},
+		{Component: testPlanComponent("b"), Identity: testPromptIdentity("z", "b", 10), Prompt: MountedPrompt{Name: "z", Order: 10, InstanceID: "b", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })}},
+		{Component: testPlanComponent("a"), Identity: testPromptIdentity("a", "a", -10), Prompt: MountedPrompt{Name: "a", Order: -10, InstanceID: "a", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })}},
 	}})
 	orchestrator := mustConfiguredOrchestrator()
 	text, err := orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
@@ -62,11 +62,11 @@ func TestFallbackModelPrependsSystemWithoutReorderingDurableMessages(t *testing.
 func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 	var sequence []string
 	plan := mustTestRunPlan(RunPlanSpec{Guards: []PlanGuard{
-		{Identity: testGuardIdentity("deny"), Guard: MountedToolGuard{ID: "deny", InstanceID: "test-guards", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+		{Component: testPlanComponent("test-guards"), Identity: testGuardIdentity("deny"), Guard: MountedToolGuard{ID: "deny", InstanceID: "test-guards", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "deny")
 			return ToolGuardResult{Decision: ToolGuardDeny, Message: "blocked"}, nil
 		})}},
-		{Identity: testGuardIdentity("audit"), Guard: MountedToolGuard{ID: "audit", InstanceID: "test-guards", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+		{Component: testPlanComponent("test-guards"), Identity: testGuardIdentity("audit"), Guard: MountedToolGuard{ID: "audit", InstanceID: "test-guards", Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "audit")
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
 		})}},
@@ -95,12 +95,12 @@ func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 		Scope:     ToolScope{Permissions: []string{"write"}},
 	}
 	plan := mustTestRunPlan(RunPlanSpec{Guards: []PlanGuard{
-		{Identity: testGuardIdentity("mutate"), Guard: MountedToolGuard{ID: "mutate", InstanceID: "test-guards", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+		{Component: testPlanComponent("test-guards"), Identity: testGuardIdentity("mutate"), Guard: MountedToolGuard{ID: "mutate", InstanceID: "test-guards", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			copy(request.Call.Input, json.RawMessage(`{"op":"hidden"}`))
 			copy(request.Call.Scope.Permissions, []string{"audit"})
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
 		})}},
-		{Identity: testGuardIdentity("deny-original"), Guard: MountedToolGuard{ID: "deny-original", InstanceID: "test-guards", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+		{Component: testPlanComponent("test-guards"), Identity: testGuardIdentity("deny-original"), Guard: MountedToolGuard{ID: "deny-original", InstanceID: "test-guards", Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			if string(request.Call.Input) != `{"op":"delete"}` || !reflect.DeepEqual(request.Call.Scope.Permissions, []string{"write"}) {
 				t.Fatalf("second guard request = %#v", request.Call)
 			}
@@ -131,7 +131,7 @@ func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 	callbackErr := errors.New("middleware failed")
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-errors"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
+		return extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
 			result, err := next(ctx, input)
 			if err != nil {
 				return ToolResult{}, err
@@ -164,20 +164,19 @@ func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 func TestToolMiddlewareCannotForgePermissionStateOrReceiveApproval(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-permission-state"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
+		if err := extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
 			result, err := next(ctx, input)
 			result.Metadata = map[string]string{"permission_status": "denied", "permission_forged": "true"}
 			return result, err
 		}); err != nil {
 			return err
 		}
-		return extension.Use(registrar, ToolResultTransformPoint, extension.Registration{ID: "result", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolResultTransform, next extension.Next[ToolResultTransform, ToolResult]) (ToolResult, error) {
+		return extension.OnTransform(registrar, ToolResultTransformPoint, extension.Registration{ID: "result", Scope: extension.GlobalScope()}, func(_ context.Context, input ToolResultTransform) (ToolResultTransform, error) {
 			if input.Call.Approval != nil {
-				return ToolResult{}, errors.New("result middleware received approval capability")
+				return ToolResultTransform{}, errors.New("result middleware received approval capability")
 			}
-			result, err := next(ctx, input)
-			result.Metadata = map[string]string{"permission_status": "approval_required", "permission_forged": "true"}
-			return result, err
+			input.Result.Metadata = map[string]string{"permission_status": "approval_required", "permission_forged": "true"}
+			return input, nil
 		})
 	}))
 	if err != nil {
@@ -212,7 +211,7 @@ func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-test", Artifact: extension.Artifact{Name: "stream-test", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "replace", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "replace", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
 			delegated, err := next(ctx, input)
 			if delegated != nil {
 				delegated.Close()
@@ -233,7 +232,7 @@ func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	_, err = extension.Invoke(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+	_, err = extension.InvokeAround(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		reader, writer := einoschema.Pipe[*einoschema.Message](1)
 		writer.Close()
 		return reader, nil
@@ -248,7 +247,7 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-swallow", Artifact: extension.Artifact{Name: "stream-swallow", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
 			_, _ = next(ctx, input)
 			return nil, nil
 		})
@@ -261,7 +260,7 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		return nil, providerErr
 	})
 	if reader != nil || !errors.Is(err, providerErr) {
@@ -285,7 +284,7 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	defer plan.Release()
 	terminalCalled := false
 	input := ModelStreamInput{ProviderID: "provider", ModelID: "model", ContentHash: "hash", Audited: AuditedModelInput{System: "system"}}
-	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, input, func(_ context.Context, value ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, input, func(_ context.Context, value ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		terminalCalled = true
 		if value.ProviderID != "provider" || value.ModelID != "model" || value.ContentHash != "hash" {
 			t.Fatalf("model stream terminal received wrong data: %#v", value)
@@ -316,7 +315,7 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-nested-mutation", Artifact: extension.Artifact{Name: "stream-nested-mutation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
+		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[*einoschema.Message]]) (*einoschema.StreamReader[*einoschema.Message], error) {
 			input.Audited.Messages[0].Canonical[0] = '['
 			return next(ctx, input)
 		})
@@ -332,7 +331,7 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 
 	original := ModelStreamInput{ContentHash: "hash", Audited: AuditedModelInput{Messages: []AuditedMessage{{Canonical: json.RawMessage(`{"role":"user","content":"original"}`)}}}}
 	providerCalled := false
-	reader, err := extension.Invoke(plan, context.Background(), ModelStreamPoint, original, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
+	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, original, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
 		providerCalled = true
 		return nil, nil
 	})
@@ -399,9 +398,9 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	component := extension.Component{InstanceID: "turn-order", Artifact: extension.Artifact{Name: "turn-order", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var seen BoundedTurnMetadata
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.Use(registrar, TurnPreparePoint, extension.Registration{ID: "observe", Scope: extension.GlobalScope()}, func(ctx context.Context, metadata BoundedTurnMetadata, next extension.Next[BoundedTurnMetadata, BoundedTurnMetadata]) (BoundedTurnMetadata, error) {
+		return extension.OnHook(registrar, TurnPreparePoint, extension.Registration{ID: "observe", Scope: extension.GlobalScope()}, func(_ context.Context, metadata BoundedTurnMetadata) error {
 			seen = cloneBoundedTurnMetadata(metadata)
-			return next(ctx, metadata)
+			return nil
 		})
 	}))
 	if err != nil {
@@ -413,8 +412,9 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	}
 	defer dispatch.Release()
 	plan := mustTestRunPlan(RunPlanSpec{Dispatch: dispatch, Tools: []PlanTool{{
-		Identity: testToolIdentity("echo"),
-		Resolve:  func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
+		Component: testPlanComponent("test-tools"),
+		Identity:  testToolIdentity("echo"),
+		Resolve:   func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
 	}}})
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
 	host := mustConfiguredOrchestrator()
@@ -461,17 +461,17 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	component := extension.Component{InstanceID: "clone-failure", Artifact: extension.Artifact{Name: "clone-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var contextEntered, toolEntered bool
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(ctx context.Context, input ContextAssembly, next extension.Next[ContextAssembly, ContextAssembly]) (ContextAssembly, error) {
+		if err := extension.OnTransform(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, input ContextAssembly) (ContextAssembly, error) {
 			contextEntered = true
 			input.Base[0].Extra["nested"].(map[string]any)["value"] = "mutated"
-			return next(ctx, input)
+			return input, nil
 		}); err != nil {
 			return err
 		}
-		return extension.Use(registrar, ToolPreparePoint, extension.Registration{ID: "tool", Scope: extension.GlobalScope()}, func(ctx context.Context, input PreparedToolCall, next extension.Next[PreparedToolCall, PreparedToolCall]) (PreparedToolCall, error) {
+		return extension.OnTransform(registrar, ToolPreparePoint, extension.Registration{ID: "tool", Scope: extension.GlobalScope()}, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) {
 			toolEntered = true
 			input.Tool.Info.Extra["nested"].(map[string]any)["value"] = "mutated"
-			return next(ctx, input)
+			return input, nil
 		})
 	}))
 	if err != nil {
@@ -485,14 +485,14 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	messageNested := map[string]any{"value": "original"}
 	message := einoschema.UserMessage("protected")
 	message.Extra = map[string]any{"nested": messageNested, "unsupported": make(chan struct{})}
-	_, err = extension.Invoke(plan, context.Background(), ContextAssemblePoint, ContextAssembly{Base: []*einoschema.Message{message}}, func(_ context.Context, input ContextAssembly) (ContextAssembly, error) { return input, nil })
+	_, err = extension.ApplyTransforms(plan, context.Background(), ContextAssemblePoint, ContextAssembly{Base: []*einoschema.Message{message}})
 	if err == nil || contextEntered || messageNested["value"] != "original" {
 		t.Fatalf("context clone failure = %v entered=%t nested=%v", err, contextEntered, messageNested)
 	}
 	toolNested := map[string]any{"value": "original"}
 	tool := Tool{Name: "tool", Info: &einoschema.ToolInfo{Name: "tool", Extra: map[string]any{"nested": toolNested, "unsupported": make(chan struct{})}}}
 	prepared := PreparedToolCall{Tool: tool, Call: ToolCall{ID: "call", Name: "tool", Input: json.RawMessage(`{}`)}}
-	_, err = extension.Invoke(plan, context.Background(), ToolPreparePoint, prepared, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) { return input, nil })
+	_, err = extension.ApplyTransforms(plan, context.Background(), ToolPreparePoint, prepared)
 	if err == nil || toolEntered || toolNested["value"] != "original" {
 		t.Fatalf("tool clone failure = %v entered=%t nested=%v", err, toolEntered, toolNested)
 	}
@@ -513,7 +513,7 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 				Tool: Tool{Name: "tool", Info: &einoschema.ToolInfo{Name: "tool", ParamsOneOf: test.params}},
 				Call: ToolCall{ID: "call", Name: "tool", Input: json.RawMessage(`{}`)},
 			}
-			_, invokeErr := extension.Invoke(plan, context.Background(), ToolPreparePoint, malformed, func(_ context.Context, input PreparedToolCall) (PreparedToolCall, error) { return input, nil })
+			_, invokeErr := extension.ApplyTransforms(plan, context.Background(), ToolPreparePoint, malformed)
 			if invokeErr == nil || toolEntered {
 				t.Fatalf("malformed schema clone failure = %v entered=%t", invokeErr, toolEntered)
 			}
@@ -632,19 +632,19 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 		t.Fatalf("resume empty strict plan = %v", err)
 	}
 	resumedDescriptor := resumed.Descriptor()
-	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || resumedDescriptor.SchemaVersion != descriptor.SchemaVersion || len(resumedDescriptor.Handlers)+len(resumedDescriptor.Tools)+len(resumedDescriptor.Prompts)+len(resumedDescriptor.Guards)+len(resumedDescriptor.Restrictions) != 0 {
+	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || resumedDescriptor.SchemaVersion != descriptor.SchemaVersion || len(resumedDescriptor.Components) != 0 {
 		t.Fatalf("resumed descriptor = %#v, want %#v", resumedDescriptor, descriptor)
 	}
 }
 
 func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
-	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{handlerPlanEntryForTest("callbacks")}}
+	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{handlerPlanEntryForTest("callbacks")}}
 	valid.Fingerprint, _ = session.FingerprintExtensionPlan(valid)
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
 		"stale": func() session.ExtensionPlanDescriptor {
 			next := valid.Clone()
-			next.Handlers[0].InstanceID = "corrupt"
+			next.Components[0].InstanceID = "corrupt"
 			return next
 		}(),
 	} {
@@ -676,14 +676,14 @@ func TestAcquireResumePlanPropagatesDurableSessionIdentity(t *testing.T) {
 	}
 }
 
-func handlerPlanEntryForTest(instance string) session.HandlerPlanIdentity {
-	return session.HandlerPlanIdentity{
+func handlerPlanEntryForTest(instance string) session.ComponentPlan {
+	return session.ComponentPlan{
 		InstanceID: instance,
 		Artifact: extension.Artifact{
 			Name: instance, Version: "1", Hash: instance + "-hash",
 			ConfigHash: instance + "-config", SourceKind: extension.SourceNative,
 		},
-		Registrations: []session.RegistrationIdentity{{
+		Handlers: []session.RegistrationIdentity{{
 			ID: "handler", Contract: "test/handler", Version: "1",
 			Scope: extension.GlobalScope(), Kind: session.HandlerNotification,
 		}},

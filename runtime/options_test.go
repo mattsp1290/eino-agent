@@ -143,7 +143,8 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 	store := newAdmissionStore()
 	var toolsResolved, eventEmitted bool
 	toolPlan := mustTestRunPlan(RunPlanSpec{Tools: []PlanTool{{
-		Identity: testToolIdentity("probe"),
+		Component: testPlanComponent("test-tools"),
+		Identity:  testToolIdentity("probe"),
 		Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
 			toolsResolved = true
 			return Tool{Name: "probe", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })}, nil

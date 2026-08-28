@@ -48,7 +48,8 @@ func TestCapabilityPlanIdentityComesFromMountedComponent(t *testing.T) {
 	}
 	defer plan.Release()
 	descriptor := plan.Descriptor()
-	if len(descriptor.Tools) != 1 || descriptor.Tools[0].InstanceID != mounted.InstanceID {
+	owned := descriptorComponent(descriptor, mounted.InstanceID)
+	if owned == nil || owned.Artifact != mounted.Artifact || len(owned.Tools) != 1 {
 		t.Fatalf("plan descriptor = %#v", descriptor)
 	}
 }
@@ -89,7 +90,7 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	}
 	defer second.Release()
 	secondDescriptor := second.Descriptor()
-	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Tools[0].SchemaHash == secondDescriptor.Tools[0].SchemaHash {
+	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Components[0].Tools[0].SchemaHash == secondDescriptor.Components[0].Tools[0].SchemaHash {
 		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 	}
 	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -148,7 +149,7 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			}
 			defer second.Release()
 			secondDescriptor := second.Descriptor()
-			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Tools[0].SchemaHash == secondDescriptor.Tools[0].SchemaHash {
+			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Components[0].Tools[0].SchemaHash == secondDescriptor.Components[0].Tools[0].SchemaHash {
 				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 			}
 			if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
@@ -214,7 +215,7 @@ func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *t
 	}
 	persisted := plan.Descriptor()
 	plan.Release()
-	persisted.Tools[0].Artifact.Hash = "tampered"
+	persisted.Components[0].Artifact.Hash = "tampered"
 	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("tampered descriptor resume = %v, want ErrExtensionPlanMismatch", err)
 	}
@@ -263,8 +264,9 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 	}
 	persisted := plan.Descriptor()
 	plan.Release()
-	if len(persisted.Handlers) != 1 || len(persisted.Handlers[0].Registrations) != 2 {
-		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Handlers)
+	owned := descriptorComponent(persisted, component.InstanceID)
+	if owned == nil || len(owned.Handlers) != 2 {
+		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Components)
 	}
 
 	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
@@ -276,9 +278,9 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 
 func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 	registry := NewRegistry(nil)
-	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Handlers: []session.HandlerPlanIdentity{{
+	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{{
 		InstanceID: "mixed", Artifact: extension.Artifact{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
-		Registrations: []session.RegistrationIdentity{
+		Handlers: []session.RegistrationIdentity{
 			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-a"), Kind: session.HandlerNotification},
 			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-b"), Kind: session.HandlerNotification},
 		},
@@ -330,7 +332,9 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 		t.Fatalf("plan tools=%#v prompts=%#v guards=%#v err=%v", resolved, prompts, guards, err)
 	}
 	descriptor := plan.Descriptor()
-	if len(descriptor.Tools) != 2 || len(descriptor.Prompts) != 1 || len(descriptor.Guards) != 1 || len(descriptor.Restrictions) != 1 {
+	globalPlan := descriptorComponent(descriptor, "cap-global")
+	sessionPlan := descriptorComponent(descriptor, "cap-session")
+	if globalPlan == nil || sessionPlan == nil || len(globalPlan.Tools) != 2 || len(sessionPlan.Prompts) != 1 || len(globalPlan.Guards) != 1 || len(sessionPlan.Restrictions) != 1 {
 		t.Fatalf("descriptor is missing a typed capability collection: %#v", descriptor)
 	}
 }
@@ -364,10 +368,14 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			persisted := first.Descriptor()
 			first.Release()
 			entryOrder := 0
+			owned := descriptorComponent(persisted, "ordered")
+			if owned == nil {
+				t.Fatalf("ordered descriptor = %#v", persisted)
+			}
 			if kind == "prompt" {
-				entryOrder = persisted.Prompts[0].Order
+				entryOrder = owned.Prompts[0].Order
 			} else {
-				entryOrder = persisted.Guards[0].Order
+				entryOrder = owned.Guards[0].Order
 			}
 			if entryOrder != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
 				t.Fatalf("ordered descriptor = %#v", persisted)

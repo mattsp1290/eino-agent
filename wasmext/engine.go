@@ -42,8 +42,6 @@ type eventComponent interface {
 type hookComponent interface {
 	compiledComponent
 	BeforeRun(context.Context, wittypes.TurnMetadata) error
-	BeforeTurn(context.Context, wittypes.TurnMetadata) error
-	AfterTurn(context.Context, wittypes.TurnMetadata) error
 	AfterRun(context.Context, wittypes.TurnMetadata) error
 }
 
@@ -79,7 +77,7 @@ var (
 		world: "eino-agent:extensions/event-sink@0.1.0", exportName: "eino-agent:extensions/event-sink-api@0.1.0", functions: []string{"emit"},
 	}
 	hookContract = worldContract{
-		world: "eino-agent:extensions/hook@0.1.0", exportName: "eino-agent:extensions/hook-api@0.1.0", functions: []string{"before-run", "before-turn", "after-turn", "after-run"},
+		world: "eino-agent:extensions/hook@0.1.0", exportName: "eino-agent:extensions/hook-api@0.1.0", functions: []string{"before-run", "after-run"},
 	}
 	toolMiddlewareContract = worldContract{
 		world: "eino-agent:extensions/tool-middleware@0.1.0", exportName: "eino-agent:extensions/tool-middleware-api@0.1.0", functions: []string{"before-tool-call", "after-tool-call"},

@@ -292,13 +292,14 @@ validates the complete construction before a run can start. `Store`, `Model`,
 and `IDs` are required and are all named in one construction error when
 missing. Later scalar options override earlier ones, and nil interface
 dependencies are errors. The run-plan provider is the sole executable
-extension source; an omitted provider yields a sealed empty plan.
+extension source; it is required even for a host that always returns the
+fingerprinted empty plan.
 
 `Admit` is deliberately excluded from options. The orchestrator derives it
 from its private store, event sink, extension plan, and clock, which prevents a
 second independently configured dependency graph.
 
-### Tool interception save points
+### Tool transformation save points
 
 `runtime.ToolPreparePoint` runs in registration order after typed input decode.
 The runtime derives the permission pattern from final normalized JSON and
@@ -308,9 +309,10 @@ rewritten JSON. Permission checks and the executor see that same input. A
 prepare error still admits and settles a failed durable call and does not abort
 unrelated sibling calls.
 
-`runtime.ToolResultTransformPoint` unwinds in reverse registration order after
-execution and before encoding/settlement. Durable output, the terminal event,
-the tool-result part, and model-visible message all use the final patch. The
+`runtime.ToolResultTransformPoint` runs transforms in registration order after
+execution and before encoding/settlement. Each callback receives the value
+returned by its predecessor. Durable output, the terminal event, the
+tool-result part, and model-visible message all use the final value. The
 executor error is immutable and remains authoritative.
 
 Resume never repeats `ToolPreparePoint`: pending records already hold rewritten
@@ -341,7 +343,10 @@ can build directly against them:
 ## Frozen extension plans
 
 Admission freezes callbacks, tools, prompts, guards, and restrictions into one
-leased plan and persists its runtime-derived canonical descriptor. Resume
+leased plan and persists its runtime-derived canonical descriptor. Each durable
+component record owns one instance/artifact identity and nested typed capability
+identities; handlerless tool, prompt, guard, and restriction components retain
+that ownership without relying on callback diagnostics. Resume
 resolves an exact current-schema fingerprint match before any durable state
 change. The authoritative point catalog and model and tool pipeline diagrams are in
 [`extension-points.md`](extension-points.md).

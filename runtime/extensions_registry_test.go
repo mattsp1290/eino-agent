@@ -25,12 +25,12 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "tool-validation", Artifact: extension.Artifact{Name: "tool-validation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.Use(registrar, runtime.ToolPreparePoint, extension.Registration{ID: "prepare", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.PreparedToolCall, next extension.Next[runtime.PreparedToolCall, runtime.PreparedToolCall]) (runtime.PreparedToolCall, error) {
-			return next(ctx, input)
+		if err := extension.OnTransform(registrar, runtime.ToolPreparePoint, extension.Registration{ID: "prepare", Scope: extension.GlobalScope()}, func(_ context.Context, input runtime.PreparedToolCall) (runtime.PreparedToolCall, error) {
+			return input, nil
 		}); err != nil {
 			return err
 		}
-		return extension.Use(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolResult]) (runtime.ToolResult, error) {
+		return extension.OnAround(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolResult]) (runtime.ToolResult, error) {
 			return next(ctx, input)
 		})
 	}))
@@ -49,16 +49,14 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 	preparedTool.Executor = nil
 	preparedTool.InputDecoder = nil
 	preparedTool.Pattern = nil
-	prepared, err := extension.Invoke(plan, context.Background(), runtime.ToolPreparePoint, runtime.PreparedToolCall{Tool: preparedTool, Call: call}, func(_ context.Context, input runtime.PreparedToolCall) (runtime.PreparedToolCall, error) {
-		return input, nil
-	})
+	prepared, err := extension.ApplyTransforms(plan, context.Background(), runtime.ToolPreparePoint, runtime.PreparedToolCall{Tool: preparedTool, Call: call})
 	if err != nil {
 		t.Fatalf("ToolPreparePoint rejected unchanged registry tool: %v", err)
 	}
 
 	terminalErr := errors.New("terminal reached")
 	terminalCalled := false
-	_, err = extension.Invoke(plan, context.Background(), runtime.ToolExecutePoint, runtime.ToolExecution(prepared), func(_ context.Context, _ runtime.ToolExecution) (runtime.ToolResult, error) {
+	_, err = extension.InvokeAround(plan, context.Background(), runtime.ToolExecutePoint, runtime.ToolExecution(prepared), func(_ context.Context, _ runtime.ToolExecution) (runtime.ToolResult, error) {
 		terminalCalled = true
 		return runtime.ToolResult{}, terminalErr
 	})

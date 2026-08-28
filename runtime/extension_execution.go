@@ -70,3 +70,13 @@ func (e *runExecution) eventSink(infrastructure EventSink) EventSink {
 	}
 	return runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}
 }
+
+func (e *runExecution) publishPersisted(ctx context.Context, infrastructure EventSink, record session.EventRecord) {
+	if e == nil {
+		if infrastructure != nil {
+			_ = infrastructure.Emit(ctx, runtimeEventRecord(record))
+		}
+		return
+	}
+	runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}.publishPersisted(ctx, record)
+}

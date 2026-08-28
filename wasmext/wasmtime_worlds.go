@@ -79,14 +79,6 @@ func (c *wasmtimeComponent) BeforeRun(ctx context.Context, turn wittypes.TurnMet
 	return c.invokeTurn(ctx, "before-run", turn)
 }
 
-func (c *wasmtimeComponent) BeforeTurn(ctx context.Context, turn wittypes.TurnMetadata) error {
-	return c.invokeTurn(ctx, "before-turn", turn)
-}
-
-func (c *wasmtimeComponent) AfterTurn(ctx context.Context, turn wittypes.TurnMetadata) error {
-	return c.invokeTurn(ctx, "after-turn", turn)
-}
-
 func (c *wasmtimeComponent) AfterRun(ctx context.Context, turn wittypes.TurnMetadata) error {
 	return c.invokeTurn(ctx, "after-run", turn)
 }

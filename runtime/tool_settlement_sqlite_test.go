@@ -29,13 +29,13 @@ func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant", SessionID: "session", RunID: "run", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	durable, err := execution.CreateToolCall(ctx, session.ToolCall{ID: "call", SessionID: "session", RunID: "run", MessageID: "assistant", ResultMessageID: "result-message", ResultPartID: "result-part", Name: "echo", Status: session.ToolCallPending})
+	durable, err := execution.CreateToolCall(ctx, testCreateToolRequest(session.ToolCall{ID: "call", SessionID: "session", RunID: "run", MessageID: "assistant", ResultMessageID: "result-message", ResultPartID: "result-part", Name: "echo", Status: session.ToolCallPending}, "event-create", now))
 	if err != nil {
 		t.Fatal(err)
 	}
 	durable.ClaimedBy = "worker"
 	durable.ClaimToken = "claim"
-	durable, err = execution.ClaimToolCall(ctx, durable, time.Minute)
+	durable, err = execution.ClaimToolCall(ctx, testClaimToolRequest(durable, "event-claim", time.Minute, now))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.SettleToolCall(ctx, settlement); err != nil {
+	if err := execution.SettleToolCall(ctx, testSettleToolRequest(settlement, "event-settle")); err != nil {
 		t.Fatalf("settle tool call: %v", err)
 	}
 	settled, err := store.GetToolCall(ctx, durable.ID)

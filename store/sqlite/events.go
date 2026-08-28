@@ -22,8 +22,14 @@ func (s *Store) appendEvent(ctx context.Context, record session.EventRecord) (se
 	if err != nil {
 		return session.EventRecord{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO events(id, session_id, run_id, kind, record, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		record.ID, record.SessionID, record.RunID, record.Kind, raw, timeText(record.CreatedAt))
+	var toolCallID any
+	var transition any
+	if record.ToolTransition != "" {
+		toolCallID = record.ToolCallID
+		transition = record.ToolTransition
+	}
+	_, err = s.exec(ctx, `INSERT INTO events(id, session_id, run_id, kind, tool_call_id, tool_transition, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.SessionID, record.RunID, record.Kind, toolCallID, transition, raw, timeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 

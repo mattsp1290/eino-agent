@@ -162,7 +162,7 @@ func planSetDefinition(state *State) agenttools.Definition {
 			return map[string]any{"items": items}, nil
 		}),
 		RetrySafe:   true,
-		Scope:       sessionScope("plan"),
+		Scope:       sessionScope(),
 		Permissions: []string{"session.plan"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -180,7 +180,7 @@ func planGetDefinition(state *State) agenttools.Definition {
 			return map[string]any{"items": items}, nil
 		}),
 		RetrySafe:   true,
-		Scope:       sessionScope("plan"),
+		Scope:       sessionScope(),
 		Permissions: []string{"session.plan"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -229,7 +229,7 @@ func retainOutputDefinition(state *State) agenttools.Definition {
 			return output, nil
 		}),
 		RetrySafe:   true,
-		Scope:       sessionScope("retained_output"),
+		Scope:       sessionScope(),
 		Permissions: []string{"session.retained_output"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096, StoreExternal: true},
 		Metadata:    map[string]string{"source": "session"},
@@ -251,7 +251,7 @@ func subagentDefinition(runner SubagentRunner) agenttools.Definition {
 			}
 			return runner.RunSubagent(ctx, SubagentRequest{SessionID: execution.Context.Turn.SessionID, Task: input.Task})
 		}),
-		Scope:       sessionScope("subagent"),
+		Scope:       sessionScope(),
 		Permissions: []string{"session.subagent"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -273,7 +273,7 @@ func skillLoadDefinition(loader SkillLoader) agenttools.Definition {
 			}
 			return loader.LoadSkill(ctx, SkillRequest{SessionID: execution.Context.Turn.SessionID, Name: input.Name})
 		}),
-		Scope:       sessionScope("skill"),
+		Scope:       sessionScope(),
 		Permissions: []string{"session.skill"},
 		Retention:   runtime.RetentionPolicy{MaxInlineBytes: 4096},
 		Metadata:    map[string]string{"source": "session"},
@@ -297,7 +297,7 @@ type skillInput struct {
 	Name string `json:"name"`
 }
 
-func sessionScope(_ string) agenttools.ScopeResolver {
+func sessionScope() agenttools.ScopeResolver {
 	return func(_ context.Context, context runtime.ToolScopeContext) runtime.ToolScope {
 		return runtime.ToolScope{
 			WorkspaceID: context.WorkspaceID,

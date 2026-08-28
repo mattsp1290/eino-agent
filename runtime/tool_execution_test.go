@@ -23,11 +23,10 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claimed.Status = session.ToolCallRunning
 	claimed.ClaimedBy = "owner-1"
 	claimed.ClaimToken = "atomic-claim"
 	claimed.StartedAt = run.CreatedAt
-	claimed, err = store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken}).ClaimToolCall(context.Background(), claimed, time.Minute)
+	claimed, err = store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken}).ClaimToolCall(context.Background(), testClaimToolRequest(claimed, "event-atomic-claim", time.Minute, claimed.StartedAt))
 	if err != nil {
 		t.Fatal(err)
 	}

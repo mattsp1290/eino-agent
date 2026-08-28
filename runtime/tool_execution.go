@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
@@ -15,6 +16,7 @@ type settledTool struct {
 	Outcome    toolOutcome
 	Settlement session.ToolSettlement
 	Output     ToolOutput
+	Event      session.EventRecord
 }
 
 func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall) (session.ToolSettlement, error) {
@@ -48,7 +50,8 @@ func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run ses
 	if err != nil {
 		return session.ToolSettlement{}, err
 	}
-	if err := e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement); err != nil {
+	eventEnvelope := toolTransitionEnvelope(e.host, e.host.resumeSnapshot(run), settlement.CompletedAt)
+	if err := e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement, eventEnvelope); err != nil {
 		return session.ToolSettlement{}, err
 	}
 	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
@@ -68,8 +71,9 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
 	})
+	eventEnvelope := toolTransitionEnvelope(e.host, snapshot, completedAt)
 	if err == nil {
-		err = e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement)
+		err = e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement, eventEnvelope)
 	}
 	if err != nil {
 		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
@@ -82,7 +86,11 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	})
 	e.host.finishObservedToolCall(observedTool, settlement.Status, outcome.RawError, outcome.Result.Metadata)
 	e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, settlement.Status, completedAt.Sub(claimed.StartedAt), outcome.RawError, outcome.Result.Metadata)
-	return settledTool{Outcome: outcome, Settlement: settlement, Output: output}, nil
+	eventRecord, err := session.ToolTransitionRecord(settlementCall(claimed, settlement), eventEnvelope)
+	if err != nil {
+		return settledTool{}, err
+	}
+	return settledTool{Outcome: outcome, Settlement: settlement, Output: output, Event: eventRecord}, nil
 }
 
 func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error) (outcome toolOutcome) {
@@ -105,9 +113,21 @@ func (e *runExecution) ensureToolResultIDs(call ToolCall, claimed session.ToolCa
 	return call, claimed
 }
 
-func (e *runExecution) commitToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement) error {
+func (e *runExecution) commitToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement, event session.ToolTransitionEvent) error {
 	if err := e.ensureStore(ctx, claimed.RunID); err != nil {
 		return err
 	}
-	return e.store.SettleToolCall(ctx, settlement)
+	return e.store.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: settlement, Event: event})
+}
+
+func settlementCall(claimed session.ToolCall, settlement session.ToolSettlement) session.ToolCall {
+	settled, _ := settlement.Apply(claimed)
+	return settled
+}
+
+func toolTransitionEnvelope(host *StreamingOrchestrator, snapshot TurnSnapshot, at time.Time) session.ToolTransitionEvent {
+	return session.ToolTransitionEvent{
+		ID: host.ids.NewEventID(), EpochID: snapshot.EpochID, ProviderID: string(snapshot.Model.Provider.ID),
+		ModelID: string(snapshot.Model.Model.ID), CreatedAt: at.UTC(),
+	}
 }

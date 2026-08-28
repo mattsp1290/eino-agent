@@ -180,7 +180,7 @@ func (e *executionStore) UpdatePart(ctx context.Context, record session.Part) er
 }
 
 func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
-	if record.RunID != e.fence.RunID {
+	if record.RunID != e.fence.RunID || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
 		return session.EventRecord{}, session.ErrConflict
 	}
 	var result session.EventRecord
@@ -195,7 +195,8 @@ func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRe
 	return result, err
 }
 
-func (e *executionStore) CreateToolCall(ctx context.Context, record session.ToolCall) (session.ToolCall, error) {
+func (e *executionStore) CreateToolCall(ctx context.Context, request session.CreateToolCallRequest) (session.ToolCall, error) {
+	record := request.Call
 	if record.RunID != e.fence.RunID {
 		return session.ToolCall{}, session.ErrConflict
 	}
@@ -204,34 +205,70 @@ func (e *executionStore) CreateToolCall(ctx context.Context, record session.Tool
 		if record.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		var err error
+		event, err := session.ToolTransitionRecord(record, request.Event)
+		if err != nil || event.ToolTransition != session.ToolTransitionPending {
+			return session.ErrConflict
+		}
 		result, err = store.createToolCall(ctx, record)
+		if err != nil {
+			return err
+		}
+		_, err = store.appendEvent(ctx, event)
 		return err
 	})
 	return result, err
 }
 
-func (e *executionStore) ClaimToolCall(ctx context.Context, record session.ToolCall, leaseDuration time.Duration) (session.ToolCall, error) {
-	if record.RunID != e.fence.RunID || leaseDuration <= 0 {
+func (e *executionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolCall, error) {
+	if request.ID == "" || request.ClaimedBy == "" || request.ClaimToken == "" || request.StartedAt.IsZero() || request.LeaseDuration <= 0 {
 		return session.ToolCall{}, session.ErrConflict
 	}
 	var result session.ToolCall
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
-		if record.SessionID != run.SessionID {
+		current, err := store.GetToolCall(ctx, request.ID)
+		if err != nil || current.RunID != e.fence.RunID || current.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		runLease, err := (&executionStore{store: store, fence: e.fence}).RenewRunLease(ctx, leaseDuration)
+		candidate := current
+		candidate.Status = session.ToolCallRunning
+		candidate.ClaimedBy = request.ClaimedBy
+		candidate.ClaimToken = request.ClaimToken
+		candidate.StartedAt = request.StartedAt.UTC()
+		candidate.CompletedAt = time.Time{}
+		event, err := session.ToolTransitionRecord(candidate, request.Event)
+		if err != nil || event.ToolTransition != session.ToolTransitionRunning {
+			return session.ErrConflict
+		}
+		if current.Status == session.ToolCallRunning {
+			if !session.SameToolTransitionState(current, candidate) {
+				return session.ErrConflict
+			}
+			if _, err := store.appendEvent(ctx, event); err != nil {
+				return err
+			}
+			result = current
+			return nil
+		}
+		if current.Status != session.ToolCallPending || current.ClaimedBy != "" || current.ClaimToken != "" {
+			return session.ErrConflict
+		}
+		runLease, err := (&executionStore{store: store, fence: e.fence}).RenewRunLease(ctx, request.LeaseDuration)
 		if err != nil {
 			return err
 		}
-		record.LeaseUntil = runLease.LeaseUntil
-		result, err = store.claimToolCall(ctx, record)
+		candidate.LeaseUntil = runLease.LeaseUntil
+		result, err = store.claimToolCall(ctx, candidate)
+		if err != nil {
+			return err
+		}
+		_, err = store.appendEvent(ctx, event)
 		return err
 	})
 	return result, err
 }
 
-func (e *executionStore) SettleToolCall(ctx context.Context, settlement session.ToolSettlement) error {
+func (e *executionStore) SettleToolCall(ctx context.Context, request session.SettleToolCallRequest) error {
+	settlement := request.Settlement
 	return e.withFence(ctx, func(store *Store, run session.Run) error {
 		call, err := store.GetToolCall(ctx, settlement.ID)
 		if err != nil {
@@ -240,7 +277,19 @@ func (e *executionStore) SettleToolCall(ctx context.Context, settlement session.
 		if call.RunID != e.fence.RunID || call.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
-		return store.settleToolCall(ctx, settlement)
+		settled, err := settlement.Apply(call)
+		if err != nil {
+			return err
+		}
+		event, err := session.ToolTransitionRecord(settled, request.Event)
+		if err != nil || event.ToolTransition != session.ToolTransitionTerminal {
+			return session.ErrConflict
+		}
+		if err := store.settleToolCall(ctx, settlement); err != nil {
+			return err
+		}
+		_, err = store.appendEvent(ctx, event)
+		return err
 	})
 }
 

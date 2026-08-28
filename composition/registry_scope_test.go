@@ -143,7 +143,7 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 			if !reflect.DeepEqual(gotTools, test.wantTools) {
 				t.Fatalf("resolved tools = %v, want %v", gotTools, test.wantTools)
 			}
-			descriptorTools := len(plan.Descriptor().Tools)
+			descriptorTools := descriptorCapabilityCount(plan.Descriptor())
 			if descriptorTools != len(test.wantTools) {
 				t.Fatalf("descriptor tools=%d, want %d", descriptorTools, len(test.wantTools))
 			}
@@ -428,15 +428,8 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 	}
 	defer plan.Release()
 	descriptor := plan.Descriptor()
-	for _, identity := range descriptor.Handlers {
-		if identity.InstanceID == "rejected" {
-			t.Fatal("rejected mount handler was published")
-		}
-	}
-	for _, identity := range descriptor.Tools {
-		if identity.InstanceID == "rejected" {
-			t.Fatal("rejected mount handler was published")
-		}
+	if descriptorComponent(descriptor, "rejected") != nil {
+		t.Fatal("rejected mount behavior was published")
 	}
 }
 

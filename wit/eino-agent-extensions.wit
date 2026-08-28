@@ -122,8 +122,6 @@ interface hook-api {
   use types.{structured-error, turn-metadata};
 
   before-run: func(snapshot: turn-metadata) -> result<_, structured-error>;
-  before-turn: func(snapshot: turn-metadata) -> result<_, structured-error>;
-  after-turn: func(snapshot: turn-metadata) -> result<_, structured-error>;
   after-run: func(snapshot: turn-metadata) -> result<_, structured-error>;
 }
 

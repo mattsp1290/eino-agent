@@ -397,10 +397,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err := hook.beforeRunBounded(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
-	if err := hook.beforeTurnBounded(ctx, metadata); err != nil {
-		t.Fatal(err)
-	}
-	if err := hook.finish(ctx, runtime.Result{RunID: "run"}); err != nil {
+	if err := hook.finish(ctx, metadata); err != nil {
 		t.Fatal(err)
 	}
 
@@ -835,12 +832,6 @@ func (c *fakeComponent) EmitEvent(ctx context.Context, input wittypes.BoundedEve
 }
 func (c *fakeComponent) BeforeRun(ctx context.Context, input wittypes.TurnMetadata) error {
 	return c.invoke(ctx, "hook.before-run", input, nil)
-}
-func (c *fakeComponent) BeforeTurn(ctx context.Context, input wittypes.TurnMetadata) error {
-	return c.invoke(ctx, "hook.before-turn", input, nil)
-}
-func (c *fakeComponent) AfterTurn(ctx context.Context, input wittypes.TurnMetadata) error {
-	return c.invoke(ctx, "hook.after-turn", input, nil)
 }
 func (c *fakeComponent) AfterRun(ctx context.Context, input wittypes.TurnMetadata) error {
 	return c.invoke(ctx, "hook.after-run", input, nil)

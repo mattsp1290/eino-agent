@@ -34,27 +34,31 @@ type RunPlanProvider interface {
 }
 
 type PlanTool struct {
-	Identity session.ToolPlanIdentity
-	Resolve  func(context.Context, ToolScopeContext) (Tool, error)
+	Component extension.Component
+	Identity  session.ToolPlanIdentity
+	Resolve   func(context.Context, ToolScopeContext) (Tool, error)
 }
 
 // PlanPrompt binds one prompt implementation to its persisted identity.
 type PlanPrompt struct {
-	Identity session.PromptPlanIdentity
-	Prompt   MountedPrompt
+	Component extension.Component
+	Identity  session.PromptPlanIdentity
+	Prompt    MountedPrompt
 }
 
 // PlanGuard binds one tool guard implementation to its persisted identity.
 type PlanGuard struct {
-	Identity session.GuardPlanIdentity
-	Guard    MountedToolGuard
+	Component extension.Component
+	Identity  session.GuardPlanIdentity
+	Guard     MountedToolGuard
 }
 
 // PlanRestriction binds one tool restriction policy to its persisted identity.
 type PlanRestriction struct {
-	Identity session.RestrictionPlanIdentity
-	Allowed  []string
-	Denied   []string
+	Component extension.Component
+	Identity  session.RestrictionPlanIdentity
+	Allowed   []string
+	Denied    []string
 }
 
 // RunPlanSpec is unfingerprinted behavior evidence. Each executable capability
@@ -85,22 +89,31 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		return nil, err
 	}
 	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion}
+	byInstance := make(map[string]int)
+	componentPlan := func(component extension.Component) (*session.ComponentPlan, error) {
+		if err := extension.ValidateComponent(component); err != nil {
+			return nil, fmt.Errorf("%w: invalid component owner", ErrExtensionPlanMismatch)
+		}
+		if index, ok := byInstance[component.InstanceID]; ok {
+			owned := &descriptor.Components[index]
+			if owned.Artifact != component.Artifact {
+				return nil, fmt.Errorf("%w: conflicting component owner", ErrExtensionPlanMismatch)
+			}
+			return owned, nil
+		}
+		index := len(descriptor.Components)
+		byInstance[component.InstanceID] = index
+		descriptor.Components = append(descriptor.Components, session.ComponentPlan{InstanceID: component.InstanceID, Artifact: component.Artifact})
+		return &descriptor.Components[index], nil
+	}
 	if spec.Dispatch != nil {
-		byInstance := make(map[string]int)
 		for _, diagnostic := range spec.Dispatch.Diagnostics() {
-			if extension.ValidateComponent(extension.Component{InstanceID: diagnostic.InstanceID, Artifact: diagnostic.Artifact}) != nil || extension.ValidateIdentifier(diagnostic.ID) != nil || extension.ValidateContract(diagnostic.Contract) != nil || extension.ValidateScope(diagnostic.Scope) != nil {
+			component := extension.Component{InstanceID: diagnostic.InstanceID, Artifact: diagnostic.Artifact}
+			owned, ownerErr := componentPlan(component)
+			if ownerErr != nil || extension.ValidateIdentifier(diagnostic.ID) != nil || extension.ValidateContract(diagnostic.Contract) != nil || extension.ValidateScope(diagnostic.Scope) != nil {
 				return fail(fmt.Errorf("%w: invalid dispatch diagnostic", ErrExtensionPlanMismatch))
 			}
-			index, ok := byInstance[diagnostic.InstanceID]
-			if !ok {
-				index = len(descriptor.Handlers)
-				byInstance[diagnostic.InstanceID] = index
-				descriptor.Handlers = append(descriptor.Handlers, session.HandlerPlanIdentity{
-					InstanceID: diagnostic.InstanceID,
-					Artifact:   diagnostic.Artifact,
-				})
-			}
-			descriptor.Handlers[index].Registrations = append(descriptor.Handlers[index].Registrations, session.RegistrationIdentity{
+			owned.Handlers = append(owned.Handlers, session.RegistrationIdentity{
 				ID: diagnostic.ID, Contract: diagnostic.Contract.ID, Version: diagnostic.Contract.Version,
 				Order: diagnostic.Order, Scope: diagnostic.Scope, Kind: session.HandlerKind(diagnostic.Kind),
 			})
@@ -112,30 +125,42 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		if capability.Resolve == nil {
 			return fail(fmt.Errorf("%w: tool resolver required", ErrExtensionPlanMismatch))
 		}
+		owned, err := componentPlan(capability.Component)
+		if err != nil {
+			return fail(err)
+		}
 		tools[index] = capability
-		descriptor.Tools = append(descriptor.Tools, capability.Identity)
+		owned.Tools = append(owned.Tools, capability.Identity)
 	}
 	prompts := make([]MountedPrompt, len(spec.Prompts))
 	for index, capability := range spec.Prompts {
 		if capability.Prompt.Provider == nil || capability.Prompt.Name == "" {
 			return fail(fmt.Errorf("%w: prompt behavior required", ErrExtensionPlanMismatch))
 		}
-		if capability.Identity.Name != capability.Prompt.Name || capability.Identity.Order != capability.Prompt.Order || capability.Identity.InstanceID != capability.Prompt.InstanceID {
+		if capability.Identity.Name != capability.Prompt.Name || capability.Identity.Order != capability.Prompt.Order || capability.Component.InstanceID != capability.Prompt.InstanceID {
 			return fail(fmt.Errorf("%w: prompt identity does not match behavior", ErrExtensionPlanMismatch))
 		}
+		owned, err := componentPlan(capability.Component)
+		if err != nil {
+			return fail(err)
+		}
 		prompts[index] = capability.Prompt
-		descriptor.Prompts = append(descriptor.Prompts, capability.Identity)
+		owned.Prompts = append(owned.Prompts, capability.Identity)
 	}
 	guards := make([]MountedToolGuard, len(spec.Guards))
 	for index, capability := range spec.Guards {
 		if capability.Guard.Guard == nil || capability.Guard.ID == "" {
 			return fail(fmt.Errorf("%w: guard behavior required", ErrExtensionPlanMismatch))
 		}
-		if capability.Identity.RegistrationID != capability.Guard.ID || capability.Identity.Order != capability.Guard.Order || capability.Identity.InstanceID != capability.Guard.InstanceID {
+		if capability.Identity.RegistrationID != capability.Guard.ID || capability.Identity.Order != capability.Guard.Order || capability.Component.InstanceID != capability.Guard.InstanceID {
 			return fail(fmt.Errorf("%w: guard identity does not match behavior", ErrExtensionPlanMismatch))
 		}
+		owned, err := componentPlan(capability.Component)
+		if err != nil {
+			return fail(err)
+		}
 		guards[index] = capability.Guard
-		descriptor.Guards = append(descriptor.Guards, capability.Identity)
+		owned.Guards = append(owned.Guards, capability.Identity)
 	}
 	restrictions := make([]PlanRestriction, len(spec.Restrictions))
 	for index, capability := range spec.Restrictions {
@@ -146,10 +171,14 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		if capability.Identity.RulesHash != rules.Hash {
 			return fail(fmt.Errorf("%w: restriction identity does not match behavior", ErrExtensionPlanMismatch))
 		}
+		owned, err := componentPlan(capability.Component)
+		if err != nil {
+			return fail(err)
+		}
 		capability.Allowed = rules.Allowed
 		capability.Denied = rules.Denied
 		restrictions[index] = capability
-		descriptor.Restrictions = append(descriptor.Restrictions, capability.Identity)
+		owned.Restrictions = append(owned.Restrictions, capability.Identity)
 	}
 	fingerprint, err := session.FingerprintExtensionPlan(descriptor)
 	if err != nil {

@@ -6,14 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
 
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
-	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
@@ -266,64 +264,21 @@ func openEventSink(ctx context.Context, cfg ModuleConfig, factory engineFactory)
 type loadedHook struct {
 	module    *module
 	component hookComponent
-	mu        sync.Mutex
-	turns     map[session.RunID]wittypes.TurnMetadata
 }
 
-func (h *loadedHook) close() error {
-	h.cleanup()
-	return h.module.Close()
-}
-
-func (h *loadedHook) cleanup() {
-	h.mu.Lock()
-	h.turns = nil
-	h.mu.Unlock()
-}
+func (h *loadedHook) close() error { return h.module.Close() }
 
 func (h *loadedHook) beforeRunBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
-	turn := turnMetadataFromBounded(metadata)
-	h.cacheTurn(turn)
-	return h.beforeRunMetadata(ctx, turn)
+	return h.beforeRunMetadata(ctx, turnMetadataFromBounded(metadata))
 }
 
 func (h *loadedHook) beforeRunMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
 	return h.module.call(ctx, "hook.before-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.BeforeRun(callCtx, turn) })
 }
 
-func (h *loadedHook) beforeTurnBounded(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
-	return h.beforeTurnMetadata(ctx, turnMetadataFromBounded(metadata))
-}
-
-func (h *loadedHook) beforeTurnMetadata(ctx context.Context, turn wittypes.TurnMetadata) error {
-	if err := h.module.call(ctx, "hook.before-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.BeforeTurn(callCtx, turn) }); err != nil {
-		return err
-	}
-	h.cacheTurn(turn)
-	return nil
-}
-
-func (h *loadedHook) cacheTurn(turn wittypes.TurnMetadata) {
-	h.mu.Lock()
-	if h.turns == nil {
-		h.turns = make(map[session.RunID]wittypes.TurnMetadata)
-	}
-	h.turns[session.RunID(turn.RunID)] = turn
-	h.mu.Unlock()
-}
-
-func (h *loadedHook) finish(ctx context.Context, result runtime.Result) error {
-	h.mu.Lock()
-	turn, ok := h.turns[result.RunID]
-	delete(h.turns, result.RunID)
-	h.mu.Unlock()
-	if !ok {
-		turn = wittypes.TurnMetadata{RunID: string(result.RunID)}
-	}
-	return errors.Join(
-		h.module.call(ctx, "hook.after-turn", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterTurn(callCtx, turn) }),
-		h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterRun(callCtx, turn) }),
-	)
+func (h *loadedHook) finish(ctx context.Context, metadata runtime.BoundedTurnMetadata) error {
+	turn := turnMetadataFromBounded(metadata)
+	return h.module.call(ctx, "hook.after-run", turnMetadataSize(turn), func(callCtx context.Context) error { return h.component.AfterRun(callCtx, turn) })
 }
 
 func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedHook, error) {
@@ -336,7 +291,7 @@ func openHook(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*lo
 		_ = module.Close()
 		return nil, err
 	}
-	return &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}, nil
+	return &loadedHook{module: module, component: component}, nil
 }
 
 // loadedToolMiddleware preserves attachments and metadata on replacement.

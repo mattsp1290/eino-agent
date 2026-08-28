@@ -128,7 +128,7 @@ func TestEventSinkUsesContentFreeSummary(t *testing.T) {
 	}
 }
 
-func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
+func TestRegisteredHookReceivesBoundedMetadataAtRunBoundaries(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string]wittypes.TurnMetadata{}
 	component := &fakeComponent{call: func(_ context.Context, operation string, input, _ any) error {
@@ -141,7 +141,7 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook := &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
+	hook := &loadedHook{module: module, component: component}
 	defer func() { _ = hook.close() }()
 
 	registry := newTestExtensionRegistry(nil)
@@ -164,25 +164,81 @@ func TestRegisteredHookReceivesBoundedMetadataAcrossAllPhases(t *testing.T) {
 		RoleCounts: runtime.MessageRoleCounts{System: 1, User: 1}, HasSystemPrompt: true,
 	}
 	extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
-	if _, err := extension.Invoke(plan, context.Background(), runtime.TurnPreparePoint, metadata, func(_ context.Context, value runtime.BoundedTurnMetadata) (runtime.BoundedTurnMetadata, error) {
-		return value, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
+	extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}, Metadata: metadata})
 
-	for _, operation := range []string{"hook.before-run", "hook.before-turn", "hook.after-turn", "hook.after-run"} {
+	for _, operation := range []string{"hook.before-run", "hook.after-run"} {
 		turn := seen[operation]
 		if turn.EpochID != "epoch-1" || turn.AgentName != "agent" || turn.AgentMode != "primary" || turn.ProviderID != "provider" || turn.ModelID != "model" {
 			t.Fatalf("%s metadata = %#v", operation, turn)
 		}
 	}
-	if seen["hook.before-turn"].ToolNames.Len() != 1 || seen["hook.after-run"].ToolNames.Len() != 1 || seen["hook.before-turn"].MessageCount != 2 || !seen["hook.before-turn"].HasSystemPrompt {
+	if len(seen) != 2 || seen["hook.before-run"].ToolNames.Len() != 1 || seen["hook.after-run"].ToolNames.Len() != 1 || seen["hook.after-run"].MessageCount != 2 || !seen["hook.after-run"].HasSystemPrompt {
 		t.Fatalf("turn metadata = %#v", seen)
 	}
 }
 
-func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.T) {
+func TestRegisteredHookRetainedOperationsAreExactlyOnceAndContained(t *testing.T) {
+	var operations []string
+	component := &fakeComponent{call: func(_ context.Context, operation string, input, _ any) error {
+		operations = append(operations, operation+":"+input.(wittypes.TurnMetadata).RunID)
+		if operation == "hook.after-run" {
+			return errors.New("contained after-run failure")
+		}
+		return nil
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("hook-settlements")), hookContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hook := &loadedHook{module: module, component: component}
+	defer func() { _ = hook.close() }()
+	registry := newTestExtensionRegistry(nil)
+	registered := extension.Component{InstanceID: "settlement-hook", Artifact: extension.Artifact{Name: "settlement-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
+	_, err = registry.Mount(context.Background(), registered, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return registerHook(registrar, extension.Registration{ID: "hook", Scope: extension.GlobalScope()}, hook)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+
+	settlements := []struct {
+		runID  session.RunID
+		status session.RunStatus
+		err    runtime.ClassifiedError
+	}{
+		{runID: "success", status: session.RunCompleted},
+		{runID: "failure", status: session.RunFailed, err: runtime.ClassifiedError{Code: "operation_failed"}},
+		{runID: "rejection", status: session.RunFailed, err: runtime.ClassifiedError{Code: "provider_rejected"}},
+		{runID: "cancellation", status: session.RunInterrupted, err: runtime.ClassifiedError{Code: "interrupted"}},
+	}
+	for _, settlement := range settlements {
+		metadata := runtime.BoundedTurnMetadata{SessionID: "session", RunID: settlement.runID}
+		extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: "session", RunID: settlement.runID, Metadata: metadata})
+		// Notifications contain callback errors, including after-run failures.
+		extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: "session", Result: runtime.Result{RunID: settlement.runID, Status: settlement.status}, Metadata: metadata, Error: settlement.err})
+	}
+	// A run that never reaches durable settlement invokes no after-run callback;
+	// loadedHook retains no metadata that needs cleanup.
+	extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: "session", RunID: "abandoned", Metadata: runtime.BoundedTurnMetadata{SessionID: "session", RunID: "abandoned"}})
+
+	want := []string{
+		"hook.before-run:success", "hook.after-run:success",
+		"hook.before-run:failure", "hook.after-run:failure",
+		"hook.before-run:rejection", "hook.after-run:rejection",
+		"hook.before-run:cancellation", "hook.after-run:cancellation",
+		"hook.before-run:abandoned",
+	}
+	if !reflect.DeepEqual(operations, want) {
+		t.Fatalf("hook operations = %v, want %v", operations, want)
+	}
+}
+
+func TestRegisteredHookUsesSettlementMetadataWithoutAdmissionState(t *testing.T) {
 	seen := map[string]wittypes.TurnMetadata{}
 	component := &fakeComponent{call: func(_ context.Context, operation string, input, _ any) error {
 		seen[operation] = input.(wittypes.TurnMetadata)
@@ -192,7 +248,7 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook := &loadedHook{module: module, component: component, turns: make(map[session.RunID]wittypes.TurnMetadata)}
+	hook := &loadedHook{module: module, component: component}
 	defer func() { _ = hook.close() }()
 	registry := newTestExtensionRegistry(nil)
 	extensionComponent := extension.Component{InstanceID: "early-hook", Artifact: extension.Artifact{Name: "early-hook", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
@@ -208,56 +264,39 @@ func TestRegisteredHookUsesAdmissionMetadataWhenRunSettlesBeforeTurn(t *testing.
 	}
 	defer plan.Release()
 	metadata := runtime.BoundedTurnMetadata{RunID: "run-early", SessionID: "session-early", EpochID: "epoch-early", AgentName: "agent", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true}
-	extension.Notify(plan, context.Background(), runtime.RunAdmittedPoint, runtime.RunAdmittedNotice{SessionID: metadata.SessionID, RunID: metadata.RunID, Metadata: metadata})
-	extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}})
-	for _, operation := range []string{"hook.after-turn", "hook.after-run"} {
-		turn := seen[operation]
-		if turn.SessionID != "session-early" || turn.EpochID != "epoch-early" || turn.AgentName != "agent" || turn.ProviderID != "provider" || turn.ModelID != "model" || turn.MessageCount != 1 || !turn.HasSystemPrompt {
-			t.Fatalf("%s metadata = %#v", operation, turn)
-		}
+	extension.Notify(plan, context.Background(), runtime.RunSettledPoint, runtime.RunSettledNotice{SessionID: metadata.SessionID, Result: runtime.Result{RunID: metadata.RunID}, Metadata: metadata})
+	turn := seen["hook.after-run"]
+	if turn.SessionID != "session-early" || turn.EpochID != "epoch-early" || turn.AgentName != "agent" || turn.ProviderID != "provider" || turn.ModelID != "model" || turn.MessageCount != 1 || !turn.HasSystemPrompt {
+		t.Fatalf("after-run metadata = %#v", turn)
 	}
-	if len(hook.turns) != 0 {
-		t.Fatalf("cached turns leaked after settlement: %#v", hook.turns)
+	if len(seen) != 1 {
+		t.Fatalf("hook operations = %#v", seen)
 	}
 }
 
-func TestFinishRegisteredHookRunsCleanupAndJoinsErrors(t *testing.T) {
-	afterTurnErr := errors.New("after turn")
+func TestFinishRegisteredHookReturnsAfterRunError(t *testing.T) {
 	afterRunErr := errors.New("after run")
 	var operations []string
 	component := &fakeComponent{call: func(_ context.Context, operation string, _ any, _ any) error {
 		operations = append(operations, operation)
-		switch operation {
-		case "hook.after-turn":
-			return afterTurnErr
-		case "hook.after-run":
+		if operation == "hook.after-run" {
 			return afterRunErr
-		default:
-			return nil
 		}
+		return nil
 	}}
 	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("hook-cleanup")), hookContract, fakeFactory(component))
 	if err != nil {
 		t.Fatal(err)
 	}
-	hook := &loadedHook{module: module, component: component, turns: map[session.RunID]wittypes.TurnMetadata{"run-1": {RunID: "run-1"}}}
+	hook := &loadedHook{module: module, component: component}
 	defer func() { _ = hook.close() }()
-	err = finishRegisteredHook(context.Background(), hook, runtime.RunSettledNotice{SessionID: "session-1", Result: runtime.Result{RunID: "run-1"}})
-	joined, ok := err.(interface{ Unwrap() []error })
-	if !ok || len(joined.Unwrap()) != 2 || !reflect.DeepEqual(operations, []string{"hook.after-turn", "hook.after-run"}) {
+	err = finishRegisteredHook(context.Background(), hook, runtime.RunSettledNotice{SessionID: "session-1", Result: runtime.Result{RunID: "run-1"}, Metadata: runtime.BoundedTurnMetadata{SessionID: "session-1", RunID: "run-1"}})
+	if !reflect.DeepEqual(operations, []string{"hook.after-run"}) {
 		t.Fatalf("finishRegisteredHook = %v operations=%v", err, operations)
 	}
-	for index, operation := range []string{"hook.after-turn", "hook.after-run"} {
-		var extensionErr *Error
-		if !errors.As(joined.Unwrap()[index], &extensionErr) || extensionErr.Operation != operation {
-			t.Fatalf("joined error %d = %#v", index, joined.Unwrap()[index])
-		}
-	}
-	hook.mu.Lock()
-	_, cached := hook.turns["run-1"]
-	hook.mu.Unlock()
-	if cached {
-		t.Fatal("after-run did not remove cached metadata")
+	var extensionErr *Error
+	if !errors.As(err, &extensionErr) || extensionErr.Operation != "hook.after-run" {
+		t.Fatalf("after-run error = %#v", err)
 	}
 }
 
@@ -309,9 +348,7 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 	}
 	defer plan.Release()
 	assembly := runtime.ContextAssembly{Metadata: runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session"}}
-	assembled, err := extension.Invoke(plan, context.Background(), runtime.ContextAssemblePoint, assembly, func(_ context.Context, value runtime.ContextAssembly) (runtime.ContextAssembly, error) {
-		return value, nil
-	})
+	assembled, err := extension.ApplyTransforms(plan, context.Background(), runtime.ContextAssemblePoint, assembly)
 	if err != nil || len(assembled.Contributions) != 2 || assembled.Contributions[0].Source == assembled.Contributions[1].Source {
 		t.Fatalf("assembled contributions = %#v, %v", assembled.Contributions, err)
 	}
@@ -339,9 +376,7 @@ func TestRegisteredContextSourceRejectsAssistantContribution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = extension.Invoke(plan, context.Background(), runtime.ContextAssemblePoint, runtime.ContextAssembly{}, func(_ context.Context, value runtime.ContextAssembly) (runtime.ContextAssembly, error) {
-		return value, nil
-	})
+	_, err = extension.ApplyTransforms(plan, context.Background(), runtime.ContextAssemblePoint, runtime.ContextAssembly{})
 	plan.Release()
 	if err == nil || !strings.Contains(err.Error(), "unsupported role") {
 		t.Fatalf("assistant context error = %v", err)
@@ -424,7 +459,7 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	if err := loader.Close(context.Background()); err != nil || !component.closed.Load() {
 		t.Fatalf("Close = %v, closed=%t", err, component.closed.Load())
 	}
-	if len(contextSourceContract.functions) != 1 || len(eventSinkContract.functions) != 1 || len(hookContract.functions) != 4 || len(toolMiddlewareContract.functions) != 2 {
+	if len(contextSourceContract.functions) != 1 || len(eventSinkContract.functions) != 1 || len(hookContract.functions) != 2 || len(toolMiddlewareContract.functions) != 2 {
 		t.Fatal("phase B contract declarations incomplete")
 	}
 }
@@ -549,9 +584,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 		RunID: "run", SessionID: "session", Base: []*einoschema.Message{einoschema.UserMessage("base")},
 		Metadata: runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", EpochID: "epoch", AgentName: "agent", AgentMode: "primary", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true},
 	}
-	assembly, err = extension.Invoke(plan, context.Background(), runtime.ContextAssemblePoint, assembly, func(_ context.Context, value runtime.ContextAssembly) (runtime.ContextAssembly, error) {
-		return value, nil
-	})
+	assembly, err = extension.ApplyTransforms(plan, context.Background(), runtime.ContextAssemblePoint, assembly)
 	if err != nil || len(assembly.Contributions) != 1 || assembly.Contributions[0].Message.Content != "from-wasm" {
 		t.Fatalf("assembly = %#v, %v", assembly, err)
 	}

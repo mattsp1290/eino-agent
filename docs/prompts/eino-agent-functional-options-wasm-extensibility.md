@@ -175,7 +175,8 @@ semantics are binding, grounded in `executeTools`
 (`runtime/orchestrator.go`) and the resume path (`runtime/interrupt.go`):
 
 - **Rewrite point**: the `BeforeToolCall` chain runs after
-  `InputDecoder.DecodeToolInput` and **before** `Store.CreateToolCall`. This
+  `InputDecoder.DecodeToolInput` and **before**
+  `ExecutionStore.CreateToolCall(CreateToolCallRequest)`. This
   is a deliberate resequencing of `executeTools`, not a one-line insertion:
   today the runtime `ToolCall` value is only assembled after the durable
   record and both status events; the implementation must assemble the
@@ -188,12 +189,13 @@ semantics are binding, grounded in `executeTools`
   want an original-input audit trail record it themselves from their own
   middleware.
 - **Patch point**: the `AfterToolCall` chain runs after `executeTool`
-  returns and **before** `encodeToolOutput`/`Store.FinishToolCall`. The
+  returns and **before**
+  `ExecutionStore.SettleToolCall(SettleToolCallRequest)`. The
   durable output, the settled tool-call event, the persisted
   `PartToolResult`, and the model-visible tool message all observe the
   patched result.
-- **Ordering**: `BeforeToolCall` runs in registration order and
-  `AfterToolCall` in reverse registration order (onion model). Permissions
+- **Ordering**: `BeforeToolCall` and `AfterToolCall` both run as transform
+  waterfalls in registration order. Permissions
   decide after the rewrite chain completes, so policy always evaluates what
   will actually execute.
 - **Exactly-once**: because rewrite precedes durable admission, resumed
@@ -244,7 +246,7 @@ proven):**
 - `event-sink` — `emit` receiving a bounded event DTO (kind, session/run
   identity, timestamps, bounded payload summary). Fire-and-forget from the
   guest's perspective; maps to `runtime.EventSink` and pi's `subscribe`.
-- `hook` — `before-run`, `before-turn`, `after-turn`, `after-run` receive the
+- `hook` — `before-run` and `after-run` receive the
   bounded snapshot DTO below and return only success or a structured error.
 - `tool-middleware` — `before-tool-call` receiving tool name, tool-call ID,
   the normalized JSON input, and the bounded turn metadata, returning a
@@ -379,8 +381,8 @@ func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error)
 func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error)
 ```
 
-`ModuleConfig` carries path, expected SHA-256, per-call limits, and bounded
-non-secret guest configuration. Wrapper semantics:
+`ModuleConfig` carries path, expected SHA-256, and per-call limits. Wrapper
+semantics:
 
 - Wrappers translate between runtime types and WIT DTOs at the boundary,
   applying the bounds from section 4 in host code on both directions.
@@ -398,11 +400,9 @@ non-secret guest configuration. Wrapper semantics:
   It reaches the orchestrator the same way native definitions do:
   `composition.Registry.Mount` → `Registrar.Tool` →
   `runtime.WithRunPlanProvider(registry)`.
-- The Wasm-backed `runtime.Hook` echoes its input snapshot unmodified from
-  `BeforeTurn`. This is a wrapper-implementation policy, not a change to
-  `runtime.Hook` — the interface's `BeforeTurn(ctx, TurnSnapshot)
-  (TurnSnapshot, error)` contract still permits native hooks to mutate, and
-  the orchestrator continues to apply returned snapshots.
+- The Wasm hook world exposes only run-boundary notifications: `before-run`
+  receives admission metadata and `after-run` receives the same bounded
+  projection on the settlement notice. The adapter retains no per-run state.
 - `runtime.EventSink` reality check (verified): every `Emit` call site in the
   orchestrator and admitter discards the error today — behavior is
   silent-drop, with no observer logging, and the tool-call status emits are
