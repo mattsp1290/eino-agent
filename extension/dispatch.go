@@ -271,10 +271,14 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 		}
 		if callbackErr != nil {
 			var delegated *delegatedError
-			if errors.As(callbackErr, &delegated) {
+			if errors.As(callbackErr, &delegated) && callbackErr == delegated {
 				return out, delegated.cause
 			}
-			return out, propagateCallbackFailure(plan, currentCtx, entry, callbackErr)
+			callbackFailure := propagateCallbackFailure(plan, currentCtx, entry, callbackErr)
+			if finalDelegatedFailure != nil {
+				return out, errors.Join(finalDelegatedFailure, callbackFailure)
+			}
+			return out, callbackFailure
 		}
 		if point.definition.validateOutput != nil {
 			if validateErr := point.definition.validateOutput(out); validateErr != nil {

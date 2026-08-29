@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"strings"
 	"testing"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -35,7 +36,11 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 		}},
 	}
 
-	request, err := snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace"}).Clone()
+	traceAttributes := map[string]string{"request": "original"}
+	request, audited, _, err := auditModelRequest(
+		snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace", Attributes: traceAttributes}, []*einoschema.Message{originalMessage}),
+		[]string{"temperature"}, 0,
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,12 +56,15 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 	snapshot.Messages = nil
 	snapshot.Tools = nil
 	snapshot.Config.Agent.Options["temperature"] = "changed"
-	request.Messages[0].Content = "changed"
-	request.Tools[0].Name = "changed"
-	if len(request.Messages) != 1 || len(request.Tools) != 1 || request.Options["temperature"] != "0" {
+	originalMessage.Content = "changed"
+	originalTool.Name = "changed"
+	traceAttributes["request"] = "changed"
+	if len(request.Messages) != 1 || len(request.Tools) != 1 || request.Messages[0].Content != "hello" || request.Tools[0].Name != "search" || request.Options["temperature"] != "0" || request.Identity.TraceAttributes["request"] != "original" {
 		t.Fatalf("request was not cloned: %#v", request)
 	}
-	if originalMessage.Content != "hello" || originalTool.Name != "search" {
-		t.Fatalf("original message/tool mutated: %q/%q", originalMessage.Content, originalTool.Name)
+	request.Messages[0].Content = "canonical changed"
+	request.Tools[0].Name = "canonical changed"
+	if !strings.Contains(string(audited.Messages[0].Canonical), `"hello"`) || strings.Contains(string(audited.Messages[0].Canonical), "canonical changed") || audited.Tools[0].Name != "search" || audited.SafeCallConfig["temperature"] != "0" {
+		t.Fatalf("audit projection changed with canonical request: %#v", audited)
 	}
 }

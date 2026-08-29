@@ -52,19 +52,13 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
 		}
 	}()
-	request := snapshot.ProviderRequest(messageID, o.trace)
-	request.Messages = cloneMessages(messages)
+	request := snapshot.ProviderRequest(messageID, o.trace, messages)
 	request.System, err = o.renderSystemPrompt(ctx, execution.plan, snapshot, attempt, step)
 	if err != nil {
 		streamErr = err
 		return nil, err
 	}
-	request, err = request.Clone()
-	if err != nil {
-		streamErr = err
-		return nil, err
-	}
-	audited, contentHash, err := AuditModelRequest(request, o.modelRequestSafeOptions, o.modelRequestMaxBytes)
+	request, audited, contentHash, err := auditModelRequest(request, o.modelRequestSafeOptions, o.modelRequestMaxBytes)
 	if err != nil {
 		streamErr = err
 		return nil, err

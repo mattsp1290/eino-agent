@@ -642,6 +642,106 @@ func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 	}
 }
 
+func TestRequiredDelegationPreservesCallbackAuthoredErrors(t *testing.T) {
+	terminalErr := errors.New("terminal detail")
+	innerErr := errors.New("inner detail")
+	outerErr := errors.New("outer detail")
+	var diagnostics []Diagnostic
+	registry := newTestRegistry(ReporterFunc(func(_ context.Context, diagnostic Diagnostic) {
+		diagnostics = append(diagnostics, diagnostic)
+	}))
+
+	for index, callback := range []struct {
+		instance string
+		invoke   func(context.Context, testPayload, Next[testPayload, string]) (string, error)
+	}{
+		{
+			instance: "outer",
+			invoke: func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+				output, err := next(ctx, input)
+				return output, errors.Join(err, outerErr)
+			},
+		},
+		{
+			instance: "inner",
+			invoke: func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+				output, err := next(ctx, input)
+				return output, fmt.Errorf("inner context: %w", errors.Join(err, innerErr))
+			},
+		},
+	} {
+		callback := callback
+		_, err := registry.Mount(context.Background(), testComponent(callback.instance), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return OnAround(registrar, testAround, spec(callback.instance, callback.instance, index, GlobalScope()), callback.invoke)
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	_, err = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		return "", terminalErr
+	})
+	if !errors.Is(err, terminalErr) || !errors.Is(err, innerErr) || !errors.Is(err, outerErr) {
+		t.Fatalf("InvokeAround error = %v", err)
+	}
+	var callbackErr *CallbackError
+	if !errors.As(err, &callbackErr) {
+		t.Fatalf("InvokeAround error lacks CallbackError: %v", err)
+	}
+	if len(diagnostics) != 2 || diagnostics[0].InstanceID != "inner" || diagnostics[1].InstanceID != "outer" {
+		t.Fatalf("diagnostics = %#v", diagnostics)
+	}
+	if !strings.Contains(err.Error(), terminalErr.Error()) || strings.Contains(err.Error(), innerErr.Error()) || strings.Contains(err.Error(), outerErr.Error()) || strings.Contains(err.Error(), "inner context") {
+		t.Fatalf("InvokeAround error text = %q", err)
+	}
+}
+
+func TestRequiredDelegationDirectOuterPropagationDoesNotDuplicateDiagnostic(t *testing.T) {
+	terminalErr := errors.New("terminal failed")
+	innerErr := errors.New("inner failed")
+	var diagnostics []Diagnostic
+	registry := newTestRegistry(ReporterFunc(func(_ context.Context, diagnostic Diagnostic) {
+		diagnostics = append(diagnostics, diagnostic)
+	}))
+	for index, callback := range []struct {
+		instance string
+		invoke   func(context.Context, testPayload, Next[testPayload, string]) (string, error)
+	}{
+		{instance: "outer", invoke: func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			return next(ctx, input)
+		}},
+		{instance: "inner", invoke: func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			output, err := next(ctx, input)
+			return output, errors.Join(err, innerErr)
+		}},
+	} {
+		callback := callback
+		_, err := registry.Mount(context.Background(), testComponent(callback.instance), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+			return OnAround(registrar, testAround, spec(callback.instance, callback.instance, index, GlobalScope()), callback.invoke)
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	_, err = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+		return "", terminalErr
+	})
+	if !errors.Is(err, terminalErr) || !errors.Is(err, innerErr) || len(diagnostics) != 1 || diagnostics[0].InstanceID != "inner" {
+		t.Fatalf("InvokeAround error = %v diagnostics=%#v", err, diagnostics)
+	}
+}
+
 func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
 	registry := newTestRegistry(nil)
 	component := testComponent("late-next")

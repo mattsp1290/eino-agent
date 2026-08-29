@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -146,10 +148,53 @@ func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithOwnerID("new-owner"), WithClock(func() time.Time { return now }))
 	execution := newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{}), run)
-	result := orchestrator.resumeRunWithSettlement(context.Background(), execution, run, nil)
+	done := make(chan Result, 1)
+	orchestrator.executeResume(context.Background(), execution, run, done)
+	result := <-done
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
 	}
+}
+
+func TestTerminalResumeReturnsCompletedHandleWithoutExecution(t *testing.T) {
+	base := newAdmissionStore()
+	run := session.Run{ID: "terminal-run", SessionID: "terminal-session", Status: session.RunFailed, Error: "already failed"}
+	base.runs[run.ID] = run
+	store := &terminalResumeStore{admissionStore: base}
+	resumeCalls := 0
+	plan := mustTestRunPlan(RunPlanSpec{})
+	defer plan.Release()
+	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithRunPlanProvider(staticRunPlanProvider{plan: plan, resumeCalls: &resumeCalls}))
+
+	handle, err := orchestrator.Resume(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.RunID != run.ID || result.Status != run.Status || result.Error == nil || result.Error.Error() != run.Error {
+		t.Fatalf("terminal result = %+v", result)
+	}
+	if resumeCalls != 0 {
+		t.Fatalf("resume plan calls = %d, want 0", resumeCalls)
+	}
+	if err := handle.Interrupt(context.Background(), "ignored"); err != nil {
+		t.Fatalf("Interrupt = %v", err)
+	}
+	if _, open := <-handle.Done(); open {
+		t.Fatal("terminal handle Done remained open")
+	}
+}
+
+type terminalResumeStore struct {
+	*admissionStore
+}
+
+func (s *terminalResumeStore) ClaimRun(context.Context, session.RunClaim) (session.Run, error) {
+	panic("terminal resume claimed run")
+}
+
+func (s *terminalResumeStore) Execution(session.RunFence) session.ExecutionStore {
+	panic("terminal resume requested execution store")
 }
 
 func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
@@ -187,6 +232,7 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 
 func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 	finishErr := errors.New("terminal finish failed")
+	providerErr := errors.New("provider failed")
 	for _, test := range []struct {
 		name       string
 		streamer   scriptedStreamer
@@ -194,13 +240,17 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 		wantStatus session.RunStatus
 		wantNotice int
 		wantError  bool
+		wantCauses []error
 	}{
 		{name: "completed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 		}), wantStatus: session.RunCompleted, wantNotice: 1},
 		{name: "failed and persisted", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return nil, errors.New("provider failed")
-		}), wantStatus: session.RunFailed, wantNotice: 1, wantError: true},
+			return nil, providerErr
+		}), wantStatus: session.RunFailed, wantNotice: 1, wantError: true, wantCauses: []error{providerErr}},
+		{name: "work and terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			return nil, providerErr
+		}), finishErr: finishErr, wantStatus: session.RunFailed, wantError: true, wantCauses: []error{providerErr, finishErr}},
 		{name: "terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 		}), finishErr: finishErr, wantStatus: session.RunFailed, wantNotice: 0, wantError: true},
@@ -221,6 +271,11 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 			result := startAndWait(t, orchestrator)
 			if result.Status != test.wantStatus || (result.Error != nil) != test.wantError {
 				t.Fatalf("result = %+v", result)
+			}
+			for _, cause := range test.wantCauses {
+				if !errors.Is(result.Error, cause) {
+					t.Fatalf("result error = %v, want cause %v", result.Error, cause)
+				}
 			}
 			if len(notices) != test.wantNotice {
 				t.Fatalf("settled notices = %#v, want %d", notices, test.wantNotice)
@@ -248,6 +303,7 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 		{name: "interrupted and persisted", wantNotice: 1},
 		{name: "terminal persistence failed", finishErr: finishErr, wantError: finishErr},
 		{name: "pre-finalization failure", listErr: listErr, wantNotice: 1, wantError: listErr},
+		{name: "work and terminal persistence failed", finishErr: finishErr, listErr: listErr, wantError: listErr},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			base := newAdmissionStore()
@@ -266,6 +322,12 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			if !errors.Is(result.Error, test.wantError) {
 				t.Fatalf("resume result = %+v, want error %v", result, test.wantError)
 			}
+			if test.finishErr != nil && test.listErr != nil && !errors.Is(result.Error, test.finishErr) {
+				t.Fatalf("resume result = %+v, want settlement error %v", result, test.finishErr)
+			}
+			if calls := store.settlementCalls.Load(); calls != 1 {
+				t.Fatalf("settlement calls = %d, want 1", calls)
+			}
 			if len(notices) != test.wantNotice {
 				t.Fatalf("settled notices = %#v, want %d", notices, test.wantNotice)
 			}
@@ -283,6 +345,26 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 	}
 }
 
+func TestExecuteResumeRecoversOrchestrationPanicAndSettlesOnce(t *testing.T) {
+	base := newAdmissionStore()
+	run := session.Run{ID: "panic-run", SessionID: "panic-session", ClaimToken: "panic-claim", Status: session.RunPending, CreatedAt: time.Now().UTC()}
+	base.runs[run.ID] = run
+	store := &runLifecycleStore{admissionStore: base, panicList: true}
+	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithClock(time.Now))
+	done := make(chan Result, 1)
+	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{}), run), run, done)
+	result := <-done
+	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "resume run panic") {
+		t.Fatalf("resume panic result = %+v", result)
+	}
+	if calls := store.settlementCalls.Load(); calls != 1 {
+		t.Fatalf("settlement calls = %d, want 1", calls)
+	}
+	if _, open := <-done; open {
+		t.Fatal("resume panic result channel remained open")
+	}
+}
+
 func countEvents(events []Event, kind EventKind) int {
 	var count int
 	for _, event := range events {
@@ -297,18 +379,22 @@ type runLifecycleStore struct {
 	*admissionStore
 	terminalFinishErr error
 	listErr           error
+	panicList         bool
+	settlementCalls   atomic.Int32
 }
 
 func (s *runLifecycleStore) Execution(fence session.RunFence) session.ExecutionStore {
-	return &runLifecycleExecution{ExecutionStore: s.admissionStore.Execution(fence), terminalFinishErr: s.terminalFinishErr}
+	return &runLifecycleExecution{ExecutionStore: s.admissionStore.Execution(fence), terminalFinishErr: s.terminalFinishErr, settlementCalls: &s.settlementCalls}
 }
 
 type runLifecycleExecution struct {
 	session.ExecutionStore
 	terminalFinishErr error
+	settlementCalls   *atomic.Int32
 }
 
 func (s *runLifecycleExecution) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	s.settlementCalls.Add(1)
 	if request.Settlement.Status != "" && s.terminalFinishErr != nil {
 		return session.RunSettlementResult{}, s.terminalFinishErr
 	}
@@ -323,6 +409,9 @@ func (s *runLifecycleStore) FinishRun(ctx context.Context, run session.Run) erro
 }
 
 func (s *runLifecycleStore) ListUnfinishedToolCalls(ctx context.Context, runID session.RunID) ([]session.ToolCall, error) {
+	if s.panicList {
+		panic("unfinished calls panic")
+	}
 	if s.listErr != nil {
 		return nil, s.listErr
 	}

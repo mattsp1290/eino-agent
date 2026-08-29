@@ -23,7 +23,8 @@ func TestRunEventSinkOnlyFansOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	infrastructure := &capturingSink{}
-	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store)), nil, run)
+	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store)), mustTestRunPlan(RunPlanSpec{}), run)
+	defer execution.release()
 	sink := execution.eventSink(infrastructure)
 
 	if err := sink.Emit(ctx, Event{Kind: EventMessageDelta, SessionID: run.SessionID, RunID: run.ID, LiveOnly: true}); err != nil {
@@ -35,6 +36,18 @@ func TestRunEventSinkOnlyFansOut(t *testing.T) {
 	if len(infrastructure.events) != 1 || infrastructure.events[0].Kind != EventMessageDelta {
 		t.Fatalf("infrastructure events = %#v", infrastructure.events)
 	}
+}
+
+func TestNewRunExecutionRejectsNilPlan(t *testing.T) {
+	store := newAdmissionStore()
+	run := session.Run{ID: "run-nil-plan", SessionID: "session-nil-plan", ClaimToken: "claim", Status: session.RunRunning}
+	store.runs[run.ID] = run
+	defer func() {
+		if recover() == nil {
+			t.Fatal("newRunExecution accepted nil plan")
+		}
+	}()
+	newRunExecution(mustConfiguredOrchestrator(WithStore(store)), nil, run)
 }
 
 func TestFailedToolTransitionPublishesNothing(t *testing.T) {

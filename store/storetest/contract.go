@@ -72,6 +72,9 @@ func Run(t *testing.T, factory Factory) {
 		admitted.Status = session.RunInterrupted
 		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
 		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		if execution == nil {
+			t.Fatal("Execution returned nil for a valid run fence")
+		}
 		if _, err := execution.SettleRun(ctx, settleRunRequest(admitted)); err != nil {
 			t.Fatalf("finish first run: %v", err)
 		}

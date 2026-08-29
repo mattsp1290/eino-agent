@@ -9,8 +9,6 @@ import (
 	"sort"
 	"time"
 
-	einoschema "github.com/cloudwego/eino/schema"
-
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -34,42 +32,44 @@ type AuditedModelInput struct {
 	SafeCallConfig map[string]string   `json:"safe_call_config"`
 }
 
-// AuditModelRequest derives the canonical, credential-free subset persisted by
-// the request ledger.
-func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes int) (AuditedModelInput, string, error) {
+// auditModelRequest takes canonical ownership of a request and derives the
+// credential-free subset persisted by the request ledger.
+func auditModelRequest(request model.Request, safeOptionKeys []string, maxBytes int) (model.Request, AuditedModelInput, string, error) {
+	canonicalRequest, err := request.Clone()
+	if err != nil {
+		return model.Request{}, AuditedModelInput{}, "", err
+	}
+	request = canonicalRequest
 	if maxBytes <= 0 {
 		maxBytes = defaultModelRequestMaxBytes
 	}
 	input := AuditedModelInput{System: request.System, SafeCallConfig: make(map[string]string)}
 	for _, message := range request.Messages {
 		if message == nil {
-			return AuditedModelInput{}, "", fmt.Errorf("nil model message")
-		}
-		if err := validateAuditSafeMessage(message); err != nil {
-			return AuditedModelInput{}, "", err
+			return model.Request{}, AuditedModelInput{}, "", fmt.Errorf("nil model message")
 		}
 		raw, err := json.Marshal(message)
 		if err != nil {
-			return AuditedModelInput{}, "", err
+			return model.Request{}, AuditedModelInput{}, "", err
 		}
 		input.Messages = append(input.Messages, AuditedMessage{Canonical: raw})
 	}
 	for _, tool := range request.Tools {
 		if tool == nil {
-			return AuditedModelInput{}, "", fmt.Errorf("nil tool schema")
+			return model.Request{}, AuditedModelInput{}, "", fmt.Errorf("nil tool schema")
 		}
 		if len(tool.Extra) != 0 {
-			return AuditedModelInput{}, "", fmt.Errorf("tool schema Extra is not audit-safe")
+			return model.Request{}, AuditedModelInput{}, "", fmt.Errorf("tool schema Extra is not audit-safe")
 		}
 		schema := json.RawMessage("null")
 		if tool.ParamsOneOf != nil {
 			converted, err := tool.ToJSONSchema()
 			if err != nil {
-				return AuditedModelInput{}, "", err
+				return model.Request{}, AuditedModelInput{}, "", err
 			}
 			schema, err = json.Marshal(converted)
 			if err != nil {
-				return AuditedModelInput{}, "", err
+				return model.Request{}, AuditedModelInput{}, "", err
 			}
 		}
 		input.Tools = append(input.Tools, AuditedToolSchema{Name: tool.Name, Description: tool.Desc, Schema: schema})
@@ -83,59 +83,13 @@ func AuditModelRequest(request model.Request, safeOptionKeys []string, maxBytes 
 	}
 	canonical, err := json.Marshal(input)
 	if err != nil {
-		return AuditedModelInput{}, "", err
+		return model.Request{}, AuditedModelInput{}, "", err
 	}
 	if len(canonical) > maxBytes {
-		return AuditedModelInput{}, "", session.ErrModelRequestTooLarge
+		return model.Request{}, AuditedModelInput{}, "", session.ErrModelRequestTooLarge
 	}
 	digest := sha256.Sum256(canonical)
-	return input, hex.EncodeToString(digest[:]), nil
-}
-
-func validateAuditSafeMessage(message *einoschema.Message) error {
-	//nolint:staticcheck // The audit boundary rejects the deprecated field.
-	if len(message.MultiContent) != 0 {
-		return fmt.Errorf("model message contains unsupported deprecated MultiContent")
-	}
-	for _, part := range message.AssistantGenMultiContent {
-		if part.StreamingMeta != nil {
-			return fmt.Errorf("model message contains streaming metadata")
-		}
-	}
-	raw, err := json.Marshal(message)
-	if err != nil {
-		return err
-	}
-	return rejectCanonicalExtra(raw)
-}
-
-func rejectCanonicalExtra(raw json.RawMessage) error {
-	var value any
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return err
-	}
-	var visit func(any) error
-	visit = func(current any) error {
-		switch typed := current.(type) {
-		case map[string]any:
-			for key, child := range typed {
-				if key == "extra" {
-					return fmt.Errorf("model message contains unsupported extra metadata")
-				}
-				if err := visit(child); err != nil {
-					return err
-				}
-			}
-		case []any:
-			for _, child := range typed {
-				if err := visit(child); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	return visit(value)
+	return request, input, hex.EncodeToString(digest[:]), nil
 }
 
 func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (session.ModelRequestRecord, error) {

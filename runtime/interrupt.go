@@ -26,26 +26,26 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	if err != nil {
 		return nil, err
 	}
-	var plan *RunPlan
-	if !run.Terminal() {
-		plan, err = o.acquireResumePlan(ctx, ResumePlanRequest{SessionID: run.SessionID, Descriptor: run.ExtensionPlan.Clone()})
-		if err != nil {
-			return nil, err
+	if run.Terminal() {
+		return terminalRunHandle(run), nil
+	}
+	plan, err := o.acquireResumePlan(ctx, ResumePlanRequest{SessionID: run.SessionID, Descriptor: run.ExtensionPlan.Clone()})
+	if err != nil {
+		return nil, err
+	}
+	run, err = o.store.ClaimRun(ctx, session.RunClaim{
+		RunID: run.ID, OwnerID: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), LeaseDuration: o.lease(),
+	})
+	if err != nil {
+		plan.release()
+		if errors.Is(err, session.ErrConflict) || errors.Is(err, session.ErrSessionBusy) {
+			return nil, session.ErrSessionBusy
 		}
-		run, err = o.store.ClaimRun(ctx, session.RunClaim{
-			RunID: run.ID, OwnerID: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), LeaseDuration: o.lease(),
-		})
-		if err != nil {
-			plan.release()
-			if errors.Is(err, session.ErrConflict) || errors.Is(err, session.ErrSessionBusy) {
-				return nil, session.ErrSessionBusy
-			}
-			return nil, err
-		}
+		return nil, err
 	}
 	ownershipTransferred := false
 	defer func() {
-		if !ownershipTransferred && plan != nil {
+		if !ownershipTransferred {
 			plan.release()
 		}
 	}()
@@ -62,44 +62,46 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	return handle, nil
 }
 
-func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *runExecution, run session.Run, done chan<- Result) {
-	defer close(done)
-	defer execution.release()
-	if !run.Terminal() {
-		ctx = execution.startLease(ctx, o.lease())
-	}
-	resumeStartedAt := o.now()
-	settled := false
-	result := o.resumeRunWithSettlement(ctx, execution, run, &settled)
-	if leaseErr := execution.stopLease(); leaseErr != nil && result.Error == nil {
-		result.Status = session.RunFailed
-		result.Error = leaseErr
-	}
-	if !settled && !run.Terminal() {
-		result = o.finishResume(ctx, execution, run, result, &settled)
-	}
-	if settled && !run.Terminal() {
-		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
-			SessionID: run.SessionID,
-			Result:    result,
-			Metadata:  boundedTurnMetadata(o.resumeSnapshot(run)),
-			Duration:  o.now().Sub(resumeStartedAt),
-			Error:     classifyExtensionError(result.Error),
-		})
-	}
-	done <- result
+func terminalRunHandle(run session.Run) Handle {
+	done := make(chan Result, 1)
+	done <- Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
+	close(done)
+	return &streamingHandle{runID: run.ID, cancel: func() {}, done: done}
 }
 
-func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, execution *runExecution, run session.Run, settled *bool) (result Result) {
-	if run.Terminal() {
-		return Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
-	}
-	o.observeResume(ctx, run, "resume")
-	run.StartedAt = o.now()
-	observed := o.startObservedRun(ctx, run, "", run.StartedAt)
+func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *runExecution, run session.Run, done chan<- Result) {
+	defer execution.release()
+	resumeStartedAt := o.now()
+	result := Result{RunID: run.ID}
+	var observed observedRun
 	defer func() {
+		if recovered := recover(); recovered != nil {
+			result.Status = session.RunFailed
+			result.Error = fmt.Errorf("resume run panic: %v", recovered)
+		}
+		var settled bool
+		result, settled = o.settleRun(ctx, execution, run, result)
 		o.finishObservedRun(observed, result, o.now())
+		if settled {
+			extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
+				SessionID: run.SessionID,
+				Result:    result,
+				Metadata:  boundedTurnMetadata(o.resumeSnapshot(run)),
+				Duration:  o.now().Sub(resumeStartedAt),
+				Error:     classifyExtensionError(result.Error),
+			})
+		}
+		done <- result
+		close(done)
 	}()
+	ctx = execution.startLease(ctx, o.lease())
+	o.observeResume(ctx, run, "resume")
+	run.StartedAt = resumeStartedAt
+	observed = o.startObservedRun(ctx, run, "", run.StartedAt)
+	result = o.resumeRun(ctx, execution, run)
+}
+
+func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExecution, run session.Run) Result {
 	started, err := execution.store.StartRun(ctx, run.StartedAt)
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
@@ -110,7 +112,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
 	if len(calls) == 0 {
-		return o.finishResume(ctx, execution, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
+		return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
 	}
 	snapshot := o.resumeSnapshot(run)
 	tools, toolContext, err := o.resumeTools(ctx, execution, run)
@@ -170,13 +172,13 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
 		if errors.Is(settledTool.Outcome.RawError, errToolExecutionPanic) {
-			return o.finishResume(ctx, execution, run, Result{RunID: run.ID, Status: session.RunFailed, Error: settledTool.Outcome.RawError}, settled)
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: settledTool.Outcome.RawError}
 		}
 		if errors.Is(settledTool.Outcome.RawError, context.Canceled) {
-			return o.finishResume(ctx, execution, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: settledTool.Outcome.RawError}, settled)
+			return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: settledTool.Outcome.RawError}
 		}
 	}
-	return o.finishResume(ctx, execution, run, Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}, settled)
+	return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
 }
 
 func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runExecution, run session.Run) (map[string]Tool, ToolContext, error) {
@@ -225,28 +227,4 @@ func errorString(value string) error {
 		return nil
 	}
 	return errors.New(value)
-}
-
-func (o *StreamingOrchestrator) finishResume(ctx context.Context, execution *runExecution, run session.Run, result Result, settled *bool) Result {
-	if leaseErr := execution.stopLease(); leaseErr != nil && result.Error == nil {
-		result.Status = session.RunFailed
-		result.Error = leaseErr
-	}
-	settlement := session.RunSettlement{Status: result.Status, FinishedAt: o.now()}
-	if result.Error != nil {
-		settlement.Error = result.Error.Error()
-	}
-	committed, err := execution.store.SettleRun(context.WithoutCancel(ctx), session.SettleRunRequest{Settlement: settlement, Event: o.finalRunEvent(result)})
-	if err != nil {
-		if result.Error == nil {
-			result.Status = session.RunFailed
-			result.Error = err
-		}
-	} else {
-		if settled != nil {
-			*settled = true
-		}
-		o.publishRunFinished(ctx, execution, committed.Event)
-	}
-	return result
 }

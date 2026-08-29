@@ -58,7 +58,7 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	if record.State != session.ModelRequestCompleted || record.System != "audited system" {
 		t.Fatalf("record = %#v", record)
 	}
-	audited, hash, err := AuditModelRequest(submitted, []string{"temperature"}, 0)
+	_, audited, hash, err := auditModelRequest(submitted, []string{"temperature"}, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -568,7 +568,7 @@ func TestAuditModelRequestRejectsUnsafeAndDeprecatedMessageShapes(t *testing.T) 
 		t.Run(test.name, func(t *testing.T) {
 			message := einoschema.UserMessage("hello")
 			test.mutate(message)
-			if _, _, err := AuditModelRequest(model.Request{Messages: []*einoschema.Message{message}}, nil, 0); err == nil {
+			if _, _, _, err := auditModelRequest(model.Request{Messages: []*einoschema.Message{message}}, nil, 0); err == nil {
 				t.Fatal("unsafe nested Extra was accepted")
 			}
 		})

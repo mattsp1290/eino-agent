@@ -347,6 +347,8 @@ type Store interface {
 	// ErrSessionBusy when another nonterminal run owns the session.
 	AdmitRun(ctx context.Context, run Run, leaseDuration time.Duration) (Run, error)
 	ClaimRun(ctx context.Context, claim RunClaim) (Run, error)
+	// Execution returns a non-nil fenced mutation capability. Store failures are
+	// reported by capability methods; nil is a store contract violation.
 	Execution(fence RunFence) ExecutionStore
 	GetRun(ctx context.Context, id RunID) (Run, error)
 	ActiveRun(ctx context.Context, sessionID ID) (Run, error)

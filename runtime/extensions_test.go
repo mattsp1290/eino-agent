@@ -41,10 +41,7 @@ func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-errors"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
 			result, err := next(ctx, input)
-			if err != nil {
-				return ToolResult{}, err
-			}
-			return result, callbackErr
+			return result, errors.Join(err, callbackErr)
 		})
 	}))
 	if err != nil {

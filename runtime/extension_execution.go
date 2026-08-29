@@ -18,11 +18,8 @@ type runExecution struct {
 }
 
 func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run) *runExecution {
-	if host == nil || host.store == nil || run.ID == "" || run.ClaimToken == "" {
+	if host == nil || host.store == nil || plan == nil || run.ID == "" || run.ClaimToken == "" {
 		panic(fmt.Sprintf("invalid run execution fence for run %q", run.ID))
-	}
-	if plan == nil {
-		plan = &RunPlan{}
 	}
 	store := host.store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 	if store == nil {

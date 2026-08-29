@@ -165,7 +165,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 	// runUsage accumulates provider usage across every model stream in the run
 	// (all turns and retry attempts), mirroring the per-stream usage reported to
 	// the observability path. It is surfaced on result.Usage in the defer below
-	// so finish() can carry the run total on the EventRunFinished event.
+	// so settleRun() can carry the run total on the EventRunFinished event.
 	var runUsage model.Usage
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -173,7 +173,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 			result.Error = fmt.Errorf("provider stream panic: %v", recovered)
 		}
 		result.Usage = runtimeUsage(runUsage)
-		result, settled = o.finish(ctx, execution, run, result)
+		result, settled = o.settleRun(ctx, execution, run, result)
 		o.finishObservedRun(observed, result, o.now())
 	}()
 	{
@@ -331,21 +331,13 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 	if cloneErr != nil {
 		return newToolOutcome(call, ToolResult{}, toolPermissionAllowed, cloneErr)
 	}
-	var executorErr error
-	var callbackErr error
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		result, err := extension.InvokeAround(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolResult, error) {
-			var result ToolResult
-			result, executorErr = tool.Executor.Execute(ctx, cloneToolCall(call))
-			return result, nil
+		return extension.InvokeAround(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolResult, error) {
+			return tool.Executor.Execute(ctx, cloneToolCall(call))
 		})
-		if err != nil {
-			callbackErr = errors.Join(callbackErr, err)
-		}
-		return result, nil
 	})
 	permission, permissionErr := executeToolWithPermissions(ctx, wrapped, call, o.permissions)
-	return newToolOutcome(call, permission.Result, permission.State, errors.Join(executorErr, callbackErr, permissionErr))
+	return newToolOutcome(call, permission.Result, permission.State, permissionErr)
 }
 
 func newToolOutcome(call ToolCall, result ToolResult, permission toolPermissionState, rawErr error) toolOutcome {
@@ -400,10 +392,10 @@ func (f runtimeToolExecutorFunc) Execute(ctx context.Context, call ToolCall) (To
 	return f(ctx, call)
 }
 
-func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecution, run session.Run, result Result) (Result, bool) {
-	if leaseErr := execution.stopLease(); leaseErr != nil && result.Error == nil {
+func (o *StreamingOrchestrator) settleRun(ctx context.Context, execution *runExecution, run session.Run, result Result) (Result, bool) {
+	if leaseErr := execution.stopLease(); leaseErr != nil {
 		result.Status = session.RunFailed
-		result.Error = leaseErr
+		result.Error = errors.Join(result.Error, leaseErr)
 	}
 	if result.Status == "" {
 		result.Status = session.RunCompleted
@@ -416,10 +408,8 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 	committed, err := execution.store.SettleRun(context.WithoutCancel(ctx), session.SettleRunRequest{Settlement: settlement, Event: o.finalRunEvent(result)})
 	if err != nil {
 		settled = false
-		if result.Error == nil {
-			result.Status = session.RunFailed
-			result.Error = err
-		}
+		result.Status = session.RunFailed
+		result.Error = errors.Join(result.Error, err)
 	} else {
 		o.publishRunFinished(ctx, execution, committed.Event)
 	}
