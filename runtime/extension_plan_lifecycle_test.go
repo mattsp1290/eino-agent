@@ -25,7 +25,7 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 	if descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || descriptor.Fingerprint == "" {
 		t.Fatalf("empty descriptor = %#v", descriptor)
 	}
-	resumed, err := orchestrator.acquireResumePlan(context.Background(), ResumePlanRequest{SessionID: "session", Descriptor: descriptor})
+	resumed, err := orchestrator.acquireResumePlan(context.Background(), "session", descriptor)
 	if err != nil {
 		t.Fatalf("resume empty strict plan = %v", err)
 	}
@@ -37,7 +37,8 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 
 func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
 	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{handlerPlanEntryForTest("callbacks")}}
-	valid.Fingerprint, _ = session.FingerprintExtensionPlan(valid)
+	sealed, _ := session.SealExtensionPlan(valid)
+	valid = sealed.Descriptor()
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
 		"stale": func() session.ExtensionPlanDescriptor {
@@ -49,7 +50,7 @@ func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *te
 		t.Run(name, func(t *testing.T) {
 			resumeCalls := 0
 			orchestrator := mustConfiguredOrchestrator(WithRunPlanProvider(staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{}), resumeCalls: &resumeCalls}))
-			if _, err := orchestrator.acquireResumePlan(context.Background(), ResumePlanRequest{SessionID: "session", Descriptor: descriptor}); !errors.Is(err, ErrExtensionPlanMismatch) {
+			if _, err := orchestrator.acquireResumePlan(context.Background(), "session", descriptor); !errors.Is(err, ErrExtensionPlanMismatch) {
 				t.Fatalf("acquireResumePlan = %v, want ErrExtensionPlanMismatch", err)
 			}
 			if resumeCalls != 0 {
@@ -64,12 +65,12 @@ func TestAcquireResumePlanPropagatesDurableSessionIdentity(t *testing.T) {
 	provider := &capturingResumePlanProvider{plan: plan}
 	orchestrator := mustConfiguredOrchestrator(WithRunPlanProvider(provider))
 	descriptor := plan.Descriptor()
-	resumed, err := orchestrator.acquireResumePlan(context.Background(), ResumePlanRequest{SessionID: "durable-session", Descriptor: descriptor})
+	resumed, err := orchestrator.acquireResumePlan(context.Background(), "durable-session", descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resumed.Release()
-	if provider.request.SessionID != "durable-session" || provider.request.Descriptor.Fingerprint != descriptor.Fingerprint {
+	if provider.request.SessionID != "durable-session" || provider.request.Plan.Fingerprint() != descriptor.Fingerprint {
 		t.Fatalf("resume request = %#v", provider.request)
 	}
 }

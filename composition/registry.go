@@ -332,64 +332,19 @@ func (r *Registry) AcquireRunPlan(ctx context.Context, request runtime.RunPlanRe
 }
 
 func (r *Registry) AcquireResumePlan(ctx context.Context, request runtime.ResumePlanRequest) (*runtime.RunPlan, error) {
-	if request.SessionID == "" {
+	if request.SessionID == "" || request.Plan.Fingerprint() == "" {
 		return nil, runtime.ErrExtensionPlanMismatch
 	}
-	persisted := request.Descriptor
-	if err := session.ValidateExtensionPlan(persisted); err != nil || persisted.Fingerprint == "" {
-		return nil, runtime.ErrExtensionPlanMismatch
-	}
-	fingerprint, err := session.FingerprintExtensionPlan(persisted)
-	if err != nil || fingerprint != persisted.Fingerprint {
-		return nil, runtime.ErrExtensionPlanMismatch
-	}
+	persisted := request.Plan.Descriptor()
 	instances := make(map[string]bool)
 	toolIdentities := make(map[planToolIdentity]bool)
 	for _, component := range persisted.Components {
 		instances[component.InstanceID] = true
-		for _, registration := range component.Handlers {
-			if err := validateResumeScope(request.SessionID, registration.Scope); err != nil {
-				return nil, err
-			}
-		}
 		for _, identity := range component.Tools {
 			toolIdentities[planToolIdentity{InstanceID: component.InstanceID, Scope: identity.Scope, RegistrationID: identity.RegistrationID, ToolName: identity.Name}] = true
-			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-				return nil, err
-			}
-		}
-		for _, identity := range component.Prompts {
-			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-				return nil, err
-			}
-		}
-		for _, identity := range component.Guards {
-			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-				return nil, err
-			}
-		}
-		for _, identity := range component.Restrictions {
-			if err := validateResumeScope(request.SessionID, identity.Scope); err != nil {
-				return nil, err
-			}
 		}
 	}
-	plan, err := r.acquire(ctx, request.SessionID, instances, persistedToolSelector(toolIdentities))
-	if err != nil {
-		return nil, err
-	}
-	if plan.Descriptor().Fingerprint != persisted.Fingerprint {
-		plan.Release()
-		return nil, runtime.ErrExtensionPlanMismatch
-	}
-	return plan, nil
-}
-
-func validateResumeScope(sessionID session.ID, scope extension.Scope) error {
-	if scope.Kind == extension.ScopeSession && scope.Key != string(sessionID) {
-		return runtime.ErrExtensionPlanMismatch
-	}
-	return nil
+	return r.acquire(ctx, request.SessionID, instances, persistedToolSelector(toolIdentities))
 }
 
 func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, selectTool planToolSelector) (*runtime.RunPlan, error) {

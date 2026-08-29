@@ -111,7 +111,7 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	now := o.now()
 	planHash := ""
 	if execution != nil && execution.plan != nil {
-		planHash = execution.plan.descriptor.Fingerprint
+		planHash = execution.plan.sealed.Fingerprint()
 	}
 	record := session.ModelRequestRecord{
 		ID:        session.ModelRequestID(fmt.Sprintf("%s:%s:%d:%d", snapshot.RunID, messageID, attempt, step)),

@@ -29,7 +29,7 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	if run.Terminal() {
 		return terminalRunHandle(run), nil
 	}
-	plan, err := o.acquireResumePlan(ctx, ResumePlanRequest{SessionID: run.SessionID, Descriptor: run.ExtensionPlan.Clone()})
+	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
 	if err != nil {
 		return nil, err
 	}
@@ -70,35 +70,20 @@ func terminalRunHandle(run session.Run) Handle {
 }
 
 func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *runExecution, run session.Run, done chan<- Result) {
-	defer execution.release()
 	resumeStartedAt := o.now()
-	result := Result{RunID: run.ID}
-	var observed observedRun
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			result.Status = session.RunFailed
-			result.Error = fmt.Errorf("resume run panic: %v", recovered)
-		}
-		var settled bool
-		result, settled = o.settleRun(ctx, execution, run, result)
-		o.finishObservedRun(observed, result, o.now())
-		if settled {
-			extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
-				SessionID: run.SessionID,
-				Result:    result,
-				Metadata:  boundedTurnMetadata(o.resumeSnapshot(run)),
-				Duration:  o.now().Sub(resumeStartedAt),
-				Error:     classifyExtensionError(result.Error),
-			})
-		}
-		done <- result
-		close(done)
-	}()
-	ctx = execution.startLease(ctx, o.lease())
-	o.observeResume(ctx, run, "resume")
-	run.StartedAt = resumeStartedAt
-	observed = o.startObservedRun(ctx, run, "", run.StartedAt)
-	result = o.resumeRun(ctx, execution, run)
+	lifecycle := &runLifecycle{
+		run:         run,
+		result:      Result{RunID: run.ID},
+		metadata:    boundedTurnMetadata(o.resumeSnapshot(run)),
+		startedAt:   resumeStartedAt,
+		panicPrefix: "resume run panic",
+	}
+	o.executeLifecycle(ctx, execution, lifecycle, done, func(ctx context.Context) {
+		o.observeResume(ctx, run, "resume")
+		run.StartedAt = resumeStartedAt
+		lifecycle.observed = o.startObservedRun(ctx, run, "", run.StartedAt)
+		lifecycle.result = o.resumeRun(ctx, execution, run)
+	})
 }
 
 func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExecution, run session.Run) Result {

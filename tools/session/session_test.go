@@ -3,7 +3,6 @@ package sessiontools
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 
@@ -224,7 +223,7 @@ func TestSessionToolMountResumesAcrossEquivalentRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = secondMount.Close(context.Background()) }()
-	resumed, err := second.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor})
+	resumed, err := second.AcquireResumePlan(context.Background(), resumePlanRequest("session-a", descriptor))
 	if err != nil {
 		t.Fatalf("AcquireResumePlan error = %v", err)
 	}
@@ -277,14 +276,22 @@ func TestSessionToolMountResumeRejectsIdentityDrift(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = mount.Close(context.Background()) }()
-			if resumed, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-				if resumed != nil {
-					resumed.Release()
-				}
-				t.Fatalf("AcquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
+			resumed, err := registry.AcquireResumePlan(context.Background(), resumePlanRequest("session-a", descriptor))
+			if err != nil {
+				t.Fatalf("AcquireResumePlan error = %v", err)
 			}
+			if resumed.Descriptor().Fingerprint == descriptor.Fingerprint {
+				resumed.Release()
+				t.Fatal("drifted session tool composition retained persisted fingerprint")
+			}
+			resumed.Release()
 		})
 	}
+}
+
+func resumePlanRequest(sessionID session.ID, descriptor session.ExtensionPlanDescriptor) runtime.ResumePlanRequest {
+	plan, _ := session.VerifyExtensionPlanForSession(sessionID, descriptor)
+	return runtime.ResumePlanRequest{SessionID: sessionID, Plan: plan}
 }
 
 func resolve(t *testing.T, registry *composition.Registry, id session.ID) map[string]runtime.Tool {

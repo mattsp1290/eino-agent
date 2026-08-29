@@ -5,10 +5,9 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/permissions"
-	"github.com/mattsp1290/eino-agent/runtime"
-	"github.com/mattsp1290/eino-agent/tools"
 )
 
 // Loader owns all modules opened through it and provides one-call shutdown.
@@ -43,28 +42,29 @@ func (o *ownedModule) beginShutdown() {
 // NewLoader returns an empty module owner.
 func NewLoader() *Loader { return &Loader{factory: newEngine, shutdownDone: make(chan struct{})} }
 
-// LoadTool loads and tracks a Wasm-backed native tool definition. The
-// definition remains valid only until Loader.Close completes.
-func (l *Loader) LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error) {
+// RegisterTool loads, registers, and owns one Wasm tool for the lifetime of
+// the prepared composition mount or Loader, whichever closes first.
+func (l *Loader) RegisterTool(ctx context.Context, registrar *composition.Registrar, registration composition.ToolRegistration, cfg ModuleConfig) error {
+	if registrar == nil {
+		return errors.New("wasm tool registration requires registrar")
+	}
 	loaded, err := openTool(ctx, cfg, l.engineFactory())
 	if err != nil {
-		return tools.Definition{}, err
+		return err
 	}
 	definition, err := loaded.definition.Clone()
 	if err != nil {
 		_ = loaded.close()
-		return tools.Definition{}, err
+		return err
 	}
-	if err := l.track(loaded.module, nil); err != nil {
-		_ = loaded.close()
-		return tools.Definition{}, err
-	}
-	return definition, nil
+	registration.Definition = definition
+	owned := &ownedModule{module: loaded.module}
+	return l.registerOwned(ctx, registrar, owned, func() error { return registrar.Tool(registration) })
 }
 
-// LoadPermissionsPolicy loads and tracks a Wasm-backed native policy. The
-// policy remains valid only until Loader.Close completes.
-func (l *Loader) LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error) {
+// LoadHostPermissionsPolicy loads and tracks a Wasm-backed host-global policy.
+// The policy remains valid only until Loader.Close completes.
+func (l *Loader) LoadHostPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error) {
 	policy, err := loadPermissionsPolicy(ctx, cfg, l.engineFactory())
 	if err != nil {
 		return nil, err
@@ -76,18 +76,15 @@ func (l *Loader) LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (p
 	return policy, nil
 }
 
-// LoadEventSink loads and tracks an event-sink component. The sink remains
-// valid only until Loader.Close completes.
-func (l *Loader) LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
+// RegisterEventSink loads, registers, and owns one Wasm event observer for the
+// lifetime of the prepared mount or Loader, whichever closes first.
+func (l *Loader) RegisterEventSink(ctx context.Context, registrar extension.Registrar, spec extension.Registration, cfg ModuleConfig) error {
 	loaded, err := openEventSink(ctx, cfg, l.engineFactory())
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := l.track(loaded.module, nil); err != nil {
-		_ = loaded.close()
-		return nil, err
-	}
-	return loaded, nil
+	owned := &ownedModule{module: loaded.module}
+	return l.registerOwned(ctx, registrar, owned, func() error { return registerEventSink(registrar, spec, loaded) })
 }
 
 // RegisterContextSource loads, registers, and owns one Wasm context source for
@@ -123,7 +120,11 @@ func (l *Loader) RegisterToolMiddleware(ctx context.Context, registrar extension
 	return l.registerOwned(ctx, registrar, owned, func() error { return registerToolMiddleware(registrar, spec, loaded) })
 }
 
-func (l *Loader) registerOwned(ctx context.Context, registrar extension.Registrar, owned *ownedModule, register func() error) error {
+type cleanupRegistrar interface {
+	Defer(extension.Cleanup) error
+}
+
+func (l *Loader) registerOwned(ctx context.Context, registrar cleanupRegistrar, owned *ownedModule, register func() error) error {
 	if registrar == nil {
 		owned.beginShutdown()
 		return errors.Join(errors.New("wasm registration requires registrar"), owned.module.waitFinalized(context.WithoutCancel(ctx)))

@@ -83,11 +83,12 @@ func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 			InstanceID: "tool-order", Artifact: componentIdentity,
 			Tools: []session.ToolPlanIdentity{{Name: "echo", RegistrationID: base.ID, Scope: base.Scope, SchemaHash: baseSchema, ExecutorHash: executorA, Order: order}},
 		}}}
-		value.Fingerprint, err = session.FingerprintExtensionPlan(value)
+		sealed, sealErr := session.SealExtensionPlan(value)
+		err = sealErr
 		if err != nil {
 			t.Fatal(err)
 		}
-		return value
+		return sealed.Descriptor()
 	}
 	if descriptor(base.Order).Fingerprint == descriptor(changedOrder.Order).Fingerprint {
 		t.Fatal("tool order did not change plan fingerprint")
@@ -145,13 +146,7 @@ func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
 			mutate.fn(&registration)
 			secondMount := mount(registration)
 			defer func() { _ = secondMount.Close(context.Background()) }()
-			resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
-			if resumed != nil {
-				resumed.Release()
-			}
-			if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-				t.Fatalf("resume drift = %v", err)
-			}
+			assertResumePlanDrift(t, registry, "session-a", persisted)
 		})
 	}
 }

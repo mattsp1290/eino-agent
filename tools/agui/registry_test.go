@@ -74,9 +74,7 @@ func TestDispatcherArtifactIdentityParticipatesInResumeFingerprint(t *testing.T)
 		t.Fatal(err)
 	}
 	defer func() { _ = second.Close(context.Background()) }()
-	if _, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("resume error = %v, want ErrExtensionPlanMismatch", err)
-	}
+	assertAGUIResumePlanDrift(t, registry, descriptor)
 }
 
 func TestClientGenerationParticipatesInResumeFingerprint(t *testing.T) {
@@ -102,8 +100,23 @@ func TestClientGenerationParticipatesInResumeFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = second.Close(context.Background()) }()
-	if _, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-a", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("resume error = %v, want ErrExtensionPlanMismatch", err)
+	assertAGUIResumePlanDrift(t, registry, descriptor)
+}
+
+func aguiResumePlanRequest(sessionID session.ID, descriptor session.ExtensionPlanDescriptor) runtime.ResumePlanRequest {
+	plan, _ := session.VerifyExtensionPlanForSession(sessionID, descriptor)
+	return runtime.ResumePlanRequest{SessionID: sessionID, Plan: plan}
+}
+
+func assertAGUIResumePlanDrift(t *testing.T, registry *composition.Registry, persisted session.ExtensionPlanDescriptor) {
+	t.Helper()
+	plan, err := registry.AcquireResumePlan(context.Background(), aguiResumePlanRequest("session-a", persisted))
+	if err != nil {
+		t.Fatalf("AcquireResumePlan error = %v", err)
+	}
+	defer plan.Release()
+	if plan.Descriptor().Fingerprint == persisted.Fingerprint {
+		t.Fatal("drifted AG-UI composition retained persisted fingerprint")
 	}
 }
 

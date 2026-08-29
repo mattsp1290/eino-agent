@@ -296,7 +296,7 @@ func TestLoaderCloseCanObserveDeferredModuleFinalization(t *testing.T) {
 	cfg := fixtureConfig(t, []byte("loader stubborn component"))
 	cfg.Limits.Timeout = time.Second
 	cfg.Limits.CloseDrain = 20 * time.Millisecond
-	policy, err := loader.LoadPermissionsPolicy(context.Background(), cfg)
+	policy, err := loader.LoadHostPermissionsPolicy(context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,7 +445,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
 	}
-	sink, err := loader.LoadEventSink(ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
+	sink, err := loadEventSinkForTest(loader, ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -492,7 +492,7 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	toolConfig.Observer = observer
 	loader := NewLoader()
 	defer func() { _ = loader.Close(context.Background()) }()
-	definition, err := loader.LoadTool(context.Background(), toolConfig)
+	definition, err := loadToolForTest(loader, context.Background(), toolConfig)
 	if err != nil {
 		var extensionErr *Error
 		if errors.As(err, &extensionErr) {
@@ -521,7 +521,7 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	}
 
 	policyConfig := checkedInFixtureConfig(t, root, "permissions-policy.wasm")
-	policy, err := loader.LoadPermissionsPolicy(context.Background(), policyConfig)
+	policy, err := loader.LoadHostPermissionsPolicy(context.Background(), policyConfig)
 	if err != nil {
 		t.Fatalf("LoadPermissionsPolicy error = %v", err)
 	}
@@ -552,7 +552,7 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			loader := NewLoader()
 			defer func() { _ = loader.Close(context.Background()) }()
-			definition, err := loader.LoadTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+			definition, err := loadToolForTest(loader, context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -569,7 +569,7 @@ func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 		cfg.Limits.CloseDrain = time.Second
 		loader := NewLoader()
 		defer func() { _ = loader.Close(context.Background()) }()
-		definition, err := loader.LoadTool(context.Background(), cfg)
+		definition, err := loadToolForTest(loader, context.Background(), cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -593,7 +593,7 @@ func TestCheckedInToolCloseInterruptsInflightAndRejectsFurtherCalls(t *testing.T
 	cfg.Limits.CloseDrain = time.Second
 	cfg.Observer = einoobs.New(einoobs.Config{Exporter: exporter})
 	loader := NewLoader()
-	definition, err := loader.LoadTool(context.Background(), cfg)
+	definition, err := loadToolForTest(loader, context.Background(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -629,7 +629,7 @@ func TestCheckedInToolConcurrentUse(t *testing.T) {
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	loader := NewLoader()
 	defer func() { _ = loader.Close(context.Background()) }()
-	definition, err := loader.LoadTool(context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
+	definition, err := loadToolForTest(loader, context.Background(), checkedInFixtureConfig(t, root, "tool.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,18 +663,14 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
 	loader := NewLoader()
 	defer func() { _ = loader.Close(context.Background()) }()
-	definition, err := loader.LoadTool(ctx, checkedInFixtureConfig(t, root, "tool.wasm"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	policy, err := loader.LoadPermissionsPolicy(ctx, checkedInFixtureConfig(t, root, "permissions-policy.wasm"))
+	policy, err := loader.LoadHostPermissionsPolicy(ctx, checkedInFixtureConfig(t, root, "permissions-policy.wasm"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	registry := composition.NewRegistry(nil)
 	component := extension.Component{InstanceID: "wasm-test", Artifact: extension.Artifact{Name: "wasm-test", Version: "1", Hash: "wasm-test-artifact", ConfigHash: "wasm-test-config", SourceKind: extension.SourceNative}}
-	mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-		return registrar.Tool(composition.ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition})
+	mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
+		return loader.RegisterTool(ctx, registrar, composition.ToolRegistration{ID: "tool", Scope: extension.GlobalScope()}, checkedInFixtureConfig(t, root, "tool.wasm"))
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -753,6 +749,35 @@ func executeLoadedDefinition(ctx context.Context, definition tools.Definition, i
 		return runtime.ToolResult{}, err
 	}
 	return materialized.Executor.Execute(ctx, runtime.ToolCall{ID: "fixture-call", Input: decoded})
+}
+
+func loadToolForTest(loader *Loader, ctx context.Context, cfg ModuleConfig) (tools.Definition, error) {
+	loaded, err := openTool(ctx, cfg, loader.engineFactory())
+	if err != nil {
+		return tools.Definition{}, err
+	}
+	definition, err := loaded.definition.Clone()
+	if err != nil {
+		_ = loaded.close()
+		return tools.Definition{}, err
+	}
+	if err := loader.track(loaded.module, nil); err != nil {
+		_ = loaded.close()
+		return tools.Definition{}, err
+	}
+	return definition, nil
+}
+
+func loadEventSinkForTest(loader *Loader, ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
+	loaded, err := openEventSink(ctx, cfg, loader.engineFactory())
+	if err != nil {
+		return nil, err
+	}
+	if err := loader.track(loaded.module, nil); err != nil {
+		_ = loaded.close()
+		return nil, err
+	}
+	return loaded, nil
 }
 
 type signalExporter struct {

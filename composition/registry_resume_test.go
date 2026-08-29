@@ -27,9 +27,7 @@ func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("resume mismatch = %v", err)
-	}
+	assertResumePlanDrift(t, registry, "session-a", persisted)
 }
 
 func TestCapabilityPlanIdentityComesFromMountedComponent(t *testing.T) {
@@ -93,9 +91,7 @@ func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
 	if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Components[0].Tools[0].SchemaHash == secondDescriptor.Components[0].Tools[0].SchemaHash {
 		t.Fatalf("changed schemas collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 	}
-	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("changed schema resume = %v, want ErrExtensionPlanMismatch", err)
-	}
+	assertResumePlanDrift(t, registry, "session-a", persisted)
 }
 
 func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
@@ -152,9 +148,7 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 			if persisted.Fingerprint == secondDescriptor.Fingerprint || persisted.Components[0].Tools[0].SchemaHash == secondDescriptor.Components[0].Tools[0].SchemaHash {
 				t.Fatalf("changed policy collided: persisted=%#v current=%#v", persisted, secondDescriptor)
 			}
-			if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-				t.Fatalf("changed policy resume = %v, want ErrExtensionPlanMismatch", err)
-			}
+			assertResumePlanDrift(t, registry, "session-a", persisted)
 		})
 	}
 }
@@ -195,9 +189,7 @@ func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
 
 	changedMount := mountRules([]string{"alpha"}, nil)
 	defer func() { _ = changedMount.Close(context.Background()) }()
-	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("changed restriction rules resumed: %v", err)
-	}
+	assertResumePlanDrift(t, registry, "session-a", persisted)
 }
 
 func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *testing.T) {
@@ -236,7 +228,7 @@ func TestAcquireResumePlanRejectsDurableSessionMismatch(t *testing.T) {
 	}
 	descriptor := plan.Descriptor()
 	plan.Release()
-	if resumed, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-b", Descriptor: descriptor}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	if resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-b", descriptor)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		if resumed != nil {
 			resumed.Release()
 		}
@@ -285,7 +277,8 @@ func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-b"), Kind: extension.HandlerNotification},
 		},
 	}}}
-	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)
+	sealed, _ := session.SealExtensionPlan(persisted)
+	persisted = sealed.Descriptor()
 	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("conflicting nested scopes = %v", err)
 	}
@@ -385,9 +378,7 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			}
 			secondMount := mountOrdered(20)
 			defer func() { _ = secondMount.Close(context.Background()) }()
-			if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-				t.Fatalf("changed order resume = %v, want mismatch", err)
-			}
+			assertResumePlanDrift(t, registry, "session-a", persisted)
 		})
 	}
 }

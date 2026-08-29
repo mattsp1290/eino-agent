@@ -9,7 +9,20 @@ import (
 )
 
 func resumeRequest(sessionID session.ID, descriptor session.ExtensionPlanDescriptor) runtime.ResumePlanRequest {
-	return runtime.ResumePlanRequest{SessionID: sessionID, Descriptor: descriptor}
+	plan, _ := session.VerifyExtensionPlanForSession(sessionID, descriptor)
+	return runtime.ResumePlanRequest{SessionID: sessionID, Plan: plan}
+}
+
+func assertResumePlanDrift(t *testing.T, registry *Registry, sessionID session.ID, persisted session.ExtensionPlanDescriptor) {
+	t.Helper()
+	plan, err := registry.AcquireResumePlan(context.Background(), resumeRequest(sessionID, persisted))
+	if err != nil {
+		t.Fatalf("AcquireResumePlan error = %v", err)
+	}
+	defer plan.Release()
+	if plan.Descriptor().Fingerprint == persisted.Fingerprint {
+		t.Fatalf("provider returned persisted fingerprint %s for drifted composition", persisted.Fingerprint)
+	}
 }
 
 func assertRegistryEmpty(t *testing.T, registry *Registry) {

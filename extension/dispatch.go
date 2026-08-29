@@ -25,11 +25,7 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 		return
 	}
 	for _, entry := range matchingEntries(plan, point.base()) {
-		observer, ok := entry.callback.(Observer[T])
-		if !ok {
-			report(plan.reporter, ctx, callbackFailure(entry, "callback_type", errors.New("observer type mismatch")))
-			continue
-		}
+		observer := entry.callback.(Observer[T])
 		input, err := cloneInput(point.definition.clone, value)
 		if err != nil {
 			report(plan.reporter, ctx, callbackFailure(entry, "clone_failed", err))
@@ -46,10 +42,7 @@ func RunHooks[T any](plan *Plan, ctx context.Context, point Hook[T], value T) er
 		return err
 	}
 	for _, entry := range matchingEntries(plan, point.base()) {
-		hook, ok := entry.callback.(HookFunc[T])
-		if !ok {
-			return errors.New("extension hook type mismatch")
-		}
+		hook := entry.callback.(HookFunc[T])
 		input, err := cloneInput(point.definition.clone, value)
 		if err != nil {
 			return err
@@ -85,10 +78,7 @@ func ApplyTransforms[T any](plan *Plan, ctx context.Context, point Transform[T],
 		}
 	}
 	for _, entry := range matchingEntries(plan, point.base()) {
-		transform, ok := entry.callback.(TransformFunc[T])
-		if !ok {
-			return value, errors.New("extension transform type mismatch")
-		}
+		transform := entry.callback.(TransformFunc[T])
 		callbackInput, cloneErr := cloneInput(point.definition.clone, current)
 		if cloneErr != nil {
 			return value, cloneErr
@@ -125,10 +115,7 @@ func EvaluateGate[I, D any](plan *Plan, ctx context.Context, point Gate[I, D], i
 		return decision, fmt.Errorf("%w: nil gate continuation predicate", ErrInvalidContract)
 	}
 	for _, entry := range matchingEntries(plan, point.base()) {
-		gate, ok := entry.callback.(GateFunc[I, D])
-		if !ok {
-			return decision, errors.New("extension gate type mismatch")
-		}
+		gate := entry.callback.(GateFunc[I, D])
 		candidate, err := cloneInput(point.definition.clone, input)
 		if err != nil {
 			return decision, err
@@ -182,10 +169,7 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 			return out, err
 		}
 		entry := entries[index]
-		around, ok := entry.callback.(Around[I, O])
-		if !ok {
-			return zero, errors.New("extension around callback type mismatch")
-		}
+		around := entry.callback.(Around[I, O])
 		var nextMu sync.Mutex
 		calls := 0
 		activeCall := false

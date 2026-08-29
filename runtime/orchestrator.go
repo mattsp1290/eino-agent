@@ -142,71 +142,91 @@ func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID
 }
 
 func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecution, admitted admittedRun, done chan<- Result) {
-	defer close(done)
-	defer execution.release()
-	result, settled := o.run(ctx, execution, admitted)
-	if settled {
-		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
-			SessionID: admitted.Run.SessionID,
-			Result:    result,
-			Metadata:  boundedTurnMetadata(admitted.Snapshot),
-			Duration:  o.now().Sub(admitted.Run.CreatedAt),
-			Error:     classifyExtensionError(result.Error),
-		})
+	lifecycle := &runLifecycle{
+		run:         admitted.Run,
+		result:      Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID},
+		metadata:    boundedTurnMetadata(admitted.Snapshot),
+		startedAt:   admitted.Run.CreatedAt,
+		panicPrefix: "provider stream panic",
 	}
-	done <- result
+	o.executeLifecycle(ctx, execution, lifecycle, done, func(ctx context.Context) {
+		o.runFresh(ctx, execution, admitted, lifecycle)
+	})
 }
 
-func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution, admitted admittedRun) (result Result, settled bool) {
-	run := admitted.Run
-	ctx = execution.startLease(ctx, o.lease())
-	result = Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID}
-	var observed observedRun
-	// runUsage accumulates provider usage across every model stream in the run
-	// (all turns and retry attempts), mirroring the per-stream usage reported to
-	// the observability path. It is surfaced on result.Usage in the defer below
-	// so settleRun() can carry the run total on the EventRunFinished event.
-	var runUsage model.Usage
+type runLifecycle struct {
+	run         session.Run
+	result      Result
+	observed    observedRun
+	metadata    BoundedTurnMetadata
+	startedAt   time.Time
+	usage       model.Usage
+	panicPrefix string
+}
+
+func (o *StreamingOrchestrator) executeLifecycle(ctx context.Context, execution *runExecution, lifecycle *runLifecycle, done chan<- Result, body func(context.Context)) {
+	defer close(done)
+	defer func() { done <- lifecycle.result }()
+	defer execution.release()
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			result.Status = session.RunFailed
-			result.Error = fmt.Errorf("provider stream panic: %v", recovered)
+			lifecycle.result.Status = session.RunFailed
+			lifecycle.result.Error = fmt.Errorf("%s: %v", lifecycle.panicPrefix, recovered)
 		}
-		result.Usage = runtimeUsage(runUsage)
-		result, settled = o.settleRun(ctx, execution, run, result)
-		o.finishObservedRun(observed, result, o.now())
+		lifecycle.result.Usage = runtimeUsage(lifecycle.usage)
+		result, settled := o.settleRun(ctx, execution, lifecycle.run, lifecycle.result)
+		lifecycle.result = result
+		o.finishObservedRun(lifecycle.observed, result, o.now())
+		if settled {
+			extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
+				SessionID: lifecycle.run.SessionID,
+				Result:    result,
+				Metadata:  lifecycle.metadata,
+				Duration:  o.now().Sub(lifecycle.startedAt),
+				Error:     classifyExtensionError(result.Error),
+			})
+		}
 	}()
+	ctx = execution.startLease(ctx, o.lease())
+	body(ctx)
+}
+
+func (o *StreamingOrchestrator) runFresh(ctx context.Context, execution *runExecution, admitted admittedRun, lifecycle *runLifecycle) {
+	run := admitted.Run
+	// runUsage accumulates provider usage across every model stream in the run
+	// (all turns and retry attempts), mirroring the per-stream usage reported to
+	// the observability path. It is surfaced on result.Usage by the finalizer
+	// so settleRun() can carry the run total on the EventRunFinished event.
 	{
 		decision, err := extension.EvaluateGate(execution.dispatch(), ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID})
 		if err != nil {
-			result.Status = session.RunFailed
-			result.Error = err
-			return result, false
+			lifecycle.result.Status = session.RunFailed
+			lifecycle.result.Error = err
+			return
 		}
 		if decision.Kind == RunReject {
-			result.Status = session.RunFailed
-			result.Error = model.Error{Code: decision.Code, Message: decision.Message, Cause: model.ErrProviderRejected}
-			return result, false
+			lifecycle.result.Status = session.RunFailed
+			lifecycle.result.Error = model.Error{Code: decision.Code, Message: decision.Message, Cause: model.ErrProviderRejected}
+			return
 		}
 	}
 	run.StartedAt = o.now()
-	observed = o.startObservedRun(ctx, run, admitted.AssistantMessage.ID, run.StartedAt)
+	lifecycle.observed = o.startObservedRun(ctx, run, admitted.AssistantMessage.ID, run.StartedAt)
 	started, err := execution.store.StartRun(ctx, run.StartedAt)
 	if err != nil {
-		result.Status = session.RunFailed
-		result.Error = err
-		return result, false
+		lifecycle.result.Status = session.RunFailed
+		lifecycle.result.Error = err
+		return
 	}
 	run = started
 	extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
 	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot)
 	if err != nil {
-		result.Status = statusForError(err)
-		result.Error = err
-		return result, false
+		lifecycle.result.Status = statusForError(err)
+		lifecycle.result.Error = err
+		return
 	}
-	result = o.executeAttempts(ctx, execution, snapshot, admitted.AssistantMessage.ID, &runUsage)
-	return result, false
+	lifecycle.result = o.executeAttempts(ctx, execution, snapshot, admitted.AssistantMessage.ID, &lifecycle.usage)
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot) (TurnSnapshot, error) {

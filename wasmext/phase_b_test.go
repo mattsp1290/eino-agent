@@ -402,11 +402,11 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
 	cfg := fixtureConfig(t, []byte("all phase b"))
-	if _, err := loader.LoadEventSink(context.Background(), cfg); err != nil {
-		t.Fatal(err)
-	}
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "phase-b", Artifact: extension.Artifact{Name: "phase-b", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+		if err := loader.RegisterEventSink(ctx, registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, cfg); err != nil {
+			return err
+		}
 		if err := loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg); err != nil {
 			return err
 		}
@@ -421,8 +421,8 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(loader.modules) != 1 {
-		t.Fatalf("loader modules after mount close = %d, want only event sink", len(loader.modules))
+	if len(loader.modules) != 0 {
+		t.Fatalf("loader modules after mount close = %d, want 0", len(loader.modules))
 	}
 	if err := loader.Close(context.Background()); err != nil || !component.closed.Load() {
 		t.Fatalf("Close = %v, closed=%t", err, component.closed.Load())
@@ -539,7 +539,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 		if err := registerContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source); err != nil {
 			return err
 		}
-		return RegisterEventSink(registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, sink)
+		return registerEventSink(registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, sink)
 	}))
 	if err != nil {
 		t.Fatal(err)

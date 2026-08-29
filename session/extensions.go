@@ -73,6 +73,29 @@ type ExtensionPlanDescriptor struct {
 	Components    []ComponentPlan
 }
 
+// SealedExtensionPlan is a validated, canonical extension-plan identity. The
+// zero value is invalid; callers obtain values through SealExtensionPlan or
+// VerifyExtensionPlanForSession.
+type SealedExtensionPlan struct {
+	descriptor ExtensionPlanDescriptor
+}
+
+// Descriptor returns a defensive copy of the canonical durable descriptor.
+func (p SealedExtensionPlan) Descriptor() ExtensionPlanDescriptor {
+	return p.descriptor.Clone()
+}
+
+// Fingerprint returns the canonical plan identity, or an empty string for the
+// invalid zero value.
+func (p SealedExtensionPlan) Fingerprint() string {
+	return p.descriptor.Fingerprint
+}
+
+// Matches reports whether two sealed plans have the same complete identity.
+func (p SealedExtensionPlan) Matches(other SealedExtensionPlan) bool {
+	return p.Fingerprint() != "" && p.Fingerprint() == other.Fingerprint()
+}
+
 func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 	next := d
 	next.Components = make([]ComponentPlan, len(d.Components))
@@ -87,8 +110,7 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 	return next
 }
 
-// ValidateExtensionPlan validates the complete current descriptor identity.
-func ValidateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
+func validateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
 	if descriptor.SchemaVersion != ExtensionPlanSchemaVersion {
 		return fmt.Errorf("unsupported extension plan schema %d", descriptor.SchemaVersion)
 	}
@@ -229,13 +251,54 @@ type restrictionIdentityKey struct {
 	Scope          extension.Scope
 }
 
-// FingerprintExtensionPlan validates and hashes a canonical restart-stable descriptor.
-func FingerprintExtensionPlan(descriptor ExtensionPlanDescriptor) (string, error) {
-	if err := ValidateExtensionPlan(descriptor); err != nil {
-		return "", err
+// SealExtensionPlan validates and seals one newly reconstructed, fingerprintless
+// descriptor. The returned value owns a canonical defensive copy.
+func SealExtensionPlan(descriptor ExtensionPlanDescriptor) (SealedExtensionPlan, error) {
+	if descriptor.Fingerprint != "" {
+		return SealedExtensionPlan{}, errors.New("new extension plan already has a fingerprint")
+	}
+	next, err := canonicalExtensionPlan(descriptor)
+	if err != nil {
+		return SealedExtensionPlan{}, err
+	}
+	raw, err := json.Marshal(next)
+	if err != nil {
+		return SealedExtensionPlan{}, err
+	}
+	digest := sha256.Sum256(raw)
+	next.Fingerprint = hex.EncodeToString(digest[:])
+	return SealedExtensionPlan{descriptor: next}, nil
+}
+
+// VerifyExtensionPlanForSession validates a persisted descriptor, verifies its
+// fingerprint, and binds every session-scoped identity to sessionID.
+func VerifyExtensionPlanForSession(sessionID ID, descriptor ExtensionPlanDescriptor) (SealedExtensionPlan, error) {
+	if sessionID == "" || descriptor.Fingerprint == "" {
+		return SealedExtensionPlan{}, errors.New("persisted extension plan requires session and fingerprint")
+	}
+	want := descriptor.Fingerprint
+	descriptor.Fingerprint = ""
+	sealed, err := SealExtensionPlan(descriptor)
+	if err != nil {
+		return SealedExtensionPlan{}, err
+	}
+	if sealed.Fingerprint() != want {
+		return SealedExtensionPlan{}, errors.New("extension plan fingerprint mismatch")
+	}
+	for _, component := range sealed.descriptor.Components {
+		if err := validateComponentSessionScopes(sessionID, component); err != nil {
+			return SealedExtensionPlan{}, err
+		}
+	}
+	return sealed, nil
+}
+
+func canonicalExtensionPlan(descriptor ExtensionPlanDescriptor) (ExtensionPlanDescriptor, error) {
+	descriptor.Fingerprint = ""
+	if err := validateExtensionPlan(descriptor); err != nil {
+		return ExtensionPlanDescriptor{}, err
 	}
 	next := descriptor.Clone()
-	next.Fingerprint = ""
 	for index := range next.Components {
 		component := &next.Components[index]
 		sort.Slice(component.Handlers, func(i, j int) bool {
@@ -251,12 +314,42 @@ func FingerprintExtensionPlan(descriptor ExtensionPlanDescriptor) (string, error
 	}
 	sort.Slice(next.Components, func(i, j int) bool { return compareComponentPlan(next.Components[i], next.Components[j]) < 0 })
 	normalizeEmptyPlanSlices(&next)
-	raw, err := json.Marshal(next)
-	if err != nil {
-		return "", err
+	return next, nil
+}
+
+func validateComponentSessionScopes(sessionID ID, component ComponentPlan) error {
+	validate := func(scope extension.Scope) error {
+		if scope.Kind == extension.ScopeSession && scope.Key != string(sessionID) {
+			return errors.New("extension plan session scope mismatch")
+		}
+		return nil
 	}
-	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:]), nil
+	for _, identity := range component.Handlers {
+		if err := validate(identity.Scope); err != nil {
+			return err
+		}
+	}
+	for _, identity := range component.Tools {
+		if err := validate(identity.Scope); err != nil {
+			return err
+		}
+	}
+	for _, identity := range component.Prompts {
+		if err := validate(identity.Scope); err != nil {
+			return err
+		}
+	}
+	for _, identity := range component.Guards {
+		if err := validate(identity.Scope); err != nil {
+			return err
+		}
+	}
+	for _, identity := range component.Restrictions {
+		if err := validate(identity.Scope); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func normalizeEmptyPlanSlices(descriptor *ExtensionPlanDescriptor) {
