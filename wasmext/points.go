@@ -50,17 +50,13 @@ func registerHook(registrar extension.Registrar, spec extension.Registration, ho
 	settled := spec
 	settled.ID += "/after-run"
 	return extension.On(registrar, runtime.RunSettledPoint, settled, func(ctx context.Context, notice runtime.RunSettledNotice) error {
-		return finishRegisteredHook(ctx, hook, notice)
+		return hook.finish(ctx, notice.Metadata)
 	})
 }
 
 func contextContributionSource(instanceID string, spec extension.Registration, index int) string {
 	parts := []string{instanceID, spec.ID, string(spec.Scope.Kind), spec.Scope.Key}
 	return fmt.Sprintf("wasm-context/%d:%s/%d:%s/%d:%s/%d:%s/%06d", len(parts[0]), parts[0], len(parts[1]), parts[1], len(parts[2]), parts[2], len(parts[3]), parts[3], index)
-}
-
-func finishRegisteredHook(ctx context.Context, hook *loadedHook, notice runtime.RunSettledNotice) error {
-	return hook.finish(ctx, notice.Metadata)
 }
 
 // registerToolMiddleware maps tool-middleware@0.1.0 only to prepare and result
@@ -84,7 +80,7 @@ func registerToolMiddleware(registrar extension.Registrar, spec extension.Regist
 	result := spec
 	result.ID += "/result"
 	return extension.OnTransform(registrar, runtime.ToolResultTransformPoint, result, func(ctx context.Context, input runtime.ToolResultTransform) (runtime.ToolResultTransform, error) {
-		transformed, err := middleware.afterToolCall(ctx, runtime.Tool{Name: input.ToolName}, input.Call, input.Result, nil)
+		transformed, err := middleware.afterToolCall(ctx, runtime.Tool{Name: input.ToolName}, input.Call, input.Result)
 		if err != nil {
 			return runtime.ToolResultTransform{}, err
 		}

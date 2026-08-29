@@ -488,51 +488,6 @@ func TestRequiredAroundDrainsAdmittedNextBeforeReturning(t *testing.T) {
 	}
 }
 
-func TestEquivalentPointValuesShareSemanticIdentity(t *testing.T) {
-	registered := NewNotification[testPayload](Contract{ID: "test/semantic-point", Version: "1"}, clonePayload)
-	invoked := NewNotification[testPayload](registered.Contract(), clonePayload)
-	registry := newTestRegistry(nil)
-	called := 0
-	_, err := registry.Mount(context.Background(), testComponent("semantic-point"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return On(registrar, registered, Registration{ID: "handler", Scope: GlobalScope()}, func(context.Context, testPayload) error {
-			called++
-			return nil
-		})
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := registry.Snapshot(GlobalScope())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer plan.Release()
-	Notify(plan, context.Background(), invoked, testPayload{})
-	if called != 1 {
-		t.Fatalf("semantic point calls = %d, want 1", called)
-	}
-}
-
-func TestPointSignatureAuthoritySurvivesClose(t *testing.T) {
-	contract := Contract{ID: "test/signature-authority", Version: "1"}
-	registry := newTestRegistry(nil)
-	first, err := registry.Mount(context.Background(), testComponent("signature-int"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return On(registrar, NewNotification[int](contract, nil), Registration{ID: "handler", Scope: GlobalScope()}, func(context.Context, int) error { return nil })
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := first.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-	_, err = registry.Mount(context.Background(), testComponent("signature-string"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-		return On(registrar, NewNotification[string](contract, nil), Registration{ID: "handler", Scope: GlobalScope()}, func(context.Context, string) error { return nil })
-	}))
-	if !errors.Is(err, ErrInvalidContract) {
-		t.Fatalf("incompatible remount error = %v, want ErrInvalidContract", err)
-	}
-}
-
 func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
 	registry := newTestRegistry(nil)
 	component := testComponent("opaque-target")

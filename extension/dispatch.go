@@ -21,16 +21,16 @@ func (e *nextOutlivedError) Is(target error) bool {
 }
 
 func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value T) {
-	if plan == nil || point.key.signature == nil {
+	if plan == nil || point.definition == nil {
 		return
 	}
-	for _, entry := range matchingEntries(plan, point.key, HandlerNotification) {
+	for _, entry := range matchingEntries(plan, point.base()) {
 		observer, ok := entry.callback.(Observer[T])
 		if !ok {
 			report(plan.reporter, ctx, callbackFailure(entry, "callback_type", errors.New("observer type mismatch")))
 			continue
 		}
-		input, err := cloneInput(point.clone, value)
+		input, err := cloneInput(point.definition.clone, value)
 		if err != nil {
 			report(plan.reporter, ctx, callbackFailure(entry, "clone_failed", err))
 			continue
@@ -42,12 +42,15 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 }
 
 func RunHooks[T any](plan *Plan, ctx context.Context, point Hook[T], value T) error {
-	for _, entry := range matchingEntries(plan, point.key, HandlerHook) {
+	if err := validatePoint(point.base()); err != nil {
+		return err
+	}
+	for _, entry := range matchingEntries(plan, point.base()) {
 		hook, ok := entry.callback.(HookFunc[T])
 		if !ok {
 			return errors.New("extension hook type mismatch")
 		}
-		input, err := cloneInput(point.clone, value)
+		input, err := cloneInput(point.definition.clone, value)
 		if err != nil {
 			return err
 		}
@@ -55,8 +58,8 @@ func RunHooks[T any](plan *Plan, ctx context.Context, point Hook[T], value T) er
 		if err != nil {
 			return propagateCallbackFailure(plan, ctx, entry, err)
 		}
-		if point.validate != nil {
-			if err := point.validate(value, input); err != nil {
+		if point.definition.validate != nil {
+			if err := point.definition.validate(value, input); err != nil {
 				return fmt.Errorf("%w: %v", ErrProtectedMutation, err)
 			}
 		}
@@ -65,25 +68,28 @@ func RunHooks[T any](plan *Plan, ctx context.Context, point Hook[T], value T) er
 }
 
 func ApplyTransforms[T any](plan *Plan, ctx context.Context, point Transform[T], value T) (T, error) {
-	original, err := cloneInput(point.clone, value)
+	if err := validatePoint(point.base()); err != nil {
+		return value, err
+	}
+	original, err := cloneInput(point.definition.clone, value)
 	if err != nil {
 		return value, err
 	}
-	current, err := cloneInput(point.clone, value)
+	current, err := cloneInput(point.definition.clone, value)
 	if err != nil {
 		return value, err
 	}
-	if point.validate != nil {
-		if validateErr := point.validate(original, current); validateErr != nil {
+	if point.definition.validate != nil {
+		if validateErr := point.definition.validate(original, current); validateErr != nil {
 			return value, validateErr
 		}
 	}
-	for _, entry := range matchingEntries(plan, point.key, HandlerTransform) {
+	for _, entry := range matchingEntries(plan, point.base()) {
 		transform, ok := entry.callback.(TransformFunc[T])
 		if !ok {
 			return value, errors.New("extension transform type mismatch")
 		}
-		callbackInput, cloneErr := cloneInput(point.clone, current)
+		callbackInput, cloneErr := cloneInput(point.definition.clone, current)
 		if cloneErr != nil {
 			return value, cloneErr
 		}
@@ -91,12 +97,12 @@ func ApplyTransforms[T any](plan *Plan, ctx context.Context, point Transform[T],
 		if callbackErr != nil {
 			return value, propagateCallbackFailure(plan, ctx, entry, callbackErr)
 		}
-		if point.validate != nil {
-			if validateErr := point.validate(original, candidate); validateErr != nil {
+		if point.definition.validate != nil {
+			if validateErr := point.definition.validate(original, candidate); validateErr != nil {
 				return value, validateErr
 			}
 		}
-		current, err = cloneInput(point.clone, candidate)
+		current, err = cloneInput(point.definition.clone, candidate)
 		if err != nil {
 			return value, err
 		}
@@ -105,21 +111,25 @@ func ApplyTransforms[T any](plan *Plan, ctx context.Context, point Transform[T],
 }
 
 func EvaluateGate[I, D any](plan *Plan, ctx context.Context, point Gate[I, D], input I) (D, error) {
-	decision := point.continueDecision
-	if point.validateDecision != nil {
-		if err := point.validateDecision(decision); err != nil {
+	var zero D
+	if err := validatePoint(point.base()); err != nil {
+		return zero, err
+	}
+	decision := point.definition.continueDecision
+	if point.definition.validateDecision != nil {
+		if err := point.definition.validateDecision(decision); err != nil {
 			return decision, err
 		}
 	}
-	if point.shouldContinue == nil {
+	if point.definition.shouldContinue == nil {
 		return decision, fmt.Errorf("%w: nil gate continuation predicate", ErrInvalidContract)
 	}
-	for _, entry := range matchingEntries(plan, point.key, HandlerGate) {
+	for _, entry := range matchingEntries(plan, point.base()) {
 		gate, ok := entry.callback.(GateFunc[I, D])
 		if !ok {
 			return decision, errors.New("extension gate type mismatch")
 		}
-		candidate, err := cloneInput(point.clone, input)
+		candidate, err := cloneInput(point.definition.clone, input)
 		if err != nil {
 			return decision, err
 		}
@@ -127,17 +137,17 @@ func EvaluateGate[I, D any](plan *Plan, ctx context.Context, point Gate[I, D], i
 		if err != nil {
 			return decision, propagateCallbackFailure(plan, ctx, entry, err)
 		}
-		if point.validateInput != nil {
-			if err := point.validateInput(input, candidate); err != nil {
+		if point.definition.validateInput != nil {
+			if err := point.definition.validateInput(input, candidate); err != nil {
 				return decision, fmt.Errorf("%w: %v", ErrProtectedMutation, err)
 			}
 		}
-		if point.validateDecision != nil {
-			if err := point.validateDecision(decision); err != nil {
+		if point.definition.validateDecision != nil {
+			if err := point.definition.validateDecision(decision); err != nil {
 				return decision, err
 			}
 		}
-		if !point.shouldContinue(decision) {
+		if !point.definition.shouldContinue(decision) {
 			return decision, nil
 		}
 	}
@@ -149,22 +159,25 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 	if terminal == nil {
 		return zero, fmt.Errorf("%w: nil terminal", ErrInvalidRegistration)
 	}
-	entries := matchingEntries(plan, point.key, HandlerAround)
+	if err := validatePoint(point.base()); err != nil {
+		return zero, err
+	}
+	entries := matchingEntries(plan, point.base())
 	var invoke func(int, context.Context, I) (O, error)
 	invoke = func(index int, currentCtx context.Context, candidate I) (O, error) {
-		if point.validateInput != nil {
-			if err := point.validateInput(input, candidate); err != nil {
+		if point.definition.validateInput != nil {
+			if err := point.definition.validateInput(input, candidate); err != nil {
 				return zero, fmt.Errorf("%w: %v", ErrProtectedMutation, err)
 			}
 		}
 		if index == len(entries) {
-			cloned, err := cloneInput(point.clone, candidate)
+			cloned, err := cloneInput(point.definition.clone, candidate)
 			if err != nil {
 				return zero, err
 			}
 			out, err := terminal(currentCtx, cloned)
-			if err == nil && point.validateOutput != nil {
-				err = point.validateOutput(out)
+			if err == nil && point.definition.validateOutput != nil {
+				err = point.definition.validateOutput(out)
 			}
 			return out, err
 		}
@@ -203,7 +216,7 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 			if nextCtx == nil {
 				nextCtx = currentCtx
 			}
-			cloned, err := cloneInput(point.clone, nextInput)
+			cloned, err := cloneInput(point.definition.clone, nextInput)
 			if err != nil {
 				nextMu.Lock()
 				delegatedFailure = err
@@ -221,7 +234,7 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 			delegatedSucceeded = true
 			return out, nil
 		}
-		cloned, err := cloneInput(point.clone, candidate)
+		cloned, err := cloneInput(point.definition.clone, candidate)
 		if err != nil {
 			return zero, err
 		}
@@ -263,32 +276,32 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 			}
 			return out, propagateCallbackFailure(plan, currentCtx, entry, callbackErr)
 		}
-		if point.validateOutput != nil {
-			if validateErr := point.validateOutput(out); validateErr != nil {
+		if point.definition.validateOutput != nil {
+			if validateErr := point.definition.validateOutput(out); validateErr != nil {
 				return zero, validateErr
 			}
 		}
-		if point.validateDelegated != nil {
-			if validateErr := point.validateDelegated(finalDelegatedOutput, out); validateErr != nil {
+		if point.definition.validateDelegated != nil {
+			if validateErr := point.definition.validateDelegated(finalDelegatedOutput, out); validateErr != nil {
 				return zero, validateErr
 			}
 		}
 		return out, nil
 	}
-	cloned, err := cloneInput(point.clone, input)
+	cloned, err := cloneInput(point.definition.clone, input)
 	if err != nil {
 		return zero, err
 	}
 	return invoke(0, ctx, cloned)
 }
 
-func matchingEntries(plan *Plan, key pointKey, kind HandlerKind) []plannedEntry {
-	if plan == nil || key.signature == nil {
+func matchingEntries(plan *Plan, point *pointDefinition) []plannedEntry {
+	if plan == nil || point == nil {
 		return nil
 	}
 	entries := make([]plannedEntry, 0)
 	for _, entry := range plan.entries {
-		if entry.point == key && entry.kind == kind {
+		if entry.point == point {
 			entries = append(entries, entry)
 		}
 	}
@@ -356,7 +369,7 @@ func cloneInput[T any](clone CloneFunc[T], input T) (T, error) {
 }
 
 func callbackFailure(entry plannedEntry, code string, cause error) Diagnostic {
-	return Diagnostic{Point: entry.contract, InstanceID: entry.component.InstanceID, HandlerID: entry.spec.ID, Code: code, Cause: cause}
+	return Diagnostic{Point: entry.point.contract, InstanceID: entry.component.InstanceID, HandlerID: entry.spec.ID, Code: code, Cause: cause}
 }
 
 func failureCode(err error) string {

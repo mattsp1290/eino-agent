@@ -63,15 +63,6 @@ const (
 	RunCompleted RunStatus = "completed"
 )
 
-// ComponentVersion records the runtime dependency identity captured at run
-// admission, for example a plugin, provider adapter, or config source.
-type ComponentVersion struct {
-	Name    string
-	Version string
-	Hash    string
-	Source  string
-}
-
 // Run records one admitted execution attempt before provider streaming starts.
 type Run struct {
 	ID            RunID
@@ -87,7 +78,6 @@ type Run struct {
 	ContextEpoch  EpochID
 	Status        RunStatus
 	Config        map[string]string
-	Components    []ComponentVersion
 	ExtensionPlan ExtensionPlanDescriptor
 	CreatedAt     time.Time
 	StartedAt     time.Time

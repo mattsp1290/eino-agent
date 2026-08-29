@@ -151,6 +151,44 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 	}
 }
 
+func TestAcquireRunPlanOmitsUnselectedCapabilityOnlyOwners(t *testing.T) {
+	registry := NewRegistry(nil)
+	mount := func(id string, installer Installer) {
+		mounted, err := registry.Mount(context.Background(), component(id), installer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = mounted.Close(context.Background()) })
+	}
+	mount("disabled-only", InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(ToolRegistration{ID: "disabled", Scope: extension.GlobalScope(), Definition: definition("disabled", "disabled")})
+	}))
+	mount("shadowed-only", InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Prompt(PromptRegistration{ID: "global-prompt", Name: "policy", Scope: extension.GlobalScope(), Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) { return "global", nil })})
+	}))
+	mount("session-prompt", InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Prompt(PromptRegistration{ID: "session-prompt", Name: "policy", Scope: extension.SessionScope("session-a"), Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) { return "session", nil })})
+	}))
+	mount("handler-only", InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil })
+	}))
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a", Config: config.Snapshot{Tools: config.ToolConfig{Disabled: []string{"disabled"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	descriptor := plan.Descriptor()
+	if descriptorComponent(descriptor, "disabled-only") != nil || descriptorComponent(descriptor, "shadowed-only") != nil {
+		t.Fatalf("unselected owners leaked into descriptor: %#v", descriptor)
+	}
+	if owner := descriptorComponent(descriptor, "session-prompt"); owner == nil || len(owner.Prompts) != 1 {
+		t.Fatalf("session prompt owner missing: %#v", descriptor)
+	}
+	if owner := descriptorComponent(descriptor, "handler-only"); owner == nil || len(owner.Handlers) != 1 {
+		t.Fatalf("handler-only owner missing: %#v", descriptor)
+	}
+}
+
 func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
 	registry := NewRegistry(nil)
 	baseComponent := component("scope-collision")

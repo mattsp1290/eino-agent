@@ -29,8 +29,10 @@ func testPlanTools(registry staticToolRegistry) []PlanTool {
 		if err != nil {
 			panic(err)
 		}
+		identity := testToolIdentity(tool.Name)
+		identity.Order = index
 		capabilities[index] = PlanTool{
-			Identity: testToolIdentity(tool.Name), Sequence: index,
+			Identity: identity,
 			Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
 				return cloneToolChecked(tool)
 			},
@@ -91,6 +93,12 @@ func testGuardIdentity(id string) session.GuardPlanIdentity {
 	return session.GuardPlanIdentity{
 		RegistrationID: id, Scope: extension.GlobalScope(),
 	}
+}
+
+func testGuardIdentityAt(id string, order int) session.GuardPlanIdentity {
+	identity := testGuardIdentity(id)
+	identity.Order = order
+	return identity
 }
 
 func testPlanComponent(id string) extension.Component {
@@ -236,22 +244,23 @@ func TestNewRunPlanRejectsDuplicateComponentOwner(t *testing.T) {
 	}
 }
 
-func TestNewRunPlanPreservesInterleavedExecutionSequences(t *testing.T) {
-	tool := func(name string, sequence int) PlanTool {
-		return PlanTool{Identity: session.ToolPlanIdentity{Name: name, RegistrationID: name, Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}, Sequence: sequence, Resolve: func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: name}, nil }}
+func TestNewRunPlanOrdersInterleavedComponentCapabilities(t *testing.T) {
+	tool := func(name string, order int) PlanTool {
+		return PlanTool{Identity: session.ToolPlanIdentity{Name: name, RegistrationID: name, Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor", Order: order}, Resolve: func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: name}, nil }}
 	}
-	prompt := func(name string, sequence int) PlanPrompt {
-		return PlanPrompt{Identity: session.PromptPlanIdentity{Name: name, RegistrationID: name, Scope: extension.GlobalScope(), Order: sequence}, Sequence: sequence, Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return name, nil })}
+	prompt := func(name string, order int) PlanPrompt {
+		return PlanPrompt{Identity: session.PromptPlanIdentity{Name: name, RegistrationID: name, Scope: extension.GlobalScope(), Order: order}, Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return name, nil })}
 	}
-	guard := func(name string, sequence int) PlanGuard {
-		return PlanGuard{Identity: session.GuardPlanIdentity{RegistrationID: name, Scope: extension.GlobalScope(), Order: sequence}, Sequence: sequence, Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+	guard := func(name string, order int) PlanGuard {
+		return PlanGuard{Identity: session.GuardPlanIdentity{RegistrationID: name, Scope: extension.GlobalScope(), Order: order}, Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
 		})}
 	}
-	plan, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{
+	components := []PlanComponent{
 		{Component: testPlanComponent("a"), Tools: []PlanTool{tool("a-1", 0), tool("a-3", 2)}, Prompts: []PlanPrompt{prompt("a-1", 0), prompt("a-3", 2)}, Guards: []PlanGuard{guard("a-1", 0), guard("a-3", 2)}},
 		{Component: testPlanComponent("b"), Tools: []PlanTool{tool("b-2", 1)}, Prompts: []PlanPrompt{prompt("b-2", 1)}, Guards: []PlanGuard{guard("b-2", 1)}},
-	}})
+	}
+	plan, err := NewRunPlan(RunPlanSpec{Components: components})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -264,6 +273,36 @@ func TestNewRunPlanPreservesInterleavedExecutionSequences(t *testing.T) {
 	}
 	if got := []string{plan.guards[0].ID, plan.guards[1].ID, plan.guards[2].ID}; !reflect.DeepEqual(got, []string{"a-1", "b-2", "a-3"}) {
 		t.Fatalf("guard order = %v", got)
+	}
+	permuted, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{components[1], components[0]}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer permuted.Release()
+	if permuted.Descriptor().Fingerprint != plan.Descriptor().Fingerprint {
+		t.Fatalf("component permutation changed fingerprint: %s != %s", permuted.Descriptor().Fingerprint, plan.Descriptor().Fingerprint)
+	}
+	if got := []string{permuted.tools.capabilities[0].Identity.Name, permuted.tools.capabilities[1].Identity.Name, permuted.tools.capabilities[2].Identity.Name}; !reflect.DeepEqual(got, []string{"a-1", "b-2", "a-3"}) {
+		t.Fatalf("permuted tool order = %v", got)
+	}
+}
+
+func TestNewRunPlanOrdersGlobalGuardBeforeSessionGuard(t *testing.T) {
+	guard := func(scope extension.Scope) PlanGuard {
+		return PlanGuard{Identity: session.GuardPlanIdentity{RegistrationID: "guard", Scope: scope}, Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
+		})}
+	}
+	plan, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{{
+		Component: testPlanComponent("guard-owner"),
+		Guards:    []PlanGuard{guard(extension.SessionScope("session")), guard(extension.GlobalScope())},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	if got := []extension.Scope{plan.guards[0].Scope, plan.guards[1].Scope}; !reflect.DeepEqual(got, []extension.Scope{extension.GlobalScope(), extension.SessionScope("session")}) {
+		t.Fatalf("guard scope order = %#v", got)
 	}
 }
 

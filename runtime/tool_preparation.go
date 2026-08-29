@@ -139,7 +139,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		resultPartID := o.ids.NewPartID()
 		createdAt := o.now()
 		createEvent := toolTransitionEnvelope(o, snapshot, createdAt)
-		created, err := execution.store.CreateToolCall(ctx, session.CreateToolCallRequest{
+		created, err := execution.persistToolCreation(ctx, session.CreateToolCallRequest{
 			Call:  session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Pattern: call.Pattern, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)},
 			Event: createEvent,
 		})
@@ -148,10 +148,9 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		}
 		record := created.Call
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
-		execution.publishPersisted(context.WithoutCancel(ctx), o.events, created.Event)
 		startedAt := o.now()
 		claimEvent := toolTransitionEnvelope(o, snapshot, startedAt)
-		claimed, err := execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+		claimed, err := execution.persistToolClaim(ctx, record.RunID, session.ClaimToolCallRequest{
 			ID: record.ID, ClaimedBy: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), StartedAt: startedAt,
 			LeaseDuration: o.lease(), Event: claimEvent,
 		})
@@ -160,14 +159,12 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		}
 		record = claimed.Call
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
-		extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
-		execution.publishPersisted(context.WithoutCancel(ctx), o.events, claimed.Event)
+		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
 		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, call, record, prepared.middlewareErr)
 		if err != nil {
 			return nil, err
 		}
 		output := settled.Settlement.Output
-		execution.publishPersisted(context.WithoutCancel(ctx), o.events, settled.Event)
 		messages = append(messages, einoschema.ToolMessage(string(output), string(callID), einoschema.WithToolName(schemaCall.Function.Name)))
 		if errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled) {
 			return messages, settled.Outcome.RawError

@@ -114,7 +114,10 @@ Tool execution and settlement:
 decode/normalize
   -> runtime/tool-prepare
   -> persist pending + canonical pending event atomically
+  -> best-effort publish the already-persisted pending event
   -> claim running + renew run lease + canonical running event atomically
+  -> best-effort publish the already-persisted running event
+  -> runtime/tool-started
   -> all deny-only guards
   -> unchanged permission/approval loop
   -> runtime/tool-execute -> body exactly once
@@ -129,10 +132,10 @@ reuse the persisted normalized input, so prepare transforms do not run twice.
 Fresh and pending-resume calls share one post-claim execution and settlement
 operation. It builds the bounded result payload, terminal call, result message,
 result part, and canonical terminal event at one completion time, then commits
-them with a cancellation-free settlement context. Fresh execution publishes
-the exact persisted pending/running/terminal events only after commit. External
-delivery remains best-effort and never appends the durable event a second time;
-resume retains its no-live-tool-transport policy.
+them with a cancellation-free settlement context. Fresh and resumed execution
+publish each exact persisted transition event only after commit and before its
+phase-specific lifecycle notice. Infrastructure delivery remains best-effort
+and never appends the durable event a second time.
 
 ## Scope, provenance, and resume
 

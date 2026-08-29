@@ -22,8 +22,6 @@ type loadedTool struct {
 	definition tools.Definition
 }
 
-func (t *loadedTool) definitionCopy() (tools.Definition, error) { return t.definition.Clone() }
-
 func (t *loadedTool) close() error { return t.module.Close() }
 
 func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedTool, error) {
@@ -316,7 +314,7 @@ func (m *loadedToolMiddleware) beforeToolCall(ctx context.Context, tool runtime.
 	return applyInputReplacement(m.module, "tool-middleware.before-tool-call", call.Input, replacement)
 }
 
-func (m *loadedToolMiddleware) afterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult, _ error) (runtime.ToolResult, error) {
+func (m *loadedToolMiddleware) afterToolCall(ctx context.Context, tool runtime.Tool, call runtime.ToolCall, result runtime.ToolResult) (runtime.ToolResult, error) {
 	encoded, err := toolResultJSON(result)
 	if err != nil {
 		return runtime.ToolResult{}, extensionError(ErrorPayload, m.module.identity, "tool-middleware.after-tool-call", err)

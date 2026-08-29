@@ -15,17 +15,9 @@ var errToolExecutionPanic = errors.New("tool execution panicked")
 type settledTool struct {
 	Outcome    toolOutcome
 	Settlement session.ToolSettlement
-	Output     ToolOutput
-	Event      session.EventRecord
 }
 
 func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall) (session.ToolSettlement, error) {
-	call := ToolCall{
-		ID: claimed.ID, SessionID: claimed.SessionID, RunID: claimed.RunID, MessageID: claimed.MessageID,
-		ResultMessageID: claimed.ResultMessageID, ResultPartID: claimed.ResultPartID, Name: claimed.Name,
-		Scope: tool.Scope, Pattern: claimed.Pattern, Input: cloneJSON(claimed.Input),
-	}
-	_, claimed = e.ensureToolResultIDs(call, claimed)
 	completedAt := e.host.now()
 	const errText = "tool was running during resume and was not re-executed"
 	raw := cloneJSON(claimed.Output)
@@ -51,7 +43,7 @@ func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run ses
 		return session.ToolSettlement{}, err
 	}
 	eventEnvelope := toolTransitionEnvelope(e.host, e.host.resumeSnapshot(run), settlement.CompletedAt)
-	if _, err := e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement, eventEnvelope); err != nil {
+	if _, err := e.persistToolSettlement(ctx, claimed, settlement, eventEnvelope); err != nil {
 		return session.ToolSettlement{}, err
 	}
 	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
@@ -62,19 +54,19 @@ func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run ses
 }
 
 func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall, claimed session.ToolCall, prepareErr error) (settledTool, error) {
-	call, claimed = e.ensureToolResultIDs(call, claimed)
+	call.ResultMessageID = claimed.ResultMessageID
+	call.ResultPartID = claimed.ResultPartID
 	e.host.observeToolMaterialized(ctx, snapshot, tool, call)
 	observedTool := e.host.startObservedToolCall(ctx, snapshot, tool, call)
 	outcome := e.executeClaimedToolPipeline(ctx, tool, call, prepareErr)
 	completedAt := e.host.now()
-	settlement, output, err := BuildToolSettlement(ToolSettlementInput{
+	settlement, _, err := BuildToolSettlement(ToolSettlementInput{
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
 	})
 	eventEnvelope := toolTransitionEnvelope(e.host, snapshot, completedAt)
-	var transition session.ToolTransitionResult
 	if err == nil {
-		transition, err = e.commitToolSettlement(context.WithoutCancel(ctx), claimed, settlement, eventEnvelope)
+		_, err = e.persistToolSettlement(ctx, claimed, settlement, eventEnvelope)
 	}
 	if err != nil {
 		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
@@ -87,7 +79,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	})
 	e.host.finishObservedToolCall(observedTool, settlement.Status, outcome.RawError, outcome.Result.Metadata)
 	e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, settlement.Status, completedAt.Sub(claimed.StartedAt), outcome.RawError, outcome.Result.Metadata)
-	return settledTool{Outcome: outcome, Settlement: settlement, Output: output, Event: transition.Event}, nil
+	return settledTool{Outcome: outcome, Settlement: settlement}, nil
 }
 
 func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error) (outcome toolOutcome) {
@@ -104,17 +96,38 @@ func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool
 	return e.host.transformToolOutcome(ctx, e, outcome)
 }
 
-func (e *runExecution) ensureToolResultIDs(call ToolCall, claimed session.ToolCall) (ToolCall, session.ToolCall) {
-	call.ResultMessageID = claimed.ResultMessageID
-	call.ResultPartID = claimed.ResultPartID
-	return call, claimed
-}
-
-func (e *runExecution) commitToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement, event session.ToolTransitionEvent) (session.ToolTransitionResult, error) {
-	if err := e.ensureStore(ctx, claimed.RunID); err != nil {
+func (e *runExecution) persistToolCreation(ctx context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
+	if err := e.ensureStore(ctx, request.Call.RunID); err != nil {
 		return session.ToolTransitionResult{}, err
 	}
-	return e.store.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: settlement, Event: event})
+	result, err := e.store.CreateToolCall(ctx, request)
+	if err == nil {
+		e.publishPersisted(ctx, e.host.events, result.Event)
+	}
+	return result, err
+}
+
+func (e *runExecution) persistToolClaim(ctx context.Context, runID session.RunID, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
+	if err := e.ensureStore(ctx, runID); err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	result, err := e.store.ClaimToolCall(ctx, request)
+	if err == nil {
+		e.publishPersisted(ctx, e.host.events, result.Event)
+	}
+	return result, err
+}
+
+func (e *runExecution) persistToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement, event session.ToolTransitionEvent) (session.ToolTransitionResult, error) {
+	persistCtx := context.WithoutCancel(ctx)
+	if err := e.ensureStore(persistCtx, claimed.RunID); err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	result, err := e.store.SettleToolCall(persistCtx, session.SettleToolCallRequest{Settlement: settlement, Event: event})
+	if err == nil {
+		e.publishPersisted(ctx, e.host.events, result.Event)
+	}
+	return result, err
 }
 
 func toolTransitionEnvelope(host *StreamingOrchestrator, snapshot TurnSnapshot, at time.Time) session.ToolTransitionEvent {

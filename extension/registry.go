@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"sort"
 	"sync"
 )
@@ -14,14 +13,14 @@ const maxReportedFailures = 64
 // Registry owns the complete lifecycle and immutable payload of mounted
 // components. T is supplied by the production host composing those payloads.
 type Registry[T any] struct {
-	mu              sync.Mutex
-	reporter        Reporter
-	mounts          map[string]*mountState[T]
-	pointSignatures map[durablePointKey]reflect.Type
+	mu               sync.Mutex
+	reporter         Reporter
+	mounts           map[string]*mountState[T]
+	pointDefinitions map[durablePointKey]*pointDefinition
 }
 
 func NewRegistry[T any](reporter Reporter) *Registry[T] {
-	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T]), pointSignatures: make(map[durablePointKey]reflect.Type)}
+	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T]), pointDefinitions: make(map[durablePointKey]*pointDefinition)}
 }
 
 type cleanupState struct {
@@ -158,17 +157,20 @@ func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selection
 	if r.mounts == nil {
 		r.mounts = make(map[string]*mountState[T])
 	}
+	if r.pointDefinitions == nil {
+		r.pointDefinitions = make(map[durablePointKey]*pointDefinition)
+	}
 	if _, exists := r.mounts[state.component.InstanceID]; exists {
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateInstance, state.component.InstanceID)
 	}
-	candidateSignatures := make(map[durablePointKey]reflect.Type)
+	candidateDefinitions := make(map[durablePointKey]*pointDefinition)
 	for _, entry := range state.entries {
-		if signature, exists := candidateSignatures[entry.point.durablePointKey]; exists && signature != entry.point.signature {
-			return nil, fmt.Errorf("%w: conflicting callback signature for %s", ErrInvalidContract, entry.contract.ID)
+		if definition, exists := candidateDefinitions[entry.point.durablePointKey]; exists && definition != entry.point {
+			return nil, fmt.Errorf("%w: conflicting point definition for %s", ErrInvalidContract, entry.point.contract.ID)
 		}
-		candidateSignatures[entry.point.durablePointKey] = entry.point.signature
-		if signature, exists := r.pointSignatures[entry.point.durablePointKey]; exists && signature != entry.point.signature {
-			return nil, fmt.Errorf("%w: conflicting callback signature for %s", ErrInvalidContract, entry.contract.ID)
+		candidateDefinitions[entry.point.durablePointKey] = entry.point
+		if definition, exists := r.pointDefinitions[entry.point.durablePointKey]; exists && definition != entry.point {
+			return nil, fmt.Errorf("%w: conflicting point definition for %s", ErrInvalidContract, entry.point.contract.ID)
 		}
 	}
 	candidate := CommitValue[T]{component: state.component, value: value}
@@ -183,8 +185,8 @@ func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selection
 			return nil, err
 		}
 	}
-	for key, signature := range candidateSignatures {
-		r.pointSignatures[key] = signature
+	for key, definition := range candidateDefinitions {
+		r.pointDefinitions[key] = definition
 	}
 	state.value = value
 	state.selectionScopes = scopes
@@ -483,7 +485,7 @@ type ComponentHandlers struct {
 }
 
 func handlerIdentity(entry registrationEntry) HandlerIdentity {
-	return HandlerIdentity{ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: entry.kind}
+	return HandlerIdentity{ID: entry.spec.ID, Contract: entry.point.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: entry.point.kind}
 }
 
 // HandlerComponents returns defensive, component-owned handler identities.

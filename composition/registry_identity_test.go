@@ -8,6 +8,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
 )
 
 func TestCapabilityRegistrarsShareCanonicalIdentifierValidation(t *testing.T) {
@@ -59,7 +60,7 @@ func TestToolSchemaHashCanonicalizesMetadataOrder(t *testing.T) {
 	}
 }
 
-func TestComposedToolIdentityTracksSourceAndOrder(t *testing.T) {
+func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 	schemaA, schemaB := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	executorA, executorB := strings.Repeat("c", 64), strings.Repeat("d", 64)
 	base := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceSchemaHash: schemaA, SourceExecutorHash: executorA, Definition: definition("echo", "v1")}
@@ -73,8 +74,23 @@ func TestComposedToolIdentityTracksSourceAndOrder(t *testing.T) {
 	changedOrder := base
 	changedOrder.Order++
 	changedOrderHash, _ := composedToolSchemaHash(changedOrder)
-	if baseSchema == changedSchemaHash || baseSchema == changedOrderHash {
-		t.Fatalf("schema identity ignored source/order: base=%s source=%s order=%s", baseSchema, changedSchemaHash, changedOrderHash)
+	if baseSchema == changedSchemaHash || baseSchema != changedOrderHash {
+		t.Fatalf("schema identity source/order separation failed: base=%s source=%s order=%s", baseSchema, changedSchemaHash, changedOrderHash)
+	}
+	componentIdentity := component("tool-order").Artifact
+	descriptor := func(order int) session.ExtensionPlanDescriptor {
+		value := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{{
+			InstanceID: "tool-order", Artifact: componentIdentity,
+			Tools: []session.ToolPlanIdentity{{Name: "echo", RegistrationID: base.ID, Scope: base.Scope, SchemaHash: baseSchema, ExecutorHash: executorA, Order: order}},
+		}}}
+		value.Fingerprint, err = session.FingerprintExtensionPlan(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	if descriptor(base.Order).Fingerprint == descriptor(changedOrder.Order).Fingerprint {
+		t.Fatal("tool order did not change plan fingerprint")
 	}
 	baseExecutor, _ := composedToolExecutorHash(executorA, "artifact")
 	changedExecutor, _ := composedToolExecutorHash(executorB, "artifact")

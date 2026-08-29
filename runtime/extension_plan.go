@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -36,21 +37,18 @@ type RunPlanProvider interface {
 type PlanTool struct {
 	Identity session.ToolPlanIdentity
 	Resolve  func(context.Context, ToolScopeContext) (Tool, error)
-	Sequence int
 }
 
 // PlanPrompt binds one prompt implementation to its persisted identity.
 type PlanPrompt struct {
 	Identity session.PromptPlanIdentity
 	Provider PromptProvider
-	Sequence int
 }
 
 // PlanGuard binds one tool guard implementation to its persisted identity.
 type PlanGuard struct {
 	Identity session.GuardPlanIdentity
 	Guard    ToolGuard
-	Sequence int
 }
 
 // PlanRestriction binds one tool restriction policy to its persisted identity.
@@ -58,7 +56,6 @@ type PlanRestriction struct {
 	Identity session.RestrictionPlanIdentity
 	Allowed  []string
 	Denied   []string
-	Sequence int
 }
 
 type PlanComponent struct {
@@ -101,26 +98,18 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		authoritativeHandlers = spec.Dispatch.HandlerComponents()
 	}
 	matchedHandlers := make([]bool, len(authoritativeHandlers))
-	type sequencedTool struct {
-		sequence int
-		value    PlanTool
+	type ownedTool struct {
+		owner string
+		value PlanTool
 	}
-	type sequencedPrompt struct {
-		sequence int
-		value    MountedPrompt
+	type ownedRestriction struct {
+		owner string
+		value PlanRestriction
 	}
-	type sequencedGuard struct {
-		sequence int
-		value    MountedToolGuard
-	}
-	type sequencedRestriction struct {
-		sequence int
-		value    PlanRestriction
-	}
-	var tools []sequencedTool
-	var prompts []sequencedPrompt
-	var guards []sequencedGuard
-	var restrictions []sequencedRestriction
+	var tools []ownedTool
+	var prompts []MountedPrompt
+	var guards []MountedToolGuard
+	var restrictions []ownedRestriction
 	for componentIndex, owned := range components {
 		if err := extension.ValidateComponent(owned.Component); err != nil || componentIndex > 0 && components[componentIndex-1].Component.InstanceID == owned.Component.InstanceID {
 			return fail(fmt.Errorf("%w: invalid or duplicate component owner", ErrExtensionPlanMismatch))
@@ -150,21 +139,21 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			if capability.Resolve == nil {
 				return fail(fmt.Errorf("%w: tool resolver required", ErrExtensionPlanMismatch))
 			}
-			tools = append(tools, sequencedTool{sequence: capability.Sequence, value: capability})
+			tools = append(tools, ownedTool{owner: owned.Component.InstanceID, value: capability})
 			durable.Tools = append(durable.Tools, capability.Identity)
 		}
 		for _, capability := range owned.Prompts {
 			if capability.Provider == nil || capability.Identity.Name == "" {
 				return fail(fmt.Errorf("%w: prompt behavior required", ErrExtensionPlanMismatch))
 			}
-			prompts = append(prompts, sequencedPrompt{sequence: capability.Sequence, value: MountedPrompt{Name: capability.Identity.Name, Order: capability.Identity.Order, InstanceID: owned.Component.InstanceID, Provider: capability.Provider}})
+			prompts = append(prompts, MountedPrompt{Name: capability.Identity.Name, ID: capability.Identity.RegistrationID, Scope: capability.Identity.Scope, Order: capability.Identity.Order, InstanceID: owned.Component.InstanceID, Provider: capability.Provider})
 			durable.Prompts = append(durable.Prompts, capability.Identity)
 		}
 		for _, capability := range owned.Guards {
 			if capability.Guard == nil || capability.Identity.RegistrationID == "" {
 				return fail(fmt.Errorf("%w: guard behavior required", ErrExtensionPlanMismatch))
 			}
-			guards = append(guards, sequencedGuard{sequence: capability.Sequence, value: MountedToolGuard{ID: capability.Identity.RegistrationID, Order: capability.Identity.Order, InstanceID: owned.Component.InstanceID, Guard: capability.Guard}})
+			guards = append(guards, MountedToolGuard{ID: capability.Identity.RegistrationID, Order: capability.Identity.Order, InstanceID: owned.Component.InstanceID, Scope: capability.Identity.Scope, Guard: capability.Guard})
 			durable.Guards = append(durable.Guards, capability.Identity)
 		}
 		for _, capability := range owned.Restrictions {
@@ -177,7 +166,7 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			}
 			capability.Allowed = rules.Allowed
 			capability.Denied = rules.Denied
-			restrictions = append(restrictions, sequencedRestriction{sequence: capability.Sequence, value: capability})
+			restrictions = append(restrictions, ownedRestriction{owner: owned.Component.InstanceID, value: capability})
 			durable.Restrictions = append(durable.Restrictions, capability.Identity)
 		}
 		descriptor.Components = append(descriptor.Components, durable)
@@ -187,22 +176,14 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			return fail(fmt.Errorf("%w: dispatch handler owner omitted", ErrExtensionPlanMismatch))
 		}
 	}
-	if err := validateSequences(tools, func(value sequencedTool) int { return value.sequence }); err != nil {
-		return fail(err)
-	}
-	if err := validateSequences(prompts, func(value sequencedPrompt) int { return value.sequence }); err != nil {
-		return fail(err)
-	}
-	if err := validateSequences(guards, func(value sequencedGuard) int { return value.sequence }); err != nil {
-		return fail(err)
-	}
-	if err := validateSequences(restrictions, func(value sequencedRestriction) int { return value.sequence }); err != nil {
-		return fail(err)
-	}
-	sort.Slice(tools, func(i, j int) bool { return tools[i].sequence < tools[j].sequence })
-	sort.Slice(prompts, func(i, j int) bool { return prompts[i].sequence < prompts[j].sequence })
-	sort.Slice(guards, func(i, j int) bool { return guards[i].sequence < guards[j].sequence })
-	sort.Slice(restrictions, func(i, j int) bool { return restrictions[i].sequence < restrictions[j].sequence })
+	sort.Slice(tools, func(i, j int) bool {
+		return comparePlanTool(tools[i].owner, tools[i].value.Identity, tools[j].owner, tools[j].value.Identity) < 0
+	})
+	sort.Slice(prompts, func(i, j int) bool { return compareMountedPrompt(prompts[i], prompts[j]) < 0 })
+	sort.Slice(guards, func(i, j int) bool { return compareMountedGuard(guards[i], guards[j]) < 0 })
+	sort.Slice(restrictions, func(i, j int) bool {
+		return comparePlanRestriction(restrictions[i].owner, restrictions[i].value.Identity, restrictions[j].owner, restrictions[j].value.Identity) < 0
+	})
 	sealedTools := make([]PlanTool, len(tools))
 	sealedPrompts := make([]MountedPrompt, len(prompts))
 	sealedGuards := make([]MountedToolGuard, len(guards))
@@ -210,12 +191,8 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	for index := range tools {
 		sealedTools[index] = tools[index].value
 	}
-	for index := range prompts {
-		sealedPrompts[index] = prompts[index].value
-	}
-	for index := range guards {
-		sealedGuards[index] = guards[index].value
-	}
+	copy(sealedPrompts, prompts)
+	copy(sealedGuards, guards)
 	for index := range restrictions {
 		sealedRestrictions[index] = restrictions[index].value
 	}
@@ -243,16 +220,59 @@ func sameHandlerIdentities(left, right []extension.HandlerIdentity) bool {
 	return true
 }
 
-func validateSequences[T any](values []T, sequence func(T) int) error {
-	seen := make([]bool, len(values))
-	for _, value := range values {
-		index := sequence(value)
-		if index < 0 || index >= len(values) || seen[index] {
-			return fmt.Errorf("%w: invalid execution sequence", ErrExtensionPlanMismatch)
+func comparePlanTool(leftOwner string, left session.ToolPlanIdentity, rightOwner string, right session.ToolPlanIdentity) int {
+	for _, result := range []int{
+		cmp.Compare(left.Order, right.Order), cmp.Compare(left.Name, right.Name), cmp.Compare(leftOwner, rightOwner),
+		cmp.Compare(left.RegistrationID, right.RegistrationID), compareExecutionScope(left.Scope, right.Scope),
+	} {
+		if result != 0 {
+			return result
 		}
-		seen[index] = true
 	}
-	return nil
+	return 0
+}
+
+func compareMountedPrompt(left, right MountedPrompt) int {
+	for _, result := range []int{
+		cmp.Compare(left.Order, right.Order), cmp.Compare(left.Name, right.Name), cmp.Compare(left.InstanceID, right.InstanceID),
+		cmp.Compare(left.ID, right.ID), compareExecutionScope(left.Scope, right.Scope),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareMountedGuard(left, right MountedToolGuard) int {
+	for _, result := range []int{
+		cmp.Compare(left.Order, right.Order), cmp.Compare(left.InstanceID, right.InstanceID), cmp.Compare(left.ID, right.ID),
+		compareExecutionScope(left.Scope, right.Scope),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func comparePlanRestriction(leftOwner string, left session.RestrictionPlanIdentity, rightOwner string, right session.RestrictionPlanIdentity) int {
+	for _, result := range []int{
+		cmp.Compare(leftOwner, rightOwner), cmp.Compare(left.RegistrationID, right.RegistrationID), compareExecutionScope(left.Scope, right.Scope),
+		cmp.Compare(left.RulesHash, right.RulesHash),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
+}
+
+func compareExecutionScope(left, right extension.Scope) int {
+	if result := cmp.Compare(left.Kind, right.Kind); result != 0 {
+		return result
+	}
+	return cmp.Compare(left.Key, right.Key)
 }
 
 // RestrictionRules is the canonical identity and executable representation of

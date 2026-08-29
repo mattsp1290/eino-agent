@@ -57,7 +57,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		t.Fatalf("openTool error = %v", err)
 	}
 	defer func() { _ = loaded.close() }()
-	definition, err := loaded.definitionCopy()
+	definition, err := loaded.definition.Clone()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +415,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 		}
 		t.Fatalf("middleware input = %s, %v", input, err)
 	}
-	result, err := middleware.afterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}}, nil)
+	result, err := middleware.afterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}})
 	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
 		t.Fatalf("middleware result = %#v, %v", result, err)
 	}

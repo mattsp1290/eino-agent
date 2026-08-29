@@ -290,9 +290,9 @@ func TestFinishRegisteredHookReturnsAfterRunError(t *testing.T) {
 	}
 	hook := &loadedHook{module: module, component: component}
 	defer func() { _ = hook.close() }()
-	err = finishRegisteredHook(context.Background(), hook, runtime.RunSettledNotice{SessionID: "session-1", Result: runtime.Result{RunID: "run-1"}, Metadata: runtime.BoundedTurnMetadata{SessionID: "session-1", RunID: "run-1"}})
+	err = hook.finish(context.Background(), runtime.BoundedTurnMetadata{SessionID: "session-1", RunID: "run-1"})
 	if !reflect.DeepEqual(operations, []string{"hook.after-run"}) {
-		t.Fatalf("finishRegisteredHook = %v operations=%v", err, operations)
+		t.Fatalf("hook.finish = %v operations=%v", err, operations)
 	}
 	var extensionErr *Error
 	if !errors.As(err, &extensionErr) || extensionErr.Operation != "hook.after-run" {
@@ -415,7 +415,7 @@ func TestToolMiddlewareJSONMappingPreservesProtectedContainers(t *testing.T) {
 	result, err := middleware.afterToolCall(context.Background(), runtime.Tool{Name: "echo"}, call, runtime.ToolResult{
 		Output: "fallback", Structured: json.RawMessage(`{"original":true}`),
 		Attachments: []runtime.Attachment{{ID: "attachment-1"}}, Metadata: map[string]string{"protected": "yes"},
-	}, nil)
+	})
 	if err != nil || string(result.Structured) != `{"changed":true}` || len(result.Attachments) != 1 || result.Metadata["protected"] != "yes" {
 		t.Fatalf("AfterToolCall = %#v, %v", result, err)
 	}

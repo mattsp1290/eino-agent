@@ -70,7 +70,7 @@ func TestExtensionPlanSchemaV1JSONAndFingerprintGolden(t *testing.T) {
 			Tools:      []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 		}},
 	}
-	const expectedJSON = `{"SchemaVersion":1,"Fingerprint":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor"}],"Prompts":null,"Guards":null,"Restrictions":null}]}`
+	const expectedJSON = `{"SchemaVersion":1,"Fingerprint":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor","Order":0}],"Prompts":null,"Guards":null,"Restrictions":null}]}`
 	raw, err := json.Marshal(descriptor)
 	if err != nil {
 		t.Fatal(err)
@@ -82,7 +82,7 @@ func TestExtensionPlanSchemaV1JSONAndFingerprintGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const expectedFingerprint = "742812920d63d81402765a211f9fef270b4d75bec632427adb5c1048f8dfb660"
+	const expectedFingerprint = "3f84a9c0b287ea01d84ae35bf94855fb6757d9412f02c3659ae9249d0b4a4d37"
 	if fingerprint != expectedFingerprint {
 		t.Fatalf("schema-v1 fingerprint = %s", fingerprint)
 	}

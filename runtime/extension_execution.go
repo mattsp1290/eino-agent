@@ -78,5 +78,5 @@ func (e *runExecution) publishPersisted(ctx context.Context, infrastructure Even
 		}
 		return
 	}
-	runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}.publishPersisted(ctx, record)
+	runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}.publishPersisted(ctx, context.WithoutCancel(ctx), record)
 }

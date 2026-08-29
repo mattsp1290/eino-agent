@@ -91,14 +91,24 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 		call session.ToolCallStatus
 		want []string
 	}{
-		{name: "pending", call: session.ToolCallPending, want: []string{"started", "settled"}},
-		{name: "running", call: session.ToolCallRunning, want: []string{"settled"}},
+		{name: "pending", call: session.ToolCallPending, want: []string{"sink:running", "published:running", "started", "sink:completed", "published:completed", "settled"}},
+		{name: "running", call: session.ToolCallRunning, want: []string{"sink:interrupted", "published:interrupted", "settled"}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			registry := newTestExtensionRegistry(nil)
 			component := extension.Component{InstanceID: "resume-lifecycle", Artifact: extension.Artifact{Name: "resume-lifecycle", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 			var notices []string
+			var publishedIDs []session.EventID
 			mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+				if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+					if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-resume" {
+						notices = append(notices, "published:"+toolEventStatus(event))
+						publishedIDs = append(publishedIDs, event.EventID)
+					}
+					return nil
+				}); err != nil {
+					return err
+				}
 				if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", Scope: extension.GlobalScope()}, func(context.Context, ToolStartedNotice) error {
 					notices = append(notices, "started")
 					return nil
@@ -124,8 +134,18 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 				return ToolResult{Output: "ok"}, nil
 			})}}}
+			var sinkIDs []session.EventID
+			sink := EventSinkFunc(func(_ context.Context, event Event) error {
+				if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-resume" {
+					notices = append(notices, "sink:"+toolEventStatus(event))
+					sinkIDs = append(sinkIDs, event.EventID)
+					return errors.New("transport unavailable")
+				}
+				return nil
+			})
 			orch := mustConfiguredOrchestrator(
 				WithStore(store),
+				WithEventSink(sink),
 				WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
 				WithOwnerID("new-owner"),
 			)
@@ -133,8 +153,28 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
 			}
-			if strings.Join(notices, ",") != strings.Join(test.want, ",") {
+			if !reflect.DeepEqual(notices, test.want) {
 				t.Fatalf("notices = %v, want %v", notices, test.want)
+			}
+			if !reflect.DeepEqual(sinkIDs, publishedIDs) {
+				t.Fatalf("sink IDs = %v, published IDs = %v", sinkIDs, publishedIDs)
+			}
+			batch, err := store.ListEvents(context.Background(), run.SessionID, session.EventCursor{Limit: 100})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var durableIDs []session.EventID
+			durableIDSet := make(map[session.EventID]bool)
+			for _, event := range batch.Events {
+				if event.ToolCallID == "call-resume" && event.Kind == string(EventToolCallUpdated) {
+					durableIDs = append(durableIDs, event.ID)
+					durableIDSet[event.ID] = true
+				}
+			}
+			for _, id := range sinkIDs {
+				if !durableIDSet[id] {
+					t.Fatalf("durable IDs = %v, published ID %s missing", durableIDs, id)
+				}
 			}
 		})
 	}

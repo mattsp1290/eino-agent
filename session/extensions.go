@@ -32,6 +32,7 @@ type ToolPlanIdentity struct {
 	Name, RegistrationID     string
 	Scope                    extension.Scope
 	SchemaHash, ExecutorHash string
+	Order                    int
 }
 
 type PromptPlanIdentity struct {
@@ -299,7 +300,10 @@ func compareToolPlanIdentity(left, right ToolPlanIdentity) int {
 	if result := cmp.Compare(left.SchemaHash, right.SchemaHash); result != 0 {
 		return result
 	}
-	return cmp.Compare(left.ExecutorHash, right.ExecutorHash)
+	if result := cmp.Compare(left.ExecutorHash, right.ExecutorHash); result != 0 {
+		return result
+	}
+	return cmp.Compare(left.Order, right.Order)
 }
 
 func comparePromptPlanIdentity(left, right PromptPlanIdentity) int {

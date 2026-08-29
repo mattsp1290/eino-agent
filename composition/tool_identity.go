@@ -24,10 +24,9 @@ func composedToolSchemaHash(registration ToolRegistration) (string, error) {
 		Version        string `json:"version"`
 		SourceHash     string `json:"source_hash"`
 		DefinitionHash string `json:"definition_hash"`
-		Order          int    `json:"order"`
 	}{
 		Version: toolSchemaIdentityVersion, SourceHash: registration.SourceSchemaHash,
-		DefinitionHash: definitionHash, Order: registration.Order,
+		DefinitionHash: definitionHash,
 	})
 }
 

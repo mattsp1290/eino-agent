@@ -47,6 +47,7 @@ func (f ToolGuardFunc) GuardTool(ctx context.Context, request ToolGuardRequest) 
 
 type MountedToolGuard struct {
 	ID         string
+	Scope      extension.Scope
 	Order      int
 	InstanceID string
 	Guard      ToolGuard

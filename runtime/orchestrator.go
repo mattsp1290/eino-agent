@@ -197,7 +197,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 	}
 	run = started
 	extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
-	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot, admitted.AssistantMessage.ID)
+	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot)
 	if err != nil {
 		result.Status = statusForError(err)
 		result.Error = err
@@ -207,7 +207,7 @@ func (o *StreamingOrchestrator) run(ctx context.Context, execution *runExecution
 	return result, false
 }
 
-func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID) (TurnSnapshot, error) {
+func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot) (TurnSnapshot, error) {
 	assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
 	assembled, err := extension.ApplyTransforms(execution.dispatch(), ctx, ContextAssemblePoint, assembly)
 	if err != nil {
@@ -239,7 +239,6 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 		return TurnSnapshot{}, err
 	}
 	o.observeToolsResolved(ctx, snapshot.Clone(), snapshot.Tools)
-	_ = messageID
 	return snapshot, nil
 }
 

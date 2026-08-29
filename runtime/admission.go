@@ -245,7 +245,6 @@ func admissionRun(request admissionRequest, sessionID session.ID, now time.Time)
 		ContextEpoch:  request.IDs.ContextEpochID,
 		Status:        session.RunPending,
 		Config:        admissionConfig(request),
-		Components:    admissionComponents(request.Config),
 		ExtensionPlan: request.ExtensionPlan.Clone(),
 		CreatedAt:     now,
 	}
@@ -293,17 +292,4 @@ func admissionConfig(request admissionRequest) map[string]string {
 		"workspace_id":   snapshot.Metadata["workspace_id"],
 		"workspace_root": snapshot.Metadata["workspace_root"],
 	}
-}
-
-func admissionComponents(snapshot config.Snapshot) []session.ComponentVersion {
-	components := make([]session.ComponentVersion, 0, len(snapshot.Plugins))
-	for _, plugin := range snapshot.Plugins {
-		components = append(components, session.ComponentVersion{
-			Name:    plugin.Name,
-			Version: plugin.Version,
-			Hash:    plugin.Hash,
-			Source:  plugin.Source,
-		})
-	}
-	return components
 }

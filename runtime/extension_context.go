@@ -51,6 +51,8 @@ func (f PromptProviderFunc) ProvidePrompt(ctx context.Context, prompt PromptCont
 
 type MountedPrompt struct {
 	Name       string
+	ID         string
+	Scope      extension.Scope
 	Order      int
 	InstanceID string
 	Provider   PromptProvider

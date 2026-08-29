@@ -323,7 +323,7 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	plan := mustTestRunPlan(spec)
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
 	host := mustConfiguredOrchestrator()
-	prepared, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot, "message")
+	prepared, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -50,7 +50,7 @@ func (l *Loader) LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definiti
 	if err != nil {
 		return tools.Definition{}, err
 	}
-	definition, err := loaded.definitionCopy()
+	definition, err := loaded.definition.Clone()
 	if err != nil {
 		_ = loaded.close()
 		return tools.Definition{}, err

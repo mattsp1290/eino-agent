@@ -2,9 +2,11 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -43,5 +45,41 @@ func TestRunEventSinkPersistsOnlyIntermediateDurableEventsThroughFence(t *testin
 	}
 	if len(store.events) != 1 {
 		t.Fatalf("durable events after transport-only notifications = %d, want 1", len(store.events))
+	}
+}
+
+func TestFailedToolTransitionPublishesNothing(t *testing.T) {
+	transitionErr := errors.New("transition failed")
+	store := newAdmissionStore()
+	run := session.Run{ID: "run-failed-transition", SessionID: "session-failed-transition", ClaimToken: "claim", Status: session.RunRunning}
+	store.runs[run.ID] = run
+	store.toolTransitionErr = transitionErr
+	registry := newTestExtensionRegistry(nil)
+	published := 0
+	mount, err := registry.Mount(context.Background(), testExtensionComponent("failed-transition"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(context.Context, Event) error {
+			published++
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &capturingSink{}
+	host := mustConfiguredOrchestrator(WithStore(store), WithEventSink(sink))
+	execution := newRunExecution(host, newTestDispatchPlan(dispatch))
+	defer execution.release()
+	execution.bindRun(run)
+	_, err = execution.persistToolCreation(context.Background(), session.CreateToolCallRequest{Call: session.ToolCall{ID: "call", RunID: run.ID}})
+	if !errors.Is(err, transitionErr) {
+		t.Fatalf("persistToolCreation error = %v", err)
+	}
+	if len(sink.events) != 0 || published != 0 {
+		t.Fatalf("failed transition published sink=%v notices=%d", sink.events, published)
 	}
 }

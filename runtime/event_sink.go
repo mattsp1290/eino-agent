@@ -40,12 +40,12 @@ func (s runEventSink) Emit(ctx context.Context, event Event) error {
 // publishPersisted delivers an event that was already committed as part of a
 // state transition. Transport and extension failures cannot roll back durable
 // state and are therefore intentionally best-effort.
-func (s runEventSink) publishPersisted(ctx context.Context, record session.EventRecord) {
+func (s runEventSink) publishPersisted(infrastructureCtx, notificationCtx context.Context, record session.EventRecord) {
 	event := runtimeEventRecord(record)
 	if s.infrastructure != nil {
-		_ = s.infrastructure.Emit(ctx, cloneEvent(event))
+		_ = s.infrastructure.Emit(infrastructureCtx, cloneEvent(event))
 	}
-	extension.Notify(s.plan, ctx, EventPublishedPoint, event)
+	extension.Notify(s.plan, notificationCtx, EventPublishedPoint, event)
 }
 
 func runtimeEventRecord(record session.EventRecord) Event {

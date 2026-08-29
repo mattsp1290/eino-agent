@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -416,81 +415,85 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 		return nil, err
 	}
 	components := snapshotComponents(snapshot.Values())
-	selected := selectTools(components, target, instances, selectTool)
-	prompts := selectPrompts(components, target, instances)
-	guards := selectGuards(components, target, instances)
-	restrictions := selectRestrictions(components, target, instances)
-	planComponents := make([]runtime.PlanComponent, 0, len(components))
-	byInstance := make(map[string]int, len(components))
-	componentPlan := func(component extension.Component) *runtime.PlanComponent {
-		if index, ok := byInstance[component.InstanceID]; ok {
-			return &planComponents[index]
-		}
-		index := len(planComponents)
-		byInstance[component.InstanceID] = index
-		var handlers []extension.HandlerIdentity
-		for _, mounted := range components {
-			if mounted.component.InstanceID == component.InstanceID {
-				handlers = append([]extension.HandlerIdentity(nil), mounted.handlers...)
-				break
+	type promptOwner struct {
+		instanceID, registrationID string
+		scope                      extension.Scope
+	}
+	promptWinners := make(map[string]promptOwner)
+	for _, mounted := range components {
+		for _, registration := range mounted.payload.prompts {
+			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
+				continue
+			}
+			current, exists := promptWinners[registration.Name]
+			if !exists || current.scope.Kind == extension.ScopeGlobal && registration.Scope.Kind == extension.ScopeSession {
+				promptWinners[registration.Name] = promptOwner{instanceID: mounted.component.InstanceID, registrationID: registration.ID, scope: registration.Scope}
 			}
 		}
-		planComponents = append(planComponents, runtime.PlanComponent{Component: component, Handlers: handlers})
-		return &planComponents[index]
 	}
+	planComponents := make([]runtime.PlanComponent, 0, len(components))
 	for _, mounted := range components {
-		if len(mounted.handlers) > 0 {
-			componentPlan(mounted.component)
+		owned := runtime.PlanComponent{Component: mounted.component, Handlers: append([]extension.HandlerIdentity(nil), mounted.handlers...)}
+		for _, registration := range mounted.payload.tools {
+			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) || selectTool != nil && !selectTool(mounted.component, registration) {
+				continue
+			}
+			schemaHash, hashErr := composedToolSchemaHash(registration)
+			if hashErr != nil {
+				snapshot.Release()
+				return nil, hashErr
+			}
+			definition, cloneErr := mountToolDefinition(mounted.callbackContext, registration.Definition).Clone()
+			if cloneErr != nil {
+				snapshot.Release()
+				return nil, cloneErr
+			}
+			owned.Tools = append(owned.Tools, runtime.PlanTool{
+				Identity: session.ToolPlanIdentity{
+					Name: registration.Definition.Name, RegistrationID: registration.ID, Scope: registration.Scope,
+					SchemaHash: schemaHash, ExecutorHash: registration.Definition.Provenance.ExecutorHash, Order: registration.Order,
+				},
+				Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
+					return tools.Materialize(ctx, definition, scope)
+				},
+			})
 		}
-	}
-	for index, entry := range selected {
-		schemaHash, hashErr := composedToolSchemaHash(entry.ToolRegistration)
-		if hashErr != nil {
-			snapshot.Release()
-			return nil, hashErr
+		for _, registration := range mounted.payload.prompts {
+			winner, ok := promptWinners[registration.Name]
+			if !ok || winner != (promptOwner{instanceID: mounted.component.InstanceID, registrationID: registration.ID, scope: registration.Scope}) {
+				continue
+			}
+			owned.Prompts = append(owned.Prompts, runtime.PlanPrompt{
+				Identity: session.PromptPlanIdentity{Name: registration.Name, RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order},
+				Provider: mountedPromptProvider{callbackContext: mounted.callbackContext, next: registration.Provider},
+			})
 		}
-		definition, cloneErr := mountToolDefinition(entry.callbackContext, entry.Definition).Clone()
-		if cloneErr != nil {
-			snapshot.Release()
-			return nil, cloneErr
+		for _, registration := range mounted.payload.guards {
+			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
+				continue
+			}
+			owned.Guards = append(owned.Guards, runtime.PlanGuard{
+				Identity: session.GuardPlanIdentity{RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order},
+				Guard:    mountedToolGuard{callbackContext: mounted.callbackContext, next: registration.Guard},
+			})
 		}
-		owned := componentPlan(entry.component)
-		owned.Tools = append(owned.Tools, runtime.PlanTool{
-			Identity: session.ToolPlanIdentity{
-				Name: entry.Definition.Name, RegistrationID: entry.ID, Scope: entry.Scope,
-				SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
-			},
-			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
-				return tools.Materialize(ctx, definition, scope)
-			},
-			Sequence: index,
-		})
-	}
-	for index, prompt := range prompts {
-		owned := componentPlan(prompt.component)
-		owned.Prompts = append(owned.Prompts, runtime.PlanPrompt{
-			Identity: session.PromptPlanIdentity{Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
-			Provider: mountedPromptProvider{callbackContext: prompt.callbackContext, next: prompt.Provider}, Sequence: index,
-		})
-	}
-	for index, guard := range guards {
-		owned := componentPlan(guard.component)
-		owned.Guards = append(owned.Guards, runtime.PlanGuard{
-			Identity: session.GuardPlanIdentity{RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
-			Guard:    mountedToolGuard{callbackContext: guard.callbackContext, next: guard.Guard}, Sequence: index,
-		})
-	}
-	for index, restriction := range restrictions {
-		rules, rulesErr := runtime.CanonicalizeRestrictionRules(restriction.Allowed, restriction.Denied)
-		if rulesErr != nil {
-			snapshot.Release()
-			return nil, rulesErr
+		for _, registration := range mounted.payload.restrictions {
+			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
+				continue
+			}
+			rules, rulesErr := runtime.CanonicalizeRestrictionRules(registration.Allowed, registration.Denied)
+			if rulesErr != nil {
+				snapshot.Release()
+				return nil, rulesErr
+			}
+			owned.Restrictions = append(owned.Restrictions, runtime.PlanRestriction{
+				Identity: session.RestrictionPlanIdentity{RegistrationID: registration.ID, Scope: registration.Scope, RulesHash: rules.Hash},
+				Allowed:  rules.Allowed, Denied: rules.Denied,
+			})
 		}
-		owned := componentPlan(restriction.component)
-		owned.Restrictions = append(owned.Restrictions, runtime.PlanRestriction{
-			Identity: session.RestrictionPlanIdentity{RegistrationID: restriction.ID, Scope: restriction.Scope, RulesHash: rules.Hash},
-			Allowed:  rules.Allowed, Denied: rules.Denied, Sequence: index,
-		})
+		if len(owned.Handlers)+len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
+			planComponents = append(planComponents, owned)
+		}
 	}
 	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: snapshot.Dispatch(), Components: planComponents})
 }
@@ -513,30 +516,7 @@ func snapshotComponents(values []extension.MountedValue[componentPayload]) []sel
 	return result
 }
 
-type selectedTool struct {
-	ToolRegistration
-	component       extension.Component
-	callbackContext func(context.Context) context.Context
-}
-
-type selectedPrompt struct {
-	PromptRegistration
-	component       extension.Component
-	callbackContext func(context.Context) context.Context
-}
-
-type selectedGuard struct {
-	GuardRegistration
-	component       extension.Component
-	callbackContext func(context.Context) context.Context
-}
-
-type selectedRestriction struct {
-	RestrictionRegistration
-	component extension.Component
-}
-
-type planToolSelector func(selectedTool) bool
+type planToolSelector func(extension.Component, ToolRegistration) bool
 
 type planToolIdentity struct {
 	InstanceID     string
@@ -554,7 +534,7 @@ func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
 	for _, name := range toolConfig.Disabled {
 		disabled[name] = true
 	}
-	return func(entry selectedTool) bool {
+	return func(_ extension.Component, entry ToolRegistration) bool {
 		if disabled[entry.Definition.Name] {
 			return false
 		}
@@ -563,110 +543,11 @@ func requestedToolSelector(toolConfig config.ToolConfig) planToolSelector {
 }
 
 func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelector {
-	return func(entry selectedTool) bool {
+	return func(component extension.Component, entry ToolRegistration) bool {
 		return identities[planToolIdentity{
-			InstanceID: entry.component.InstanceID, Scope: entry.Scope, RegistrationID: entry.ID, ToolName: entry.Definition.Name,
+			InstanceID: component.InstanceID, Scope: entry.Scope, RegistrationID: entry.ID, ToolName: entry.Definition.Name,
 		}]
 	}
-}
-
-func selectTools(components []selectedComponent, target extension.Scope, instances map[string]bool, selectTool planToolSelector) []selectedTool {
-	var result []selectedTool
-	for _, mounted := range components {
-		for _, registration := range mounted.payload.tools {
-			entry := selectedTool{ToolRegistration: registration, component: mounted.component, callbackContext: mounted.callbackContext}
-			if instances != nil && !instances[entry.component.InstanceID] || selectTool != nil && !selectTool(entry) {
-				continue
-			}
-			if entry.Scope.Kind == extension.ScopeGlobal || entry.Scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && entry.Scope.Key == target.Key {
-				result = append(result, entry)
-			}
-		}
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Order != result[j].Order {
-			return result[i].Order < result[j].Order
-		}
-		if result[i].Definition.Name != result[j].Definition.Name {
-			return result[i].Definition.Name < result[j].Definition.Name
-		}
-		if result[i].component.InstanceID != result[j].component.InstanceID {
-			return result[i].component.InstanceID < result[j].component.InstanceID
-		}
-		return result[i].ID < result[j].ID
-	})
-	return result
-}
-
-func selectPrompts(components []selectedComponent, target extension.Scope, instances map[string]bool) []selectedPrompt {
-	selected := make(map[string]selectedPrompt)
-	for _, mounted := range components {
-		for _, registration := range mounted.payload.prompts {
-			entry := selectedPrompt{PromptRegistration: registration, component: mounted.component, callbackContext: mounted.callbackContext}
-			if !capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
-				continue
-			}
-			current, exists := selected[entry.Name]
-			if !exists || current.Scope.Kind == extension.ScopeGlobal && entry.Scope.Kind == extension.ScopeSession {
-				selected[entry.Name] = entry
-			}
-		}
-	}
-	result := make([]selectedPrompt, 0, len(selected))
-	for _, entry := range selected {
-		result = append(result, entry)
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Order != result[j].Order {
-			return result[i].Order < result[j].Order
-		}
-		if result[i].Name != result[j].Name {
-			return result[i].Name < result[j].Name
-		}
-		return result[i].component.InstanceID < result[j].component.InstanceID
-	})
-	return result
-}
-
-func selectGuards(components []selectedComponent, target extension.Scope, instances map[string]bool) []selectedGuard {
-	var result []selectedGuard
-	for _, mounted := range components {
-		for _, registration := range mounted.payload.guards {
-			entry := selectedGuard{GuardRegistration: registration, component: mounted.component, callbackContext: mounted.callbackContext}
-			if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
-				result = append(result, entry)
-			}
-		}
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Order != result[j].Order {
-			return result[i].Order < result[j].Order
-		}
-		if result[i].component.InstanceID != result[j].component.InstanceID {
-			return result[i].component.InstanceID < result[j].component.InstanceID
-		}
-		return result[i].ID < result[j].ID
-	})
-	return result
-}
-
-func selectRestrictions(components []selectedComponent, target extension.Scope, instances map[string]bool) []selectedRestriction {
-	var result []selectedRestriction
-	for _, mounted := range components {
-		for _, registration := range mounted.payload.restrictions {
-			entry := selectedRestriction{RestrictionRegistration: registration, component: mounted.component}
-			if capabilityApplies(entry.component.InstanceID, entry.Scope, target, instances) {
-				result = append(result, entry)
-			}
-		}
-	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].component.InstanceID != result[j].component.InstanceID {
-			return result[i].component.InstanceID < result[j].component.InstanceID
-		}
-		return result[i].ID < result[j].ID
-	})
-	return result
 }
 
 func capabilityApplies(instanceID string, scope, target extension.Scope, instances map[string]bool) bool {
