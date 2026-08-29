@@ -72,7 +72,7 @@ func Run(t *testing.T, factory Factory) {
 		admitted.Status = session.RunInterrupted
 		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
 		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
-		if _, err := execution.SettleRun(ctx, admitted, nil); err != nil {
+		if _, err := execution.SettleRun(ctx, settleRunRequest(admitted)); err != nil {
 			t.Fatalf("finish first run: %v", err)
 		}
 		if _, err := subject.Store.AdmitRun(ctx, run("run-3", s.ID, "owner-3"), time.Minute); err != nil {
@@ -92,11 +92,168 @@ func Run(t *testing.T, factory Factory) {
 		admitted.Status = session.RunCompleted
 		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
 		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
-		if _, err := execution.SettleRun(ctx, admitted, nil); err != nil {
+		if _, err := execution.SettleRun(ctx, settleRunRequest(admitted)); err != nil {
 			t.Fatalf("settle run: %v", err)
 		}
 		if _, err := subject.Store.AdmitRun(ctx, candidate, time.Minute); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("duplicate terminal admission err = %v, want ErrConflict", err)
+		}
+	})
+
+	t.Run("run settlement is required canonical and replay safe", func(t *testing.T) {
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-settlement")
+		admitted := admitRun(t, ctx, subject.Store, run("run-settlement", s.ID, "owner"))
+		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		finishedAt := admitted.CreatedAt.Add(time.Minute)
+		request := session.SettleRunRequest{
+			Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: finishedAt},
+			Event:      session.RunSettlementEvent{ID: "run-settlement-finished", MessageID: "assistant", Usage: session.Usage{InputTokens: 3, OutputTokens: 2}},
+		}
+		if _, err := execution.SettleRun(ctx, session.SettleRunRequest{Settlement: request.Settlement}); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("zero event settlement err = %v, want ErrConflict", err)
+		}
+		if _, err := execution.AppendEvent(ctx, session.EventRecord{ID: "forged-finish", SessionID: s.ID, RunID: admitted.ID, Kind: session.RunSettlementEventKind, CreatedAt: finishedAt}); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("ordinary run-finished append err = %v, want ErrConflict", err)
+		}
+		first, err := execution.SettleRun(ctx, request)
+		if err != nil {
+			t.Fatalf("settle run: %v", err)
+		}
+		replayed, err := execution.SettleRun(ctx, request)
+		if err != nil || !reflect.DeepEqual(replayed, first) {
+			t.Fatalf("identical replay = %#v, %v; want %#v", replayed, err, first)
+		}
+		conflict := request
+		conflict.Event.ID = "different-finish"
+		if _, err := execution.SettleRun(ctx, conflict); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("different event replay err = %v, want ErrConflict", err)
+		}
+		for name, mutate := range map[string]func(*session.SettleRunRequest){
+			"usage":          func(request *session.SettleRunRequest) { request.Event.Usage.OutputTokens++ },
+			"classification": func(request *session.SettleRunRequest) { request.Event.ErrorCode = "changed" },
+			"status":         func(request *session.SettleRunRequest) { request.Settlement.Status = session.RunFailed },
+			"error":          func(request *session.SettleRunRequest) { request.Settlement.Error = "changed" },
+		} {
+			t.Run("rejects changed "+name, func(t *testing.T) {
+				changed := request
+				mutate(&changed)
+				if _, err := execution.SettleRun(ctx, changed); !errors.Is(err, session.ErrConflict) {
+					t.Fatalf("changed %s replay err = %v, want ErrConflict", name, err)
+				}
+			})
+		}
+		batch, err := subject.Store.ListEvents(ctx, s.ID, session.EventCursor{Limit: 10})
+		if err != nil || len(batch.Events) != 1 || !reflect.DeepEqual(batch.Events[0], first.Event) {
+			t.Fatalf("settlement events = %#v, %v; want one canonical event", batch.Events, err)
+		}
+	})
+
+	t.Run("run settlement retains renewed lease", func(t *testing.T) {
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-settlement-lease")
+		admitted := admitRun(t, ctx, subject.Store, run("run-settlement-lease", s.ID, "owner"))
+		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		renewed, err := execution.RenewRunLease(ctx, 2*time.Minute)
+		if err != nil {
+			t.Fatalf("renew run lease: %v", err)
+		}
+		request := session.SettleRunRequest{
+			Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: admitted.CreatedAt.Add(time.Minute)},
+			Event:      session.RunSettlementEvent{ID: "run-settlement-lease-finished"},
+		}
+		first, err := execution.SettleRun(ctx, request)
+		if err != nil {
+			t.Fatalf("settle renewed run: %v", err)
+		}
+		if !first.Run.LeaseUntil.Equal(renewed.LeaseUntil) {
+			t.Fatalf("settled lease = %s, want renewed %s", first.Run.LeaseUntil, renewed.LeaseUntil)
+		}
+		replayed, err := execution.SettleRun(ctx, request)
+		if err != nil || !reflect.DeepEqual(replayed, first) {
+			t.Fatalf("renewed replay = %#v, %v; want %#v", replayed, err, first)
+		}
+	})
+
+	t.Run("concurrent run settlement elects one canonical event", func(t *testing.T) {
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-settlement-race")
+		admitted := admitRun(t, ctx, subject.Store, run("run-settlement-race", s.ID, "owner"))
+		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		base := session.SettleRunRequest{Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: admitted.CreatedAt.Add(time.Minute)}}
+		requests := []session.SettleRunRequest{base, base}
+		requests[0].Event.ID = "race-finish-a"
+		requests[1].Event.ID = "race-finish-b"
+		type outcome struct {
+			result session.RunSettlementResult
+			err    error
+		}
+		start := make(chan struct{})
+		outcomes := make(chan outcome, len(requests))
+		for _, request := range requests {
+			go func(request session.SettleRunRequest) {
+				<-start
+				result, err := execution.SettleRun(ctx, request)
+				outcomes <- outcome{result: result, err: err}
+			}(request)
+		}
+		close(start)
+		var winner session.RunSettlementResult
+		var successes, conflicts int
+		for range requests {
+			outcome := <-outcomes
+			switch {
+			case outcome.err == nil:
+				successes++
+				winner = outcome.result
+			case errors.Is(outcome.err, session.ErrConflict):
+				conflicts++
+			default:
+				t.Fatalf("concurrent settlement err = %v", outcome.err)
+			}
+		}
+		if successes != 1 || conflicts != 1 {
+			t.Fatalf("successes=%d conflicts=%d, want 1/1", successes, conflicts)
+		}
+		batch, err := subject.Store.ListEvents(ctx, s.ID, session.EventCursor{Limit: 10})
+		if err != nil || len(batch.Events) != 1 || !reflect.DeepEqual(batch.Events[0], winner.Event) {
+			t.Fatalf("race events = %#v, %v; winner=%#v", batch.Events, err, winner)
+		}
+	})
+
+	t.Run("concurrent identical run settlement returns one result", func(t *testing.T) {
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-settlement-identical")
+		admitted := admitRun(t, ctx, subject.Store, run("run-settlement-identical", s.ID, "owner"))
+		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
+		request := session.SettleRunRequest{
+			Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: admitted.CreatedAt.Add(time.Minute)},
+			Event:      session.RunSettlementEvent{ID: "identical-finish"},
+		}
+		start := make(chan struct{})
+		results := make(chan session.RunSettlementResult, 2)
+		errs := make(chan error, 2)
+		for range 2 {
+			go func() {
+				<-start
+				result, err := execution.SettleRun(ctx, request)
+				results <- result
+				errs <- err
+			}()
+		}
+		close(start)
+		first, second := <-results, <-results
+		for range 2 {
+			if err := <-errs; err != nil {
+				t.Fatalf("identical concurrent settlement: %v", err)
+			}
+		}
+		if !reflect.DeepEqual(first, second) {
+			t.Fatalf("concurrent results differ: %#v != %#v", first, second)
 		}
 	})
 
@@ -690,6 +847,13 @@ func eventRecord(id session.EventID, sessionID session.ID, runID session.RunID, 
 		Kind:      "event",
 		Payload:   json.RawMessage(`{"ok":true}`),
 		CreatedAt: time.Now().UTC().Add(time.Duration(offset) * time.Second),
+	}
+}
+
+func settleRunRequest(run session.Run) session.SettleRunRequest {
+	return session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: run.Status, FinishedAt: run.FinishedAt, Error: run.Error},
+		Event:      session.RunSettlementEvent{ID: session.EventID(string(run.ID) + "-finished")},
 	}
 }
 

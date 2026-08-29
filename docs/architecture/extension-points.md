@@ -71,7 +71,7 @@ Order constants reserve broad bands: `runtime.OrderHostPolicy` (`-1000`),
 | --- | --- | --- | --- | --- | --- |
 | `eino-agent/runtime/run-admitted` | admission | contained notice to run observers | contained | after durable admission; fresh runs only | hook adapter |
 | `eino-agent/runtime/run-started` | execution start | contained notice | contained | run is already running; fresh runs only | native |
-| `eino-agent/runtime/run-settled` | run settlement | contained notice | contained | after `FinishRun`; fresh/resumed nonterminal runs | hook adapter |
+| `eino-agent/runtime/run-settled` | run settlement | contained notice | contained | after `SettleRun`; fresh/resumed nonterminal runs | hook adapter |
 | `eino-agent/runtime/model-requested` | model dispatch | contained notice | contained | ledger is `dispatch_started` | native |
 | `eino-agent/runtime/model-completed` | stream terminal | contained notice | contained | after ledger terminal commit; every attempt | native |
 | `eino-agent/runtime/tool-prepared` | tool preparation | contained notice | contained | before durable tool admission; fresh calls | native |
@@ -189,9 +189,10 @@ callbacks, observers, and trace attributes are excluded. Disallowed message or
 tool `Extra` fields fail closed. The dependency's deprecated message
 `MultiContent` field is rejected rather than converted. Records move through `prepared`,
 `dispatch_started`, and `completed`/`failed`; orphaned nonterminal records are
-valid evidence of an uncertain dispatch. A record ID is offered only to
-adapters implementing `model.IdempotentStreamer` and is not an exactly-once
-network claim. Retention and deletion remain host policy.
+valid evidence of an uncertain dispatch. A record ID is supplied through
+`model.Request.IdempotencyKey`. Adapters may pass it to provider transports
+that accept such a key; it is not an exactly-once network claim. Retention and
+deletion remain host policy.
 
 ## Mount and shutdown example
 

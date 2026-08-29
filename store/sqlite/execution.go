@@ -70,15 +70,6 @@ func loadRunFence(ctx context.Context, store *Store, fence session.RunFence, all
 	return run, nil
 }
 
-func sameRunExecution(current, candidate session.Run) bool {
-	current.Status, candidate.Status = "", ""
-	current.LeaseUntil, candidate.LeaseUntil = time.Time{}, time.Time{}
-	current.StartedAt, candidate.StartedAt = time.Time{}, time.Time{}
-	current.FinishedAt, candidate.FinishedAt = time.Time{}, time.Time{}
-	current.Error, candidate.Error = "", ""
-	return sameRecord(current, candidate)
-}
-
 func (e *executionStore) StartRun(ctx context.Context, startedAt time.Time) (session.Run, error) {
 	var started session.Run
 	err := e.withFence(ctx, func(store *Store, current session.Run) error {
@@ -113,28 +104,49 @@ func (e *executionStore) RenewRunLease(ctx context.Context, leaseDuration time.D
 	return renewed, err
 }
 
-func (e *executionStore) SettleRun(ctx context.Context, run session.Run, finalEvent *session.EventRecord) (*session.EventRecord, error) {
-	if run.ID != e.fence.RunID || run.ClaimToken != e.fence.ClaimToken || !run.Terminal() {
-		return nil, session.ErrConflict
+func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	if !request.Settlement.FinishedAt.IsZero() {
+		request.Settlement.FinishedAt = request.Settlement.FinishedAt.UTC()
 	}
-	var committed *session.EventRecord
+	if request.Event.ID == "" {
+		return session.RunSettlementResult{}, session.ErrConflict
+	}
+	var committed session.RunSettlementResult
 	err := e.withFenceState(ctx, true, func(store *Store, current session.Run) error {
-		if !sameRunExecution(current, run) {
-			return session.ErrConflict
-		}
-		if finalEvent != nil && (finalEvent.RunID != run.ID || finalEvent.SessionID != current.SessionID) {
-			return session.ErrConflict
-		}
-		if err := store.writeRun(ctx, run); err != nil {
-			return err
-		}
-		if finalEvent != nil {
-			record, err := store.appendEvent(ctx, *finalEvent)
-			if err == nil {
-				committed = &record
+		if current.Terminal() {
+			if current.Status != request.Settlement.Status || !current.FinishedAt.Equal(request.Settlement.FinishedAt) || current.Error != request.Settlement.Error {
+				return session.ErrConflict
 			}
+			expected, err := session.RunSettlementRecord(current, request.Event)
+			if err != nil {
+				return err
+			}
+			var existing session.EventRecord
+			if err := store.getJSON(ctx, `SELECT record FROM events WHERE run_id = ? AND kind = ?`, []any{current.ID, session.RunSettlementEventKind}, &existing); err != nil {
+				return session.ErrConflict
+			}
+			if !sameRecord(existing, expected) {
+				return session.ErrConflict
+			}
+			committed = session.RunSettlementResult{Run: current, Event: existing}
+			return nil
+		}
+		canonicalRun, err := session.ApplyRunSettlement(current, request.Settlement)
+		if err != nil {
 			return err
 		}
+		canonicalEvent, err := session.RunSettlementRecord(canonicalRun, request.Event)
+		if err != nil {
+			return err
+		}
+		if err := store.writeRun(ctx, canonicalRun); err != nil {
+			return err
+		}
+		canonicalEvent, err = store.appendEvent(ctx, canonicalEvent)
+		if err != nil {
+			return err
+		}
+		committed = session.RunSettlementResult{Run: canonicalRun, Event: canonicalEvent}
 		return nil
 	})
 	return committed, err
@@ -185,7 +197,7 @@ func (e *executionStore) UpdatePart(ctx context.Context, record session.Part) er
 }
 
 func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
-	if record.RunID != e.fence.RunID || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
+	if record.RunID != e.fence.RunID || record.Kind == session.RunSettlementEventKind || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
 		return session.EventRecord{}, session.ErrConflict
 	}
 	var result session.EventRecord

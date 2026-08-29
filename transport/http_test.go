@@ -236,12 +236,17 @@ func replayStore(t *testing.T) session.Store {
 	}
 	events := []session.EventRecord{
 		{ID: "evt-started", SessionID: "session-http", RunID: "run-http", MessageID: "msg-http", Kind: string(runtime.EventRunStarted), CreatedAt: now},
-		{ID: "evt-finished", SessionID: "session-http", RunID: "run-http", MessageID: "msg-http", Kind: string(runtime.EventRunFinished), CreatedAt: now.Add(time.Second)},
 	}
 	for _, event := range events {
 		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("append event: %v", err)
 		}
+	}
+	if _, err := execution.SettleRun(ctx, session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: now.Add(time.Second)},
+		Event:      session.RunSettlementEvent{ID: "evt-finished", MessageID: "msg-http"},
+	}); err != nil {
+		t.Fatalf("settle run: %v", err)
 	}
 	return store
 }

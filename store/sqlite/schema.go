@@ -40,6 +40,7 @@ var currentIndexes = map[string]indexSchema{
 	"parts_replay_idx":                    {table: "parts", columns: []string{"session_id", "message_id", "ordinal", "id"}},
 	"events_replay_idx":                   {table: "events", columns: []string{"session_id", "created_at", "id"}},
 	"events_tool_transition_unique_idx":   {table: "events", columns: []string{"tool_call_id", "tool_transition"}, unique: true, partial: true},
+	"events_run_finished_unique_idx":      {table: "events", columns: []string{"run_id", "kind"}, unique: true, partial: true},
 	"tool_calls_unfinished_idx":           {table: "tool_calls", columns: []string{"run_id", "status"}},
 	"model_requests_run_attempt_step_idx": {table: "model_requests", columns: []string{"run_id", "attempt", "step"}, unique: true},
 	"model_requests_run_created_idx":      {table: "model_requests", columns: []string{"run_id", "created_at", "id"}},

@@ -130,6 +130,133 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 	}
 }
 
+func TestLedgerRetryPreservesCumulativeUsageIncludingTerminalErrorDelta(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	var sequence []string
+	var completed []ModelCompletedNotice
+	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
+	defer cleanup()
+	var attempts int
+	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+		attempts++
+		reader, writer := einoschema.Pipe[model.StreamDelta](3)
+		if attempts == 1 {
+			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-a", nil), Usage: model.Usage{InputTokens: 3}}, nil)
+			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-b", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 2}}, nil)
+			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("ignored", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}}, model.Error{Code: "temporary", Message: "retry", Retryable: true})
+		} else {
+			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil), Usage: model.Usage{InputTokens: 5, OutputTokens: 1, CacheReadTokens: 2}}, nil)
+		}
+		writer.Close()
+		return reader, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: plan}), WithAttempts(2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "partial-usage-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	want := Usage{InputTokens: 8, OutputTokens: 5, ReasoningTokens: 1, CacheReadTokens: 2}
+	if result.Error != nil || result.Usage != want || attempts != 2 {
+		t.Fatalf("result=%#v attempts=%d want usage=%#v", result, attempts, want)
+	}
+	if len(completed) != 2 || completed[0].Usage != (Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}) || completed[0].Error.Code == "" || completed[1].Usage != (Usage{InputTokens: 5, OutputTokens: 1, CacheReadTokens: 2}) {
+		t.Fatalf("completed notices = %#v", completed)
+	}
+	batch, err := store.ListEvents(context.Background(), "partial-usage-session", session.EventCursor{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var finished []session.EventRecord
+	for _, event := range batch.Events {
+		if event.Kind == session.RunSettlementEventKind {
+			finished = append(finished, event)
+		}
+	}
+	if len(finished) != 1 || finished[0].Usage != (session.Usage{InputTokens: 8, OutputTokens: 5, ReasoningTokens: 1, CacheReadTokens: 2}) {
+		t.Fatalf("run-finished events = %#v", finished)
+	}
+}
+
+func TestLedgerCancellationAfterDispatchSettlesFailed(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	started := make(chan struct{})
+	streamer := deltaStreamerFunc(func(ctx context.Context, _ model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+		reader, writer := einoschema.Pipe[model.StreamDelta](1)
+		close(started)
+		go func() {
+			defer writer.Close()
+			<-ctx.Done()
+			writer.Send(model.StreamDelta{}, ctx.Err())
+		}()
+		return reader, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := orchestrator.Start(context.Background(), Request{SessionID: "cancel-ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := handle.Interrupt(context.Background(), "test cancellation"); err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunInterrupted {
+		t.Fatalf("result = %#v", result)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed {
+		t.Fatalf("canceled ledger records = %#v, %v", batch.Records, err)
+	}
+}
+
+func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	updateErr := errors.New("terminal ledger update failed")
+	failingStore := &terminalUpdateFailingStore{Store: store, err: updateErr}
+	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+		reader, writer := einoschema.Pipe[model.StreamDelta](1)
+		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil), Usage: model.Usage{InputTokens: 4, OutputTokens: 2}}, nil)
+		writer.Close()
+		return reader, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(failingStore), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "terminal-ledger-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if !errors.Is(result.Error, updateErr) || result.Usage != (Usage{InputTokens: 4, OutputTokens: 2}) {
+		t.Fatalf("result = %#v", result)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestDispatchStarted {
+		t.Fatalf("ledger records = %#v, %v", batch.Records, err)
+	}
+}
+
 func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -330,6 +457,33 @@ type dispatchStartFailingStore struct {
 	err error
 }
 
+type terminalUpdateFailingStore struct {
+	session.Store
+	err error
+}
+
+func (s *terminalUpdateFailingStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
+	return s.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+		return fn(ctx, &terminalUpdateFailingStore{Store: tx, err: s.err})
+	})
+}
+
+func (s *terminalUpdateFailingStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &terminalUpdateFailingExecution{ExecutionStore: s.Store.Execution(fence), err: s.err}
+}
+
+type terminalUpdateFailingExecution struct {
+	session.ExecutionStore
+	err error
+}
+
+func (s *terminalUpdateFailingExecution) UpdateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
+	if record.State == session.ModelRequestCompleted || record.State == session.ModelRequestFailed {
+		return s.err
+	}
+	return s.ExecutionStore.UpdateModelRequest(ctx, record)
+}
+
 func (s *dispatchStartFailingStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
 	return s.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 		return fn(ctx, &dispatchStartFailingStore{Store: tx, err: s.err})
@@ -428,13 +582,13 @@ func TestLedgerUsesExecutionScopedWriterCapability(t *testing.T) {
 	}
 }
 
-func TestLedgerPassesDurableRecordIDToIdempotentStreamer(t *testing.T) {
+func TestLedgerPassesDurableRecordIDThroughRequest(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	streamer := &recordingIdempotentStreamer{}
+	streamer := &recordingRequestStreamer{}
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatal(err)
@@ -447,31 +601,23 @@ func TestLedgerPassesDurableRecordIDToIdempotentStreamer(t *testing.T) {
 	if err != nil || len(batch.Records) != 1 {
 		t.Fatalf("records = %#v, %v", batch.Records, err)
 	}
-	if streamer.key != string(batch.Records[0].ID) || streamer.request.IdempotencyKey != streamer.key || streamer.fallbackCalled {
-		t.Fatalf("idempotency key=%q request=%q fallback=%t record=%q", streamer.key, streamer.request.IdempotencyKey, streamer.fallbackCalled, batch.Records[0].ID)
+	if streamer.request.IdempotencyKey != string(batch.Records[0].ID) {
+		t.Fatalf("request key=%q record=%q", streamer.request.IdempotencyKey, batch.Records[0].ID)
 	}
 }
 
-type recordingIdempotentStreamer struct {
-	key            string
-	request        model.Request
-	fallbackCalled bool
+type recordingRequestStreamer struct {
+	request model.Request
 }
 
-func (s *recordingIdempotentStreamer) StreamProvider(context.Context, model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	s.fallbackCalled = true
-	return nil, errors.New("idempotent path not used")
-}
-
-func (s *recordingIdempotentStreamer) StreamProviderWithIdempotencyKey(_ context.Context, request model.Request, key string) (*einoschema.StreamReader[*einoschema.Message], error) {
-	s.key = key
+func (s *recordingRequestStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	var err error
 	s.request, err = request.Clone()
 	if err != nil {
 		return nil, err
 	}
-	reader, writer := einoschema.Pipe[*einoschema.Message](1)
-	_ = writer.Send(einoschema.AssistantMessage("done", nil), nil)
+	reader, writer := einoschema.Pipe[model.StreamDelta](1)
+	_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil)}, nil)
 	writer.Close()
 	return reader, nil
 }

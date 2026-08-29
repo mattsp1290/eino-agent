@@ -277,21 +277,24 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 	sink := &capturingSink{}
 	var calls int
 	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.Message, error) {
+		_ = ctx
 		calls++
 		for _, msg := range request.Messages {
 			if msg.Role == einoschema.Tool {
 				// Second stream (after the tool result): report usage, finish.
-				request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 7, OutputTokens: 3}})
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				response := einoschema.AssistantMessage("done", nil)
+				response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{PromptTokens: 7, CompletionTokens: 3}}
+				return []*einoschema.Message{response}, nil
 			}
 		}
 		// First stream: report usage, emit a tool call to force a second turn.
-		request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 10, OutputTokens: 5}})
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+		response := einoschema.AssistantMessage("", []einoschema.ToolCall{{
 			ID:       "call-1",
 			Type:     "function",
 			Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hi"}`},
-		}})}, nil
+		}})
+		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{PromptTokens: 10, CompletionTokens: 5}}
+		return []*einoschema.Message{response}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -325,11 +328,9 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 	}
 }
 
-// TestResolveStreamUsage covers the Eino-streamer usage bridge: when no observer
-// adapter reported usage through the observer (the default resolved.Client
-// path), the token usage must be taken from the concatenated message's
-// ResponseMeta.Usage so run consumers still see non-zero tokens. When the
-// observer DID report usage (a Streamer adapter), that wins.
+// TestResolveStreamUsage covers the Eino-streamer usage bridge. Delta usage
+// wins field by field, while the concatenated message's ResponseMeta fills
+// fields that the provider delta did not report.
 func TestResolveStreamUsage(t *testing.T) {
 	t.Parallel()
 
@@ -339,16 +340,16 @@ func TestResolveStreamUsage(t *testing.T) {
 	}}
 	msgNoMeta := &einoschema.Message{}
 
-	// Observer reported usage (Streamer path) → observer wins, message ignored.
+	// Delta usage wins over message metadata for fields it reports.
 	if got := resolveStreamUsage(observed, msgWithUsage); got != observed {
-		t.Errorf("observer-reported usage should win: got %+v, want %+v", got, observed)
+		t.Errorf("delta-reported usage should win: got %+v, want %+v", got, observed)
 	}
-	// Client path: observer empty, message carries ResponseMeta.Usage → use it.
+	// Empty delta usage falls back to message ResponseMeta.Usage.
 	got := resolveStreamUsage(model.Usage{}, msgWithUsage)
 	if got.InputTokens != 23 || got.OutputTokens != 18 {
 		t.Errorf("client-path usage from ResponseMeta: got %+v, want input=23 output=18", got)
 	}
-	// Empty observer + no usable message metadata → zero.
+	// No delta or message usage yields zero.
 	if got := resolveStreamUsage(model.Usage{}, msgNoMeta); got != (model.Usage{}) {
 		t.Errorf("no usage anywhere should be zero: got %+v", got)
 	}

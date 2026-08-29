@@ -22,22 +22,11 @@ var (
 	ErrInvalidResolution = errors.New("invalid resolved model")
 )
 
-// StreamDelta is one normalized chunk from a provider stream.
+// StreamDelta is one normalized chunk from a provider stream. Usage is the
+// cumulative attempt-to-date provider usage at this point in the stream.
 type StreamDelta struct {
 	Message *einoschema.Message
 	Usage   Usage
-	Index   int64
-	Done    bool
-}
-
-// StreamObserver receives normalized provider stream callbacks. Runtime
-// adapters can use these callbacks for usage propagation and lifecycle events
-// without parsing provider-specific payloads.
-type StreamObserver interface {
-	OnProviderStart(ctx context.Context, request Request)
-	OnProviderDelta(ctx context.Context, delta StreamDelta)
-	OnProviderError(ctx context.Context, err Error)
-	OnProviderEnd(ctx context.Context, response Response)
 }
 
 // Request is the transport-neutral provider request shape.
@@ -47,10 +36,9 @@ type Request struct {
 	System   string
 	Tools    []*einoschema.ToolInfo
 	Options  map[string]string
-	Observer StreamObserver
 	// IdempotencyKey is assigned by a ledger-enabled runtime. It is not part of
-	// the model-visible audited projection and is used only by adapters that
-	// explicitly implement IdempotentStreamer.
+	// the model-visible audited projection. Adapters whose provider transport
+	// accepts an idempotency key may read it directly.
 	IdempotencyKey string
 }
 
@@ -92,12 +80,6 @@ func (r Request) Clone() (Request, error) {
 	}
 	next.Options = cloneMap(r.Options)
 	return next, nil
-}
-
-// Response is the normalized terminal provider response.
-type Response struct {
-	Message *einoschema.Message
-	Usage   Usage
 }
 
 // Usage records provider token and cost data in model-layer terms.
@@ -154,15 +136,7 @@ type OptionalAdapter interface {
 
 // Streamer is the sole provider execution surface.
 type Streamer interface {
-	StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[*einoschema.Message], error)
-}
-
-// IdempotentStreamer is an optional adapter capability. The key identifies the
-// durable prepared request record; adapters decide how (or whether) their
-// provider transport can honor it and must not imply exactly-once delivery.
-type IdempotentStreamer interface {
-	Streamer
-	StreamProviderWithIdempotencyKey(ctx context.Context, request Request, key string) (*einoschema.StreamReader[*einoschema.Message], error)
+	StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[StreamDelta], error)
 }
 
 // AdapterResolver resolves model selections through registered adapters.

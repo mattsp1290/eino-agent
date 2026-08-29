@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS events_replay_idx ON events(session_id, created_at, id);
 CREATE UNIQUE INDEX IF NOT EXISTS events_tool_transition_unique_idx ON events(tool_call_id, tool_transition) WHERE tool_transition IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS events_run_finished_unique_idx ON events(run_id, kind) WHERE kind = 'run_finished';
 
 CREATE TABLE IF NOT EXISTS tool_calls (
   id TEXT PRIMARY KEY,

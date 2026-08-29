@@ -87,7 +87,6 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
-	execution := newRunExecution(o, plan)
 	ids := admissionIDs{
 		SessionID:          request.SessionID,
 		RunID:              o.ids.NewRunID(),
@@ -111,12 +110,12 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
-	execution.publishPersistedWithNotificationContext(ctx, ctx, o.events, admitted.Event)
-	extension.Notify(execution.dispatch(), ctx, RunAdmittedPoint, RunAdmittedNotice{
+	runEventSink{infrastructure: o.events, plan: plan.dispatch}.publishPersisted(ctx, ctx, admitted.Event)
+	extension.Notify(plan.dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{
 		SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor(),
 		Metadata: boundedTurnMetadata(admitted.Snapshot), Time: admitted.Snapshot.CreatedAt,
 	})
-	execution.bindRun(admitted.Run)
+	execution := newRunExecution(o, plan, admitted.Run)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
 		runID:  admitted.Run.ID,
@@ -409,14 +408,12 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 	if result.Status == "" {
 		result.Status = session.RunCompleted
 	}
-	run.Status = result.Status
-	run.FinishedAt = o.now()
+	settlement := session.RunSettlement{Status: result.Status, FinishedAt: o.now()}
 	if result.Error != nil {
-		run.Error = result.Error.Error()
+		settlement.Error = result.Error.Error()
 	}
-	finalEvent := o.finalRunEvent(run, result)
 	settled := true
-	committedEvent, err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent)
+	committed, err := execution.store.SettleRun(context.WithoutCancel(ctx), session.SettleRunRequest{Settlement: settlement, Event: o.finalRunEvent(result)})
 	if err != nil {
 		settled = false
 		if result.Error == nil {
@@ -424,31 +421,22 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 			result.Error = err
 		}
 	} else {
-		o.publishRunFinished(ctx, execution, committedEvent)
+		o.publishRunFinished(ctx, execution, committed.Event)
 	}
 	return result, settled
 }
 
-func (o *StreamingOrchestrator) finalRunEvent(run session.Run, result Result) *session.EventRecord {
-	if o == nil || o.ids == nil {
-		return nil
-	}
+func (o *StreamingOrchestrator) finalRunEvent(result Result) session.RunSettlementEvent {
 	eventErr := eventError(result.Error)
-	return &session.EventRecord{
-		ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, MessageID: result.MessageID,
-		ProviderID: run.ProviderID, ModelID: run.ModelID, Kind: string(EventRunFinished),
+	return session.RunSettlementEvent{
+		ID: o.ids.NewEventID(), MessageID: result.MessageID,
 		Usage:     session.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, ReasoningTokens: result.Usage.ReasoningTokens, CacheReadTokens: result.Usage.CacheReadTokens, CacheWriteTokens: result.Usage.CacheWriteTokens, Cost: result.Usage.Cost},
-		Error:     session.EventError{Code: eventErr.Code, Message: eventErr.Message, Retryable: eventErr.Retryable},
-		Payload:   mustJSON(map[string]any{"status": string(result.Status), "interrupted": result.Interrupted}),
-		Redaction: session.RedactionMetadata, CreatedAt: o.now(),
+		ErrorCode: eventErr.Code, Retryable: eventErr.Retryable,
 	}
 }
 
-func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, execution *runExecution, event *session.EventRecord) {
-	if event == nil {
-		return
-	}
-	execution.publishPersisted(context.WithoutCancel(ctx), o.events, *event)
+func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, execution *runExecution, event session.EventRecord) {
+	execution.publishPersisted(context.WithoutCancel(ctx), o.events, event)
 }
 
 func (o *StreamingOrchestrator) validate(request Request) error {

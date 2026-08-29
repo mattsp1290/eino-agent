@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
@@ -16,36 +17,18 @@ type runExecution struct {
 	lease *runLeaseHeartbeat
 }
 
-func (e *runExecution) bindRun(run session.Run) {
-	if e == nil || e.host == nil || e.host.store == nil {
-		return
+func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run) *runExecution {
+	if host == nil || host.store == nil || run.ID == "" || run.ClaimToken == "" {
+		panic(fmt.Sprintf("invalid run execution fence for run %q", run.ID))
 	}
-	e.store = e.host.store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-}
-
-func (e *runExecution) ensureStore(ctx context.Context, runID session.RunID) error {
-	if e.store != nil {
-		return nil
-	}
-	if e == nil || e.host == nil || e.host.store == nil {
-		return session.ErrConflict
-	}
-	run, err := e.host.store.GetRun(ctx, runID)
-	if err != nil {
-		return err
-	}
-	e.bindRun(run)
-	if e.store == nil {
-		return session.ErrConflict
-	}
-	return nil
-}
-
-func newRunExecution(host *StreamingOrchestrator, plan *RunPlan) *runExecution {
 	if plan == nil {
 		plan = &RunPlan{}
 	}
-	return &runExecution{host: host, plan: plan}
+	store := host.store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if store == nil {
+		panic(fmt.Sprintf("nil run execution store for run %q", run.ID))
+	}
+	return &runExecution{host: host, plan: plan, store: store}
 }
 
 func (e *runExecution) dispatch() *extension.Plan {

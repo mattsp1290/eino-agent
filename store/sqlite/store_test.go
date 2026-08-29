@@ -44,6 +44,13 @@ func sqliteSettleRequest(settlement session.ToolSettlement, id session.EventID) 
 	return session.SettleToolCallRequest{Settlement: settlement, Event: sqliteToolEvent(id, settlement.CompletedAt)}
 }
 
+func sqliteRunSettlementRequest(run session.Run, id session.EventID) session.SettleRunRequest {
+	return session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: run.Status, FinishedAt: run.FinishedAt, Error: run.Error},
+		Event:      session.RunSettlementEvent{ID: id},
+	}
+}
+
 func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -374,7 +381,7 @@ func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	}
 }
 
-func TestFinishRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
+func TestSettleRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
@@ -395,27 +402,66 @@ func TestFinishRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 	run.Status = session.RunCompleted
 	run.FinishedAt = now.Add(time.Second)
 	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-	finalEvent := session.EventRecord{ID: "event-run-finished", SessionID: run.SessionID, RunID: run.ID, Kind: "run_finished", CreatedAt: run.FinishedAt}
-	committedEvent, err := execution.SettleRun(ctx, run, &finalEvent)
+	request := sqliteRunSettlementRequest(run, "event-run-finished")
+	committed, err := execution.SettleRun(ctx, request)
 	if err != nil {
 		t.Fatalf("finish run: %v", err)
 	}
-	if committedEvent == nil || !reflect.DeepEqual(*committedEvent, finalEvent) {
-		t.Fatalf("committed event = %#v, want %#v", committedEvent, finalEvent)
+	finalEvent, err := session.RunSettlementRecord(committed.Run, request.Event)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if _, err := execution.SettleRun(ctx, run, nil); err != nil {
+	if !reflect.DeepEqual(committed.Event, finalEvent) {
+		t.Fatalf("committed event = %#v, want %#v", committed.Event, finalEvent)
+	}
+	if _, err := execution.SettleRun(ctx, request); err != nil {
 		t.Fatalf("idempotent finish run: %v", err)
 	}
-	conflict := run
-	conflict.Status = session.RunFailed
-	conflict.Error = "different"
-	if _, err := execution.SettleRun(ctx, conflict, nil); !errors.Is(err, session.ErrConflict) {
+	conflict := request
+	conflict.Settlement.Status = session.RunFailed
+	conflict.Settlement.Error = "different"
+	if _, err := execution.SettleRun(ctx, conflict); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("conflicting finish err = %v, want ErrConflict", err)
 	}
-	stale := run
-	stale.Status = session.RunRunning
-	if _, err := execution.SettleRun(ctx, stale, nil); !errors.Is(err, session.ErrConflict) {
+	stale := request
+	stale.Settlement.Status = session.RunRunning
+	if _, err := execution.SettleRun(ctx, stale); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale nonterminal update err = %v, want ErrConflict", err)
+	}
+}
+
+func TestSettleRunRollsBackTerminalStateWhenEventInsertFails(t *testing.T) {
+	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := st.CreateSession(ctx, session.Session{ID: "run-rollback-session", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.AdmitRun(ctx, session.Run{ID: "run-rollback", SessionID: "run-rollback-session", OwnerID: "owner", ClaimToken: "claim", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_run_finished BEFORE INSERT ON events WHEN NEW.kind = 'run_finished' BEGIN SELECT RAISE(ABORT, 'forced run event failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	request := session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: now.Add(time.Second)},
+		Event:      session.RunSettlementEvent{ID: "run-rollback-finished"},
+	}
+	if _, err := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken}).SettleRun(ctx, request); err == nil {
+		t.Fatal("settlement succeeded despite forced event failure")
+	}
+	stored, err := st.GetRun(ctx, run.ID)
+	if err != nil || stored.Terminal() {
+		t.Fatalf("run after rollback = %#v, %v", stored, err)
+	}
+	batch, err := st.ListEvents(ctx, run.SessionID, session.EventCursor{Limit: 10})
+	if err != nil || len(batch.Events) != 0 {
+		t.Fatalf("events after rollback = %#v, %v", batch.Events, err)
 	}
 }
 
@@ -512,7 +558,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	staleRun.ClaimToken = run.ClaimToken
 	staleRun.Status = session.RunCompleted
 	staleRun.FinishedAt = time.Now().UTC()
-	if _, err := oldExecution.SettleRun(ctx, staleRun, nil); !errors.Is(err, session.ErrConflict) {
+	if _, err := oldExecution.SettleRun(ctx, sqliteRunSettlementRequest(staleRun, "stale-finished")); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale SettleRun error = %v", err)
 	}
 	if batch, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{}); err != nil || len(batch.Messages) != 0 || len(batch.Parts) != 0 {
@@ -536,13 +582,6 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	}
 	if _, err := currentExecution.StartContextEpoch(ctx, session.ContextEpoch{ID: "foreign-epoch", SessionID: "another-session", CreatedAt: now}); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("cross-session StartContextEpoch error = %v", err)
-	}
-	foreignSettlement := winner
-	foreignSettlement.SessionID = "another-session"
-	foreignSettlement.Status = session.RunCompleted
-	foreignSettlement.FinishedAt = now
-	if _, err := currentExecution.SettleRun(ctx, foreignSettlement, nil); !errors.Is(err, session.ErrConflict) {
-		t.Fatalf("cross-session SettleRun error = %v", err)
 	}
 	if _, err := currentExecution.AppendMessage(ctx, session.Message{ID: "winner-message", SessionID: winner.SessionID, RunID: winner.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("winner AppendMessage: %v", err)

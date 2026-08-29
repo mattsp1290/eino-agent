@@ -23,8 +23,7 @@ func TestRunEventSinkOnlyFansOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	infrastructure := &capturingSink{}
-	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store)), nil)
-	execution.bindRun(run)
+	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store)), nil, run)
 	sink := execution.eventSink(infrastructure)
 
 	if err := sink.Emit(ctx, Event{Kind: EventMessageDelta, SessionID: run.SessionID, RunID: run.ID, LiveOnly: true}); err != nil {
@@ -62,9 +61,8 @@ func TestFailedToolTransitionPublishesNothing(t *testing.T) {
 	}
 	sink := &capturingSink{}
 	host := mustConfiguredOrchestrator(WithStore(store), WithEventSink(sink))
-	execution := newRunExecution(host, newTestDispatchPlan(dispatch))
+	execution := newRunExecution(host, newTestDispatchPlan(dispatch), run)
 	defer execution.release()
-	execution.bindRun(run)
 	_, err = execution.persistToolCreation(context.Background(), session.CreateToolCallRequest{Call: session.ToolCall{ID: "call", RunID: run.ID}})
 	if !errors.Is(err, transitionErr) {
 		t.Fatalf("persistToolCreation error = %v", err)

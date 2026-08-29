@@ -11,7 +11,7 @@ import (
 // ProviderRequest builds the transport-neutral request passed to model
 // adapters for one turn. The caller validates and defensively clones the
 // complete request before dispatch.
-func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, observer model.StreamObserver) model.Request {
+func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext) model.Request {
 	tools := make([]*einoschema.ToolInfo, 0, len(s.Tools))
 	for _, tool := range s.Tools {
 		if tool.Info != nil {
@@ -23,7 +23,6 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		Messages: cloneSlice(s.Messages),
 		Tools:    tools,
 		Options:  cloneStringMap(s.Config.Agent.Options),
-		Observer: observer,
 	}
 }
 

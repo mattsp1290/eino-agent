@@ -431,7 +431,7 @@ type catalogRuntimeStreamer struct {
 	err       error
 }
 
-func (s *catalogRuntimeStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (s *catalogRuntimeStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	s.turn++
 	var response *einoschema.Message
 	if s.turn == 1 {
@@ -450,8 +450,8 @@ func (s *catalogRuntimeStreamer) StreamProvider(_ context.Context, request model
 	} else {
 		response = einoschema.AssistantMessage("done", nil)
 	}
-	reader, writer := einoschema.Pipe[*einoschema.Message](1)
-	_ = writer.Send(response, nil)
+	reader, writer := einoschema.Pipe[model.StreamDelta](1)
+	_ = writer.Send(model.StreamDelta{Message: response}, nil)
 	writer.Close()
 	return reader, nil
 }

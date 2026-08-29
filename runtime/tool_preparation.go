@@ -150,7 +150,7 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		startedAt := o.now()
 		claimEvent := toolTransitionEnvelope(o, snapshot, startedAt)
-		claimed, err := execution.persistToolClaim(ctx, record.RunID, session.ClaimToolCallRequest{
+		claimed, err := execution.persistToolClaim(ctx, session.ClaimToolCallRequest{
 			ID: record.ID, ClaimedBy: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), StartedAt: startedAt,
 			LeaseDuration: o.lease(), Event: claimEvent,
 		})

@@ -42,7 +42,7 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 	)
 	plan := newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})
 	call := runtimeCallFromClaim(tool, claimed)
-	settled, err := newRunExecution(orchestrator, plan).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
+	settled, err := newRunExecution(orchestrator, plan, run).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
 	if err != nil {
 		t.Fatalf("execute and settle: %v", err)
 	}
@@ -70,15 +70,15 @@ func TestFinalToolContextPreservesPlanOrderAndIsIsolated(t *testing.T) {
 		Model:    model.Resolved{Provider: model.Provider{ID: "provider"}, Model: model.Descriptor{ID: "model"}},
 		Messages: []*einoschema.Message{einoschema.UserMessage("secret")},
 	}
-	preparedSnapshot, err := host.prepareSnapshot(context.Background(), newRunExecution(host, plan), snapshot)
+	preparedSnapshot, err := host.prepareSnapshot(context.Background(), newTestRunExecution(host, plan), snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls, err := host.prepareToolCalls(context.Background(), newRunExecution(host, plan), preparedSnapshot, "message", []einoschema.ToolCall{{ID: "call", Function: einoschema.FunctionCall{Name: "zeta", Arguments: `{}`}}})
+	calls, err := host.prepareToolCalls(context.Background(), newTestRunExecution(host, plan), preparedSnapshot, "message", []einoschema.ToolCall{{ID: "call", Function: einoschema.FunctionCall{Name: "zeta", Arguments: `{}`}}})
 	if err != nil || len(calls) != 1 {
 		t.Fatalf("prepared calls = %#v, %v", calls, err)
 	}
-	outcome := host.executeToolOutcome(context.Background(), newRunExecution(host, plan), calls[0].tool, calls[0].call)
+	outcome := host.executeToolOutcome(context.Background(), newTestRunExecution(host, plan), calls[0].tool, calls[0].call)
 	if outcome.RawError != nil {
 		t.Fatal(outcome.RawError)
 	}
@@ -202,7 +202,7 @@ func TestPendingResumeToolPanicPublishesClaimAndSettlement(t *testing.T) {
 		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
 	)
 	done := make(chan Result, 1)
-	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan), run, done)
+	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan, run), run, done)
 	result := <-done
 	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolExecutionPanic) {
 		t.Fatalf("result = %+v", result)

@@ -203,6 +203,23 @@ func TestRequestCloneRejectsUnsupportedMetadata(t *testing.T) {
 	}
 }
 
+func TestUsageFromMessageMapsDetailedEinoUsage(t *testing.T) {
+	message := einoschema.AssistantMessage("done", nil)
+	message.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+		PromptTokens: 11, CompletionTokens: 7,
+		CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 3},
+		PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 5},
+	}}
+	got := UsageFromMessage(message)
+	want := Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3, CacheReadTokens: 5}
+	if got != want {
+		t.Fatalf("usage = %#v, want %#v", got, want)
+	}
+	if got := UsageFromMessage(nil); got != (Usage{}) {
+		t.Fatalf("nil message usage = %#v", got)
+	}
+}
+
 type testAdapter struct {
 	provider     Provider
 	models       []Descriptor
@@ -227,8 +244,8 @@ func (a *testAdapter) Available(context.Context, Runtime) error {
 	return a.availableErr
 }
 
-func (a *testAdapter) StreamProvider(context.Context, Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	return einoschema.StreamReaderFromArray([]*einoschema.Message{}), nil
+func (a *testAdapter) StreamProvider(context.Context, Request) (*einoschema.StreamReader[StreamDelta], error) {
+	return einoschema.StreamReaderFromArray([]StreamDelta{}), nil
 }
 
 type testCatalog struct {

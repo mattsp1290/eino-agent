@@ -30,11 +30,11 @@ For a runnable starting point, see `examples/minimal-server` and
 
 A typical server wires these pieces once at startup through
 `runtime.NewStreamingOrchestrator`. This snippet is schematic:
-`newIDGenerator`, `providerResolver`, `planProvider`, and `eventSink` are
-application-owned implementations. The required fields for a successful minimal
-start are `Store`, `Model`, `IDs`, and a non-empty request `SessionID`.
-`Events`, `Plans`, `Permissions`, `OwnerID`, queue sizing, and leases add
-production behavior.
+`newIDGenerator`, `providerResolver`, and `planProvider` are application-owned
+implementations. A successful construction requires a Store, ModelResolver,
+RunPlanProvider, and IDGenerator. A successful start also requires a non-empty
+request `SessionID`. EventSink, permissions policy, owner ID override, queue
+sizing, and lease tuning are optional.
 
 ```go
 store, err := sqlite.Open(ctx, "agent.db")
@@ -153,7 +153,8 @@ Required semantics:
 - Every existing run ID is rejected with `session.ErrConflict`; starting a run
   is one-shot and never resumes or replays prior admission side effects.
 - A second nonterminal run for the same session returns `session.ErrSessionBusy`.
-- `FinishRun` records one terminal state: completed, failed, or interrupted.
+- `SettleRun` atomically records one terminal state and its canonical
+  `run_finished` event: completed, failed, or interrupted.
 - Replay ordering is deterministic and cursor-based.
 - Duplicate ordinary records with identical caller-supplied IDs are
   idempotent; `AdmitRun` is the explicit exception above.

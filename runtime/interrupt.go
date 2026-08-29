@@ -49,8 +49,7 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 			plan.release()
 		}
 	}()
-	execution := newRunExecution(o, plan)
-	execution.bindRun(run)
+	execution := newRunExecution(o, plan, run)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
 		runID:       runID,
@@ -66,9 +65,6 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *runExecution, run session.Run, done chan<- Result) {
 	defer close(done)
 	defer execution.release()
-	if execution.store == nil {
-		execution.bindRun(run)
-	}
 	if !run.Terminal() {
 		ctx = execution.startLease(ctx, o.lease())
 	}
@@ -95,9 +91,6 @@ func (o *StreamingOrchestrator) executeResume(ctx context.Context, execution *ru
 }
 
 func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, execution *runExecution, run session.Run, settled *bool) (result Result) {
-	if execution.store == nil {
-		execution.bindRun(run)
-	}
 	if run.Terminal() {
 		return Result{RunID: run.ID, Status: run.Status, Interrupted: run.Status == session.RunInterrupted, Error: errorString(run.Error)}
 	}
@@ -147,7 +140,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		if claimToken == "" || call.ClaimedBy != o.ownerID() {
 			claimToken = string(o.ids.NewEventID())
 		}
-		claimResult, err := execution.persistToolClaim(ctx, run.ID, session.ClaimToolCallRequest{
+		claimResult, err := execution.persistToolClaim(ctx, session.ClaimToolCallRequest{
 			ID: call.ID, ClaimedBy: o.ownerID(), ClaimToken: claimToken, StartedAt: startedAt,
 			LeaseDuration: o.lease(), Event: toolTransitionEnvelope(o, snapshot, startedAt),
 		})
@@ -239,13 +232,11 @@ func (o *StreamingOrchestrator) finishResume(ctx context.Context, execution *run
 		result.Status = session.RunFailed
 		result.Error = leaseErr
 	}
-	run.Status = result.Status
-	run.FinishedAt = o.now()
+	settlement := session.RunSettlement{Status: result.Status, FinishedAt: o.now()}
 	if result.Error != nil {
-		run.Error = result.Error.Error()
+		settlement.Error = result.Error.Error()
 	}
-	finalEvent := o.finalRunEvent(run, result)
-	committedEvent, err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent)
+	committed, err := execution.store.SettleRun(context.WithoutCancel(ctx), session.SettleRunRequest{Settlement: settlement, Event: o.finalRunEvent(result)})
 	if err != nil {
 		if result.Error == nil {
 			result.Status = session.RunFailed
@@ -255,7 +246,7 @@ func (o *StreamingOrchestrator) finishResume(ctx context.Context, execution *run
 		if settled != nil {
 			*settled = true
 		}
-		o.publishRunFinished(ctx, execution, committedEvent)
+		o.publishRunFinished(ctx, execution, committed.Event)
 	}
 	return result
 }

@@ -145,8 +145,7 @@ func TestResumeRunCallbacksOnlyDoesNotRequireTools(t *testing.T) {
 	}
 	time.Sleep(2 * time.Millisecond)
 	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithOwnerID("new-owner"), WithClock(func() time.Time { return now }))
-	execution := newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{}))
-	execution.bindRun(run)
+	execution := newRunExecution(orchestrator, mustTestRunPlan(RunPlanSpec{}), run)
 	result := orchestrator.resumeRunWithSettlement(context.Background(), execution, run, nil)
 	if errors.Is(result.Error, ErrInvalidOrchestrator) {
 		t.Fatalf("resumeRun required settlement store for callback-only plan: %v", result.Error)
@@ -171,12 +170,12 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := newAdmissionStore()
-	run := session.Run{ID: "run", SessionID: "session", Status: session.RunPending, CreatedAt: time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)}
+	run := session.Run{ID: "run", SessionID: "session", ClaimToken: "claim", Status: session.RunPending, CreatedAt: time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC)}
 	store.runs[run.ID] = run
 	now := time.Date(2026, 8, 22, 13, 0, 0, 0, time.UTC)
 	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithClock(func() time.Time { return now }))
 	done := make(chan Result, 1)
-	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, newTestDispatchPlan(dispatch)), run, done)
+	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, newTestDispatchPlan(dispatch), run), run, done)
 	result := <-done
 	if result.Error != nil || duration != 0 {
 		t.Fatalf("resume result=%+v duration=%s", result, duration)
@@ -261,7 +260,7 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			defer closePlan()
 			orchestrator := mustConfiguredOrchestrator(WithStore(store), WithOwnerID("new-owner"), WithClock(time.Now), WithEventSink(events))
 			done := make(chan Result, 1)
-			orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan), run, done)
+			orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan, run), run, done)
 			result := <-done
 
 			if !errors.Is(result.Error, test.wantError) {
@@ -309,11 +308,11 @@ type runLifecycleExecution struct {
 	terminalFinishErr error
 }
 
-func (s *runLifecycleExecution) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) (*session.EventRecord, error) {
-	if run.Terminal() && s.terminalFinishErr != nil {
-		return nil, s.terminalFinishErr
+func (s *runLifecycleExecution) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	if request.Settlement.Status != "" && s.terminalFinishErr != nil {
+		return session.RunSettlementResult{}, s.terminalFinishErr
 	}
-	return s.ExecutionStore.SettleRun(ctx, run, event)
+	return s.ExecutionStore.SettleRun(ctx, request)
 }
 
 func (s *runLifecycleStore) FinishRun(ctx context.Context, run session.Run) error {

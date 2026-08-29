@@ -97,9 +97,6 @@ func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool
 }
 
 func (e *runExecution) persistToolCreation(ctx context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
-	if err := e.ensureStore(ctx, request.Call.RunID); err != nil {
-		return session.ToolTransitionResult{}, err
-	}
 	result, err := e.store.CreateToolCall(ctx, request)
 	if err == nil {
 		e.publishPersisted(ctx, e.host.events, result.Event)
@@ -107,10 +104,7 @@ func (e *runExecution) persistToolCreation(ctx context.Context, request session.
 	return result, err
 }
 
-func (e *runExecution) persistToolClaim(ctx context.Context, runID session.RunID, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
-	if err := e.ensureStore(ctx, runID); err != nil {
-		return session.ToolTransitionResult{}, err
-	}
+func (e *runExecution) persistToolClaim(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
 	result, err := e.store.ClaimToolCall(ctx, request)
 	if err == nil {
 		e.publishPersisted(ctx, e.host.events, result.Event)
@@ -120,9 +114,6 @@ func (e *runExecution) persistToolClaim(ctx context.Context, runID session.RunID
 
 func (e *runExecution) persistToolSettlement(ctx context.Context, claimed session.ToolCall, settlement session.ToolSettlement, event session.ToolTransitionEvent) (session.ToolTransitionResult, error) {
 	persistCtx := context.WithoutCancel(ctx)
-	if err := e.ensureStore(persistCtx, claimed.RunID); err != nil {
-		return session.ToolTransitionResult{}, err
-	}
 	result, err := e.store.SettleToolCall(persistCtx, session.SettleToolCallRequest{Settlement: settlement, Event: event})
 	if err == nil {
 		e.publishPersisted(ctx, e.host.events, result.Event)

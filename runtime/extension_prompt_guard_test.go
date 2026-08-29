@@ -29,7 +29,7 @@ func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 
 func TestFallbackModelPrependsSystemWithoutReorderingDurableMessages(t *testing.T) {
 	client := &capturingChatModel{}
-	reader, err := openStream(context.Background(), model.Resolved{Streamer: model.NewEinoStreamer(client)}, model.Request{System: "generated", Messages: []*einoschema.Message{einoschema.SystemMessage("durable"), einoschema.UserMessage("hello")}, Tools: []*einoschema.ToolInfo{{Name: "echo"}}})
+	reader, err := model.NewEinoStreamer(client).StreamProvider(context.Background(), model.Request{System: "generated", Messages: []*einoschema.Message{einoschema.SystemMessage("durable"), einoschema.UserMessage("hello")}, Tools: []*einoschema.ToolInfo{{Name: "echo"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 		executed = true
 		return ToolResult{Output: "bad"}, nil
 	})}
-	outcome := orchestrator.executeToolOutcome(context.Background(), newRunExecution(orchestrator, plan), tool, ToolCall{ID: "call", Name: "danger", Input: []byte(`{}`)})
+	outcome := orchestrator.executeToolOutcome(context.Background(), newTestRunExecution(orchestrator, plan), tool, ToolCall{ID: "call", Name: "danger", Input: []byte(`{}`)})
 	if outcome.Disposition != ToolDenied || outcome.Result.Metadata["permission_status"] != "denied" || permissionsCalled || executed || !reflect.DeepEqual(sequence, []string{"deny", "audit"}) {
 		t.Fatalf("outcome=%#v permissions=%t executed=%t sequence=%v", outcome, permissionsCalled, executed, sequence)
 	}

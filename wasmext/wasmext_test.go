@@ -770,16 +770,16 @@ func (*signalExporter) Shutdown(context.Context) error { return nil }
 
 type wasmScriptedStreamer func(context.Context, model.Request) ([]*einoschema.Message, error)
 
-func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	messages, err := s(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-	reader, writer := einoschema.Pipe[*einoschema.Message](len(messages))
+	reader, writer := einoschema.Pipe[model.StreamDelta](len(messages))
 	go func() {
 		defer writer.Close()
 		for _, message := range messages {
-			if writer.Send(message, nil) {
+			if writer.Send(model.StreamDelta{Message: message, Usage: model.UsageFromMessage(message)}, nil) {
 				return
 			}
 		}

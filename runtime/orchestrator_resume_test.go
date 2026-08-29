@@ -41,7 +41,7 @@ func TestResumePreservesDeniedDispositionAfterFreshResultTransform(t *testing.T)
 		})),
 		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }), WithOwnerID("owner-1"),
 	)
-	result := orchestrator.resumeRunWithSettlement(ctx, newRunExecution(orchestrator, plan), run, nil)
+	result := orchestrator.resumeRunWithSettlement(ctx, newRunExecution(orchestrator, plan, run), run, nil)
 	if result.Error != nil || executed.Load() {
 		t.Fatalf("resume result = %+v", result)
 	}
@@ -150,7 +150,7 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 				WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
 				WithOwnerID("new-owner"),
 			)
-			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, newTestToolPlanWithDispatch(toolRegistry, dispatch)), run, nil)
+			result := orch.resumeRunWithSettlement(context.Background(), newRunExecution(orch, newTestToolPlanWithDispatch(toolRegistry, dispatch), run), run, nil)
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
 			}

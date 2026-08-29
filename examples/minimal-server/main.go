@@ -353,9 +353,9 @@ func (scriptedResolver) Resolve(_ context.Context, selection model.Selection, _ 
 
 type scriptedStreamer struct{}
 
-func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	delay := streamDelay(request.Options)
-	reader, writer := einoschema.Pipe[*einoschema.Message](2)
+	reader, writer := einoschema.Pipe[model.StreamDelta](2)
 	go func() {
 		defer writer.Close()
 		chunks := []*einoschema.Message{
@@ -365,11 +365,11 @@ func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Reques
 		for _, chunk := range chunks {
 			select {
 			case <-ctx.Done():
-				writer.Send(nil, ctx.Err())
+				writer.Send(model.StreamDelta{}, ctx.Err())
 				return
 			case <-time.After(delay):
 			}
-			if writer.Send(chunk, nil) {
+			if writer.Send(model.StreamDelta{Message: chunk}, nil) {
 				return
 			}
 		}

@@ -736,18 +736,23 @@ func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Dura
 	return run, nil
 }
 
-func (s *fakeExecutionStore) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) (*session.EventRecord, error) {
-	if !s.valid() || run.ID != s.fence.RunID || run.ClaimToken != s.fence.ClaimToken {
-		return nil, session.ErrConflict
+func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	if !s.valid() {
+		return session.RunSettlementResult{}, session.ErrConflict
+	}
+	run, err := session.ApplyRunSettlement(s.runs[s.fence.RunID], request.Settlement)
+	if err != nil {
+		return session.RunSettlementResult{}, err
+	}
+	event, err := session.RunSettlementRecord(run, request.Event)
+	if err != nil {
+		return session.RunSettlementResult{}, err
 	}
 	if err := s.FinishRun(ctx, run); err != nil {
-		return nil, err
+		return session.RunSettlementResult{}, err
 	}
-	if event != nil {
-		record, err := s.AppendEvent(ctx, *event)
-		return &record, err
-	}
-	return nil, nil
+	record, err := s.AppendEvent(ctx, event)
+	return session.RunSettlementResult{Run: run, Event: record}, err
 }
 
 func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {

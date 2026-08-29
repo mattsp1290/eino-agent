@@ -21,14 +21,14 @@ Core flow:
 
 1. Open local storage with `store/sqlite.Open`.
 2. Build a `stream.Tail` for live fanout.
-3. Build a composite `runtime.EventSink` that appends non-live events to durable storage and then emits every event to the `stream.Tail`; pass it with `runtime.WithEventSink`, and pass only the tail to `transport.SSEHandler`.
+3. Pass the `stream.Tail` through `runtime.WithEventSink` for live fanout, and pass the same tail to `transport.SSEHandler`.
 4. Build one `composition.Registry`, mount server tools into it, and install it with `runtime.WithRunPlanProvider`.
 5. For each AG-UI run request, close the prior session mount, convert messages, and publish client tools with `tools/agui.MountClientTools`.
 6. Call `runtime.StreamingOrchestrator.Start`.
 7. Serve replay/reconnect through `transport.SSEHandler`.
 8. Serve interrupts through `transport.InterruptHandler`.
 
-Do not pass `stream.Tail` alone through `runtime.WithEventSink`: it is a live fanout, not durable event storage. The minimal server example includes a concrete durable-plus-live sink pattern.
+`runtime.EventSink` is for live delivery and observation. The runtime commits replayable events through the run-fenced `session.ExecutionStore` before forwarding copies to the tail; consumers must not append those copies to durable storage again.
 
 ## POST-SSE Route Shape
 

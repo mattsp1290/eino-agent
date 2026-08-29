@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
-	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -54,8 +52,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ModelCompletedPoint, ModelCompletedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, Usage: runtimeUsage(streamUsage), Error: classifyExtensionError(streamErr)})
 		}
 	}()
-	observer := &streamObserver{queue: queue, base: snapshot, messageID: messageID, now: o.now}
-	request := snapshot.ProviderRequest(messageID, o.trace, observer)
+	request := snapshot.ProviderRequest(messageID, o.trace)
 	request.Messages = cloneMessages(messages)
 	request.System, err = o.renderSystemPrompt(ctx, execution.plan, snapshot, attempt, step)
 	if err != nil {
@@ -84,8 +81,8 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	}
 	extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecord.ID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
 	modelRequested = true
-	reader, err := extension.InvokeAround(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), Audited: audited, ContentHash: contentHash}, func(ctx context.Context, _ ModelStreamInput) (*einoschema.StreamReader[*einoschema.Message], error) {
-		return openStream(ctx, snapshot.Model, request)
+	reader, err := extension.InvokeAround(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), Audited: audited, ContentHash: contentHash}, func(ctx context.Context, _ ModelStreamInput) (*einoschema.StreamReader[model.StreamDelta], error) {
+		return snapshot.Model.Streamer.StreamProvider(ctx, request)
 	})
 	if err != nil {
 		streamErr = err
@@ -102,7 +99,8 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			streamErr = err
 			return nil, err
 		}
-		chunk, err := reader.Recv()
+		delta, err := reader.Recv()
+		streamUsage = mergeUsage(streamUsage, delta.Usage)
 		if errors.Is(err, io.EOF) {
 			break
 		}
@@ -114,17 +112,17 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			streamErr = err
 			return nil, err
 		}
-		if chunk == nil {
+		if delta.Message == nil {
 			streamErr = model.Error{Code: "malformed_provider_stream", Message: "provider returned nil message chunk"}
 			return nil, streamErr
 		}
 		o.observeStreamChunk(obsStream, int64(len(chunks)))
-		chunks = append(chunks, chunk)
+		chunks = append(chunks, delta.Message)
 		if err := queue.emit(Event{
 			Kind: EventMessageDelta, SessionID: snapshot.SessionID, RunID: snapshot.RunID,
 			MessageID: messageID, EpochID: snapshot.EpochID,
 			ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
-			Payload:  mustJSON(map[string]string{"content": chunk.Content, "reasoning": chunk.ReasoningContent}),
+			Payload:  mustJSON(map[string]string{"content": delta.Message.Content, "reasoning": delta.Message.ReasoningContent}),
 			LiveOnly: true, Time: o.now(),
 		}); err != nil {
 			streamErr = err
@@ -132,7 +130,6 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		}
 	}
 	if len(chunks) == 0 {
-		streamUsage = observer.usageSnapshot()
 		return einoschema.AssistantMessage("", nil), nil
 	}
 	msg, err := einoschema.ConcatMessages(chunks)
@@ -140,67 +137,12 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		streamErr = model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
 		return nil, streamErr
 	}
-	streamUsage = resolveStreamUsage(observer.usageSnapshot(), msg)
+	streamUsage = resolveStreamUsage(streamUsage, msg)
 	return msg, nil
 }
 
-func openStream(ctx context.Context, resolved model.Resolved, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	if resolved.Streamer == nil {
-		return nil, model.Error{Code: "model_streamer_missing", Message: "resolved model has no streamer", Cause: model.ErrProviderUnavailable}
-	}
-	if request.IdempotencyKey != "" {
-		if streamer, ok := resolved.Streamer.(model.IdempotentStreamer); ok {
-			return streamer.StreamProviderWithIdempotencyKey(ctx, request, request.IdempotencyKey)
-		}
-	}
-	return resolved.Streamer.StreamProvider(ctx, request)
-}
-
-type streamObserver struct {
-	queue     *eventQueue
-	base      TurnSnapshot
-	messageID session.MessageID
-	now       func() time.Time
-	mu        sync.Mutex
-	usage     model.Usage
-}
-
-func (o *streamObserver) OnProviderStart(context.Context, model.Request) {}
-func (o *streamObserver) OnProviderDelta(_ context.Context, delta model.StreamDelta) {
-	o.setUsage(delta.Usage)
-}
-func (o *streamObserver) OnProviderError(context.Context, model.Error) {}
-func (o *streamObserver) OnProviderEnd(_ context.Context, response model.Response) {
-	o.setUsage(response.Usage)
-}
-
-func (o *streamObserver) setUsage(usage model.Usage) {
-	if o == nil {
-		return
-	}
-	o.mu.Lock()
-	o.usage = mergeUsage(o.usage, usage)
-	o.mu.Unlock()
-}
-
-func (o *streamObserver) usageSnapshot() model.Usage {
-	if o == nil {
-		return model.Usage{}
-	}
-	o.mu.Lock()
-	defer o.mu.Unlock()
-	return o.usage
-}
-
 func resolveStreamUsage(observed model.Usage, msg *einoschema.Message) model.Usage {
-	if observed.InputTokens != 0 || observed.OutputTokens != 0 {
-		return observed
-	}
-	if msg != nil && msg.ResponseMeta != nil && msg.ResponseMeta.Usage != nil {
-		u := msg.ResponseMeta.Usage
-		return model.Usage{InputTokens: int64(u.PromptTokens), OutputTokens: int64(u.CompletionTokens)}
-	}
-	return observed
+	return mergeUsage(model.UsageFromMessage(msg), observed)
 }
 
 func mergeUsage(current model.Usage, next model.Usage) model.Usage {

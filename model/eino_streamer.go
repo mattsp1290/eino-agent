@@ -2,9 +2,6 @@ package model
 
 import (
 	"context"
-	"errors"
-	"fmt"
-	"sync/atomic"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -23,7 +20,7 @@ type einoStreamer struct {
 	client einomodel.ToolCallingChatModel
 }
 
-func (s *einoStreamer) StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (s *einoStreamer) StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[StreamDelta], error) {
 	if s == nil || s.client == nil {
 		return nil, Error{Code: "model_client_missing", Message: "Eino model client missing", Cause: ErrProviderUnavailable}
 	}
@@ -31,14 +28,10 @@ func (s *einoStreamer) StreamProvider(ctx context.Context, request Request) (*ei
 	if err != nil {
 		return nil, err
 	}
-	if err := notifyStart(ctx, req.Observer, req); err != nil {
-		return nil, err
-	}
 	client := s.client
 	if len(req.Tools) != 0 {
 		client, err = client.WithTools(req.Tools)
 		if err != nil {
-			notifyProviderError(ctx, req.Observer, err)
 			return nil, err
 		}
 	}
@@ -48,63 +41,28 @@ func (s *einoStreamer) StreamProvider(ctx context.Context, request Request) (*ei
 	}
 	upstream, err := client.Stream(ctx, messages)
 	if err != nil {
-		notifyProviderError(ctx, req.Observer, err)
 		return nil, err
 	}
 	if upstream == nil {
 		err = Error{Code: "nil_provider_stream", Message: "Eino model returned nil stream"}
-		notifyProviderError(ctx, req.Observer, err)
 		return nil, err
 	}
-	var index atomic.Int64
-	return einoschema.StreamReaderWithConvert(upstream, func(message *einoschema.Message) (*einoschema.Message, error) {
-		if err := notifyDelta(ctx, req.Observer, StreamDelta{Message: message, Index: index.Add(1) - 1}); err != nil {
-			return nil, err
-		}
-		return message, nil
-	}, einoschema.WithErrWrapper(func(err error) error {
-		notifyProviderError(ctx, req.Observer, err)
-		return err
-	})), nil
+	return einoschema.StreamReaderWithConvert(upstream, func(message *einoschema.Message) (StreamDelta, error) {
+		return StreamDelta{Message: message, Usage: UsageFromMessage(message)}, nil
+	}), nil
 }
 
-func notifyStart(ctx context.Context, observer StreamObserver, request Request) (err error) {
-	if observer == nil {
-		return nil
+// UsageFromMessage maps the usage metadata Eino exposes on a streamed message
+// into the provider-neutral cumulative usage shape.
+func UsageFromMessage(message *einoschema.Message) Usage {
+	if message == nil || message.ResponseMeta == nil || message.ResponseMeta.Usage == nil {
+		return Usage{}
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("provider observer start panic: %v", recovered)
-		}
-	}()
-	observer.OnProviderStart(ctx, request)
-	return nil
-}
-
-func notifyDelta(ctx context.Context, observer StreamObserver, delta StreamDelta) (err error) {
-	if observer == nil {
-		return nil
+	usage := message.ResponseMeta.Usage
+	return Usage{
+		InputTokens:     int64(usage.PromptTokens),
+		OutputTokens:    int64(usage.CompletionTokens),
+		ReasoningTokens: int64(usage.CompletionTokensDetails.ReasoningTokens),
+		CacheReadTokens: int64(usage.PromptTokenDetails.CachedTokens),
 	}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("provider observer delta panic: %v", recovered)
-		}
-	}()
-	observer.OnProviderDelta(ctx, delta)
-	return nil
-}
-
-func notifyProviderError(ctx context.Context, observer StreamObserver, err error) {
-	if observer == nil {
-		return
-	}
-	providerErr := Error{Code: "provider_stream_error", Message: err.Error(), Cause: err}
-	var normalized Error
-	if errors.As(err, &normalized) {
-		providerErr = normalized
-	}
-	func() {
-		defer func() { _ = recover() }()
-		observer.OnProviderError(ctx, providerErr)
-	}()
 }

@@ -73,76 +73,43 @@ type providerStreamer struct {
 	runtime    model.Runtime
 }
 
-// StreamProvider returns a fake stream and emits normalized observer callbacks.
-func (s *providerStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+// StreamProvider returns a fake stream of normalized cumulative deltas.
+func (s *providerStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	if s == nil {
 		return nil, errors.New("fake provider streamer is nil")
 	}
-	req, err := request.Clone()
-	if err != nil {
+	if _, err := request.Clone(); err != nil {
 		return nil, err
-	}
-	if req.Observer != nil {
-		req.Observer.OnProviderStart(ctx, req)
 	}
 	providerID := s.providerID
 	modelID := s.modelID
 	steps := cloneSteps(s.steps)
-	reader, writer := einoschema.Pipe[*einoschema.Message](len(steps))
+	reader, writer := einoschema.Pipe[model.StreamDelta](len(steps))
 	go func() {
 		defer writer.Close()
 		var usage model.Usage
-		for index, step := range steps {
+		for _, step := range steps {
 			if err := ctx.Err(); err != nil {
-				notifyError(ctx, req.Observer, err)
-				writer.Send(nil, err)
+				writer.Send(model.StreamDelta{Usage: usage}, err)
 				return
 			}
 			if step.Err != nil {
 				err := normalizeError(step.Err)
-				notifyError(ctx, req.Observer, err)
-				writer.Send(nil, err)
+				writer.Send(model.StreamDelta{Usage: usage}, err)
 				return
 			}
 			usage = addUsage(usage, step.Usage)
 			msg := messageForStep(providerID, modelID, step)
 			delta := model.StreamDelta{
 				Message: msg,
-				Usage:   step.Usage,
-				Index:   int64(index),
-				Done:    index == len(steps)-1,
+				Usage:   usage,
 			}
-			if req.Observer != nil {
-				req.Observer.OnProviderDelta(ctx, delta)
-			}
-			if writer.Send(msg, nil) {
+			if writer.Send(delta, nil) {
 				return
 			}
 		}
-		if req.Observer != nil {
-			req.Observer.OnProviderEnd(ctx, model.Response{
-				Message: einoschema.AssistantMessage("", nil),
-				Usage:   usage,
-			})
-		}
 	}()
 	return reader, nil
-}
-
-func notifyError(ctx context.Context, observer model.StreamObserver, err error) {
-	if observer == nil {
-		return
-	}
-	var providerErr model.Error
-	if errors.As(err, &providerErr) {
-		observer.OnProviderError(ctx, providerErr)
-		return
-	}
-	observer.OnProviderError(ctx, model.Error{
-		Code:    "fake_provider_error",
-		Message: err.Error(),
-		Cause:   err,
-	})
 }
 
 func messageForStep(providerID model.ProviderID, modelID model.ID, step Step) *einoschema.Message {

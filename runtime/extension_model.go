@@ -40,14 +40,14 @@ func validateModelStreamInput(original, candidate ModelStreamInput) error {
 	return nil
 }
 
-func validateStreamReader(reader *einoschema.StreamReader[*einoschema.Message]) error {
+func validateStreamReader(reader *einoschema.StreamReader[model.StreamDelta]) error {
 	if reader == nil {
 		return errors.New("nil provider stream")
 	}
 	return nil
 }
 
-func validateDelegatedStreamReader(delegated, returned *einoschema.StreamReader[*einoschema.Message]) error {
+func validateDelegatedStreamReader(delegated, returned *einoschema.StreamReader[model.StreamDelta]) error {
 	if delegated != returned {
 		return extension.ErrProtectedMutation
 	}

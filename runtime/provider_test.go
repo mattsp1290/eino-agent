@@ -35,7 +35,7 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 		}},
 	}
 
-	request, err := snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace"}, nil).Clone()
+	request, err := snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace"}).Clone()
 	if err != nil {
 		t.Fatal(err)
 	}

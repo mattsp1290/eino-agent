@@ -214,7 +214,7 @@ const (
 	// EventToolCallUpdated is emitted for tool-call state transitions.
 	EventToolCallUpdated EventKind = "tool_call_updated"
 	// EventRunFinished is emitted after durable run settlement.
-	EventRunFinished EventKind = "run_finished"
+	EventRunFinished EventKind = EventKind(session.RunSettlementEventKind)
 	// EventTailOverflow reports that a reconnect live-tail subscriber fell
 	// behind a bounded queue and must reconnect or resync.
 	EventTailOverflow EventKind = "tail_overflow"

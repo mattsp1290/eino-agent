@@ -134,16 +134,16 @@ type capturingStreamer struct {
 	messages []string
 }
 
-func (s *capturingStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (s *capturingStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	s.mu.Lock()
 	for _, message := range request.Messages {
 		s.messages = append(s.messages, message.Content)
 	}
 	s.mu.Unlock()
-	reader, writer := einoschema.Pipe[*einoschema.Message](1)
+	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	go func() {
 		defer writer.Close()
-		writer.Send(einoschema.AssistantMessage("done", nil), nil)
+		writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil)}, nil)
 	}()
 	return reader, nil
 }

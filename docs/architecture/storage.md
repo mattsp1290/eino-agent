@@ -56,6 +56,8 @@ Required behavior:
 - Terminal statuses are `RunInterrupted`, `RunFailed`, and `RunCompleted`.
 - After scoped `SettleRun` records terminal state and its durable event, the next
   run may be admitted.
+- `run_finished` is a reserved canonical event kind. Exactly one exists per run,
+  and only `SettleRun` may commit it.
 - `ClaimToken` is mutation authority. `OwnerID` is diagnostic metadata.
 - `ClaimRun` atomically replaces owner/token only when the store clock observes
   an expired nonterminal lease.

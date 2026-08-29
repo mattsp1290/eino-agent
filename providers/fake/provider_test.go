@@ -9,10 +9,9 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 )
 
-func TestStreamProviderEmitsCallbacksUsageAndChunks(t *testing.T) {
+func TestStreamProviderEmitsCumulativeUsageAndChunks(t *testing.T) {
 	t.Parallel()
 
-	observer := &recordingObserver{}
 	provider := &Provider{
 		ID: "fake",
 		Steps: []Step{
@@ -26,7 +25,6 @@ func TestStreamProviderEmitsCallbacksUsageAndChunks(t *testing.T) {
 	}
 	reader, err := streamer.StreamProvider(context.Background(), model.Request{
 		Identity: model.Identity{ProviderID: "fake", ModelID: "m1"},
-		Observer: observer,
 	})
 	if err != nil {
 		t.Fatalf("StreamProvider error = %v", err)
@@ -34,31 +32,32 @@ func TestStreamProviderEmitsCallbacksUsageAndChunks(t *testing.T) {
 	defer reader.Close()
 
 	var content string
+	var usages []model.Usage
 	for {
-		msg, err := reader.Recv()
+		delta, err := reader.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			t.Fatalf("Recv error = %v", err)
 		}
-		content += msg.Content
+		content += delta.Message.Content
+		usages = append(usages, delta.Usage)
 	}
 	if content != "hello world" {
 		t.Fatalf("content = %q, want hello world", content)
 	}
-	if observer.started != 1 || observer.ended != 1 || len(observer.deltas) != 2 {
-		t.Fatalf("observer started=%d ended=%d deltas=%d", observer.started, observer.ended, len(observer.deltas))
+	if len(usages) != 2 || usages[0].InputTokens != 3 || usages[0].OutputTokens != 0 {
+		t.Fatalf("first usage = %#v", usages)
 	}
-	if observer.response.Usage.InputTokens != 3 || observer.response.Usage.OutputTokens != 2 {
-		t.Fatalf("usage = %#v", observer.response.Usage)
+	if usages[1].InputTokens != 3 || usages[1].OutputTokens != 2 {
+		t.Fatalf("final usage = %#v", usages[1])
 	}
 }
 
 func TestStreamProviderNormalizesErrors(t *testing.T) {
 	t.Parallel()
 
-	observer := &recordingObserver{}
 	provider := &Provider{
 		ID:    "fake",
 		Steps: []Step{{Err: errors.New("boom")}},
@@ -67,7 +66,7 @@ func TestStreamProviderNormalizesErrors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader, err := streamer.StreamProvider(context.Background(), model.Request{Observer: observer})
+	reader, err := streamer.StreamProvider(context.Background(), model.Request{})
 	if err != nil {
 		t.Fatalf("StreamProvider error = %v", err)
 	}
@@ -78,8 +77,8 @@ func TestStreamProviderNormalizesErrors(t *testing.T) {
 	if !errors.As(err, &providerErr) {
 		t.Fatalf("Recv error = %T %[1]v, want model.Error", err)
 	}
-	if observer.err.Code != "fake_provider_error" {
-		t.Fatalf("observer err = %#v", observer.err)
+	if providerErr.Code != "fake_provider_error" {
+		t.Fatalf("provider err = %#v", providerErr)
 	}
 }
 
@@ -103,15 +102,15 @@ func TestStreamProviderSnapshotsProviderState(t *testing.T) {
 		t.Fatalf("StreamProvider error = %v", err)
 	}
 	defer reader.Close()
-	msg, err := reader.Recv()
+	delta, err := reader.Recv()
 	if err != nil {
 		t.Fatalf("Recv error = %v", err)
 	}
-	if msg.Content != "original" {
-		t.Fatalf("content = %q, want original", msg.Content)
+	if delta.Message.Content != "original" {
+		t.Fatalf("content = %q, want original", delta.Message.Content)
 	}
-	if msg.Extra["provider_id"] != "fake" {
-		t.Fatalf("provider id = %q, want fake", msg.Extra["provider_id"])
+	if delta.Message.Extra["provider_id"] != "fake" {
+		t.Fatalf("provider id = %q, want fake", delta.Message.Extra["provider_id"])
 	}
 }
 
@@ -166,29 +165,4 @@ func TestBuildClonesRuntime(t *testing.T) {
 	if base.runtime.Options["session"] != "a" {
 		t.Fatalf("runtime options mutated to %q", base.runtime.Options["session"])
 	}
-}
-
-type recordingObserver struct {
-	started  int
-	ended    int
-	deltas   []model.StreamDelta
-	err      model.Error
-	response model.Response
-}
-
-func (o *recordingObserver) OnProviderStart(context.Context, model.Request) {
-	o.started++
-}
-
-func (o *recordingObserver) OnProviderDelta(_ context.Context, delta model.StreamDelta) {
-	o.deltas = append(o.deltas, delta)
-}
-
-func (o *recordingObserver) OnProviderError(_ context.Context, err model.Error) {
-	o.err = err
-}
-
-func (o *recordingObserver) OnProviderEnd(_ context.Context, response model.Response) {
-	o.ended++
-	o.response = response
 }

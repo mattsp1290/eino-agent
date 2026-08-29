@@ -42,6 +42,12 @@ func mustConfiguredOrchestrator(extra ...Option) *StreamingOrchestrator {
 	return orchestrator
 }
 
+func newTestRunExecution(host *StreamingOrchestrator, plan *RunPlan) *runExecution {
+	return newRunExecution(host, plan, session.Run{
+		ID: "test-run", SessionID: "test-session", ClaimToken: "test-claim", Status: session.RunRunning,
+	})
+}
+
 func orchestratorConfig() config.Snapshot {
 	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
 	return config.Snapshot{
@@ -72,21 +78,27 @@ func (r resolvedModel) Resolve(context.Context, model.Selection, model.Runtime) 
 
 type scriptedStreamer func(context.Context, model.Request) ([]*einoschema.Message, error)
 
-func (s scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (s scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	messages, err := s(ctx, request)
 	if err != nil {
 		return nil, err
 	}
-	reader, writer := einoschema.Pipe[*einoschema.Message](len(messages))
+	reader, writer := einoschema.Pipe[model.StreamDelta](len(messages))
 	go func() {
 		defer writer.Close()
 		for _, msg := range messages {
-			if writer.Send(msg, nil) {
+			if writer.Send(model.StreamDelta{Message: msg, Usage: model.UsageFromMessage(msg)}, nil) {
 				return
 			}
 		}
 	}()
 	return reader, nil
+}
+
+type deltaStreamerFunc func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error)
+
+func (f deltaStreamerFunc) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+	return f(ctx, request)
 }
 
 type sequenceIDs struct {

@@ -24,9 +24,14 @@ func TestStreamingOrchestratorRecordsNoNetworkObservations(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.Message, error) {
-		request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 3, OutputTokens: 2, ReasoningTokens: 1, CacheReadTokens: 4}})
-		return []*einoschema.Message{einoschema.AssistantMessage("hello", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		response := einoschema.AssistantMessage("hello", nil)
+		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+			PromptTokens: 3, CompletionTokens: 2,
+			CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 1},
+			PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 4},
+		}}
+		return []*einoschema.Message{response}, nil
 	}))
 	orch.observer = observer
 	orch.trace = agentcontext.TraceContext{TraceID: "trace-1"}
