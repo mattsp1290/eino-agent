@@ -103,6 +103,12 @@ type durablePointKey struct {
 	kind     HandlerKind
 }
 
+// Point is a host-declared extension point. The unexported method keeps point
+// authority limited to the typed handles defined by this package.
+type Point interface {
+	extensionPoint() *pointDefinition
+}
+
 // pointDefinition is the immutable, process-local authority for one extension
 // point. Typed definitions own both this identity and the policies used when
 // dispatching it, so copying a point cannot separate identity from semantics.
@@ -130,6 +136,7 @@ func (p Notification[T]) base() *pointDefinition {
 	}
 	return &p.definition.point
 }
+func (p Notification[T]) extensionPoint() *pointDefinition { return p.base() }
 
 type Hook[T any] struct {
 	definition *hookDefinition[T]
@@ -152,6 +159,7 @@ func (p Hook[T]) base() *pointDefinition {
 	}
 	return &p.definition.point
 }
+func (p Hook[T]) extensionPoint() *pointDefinition { return p.base() }
 
 type Transform[T any] struct {
 	definition *transformDefinition[T]
@@ -174,6 +182,7 @@ func (p Transform[T]) base() *pointDefinition {
 	}
 	return &p.definition.point
 }
+func (p Transform[T]) extensionPoint() *pointDefinition { return p.base() }
 
 type Gate[I, D any] struct {
 	definition *gateDefinition[I, D]
@@ -199,6 +208,7 @@ func (p Gate[I, D]) base() *pointDefinition {
 	}
 	return &p.definition.point
 }
+func (p Gate[I, D]) extensionPoint() *pointDefinition { return p.base() }
 
 type RequiredAround[I, O any] struct {
 	definition *aroundDefinition[I, O]
@@ -223,6 +233,7 @@ func (p RequiredAround[I, O]) base() *pointDefinition {
 	}
 	return &p.definition.point
 }
+func (p RequiredAround[I, O]) extensionPoint() *pointDefinition { return p.base() }
 
 func newPointDefinition(contract Contract, kind HandlerKind) pointDefinition {
 	return pointDefinition{durablePointKey: durablePointKey{contract: contract, kind: kind}}

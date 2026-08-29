@@ -15,7 +15,10 @@ import (
 )
 
 func TestMountStandardPreservesUnsupportedPlatformError(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := extension.Component{InstanceID: "windows", Artifact: extension.Artifact{
 		Name: "eino-tools-standard", Version: "test", Hash: "adapter", ConfigHash: "catalog", SourceKind: extension.SourceNative,
 	}}

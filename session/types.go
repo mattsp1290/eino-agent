@@ -201,6 +201,7 @@ type ToolCall struct {
 	SessionID       ID
 	RunID           RunID
 	MessageID       MessageID
+	RequestPartID   PartID
 	ResultMessageID MessageID
 	ResultPartID    PartID
 	Name            string
@@ -251,7 +252,6 @@ const (
 // ReplayCursor selects a stable page of replayable history.
 type ReplayCursor struct {
 	AfterMessageID MessageID
-	AfterPartID    PartID
 	Limit          int
 }
 

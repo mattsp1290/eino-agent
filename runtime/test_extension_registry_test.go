@@ -12,7 +12,11 @@ type testExtensionRegistry struct {
 }
 
 func newTestExtensionRegistry(reporter extension.Reporter) *testExtensionRegistry {
-	return &testExtensionRegistry{Registry: extension.NewRegistry[struct{}](reporter)}
+	registry, err := extension.NewRegistry[struct{}](reporter, ExtensionPoints()...)
+	if err != nil {
+		panic(err)
+	}
+	return &testExtensionRegistry{Registry: registry}
 }
 
 func (r *testExtensionRegistry) Mount(ctx context.Context, component extension.Component, installer extension.Installer) (*extension.Mount[struct{}], error) {

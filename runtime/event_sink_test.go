@@ -3,10 +3,14 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
+	einoschema "github.com/cloudwego/eino/schema"
+
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -23,16 +27,17 @@ func TestRunEventSinkOnlyFansOut(t *testing.T) {
 		t.Fatal(err)
 	}
 	infrastructure := &capturingSink{}
-	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store)), mustTestRunPlan(RunPlanSpec{}), run)
+	execution := newRunExecution(mustConfiguredOrchestrator(WithStore(store), WithEventSink(infrastructure)), mustTestRunPlan(RunPlanSpec{}), run)
 	defer execution.release()
-	sink := execution.eventSink(infrastructure)
+	sink := execution.eventSink()
 
 	sink.Emit(ctx, session.EventRecord{Kind: EventMessageDelta, SessionID: run.SessionID, RunID: run.ID, LiveOnly: true})
 	if len(store.events) != 0 {
 		t.Fatalf("fanout persisted %d events, want none", len(store.events))
 	}
-	if len(infrastructure.events) != 1 || infrastructure.events[0].Kind != EventMessageDelta {
-		t.Fatalf("infrastructure events = %#v", infrastructure.events)
+	events := infrastructure.waitFor(t, 1)
+	if events[0].Kind != EventMessageDelta {
+		t.Fatalf("infrastructure events = %#v", events)
 	}
 }
 
@@ -78,7 +83,36 @@ func TestFailedToolTransitionPublishesNothing(t *testing.T) {
 	if !errors.Is(err, transitionErr) {
 		t.Fatalf("persistToolCreation error = %v", err)
 	}
-	if len(sink.events) != 0 || published != 0 {
-		t.Fatalf("failed transition published sink=%v notices=%d", sink.events, published)
+	if events := sink.snapshot(); len(events) != 0 || published != 0 {
+		t.Fatalf("failed transition published sink=%v notices=%d", events, published)
 	}
+}
+
+func TestBlockedInfrastructureSinkCannotBlockAdmissionOrHandleDone(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	}), WithEventSink(EventSinkFunc(func(context.Context, session.EventRecord) {
+		once.Do(func() { close(started) })
+		<-release
+	})), WithQueueSize(2))
+	handle, err := orch.Start(context.Background(), Request{
+		SessionID: "blocked-sink-session", ParentID: "user-1", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	select {
+	case result := <-handle.Done():
+		if result.Status != session.RunCompleted {
+			t.Fatalf("result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Handle.Done blocked on infrastructure sink")
+	}
+	close(release)
 }

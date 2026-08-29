@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestNewStreamingOrchestratorMinimalAndOrderedOptions(t *testing.T) {
 	if orch.store != store || orch.ids != ids || orch.attempts() != 4 || orch.ownerID() != "last" {
 		t.Fatalf("orchestrator options not applied: %+v", orch)
 	}
-	if orch.toolTurns() != 8 || orch.lease() != time.Minute || orch.queueSize != 1 || orch.modelRequestMaxBytes != defaultModelRequestMaxBytes {
+	if orch.toolTurns() != 8 || orch.lease() != time.Minute || orch.queueSize != 64 || orch.modelRequestMaxBytes != defaultModelRequestMaxBytes {
 		t.Fatalf("constructor defaults changed")
 	}
 }
@@ -141,7 +142,8 @@ func TestNewStreamingOrchestratorRejectsNilInterfaceOptions(t *testing.T) {
 func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 	t.Parallel()
 	store := newAdmissionStore()
-	var toolsResolved, eventEmitted bool
+	var toolsResolved bool
+	var eventEmitted atomic.Bool
 	probe := testPlanTool("probe")
 	probe.Resolve = func(context.Context, ToolScopeContext) (Tool, error) {
 		toolsResolved = true
@@ -158,14 +160,18 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 		WithIDGenerator(&sequenceIDs{}),
 		WithRunPlanProvider(staticRunPlanProvider{plan: toolPlan}),
 		WithEventSink(EventSinkFunc(func(context.Context, session.EventRecord) {
-			eventEmitted = true
+			eventEmitted.Store(true)
 		})),
 	)
 	if err != nil {
 		t.Fatalf("NewStreamingOrchestrator error = %v", err)
 	}
 	result := startAndWait(t, orch)
-	if result.Status != session.RunCompleted || !toolsResolved || !eventEmitted {
-		t.Fatalf("result = %+v; tools=%v event=%v", result, toolsResolved, eventEmitted)
+	deadline := time.Now().Add(time.Second)
+	for !eventEmitted.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if result.Status != session.RunCompleted || !toolsResolved || !eventEmitted.Load() {
+		t.Fatalf("result = %+v; tools=%v event=%v", result, toolsResolved, eventEmitted.Load())
 	}
 }

@@ -32,8 +32,11 @@ func TestCapabilityRegistrarsShareCanonicalIdentifierValidation(t *testing.T) {
 	}
 	for name, installer := range installers {
 		t.Run(name, func(t *testing.T) {
-			registry := NewRegistry(nil)
-			_, err := registry.Mount(context.Background(), component("invalid-"+name), installer)
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = registry.Mount(context.Background(), component("invalid-"+name), installer)
 			if !errors.Is(err, extension.ErrInvalidRegistration) {
 				t.Fatalf("Mount error = %v, want ErrInvalidRegistration", err)
 			}
@@ -109,7 +112,10 @@ func TestToolSourceIdentityValidationIsAtomic(t *testing.T) {
 }
 
 func TestMountedToolSourceIdentityIsCallerImmutable(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	registration := ToolRegistration{
 		ID: "standard.echo", Scope: extension.GlobalScope(),
 		SourceIdentity: mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("c", 64)),
@@ -154,7 +160,10 @@ func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
 		{name: "order", fn: func(registration *ToolRegistration) { registration.Order++ }},
 	} {
 		t.Run(mutate.name, func(t *testing.T) {
-			registry := NewRegistry(nil)
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
 			component := component("source-resume")
 			registration := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceIdentity: mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("c", 64)), Definition: definition("echo", "v1")}
 			mount := func(value ToolRegistration) *Mount {

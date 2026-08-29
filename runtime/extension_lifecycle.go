@@ -114,6 +114,17 @@ var (
 	EventPublishedPoint = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/event-published", Version: "1"}, infallibleClone(cloneEvent))
 )
 
+// ExtensionPoints returns the complete canonical runtime point catalog.
+func ExtensionPoints() []extension.Point {
+	return []extension.Point{
+		RunBeforeExecutePoint, ContextAssemblePoint, TurnPreparePoint, ModelStreamPoint,
+		ToolPreparePoint, ToolExecutePoint, ToolResultTransformPoint,
+		RunAdmittedPoint, RunStartedPoint, RunSettledPoint, ModelRequestedPoint,
+		ModelCompletedPoint, ToolPreparedPoint, ToolStartedPoint, ToolSettledPoint,
+		EventPublishedPoint,
+	}
+}
+
 func identityClone[T any](value T) (T, error) { return value, nil }
 
 func infallibleClone[T any](clone func(T) T) extension.CloneFunc[T] {

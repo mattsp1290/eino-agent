@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -101,12 +102,12 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		panic("executor secret")
 	})}}}
 	registry := newTestExtensionRegistry(nil)
-	var order []string
+	var notificationOrder []string
 	var publishedIDs []session.EventID
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("transition-order"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event session.EventRecord) error {
 			if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
-				order = append(order, "published:"+toolEventStatus(event))
+				notificationOrder = append(notificationOrder, "published:"+toolEventStatus(event))
 				publishedIDs = append(publishedIDs, event.ID)
 			}
 			return nil
@@ -114,13 +115,13 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 			return err
 		}
 		if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", Scope: extension.GlobalScope()}, func(context.Context, ToolStartedNotice) error {
-			order = append(order, "started")
+			notificationOrder = append(notificationOrder, "started")
 			return nil
 		}); err != nil {
 			return err
 		}
 		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(context.Context, ToolSettledNotice) error {
-			order = append(order, "settled")
+			notificationOrder = append(notificationOrder, "settled")
 			return nil
 		})
 	}))
@@ -133,10 +134,12 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := newTestToolPlanWithDispatch(toolRegistry, dispatch)
+	var sinkMu sync.Mutex
 	var sinkEvents []session.EventRecord
 	sink := EventSinkFunc(func(_ context.Context, event session.EventRecord) {
 		if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
-			order = append(order, "sink:"+toolEventStatus(event))
+			sinkMu.Lock()
+			defer sinkMu.Unlock()
 			sinkEvents = append(sinkEvents, event)
 		}
 	})
@@ -152,11 +155,29 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolExecutionPanic) {
 		t.Fatalf("result = %+v", result)
 	}
-	assertDurableToolResult(t, store, "panic-session", "call-panic", session.ToolCallFailed, "operational_failure")
-	wantOrder := []string{"sink:pending", "published:pending", "sink:running", "published:running", "started", "sink:failed", "published:failed", "settled"}
-	if !reflect.DeepEqual(order, wantOrder) {
-		t.Fatalf("transition observer order = %v, want %v", order, wantOrder)
+	if err := plan.FlushNotifications(context.Background()); err != nil {
+		t.Fatal(err)
 	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		sinkMu.Lock()
+		count := len(sinkEvents)
+		sinkMu.Unlock()
+		if count == 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink event count = %d, want 3", count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	assertDurableToolResult(t, store, "panic-session", "call-panic", session.ToolCallFailed, "operational_failure")
+	wantOrder := []string{"published:pending", "published:running", "started", "published:failed", "settled"}
+	if !reflect.DeepEqual(notificationOrder, wantOrder) {
+		t.Fatalf("notification order = %v, want %v", notificationOrder, wantOrder)
+	}
+	sinkMu.Lock()
+	defer sinkMu.Unlock()
 	if len(sinkEvents) != 3 || len(publishedIDs) != 3 {
 		t.Fatalf("sink events = %#v published IDs = %#v", sinkEvents, publishedIDs)
 	}
@@ -176,6 +197,50 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		if sinkEvents[index].ID != publishedIDs[index] || !durableIDSet[sinkEvents[index].ID] {
 			t.Fatalf("transition IDs differ: sink=%v published=%v durable=%v", sinkEvents, publishedIDs, durableIDs)
 		}
+	}
+}
+
+func TestFreshToolPanicInterruptsEveryRemainingCommittedCall(t *testing.T) {
+	store := newAdmissionStore()
+	var secondExecutions int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{
+			{ID: "call-panic-first", Type: "function", Function: einoschema.FunctionCall{Name: "panic", Arguments: `{}`}},
+			{ID: "call-skipped-second", Type: "function", Function: einoschema.FunctionCall{Name: "second", Arguments: `{}`}},
+		})}, nil
+	}))
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{
+		{Name: "panic", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { panic("boom") })},
+		{Name: "second", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { secondExecutions++; return ToolResult{}, nil })},
+	}})
+
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolExecutionPanic) {
+		t.Fatalf("result = %+v", result)
+	}
+	if secondExecutions != 0 {
+		t.Fatalf("second executor ran %d times", secondExecutions)
+	}
+	first, err := store.GetToolCall(context.Background(), "call-panic-first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.GetToolCall(context.Background(), "call-skipped-second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != session.ToolCallFailed || second.Status != session.ToolCallInterrupted {
+		t.Fatalf("terminal calls = first:%s second:%s", first.Status, second.Status)
+	}
+	if _, ok := store.parts[first.ResultPartID]; !ok {
+		t.Fatalf("first result part %q missing", first.ResultPartID)
+	}
+	if _, ok := store.parts[second.ResultPartID]; !ok {
+		t.Fatalf("second result part %q missing", second.ResultPartID)
+	}
+	run, err := store.GetRun(context.Background(), result.RunID)
+	if err != nil || !run.Terminal() {
+		t.Fatalf("run = %#v, %v", run, err)
 	}
 }
 
@@ -207,7 +272,7 @@ func TestPendingResumeToolPanicPublishesClaimAndSettlement(t *testing.T) {
 	}
 	assertDurableToolResult(t, store, run.SessionID, "call-resume", session.ToolCallFailed, "operational_failure")
 	var toolEvents []session.EventRecord
-	for _, event := range sink.events {
+	for _, event := range sink.snapshot() {
 		if event.Kind == EventToolCallUpdated {
 			toolEvents = append(toolEvents, event)
 		}

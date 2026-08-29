@@ -170,8 +170,13 @@ type componentPayload struct {
 	restrictions []RestrictionRegistration
 }
 
-func NewRegistry(reporter extension.Reporter) *Registry {
-	return &Registry{extensions: extension.NewRegistry[componentPayload](reporter)}
+func NewRegistry(reporter extension.Reporter, customPoints ...extension.Point) (*Registry, error) {
+	catalog := append(runtime.ExtensionPoints(), customPoints...)
+	extensions, err := extension.NewRegistry[componentPayload](reporter, catalog...)
+	if err != nil {
+		return nil, err
+	}
+	return &Registry{extensions: extensions}, nil
 }
 
 type Mount struct {

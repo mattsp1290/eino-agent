@@ -14,8 +14,6 @@ import (
 )
 
 func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (message *einoschema.Message, receivedDelta bool, err error) {
-	queue := newEventQueue(ctx, o.queueSize, execution.eventSink(o.events))
-	defer queue.close()
 	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
 	var streamUsage model.Usage
 	var streamErr error
@@ -113,16 +111,13 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		receivedDelta = true
 		o.observeStreamChunk(obsStream, int64(len(chunks)))
 		chunks = append(chunks, delta.Message)
-		if err := queue.emit(session.EventRecord{
+		execution.eventSink().Emit(ctx, session.EventRecord{
 			Kind: EventMessageDelta, SessionID: snapshot.SessionID, RunID: snapshot.RunID,
 			MessageID: messageID, EpochID: snapshot.EpochID,
 			ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
 			Payload:  mustJSON(map[string]string{"content": delta.Message.Content, "reasoning": delta.Message.ReasoningContent}),
 			LiveOnly: true, CreatedAt: o.now(),
-		}); err != nil {
-			streamErr = err
-			return nil, receivedDelta, err
-		}
+		})
 	}
 	if len(chunks) == 0 {
 		return einoschema.AssistantMessage("", nil), false, nil

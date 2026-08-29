@@ -19,8 +19,25 @@ type Registry[T any] struct {
 	pointDefinitions map[durablePointKey]*pointDefinition
 }
 
-func NewRegistry[T any](reporter Reporter) *Registry[T] {
-	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T]), pointDefinitions: make(map[durablePointKey]*pointDefinition)}
+func NewRegistry[T any](reporter Reporter, catalog ...Point) (*Registry[T], error) {
+	definitions := make(map[durablePointKey]*pointDefinition, len(catalog))
+	for _, point := range catalog {
+		if point == nil {
+			return nil, fmt.Errorf("%w: nil point", ErrInvalidContract)
+		}
+		definition := point.extensionPoint()
+		if err := validatePoint(definition); err != nil {
+			return nil, err
+		}
+		if existing, ok := definitions[definition.durablePointKey]; ok {
+			if existing != definition {
+				return nil, fmt.Errorf("%w: conflicting point definition for %s", ErrInvalidContract, definition.contract.ID)
+			}
+			continue
+		}
+		definitions[definition.durablePointKey] = definition
+	}
+	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T]), pointDefinitions: definitions}, nil
 }
 
 type cleanupState struct {
@@ -157,19 +174,12 @@ func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selection
 	if r.mounts == nil {
 		r.mounts = make(map[string]*mountState[T])
 	}
-	if r.pointDefinitions == nil {
-		r.pointDefinitions = make(map[durablePointKey]*pointDefinition)
-	}
 	if _, exists := r.mounts[state.component.InstanceID]; exists {
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateInstance, state.component.InstanceID)
 	}
-	candidateDefinitions := make(map[durablePointKey]*pointDefinition)
 	for _, entry := range state.entries {
-		if definition, exists := candidateDefinitions[entry.point.durablePointKey]; exists && definition != entry.point {
-			return nil, fmt.Errorf("%w: conflicting point definition for %s", ErrInvalidContract, entry.point.contract.ID)
-		}
-		candidateDefinitions[entry.point.durablePointKey] = entry.point
-		if definition, exists := r.pointDefinitions[entry.point.durablePointKey]; exists && definition != entry.point {
+		definition, exists := r.pointDefinitions[entry.point.durablePointKey]
+		if !exists || definition != entry.point {
 			return nil, fmt.Errorf("%w: conflicting point definition for %s", ErrInvalidContract, entry.point.contract.ID)
 		}
 	}
@@ -184,9 +194,6 @@ func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selection
 		if err := callCommitValidator(validate, active, candidate); err != nil {
 			return nil, err
 		}
-	}
-	for key, definition := range candidateDefinitions {
-		r.pointDefinitions[key] = definition
 	}
 	state.value = value
 	state.selectionScopes = scopes
@@ -349,12 +356,17 @@ type Plan struct {
 	reporter          Reporter
 	release           sync.Once
 	releases          []func()
+	notifyMu          sync.Mutex
+	notifyClosed      bool
+	notifications     chan notificationTask
+	notifyDone        chan struct{}
 }
 
 type plannedEntry struct {
 	registrationEntry
 	component Component
 	token     *callbackToken
+	retain    func() func()
 }
 
 // MountedValue is an immutable, lease-protected payload selected into a
@@ -433,7 +445,18 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 			if !scopeApplies(entry.spec.Scope, target) {
 				continue
 			}
-			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component, token: state.token})
+			leasedState := state
+			entries = append(entries, plannedEntry{
+				registrationEntry: entry,
+				component:         state.component,
+				token:             state.token,
+				retain: func() func() {
+					r.mu.Lock()
+					leasedState.refs++
+					r.mu.Unlock()
+					return func() { r.release(leasedState) }
+				},
+			})
 			handlers = append(handlers, handlerIdentity(entry))
 			applies = true
 		}
@@ -464,6 +487,7 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 		return handlerComponents[i].Component.InstanceID < handlerComponents[j].Component.InstanceID
 	})
 	dispatch := &Plan{entries: entries, handlerComponents: handlerComponents, reporter: r.reporter, releases: releases}
+	dispatch.startNotificationWorker()
 	return &Snapshot[T]{dispatch: dispatch, values: values}, nil
 }
 
@@ -540,6 +564,12 @@ func (p *Plan) Release() {
 		return
 	}
 	p.release.Do(func() {
+		p.notifyMu.Lock()
+		p.notifyClosed = true
+		if p.notifications != nil {
+			close(p.notifications)
+		}
+		p.notifyMu.Unlock()
 		for _, release := range p.releases {
 			release()
 		}

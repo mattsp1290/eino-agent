@@ -80,7 +80,12 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	tail := stream.NewTail(64)
 	sink := eventSink{tail: tail}
 	snapshot := minimalConfig()
-	plans := composition.NewRegistry(nil)
+	plans, err := composition.NewRegistry(nil)
+	if err != nil {
+		tail.Close()
+		_ = store.Close()
+		return nil, err
+	}
 	orchestrator, err := runtime.NewStreamingOrchestrator(
 		runtime.WithStore(store),
 		runtime.WithModelResolver(scriptedResolver{}),

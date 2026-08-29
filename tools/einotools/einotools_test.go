@@ -34,7 +34,10 @@ import (
 )
 
 func TestMountStandardPublishesCatalogOrderAndExecutesFileRead(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := standardComponent("standard")
 	mount, err := MountStandard(context.Background(), registry, component, Options{Scope: extension.GlobalScope()})
 	if err != nil {
@@ -107,7 +110,10 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	if err := os.WriteFile(filepath.Join(root, "hello.txt"), []byte("hello"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	plans := composition.NewRegistry(nil)
+	plans, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount, err := MountStandard(ctx, plans, standardComponent("runtime"), Options{
 		Scope: extension.GlobalScope(),
 		Permissions: map[string][]string{
@@ -173,7 +179,10 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 }
 
 func TestMountStandardTrackerAndMCPPending(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	writer := &closeWriter{}
 	mount, err := MountStandard(context.Background(), registry, standardComponent("tracker"), Options{
 		Scope: extension.GlobalScope(), Catalog: catalog.Options{TrackerWriter: writer},
@@ -218,9 +227,12 @@ func TestMountStandardTrackerAndMCPPending(t *testing.T) {
 }
 
 func TestMountStandardErrorsDoNotPublish(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	unsupported := errors.New("wrapped: " + catalog.ErrUnsupportedPlatform.Error())
-	_, err := mountStandard(context.Background(), registry, standardComponent("unsupported"), Options{Scope: extension.GlobalScope()}, func(catalog.Options) ([]catalog.Definition, error) {
+	_, err = mountStandard(context.Background(), registry, standardComponent("unsupported"), Options{Scope: extension.GlobalScope()}, func(catalog.Options) ([]catalog.Definition, error) {
 		return nil, errors.Join(unsupported, catalog.ErrUnsupportedPlatform)
 	})
 	if !errors.Is(err, catalog.ErrUnsupportedPlatform) {

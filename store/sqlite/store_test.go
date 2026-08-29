@@ -40,6 +40,27 @@ func sqliteToolEvent(id session.EventID, at time.Time) session.ToolTransitionEve
 	return session.ToolTransitionEvent{ID: id, CreatedAt: at.UTC()}
 }
 
+func sqliteCreateRequest(call session.ToolCall, id session.EventID, at time.Time) session.CreateToolCallRequest {
+	if call.RequestPartID == "" {
+		call.RequestPartID = session.PartID("request-part-" + string(call.ID))
+	}
+	if len(call.Input) == 0 {
+		call.Input = json.RawMessage(`{}`)
+	}
+	payload, err := json.Marshal(map[string]any{"id": call.ID, "name": call.Name, "arguments": call.Input})
+	if err != nil {
+		panic(err)
+	}
+	return session.CreateToolCallRequest{
+		Call: call,
+		RequestPart: session.Part{
+			ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID,
+			Kind: session.PartToolCall, Payload: payload, CreatedAt: at.UTC(), UpdatedAt: at.UTC(),
+		},
+		Event: sqliteToolEvent(id, at),
+	}
+}
+
 func sqliteSettleRequest(settlement session.ToolSettlement, id session.EventID) session.SettleToolCallRequest {
 	return session.SettleToolCallRequest{Settlement: settlement, Event: sqliteToolEvent(id, settlement.CompletedAt)}
 }
@@ -74,7 +95,7 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 		t.Fatalf("append message: %v", err)
 	}
 	call := session.ToolCall{ID: "call-claim", SessionID: "session-claim", RunID: "run-claim", MessageID: "msg-claim", Name: "tool", Status: session.ToolCallPending}
-	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, Event: sqliteToolEvent("event-create-claim", now)}); err != nil {
+	if _, err := execution.CreateToolCall(ctx, sqliteCreateRequest(call, "event-create-claim", now)); err != nil {
 		t.Fatalf("create tool call: %v", err)
 	}
 
@@ -214,7 +235,7 @@ func TestToolTransitionEventFailureRollsBackCreateAndClaim(t *testing.T) {
 		if _, err := st.db.ExecContext(context.Background(), `CREATE TRIGGER fail_tool_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'forced event failure'); END`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := execution.CreateToolCall(context.Background(), session.CreateToolCallRequest{Call: call, Event: sqliteToolEvent("event-create-fail", now)}); err == nil {
+		if _, err := execution.CreateToolCall(context.Background(), sqliteCreateRequest(call, "event-create-fail", now)); err == nil {
 			t.Fatal("create succeeded despite event failure")
 		}
 		if _, err := st.GetToolCall(context.Background(), call.ID); !errors.Is(err, session.ErrNotFound) {
@@ -226,7 +247,7 @@ func TestToolTransitionEventFailureRollsBackCreateAndClaim(t *testing.T) {
 		st, execution, call, now := setupToolTransitionTest(t)
 		defer func() { _ = st.Close() }()
 		ctx := context.Background()
-		if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, Event: sqliteToolEvent("event-create-ok", now)}); err != nil {
+		if _, err := execution.CreateToolCall(ctx, sqliteCreateRequest(call, "event-create-ok", now)); err != nil {
 			t.Fatal(err)
 		}
 		before, err := st.GetRun(ctx, call.RunID)
@@ -430,6 +451,43 @@ func TestSettleRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 	}
 }
 
+func TestListMessagesDoesNotDecodePartsOutsideCurrentPage(t *testing.T) {
+	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if _, err := st.CreateSession(ctx, session.Session{ID: "session-page", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.AdmitRun(ctx, session.Run{ID: "run-page", SessionID: "session-page", OwnerID: "owner", ClaimToken: "claim", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	for index, id := range []session.MessageID{"message-one", "message-two"} {
+		at := now.Add(time.Duration(index) * time.Second)
+		if _, err := execution.AppendMessage(ctx, session.Message{ID: id, SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: at, UpdatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := execution.AppendPart(ctx, session.Part{ID: session.PartID("part-" + string(id)), MessageID: id, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Payload: json.RawMessage(`{"text":"ok"}`), CreatedAt: at, UpdatedAt: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := st.exec(ctx, `UPDATE parts SET record = ? WHERE id = ?`, []byte(`{malformed`), "part-message-two"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 1})
+	if err != nil || len(first.Messages) != 1 || len(first.Parts) != 1 || first.Messages[0].ID != "message-one" {
+		t.Fatalf("first page = %#v, %v", first, err)
+	}
+	if _, err := st.ListMessages(ctx, run.SessionID, first.Next); err == nil {
+		t.Fatal("page containing malformed part unexpectedly decoded")
+	}
+}
+
 func TestSettleRunRollsBackTerminalStateWhenEventInsertFails(t *testing.T) {
 	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -525,7 +583,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 		t.Fatalf("stale AppendEvent error = %v", err)
 	}
 	staleCall := session.ToolCall{ID: "stale-call", SessionID: run.SessionID, RunID: run.ID, MessageID: "stale-message", Status: session.ToolCallPending}
-	if _, err := oldExecution.CreateToolCall(ctx, session.CreateToolCallRequest{Call: staleCall, Event: sqliteToolEvent("stale-tool-create", now)}); !errors.Is(err, session.ErrConflict) {
+	if _, err := oldExecution.CreateToolCall(ctx, sqliteCreateRequest(staleCall, "stale-tool-create", now)); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale CreateToolCall error = %v", err)
 	}
 	if _, err := oldExecution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: staleCall.ID, ClaimedBy: "stale", ClaimToken: "stale", StartedAt: now, LeaseDuration: time.Minute, Event: sqliteToolEvent("stale-tool-claim", now)}); !errors.Is(err, session.ErrConflict) {
@@ -597,7 +655,7 @@ func TestCreateToolCallDuplicateRequiresFullRecordMatch(t *testing.T) {
 	ctx := context.Background()
 	conflict := call
 	conflict.Input = []byte(`{"changed":true}`)
-	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{Call: conflict, Event: sqliteToolEvent("event-create-tool", time.Now().UTC())}); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.CreateToolCall(ctx, sqliteCreateRequest(conflict, "event-create-tool", time.Now().UTC())); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("duplicate tool input err = %v, want ErrConflict", err)
 	}
 }
@@ -766,7 +824,7 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ExecutionStore, session
 	t.Helper()
 	st, execution, call, now := setupToolTransitionTest(t)
 	ctx := context.Background()
-	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, Event: sqliteToolEvent("event-create-tool", now)}); err != nil {
+	if _, err := execution.CreateToolCall(ctx, sqliteCreateRequest(call, "event-create-tool", now)); err != nil {
 		_ = st.Close()
 		t.Fatalf("create tool call: %v", err)
 	}

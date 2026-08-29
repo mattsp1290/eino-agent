@@ -10,7 +10,10 @@ import (
 )
 
 func TestToolScopeResolverReceivesCanonicalCallbackContext(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var mount *Mount
 	var closeErr error
 	definition := definition("scope-aware", "ok")
@@ -18,7 +21,6 @@ func TestToolScopeResolverReceivesCanonicalCallbackContext(t *testing.T) {
 		closeErr = mount.Close(ctx)
 		return runtime.ToolScope{WorkspaceID: scope.WorkspaceID}
 	}
-	var err error
 	mount, err = registry.Mount(context.Background(), component("scope-context-live"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "scope", Scope: extension.GlobalScope(), Definition: definition})
 	}))

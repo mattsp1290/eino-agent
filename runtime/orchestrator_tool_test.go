@@ -77,7 +77,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 		t.Fatalf("tool call parts = %#v", toolCallParts)
 	}
 	var toolEvents []session.EventRecord
-	for _, event := range sink.events {
+	for _, event := range sink.waitForKind(t, EventToolCallUpdated, 3) {
 		if event.Kind == EventToolCallUpdated {
 			toolEvents = append(toolEvents, event)
 		}
@@ -113,8 +113,12 @@ func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 	if err != nil || call.Status != session.ToolCallCompleted {
 		t.Fatalf("durable call = %+v, %v", call, err)
 	}
-	if sink.toolEvents != 3 {
-		t.Fatalf("tool event delivery attempts = %d, want 3", sink.toolEvents)
+	deadline := time.Now().Add(time.Second)
+	for sink.toolEvents.Load() != 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := sink.toolEvents.Load(); got != 3 {
+		t.Fatalf("tool event delivery attempts = %d, want 3", got)
 	}
 }
 
@@ -137,12 +141,12 @@ func TestToolTransitionPersistenceFailureFailsMutation(t *testing.T) {
 }
 
 type selectiveToolPanickingSink struct {
-	toolEvents int
+	toolEvents atomic.Int32
 }
 
 func (s *selectiveToolPanickingSink) Emit(_ context.Context, event session.EventRecord) {
 	if event.Kind == EventToolCallUpdated {
-		s.toolEvents++
+		s.toolEvents.Add(1)
 		panic("transport unavailable")
 	}
 }

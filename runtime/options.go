@@ -26,7 +26,7 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		ownerIDValue:         "runtime",
 		attemptsValue:        1,
 		toolTurnsValue:       8,
-		queueSize:            1,
+		queueSize:            64,
 		leaseValue:           time.Minute,
 		modelRequestMaxBytes: defaultModelRequestMaxBytes,
 	}

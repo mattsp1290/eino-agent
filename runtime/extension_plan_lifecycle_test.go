@@ -223,6 +223,9 @@ func TestExecuteResumeSettledDurationStartsAtResumeExecution(t *testing.T) {
 	done := make(chan Result, 1)
 	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, newTestDispatchPlan(dispatch), run), run, done)
 	result := <-done
+	if err := dispatch.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if result.Error != nil || duration != 0 {
 		t.Fatalf("resume result=%+v duration=%s", result, duration)
 	}
@@ -270,6 +273,9 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 			)
 
 			result := startAndWait(t, orchestrator)
+			if err := plan.FlushNotifications(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 			if result.Status != test.wantStatus || (result.Error != nil) != test.wantError {
 				t.Fatalf("result = %+v", result)
 			}
@@ -284,7 +290,10 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 			if len(notices) == 1 && notices[0].Result.Status != test.wantStatus {
 				t.Fatalf("settled notice result = %+v", notices[0].Result)
 			}
-			if got := countEvents(events.events, EventRunFinished); got != test.wantNotice {
+			if test.wantNotice > 0 {
+				events.waitForKind(t, EventRunFinished, test.wantNotice)
+			}
+			if got := countEvents(events.snapshot(), EventRunFinished); got != test.wantNotice {
 				t.Fatalf("run_finished events = %d, want %d", got, test.wantNotice)
 			}
 		})
@@ -319,6 +328,9 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			done := make(chan Result, 1)
 			orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan, run), run, done)
 			result := <-done
+			if err := plan.FlushNotifications(context.Background()); err != nil {
+				t.Fatal(err)
+			}
 
 			if !errors.Is(result.Error, test.wantError) {
 				t.Fatalf("resume result = %+v, want error %v", result, test.wantError)
@@ -332,7 +344,10 @@ func TestRunSettledNoticeRequiresDurableResumeTerminalState(t *testing.T) {
 			if len(notices) != test.wantNotice {
 				t.Fatalf("settled notices = %#v, want %d", notices, test.wantNotice)
 			}
-			if got := countEvents(events.events, EventRunFinished); got != test.wantNotice {
+			if test.wantNotice > 0 {
+				events.waitForKind(t, EventRunFinished, test.wantNotice)
+			}
+			if got := countEvents(events.snapshot(), EventRunFinished); got != test.wantNotice {
 				t.Fatalf("run_finished events = %d, want %d", got, test.wantNotice)
 			}
 			wantStatus := session.RunInterrupted

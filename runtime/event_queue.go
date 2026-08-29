@@ -2,43 +2,77 @@ package runtime
 
 import (
 	"context"
+	"sync"
 
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-type eventQueue struct {
-	ctx    context.Context
-	events chan session.EventRecord
-	sink   EventSink
-	done   chan struct{}
+type queuedEvent struct {
+	ctx   context.Context
+	event session.EventRecord
 }
 
-func newEventQueue(ctx context.Context, size int, sink EventSink) *eventQueue {
+// eventQueue is one run-owned, bounded, best-effort infrastructure
+// dispatcher. Closing admission never waits for native sink code.
+type eventQueue struct {
+	mu     sync.Mutex
+	events chan queuedEvent
+	sink   EventSink
+	done   chan struct{}
+	closed bool
+}
+
+func newEventQueue(size int, sink EventSink) *eventQueue {
 	if size <= 0 {
 		size = 1
 	}
-	q := &eventQueue{ctx: ctx, events: make(chan session.EventRecord, size), sink: sink, done: make(chan struct{})}
+	q := &eventQueue{events: make(chan queuedEvent, size), sink: sink, done: make(chan struct{})}
 	go func() {
 		defer close(q.done)
-		for event := range q.events {
-			if q.sink != nil {
-				emitBestEffort(q.sink, ctx, event)
-			}
+		for task := range q.events {
+			emitBestEffort(q.sink, task.ctx, task.event)
 		}
 	}()
 	return q
 }
 
-func (q *eventQueue) emit(event session.EventRecord) error {
+func (q *eventQueue) emit(ctx context.Context, event session.EventRecord) bool {
+	if q == nil || q.sink == nil {
+		return false
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return false
+	}
 	select {
-	case <-q.ctx.Done():
-		return q.ctx.Err()
-	case q.events <- cloneEvent(event):
-		return nil
+	case q.events <- queuedEvent{ctx: context.WithoutCancel(ctx), event: cloneEvent(event)}:
+		return true
+	default:
+		return false
 	}
 }
 
 func (q *eventQueue) close() {
-	close(q.events)
-	<-q.done
+	if q == nil {
+		return
+	}
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		close(q.events)
+	}
+	q.mu.Unlock()
+}
+
+func (q *eventQueue) flush(ctx context.Context) error {
+	if q == nil {
+		return nil
+	}
+	select {
+	case <-q.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }

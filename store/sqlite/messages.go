@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -66,7 +67,8 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 	args := []any{sessionID}
 	where := "session_id = ?"
 	if cursor.AfterMessageID != "" {
-		after, err := s.GetMessage(ctx, cursor.AfterMessageID)
+		var after session.Message
+		err := s.getJSON(ctx, `SELECT record FROM messages WHERE id = ? AND session_id = ?`, []any{cursor.AfterMessageID, sessionID}, &after)
 		if err != nil {
 			return session.ReplayBatch{}, err
 		}
@@ -84,21 +86,23 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 		next = session.ReplayCursor{AfterMessageID: last.ID, Limit: limit}
 		messages = messages[:limit]
 	}
-	parts, err := listJSON[session.Part](ctx, s, `SELECT p.record FROM parts p JOIN messages m ON p.message_id = m.id WHERE p.session_id = ? ORDER BY m.created_at, m.id, p.ordinal, p.id`, sessionID)
+	if len(messages) == 0 {
+		return session.ReplayBatch{Messages: messages, Next: next}, nil
+	}
+	placeholders := make([]string, len(messages))
+	partArgs := make([]any, len(messages))
+	for index, message := range messages {
+		placeholders[index] = "?"
+		partArgs[index] = message.ID
+	}
+	parts, err := listJSON[session.Part](ctx, s, `WITH page(id, created_at) AS (
+		SELECT id, created_at FROM messages WHERE id IN (`+strings.Join(placeholders, ",")+`)
+	) SELECT p.record FROM page JOIN parts p ON p.message_id = page.id
+	ORDER BY page.created_at, page.id, p.ordinal, p.id`, partArgs...)
 	if err != nil {
 		return session.ReplayBatch{}, err
 	}
-	include := make(map[session.MessageID]bool, len(messages))
-	for _, msg := range messages {
-		include[msg.ID] = true
-	}
-	filtered := parts[:0]
-	for _, part := range parts {
-		if include[part.MessageID] {
-			filtered = append(filtered, part)
-		}
-	}
-	return session.ReplayBatch{Messages: messages, Parts: filtered, Next: next}, nil
+	return session.ReplayBatch{Messages: messages, Parts: parts, Next: next}, nil
 }
 
 func (s *Store) GetMessage(ctx context.Context, id session.MessageID) (session.Message, error) {

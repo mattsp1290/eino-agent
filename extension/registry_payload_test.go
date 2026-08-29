@@ -9,7 +9,10 @@ import (
 
 func TestTypedCommitValidationIsAtomicAndRejectedPreparationRollsBack(t *testing.T) {
 	t.Parallel()
-	registry := NewRegistry[string](nil)
+	registry, err := NewRegistry[string](nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	first, err := registry.PrepareMount(context.Background(), testComponent("first-payload"), InstallerFunc(func(context.Context, Registrar) error { return nil }))
 	if err != nil {
 		t.Fatal(err)
@@ -62,11 +65,14 @@ func TestTypedCommitValidationIsAtomicAndRejectedPreparationRollsBack(t *testing
 
 func TestPrepareFailureCleanupIgnoresCancellation(t *testing.T) {
 	t.Parallel()
-	registry := NewRegistry[struct{}](nil)
+	registry, err := NewRegistry[struct{}](nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cleaned := false
-	_, err := registry.PrepareMount(ctx, testComponent("prepare-canceled"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+	_, err = registry.PrepareMount(ctx, testComponent("prepare-canceled"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if err := registrar.Defer(func(cleanupCtx context.Context) error {
 			if cleanupCtx.Err() != nil {
 				t.Fatalf("cleanup inherited cancellation: %v", cleanupCtx.Err())
@@ -85,7 +91,10 @@ func TestPrepareFailureCleanupIgnoresCancellation(t *testing.T) {
 
 func TestCapabilityOnlySnapshotHasOneIdempotentLease(t *testing.T) {
 	t.Parallel()
-	registry := NewRegistry[string](nil)
+	registry, err := NewRegistry[string](nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cleanups := 0
 	prepared, err := registry.PrepareMount(context.Background(), testComponent("capability-only"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return registrar.Defer(func(context.Context) error { cleanups++; return nil })

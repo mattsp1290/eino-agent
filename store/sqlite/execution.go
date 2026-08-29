@@ -113,6 +113,13 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 	}
 	var committed session.RunSettlementResult
 	err := e.withFenceState(ctx, true, func(store *Store, current session.Run) error {
+		var unfinished int
+		if err := store.queryRow(ctx, `SELECT COUNT(*) FROM tool_calls WHERE run_id = ? AND status IN (?, ?)`, current.ID, session.ToolCallPending, session.ToolCallRunning).Scan(&unfinished); err != nil {
+			return mapErr(err)
+		}
+		if unfinished != 0 {
+			return session.ErrConflict
+		}
 		if current.Terminal() {
 			if current.Status != request.Settlement.Status || !current.FinishedAt.Equal(request.Settlement.FinishedAt) || current.Error != request.Settlement.Error {
 				return session.ErrConflict
@@ -169,6 +176,9 @@ func (e *executionStore) AppendMessage(ctx context.Context, record session.Messa
 }
 
 func (e *executionStore) AppendPart(ctx context.Context, record session.Part) (session.Part, error) {
+	if record.Kind == session.PartToolCall || record.Kind == session.PartToolResult {
+		return session.Part{}, session.ErrConflict
+	}
 	if record.RunID != e.fence.RunID {
 		return session.Part{}, session.ErrConflict
 	}
@@ -219,12 +229,16 @@ func (e *executionStore) CreateToolCall(ctx context.Context, request session.Cre
 	}
 	var result session.ToolTransitionResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
-		if record.SessionID != run.SessionID {
+		part := request.RequestPart
+		if record.SessionID != run.SessionID || !validToolRequestEnvelope(record, part) {
 			return session.ErrConflict
 		}
 		event, err := session.ToolTransitionRecord(record, request.Event)
 		if err != nil || event.ToolTransition != session.ToolTransitionPending {
 			return session.ErrConflict
+		}
+		if _, err = store.appendPart(ctx, part); err != nil {
+			return err
 		}
 		result.Call, err = store.createToolCall(ctx, record)
 		if err != nil {

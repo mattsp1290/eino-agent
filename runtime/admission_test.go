@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -294,11 +295,50 @@ func testRunAdmission() admissionRequest {
 }
 
 type capturingSink struct {
+	mu     sync.Mutex
 	events []session.EventRecord
 }
 
 func (s *capturingSink) Emit(_ context.Context, event session.EventRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, event)
+}
+
+func (s *capturingSink) snapshot() []session.EventRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]session.EventRecord(nil), s.events...)
+}
+
+func (s *capturingSink) waitFor(t testing.TB, count int) []session.EventRecord {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		events := s.snapshot()
+		if len(events) >= count {
+			return events
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink events = %#v, want at least %d", events, count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (s *capturingSink) waitForKind(t testing.TB, kind string, count int) []session.EventRecord {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		events := s.snapshot()
+		if countEvents(events, kind) >= count {
+			return events
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink events = %#v, want at least %d of kind %q", events, count, kind)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 type admissionStore struct {
@@ -315,6 +355,8 @@ type admissionStore struct {
 	appendPartCalls   int
 	settleToolCallErr error
 	toolTransitionErr error
+	createToolErrAt   int
+	createToolCalls   int
 	normalizeEvent    func(session.EventRecord) session.EventRecord
 	listMessagesCalls atomic.Int32
 	getRunCalls       atomic.Int32
@@ -361,8 +403,11 @@ func (s *admissionStore) clone() *admissionStore {
 		modelRequests:     cloneMap(s.modelRequests),
 		appendEventErr:    s.appendEventErr,
 		appendPartErrAt:   s.appendPartErrAt,
+		appendPartCalls:   s.appendPartCalls,
 		settleToolCallErr: s.settleToolCallErr,
 		toolTransitionErr: s.toolTransitionErr,
+		createToolErrAt:   s.createToolErrAt,
+		createToolCalls:   s.createToolCalls,
 		normalizeEvent:    s.normalizeEvent,
 	}
 }
@@ -564,6 +609,10 @@ func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ s
 }
 
 func (s *admissionStore) CreateToolCall(_ context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
+	s.createToolCalls++
+	if s.createToolErrAt > 0 && s.createToolCalls == s.createToolErrAt {
+		return session.ToolTransitionResult{}, errors.New("injected create tool failure")
+	}
 	if s.toolTransitionErr != nil {
 		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
@@ -576,6 +625,12 @@ func (s *admissionStore) CreateToolCall(_ context.Context, request session.Creat
 	}
 	event, err := session.ToolTransitionRecord(call, request.Event)
 	if err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	if request.RequestPart.ID == "" || request.RequestPart.ID != call.RequestPartID || request.RequestPart.Kind != session.PartToolCall {
+		return session.ToolTransitionResult{}, session.ErrConflict
+	}
+	if _, err := s.AppendPart(context.Background(), request.RequestPart); err != nil {
 		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
@@ -739,6 +794,11 @@ func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Dura
 func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
 	if !s.valid() {
 		return session.RunSettlementResult{}, session.ErrConflict
+	}
+	for _, call := range s.toolCalls {
+		if call.RunID == s.fence.RunID && !session.TerminalToolCall(call.Status) {
+			return session.RunSettlementResult{}, session.ErrConflict
+		}
 	}
 	run, err := session.ApplyRunSettlement(s.runs[s.fence.RunID], request.Settlement)
 	if err != nil {

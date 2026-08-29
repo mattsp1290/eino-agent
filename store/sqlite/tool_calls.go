@@ -28,6 +28,22 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 	return record, mapErr(err)
 }
 
+func validToolRequestEnvelope(call session.ToolCall, part session.Part) bool {
+	if call.RequestPartID == "" || part.ID != call.RequestPartID || part.MessageID != call.MessageID ||
+		part.SessionID != call.SessionID || part.RunID != call.RunID || part.Kind != session.PartToolCall {
+		return false
+	}
+	var payload struct {
+		ID        session.ToolCallID `json:"id"`
+		Name      string             `json:"name"`
+		Arguments json.RawMessage    `json:"arguments"`
+	}
+	if err := json.Unmarshal(part.Payload, &payload); err != nil {
+		return false
+	}
+	return payload.ID == call.ID && payload.Name == call.Name && jsonequal.Equal(payload.Arguments, call.Input)
+}
+
 func (s *Store) GetToolCall(ctx context.Context, id session.ToolCallID) (session.ToolCall, error) {
 	var record session.ToolCall
 	err := s.getJSON(ctx, "SELECT record FROM tool_calls WHERE id = ?", []any{id}, &record)

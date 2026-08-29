@@ -18,7 +18,10 @@ import (
 )
 
 func TestMountClientToolsPublishesSessionScopedPlanTool(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount, err := MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +58,10 @@ func TestMountClientToolsPublishesSessionScopedPlanTool(t *testing.T) {
 }
 
 func TestDispatcherArtifactIdentityParticipatesInResumeFingerprint(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	first, err := MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +84,10 @@ func TestDispatcherArtifactIdentityParticipatesInResumeFingerprint(t *testing.T)
 }
 
 func TestClientGenerationParticipatesInResumeFingerprint(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	firstSnapshot := clientSnapshot("session-a", "dispatcher-v1")
 	first, err := MountClientTools(context.Background(), registry, firstSnapshot, dispatcher())
 	if err != nil {
@@ -123,9 +132,11 @@ func assertAGUIResumePlanDrift(t *testing.T, registry *composition.Registry, per
 func TestGlobalAndClientToolNameCollisionsAreRejectedInEitherMountOrder(t *testing.T) {
 	for _, clientFirst := range []bool{false, true} {
 		t.Run(map[bool]string{false: "global-first", true: "client-first"}[clientFirst], func(t *testing.T) {
-			registry := composition.NewRegistry(nil)
+			registry, err := composition.NewRegistry(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
 			var first *composition.Mount
-			var err error
 			if clientFirst {
 				first, err = MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
 			} else {
@@ -148,7 +159,10 @@ func TestGlobalAndClientToolNameCollisionsAreRejectedInEitherMountOrder(t *testi
 }
 
 func TestMountClientToolsValidatesIdentityAndDispatcher(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, snapshot := range map[string]agentagui.ClientToolSnapshot{
 		"session":             {Generation: 1, DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}},
 		"generation":          {SessionID: "session", DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}},

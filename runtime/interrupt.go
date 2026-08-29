@@ -100,9 +100,16 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
 	}
 	snapshot := o.resumeSnapshot(run)
+	withCleanup := func(result Result) Result {
+		if cleanupErr := execution.terminalizeUnfinishedTools(context.WithoutCancel(ctx), snapshot, calls); cleanupErr != nil {
+			result.Status = session.RunFailed
+			result.Error = errors.Join(result.Error, cleanupErr)
+		}
+		return result
+	}
 	tools, toolContext, err := o.resumeTools(ctx, execution, run)
 	if err != nil {
-		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
 	}
 	for _, call := range calls {
 		if session.TerminalToolCall(call.Status) {
@@ -110,15 +117,15 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		}
 		canonicalInput, canonicalErr := canonicalToolObject(call.Input)
 		if canonicalErr != nil || string(canonicalInput) != string(call.Input) || call.Pattern == "" || len(call.Pattern) > 4096 {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("invalid persisted tool call %q", call.ID)}
+			return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("invalid persisted tool call %q", call.ID)})
 		}
 		tool, ok := tools[call.Name]
 		if !ok || tool.Executor == nil {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("tool %q unavailable", call.Name)}
+			return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("tool %q unavailable", call.Name)})
 		}
 		if call.Status == session.ToolCallRunning {
 			if _, err := execution.settleInterruptedRunningTool(ctx, run, tool, call); err != nil {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+				return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
 			}
 			continue
 		}
@@ -133,9 +140,9 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		})
 		if err != nil {
 			if errors.Is(err, session.ErrConflict) {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrSessionBusy}
+				return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: session.ErrSessionBusy})
 			}
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
 		}
 		claimed := claimResult.Call
 		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ToolStartedPoint, ToolStartedNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Time: claimed.StartedAt})
@@ -154,13 +161,13 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		}
 		settledTool, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, toolCall, claimed, nil)
 		if err != nil {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
 		}
 		if errors.Is(settledTool.Outcome.RawError, errToolExecutionPanic) {
-			return Result{RunID: run.ID, Status: session.RunFailed, Error: settledTool.Outcome.RawError}
+			return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: settledTool.Outcome.RawError})
 		}
 		if errors.Is(settledTool.Outcome.RawError, context.Canceled) {
-			return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: settledTool.Outcome.RawError}
+			return withCleanup(Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true, Error: settledTool.Outcome.RawError})
 		}
 	}
 	return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}

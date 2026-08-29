@@ -17,7 +17,10 @@ import (
 )
 
 func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	global, err := registry.Mount(context.Background(), component("global"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {
 			return err
@@ -66,7 +69,10 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 
 func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 	for index, key := range []string{"user@example.com==", strings.Repeat("opaque", 60) + "=="} {
-		registry := NewRegistry(nil)
+		registry, err := NewRegistry(nil, compositionNotice)
+		if err != nil {
+			t.Fatal(err)
+		}
 		mountedComponent := component("opaque-scope-" + string(rune('a'+index)))
 		mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 			if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", Scope: extension.SessionScope(key)}, func(context.Context, string) error { return nil }); err != nil {
@@ -104,7 +110,10 @@ func TestMountAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 }
 
 func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := component("selected-tools")
 	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := registrar.Tool(ToolRegistration{ID: "a", Scope: extension.GlobalScope(), Definition: definition("a", "a")}); err != nil {
@@ -152,7 +161,10 @@ func TestAcquireRunPlanFreezesRequestedToolSelection(t *testing.T) {
 }
 
 func TestAcquireRunPlanOmitsUnselectedCapabilityOnlyOwners(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount := func(id string, installer Installer) {
 		mounted, err := registry.Mount(context.Background(), component(id), installer)
 		if err != nil {
@@ -190,9 +202,12 @@ func TestAcquireRunPlanOmitsUnselectedCapabilityOnlyOwners(t *testing.T) {
 }
 
 func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	baseComponent := component("scope-collision")
-	_, err := registry.Mount(context.Background(), baseComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+	_, err = registry.Mount(context.Background(), baseComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := registrar.Tool(ToolRegistration{ID: "global", Scope: extension.GlobalScope(), Definition: definition("echo", "global")}); err != nil {
 			return err
 		}
@@ -205,7 +220,10 @@ func TestMountRejectsGlobalAndSessionToolNameCollision(t *testing.T) {
 }
 
 func TestMountRejectsCrossMountToolCollisionAndRemainsReusable(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	globalComponent := component("global-collision")
 	global, err := registry.Mount(context.Background(), globalComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "global", Scope: extension.GlobalScope(), Definition: definition("echo", "global")})
@@ -241,7 +259,10 @@ func TestMountRejectsCrossMountToolCollisionAndRemainsReusable(t *testing.T) {
 }
 
 func TestMountedToolCallbacksReceiveMountContext(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mountedComponent := component("callback-context")
 	var mounted *Mount
 	definition := definition("probe", "probe")
@@ -254,7 +275,6 @@ func TestMountedToolCallbacksReceiveMountContext(t *testing.T) {
 		}
 		return append(json.RawMessage(nil), raw...), nil
 	}
-	var err error
 	mounted, err = registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "probe", Scope: extension.GlobalScope(), Definition: definition})
 	}))
@@ -280,7 +300,10 @@ func TestMountedToolCallbacksReceiveMountContext(t *testing.T) {
 }
 
 func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cleaned := false
 	mount, err := registry.Mount(context.Background(), component("drain"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := registrar.Defer(func(context.Context) error { cleaned = true; return nil }); err != nil {
@@ -317,7 +340,10 @@ func TestUnmountPreventsNewPlansAndDrainsExistingLease(t *testing.T) {
 }
 
 func TestSessionScopedCallbackOnlyMountIgnoresUnrelatedPlan(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mountedComponent := component("callback-only")
 	mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return extension.On(registrar.Extensions(), compositionNotice, extension.Registration{
@@ -339,7 +365,10 @@ func TestSessionScopedCallbackOnlyMountIgnoresUnrelatedPlan(t *testing.T) {
 }
 
 func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	componentA := component("resume-lease-a")
 	mountA, err := registry.Mount(context.Background(), componentA, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "tool-a", Scope: extension.SessionScope("session-a"), Definition: definition("tool-a", "a")})
@@ -379,7 +408,10 @@ func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
 }
 
 func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var nested *Mount
 	done := make(chan error, 1)
 	go func() {
@@ -425,7 +457,10 @@ func TestMountInstallerAndRollbackCanReenterRegistry(t *testing.T) {
 }
 
 func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	first, err := registry.Mount(context.Background(), component("first"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition("duplicate", "first")})
 	}))
@@ -472,7 +507,10 @@ func TestCapabilityConflictRollbackReentersWithoutPublishingHandlers(t *testing.
 }
 
 func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var mount *Mount
 	definition := definition("self-close", "self-close")
 	definition.Normalize = func(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
@@ -481,7 +519,6 @@ func TestMountedCapabilitiesRejectSelfCloseBeforeDeactivation(t *testing.T) {
 	definition.Execute = func(ctx context.Context, _ tools.Execution) (json.RawMessage, error) {
 		return nil, mount.Close(ctx)
 	}
-	var err error
 	mount, err = registry.Mount(context.Background(), component("self-close"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := registrar.Tool(ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition}); err != nil {
 			return err

@@ -110,12 +110,12 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
-	runEventSink{infrastructure: o.events, plan: plan.dispatch}.publishPersisted(ctx, ctx, admitted.Event)
+	execution := newRunExecution(o, plan, admitted.Run)
+	execution.publishPersistedWithNotificationContext(ctx, ctx, admitted.Event)
 	extension.Notify(plan.dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{
 		SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor(),
 		Metadata: boundedTurnMetadata(admitted.Snapshot), Time: admitted.Snapshot.CreatedAt,
 	})
-	execution := newRunExecution(o, plan, admitted.Run)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
 		runID:  admitted.Run.ID,
@@ -280,7 +280,8 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 		for index := range preparedCalls {
 			msg.ToolCalls[index] = preparedCalls[index].schemaCall
 		}
-		if err := o.persistAssistant(ctx, execution, snapshot, currentMessageID, msg); err != nil {
+		preparedCalls, err = o.persistAssistantTurn(ctx, execution, snapshot, currentMessageID, msg, preparedCalls)
+		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
 		if len(msg.ToolCalls) == 0 {
@@ -449,7 +450,7 @@ func (o *StreamingOrchestrator) finalRunEvent(result Result) session.RunSettleme
 }
 
 func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, execution *runExecution, event session.EventRecord) {
-	execution.publishPersisted(context.WithoutCancel(ctx), o.events, event)
+	execution.publishPersisted(context.WithoutCancel(ctx), event)
 }
 
 func (o *StreamingOrchestrator) validate(request Request) error {

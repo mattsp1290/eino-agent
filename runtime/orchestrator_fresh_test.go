@@ -161,14 +161,18 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	if result.Error != nil {
 		t.Fatalf("result = %+v", result)
 	}
+	if err := dispatch.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	runtimeEvents := runtimeSink.waitForKind(t, EventRunFinished, 1)
 	var starts int
-	for _, event := range runtimeSink.events {
+	for _, event := range runtimeEvents {
 		if event.Kind == EventRunStarted {
 			starts++
 		}
 	}
-	if starts != 1 || len(runtimeSink.events) < 2 {
-		t.Fatalf("runtime events = %#v, want one admission start plus execution events", runtimeSink.events)
+	if starts != 1 || len(runtimeEvents) < 2 {
+		t.Fatalf("runtime events = %#v, want one admission start plus execution events", runtimeEvents)
 	}
 	var publishedStarts int
 	for _, kind := range published {
@@ -182,7 +186,7 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	if !reflect.DeepEqual(order, []string{"event-published", "run-admitted"}) {
 		t.Fatalf("admission notification order = %v", order)
 	}
-	for _, event := range runtimeSink.events {
+	for _, event := range runtimeEvents {
 		if event.Kind == EventRunStarted || event.Kind == EventRunFinished {
 			if event.Correlation != "stored:"+string(event.Kind) {
 				t.Fatalf("published %s correlation = %q, want store normalization", event.Kind, event.Correlation)
@@ -215,6 +219,9 @@ func TestAdmissionSinkPanicDoesNotPreventRunOrExtensionNotification(t *testing.T
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("result = %+v", result)
+	}
+	if err := dispatch.Flush(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	if len(published) < 2 || published[0] != EventRunStarted {
 		t.Fatalf("published events = %v", published)

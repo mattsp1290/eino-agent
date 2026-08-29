@@ -19,7 +19,10 @@ import (
 )
 
 func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var cleaned atomic.Bool
 	mount, err := Mount(context.Background(), registry, "session-a", func() { cleaned.Store(true) })
 	if err != nil {
@@ -91,7 +94,10 @@ func TestNativeContextContributionReachesProviderBeforeHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = store.Close() }()
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount, err := Mount(context.Background(), registry, "session-a", nil)
 	if err != nil {
 		t.Fatal(err)

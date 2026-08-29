@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -138,9 +139,11 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 				return ToolResult{Output: "ok"}, nil
 			})}}}
 			var sinkIDs []session.EventID
+			var sinkMu sync.Mutex
 			sink := EventSinkFunc(func(_ context.Context, event session.EventRecord) {
 				if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-resume" {
-					notices = append(notices, "sink:"+toolEventStatus(event))
+					sinkMu.Lock()
+					defer sinkMu.Unlock()
 					sinkIDs = append(sinkIDs, event.ID)
 				}
 			})
@@ -156,12 +159,37 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			if result.Error != nil {
 				t.Fatalf("resumeRun result = %+v", result)
 			}
-			if !reflect.DeepEqual(notices, test.want) {
-				t.Fatalf("notices = %v, want %v", notices, test.want)
+			if err := dispatch.Flush(context.Background()); err != nil {
+				t.Fatal(err)
 			}
+			var wantNotices []string
+			for _, notice := range test.want {
+				if !strings.HasPrefix(notice, "sink:") {
+					wantNotices = append(wantNotices, notice)
+				}
+			}
+			if !reflect.DeepEqual(notices, wantNotices) {
+				t.Fatalf("notices = %v, want %v", notices, wantNotices)
+			}
+			deadline := time.Now().Add(time.Second)
+			for {
+				sinkMu.Lock()
+				count := len(sinkIDs)
+				currentSinkIDs := append([]session.EventID(nil), sinkIDs...)
+				sinkMu.Unlock()
+				if count == len(publishedIDs) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("sink IDs = %v, want %d", currentSinkIDs, len(publishedIDs))
+				}
+				time.Sleep(time.Millisecond)
+			}
+			sinkMu.Lock()
 			if !reflect.DeepEqual(sinkIDs, publishedIDs) {
 				t.Fatalf("sink IDs = %v, published IDs = %v", sinkIDs, publishedIDs)
 			}
+			sinkMu.Unlock()
 			batch, err := store.ListEvents(context.Background(), run.SessionID, session.EventCursor{Limit: 100})
 			if err != nil {
 				t.Fatal(err)

@@ -160,7 +160,10 @@ func TestSessionHooksReceiveSessionID(t *testing.T) {
 }
 
 func TestSessionToolMountDeactivationPreservesAcquiredPlan(t *testing.T) {
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := sessionToolComponent()
 	mount, err := Mount(context.Background(), registry, component, extension.GlobalScope(), Options{})
 	if err != nil {
@@ -202,7 +205,10 @@ func TestSessionToolMountRoutesExactSessionScope(t *testing.T) {
 
 func TestSessionToolMountResumesAcrossEquivalentRegistry(t *testing.T) {
 	component := sessionToolComponent()
-	first := composition.NewRegistry(nil)
+	first, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	firstMount, err := Mount(context.Background(), first, component, extension.GlobalScope(), Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -217,7 +223,13 @@ func TestSessionToolMountResumesAcrossEquivalentRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second := composition.NewRegistry(nil)
+	second, err := composition.NewRegistry(nil)
+
+	if err != nil {
+
+		t.Fatal(err)
+
+	}
 	secondMount, err := Mount(context.Background(), second, component, extension.GlobalScope(), Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -239,7 +251,10 @@ func TestSessionToolMountResumeRejectsIdentityDrift(t *testing.T) {
 		return SubagentResult{ID: "task", Status: "queued"}, nil
 	})
 	component := sessionToolComponent()
-	original := composition.NewRegistry(nil)
+	original, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	originalMount, err := Mount(context.Background(), original, component, extension.GlobalScope(), Options{Subagent: subagent})
 	if err != nil {
 		t.Fatal(err)
@@ -270,7 +285,10 @@ func TestSessionToolMountResumeRejectsIdentityDrift(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			registry := composition.NewRegistry(nil)
+			registry, err := composition.NewRegistry(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
 			mount, err := Mount(context.Background(), registry, test.component, test.scope, test.options)
 			if err != nil {
 				t.Fatal(err)
@@ -316,7 +334,10 @@ func resolve(t *testing.T, registry *composition.Registry, id session.ID) map[st
 
 func mountSessionTools(t *testing.T, scope extension.Scope, options Options) *composition.Registry {
 	t.Helper()
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := sessionToolComponent()
 	mount, err := Mount(context.Background(), registry, component, scope, options)
 	if err != nil {

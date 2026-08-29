@@ -56,11 +56,12 @@ func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 	}
 }
 
-func TestStreamingOrchestratorHonorsCancellationDuringDeltaBackpressure(t *testing.T) {
+func TestStreamingOrchestratorCompletesWithBlockedInfrastructureSink(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
 	started := make(chan struct{})
+	release := make(chan struct{})
 	var once sync.Once
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{
@@ -69,10 +70,10 @@ func TestStreamingOrchestratorHonorsCancellationDuringDeltaBackpressure(t *testi
 			einoschema.AssistantMessage("c", nil),
 		}, nil
 	}))
-	orch.events = blockingSinkFunc(func(ctx context.Context, event session.EventRecord) {
+	orch.events = blockingSinkFunc(func(_ context.Context, event session.EventRecord) {
 		if event.Kind == EventMessageDelta {
 			once.Do(func() { close(started) })
-			<-ctx.Done()
+			<-release
 		}
 	})
 	orch.queueSize = 1
@@ -85,13 +86,15 @@ func TestStreamingOrchestratorHonorsCancellationDuringDeltaBackpressure(t *testi
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	<-started
-	if err := handle.Interrupt(context.Background(), "test"); err != nil {
-		t.Fatalf("Interrupt error = %v", err)
-	}
 	result := <-handle.Done()
-	if result.Status != session.RunInterrupted {
+	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
+	}
+	select {
+	case <-started:
+		close(release)
+	default:
+		// The bounded queue may drop every delta behind the admission event.
 	}
 }
 
@@ -144,7 +147,36 @@ func TestStreamingOrchestratorRollsBackIncompleteAssistantParts(t *testing.T) {
 	}
 }
 
-func TestStreamingOrchestratorBoundedQueueAppliesBackpressure(t *testing.T) {
+func TestStreamingOrchestratorRollsBackWholeTurnWhenSecondToolCreationFails(t *testing.T) {
+	store := newAdmissionStore()
+	store.createToolErrAt = 2
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("answer", []einoschema.ToolCall{
+			{ID: "call-one", Type: "function", Function: einoschema.FunctionCall{Name: "one", Arguments: `{}`}},
+			{ID: "call-two", Type: "function", Function: einoschema.FunctionCall{Name: "two", Arguments: `{}`}},
+		})}, nil
+	}))
+	var executions int
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{
+		{Name: "one", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { executions++; return ToolResult{}, nil })},
+		{Name: "two", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { executions++; return ToolResult{}, nil })},
+	}})
+
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || result.Error == nil {
+		t.Fatalf("result = %+v, want failed persistence", result)
+	}
+	if len(store.parts) != 0 || len(store.toolCalls) != 0 || executions != 0 {
+		t.Fatalf("rolled back turn: parts=%#v calls=%#v executions=%d", store.parts, store.toolCalls, executions)
+	}
+	for _, event := range store.events {
+		if event.ToolTransition == session.ToolTransitionPending {
+			t.Fatalf("pending event survived rollback: %#v", event)
+		}
+	}
+}
+
+func TestStreamingOrchestratorBoundedQueueDropsWithoutBackpressure(t *testing.T) {
 	t.Parallel()
 
 	sink := &blockingSink{delay: time.Millisecond}
@@ -162,8 +194,8 @@ func TestStreamingOrchestratorBoundedQueueAppliesBackpressure(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	if sink.count(EventMessageDelta) != 3 {
-		t.Fatalf("delta events = %d, want 3", sink.count(EventMessageDelta))
+	if got := sink.count(EventMessageDelta); got > 3 {
+		t.Fatalf("delta events = %d, want at most 3", got)
 	}
 }
 
@@ -344,7 +376,7 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 	}
 
 	var finished []session.EventRecord
-	for _, event := range sink.events {
+	for _, event := range sink.waitForKind(t, EventRunFinished, 1) {
 		if event.Kind == EventRunFinished {
 			finished = append(finished, event)
 		}

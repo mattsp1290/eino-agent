@@ -9,8 +9,13 @@ type testRegistry struct {
 	*Registry[struct{}]
 }
 
-func newTestRegistry(reporter Reporter) *testRegistry {
-	return &testRegistry{Registry: NewRegistry[struct{}](reporter)}
+func newTestRegistry(reporter Reporter, points ...Point) *testRegistry {
+	catalog := append([]Point{testNotice, testAround}, points...)
+	registry, err := NewRegistry[struct{}](reporter, catalog...)
+	if err != nil {
+		panic(err)
+	}
+	return &testRegistry{Registry: registry}
 }
 
 func (r *testRegistry) Mount(ctx context.Context, component Component, installer Installer) (*Mount[struct{}], error) {

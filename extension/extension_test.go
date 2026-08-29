@@ -163,6 +163,9 @@ func TestCallbackIdentityDistinguishesReusedInstanceID(t *testing.T) {
 		t.Fatal(err)
 	}
 	Notify(plan, context.Background(), testNotice, testPayload{})
+	if err := plan.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	plan.Release()
 	if err := old.Close(context.Background()); err != nil {
 		t.Fatal(err)
@@ -209,6 +212,9 @@ func TestScopedOrderingDefensiveCopyAndContainedFailures(t *testing.T) {
 	defer plan.Release()
 	payload := testPayload{Protected: "fixed", Values: []string{"original"}}
 	Notify(plan, context.Background(), testNotice, payload)
+	if err := plan.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if !reflect.DeepEqual(sequence, []string{"a", "z", "b"}) || payload.Values[0] != "original" || diagnostics.Load() != 1 {
 		t.Fatalf("sequence=%v payload=%v diagnostics=%d", sequence, payload, diagnostics.Load())
 	}
@@ -243,6 +249,9 @@ func TestNotifyReportsEveryFailureAndContinues(t *testing.T) {
 	defer plan.Release()
 
 	Notify(plan, context.Background(), testNotice, testPayload{})
+	if err := plan.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if got := diagnostics.Load(); got != failureCount {
 		t.Fatalf("reported failures = %d, want %d", got, failureCount)
 	}
@@ -258,7 +267,7 @@ func TestTransformChainFeedsValidatedOutputInOrder(t *testing.T) {
 		}
 		return nil
 	})
-	registry := newTestRegistry(nil)
+	registry := newTestRegistry(nil, point)
 	_, err := registry.Mount(context.Background(), testComponent("transforms"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if err := OnTransform(registrar, point, spec("transforms", "first", 0, GlobalScope()), func(_ context.Context, value testPayload) (testPayload, error) {
 			value.Values = append(value.Values, "first")
@@ -293,7 +302,7 @@ func TestHookChainFailsFast(t *testing.T) {
 		}
 		return nil
 	})
-	registry := newTestRegistry(nil)
+	registry := newTestRegistry(nil, point)
 	var sequence []string
 	_, err := registry.Mount(context.Background(), testComponent("hooks"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		if err := OnHook(registrar, point, spec("hooks", "fail", 0, GlobalScope()), func(context.Context, testPayload) error {
@@ -336,7 +345,7 @@ func TestGateStopsAtFirstRejectAndValidatesDecisions(t *testing.T) {
 		}
 		return nil
 	}, proceed, func(value decision) bool { return value == proceed })
-	registry := newTestRegistry(nil)
+	registry := newTestRegistry(nil, point)
 	var sequence []string
 	_, err := registry.Mount(context.Background(), testComponent("gates"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		for index, item := range []struct {
@@ -363,7 +372,7 @@ func TestGateStopsAtFirstRejectAndValidatesDecisions(t *testing.T) {
 		t.Fatalf("EvaluateGate = %q, %v; sequence=%v", got, err, sequence)
 	}
 
-	invalidRegistry := newTestRegistry(nil)
+	invalidRegistry := newTestRegistry(nil, point)
 	_, err = invalidRegistry.Mount(context.Background(), testComponent("invalid-gate"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return OnGate(registrar, point, spec("invalid-gate", "invalid", 0, GlobalScope()), func(context.Context, testPayload) (decision, error) {
 			return "invalid", nil
@@ -387,7 +396,7 @@ func TestGateCallbackFailureIsBoundedAndStopsEvaluation(t *testing.T) {
 		}
 		return nil
 	}, func(decision) error { return nil }, decision(true), func(value decision) bool { return bool(value) })
-	registry := newTestRegistry(nil)
+	registry := newTestRegistry(nil, point)
 	called := false
 	secret := errors.New("secret gate failure")
 	_, err := registry.Mount(context.Background(), testComponent("failing-gate"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
@@ -537,6 +546,9 @@ func TestRegistrationAcceptsOpaqueSessionScopeKeys(t *testing.T) {
 			t.Fatalf("Snapshot(%q) = %v", key, err)
 		}
 		Notify(plan, context.Background(), testNotice, testPayload{})
+		if err := plan.Flush(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 		plan.Release()
 		if counts[index] != 1 {
 			t.Fatalf("callback count for %q = %d, want 1", key, counts[index])
@@ -921,5 +933,85 @@ func TestInterceptorErrorHasBoundedPublicTextAndLocalCause(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "credential-sentinel") {
 		t.Fatalf("public callback error leaked cause: %q", err)
+	}
+}
+
+func TestBlockedNotificationRetainsOnlyItsOwnMount(t *testing.T) {
+	registry := newTestRegistry(nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	mountA, err := registry.Mount(context.Background(), testComponent("blocked-observer"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, testNotice, Registration{ID: "blocked", Scope: GlobalScope()}, func(context.Context, testPayload) error {
+			close(started)
+			<-release
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mountB, err := registry.Mount(context.Background(), testComponent("unrelated-around"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return OnAround(registrar, testAround, Registration{ID: "around", Scope: GlobalScope()}, func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			return next(ctx, input)
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	Notify(plan, context.Background(), testNotice, testPayload{})
+	<-started
+	plan.Release()
+	if err := mountB.Close(context.Background()); err != nil {
+		t.Fatalf("unrelated mount close = %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	if err := mountA.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked mount close = %v, want deadline", err)
+	}
+	close(release)
+	if err := mountA.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBlockedReporterCannotBlockNotifyOrPlanRelease(t *testing.T) {
+	reporterStarted := make(chan struct{})
+	releaseReporter := make(chan struct{})
+	registry := newTestRegistry(ReporterFunc(func(context.Context, Diagnostic) {
+		close(reporterStarted)
+		<-releaseReporter
+	}))
+	mount, err := registry.Mount(context.Background(), testComponent("blocked-reporter"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, testNotice, Registration{ID: "fails", Scope: GlobalScope()}, func(context.Context, testPayload) error {
+			return errors.New("observer failure")
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	Notify(plan, context.Background(), testNotice, testPayload{})
+	<-reporterStarted
+	released := make(chan struct{})
+	go func() {
+		plan.Release()
+		close(released)
+	}()
+	select {
+	case <-released:
+	case <-time.After(time.Second):
+		t.Fatal("Plan.Release blocked on reporter")
+	}
+	close(releaseReporter)
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

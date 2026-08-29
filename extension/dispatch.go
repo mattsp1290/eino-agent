@@ -28,12 +28,16 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 		observer := entry.callback.(Observer[T])
 		input, err := cloneInput(point.definition.clone, value)
 		if err != nil {
-			report(plan.reporter, ctx, callbackFailure(entry, "clone_failed", err))
+			plan.enqueueNotification(entry, func() {
+				report(plan.reporter, ctx, callbackFailure(entry, "clone_failed", err))
+			})
 			continue
 		}
-		if err := callObserver(callbackContext(ctx, entry.token), observer, input); err != nil {
-			report(plan.reporter, ctx, callbackFailure(entry, failureCode(err), err))
-		}
+		plan.enqueueNotification(entry, func() {
+			if err := callObserver(callbackContext(ctx, entry.token), observer, input); err != nil {
+				report(plan.reporter, ctx, callbackFailure(entry, failureCode(err), err))
+			}
+		})
 	}
 }
 

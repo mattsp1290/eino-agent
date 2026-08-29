@@ -369,6 +369,16 @@ func Run(t *testing.T, factory Factory) {
 		if got := ids(append(first.Messages, second.Messages...)); got != "msg-z,msg-a" {
 			t.Fatalf("paged message order = %s, want msg-z,msg-a", got)
 		}
+		if got := partIDs(first.Parts); got != "prt-m" {
+			t.Fatalf("first page parts = %s, want prt-m", got)
+		}
+		if got := partIDs(second.Parts); got != "prt-z,prt-a" {
+			t.Fatalf("second page parts = %s, want prt-z,prt-a", got)
+		}
+		other := createSession(t, ctx, subject.Store, "session-replay-other")
+		if _, err := subject.Store.ListMessages(ctx, other.ID, session.ReplayCursor{AfterMessageID: msg1.ID, Limit: 1}); !errors.Is(err, session.ErrNotFound) {
+			t.Fatalf("cross-session replay cursor = %v, want ErrNotFound", err)
+		}
 	})
 
 	t.Run("compatible duplicate writes are idempotent and conflicts are rejected", func(t *testing.T) {
@@ -477,17 +487,35 @@ func Run(t *testing.T, factory Factory) {
 		msg := appendMessage(t, ctx, execution, message("msg-tools", s.ID, r.ID, session.RoleAssistant))
 		call := session.ToolCall{
 			ID: "call-1", SessionID: s.ID, RunID: r.ID, MessageID: msg.ID,
+			RequestPartID:   "request-part-1",
 			ResultMessageID: "result-message-1", ResultPartID: "result-part-1",
-			Name: "file_read", Status: session.ToolCallPending, RetrySafe: true,
+			Name: "file_read", Input: json.RawMessage(`{}`), Status: session.ToolCallPending, RetrySafe: true,
 		}
 		createdAt := time.Now().UTC()
-		createRequest := session.CreateToolCallRequest{Call: call, Event: toolEvent("event-create", createdAt)}
+		createRequest := session.CreateToolCallRequest{
+			Call: call,
+			RequestPart: session.Part{ID: call.RequestPartID, MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolCall,
+				Payload: json.RawMessage(`{"id":"call-1","name":"file_read","arguments":{}}`), CreatedAt: createdAt, UpdatedAt: createdAt},
+			Event: toolEvent("event-create", createdAt),
+		}
 		created, err := execution.CreateToolCall(ctx, createRequest)
 		if err != nil {
 			t.Fatalf("create tool call: %v", err)
 		}
 		if created.Call.ID != call.ID || created.Event.ID != createRequest.Event.ID || created.Event.ToolTransition != session.ToolTransitionPending {
 			t.Fatalf("create transition result = %#v", created)
+		}
+		if _, err := execution.AppendPart(ctx, createRequest.RequestPart); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("generic tool request part write = %v, want ErrConflict", err)
+		}
+		if _, err := execution.AppendPart(ctx, session.Part{ID: "generic-result", MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolResult}); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("generic tool result part write = %v, want ErrConflict", err)
+		}
+		unfinishedRun := r
+		unfinishedRun.Status = session.RunFailed
+		unfinishedRun.FinishedAt = time.Now().UTC()
+		if _, err := execution.SettleRun(ctx, settleRunRequest(unfinishedRun)); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("run settlement with pending call = %v, want ErrConflict", err)
 		}
 		createReplay, err := execution.CreateToolCall(ctx, createRequest)
 		if err != nil {

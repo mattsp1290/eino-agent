@@ -10,12 +10,12 @@ import (
 // runEventSink fans out transport and observability copies. Durable records are
 // committed by the state transition that owns them before reaching this sink.
 type runEventSink struct {
-	infrastructure EventSink
+	infrastructure *eventQueue
 	plan           *extension.Plan
 }
 
 func (s runEventSink) Emit(ctx context.Context, event session.EventRecord) {
-	emitBestEffort(s.infrastructure, ctx, event)
+	s.infrastructure.emit(ctx, event)
 	extension.Notify(s.plan, ctx, EventPublishedPoint, event)
 }
 
@@ -23,7 +23,7 @@ func (s runEventSink) Emit(ctx context.Context, event session.EventRecord) {
 // state transition. Transport and extension failures cannot roll back durable
 // state and are therefore intentionally best-effort.
 func (s runEventSink) publishPersisted(infrastructureCtx, notificationCtx context.Context, record session.EventRecord) {
-	emitBestEffort(s.infrastructure, infrastructureCtx, record)
+	s.infrastructure.emit(infrastructureCtx, record)
 	extension.Notify(s.plan, notificationCtx, EventPublishedPoint, record)
 }
 

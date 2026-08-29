@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -12,12 +11,8 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message) error {
-	calls, err := normalizeToolCalls(msg.ToolCalls)
-	if err != nil {
-		return err
-	}
-	parts := make([]session.Part, 0, 2+len(calls))
+func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message, calls []preparedToolCall) ([]preparedToolCall, error) {
+	parts := make([]session.Part, 0, 2)
 	ordinal := int64(0)
 	now := o.now()
 	if msg.Content != "" {
@@ -28,39 +23,50 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, execution 
 		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: now, UpdatedAt: now})
 		ordinal++
 	}
-	for _, call := range calls {
-		payload := toolCallPayload{ID: call.call.ID, Name: call.call.Function.Name, Arguments: call.arguments}
-		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: now, UpdatedAt: now})
+	for index := range calls {
+		prepared := &calls[index]
+		requestPartID := o.ids.NewPartID()
+		resultMessageID := o.ids.NewMessageID()
+		resultPartID := o.ids.NewPartID()
+		payload := toolCallPayload{ID: string(prepared.call.ID), Name: prepared.call.Name, Arguments: prepared.call.Input}
+		prepared.request = session.CreateToolCallRequest{
+			Call: session.ToolCall{
+				ID: prepared.call.ID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				RequestPartID: requestPartID, ResultMessageID: resultMessageID, ResultPartID: resultPartID,
+				Name: prepared.call.Name, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
+				RetrySafe: prepared.tool.RetrySafe, Metadata: cloneStringMap(prepared.tool.Metadata),
+			},
+			RequestPart: session.Part{ID: requestPartID, MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: now, UpdatedAt: now},
+			Event:       toolTransitionEnvelope(o, snapshot, now),
+		}
 		ordinal++
 	}
-	if len(parts) == 0 {
-		return nil
-	}
-	return execution.store.WithinTx(ctx, func(ctx context.Context, store session.ExecutionStore) error {
+	created := make([]session.ToolTransitionResult, len(calls))
+	err := execution.store.WithinTx(ctx, func(ctx context.Context, store session.ExecutionStore) error {
 		for _, part := range parts {
 			if _, err := store.AppendPart(ctx, part); err != nil {
 				return err
 			}
 		}
+		for index := range calls {
+			result, err := store.CreateToolCall(ctx, calls[index].request)
+			if err != nil {
+				return err
+			}
+			created[index] = result
+		}
 		return nil
 	})
-}
-
-type normalizedToolCall struct {
-	call      einoschema.ToolCall
-	arguments json.RawMessage
-}
-
-func normalizeToolCalls(calls []einoschema.ToolCall) ([]normalizedToolCall, error) {
-	normalized := make([]normalizedToolCall, 0, len(calls))
-	for _, call := range calls {
-		arguments, err := normalizedToolArguments(call.Function.Arguments)
-		if err != nil {
-			return nil, err
-		}
-		normalized = append(normalized, normalizedToolCall{call: call, arguments: arguments})
+	if err != nil {
+		return nil, err
 	}
-	return normalized, nil
+	for index := range calls {
+		calls[index].record = created[index].Call
+		calls[index].call.ResultMessageID = created[index].Call.ResultMessageID
+		calls[index].call.ResultPartID = created[index].Call.ResultPartID
+		execution.publishPersisted(ctx, created[index].Event)
+	}
+	return calls, nil
 }
 
 type preparedToolCall struct {
@@ -68,6 +74,8 @@ type preparedToolCall struct {
 	tool          Tool
 	call          ToolCall
 	middlewareErr error
+	request       session.CreateToolCallRequest
+	record        session.ToolCall
 }
 
 func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []einoschema.ToolCall) ([]preparedToolCall, error) {
@@ -133,21 +141,11 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 
 func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.Message, error) {
 	messages := make([]*einoschema.Message, 0, len(calls))
+	var fatal error
 	for _, prepared := range calls {
 		schemaCall, tool, call := prepared.schemaCall, prepared.tool, prepared.call
-		callID, input := call.ID, call.Input
-		resultMessageID := o.ids.NewMessageID()
-		resultPartID := o.ids.NewPartID()
-		createdAt := o.now()
-		createEvent := toolTransitionEnvelope(o, snapshot, createdAt)
-		created, err := execution.persistToolCreation(ctx, session.CreateToolCallRequest{
-			Call:  session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Pattern: call.Pattern, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)},
-			Event: createEvent,
-		})
-		if err != nil {
-			return nil, err
-		}
-		record := created.Call
+		callID := call.ID
+		record := prepared.record
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		startedAt := o.now()
 		claimEvent := toolTransitionEnvelope(o, snapshot, startedAt)
@@ -156,20 +154,30 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 			LeaseDuration: o.lease(), Event: claimEvent,
 		})
 		if err != nil {
-			return nil, err
+			fatal = err
+			break
 		}
 		record = claimed.Call
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
 		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, call, record, prepared.middlewareErr)
 		if err != nil {
-			return nil, err
+			fatal = err
+			break
 		}
 		output := settled.Settlement.Output
 		messages = append(messages, einoschema.ToolMessage(string(output), string(callID), einoschema.WithToolName(schemaCall.Function.Name)))
 		if errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled) {
-			return messages, settled.Outcome.RawError
+			fatal = settled.Outcome.RawError
+			break
 		}
 	}
-	return messages, nil
+	if fatal != nil {
+		records := make([]session.ToolCall, len(calls))
+		for index := range calls {
+			records[index] = calls[index].record
+		}
+		fatal = errors.Join(fatal, execution.terminalizeUnfinishedTools(context.WithoutCancel(ctx), snapshot, records))
+	}
+	return messages, fatal
 }

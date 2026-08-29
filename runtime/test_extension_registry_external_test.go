@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/runtime"
 )
 
 type testExtensionRegistry struct {
@@ -12,7 +13,11 @@ type testExtensionRegistry struct {
 }
 
 func newTestExtensionRegistry(reporter extension.Reporter) *testExtensionRegistry {
-	return &testExtensionRegistry{Registry: extension.NewRegistry[struct{}](reporter)}
+	registry, err := extension.NewRegistry[struct{}](reporter, runtime.ExtensionPoints()...)
+	if err != nil {
+		panic(err)
+	}
+	return &testExtensionRegistry{Registry: registry}
 }
 
 func (r *testExtensionRegistry) Mount(ctx context.Context, component extension.Component, installer extension.Installer) (*extension.Mount[struct{}], error) {

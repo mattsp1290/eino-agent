@@ -23,8 +23,9 @@ type ToolTransitionEvent struct {
 
 // CreateToolCallRequest atomically creates pending state and its event.
 type CreateToolCallRequest struct {
-	Call  ToolCall
-	Event ToolTransitionEvent
+	Call        ToolCall
+	RequestPart Part
+	Event       ToolTransitionEvent
 }
 
 // ClaimToolCallRequest atomically claims pending state, renews the run lease,
@@ -114,7 +115,7 @@ func SameToolTransitionState(left, right ToolCall) bool {
 	left.LeaseUntil = time.Time{}
 	right.LeaseUntil = time.Time{}
 	return left.ID == right.ID && left.SessionID == right.SessionID && left.RunID == right.RunID && left.MessageID == right.MessageID &&
-		left.ResultMessageID == right.ResultMessageID && left.ResultPartID == right.ResultPartID && left.Name == right.Name && left.Pattern == right.Pattern &&
+		left.RequestPartID == right.RequestPartID && left.ResultMessageID == right.ResultMessageID && left.ResultPartID == right.ResultPartID && left.Name == right.Name && left.Pattern == right.Pattern &&
 		jsonequal.Equal(left.Input, right.Input) && jsonequal.Equal(left.Output, right.Output) && left.Status == right.Status && left.RetrySafe == right.RetrySafe &&
 		reflect.DeepEqual(left.Metadata, right.Metadata) && left.ClaimedBy == right.ClaimedBy && left.ClaimToken == right.ClaimToken &&
 		left.StartedAt.Equal(right.StartedAt) && left.CompletedAt.Equal(right.CompletedAt) && left.Error == right.Error

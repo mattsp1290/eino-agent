@@ -666,7 +666,10 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry := composition.NewRegistry(nil)
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := extension.Component{InstanceID: "wasm-test", Artifact: extension.Artifact{Name: "wasm-test", Version: "1", Hash: "wasm-test-artifact", ConfigHash: "wasm-test-config", SourceKind: extension.SourceNative}}
 	mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
 		return loader.RegisterTool(ctx, registrar, composition.ToolRegistration{ID: "tool", Scope: extension.GlobalScope()}, checkedInFixtureConfig(t, root, "tool.wasm"))

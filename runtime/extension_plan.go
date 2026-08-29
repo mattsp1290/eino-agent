@@ -464,6 +464,16 @@ func (p *RunPlan) Guards() []MountedToolGuard {
 
 func (p *RunPlan) Release() { p.release() }
 
+// FlushNotifications waits for notifications accepted by this plan. Runtime
+// execution never calls it; it provides an explicit bounded synchronization
+// point for shutdown and tests.
+func (p *RunPlan) FlushNotifications(ctx context.Context) error {
+	if p == nil || p.dispatch == nil {
+		return nil
+	}
+	return p.dispatch.Flush(ctx)
+}
+
 func (p *RunPlan) release() {
 	if p == nil {
 		return

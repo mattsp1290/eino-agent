@@ -18,8 +18,55 @@ type settledTool struct {
 }
 
 func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall) (session.ToolSettlement, error) {
+	return e.settleInterruptedTool(ctx, run, tool, claimed, "tool was running during resume and was not re-executed")
+}
+
+func (e *runExecution) interruptPendingTool(ctx context.Context, snapshot TurnSnapshot, pending session.ToolCall) error {
+	startedAt := e.host.now()
+	claimed, err := e.persistToolClaim(ctx, session.ClaimToolCallRequest{
+		ID: pending.ID, ClaimedBy: e.host.ownerID(), ClaimToken: string(e.host.ids.NewEventID()), StartedAt: startedAt,
+		LeaseDuration: e.host.lease(), Event: toolTransitionEnvelope(e.host, snapshot, startedAt),
+	})
+	if err != nil {
+		return err
+	}
+	extension.Notify(e.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{
+		SessionID: pending.SessionID, RunID: pending.RunID, ToolCallID: pending.ID, ToolName: pending.Name, Time: claimed.Call.StartedAt,
+	})
+	run := session.Run{ID: pending.RunID, SessionID: pending.SessionID, ModelID: string(snapshot.Model.Model.ID)}
+	_, err = e.settleInterruptedTool(ctx, run, Tool{Name: pending.Name, Metadata: cloneStringMap(pending.Metadata)}, claimed.Call, "tool was skipped after an earlier fatal tool outcome")
+	return err
+}
+
+func (e *runExecution) terminalizeUnfinishedTools(ctx context.Context, snapshot TurnSnapshot, calls []session.ToolCall) error {
+	var errs []error
+	for _, listed := range calls {
+		current, err := e.host.store.GetToolCall(ctx, listed.ID)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if session.TerminalToolCall(current.Status) {
+			continue
+		}
+		switch current.Status {
+		case session.ToolCallPending:
+			err = e.interruptPendingTool(ctx, snapshot, current)
+		case session.ToolCallRunning:
+			run := session.Run{ID: current.RunID, SessionID: current.SessionID, ModelID: string(snapshot.Model.Model.ID)}
+			_, err = e.settleInterruptedTool(ctx, run, Tool{Name: current.Name, Metadata: cloneStringMap(current.Metadata)}, current, "tool was interrupted after a fatal tool lifecycle outcome")
+		default:
+			err = session.ErrConflict
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall, errText string) (session.ToolSettlement, error) {
 	completedAt := e.host.now()
-	const errText = "tool was running during resume and was not re-executed"
 	raw := cloneJSON(claimed.Output)
 	metadata := cloneStringMap(claimed.Metadata)
 	result := ToolResult{}
@@ -99,7 +146,7 @@ func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool
 func (e *runExecution) persistToolCreation(ctx context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
 	result, err := e.store.CreateToolCall(ctx, request)
 	if err == nil {
-		e.publishPersisted(ctx, e.host.events, result.Event)
+		e.publishPersisted(ctx, result.Event)
 	}
 	return result, err
 }
@@ -107,7 +154,7 @@ func (e *runExecution) persistToolCreation(ctx context.Context, request session.
 func (e *runExecution) persistToolClaim(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
 	result, err := e.store.ClaimToolCall(ctx, request)
 	if err == nil {
-		e.publishPersisted(ctx, e.host.events, result.Event)
+		e.publishPersisted(ctx, result.Event)
 	}
 	return result, err
 }
@@ -116,7 +163,7 @@ func (e *runExecution) persistToolSettlement(ctx context.Context, claimed sessio
 	persistCtx := context.WithoutCancel(ctx)
 	result, err := e.store.SettleToolCall(persistCtx, session.SettleToolCallRequest{Settlement: settlement, Event: event})
 	if err == nil {
-		e.publishPersisted(ctx, e.host.events, result.Event)
+		e.publishPersisted(ctx, result.Event)
 	}
 	return result, err
 }

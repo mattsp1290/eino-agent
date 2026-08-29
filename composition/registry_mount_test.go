@@ -69,10 +69,13 @@ func TestDuplicateGuardAndRestrictionMountsRollbackAtomically(t *testing.T) {
 	}
 	for name, test := range tests {
 		t.Run(name, func(t *testing.T) {
-			registry := NewRegistry(nil)
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
 			mountedComponent := component("atomic-" + name)
 			cleanups := 0
-			_, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			_, err = registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 				if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
 					return err
 				}
@@ -126,8 +129,11 @@ func TestRestrictionRegistrationRejectsInvalidRuleSets(t *testing.T) {
 	}
 	for name, registration := range tests {
 		t.Run(name, func(t *testing.T) {
-			registry := NewRegistry(nil)
-			_, err := registry.Mount(context.Background(), component("invalid-restriction-"+name), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = registry.Mount(context.Background(), component("invalid-restriction-"+name), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 				return registrar.RestrictTools(registration)
 			}))
 			if !errors.Is(err, extension.ErrInvalidRegistration) {
@@ -150,11 +156,14 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			registry := NewRegistry(nil)
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
 			component := component("invalid-tool")
 			invalid := definition("broken", "broken")
 			test.mutate(&invalid)
-			_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+			_, err = registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 				return registrar.Tool(ToolRegistration{ID: "broken", Scope: extension.GlobalScope(), Definition: invalid})
 			}))
 			if !errors.Is(err, tools.ErrInvalidDefinition) {

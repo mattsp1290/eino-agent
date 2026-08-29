@@ -14,7 +14,10 @@ import (
 )
 
 func TestResumeMismatchBeforePlanExecution(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount, err := registry.Mount(context.Background(), component("mismatch"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition("tool", "v1")})
 	}))
@@ -31,7 +34,10 @@ func TestResumeMismatchBeforePlanExecution(t *testing.T) {
 }
 
 func TestCapabilityPlanIdentityComesFromMountedComponent(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mounted := component("canonical-capability")
 	mount, err := registry.Mount(context.Background(), mounted, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition("echo", "v1")})
@@ -53,7 +59,10 @@ func TestCapabilityPlanIdentityComesFromMountedComponent(t *testing.T) {
 }
 
 func TestStrictResumeRejectsChangedConvertedToolSchema(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := component("schema-fingerprint")
 	mountSchema := func(parameterType einoschema.DataType) *Mount {
 		mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
@@ -106,7 +115,10 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			registry := NewRegistry(nil)
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
 			component := component("policy-fingerprint")
 			newDefinition := func() tools.Definition {
 				tool := definition("policy-tool", "stable")
@@ -154,7 +166,10 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 }
 
 func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mountedComponent := component("restriction-canonical")
 	mountRules := func(allowed, denied []string) *Mount {
 		mount, err := registry.Mount(context.Background(), mountedComponent, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
@@ -193,7 +208,10 @@ func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
 }
 
 func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount, err := registry.Mount(context.Background(), component("tamper-check"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "echo", Scope: extension.GlobalScope(), Definition: definition("echo", "stable")})
 	}))
@@ -214,7 +232,10 @@ func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *t
 }
 
 func TestAcquireResumePlanRejectsDurableSessionMismatch(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	mount, err := registry.Mount(context.Background(), component("resume-session"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		return registrar.Tool(ToolRegistration{ID: "session-tool", Scope: extension.SessionScope("session-a"), Definition: definition("session-tool", "ok")})
 	}))
@@ -237,7 +258,10 @@ func TestAcquireResumePlanRejectsDurableSessionMismatch(t *testing.T) {
 }
 
 func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := component("mixed-handlers")
 	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "global", Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {
@@ -269,7 +293,10 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 }
 
 func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{{
 		InstanceID: "mixed", Artifact: extension.Artifact{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
 		Handlers: []session.RegistrationIdentity{
@@ -285,7 +312,10 @@ func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 }
 
 func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	global, err := registry.Mount(context.Background(), component("cap-global"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := registrar.Tool(ToolRegistration{ID: "a", Scope: extension.GlobalScope(), Definition: definition("a", "a")}); err != nil {
 			return err
@@ -335,7 +365,10 @@ func TestPromptShadowRestrictionsAndGuardsFreezeTogether(t *testing.T) {
 func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 	for _, kind := range []string{"prompt", "guard"} {
 		t.Run(kind, func(t *testing.T) {
-			registry := NewRegistry(nil)
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
 			mountOrdered := func(order int) *Mount {
 				mount, err := registry.Mount(context.Background(), component("ordered"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 					switch kind {
@@ -384,7 +417,10 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 }
 
 func TestUnsupportedVersionTwoPlanIsRejected(t *testing.T) {
-	registry := NewRegistry(nil)
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
 	component := component("unsupported-version")
 	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
 		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {

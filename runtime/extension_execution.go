@@ -11,10 +11,11 @@ import (
 // runExecution owns the frozen extension plan for one fresh or resumed run.
 // Request contexts carry cancellation and request values, never plan identity.
 type runExecution struct {
-	host  *StreamingOrchestrator
-	plan  *RunPlan
-	store session.ExecutionStore
-	lease *runLeaseHeartbeat
+	host   *StreamingOrchestrator
+	plan   *RunPlan
+	store  session.ExecutionStore
+	lease  *runLeaseHeartbeat
+	events *eventQueue
 }
 
 func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run) *runExecution {
@@ -25,7 +26,7 @@ func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run
 	if store == nil {
 		panic(fmt.Sprintf("nil run execution store for run %q", run.ID))
 	}
-	return &runExecution{host: host, plan: plan, store: store}
+	return &runExecution{host: host, plan: plan, store: store, events: newEventQueue(host.queueSize, host.events)}
 }
 
 func (e *runExecution) dispatch() *extension.Plan {
@@ -36,37 +37,31 @@ func (e *runExecution) dispatch() *extension.Plan {
 }
 
 func (e *runExecution) release() {
-	if e != nil && e.plan != nil {
-		e.plan.release()
+	if e != nil {
+		e.events.close()
+		if e.plan != nil {
+			e.plan.release()
+		}
 	}
 }
 
-func (e *runExecution) eventSink(infrastructure EventSink) EventSink {
+func (e *runExecution) eventSink() EventSink {
 	if e == nil {
-		return infrastructure
-	}
-	if infrastructure == nil && e.dispatch() == nil {
 		return nil
 	}
-	return runEventSink{infrastructure: infrastructure, plan: e.dispatch()}
+	return runEventSink{infrastructure: e.events, plan: e.dispatch()}
 }
 
-func (e *runExecution) publishPersisted(ctx context.Context, infrastructure EventSink, record session.EventRecord) {
+func (e *runExecution) publishPersisted(ctx context.Context, record session.EventRecord) {
 	if e == nil {
-		if infrastructure != nil {
-			emitBestEffort(infrastructure, ctx, record)
-		}
 		return
 	}
-	e.publishPersistedWithNotificationContext(ctx, context.WithoutCancel(ctx), infrastructure, record)
+	e.publishPersistedWithNotificationContext(ctx, context.WithoutCancel(ctx), record)
 }
 
-func (e *runExecution) publishPersistedWithNotificationContext(infrastructureCtx, notificationCtx context.Context, infrastructure EventSink, record session.EventRecord) {
+func (e *runExecution) publishPersistedWithNotificationContext(infrastructureCtx, notificationCtx context.Context, record session.EventRecord) {
 	if e == nil {
-		if infrastructure != nil {
-			emitBestEffort(infrastructure, infrastructureCtx, record)
-		}
 		return
 	}
-	runEventSink{infrastructure: infrastructure, plan: e.dispatch()}.publishPersisted(infrastructureCtx, notificationCtx, record)
+	runEventSink{infrastructure: e.events, plan: e.dispatch()}.publishPersisted(infrastructureCtx, notificationCtx, record)
 }
