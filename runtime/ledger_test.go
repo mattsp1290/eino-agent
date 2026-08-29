@@ -220,7 +220,7 @@ func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "partial-usage-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
-	want := Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}
+	want := session.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}
 	if result.Status != session.RunFailed || result.Error == nil || result.Usage != want || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d want usage=%#v", result, attempts, want)
 	}
@@ -306,7 +306,7 @@ func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.
 		t.Fatal(err)
 	}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "terminal-ledger-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
-	if !errors.Is(result.Error, updateErr) || result.Usage != (Usage{InputTokens: 4, OutputTokens: 2}) {
+	if !errors.Is(result.Error, updateErr) || result.Usage != (session.Usage{InputTokens: 4, OutputTokens: 2}) {
 		t.Fatalf("result = %#v", result)
 	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})

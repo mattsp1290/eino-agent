@@ -257,8 +257,8 @@ type closingTail struct {
 	done chan struct{}
 }
 
-func (t *closingTail) Subscribe(context.Context, session.ID) (<-chan runtime.Event, error) {
-	ch := make(chan runtime.Event)
+func (t *closingTail) Subscribe(context.Context, session.ID) (<-chan session.EventRecord, error) {
+	ch := make(chan session.EventRecord)
 	close(ch)
 	return ch, nil
 }
@@ -268,13 +268,13 @@ type blockingTail struct {
 	canceled   chan struct{}
 }
 
-func (t *blockingTail) Subscribe(ctx context.Context, _ session.ID) (<-chan runtime.Event, error) {
+func (t *blockingTail) Subscribe(ctx context.Context, _ session.ID) (<-chan session.EventRecord, error) {
 	close(t.subscribed)
 	go func() {
 		<-ctx.Done()
 		close(t.canceled)
 	}()
-	return make(chan runtime.Event), nil
+	return make(chan session.EventRecord), nil
 }
 
 type interruptHandle struct {

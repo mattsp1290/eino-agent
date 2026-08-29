@@ -54,7 +54,7 @@ func (e *runExecution) eventSink(infrastructure EventSink) EventSink {
 func (e *runExecution) publishPersisted(ctx context.Context, infrastructure EventSink, record session.EventRecord) {
 	if e == nil {
 		if infrastructure != nil {
-			_ = infrastructure.Emit(ctx, runtimeEventRecord(record))
+			emitBestEffort(infrastructure, ctx, record)
 		}
 		return
 	}
@@ -64,7 +64,7 @@ func (e *runExecution) publishPersisted(ctx context.Context, infrastructure Even
 func (e *runExecution) publishPersistedWithNotificationContext(infrastructureCtx, notificationCtx context.Context, infrastructure EventSink, record session.EventRecord) {
 	if e == nil {
 		if infrastructure != nil {
-			_ = infrastructure.Emit(infrastructureCtx, runtimeEventRecord(record))
+			emitBestEffort(infrastructure, infrastructureCtx, record)
 		}
 		return
 	}

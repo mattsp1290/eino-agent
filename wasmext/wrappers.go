@@ -12,6 +12,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
@@ -243,11 +244,11 @@ type loadedEventSink struct {
 
 func (s *loadedEventSink) close() error { return s.module.Close() }
 
-func (s *loadedEventSink) Emit(ctx context.Context, event runtime.Event) error {
+func (s *loadedEventSink) Emit(ctx context.Context, event session.EventRecord) error {
 	input := wittypes.BoundedEvent{
 		Kind: string(event.Kind), SessionID: string(event.SessionID), RunID: string(event.RunID),
 		MessageID: string(event.MessageID), ToolCallID: string(event.ToolCallID), EpochID: string(event.EpochID),
-		TimestampUnixMillis: event.Time.UTC().UnixMilli(), PayloadSummary: boundedEventSummary(event, s.module.limits.MaxOutputBytes),
+		TimestampUnixMillis: event.CreatedAt.UTC().UnixMilli(), PayloadSummary: boundedEventSummary(event, s.module.limits.MaxOutputBytes),
 	}
 	return s.module.call(ctx, "event-sink.emit", boundedEventSize(input), func(callCtx context.Context) error {
 		return s.component.EmitEvent(callCtx, input)

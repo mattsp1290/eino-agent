@@ -69,12 +69,11 @@ func TestStreamingOrchestratorHonorsCancellationDuringDeltaBackpressure(t *testi
 			einoschema.AssistantMessage("c", nil),
 		}, nil
 	}))
-	orch.events = blockingSinkFunc(func(ctx context.Context, event Event) error {
+	orch.events = blockingSinkFunc(func(ctx context.Context, event session.EventRecord) {
 		if event.Kind == EventMessageDelta {
 			once.Do(func() { close(started) })
 			<-ctx.Done()
 		}
-		return nil
 	})
 	orch.queueSize = 1
 	handle, err := orch.Start(context.Background(), Request{
@@ -344,7 +343,7 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 		t.Fatalf("result.Usage = %+v, want input=%d output=%d", result.Usage, wantInput, wantOutput)
 	}
 
-	var finished []Event
+	var finished []session.EventRecord
 	for _, event := range sink.events {
 		if event.Kind == EventRunFinished {
 			finished = append(finished, event)

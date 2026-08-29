@@ -49,19 +49,6 @@ type Definition struct {
 	Retention   runtime.RetentionPolicy
 	Permissions []string
 	Metadata    map[string]string
-	// Provenance is the restart-stable identity of the component and executor
-	// supplying this definition. It is copied into frozen run plans.
-	Provenance Provenance
-}
-
-// Provenance identifies the executable artifact behind a tool definition.
-type Provenance struct {
-	InstanceID      string
-	ArtifactName    string
-	ArtifactVersion string
-	ArtifactHash    string
-	ConfigHash      string
-	ExecutorHash    string
 }
 
 // Execution is canonical JSON input and durable runtime context for one call.

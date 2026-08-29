@@ -78,46 +78,58 @@ func (l *Loader) LoadHostPermissionsPolicy(ctx context.Context, cfg ModuleConfig
 
 // RegisterEventSink loads, registers, and owns one Wasm event observer for the
 // lifetime of the prepared mount or Loader, whichever closes first.
-func (l *Loader) RegisterEventSink(ctx context.Context, registrar extension.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+func (l *Loader) RegisterEventSink(ctx context.Context, registrar *composition.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+	if registrar == nil {
+		return errors.New("wasm event sink registration requires registrar")
+	}
 	loaded, err := openEventSink(ctx, cfg, l.engineFactory())
 	if err != nil {
 		return err
 	}
 	owned := &ownedModule{module: loaded.module}
-	return l.registerOwned(ctx, registrar, owned, func() error { return registerEventSink(registrar, spec, loaded) })
+	return l.registerOwned(ctx, registrar, owned, func() error { return registerEventSink(registrar.Extensions(), spec, loaded) })
 }
 
 // RegisterContextSource loads, registers, and owns one Wasm context source for
 // the lifetime of the prepared mount or Loader, whichever closes first.
-func (l *Loader) RegisterContextSource(ctx context.Context, registrar extension.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+func (l *Loader) RegisterContextSource(ctx context.Context, registrar *composition.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+	if registrar == nil {
+		return errors.New("wasm context source registration requires registrar")
+	}
 	loaded, err := openContextSource(ctx, cfg, l.engineFactory())
 	if err != nil {
 		return err
 	}
 	owned := &ownedModule{module: loaded.module}
-	return l.registerOwned(ctx, registrar, owned, func() error { return registerContextSource(registrar, spec, loaded) })
+	return l.registerOwned(ctx, registrar, owned, func() error { return registerContextSource(registrar.Extensions(), spec, loaded) })
 }
 
 // RegisterHook loads, registers, and owns one Wasm lifecycle hook for the
 // lifetime of the prepared mount or Loader, whichever closes first.
-func (l *Loader) RegisterHook(ctx context.Context, registrar extension.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+func (l *Loader) RegisterHook(ctx context.Context, registrar *composition.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+	if registrar == nil {
+		return errors.New("wasm hook registration requires registrar")
+	}
 	loaded, err := openHook(ctx, cfg, l.engineFactory())
 	if err != nil {
 		return err
 	}
 	owned := &ownedModule{module: loaded.module}
-	return l.registerOwned(ctx, registrar, owned, func() error { return registerHook(registrar, spec, loaded) })
+	return l.registerOwned(ctx, registrar, owned, func() error { return registerHook(registrar.Extensions(), spec, loaded) })
 }
 
 // RegisterToolMiddleware loads, registers, and owns one Wasm tool middleware
 // for the lifetime of the prepared mount or Loader, whichever closes first.
-func (l *Loader) RegisterToolMiddleware(ctx context.Context, registrar extension.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+func (l *Loader) RegisterToolMiddleware(ctx context.Context, registrar *composition.Registrar, spec extension.Registration, cfg ModuleConfig) error {
+	if registrar == nil {
+		return errors.New("wasm tool middleware registration requires registrar")
+	}
 	loaded, err := openToolMiddleware(ctx, cfg, l.engineFactory())
 	if err != nil {
 		return err
 	}
 	owned := &ownedModule{module: loaded.module}
-	return l.registerOwned(ctx, registrar, owned, func() error { return registerToolMiddleware(registrar, spec, loaded) })
+	return l.registerOwned(ctx, registrar, owned, func() error { return registerToolMiddleware(registrar.Extensions(), spec, loaded) })
 }
 
 type cleanupRegistrar interface {

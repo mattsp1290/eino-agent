@@ -448,7 +448,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := sink.Emit(ctx, runtime.Event{Kind: runtime.EventRunStarted, SessionID: "session", RunID: "run", Payload: json.RawMessage(`{"secret":"credential-sentinel"}`), Time: time.Unix(1, 0)}); err != nil {
+	if err := sink.Emit(ctx, session.EventRecord{Kind: runtime.EventRunStarted, SessionID: "session", RunID: "run", Payload: json.RawMessage(`{"secret":"credential-sentinel"}`), CreatedAt: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
 	hook, err := openHook(ctx, checkedInFixtureConfig(t, root, "hook.wasm"), loader.engineFactory())
@@ -767,7 +767,7 @@ func loadToolForTest(loader *Loader, ctx context.Context, cfg ModuleConfig) (too
 	return definition, nil
 }
 
-func loadEventSinkForTest(loader *Loader, ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error) {
+func loadEventSinkForTest(loader *Loader, ctx context.Context, cfg ModuleConfig) (*loadedEventSink, error) {
 	loaded, err := openEventSink(ctx, cfg, loader.engineFactory())
 	if err != nil {
 		return nil, err

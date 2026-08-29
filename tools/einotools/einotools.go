@@ -90,11 +90,13 @@ func translateCatalog(ctx context.Context, component extension.Component, option
 		if err != nil {
 			return nil, fmt.Errorf("translate catalog definition %q: %w", source.ID, err)
 		}
+		sourceIdentity, err := composition.NewToolSourceIdentity(source.SchemaHash, source.ExecutorHash)
+		if err != nil {
+			return nil, fmt.Errorf("translate catalog identity %q: %w", source.ID, err)
+		}
 		registrations = append(registrations, composition.ToolRegistration{
-			ID:    source.ID,
-			Order: runtime.OrderApplication + index, Scope: options.Scope,
-			SourceSchemaHash: source.SchemaHash, SourceExecutorHash: source.ExecutorHash,
-			Definition: definition,
+			ID: source.ID, Order: runtime.OrderApplication + index, Scope: options.Scope,
+			SourceIdentity: sourceIdentity, Definition: definition,
 		})
 	}
 	return registrations, nil

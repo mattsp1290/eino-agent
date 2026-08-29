@@ -63,13 +63,13 @@ func TestToolSchemaHashCanonicalizesMetadataOrder(t *testing.T) {
 func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 	schemaA, schemaB := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	executorA, executorB := strings.Repeat("c", 64), strings.Repeat("d", 64)
-	base := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceSchemaHash: schemaA, SourceExecutorHash: executorA, Definition: definition("echo", "v1")}
+	base := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceIdentity: mustToolSourceIdentity(t, schemaA, executorA), Definition: definition("echo", "v1")}
 	baseSchema, err := composedToolSchemaHash(base)
 	if err != nil {
 		t.Fatal(err)
 	}
 	changedSchema := base
-	changedSchema.SourceSchemaHash = schemaB
+	changedSchema.SourceIdentity = mustToolSourceIdentity(t, schemaB, executorA)
 	changedSchemaHash, _ := composedToolSchemaHash(changedSchema)
 	changedOrder := base
 	changedOrder.Order++
@@ -102,15 +102,42 @@ func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 }
 
 func TestToolSourceIdentityValidationIsAtomic(t *testing.T) {
-	registry := NewRegistry(nil)
-	component := component("source-validation")
-	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
-		return registrar.Tool(ToolRegistration{ID: "standard.echo", Scope: extension.GlobalScope(), SourceSchemaHash: strings.Repeat("a", 64), Definition: definition("echo", "v1")})
-	}))
+	_, err := NewToolSourceIdentity(strings.Repeat("a", 64), "")
 	if !errors.Is(err, extension.ErrInvalidRegistration) {
-		t.Fatalf("partial source identity = %v", err)
+		t.Fatalf("partial source identity error = %v", err)
 	}
-	assertRegistryEmpty(t, registry)
+}
+
+func TestMountedToolSourceIdentityIsCallerImmutable(t *testing.T) {
+	registry := NewRegistry(nil)
+	registration := ToolRegistration{
+		ID: "standard.echo", Scope: extension.GlobalScope(),
+		SourceIdentity: mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("c", 64)),
+		Definition:     definition("echo", "v1"),
+	}
+	mount, err := registry.Mount(context.Background(), component("source-copy"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(registration)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstFingerprint := first.Descriptor().Fingerprint
+	first.Release()
+	registration.SourceIdentity.schemaHash = strings.Repeat("b", 64)
+	registration.SourceIdentity.executorHash = strings.Repeat("d", 64)
+	second, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Descriptor().Fingerprint != firstFingerprint {
+		t.Fatal("caller mutation changed mounted tool identity")
+	}
 }
 
 func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
@@ -118,14 +145,18 @@ func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
 		name string
 		fn   func(*ToolRegistration)
 	}{
-		{name: "schema", fn: func(registration *ToolRegistration) { registration.SourceSchemaHash = strings.Repeat("b", 64) }},
-		{name: "executor", fn: func(registration *ToolRegistration) { registration.SourceExecutorHash = strings.Repeat("d", 64) }},
+		{name: "schema", fn: func(registration *ToolRegistration) {
+			registration.SourceIdentity = mustToolSourceIdentity(t, strings.Repeat("b", 64), strings.Repeat("c", 64))
+		}},
+		{name: "executor", fn: func(registration *ToolRegistration) {
+			registration.SourceIdentity = mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("d", 64))
+		}},
 		{name: "order", fn: func(registration *ToolRegistration) { registration.Order++ }},
 	} {
 		t.Run(mutate.name, func(t *testing.T) {
 			registry := NewRegistry(nil)
 			component := component("source-resume")
-			registration := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceSchemaHash: strings.Repeat("a", 64), SourceExecutorHash: strings.Repeat("c", 64), Definition: definition("echo", "v1")}
+			registration := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceIdentity: mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("c", 64)), Definition: definition("echo", "v1")}
 			mount := func(value ToolRegistration) *Mount {
 				mounted, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error { return registrar.Tool(value) }))
 				if err != nil {
@@ -149,4 +180,13 @@ func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
 			assertResumePlanDrift(t, registry, "session-a", persisted)
 		})
 	}
+}
+
+func mustToolSourceIdentity(t *testing.T, schemaHash, executorHash string) ToolSourceIdentity {
+	t.Helper()
+	identity, err := NewToolSourceIdentity(schemaHash, executorHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
 }

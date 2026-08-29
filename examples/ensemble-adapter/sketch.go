@@ -64,7 +64,7 @@ const (
 
 // MappedEvent is the planned eino-agent projection for one ensemble event.
 type MappedEvent struct {
-	RuntimeEvent runtime.Event
+	RuntimeEvent session.EventRecord
 	Disposition  Disposition
 	Observation  string
 }
@@ -73,15 +73,15 @@ type MappedEvent struct {
 // runtime event vocabulary. It is illustrative: a production adapter must add
 // ID generation, store persistence, and AG-UI bridge wiring around this mapping.
 func MapRunEvent(event RunEvent) MappedEvent {
-	base := runtime.Event{
+	base := session.EventRecord{
 		SessionID: session.ID(first(event.ThreadID, event.SessionID)),
 		RunID:     session.RunID(event.RunAttemptID),
-		Usage: runtime.Usage{
+		Usage: session.Usage{
 			InputTokens:  event.InputTokens,
 			OutputTokens: event.OutputTokens,
 		},
-		Payload: payload(event),
-		Time:    event.Time,
+		Payload:   payload(event),
+		CreatedAt: event.Time,
 	}
 	switch event.Kind {
 	case EventRunStarted:

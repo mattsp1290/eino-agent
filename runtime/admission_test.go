@@ -294,12 +294,11 @@ func testRunAdmission() admissionRequest {
 }
 
 type capturingSink struct {
-	events []Event
+	events []session.EventRecord
 }
 
-func (s *capturingSink) Emit(_ context.Context, event Event) error {
+func (s *capturingSink) Emit(_ context.Context, event session.EventRecord) {
 	s.events = append(s.events, event)
-	return nil
 }
 
 type admissionStore struct {

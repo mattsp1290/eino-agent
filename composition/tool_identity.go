@@ -15,6 +15,32 @@ const (
 	toolExecutorIdentityVersion = "eino-agent-tool-executor-v2"
 )
 
+// ToolSourceIdentity is the immutable upstream schema and executor identity
+// for an adapter-supplied tool. Its zero value means no upstream identity.
+type ToolSourceIdentity struct {
+	schemaHash   string
+	executorHash string
+}
+
+// NewToolSourceIdentity validates and binds the two halves of an upstream
+// tool identity.
+func NewToolSourceIdentity(schemaHash, executorHash string) (ToolSourceIdentity, error) {
+	if !validSHA256Hex(schemaHash) || !validSHA256Hex(executorHash) {
+		return ToolSourceIdentity{}, fmt.Errorf("%w: invalid tool source identity", extension.ErrInvalidRegistration)
+	}
+	return ToolSourceIdentity{schemaHash: schemaHash, executorHash: executorHash}, nil
+}
+
+func (identity ToolSourceIdentity) validate() error {
+	if identity == (ToolSourceIdentity{}) {
+		return nil
+	}
+	if !validSHA256Hex(identity.schemaHash) || !validSHA256Hex(identity.executorHash) {
+		return fmt.Errorf("%w: invalid tool source identity", extension.ErrInvalidRegistration)
+	}
+	return nil
+}
+
 func composedToolSchemaHash(registration ToolRegistration) (string, error) {
 	definitionHash, err := toolSchemaHash(registration.Definition)
 	if err != nil {
@@ -25,7 +51,7 @@ func composedToolSchemaHash(registration ToolRegistration) (string, error) {
 		SourceHash     string `json:"source_hash"`
 		DefinitionHash string `json:"definition_hash"`
 	}{
-		Version: toolSchemaIdentityVersion, SourceHash: registration.SourceSchemaHash,
+		Version: toolSchemaIdentityVersion, SourceHash: registration.SourceIdentity.schemaHash,
 		DefinitionHash: definitionHash,
 	})
 }
@@ -45,19 +71,6 @@ func hashToolIdentity(value any) (string, error) {
 	}
 	digest := sha256.Sum256(raw)
 	return hex.EncodeToString(digest[:]), nil
-}
-
-func validateToolSourceIdentity(schemaHash, executorHash string) error {
-	if schemaHash == "" && executorHash == "" {
-		return nil
-	}
-	if schemaHash == "" || executorHash == "" {
-		return fmt.Errorf("%w: tool source schema and executor hashes must be supplied together", extension.ErrInvalidRegistration)
-	}
-	if !validSHA256Hex(schemaHash) || !validSHA256Hex(executorHash) {
-		return fmt.Errorf("%w: invalid tool source identity", extension.ErrInvalidRegistration)
-	}
-	return nil
 }
 
 func validSHA256Hex(value string) bool {

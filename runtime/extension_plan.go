@@ -35,27 +35,35 @@ type RunPlanProvider interface {
 }
 
 type PlanTool struct {
-	Identity session.ToolPlanIdentity
-	Resolve  func(context.Context, ToolScopeContext) (Tool, error)
+	Name, RegistrationID     string
+	Scope                    extension.Scope
+	SchemaHash, ExecutorHash string
+	Order                    int
+	Resolve                  func(context.Context, ToolScopeContext) (Tool, error)
 }
 
-// PlanPrompt binds one prompt implementation to its persisted identity.
+// PlanPrompt binds one prompt implementation to its registration.
 type PlanPrompt struct {
-	Identity session.PromptPlanIdentity
-	Provider PromptProvider
+	Name, RegistrationID string
+	Scope                extension.Scope
+	Order                int
+	Provider             PromptProvider
 }
 
-// PlanGuard binds one tool guard implementation to its persisted identity.
+// PlanGuard binds one tool guard implementation to its registration.
 type PlanGuard struct {
-	Identity session.GuardPlanIdentity
-	Guard    ToolGuard
+	RegistrationID string
+	Scope          extension.Scope
+	Order          int
+	Guard          ToolGuard
 }
 
-// PlanRestriction binds one tool restriction policy to its persisted identity.
+// PlanRestriction binds one tool restriction policy to its registration.
 type PlanRestriction struct {
-	Identity session.RestrictionPlanIdentity
-	Allowed  []string
-	Denied   []string
+	RegistrationID string
+	Scope          extension.Scope
+	Allowed        []string
+	Denied         []string
 }
 
 type PlanComponent struct {
@@ -68,23 +76,25 @@ type PlanComponent struct {
 
 // RunPlanSpec is unfingerprinted, component-owned behavior evidence.
 type RunPlanSpec struct {
+	SessionID  session.ID
 	Dispatch   *extension.Plan
 	Components []PlanComponent
 }
 
 // RunPlan is the immutable executable state for one run.
 type RunPlan struct {
-	dispatch *extension.Plan
-	tools    sealedPlanTools
-	prompts  []MountedPrompt
-	guards   []MountedToolGuard
-	sealed   session.SealedExtensionPlan
-	once     sync.Once
+	dispatch  *extension.Plan
+	sessionID session.ID
+	tools     sealedPlanTools
+	prompts   []MountedPrompt
+	guards    []MountedToolGuard
+	sealed    session.SealedExtensionPlan
+	once      sync.Once
 }
 
-// NewRunPlan validates identity-bound behavior and seals its descriptor.
+// NewRunPlan derives durable identity from registered behavior and seals it.
 func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
-	plan := &RunPlan{dispatch: spec.Dispatch}
+	plan := &RunPlan{dispatch: spec.Dispatch, sessionID: spec.SessionID}
 	fail := func(err error) (*RunPlan, error) {
 		plan.release()
 		return nil, err
@@ -107,6 +117,9 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		}
 		durable := session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
 		for _, handler := range owned.Handlers {
+			if err := validatePlanScope(spec.SessionID, handler.Scope); err != nil {
+				return fail(err)
+			}
 			durable.Handlers = append(durable.Handlers, session.RegistrationIdentity{ID: handler.ID, Contract: handler.Contract.ID, Version: handler.Contract.Version, Order: handler.Order, Scope: handler.Scope, Kind: handler.Kind})
 		}
 		componentOwners[owned.Component.InstanceID] = owned.Component
@@ -140,38 +153,50 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			componentOwners[owned.Component.InstanceID] = owned.Component
 		}
 		for _, capability := range owned.Tools {
-			if capability.Resolve == nil {
+			if extension.ValidateIdentifier(capability.Name) != nil || extension.ValidateIdentifier(capability.RegistrationID) != nil || capability.SchemaHash == "" || capability.ExecutorHash == "" || capability.Resolve == nil {
 				return fail(fmt.Errorf("%w: tool resolver required", ErrExtensionPlanMismatch))
 			}
+			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
+				return fail(err)
+			}
 			tools = append(tools, ownedTool{owner: owned.Component.InstanceID, value: capability})
-			durable.Tools = append(durable.Tools, capability.Identity)
+			durable.Tools = append(durable.Tools, toolPlanIdentity(capability))
 		}
 		for _, capability := range owned.Prompts {
-			if capability.Provider == nil || capability.Identity.Name == "" {
+			if extension.ValidateIdentifier(capability.Name) != nil || extension.ValidateIdentifier(capability.RegistrationID) != nil || capability.Name == systemPromptSectionName || capability.Provider == nil {
 				return fail(fmt.Errorf("%w: prompt behavior required", ErrExtensionPlanMismatch))
 			}
-			prompts = append(prompts, MountedPrompt{Name: capability.Identity.Name, ID: capability.Identity.RegistrationID, Scope: capability.Identity.Scope, Order: capability.Identity.Order, InstanceID: owned.Component.InstanceID, Provider: capability.Provider})
-			durable.Prompts = append(durable.Prompts, capability.Identity)
+			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
+				return fail(err)
+			}
+			prompts = append(prompts, MountedPrompt{Name: capability.Name, ID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order, InstanceID: owned.Component.InstanceID, Provider: capability.Provider})
+			durable.Prompts = append(durable.Prompts, session.PromptPlanIdentity{Name: capability.Name, RegistrationID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order})
 		}
 		for _, capability := range owned.Guards {
-			if capability.Guard == nil || capability.Identity.RegistrationID == "" {
+			if extension.ValidateIdentifier(capability.RegistrationID) != nil || capability.Guard == nil {
 				return fail(fmt.Errorf("%w: guard behavior required", ErrExtensionPlanMismatch))
 			}
-			guards = append(guards, MountedToolGuard{ID: capability.Identity.RegistrationID, Order: capability.Identity.Order, InstanceID: owned.Component.InstanceID, Scope: capability.Identity.Scope, Guard: capability.Guard})
-			durable.Guards = append(durable.Guards, capability.Identity)
+			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
+				return fail(err)
+			}
+			guards = append(guards, MountedToolGuard{ID: capability.RegistrationID, Order: capability.Order, InstanceID: owned.Component.InstanceID, Scope: capability.Scope, Guard: capability.Guard})
+			durable.Guards = append(durable.Guards, session.GuardPlanIdentity{RegistrationID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order})
 		}
 		for _, capability := range owned.Restrictions {
+			if extension.ValidateIdentifier(capability.RegistrationID) != nil {
+				return fail(fmt.Errorf("%w: invalid restriction registration", ErrExtensionPlanMismatch))
+			}
+			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
+				return fail(err)
+			}
 			rules, err := CanonicalizeRestrictionRules(capability.Allowed, capability.Denied)
 			if err != nil {
 				return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
 			}
-			if capability.Identity.RulesHash != rules.Hash {
-				return fail(fmt.Errorf("%w: restriction identity does not match behavior", ErrExtensionPlanMismatch))
-			}
 			capability.Allowed = rules.Allowed
 			capability.Denied = rules.Denied
 			restrictions = append(restrictions, ownedRestriction{owner: owned.Component.InstanceID, value: capability})
-			durable.Restrictions = append(durable.Restrictions, capability.Identity)
+			durable.Restrictions = append(durable.Restrictions, session.RestrictionPlanIdentity{RegistrationID: capability.RegistrationID, Scope: capability.Scope, RulesHash: rules.Hash})
 		}
 		durableComponents[owned.Component.InstanceID] = durable
 	}
@@ -184,13 +209,27 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		descriptor.Components = append(descriptor.Components, durableComponents[instanceID])
 	}
 	sort.Slice(tools, func(i, j int) bool {
-		return comparePlanTool(tools[i].owner, tools[i].value.Identity, tools[j].owner, tools[j].value.Identity) < 0
+		return comparePlanTool(tools[i].owner, toolPlanIdentity(tools[i].value), tools[j].owner, toolPlanIdentity(tools[j].value)) < 0
 	})
 	sort.Slice(prompts, func(i, j int) bool { return compareMountedPrompt(prompts[i], prompts[j]) < 0 })
 	sort.Slice(guards, func(i, j int) bool { return compareMountedGuard(guards[i], guards[j]) < 0 })
 	sort.Slice(restrictions, func(i, j int) bool {
-		return comparePlanRestriction(restrictions[i].owner, restrictions[i].value.Identity, restrictions[j].owner, restrictions[j].value.Identity) < 0
+		return comparePlanRestriction(restrictions[i].owner, restrictions[i].value, restrictions[j].owner, restrictions[j].value) < 0
 	})
+	toolNames := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		if toolNames[tool.value.Name] {
+			return fail(fmt.Errorf("%w: duplicate tool name %q", ErrExtensionPlanMismatch, tool.value.Name))
+		}
+		toolNames[tool.value.Name] = true
+	}
+	promptNames := make(map[string]bool, len(prompts))
+	for _, prompt := range prompts {
+		if promptNames[prompt.Name] {
+			return fail(fmt.Errorf("%w: duplicate prompt name %q", ErrExtensionPlanMismatch, prompt.Name))
+		}
+		promptNames[prompt.Name] = true
+	}
 	sealedTools := make([]PlanTool, len(tools))
 	sealedPrompts := make([]MountedPrompt, len(prompts))
 	sealedGuards := make([]MountedToolGuard, len(guards))
@@ -212,6 +251,23 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	plan.guards = sealedGuards
 	plan.sealed = sealed
 	return plan, nil
+}
+
+func validatePlanScope(sessionID session.ID, scope extension.Scope) error {
+	if err := extension.ValidateScope(scope); err != nil {
+		return fmt.Errorf("%w: invalid capability scope", ErrExtensionPlanMismatch)
+	}
+	if scope.Kind == extension.ScopeSession && (sessionID == "" || scope.Key != string(sessionID)) {
+		return fmt.Errorf("%w: session scope does not match plan session", ErrExtensionPlanMismatch)
+	}
+	return nil
+}
+
+func toolPlanIdentity(capability PlanTool) session.ToolPlanIdentity {
+	return session.ToolPlanIdentity{
+		Name: capability.Name, RegistrationID: capability.RegistrationID, Scope: capability.Scope,
+		SchemaHash: capability.SchemaHash, ExecutorHash: capability.ExecutorHash, Order: capability.Order,
+	}
 }
 
 func comparePlanTool(leftOwner string, left session.ToolPlanIdentity, rightOwner string, right session.ToolPlanIdentity) int {
@@ -250,10 +306,10 @@ func compareMountedGuard(left, right MountedToolGuard) int {
 	return 0
 }
 
-func comparePlanRestriction(leftOwner string, left session.RestrictionPlanIdentity, rightOwner string, right session.RestrictionPlanIdentity) int {
+func comparePlanRestriction(leftOwner string, left PlanRestriction, rightOwner string, right PlanRestriction) int {
 	for _, result := range []int{
 		cmp.Compare(leftOwner, rightOwner), cmp.Compare(left.RegistrationID, right.RegistrationID), compareExecutionScope(left.Scope, right.Scope),
-		cmp.Compare(left.RulesHash, right.RulesHash),
+		cmp.Compare(strings.Join(left.Allowed, "\x00"), strings.Join(right.Allowed, "\x00")), cmp.Compare(strings.Join(left.Denied, "\x00"), strings.Join(right.Denied, "\x00")),
 	} {
 		if result != 0 {
 			return result
@@ -338,7 +394,7 @@ func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContex
 		if err != nil {
 			return nil, err
 		}
-		expected := capability.Identity.Name
+		expected := capability.Name
 		if tool.Name == "" || tool.Name != expected || seen[tool.Name] {
 			return nil, fmt.Errorf("%w: sealed tool resolver returned %q for %q", ErrExtensionPlanMismatch, tool.Name, expected)
 		}
@@ -424,7 +480,7 @@ func (o *StreamingOrchestrator) acquireRunPlan(ctx context.Context, request RunP
 	if err != nil {
 		return nil, err
 	}
-	if plan == nil || plan.sealed.Fingerprint() == "" {
+	if plan == nil || plan.sealed.Fingerprint() == "" || plan.sessionID != "" && plan.sessionID != request.SessionID {
 		if plan != nil {
 			plan.release()
 		}

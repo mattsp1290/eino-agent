@@ -366,7 +366,7 @@ func TestExecuteResumeRecoversOrchestrationPanicAndSettlesOnce(t *testing.T) {
 	}
 }
 
-func countEvents(events []Event, kind EventKind) int {
+func countEvents(events []session.EventRecord, kind string) int {
 	var count int
 	for _, event := range events {
 		if event.Kind == kind {

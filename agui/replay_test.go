@@ -55,13 +55,13 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 		done <- err
 	}()
 	<-tail.subscribed
-	tail.events <- runtime.Event{
+	tail.events <- session.EventRecord{
 		Kind:      runtime.EventRunFinished,
-		EventID:   "evt-finished",
+		ID:        "evt-finished",
 		SessionID: "session-replay",
 		MessageID: "assistant-1",
 	}
-	tail.events <- runtime.Event{
+	tail.events <- session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
 		SessionID: "session-replay",
 		MessageID: "assistant-1",
@@ -93,7 +93,7 @@ func TestReconnectReportsTailOverflow(t *testing.T) {
 		done <- err
 	}()
 	<-tail.subscribed
-	tail.events <- runtime.Event{Kind: runtime.EventTailOverflow, SessionID: "session-replay"}
+	tail.events <- session.EventRecord{Kind: runtime.EventTailOverflow, SessionID: "session-replay"}
 	if err := <-done; !errors.Is(err, ErrTailOverflow) {
 		t.Fatalf("Reconnect err = %v, want ErrTailOverflow", err)
 	}
@@ -165,20 +165,20 @@ func replayStore(t *testing.T) session.Store {
 }
 
 type replayTail struct {
-	events     chan runtime.Event
+	events     chan session.EventRecord
 	subscribed chan struct{}
 	canceled   chan struct{}
 }
 
 func newReplayTail() *replayTail {
 	return &replayTail{
-		events:     make(chan runtime.Event),
+		events:     make(chan session.EventRecord),
 		subscribed: make(chan struct{}),
 		canceled:   make(chan struct{}),
 	}
 }
 
-func (t *replayTail) Subscribe(ctx context.Context, _ session.ID) (<-chan runtime.Event, error) {
+func (t *replayTail) Subscribe(ctx context.Context, _ session.ID) (<-chan session.EventRecord, error) {
 	close(t.subscribed)
 	go func() {
 		<-ctx.Done()

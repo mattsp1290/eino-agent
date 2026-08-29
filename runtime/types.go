@@ -41,7 +41,7 @@ type Result struct {
 	// observability path sums onto the run span. It is surfaced on the
 	// EventRunFinished event so EventSink consumers can persist token totals
 	// without reading the OTel span.
-	Usage Usage
+	Usage session.Usage
 }
 
 // Orchestrator owns run admission, locking, streaming, interruption, and
@@ -203,58 +203,32 @@ type ApprovalRequester interface {
 	Ask(ctx context.Context, request ApprovalRequest) error
 }
 
-// EventKind classifies internal runtime events before transport adaptation.
-type EventKind string
-
 const (
 	// EventRunStarted is emitted after durable run admission.
-	EventRunStarted EventKind = "run_started"
+	EventRunStarted = "run_started"
 	// EventMessageDelta is emitted for live-only model deltas.
-	EventMessageDelta EventKind = "message_delta"
+	EventMessageDelta = "message_delta"
 	// EventToolCallUpdated is emitted for tool-call state transitions.
-	EventToolCallUpdated EventKind = "tool_call_updated"
+	EventToolCallUpdated = "tool_call_updated"
 	// EventRunFinished is emitted after durable run settlement.
-	EventRunFinished EventKind = EventKind(session.RunSettlementEventKind)
+	EventRunFinished = session.RunSettlementEventKind
 	// EventTailOverflow reports that a reconnect live-tail subscriber fell
 	// behind a bounded queue and must reconnect or resync.
-	EventTailOverflow EventKind = "tail_overflow"
+	EventTailOverflow = "tail_overflow"
 )
-
-// Event is the internal event envelope consumed by AG-UI and observability
-// adapters. Durable stores remain authoritative for replay.
-type Event struct {
-	Kind        EventKind
-	EventID     session.EventID
-	SessionID   session.ID
-	RunID       session.RunID
-	MessageID   session.MessageID
-	PartID      session.PartID
-	ToolCallID  session.ToolCallID
-	EpochID     session.EpochID
-	ProviderID  string
-	ModelID     string
-	ParentID    string
-	Correlation string
-	Usage       Usage
-	Error       EventError
-	Redaction   RedactionClass
-	Payload     json.RawMessage
-	Time        time.Time
-	LiveOnly    bool
-}
 
 // EventSink receives transport and observability copies of internal runtime
 // events. It has no durable-store authority; runtime persists durable events
 // through the current run's fenced ExecutionStore before publication.
 type EventSink interface {
-	Emit(ctx context.Context, event Event) error
+	Emit(ctx context.Context, event session.EventRecord)
 }
 
 // EventSinkFunc adapts a function into an EventSink.
-type EventSinkFunc func(context.Context, Event) error
+type EventSinkFunc func(context.Context, session.EventRecord)
 
 // Emit calls fn.
-func (fn EventSinkFunc) Emit(ctx context.Context, event Event) error { return fn(ctx, event) }
+func (fn EventSinkFunc) Emit(ctx context.Context, event session.EventRecord) { fn(ctx, event) }
 
 var _ EventSink = EventSinkFunc(nil)
 
@@ -266,33 +240,3 @@ func cloneSlice[T any](src []T) []T {
 	copy(dst, src)
 	return dst
 }
-
-// Usage records provider usage data in a transport-neutral form.
-type Usage struct {
-	InputTokens      int64
-	OutputTokens     int64
-	ReasoningTokens  int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	Cost             float64
-}
-
-// EventError records stable error classification without requiring adapters to
-// parse opaque payload JSON.
-type EventError struct {
-	Code      string
-	Message   string
-	Retryable bool
-}
-
-// RedactionClass classifies event payload sensitivity for observability sinks.
-type RedactionClass string
-
-const (
-	// RedactionNone marks payloads safe for direct export.
-	RedactionNone RedactionClass = "none"
-	// RedactionMetadata marks payloads where metadata can export but content cannot.
-	RedactionMetadata RedactionClass = "metadata"
-	// RedactionContent marks payloads containing user, model, or tool content.
-	RedactionContent RedactionClass = "content"
-)

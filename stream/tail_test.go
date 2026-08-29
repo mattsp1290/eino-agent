@@ -19,13 +19,9 @@ func TestTailContinuesLiveEventsForSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Subscribe error = %v", err)
 	}
-	if err := tail.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunStarted, SessionID: "other"}); err != nil {
-		t.Fatalf("emit other: %v", err)
-	}
-	want := runtime.Event{Kind: runtime.EventMessageDelta, SessionID: "session-1", MessageID: "msg-1"}
-	if err := tail.Emit(context.Background(), want); err != nil {
-		t.Fatalf("emit wanted: %v", err)
-	}
+	tail.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted, SessionID: "other"})
+	want := session.EventRecord{Kind: runtime.EventMessageDelta, SessionID: "session-1", MessageID: "msg-1"}
+	tail.Emit(context.Background(), want)
 	select {
 	case got := <-events:
 		if got.Kind != want.Kind || got.SessionID != want.SessionID || got.MessageID != want.MessageID {
@@ -45,8 +41,8 @@ func TestTailDisconnectsSlowSubscriberWhenQueueBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Subscribe error = %v", err)
 	}
-	_ = tail.Emit(context.Background(), runtime.Event{Kind: runtime.EventMessageDelta, SessionID: "session-1"})
-	_ = tail.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunFinished, SessionID: "session-1"})
+	tail.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, SessionID: "session-1"})
+	tail.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunFinished, SessionID: "session-1"})
 	if event, ok := <-events; !ok || event.Kind != runtime.EventTailOverflow || !event.LiveOnly {
 		t.Fatalf("overflow event = %+v ok=%t, want tail overflow", event, ok)
 	}
@@ -64,6 +60,26 @@ func TestTailRejectsCanceledSubscription(t *testing.T) {
 	cancel()
 	if _, err := tail.Subscribe(ctx, "session-1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Subscribe err = %v, want context canceled", err)
+	}
+}
+
+func TestTailClonesPayloadForEverySubscriber(t *testing.T) {
+	tail := NewTail(2)
+	defer tail.Close()
+	first, err := tail.Subscribe(context.Background(), "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := tail.Subscribe(context.Background(), "session-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, SessionID: "session-1", Payload: []byte(`{"value":"original"}`)})
+	firstEvent := <-first
+	secondEvent := <-second
+	copy(firstEvent.Payload, []byte(`{"value":"mutated!"}`))
+	if string(secondEvent.Payload) != `{"value":"original"}` {
+		t.Fatalf("second subscriber payload = %s", secondEvent.Payload)
 	}
 }
 
@@ -95,7 +111,7 @@ func TestTailImplementsAGUIReplayInterface(t *testing.T) {
 	t.Parallel()
 
 	type replayTail interface {
-		Subscribe(context.Context, session.ID) (<-chan runtime.Event, error)
+		Subscribe(context.Context, session.ID) (<-chan session.EventRecord, error)
 	}
 	var _ replayTail = (*Tail)(nil)
 }

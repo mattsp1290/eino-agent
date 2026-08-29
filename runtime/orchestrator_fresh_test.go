@@ -128,10 +128,10 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	runtimeSink := &capturingSink{}
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "admission-events", Artifact: extension.Artifact{Name: "admission-events", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
-	var published []EventKind
+	var published []string
 	var order []string
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event session.EventRecord) error {
 			published = append(published, event.Kind)
 			if event.Kind == EventRunStarted {
 				order = append(order, "event-published")
@@ -190,6 +190,40 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 		}
 	}
 }
+
+func TestAdmissionSinkPanicDoesNotPreventRunOrExtensionNotification(t *testing.T) {
+	store := newAdmissionStore()
+	registry := newTestExtensionRegistry(nil)
+	var published []string
+	mount, err := registry.Mount(context.Background(), testExtensionComponent("panicking-admission-sink"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event session.EventRecord) error {
+			published = append(published, event.Kind)
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	}), WithEventSink(panickingEventSink{}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted || result.Error != nil {
+		t.Fatalf("result = %+v", result)
+	}
+	if len(published) < 2 || published[0] != EventRunStarted {
+		t.Fatalf("published events = %v", published)
+	}
+}
+
+type panickingEventSink struct{}
+
+func (panickingEventSink) Emit(context.Context, session.EventRecord) { panic("sink failed") }
 
 func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T) {
 	t.Parallel()

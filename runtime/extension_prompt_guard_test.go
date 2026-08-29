@@ -17,8 +17,8 @@ import (
 func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", EpochID: "epoch", SystemPrompt: "configured"}
 	plan := mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{
-		{Component: testPlanComponent("b"), Prompts: []PlanPrompt{{Identity: testPromptIdentity("z", "b", 10), Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil })}}},
-		{Component: testPlanComponent("a"), Prompts: []PlanPrompt{{Identity: testPromptIdentity("a", "a", -10), Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil })}}},
+		{Component: testPlanComponent("b"), Prompts: []PlanPrompt{testPlanPrompt("z", 10, PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "last", nil }))}},
+		{Component: testPlanComponent("a"), Prompts: []PlanPrompt{testPlanPrompt("a", -10, PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "first", nil }))}},
 	}})
 	orchestrator := mustConfiguredOrchestrator()
 	text, err := orchestrator.renderSystemPrompt(context.Background(), plan, snapshot, 1, 2)
@@ -47,14 +47,14 @@ func TestFallbackModelPrependsSystemWithoutReorderingDurableMessages(t *testing.
 func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 	var sequence []string
 	plan := mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{{Component: testPlanComponent("test-guards"), Guards: []PlanGuard{
-		{Identity: testGuardIdentityAt("deny", 0), Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+		testPlanGuard("deny", 0, ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "deny")
 			return ToolGuardResult{Decision: ToolGuardDeny, Message: "blocked"}, nil
-		})},
-		{Identity: testGuardIdentityAt("audit", 1), Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+		})),
+		testPlanGuard("audit", 1, ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
 			sequence = append(sequence, "audit")
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
-		})},
+		})),
 	}}}})
 	permissionsCalled := false
 	executed := false
@@ -75,17 +75,17 @@ func TestMountedGuardsAllRunAndDenyBeforePermissions(t *testing.T) {
 func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 	original := ToolCall{SessionID: "session", RunID: "run", Input: json.RawMessage(`{"op":"delete"}`), Scope: ToolScope{Permissions: []string{"write"}}}
 	plan := mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{{Component: testPlanComponent("test-guards"), Guards: []PlanGuard{
-		{Identity: testGuardIdentityAt("mutate", 0), Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+		testPlanGuard("mutate", 0, ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			copy(request.Call.Input, json.RawMessage(`{"op":"hidden"}`))
 			copy(request.Call.Scope.Permissions, []string{"audit"})
 			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
-		})},
-		{Identity: testGuardIdentityAt("deny-original", 1), Guard: ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
+		})),
+		testPlanGuard("deny-original", 1, ToolGuardFunc(func(_ context.Context, request ToolGuardRequest) (ToolGuardResult, error) {
 			if string(request.Call.Input) != `{"op":"delete"}` || !reflect.DeepEqual(request.Call.Scope.Permissions, []string{"write"}) {
 				return ToolGuardResult{}, errors.New("guard received mutated input")
 			}
 			return ToolGuardResult{Decision: ToolGuardDeny}, nil
-		})},
+		})),
 	}}}})
 	decision, err := evaluateToolGuards(context.Background(), plan, Tool{Name: "danger"}, original)
 	if err != nil || decision.Decision != ToolGuardDeny {

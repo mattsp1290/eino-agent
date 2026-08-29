@@ -27,7 +27,7 @@ func registerContextSource(registrar extension.Registrar, spec extension.Registr
 
 // registerEventSink adapts event-sink@0.1.0 to immutable runtime event
 // observation. Infrastructure event delivery remains a separate EventSink.
-func registerEventSink(registrar extension.Registrar, spec extension.Registration, sink runtime.EventSink) error {
+func registerEventSink(registrar extension.Registrar, spec extension.Registration, sink *loadedEventSink) error {
 	if sink == nil {
 		return fmt.Errorf("nil Wasm event sink")
 	}

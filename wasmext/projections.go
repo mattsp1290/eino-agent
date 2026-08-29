@@ -11,6 +11,7 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
 
@@ -30,7 +31,7 @@ func boundedEventSize(event wittypes.BoundedEvent) int {
 	return len(event.Kind) + len(event.SessionID) + len(event.RunID) + len(event.MessageID) + len(event.ToolCallID) + len(event.EpochID) + len(event.PayloadSummary)
 }
 
-func boundedEventSummary(event runtime.Event, limit int64) string {
+func boundedEventSummary(event session.EventRecord, limit int64) string {
 	summary := fmt.Sprintf("payload_bytes=%d redaction=%s live_only=%t", len(event.Payload), event.Redaction, event.LiveOnly)
 	if int64(len(summary)) > limit {
 		return summary[:limit]

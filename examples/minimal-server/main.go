@@ -399,8 +399,8 @@ type eventSink struct {
 	tail *stream.Tail
 }
 
-func (s eventSink) Emit(ctx context.Context, event runtime.Event) error {
-	return s.tail.Emit(ctx, event)
+func (s eventSink) Emit(ctx context.Context, event session.EventRecord) {
+	s.tail.Emit(ctx, event)
 }
 
 type sequenceIDs struct {

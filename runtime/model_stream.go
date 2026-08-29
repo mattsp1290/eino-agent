@@ -113,12 +113,12 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		receivedDelta = true
 		o.observeStreamChunk(obsStream, int64(len(chunks)))
 		chunks = append(chunks, delta.Message)
-		if err := queue.emit(Event{
+		if err := queue.emit(session.EventRecord{
 			Kind: EventMessageDelta, SessionID: snapshot.SessionID, RunID: snapshot.RunID,
 			MessageID: messageID, EpochID: snapshot.EpochID,
 			ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
 			Payload:  mustJSON(map[string]string{"content": delta.Message.Content, "reasoning": delta.Message.ReasoningContent}),
-			LiveOnly: true, Time: o.now(),
+			LiveOnly: true, CreatedAt: o.now(),
 		}); err != nil {
 			streamErr = err
 			return nil, receivedDelta, err

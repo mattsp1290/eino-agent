@@ -124,19 +124,18 @@ func (s *sequenceIDs) NewEpochID() session.EpochID { return session.EpochID(s.ne
 
 type blockingSink struct {
 	mu     sync.Mutex
-	events []Event
+	events []session.EventRecord
 	delay  time.Duration
 }
 
-func (s *blockingSink) Emit(_ context.Context, event Event) error {
+func (s *blockingSink) Emit(_ context.Context, event session.EventRecord) {
 	time.Sleep(s.delay)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.events = append(s.events, event)
-	return nil
 }
 
-func (s *blockingSink) count(kind EventKind) int {
+func (s *blockingSink) count(kind string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var count int
@@ -148,10 +147,10 @@ func (s *blockingSink) count(kind EventKind) int {
 	return count
 }
 
-type blockingSinkFunc func(context.Context, Event) error
+type blockingSinkFunc func(context.Context, session.EventRecord)
 
-func (f blockingSinkFunc) Emit(ctx context.Context, event Event) error {
-	return f(ctx, event)
+func (f blockingSinkFunc) Emit(ctx context.Context, event session.EventRecord) {
+	f(ctx, event)
 }
 
 type staticToolRegistry struct {

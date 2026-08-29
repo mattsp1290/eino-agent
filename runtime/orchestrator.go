@@ -515,15 +515,15 @@ func statusForError(err error) session.RunStatus {
 	return session.RunFailed
 }
 
-func eventError(err error) EventError {
+func eventError(err error) session.EventError {
 	if err == nil {
-		return EventError{}
+		return session.EventError{}
 	}
 	var providerErr model.Error
 	if errors.As(err, &providerErr) {
-		return EventError{Code: providerErr.Code, Message: providerErr.Message, Retryable: providerErr.Retryable}
+		return session.EventError{Code: providerErr.Code, Message: providerErr.Message, Retryable: providerErr.Retryable}
 	}
-	return EventError{Message: err.Error()}
+	return session.EventError{Message: err.Error()}
 }
 
 type toolCallPayload struct {

@@ -317,7 +317,9 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	}
 	defer dispatch.Release()
 	spec := testDispatchPlanSpec(dispatch)
-	spec.Components = append(spec.Components, PlanComponent{Component: testPlanComponent("test-tools"), Tools: []PlanTool{{Identity: testToolIdentity("echo"), Resolve: func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil }}}})
+	tool := testPlanTool("echo")
+	tool.Resolve = func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil }
+	spec.Components = append(spec.Components, PlanComponent{Component: testPlanComponent("test-tools"), Tools: []PlanTool{tool}})
 	plan := mustTestRunPlan(spec)
 	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
 	host := mustConfiguredOrchestrator()

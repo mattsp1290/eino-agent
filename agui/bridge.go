@@ -49,9 +49,9 @@ func (b *Bridge) EncErr() error {
 }
 
 // Emit implements runtime.EventSink.
-func (b *Bridge) Emit(_ context.Context, event runtime.Event) error {
+func (b *Bridge) Emit(_ context.Context, event session.EventRecord) {
 	if b == nil || b.emit == nil {
-		return nil
+		return
 	}
 	switch event.Kind {
 	case runtime.EventRunStarted:
@@ -73,7 +73,6 @@ func (b *Bridge) Emit(_ context.Context, event runtime.Event) error {
 			b.emit.RunFinishedSuccess()
 		}
 	}
-	return b.Err()
 }
 
 // MessagesSnapshot converts Eino messages with eino-agui/convert before
@@ -140,7 +139,7 @@ func (b *Bridge) ReasoningEncryptedValue(subtype aguievents.ReasoningEncryptedVa
 	b.emit.ReasoningEncryptedValue(subtype, entityID, encryptedValue)
 }
 
-func (b *Bridge) emitMessageDelta(event runtime.Event) {
+func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	payload := messageDeltaPayload{}
 	_ = json.Unmarshal(event.Payload, &payload)
 	messageID := event.MessageID
@@ -172,7 +171,7 @@ func (b *Bridge) emitMessageDelta(event runtime.Event) {
 	}
 }
 
-func (b *Bridge) emitToolCallUpdated(event runtime.Event) {
+func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 	payload := toolPayload{}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		b.emit.RunError(err.Error())

@@ -16,9 +16,10 @@ import (
 )
 
 const (
-	OrderHostPolicy  = -1000
-	OrderRuntime     = 0
-	OrderApplication = 1000
+	OrderHostPolicy         = -1000
+	OrderRuntime            = 0
+	OrderApplication        = 1000
+	systemPromptSectionName = "agent/system"
 )
 
 type PromptContext struct {
@@ -120,7 +121,7 @@ type MessageRoleCounts struct {
 func (o *StreamingOrchestrator) renderSystemPrompt(ctx context.Context, plan *RunPlan, snapshot TurnSnapshot, attempt, step int) (string, error) {
 	sections := make([]promptSection, 0)
 	if snapshot.SystemPrompt != "" {
-		sections = append(sections, promptSection{Name: "agent/system", Order: OrderRuntime, Text: snapshot.SystemPrompt, InstanceID: "runtime"})
+		sections = append(sections, promptSection{Name: systemPromptSectionName, Order: OrderRuntime, Text: snapshot.SystemPrompt, InstanceID: "runtime"})
 	}
 	if plan != nil {
 		promptContext := PromptContext{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Attempt: attempt, Step: step, AgentName: snapshot.Config.Agent.Name, ProviderID: string(snapshot.Model.Provider.ID), ModelID: string(snapshot.Model.Model.ID)}
@@ -147,12 +148,7 @@ func (o *StreamingOrchestrator) renderSystemPrompt(ctx context.Context, plan *Ru
 		return sections[i].InstanceID < sections[j].InstanceID
 	})
 	parts := make([]string, 0, len(sections))
-	seen := make(map[string]bool, len(sections))
 	for _, section := range sections {
-		if seen[section.Name] {
-			return "", fmt.Errorf("duplicate prompt section %q", section.Name)
-		}
-		seen[section.Name] = true
 		parts = append(parts, section.Text)
 	}
 	return strings.Join(parts, "\n\n"), nil

@@ -58,7 +58,7 @@ type ModelCompletedNotice struct {
 	MessageID session.MessageID
 	Attempt   int
 	Step      int
-	Usage     Usage
+	Usage     session.Usage
 	Error     ClassifiedError
 }
 
@@ -144,7 +144,7 @@ func cloneToolSettledNotice(value ToolSettledNotice) ToolSettledNotice {
 	return value
 }
 
-func cloneEvent(value Event) Event {
+func cloneEvent(value session.EventRecord) session.EventRecord {
 	value.Payload = cloneJSON(value.Payload)
 	return value
 }

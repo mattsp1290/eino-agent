@@ -25,12 +25,11 @@ func (f InstallerFunc) Install(ctx context.Context, registrar *Registrar) error 
 }
 
 type ToolRegistration struct {
-	ID                 string
-	Order              int
-	Scope              extension.Scope
-	SourceSchemaHash   string
-	SourceExecutorHash string
-	Definition         tools.Definition
+	ID             string
+	Order          int
+	Scope          extension.Scope
+	SourceIdentity ToolSourceIdentity
+	Definition     tools.Definition
 }
 
 type PromptRegistration struct {
@@ -143,7 +142,7 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 	if err := tools.ValidateDefinition(registration.Definition); err != nil {
 		return err
 	}
-	if err := validateToolSourceIdentity(registration.SourceSchemaHash, registration.SourceExecutorHash); err != nil {
+	if err := registration.SourceIdentity.validate(); err != nil {
 		return err
 	}
 	for _, existing := range r.tools {
@@ -156,15 +155,6 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 		return fmt.Errorf("freeze composed tool %q: %w", registration.Definition.Name, err)
 	}
 	registration.Definition = frozen
-	executorHash, err := composedToolExecutorHash(registration.SourceExecutorHash, r.component.Artifact.Hash)
-	if err != nil {
-		return err
-	}
-	registration.Definition.Provenance = tools.Provenance{
-		InstanceID: r.component.InstanceID, ArtifactName: r.component.Artifact.Name,
-		ArtifactVersion: r.component.Artifact.Version, ArtifactHash: r.component.Artifact.Hash,
-		ConfigHash: r.component.Artifact.ConfigHash, ExecutorHash: executorHash,
-	}
 	r.tools = append(r.tools, registration)
 	return nil
 }
@@ -403,11 +393,14 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 				snapshot.Release()
 				return nil, cloneErr
 			}
+			executorHash, hashErr := composedToolExecutorHash(registration.SourceIdentity.executorHash, mounted.component.Artifact.Hash)
+			if hashErr != nil {
+				snapshot.Release()
+				return nil, hashErr
+			}
 			owned.Tools = append(owned.Tools, runtime.PlanTool{
-				Identity: session.ToolPlanIdentity{
-					Name: registration.Definition.Name, RegistrationID: registration.ID, Scope: registration.Scope,
-					SchemaHash: schemaHash, ExecutorHash: registration.Definition.Provenance.ExecutorHash, Order: registration.Order,
-				},
+				Name: registration.Definition.Name, RegistrationID: registration.ID, Scope: registration.Scope,
+				SchemaHash: schemaHash, ExecutorHash: executorHash, Order: registration.Order,
 				Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 					return tools.Materialize(ctx, definition, scope)
 				},
@@ -419,7 +412,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 				continue
 			}
 			owned.Prompts = append(owned.Prompts, runtime.PlanPrompt{
-				Identity: session.PromptPlanIdentity{Name: registration.Name, RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order},
+				Name: registration.Name, RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order,
 				Provider: mountedPromptProvider{callbackContext: mounted.callbackContext, next: registration.Provider},
 			})
 		}
@@ -428,29 +421,24 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 				continue
 			}
 			owned.Guards = append(owned.Guards, runtime.PlanGuard{
-				Identity: session.GuardPlanIdentity{RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order},
-				Guard:    mountedToolGuard{callbackContext: mounted.callbackContext, next: registration.Guard},
+				RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order,
+				Guard: mountedToolGuard{callbackContext: mounted.callbackContext, next: registration.Guard},
 			})
 		}
 		for _, registration := range mounted.payload.restrictions {
 			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
 				continue
 			}
-			rules, rulesErr := runtime.CanonicalizeRestrictionRules(registration.Allowed, registration.Denied)
-			if rulesErr != nil {
-				snapshot.Release()
-				return nil, rulesErr
-			}
 			owned.Restrictions = append(owned.Restrictions, runtime.PlanRestriction{
-				Identity: session.RestrictionPlanIdentity{RegistrationID: registration.ID, Scope: registration.Scope, RulesHash: rules.Hash},
-				Allowed:  rules.Allowed, Denied: rules.Denied,
+				RegistrationID: registration.ID, Scope: registration.Scope,
+				Allowed: registration.Allowed, Denied: registration.Denied,
 			})
 		}
 		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
 			planComponents = append(planComponents, owned)
 		}
 	}
-	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: snapshot.Dispatch(), Components: planComponents})
+	return runtime.NewRunPlan(runtime.RunPlanSpec{SessionID: sessionID, Dispatch: snapshot.Dispatch(), Components: planComponents})
 }
 
 type selectedComponent struct {

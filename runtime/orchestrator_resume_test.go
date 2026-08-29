@@ -103,10 +103,10 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 			var notices []string
 			var publishedIDs []session.EventID
 			mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-				if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+				if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event session.EventRecord) error {
 					if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-resume" {
 						notices = append(notices, "published:"+toolEventStatus(event))
-						publishedIDs = append(publishedIDs, event.EventID)
+						publishedIDs = append(publishedIDs, event.ID)
 					}
 					return nil
 				}); err != nil {
@@ -138,13 +138,11 @@ func TestResumeToolLifecycleNotificationsFollowDurableClaim(t *testing.T) {
 				return ToolResult{Output: "ok"}, nil
 			})}}}
 			var sinkIDs []session.EventID
-			sink := EventSinkFunc(func(_ context.Context, event Event) error {
+			sink := EventSinkFunc(func(_ context.Context, event session.EventRecord) {
 				if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-resume" {
 					notices = append(notices, "sink:"+toolEventStatus(event))
-					sinkIDs = append(sinkIDs, event.EventID)
-					return errors.New("transport unavailable")
+					sinkIDs = append(sinkIDs, event.ID)
 				}
-				return nil
 			})
 			orch := mustConfiguredOrchestrator(
 				WithStore(store),

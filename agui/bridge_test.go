@@ -15,6 +15,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
 )
 
 func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
@@ -22,13 +23,13 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 
 	sink := newSSESink()
 	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	_ = bridge.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunStarted})
-	_ = bridge.Emit(context.Background(), runtime.Event{
+	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted})
+	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
 		MessageID: "assistant-1",
 		Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
 	})
-	_ = bridge.Emit(context.Background(), runtime.Event{
+	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:       runtime.EventToolCallUpdated,
 		MessageID:  "tool-message-1",
 		ToolCallID: "tool-1",
@@ -46,7 +47,7 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	bridge.StepFinished("model")
 	bridge.Custom("agent_note", map[string]any{"ok": true})
 	bridge.ReasoningEncryptedValue(aguievents.ReasoningEncryptedValueSubtypeMessage, "assistant-1", "ciphertext")
-	_ = bridge.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunFinished})
+	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunFinished})
 
 	frames := frameData(t, sink.Bytes())
 	fixture := readGolden(t, "../testdata/agui/full_surface_events.json")

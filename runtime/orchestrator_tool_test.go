@@ -76,7 +76,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	if len(toolCallParts) != 1 || string(toolCallParts[0].Payload) != `{"id":"call-1","name":"echo","arguments":{"text":"hi"}}` {
 		t.Fatalf("tool call parts = %#v", toolCallParts)
 	}
-	var toolEvents []Event
+	var toolEvents []session.EventRecord
 	for _, event := range sink.events {
 		if event.Kind == EventToolCallUpdated {
 			toolEvents = append(toolEvents, event)
@@ -90,9 +90,9 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	}
 }
 
-func TestToolTransitionTransportFailureIsPostCommitBestEffort(t *testing.T) {
+func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 	store := newAdmissionStore()
-	sink := &selectiveToolFailingSink{err: errors.New("transport unavailable")}
+	sink := &selectiveToolPanickingSink{}
 	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		for _, msg := range request.Messages {
 			if msg.Role == einoschema.Tool {
@@ -136,17 +136,15 @@ func TestToolTransitionPersistenceFailureFailsMutation(t *testing.T) {
 	}
 }
 
-type selectiveToolFailingSink struct {
-	err        error
+type selectiveToolPanickingSink struct {
 	toolEvents int
 }
 
-func (s *selectiveToolFailingSink) Emit(_ context.Context, event Event) error {
+func (s *selectiveToolPanickingSink) Emit(_ context.Context, event session.EventRecord) {
 	if event.Kind == EventToolCallUpdated {
 		s.toolEvents++
-		return s.err
+		panic("transport unavailable")
 	}
-	return nil
 }
 
 // TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage pins that the

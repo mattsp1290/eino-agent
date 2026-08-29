@@ -27,9 +27,7 @@ func TestRunEventSinkOnlyFansOut(t *testing.T) {
 	defer execution.release()
 	sink := execution.eventSink(infrastructure)
 
-	if err := sink.Emit(ctx, Event{Kind: EventMessageDelta, SessionID: run.SessionID, RunID: run.ID, LiveOnly: true}); err != nil {
-		t.Fatalf("emit live event: %v", err)
-	}
+	sink.Emit(ctx, session.EventRecord{Kind: EventMessageDelta, SessionID: run.SessionID, RunID: run.ID, LiveOnly: true})
 	if len(store.events) != 0 {
 		t.Fatalf("fanout persisted %d events, want none", len(store.events))
 	}
@@ -59,7 +57,7 @@ func TestFailedToolTransitionPublishesNothing(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	published := 0
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("failed-transition"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(context.Context, Event) error {
+		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(context.Context, session.EventRecord) error {
 			published++
 			return nil
 		})

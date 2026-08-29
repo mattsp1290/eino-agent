@@ -40,7 +40,7 @@ type Interruptor interface {
 
 // Tail is the live AG-UI event tail used by SSE reconnect handlers.
 type Tail interface {
-	Subscribe(context.Context, session.ID) (<-chan runtime.Event, error)
+	Subscribe(context.Context, session.ID) (<-chan session.EventRecord, error)
 }
 
 // SSEConfig wires a consuming server's route to the AG-UI replay/live-tail

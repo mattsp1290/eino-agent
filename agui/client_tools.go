@@ -138,15 +138,6 @@ func cloneJSONValue(src any) (any, error) {
 	return dst, nil
 }
 
-func cloneRaw(src json.RawMessage) json.RawMessage {
-	if src == nil {
-		return nil
-	}
-	dst := make(json.RawMessage, len(src))
-	copy(dst, src)
-	return dst
-}
-
 func cloneStrings(src []string) []string {
 	if src == nil {
 		return nil

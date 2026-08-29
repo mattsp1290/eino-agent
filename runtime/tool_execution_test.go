@@ -104,10 +104,10 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	var order []string
 	var publishedIDs []session.EventID
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("transition-order"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event session.EventRecord) error {
 			if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
 				order = append(order, "published:"+toolEventStatus(event))
-				publishedIDs = append(publishedIDs, event.EventID)
+				publishedIDs = append(publishedIDs, event.ID)
 			}
 			return nil
 		}); err != nil {
@@ -133,14 +133,12 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	plan := newTestToolPlanWithDispatch(toolRegistry, dispatch)
-	var sinkEvents []Event
-	sink := EventSinkFunc(func(_ context.Context, event Event) error {
+	var sinkEvents []session.EventRecord
+	sink := EventSinkFunc(func(_ context.Context, event session.EventRecord) {
 		if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
 			order = append(order, "sink:"+toolEventStatus(event))
 			sinkEvents = append(sinkEvents, event)
-			return errors.New("transport unavailable")
 		}
-		return nil
 	})
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store),
@@ -175,13 +173,13 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		}
 	}
 	for index := range sinkEvents {
-		if sinkEvents[index].EventID != publishedIDs[index] || !durableIDSet[sinkEvents[index].EventID] {
+		if sinkEvents[index].ID != publishedIDs[index] || !durableIDSet[sinkEvents[index].ID] {
 			t.Fatalf("transition IDs differ: sink=%v published=%v durable=%v", sinkEvents, publishedIDs, durableIDs)
 		}
 	}
 }
 
-func toolEventStatus(event Event) string {
+func toolEventStatus(event session.EventRecord) string {
 	for _, status := range []session.ToolCallStatus{session.ToolCallPending, session.ToolCallRunning, session.ToolCallCompleted, session.ToolCallFailed, session.ToolCallInterrupted} {
 		if strings.Contains(string(event.Payload), `"status":"`+string(status)+`"`) {
 			return string(status)
@@ -208,7 +206,7 @@ func TestPendingResumeToolPanicPublishesClaimAndSettlement(t *testing.T) {
 		t.Fatalf("result = %+v", result)
 	}
 	assertDurableToolResult(t, store, run.SessionID, "call-resume", session.ToolCallFailed, "operational_failure")
-	var toolEvents []Event
+	var toolEvents []session.EventRecord
 	for _, event := range sink.events {
 		if event.Kind == EventToolCallUpdated {
 			toolEvents = append(toolEvents, event)

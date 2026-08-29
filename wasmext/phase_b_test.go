@@ -64,7 +64,7 @@ func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 	loader.factory = fakeFactory(component)
 	registry := composition.NewRegistry(nil)
 	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "wasm-context-provider", Artifact: extension.Artifact{Name: "wasm-context-provider", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
-		return loader.RegisterContextSource(ctx, registrar.Extensions(), extension.Registration{ID: "context", Scope: extension.GlobalScope()}, fixtureConfig(t, []byte("provider-order")))
+		return loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, fixtureConfig(t, []byte("provider-order")))
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +123,7 @@ func TestEventSinkUsesContentFreeSummary(t *testing.T) {
 	}
 	sink := &loadedEventSink{module: module, component: component}
 	defer func() { _ = sink.close() }()
-	if err := sink.Emit(context.Background(), runtime.Event{Kind: runtime.EventMessageDelta, Payload: json.RawMessage(`{"content":"SECRET"}`), Time: time.Unix(1, 0)}); err != nil {
+	if err := sink.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, Payload: json.RawMessage(`{"content":"SECRET"}`), CreatedAt: time.Unix(1, 0)}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -402,8 +402,8 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
 	cfg := fixtureConfig(t, []byte("all phase b"))
-	registry := newTestExtensionRegistry(nil)
-	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "phase-b", Artifact: extension.Artifact{Name: "phase-b", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+	registry := composition.NewRegistry(nil)
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "phase-b", Artifact: extension.Artifact{Name: "phase-b", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
 		if err := loader.RegisterEventSink(ctx, registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, cfg); err != nil {
 			return err
 		}
@@ -440,7 +440,7 @@ func TestDirectRegistrationRollsBackOnCompositionInstallerFailure(t *testing.T) 
 	cfg := fixtureConfig(t, []byte("composition rollback"))
 	mountedComponent := extension.Component{InstanceID: "wasm-rollback", Artifact: extension.Artifact{Name: "wasm-rollback", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
 	_, err := registry.Mount(context.Background(), mountedComponent, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
-		if err := loader.RegisterContextSource(ctx, registrar.Extensions(), extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg); err != nil {
+		if err := loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg); err != nil {
 			return err
 		}
 		return registrar.Guard(composition.GuardRegistration{ID: "invalid guard id", Scope: extension.GlobalScope()})
@@ -457,13 +457,15 @@ func TestDirectRegistrationRollsBackOnCommitFailure(t *testing.T) {
 	component := contextSourceFakeComponent()
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
-	registry := newTestExtensionRegistry(nil)
+	registry := composition.NewRegistry(nil)
 	mountedComponent := extension.Component{InstanceID: "duplicate", Artifact: extension.Artifact{Name: "duplicate", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}
-	if _, err := registry.Mount(context.Background(), mountedComponent, extension.InstallerFunc(func(context.Context, extension.Registrar) error { return nil })); err != nil {
+	first, err := registry.Mount(context.Background(), mountedComponent, composition.InstallerFunc(func(context.Context, *composition.Registrar) error { return nil }))
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = first.Close(context.Background()) }()
 	cfg := fixtureConfig(t, []byte("commit rollback"))
-	_, err := registry.Mount(context.Background(), mountedComponent, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+	_, err = registry.Mount(context.Background(), mountedComponent, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
 		return loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg)
 	}))
 	if !errors.Is(err, extension.ErrDuplicateInstance) {
@@ -474,13 +476,13 @@ func TestDirectRegistrationRollsBackOnCommitFailure(t *testing.T) {
 	}
 }
 
-func TestDirectRegistrationRollbackRacesLoaderClose(t *testing.T) {
+func TestDirectRegistrationMountCloseRacesLoaderClose(t *testing.T) {
 	component := contextSourceFakeComponent()
 	loader := NewLoader()
 	loader.factory = fakeFactory(component)
-	registry := newTestExtensionRegistry(nil)
+	registry := composition.NewRegistry(nil)
 	cfg := fixtureConfig(t, []byte("close race"))
-	prepared, err := registry.PrepareMount(context.Background(), extension.Component{InstanceID: "close-race", Artifact: extension.Artifact{Name: "close-race", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(ctx context.Context, registrar extension.Registrar) error {
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "close-race", Artifact: extension.Artifact{Name: "close-race", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, composition.InstallerFunc(func(ctx context.Context, registrar *composition.Registrar) error {
 		return loader.RegisterContextSource(ctx, registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, cfg)
 	}))
 	if err != nil {
@@ -489,7 +491,7 @@ func TestDirectRegistrationRollbackRacesLoaderClose(t *testing.T) {
 	start := make(chan struct{})
 	errs := make(chan error, 2)
 	go func() { <-start; errs <- loader.Close(context.Background()) }()
-	go func() { <-start; errs <- prepared.Rollback(context.Background()) }()
+	go func() { <-start; errs <- mount.Close(context.Background()) }()
 	close(start)
 	if err := <-errs; err != nil {
 		t.Fatal(err)
@@ -499,6 +501,42 @@ func TestDirectRegistrationRollbackRacesLoaderClose(t *testing.T) {
 	}
 	if len(loader.modules) != 0 || component.closeCalls.Load() != 1 {
 		t.Fatalf("close race ownership: modules=%d close calls=%d", len(loader.modules), component.closeCalls.Load())
+	}
+}
+
+func TestRegisteredEventObserverReportsModuleFailure(t *testing.T) {
+	want := errors.New("guest event failure")
+	component := &fakeComponent{call: func(context.Context, string, any, any) error { return want }}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("failing-event")), eventSinkContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sink := &loadedEventSink{module: module, component: component}
+	defer func() { _ = sink.close() }()
+	diagnostics := make(chan extension.Diagnostic, 1)
+	registry := newTestExtensionRegistry(extension.ReporterFunc(func(_ context.Context, diagnostic extension.Diagnostic) {
+		diagnostics <- diagnostic
+	}))
+	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "failing-event", Artifact: extension.Artifact{Name: "failing-event", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return registerEventSink(registrar, extension.Registration{ID: "events", Scope: extension.GlobalScope()}, sink)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	extension.Notify(plan, context.Background(), runtime.EventPublishedPoint, session.EventRecord{Kind: runtime.EventRunStarted})
+	select {
+	case diagnostic := <-diagnostics:
+		if diagnostic.HandlerID != "events" || diagnostic.Cause == nil {
+			t.Fatalf("diagnostic = %#v", diagnostic)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("event observer failure was not reported")
 	}
 }
 
@@ -559,7 +597,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	if contextTurn.AgentName != "agent" || contextTurn.AgentMode != "primary" || contextTurn.ProviderID != "provider" || contextTurn.ModelID != "model" || !contextTurn.HasSystemPrompt || contextTurn.RoleCounts.User != 1 {
 		t.Fatalf("registered context metadata = %#v", contextTurn)
 	}
-	extension.Notify(plan, context.Background(), runtime.EventPublishedPoint, runtime.Event{Kind: runtime.EventRunStarted})
+	extension.Notify(plan, context.Background(), runtime.EventPublishedPoint, session.EventRecord{Kind: runtime.EventRunStarted})
 	if eventCalls != 1 {
 		t.Fatalf("event calls = %d", eventCalls)
 	}

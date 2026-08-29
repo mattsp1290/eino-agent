@@ -22,9 +22,9 @@ type ObservabilitySink struct {
 	Observer *einoobs.Observer
 }
 
-func (s ObservabilitySink) Emit(ctx context.Context, event Event) error {
+func (s ObservabilitySink) Emit(ctx context.Context, event session.EventRecord) {
 	if s.Observer == nil {
-		return nil
+		return
 	}
 	switch event.Kind {
 	case EventRunFinished:
@@ -35,11 +35,10 @@ func (s ObservabilitySink) Emit(ctx context.Context, event Event) error {
 				Classification: firstNonEmpty(event.Error.Code, "run_error"),
 				Err:            observationErrorFromClassification(firstNonEmpty(event.Error.Code, "run_error")),
 				Retryable:      event.Error.Retryable,
-				Time:           event.Time,
+				Time:           event.CreatedAt,
 			})
 		}
 	}
-	return nil
 }
 
 func (o *StreamingOrchestrator) startObservedRun(ctx context.Context, run session.Run, messageID session.MessageID, start time.Time) observedRun {
@@ -353,7 +352,7 @@ func observationID(parts ...string) string {
 	return strings.Join(kept, ":")
 }
 
-func eventCorrelation(event Event, kind string) einoobs.Correlation {
+func eventCorrelation(event session.EventRecord, kind string) einoobs.Correlation {
 	return einoobs.Correlation{
 		SessionID:           string(event.SessionID),
 		RunID:               string(event.RunID),
@@ -394,11 +393,9 @@ func addUsage(a, b model.Usage) model.Usage {
 	}
 }
 
-// runtimeUsage maps a provider-level model.Usage to the transport-neutral
-// runtime Usage carried on events. The field sets are identical; this is the
-// package boundary conversion.
-func runtimeUsage(u model.Usage) Usage {
-	return Usage{
+// runtimeUsage maps provider-level usage to the durable event usage contract.
+func runtimeUsage(u model.Usage) session.Usage {
+	return session.Usage{
 		InputTokens:      u.InputTokens,
 		OutputTokens:     u.OutputTokens,
 		ReasoningTokens:  u.ReasoningTokens,
