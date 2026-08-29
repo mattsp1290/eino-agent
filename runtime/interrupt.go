@@ -147,7 +147,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 		if claimToken == "" || call.ClaimedBy != o.ownerID() {
 			claimToken = string(o.ids.NewEventID())
 		}
-		claimed, err := execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+		claimResult, err := execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
 			ID: call.ID, ClaimedBy: o.ownerID(), ClaimToken: claimToken, StartedAt: startedAt,
 			LeaseDuration: o.lease(), Event: toolTransitionEnvelope(o, snapshot, startedAt),
 		})
@@ -157,6 +157,7 @@ func (o *StreamingOrchestrator) resumeRunWithSettlement(ctx context.Context, exe
 			}
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
+		claimed := claimResult.Call
 		extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: run.SessionID, RunID: run.ID, ToolCallID: claimed.ID, ToolName: claimed.Name, Time: claimed.StartedAt})
 		toolCall := ToolCall{
 			ID:              claimed.ID,

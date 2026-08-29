@@ -68,9 +68,9 @@ func TestRegistrarOwnsMountedIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	diagnostics := plan.Diagnostics()
-	if len(diagnostics) != 1 || diagnostics[0].InstanceID != component.InstanceID {
-		t.Fatalf("plan diagnostics = %#v", diagnostics)
+	handlers := plan.HandlerComponents()
+	if len(handlers) != 1 || handlers[0].Component.InstanceID != component.InstanceID {
+		t.Fatalf("plan handlers = %#v", handlers)
 	}
 }
 
@@ -444,6 +444,95 @@ func TestRequiredAroundRejectsConcurrentNext(t *testing.T) {
 	}
 }
 
+func TestRequiredAroundDrainsAdmittedNextBeforeReturning(t *testing.T) {
+	registry := newTestRegistry(nil)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	secret := errors.New("delegated secret")
+	_, err := registry.Mount(context.Background(), testComponent("outlived-next"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return OnAround(registrar, testAround, spec("outlived-next", "around", 0, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
+			go func() { _, _ = next(ctx, input) }()
+			<-entered
+			return "callback", nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	result := make(chan error, 1)
+	go func() {
+		_, invokeErr := InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) {
+			close(entered)
+			<-release
+			return "", secret
+		})
+		result <- invokeErr
+	}()
+	select {
+	case err := <-result:
+		t.Fatalf("InvokeAround returned before terminal completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	err = <-result
+	if !errors.Is(err, ErrNextOutlivedCallback) || !errors.Is(err, secret) {
+		t.Fatalf("InvokeAround error = %v", err)
+	}
+	if strings.Contains(err.Error(), secret.Error()) {
+		t.Fatalf("public lifecycle error leaked delegated text: %q", err)
+	}
+}
+
+func TestEquivalentPointValuesShareSemanticIdentity(t *testing.T) {
+	registered := NewNotification[testPayload](Contract{ID: "test/semantic-point", Version: "1"}, clonePayload)
+	invoked := NewNotification[testPayload](registered.Contract(), clonePayload)
+	registry := newTestRegistry(nil)
+	called := 0
+	_, err := registry.Mount(context.Background(), testComponent("semantic-point"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, registered, Registration{ID: "handler", Scope: GlobalScope()}, func(context.Context, testPayload) error {
+			called++
+			return nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	Notify(plan, context.Background(), invoked, testPayload{})
+	if called != 1 {
+		t.Fatalf("semantic point calls = %d, want 1", called)
+	}
+}
+
+func TestPointSignatureAuthoritySurvivesClose(t *testing.T) {
+	contract := Contract{ID: "test/signature-authority", Version: "1"}
+	registry := newTestRegistry(nil)
+	first, err := registry.Mount(context.Background(), testComponent("signature-int"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, NewNotification[int](contract, nil), Registration{ID: "handler", Scope: GlobalScope()}, func(context.Context, int) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = registry.Mount(context.Background(), testComponent("signature-string"), InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return On(registrar, NewNotification[string](contract, nil), Registration{ID: "handler", Scope: GlobalScope()}, func(context.Context, string) error { return nil })
+	}))
+	if !errors.Is(err, ErrInvalidContract) {
+		t.Fatalf("incompatible remount error = %v, want ErrInvalidContract", err)
+	}
+}
+
 func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
 	registry := newTestRegistry(nil)
 	component := testComponent("opaque-target")
@@ -460,8 +549,8 @@ func TestSnapshotAcceptsOpaqueSessionTargetKeys(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Snapshot(%q) = %v", key, err)
 		}
-		if len(plan.Diagnostics()) != 1 {
-			t.Fatalf("Snapshot(%q) diagnostics = %#v", key, plan.Diagnostics())
+		if len(plan.HandlerComponents()) != 1 {
+			t.Fatalf("Snapshot(%q) handlers = %#v", key, plan.HandlerComponents())
 		}
 		plan.Release()
 	}
@@ -623,8 +712,8 @@ func TestInvokeRejectsDelegationStartedAfterInterceptorReturns(t *testing.T) {
 	}); !errors.Is(err, ErrNextNotCalled) {
 		t.Fatalf("Invoke error = %v, want ErrNextNotCalled", err)
 	}
-	if _, err := (<-savedNext)(context.Background(), testPayload{Protected: "fixed"}); !errors.Is(err, ErrNextNotCalled) {
-		t.Fatalf("late next error = %v, want ErrNextNotCalled", err)
+	if _, err := (<-savedNext)(context.Background(), testPayload{Protected: "fixed"}); !errors.Is(err, ErrNextOutlivedCallback) {
+		t.Fatalf("late next error = %v, want ErrNextOutlivedCallback", err)
 	}
 	if calls := terminalCalls.Load(); calls != 0 {
 		t.Fatalf("terminal calls = %d, want 0", calls)

@@ -117,10 +117,10 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
 		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
 	}
-	if err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
+	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
+	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
 		t.Fatalf("idempotent settlement = %v", err)
 	}
 	settled, err := st.GetToolCall(ctx, call.ID)
@@ -133,12 +133,12 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	conflict := settlement
 	conflict.Output = json.RawMessage(`{"different":true}`)
 	conflict.ResultPart.Payload = conflict.Output
-	if err := execution.SettleToolCall(ctx, sqliteSettleRequest(conflict, "event-settle")); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(conflict, "event-settle")); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("conflicting settlement = %v", err)
 	}
 	stale := settlement
 	stale.ClaimToken = "stale"
-	if err := execution.SettleToolCall(ctx, sqliteSettleRequest(stale, "event-settle")); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(stale, "event-settle")); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("terminal stale settlement = %v", err)
 	}
 }
@@ -180,15 +180,15 @@ func TestToolTransitionEventIdentityAndGenericBypass(t *testing.T) {
 		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: completedAt, UpdatedAt: completedAt},
 	}
 	request := sqliteSettleRequest(settlement, "event-terminal-tool")
-	if err := execution.SettleToolCall(ctx, request); err != nil {
+	if _, err := execution.SettleToolCall(ctx, request); err != nil {
 		t.Fatalf("settle: %v", err)
 	}
-	if err := execution.SettleToolCall(ctx, request); err != nil {
+	if _, err := execution.SettleToolCall(ctx, request); err != nil {
 		t.Fatalf("same terminal event replay: %v", err)
 	}
 	differentTerminalID := request
 	differentTerminalID.Event.ID = "event-terminal-tool-different"
-	if err := execution.SettleToolCall(ctx, differentTerminalID); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.SettleToolCall(ctx, differentTerminalID); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("different terminal event id = %v, want ErrConflict", err)
 	}
 	batch, err := st.ListEvents(ctx, call.SessionID, session.EventCursor{Limit: 10})
@@ -269,7 +269,7 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 			if _, err = st.db.ExecContext(ctx, trigger); err != nil {
 				t.Fatal(err)
 			}
-			if err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err == nil {
+			if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err == nil {
 				t.Fatal("SettleToolCall succeeded despite injected persistence failure")
 			}
 			current, err := st.GetToolCall(ctx, call.ID)
@@ -286,7 +286,7 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 			if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_settlement`); err != nil {
 				t.Fatal(err)
 			}
-			if err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
+			if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
 				t.Fatalf("retry after rollback = %v", err)
 			}
 		})
@@ -328,7 +328,7 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 				ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
 			}
 			mutate(&settlement)
-			if err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); !errors.Is(err, session.ErrConflict) {
+			if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); !errors.Is(err, session.ErrConflict) {
 				t.Fatalf("SettleToolCall error = %v, want ErrConflict", err)
 			}
 			current, err := st.GetToolCall(ctx, call.ID)
@@ -366,7 +366,7 @@ func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	if _, err := st.exec(ctx, `UPDATE tool_calls SET claimed_by = ?, claim_token = ?, record = ? WHERE id = ?`, current.ClaimedBy, current.ClaimToken, raw, current.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.SettleToolCall(ctx, sqliteSettleRequest(stale, "event-settle")); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(stale, "event-settle")); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale settlement = %v, want ErrConflict", err)
 	}
 	if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
@@ -480,7 +480,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	if _, err := oldExecution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: staleCall.ID, ClaimedBy: "stale", ClaimToken: "stale", StartedAt: now, LeaseDuration: time.Minute, Event: sqliteToolEvent("stale-tool-claim", now)}); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale ClaimToolCall error = %v", err)
 	}
-	if err := oldExecution.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: session.ToolSettlement{ID: staleCall.ID}, Event: sqliteToolEvent("stale-tool-settle", now)}); !errors.Is(err, session.ErrConflict) {
+	if _, err := oldExecution.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: session.ToolSettlement{ID: staleCall.ID}, Event: sqliteToolEvent("stale-tool-settle", now)}); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale SettleToolCall error = %v", err)
 	}
 	staleEpoch := session.ContextEpoch{ID: "stale-epoch", SessionID: run.SessionID, CreatedAt: now}
@@ -734,9 +734,9 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ExecutionStore, session
 		_ = st.Close()
 		t.Fatalf("claim tool call: %v", err)
 	}
-	if claimed.Pattern != "resource/one" {
+	if claimed.Call.Pattern != "resource/one" {
 		_ = st.Close()
-		t.Fatalf("claimed pattern = %q", claimed.Pattern)
+		t.Fatalf("claimed pattern = %q", claimed.Call.Pattern)
 	}
-	return st, execution, claimed
+	return st, execution, claimed.Call
 }

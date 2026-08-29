@@ -89,7 +89,7 @@ func TestContextContributionReachesProviderInCanonicalOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := mustTestRunPlan(RunPlanSpec{Dispatch: dispatch})
+	plan := mustTestRunPlan(testDispatchPlanSpec(dispatch))
 	var captured []string
 	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		for _, message := range request.Messages {

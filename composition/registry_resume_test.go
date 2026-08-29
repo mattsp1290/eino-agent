@@ -281,8 +281,8 @@ func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{{
 		InstanceID: "mixed", Artifact: extension.Artifact{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
 		Handlers: []session.RegistrationIdentity{
-			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-a"), Kind: session.HandlerNotification},
-			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-b"), Kind: session.HandlerNotification},
+			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-a"), Kind: extension.HandlerNotification},
+			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-b"), Kind: extension.HandlerNotification},
 		},
 	}}}
 	persisted.Fingerprint, _ = session.FingerprintExtensionPlan(persisted)

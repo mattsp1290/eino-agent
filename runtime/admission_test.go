@@ -590,24 +590,24 @@ func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ s
 	return session.EventBatch{Events: events}, nil
 }
 
-func (s *admissionStore) CreateToolCall(_ context.Context, request session.CreateToolCallRequest) (session.ToolCall, error) {
+func (s *admissionStore) CreateToolCall(_ context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
 	if s.toolTransitionErr != nil {
-		return session.ToolCall{}, s.toolTransitionErr
+		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
 	call := request.Call
 	if existing, ok := s.toolCalls[call.ID]; ok {
 		if existing.Name != call.Name {
-			return session.ToolCall{}, session.ErrConflict
+			return session.ToolTransitionResult{}, session.ErrConflict
 		}
-		return existing, nil
+		return session.ToolTransitionResult{Call: existing, Event: s.events[request.Event.ID]}, nil
 	}
 	event, err := session.ToolTransitionRecord(call, request.Event)
 	if err != nil {
-		return session.ToolCall{}, err
+		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
 	s.events[event.ID] = event
-	return call, nil
+	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
 func (s *admissionStore) GetToolCall(_ context.Context, id session.ToolCallID) (session.ToolCall, error) {
 	call, ok := s.toolCalls[id]
@@ -625,13 +625,13 @@ func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID sessio
 	}
 	return calls, nil
 }
-func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimToolCallRequest) (session.ToolCall, error) {
+func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
 	if s.toolTransitionErr != nil {
-		return session.ToolCall{}, s.toolTransitionErr
+		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
 	call, ok := s.toolCalls[request.ID]
 	if !ok {
-		return session.ToolCall{}, session.ErrNotFound
+		return session.ToolTransitionResult{}, session.ErrNotFound
 	}
 	call.Status = session.ToolCallRunning
 	call.ClaimedBy = request.ClaimedBy
@@ -639,37 +639,37 @@ func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimT
 	call.StartedAt = request.StartedAt
 	event, err := session.ToolTransitionRecord(call, request.Event)
 	if err != nil {
-		return session.ToolCall{}, err
+		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
 	s.events[event.ID] = event
-	return call, nil
+	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
-func (s *admissionStore) SettleToolCall(_ context.Context, request session.SettleToolCallRequest) error {
+func (s *admissionStore) SettleToolCall(_ context.Context, request session.SettleToolCallRequest) (session.ToolTransitionResult, error) {
 	if s.toolTransitionErr != nil {
-		return s.toolTransitionErr
+		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
 	settlement := request.Settlement
 	if s.settleToolCallErr != nil {
-		return s.settleToolCallErr
+		return session.ToolTransitionResult{}, s.settleToolCallErr
 	}
 	call, ok := s.toolCalls[settlement.ID]
 	if !ok {
-		return session.ErrNotFound
+		return session.ToolTransitionResult{}, session.ErrNotFound
 	}
 	terminal, err := settlement.Apply(call)
 	if err != nil {
-		return err
+		return session.ToolTransitionResult{}, err
 	}
 	event, err := session.ToolTransitionRecord(terminal, request.Event)
 	if err != nil {
-		return err
+		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[terminal.ID] = terminal
 	s.messages[settlement.ResultMessage.ID] = settlement.ResultMessage
 	s.parts[settlement.ResultPart.ID] = settlement.ResultPart
 	s.events[event.ID] = event
-	return nil
+	return session.ToolTransitionResult{Call: terminal, Event: event}, nil
 }
 func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.ContextEpoch) (session.ContextEpoch, error) {
 	if existing, ok := s.epochs[epoch.ID]; ok {
@@ -777,16 +777,16 @@ func (s *fakeExecutionStore) SettleRun(ctx context.Context, run session.Run, eve
 	return nil
 }
 
-func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolCall, error) {
+func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
 	if !s.valid() {
-		return session.ToolCall{}, session.ErrConflict
+		return session.ToolTransitionResult{}, session.ErrConflict
 	}
 	claimed, err := s.admissionStore.ClaimToolCall(ctx, request)
 	if err != nil {
-		return session.ToolCall{}, err
+		return session.ToolTransitionResult{}, err
 	}
-	claimed.LeaseUntil = time.Now().UTC().Add(request.LeaseDuration)
-	s.toolCalls[claimed.ID] = claimed
+	claimed.Call.LeaseUntil = time.Now().UTC().Add(request.LeaseDuration)
+	s.toolCalls[claimed.Call.ID] = claimed.Call
 	return claimed, nil
 }
 

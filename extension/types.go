@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 )
@@ -16,6 +17,7 @@ var (
 	ErrDuplicateInstance     = errors.New("duplicate extension instance")
 	ErrNextCalledTwice       = errors.New("extension next called more than once")
 	ErrNextNotCalled         = errors.New("extension next was not called")
+	ErrNextOutlivedCallback  = errors.New("extension next outlived its callback")
 	ErrProtectedMutation     = errors.New("extension changed protected input")
 	ErrMountClosed           = errors.New("extension mount closed")
 	ErrSelfClose             = errors.New("extension callback cannot wait for its own mount")
@@ -87,50 +89,68 @@ type GateFunc[I, D any] func(context.Context, I) (D, error)
 type Observer[T any] func(context.Context, T) error
 type Cleanup func(context.Context) error
 
-// pointKey must be non-zero-sized: Go permits pointers to distinct zero-sized
-// variables to compare equal, which can alias otherwise unrelated points.
-type pointKey [1]byte
+type HandlerKind string
+
+const (
+	HandlerNotification HandlerKind = "notification"
+	HandlerHook         HandlerKind = "hook"
+	HandlerTransform    HandlerKind = "transform"
+	HandlerGate         HandlerKind = "gate"
+	HandlerAround       HandlerKind = "around"
+)
+
+type durablePointKey struct {
+	contract Contract
+	kind     HandlerKind
+}
+
+// pointKey is semantic across independently constructed points. signature is
+// intentionally process-local and prevents unsafe generic callback matches.
+type pointKey struct {
+	durablePointKey
+	signature reflect.Type
+}
 
 type Notification[T any] struct {
-	key      *pointKey
+	key      pointKey
 	contract Contract
 	clone    CloneFunc[T]
 }
 
 func NewNotification[T any](contract Contract, clone CloneFunc[T]) Notification[T] {
-	return Notification[T]{key: &pointKey{}, contract: contract, clone: clone}
+	return Notification[T]{key: pointKey{durablePointKey: durablePointKey{contract: contract, kind: HandlerNotification}, signature: reflect.TypeFor[Observer[T]]()}, contract: contract, clone: clone}
 }
 
 func (p Notification[T]) Contract() Contract { return p.contract }
 
 type Hook[T any] struct {
-	key      *pointKey
+	key      pointKey
 	contract Contract
 	clone    CloneFunc[T]
 	validate NextValidator[T]
 }
 
 func NewHook[T any](contract Contract, clone CloneFunc[T], validate NextValidator[T]) Hook[T] {
-	return Hook[T]{key: &pointKey{}, contract: contract, clone: clone, validate: validate}
+	return Hook[T]{key: pointKey{durablePointKey: durablePointKey{contract: contract, kind: HandlerHook}, signature: reflect.TypeFor[HookFunc[T]]()}, contract: contract, clone: clone, validate: validate}
 }
 
 func (p Hook[T]) Contract() Contract { return p.contract }
 
 type Transform[T any] struct {
-	key      *pointKey
+	key      pointKey
 	contract Contract
 	clone    CloneFunc[T]
 	validate NextValidator[T]
 }
 
 func NewTransform[T any](contract Contract, clone CloneFunc[T], validate NextValidator[T]) Transform[T] {
-	return Transform[T]{key: &pointKey{}, contract: contract, clone: clone, validate: validate}
+	return Transform[T]{key: pointKey{durablePointKey: durablePointKey{contract: contract, kind: HandlerTransform}, signature: reflect.TypeFor[TransformFunc[T]]()}, contract: contract, clone: clone, validate: validate}
 }
 
 func (p Transform[T]) Contract() Contract { return p.contract }
 
 type Gate[I, D any] struct {
-	key              *pointKey
+	key              pointKey
 	contract         Contract
 	clone            CloneFunc[I]
 	validateInput    NextValidator[I]
@@ -140,13 +160,13 @@ type Gate[I, D any] struct {
 }
 
 func NewGate[I, D any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateDecision ValidateFunc[D], continueDecision D, shouldContinue ContinueFunc[D]) Gate[I, D] {
-	return Gate[I, D]{key: &pointKey{}, contract: contract, clone: clone, validateInput: validateInput, validateDecision: validateDecision, continueDecision: continueDecision, shouldContinue: shouldContinue}
+	return Gate[I, D]{key: pointKey{durablePointKey: durablePointKey{contract: contract, kind: HandlerGate}, signature: reflect.TypeFor[GateFunc[I, D]]()}, contract: contract, clone: clone, validateInput: validateInput, validateDecision: validateDecision, continueDecision: continueDecision, shouldContinue: shouldContinue}
 }
 
 func (p Gate[I, D]) Contract() Contract { return p.contract }
 
 type RequiredAround[I, O any] struct {
-	key               *pointKey
+	key               pointKey
 	contract          Contract
 	clone             CloneFunc[I]
 	validateInput     NextValidator[I]
@@ -155,7 +175,7 @@ type RequiredAround[I, O any] struct {
 }
 
 func NewRequiredAround[I, O any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateOutput ValidateFunc[O], validateDelegated DelegatedOutputValidator[O]) RequiredAround[I, O] {
-	return RequiredAround[I, O]{key: &pointKey{}, contract: contract, clone: clone, validateInput: validateInput, validateOutput: validateOutput, validateDelegated: validateDelegated}
+	return RequiredAround[I, O]{key: pointKey{durablePointKey: durablePointKey{contract: contract, kind: HandlerAround}, signature: reflect.TypeFor[Around[I, O]]()}, contract: contract, clone: clone, validateInput: validateInput, validateOutput: validateOutput, validateDelegated: validateDelegated}
 }
 
 func (p RequiredAround[I, O]) Contract() Contract { return p.contract }
@@ -218,21 +238,11 @@ type Registrar interface {
 	Defer(Cleanup) error
 }
 
-type entryKind uint8
-
-const (
-	entryNotification entryKind = iota
-	entryHook
-	entryTransform
-	entryGate
-	entryAround
-)
-
 type registrationEntry struct {
-	point    *pointKey
+	point    pointKey
 	contract Contract
 	spec     Registration
-	kind     entryKind
+	kind     HandlerKind
 	callback any
 }
 
@@ -243,38 +253,38 @@ func On[T any](registrar Registrar, point Notification[T], spec Registration, fn
 	if err := validatePoint(point.key, point.contract); err != nil {
 		return err
 	}
-	return registrar.register(registrationEntry{point: point.key, contract: point.contract, spec: spec, kind: entryNotification, callback: fn})
+	return registrar.register(registrationEntry{point: point.key, contract: point.contract, spec: spec, kind: HandlerNotification, callback: fn})
 }
 
 func OnHook[T any](registrar Registrar, point Hook[T], spec Registration, fn HookFunc[T]) error {
 	if fn == nil {
 		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
 	}
-	return registerCallback(registrar, point.key, point.contract, spec, entryHook, fn)
+	return registerCallback(registrar, point.key, point.contract, spec, HandlerHook, fn)
 }
 
 func OnTransform[T any](registrar Registrar, point Transform[T], spec Registration, fn TransformFunc[T]) error {
 	if fn == nil {
 		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
 	}
-	return registerCallback(registrar, point.key, point.contract, spec, entryTransform, fn)
+	return registerCallback(registrar, point.key, point.contract, spec, HandlerTransform, fn)
 }
 
 func OnGate[I, D any](registrar Registrar, point Gate[I, D], spec Registration, fn GateFunc[I, D]) error {
 	if fn == nil {
 		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
 	}
-	return registerCallback(registrar, point.key, point.contract, spec, entryGate, fn)
+	return registerCallback(registrar, point.key, point.contract, spec, HandlerGate, fn)
 }
 
 func OnAround[I, O any](registrar Registrar, point RequiredAround[I, O], spec Registration, fn Around[I, O]) error {
 	if fn == nil {
 		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
 	}
-	return registerCallback(registrar, point.key, point.contract, spec, entryAround, fn)
+	return registerCallback(registrar, point.key, point.contract, spec, HandlerAround, fn)
 }
 
-func registerCallback(registrar Registrar, key *pointKey, contract Contract, spec Registration, kind entryKind, callback any) error {
+func registerCallback(registrar Registrar, key pointKey, contract Contract, spec Registration, kind HandlerKind, callback any) error {
 	if registrar == nil || callback == nil {
 		return fmt.Errorf("%w: nil registrar or callback", ErrInvalidRegistration)
 	}
@@ -302,8 +312,8 @@ func ValidateContract(contract Contract) error {
 	return nil
 }
 
-func validatePoint(key *pointKey, contract Contract) error {
-	if key == nil {
+func validatePoint(key pointKey, contract Contract) error {
+	if key.signature == nil || key.contract != contract || key.kind == "" {
 		return fmt.Errorf("%w: stable id and version required", ErrInvalidContract)
 	}
 	return ValidateContract(contract)

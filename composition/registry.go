@@ -420,7 +420,29 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	prompts := selectPrompts(components, target, instances)
 	guards := selectGuards(components, target, instances)
 	restrictions := selectRestrictions(components, target, instances)
-	planTools := make([]runtime.PlanTool, len(selected))
+	planComponents := make([]runtime.PlanComponent, 0, len(components))
+	byInstance := make(map[string]int, len(components))
+	componentPlan := func(component extension.Component) *runtime.PlanComponent {
+		if index, ok := byInstance[component.InstanceID]; ok {
+			return &planComponents[index]
+		}
+		index := len(planComponents)
+		byInstance[component.InstanceID] = index
+		var handlers []extension.HandlerIdentity
+		for _, mounted := range components {
+			if mounted.component.InstanceID == component.InstanceID {
+				handlers = append([]extension.HandlerIdentity(nil), mounted.handlers...)
+				break
+			}
+		}
+		planComponents = append(planComponents, runtime.PlanComponent{Component: component, Handlers: handlers})
+		return &planComponents[index]
+	}
+	for _, mounted := range components {
+		if len(mounted.handlers) > 0 {
+			componentPlan(mounted.component)
+		}
+	}
 	for index, entry := range selected {
 		schemaHash, hashErr := composedToolSchemaHash(entry.ToolRegistration)
 		if hashErr != nil {
@@ -432,8 +454,8 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			snapshot.Release()
 			return nil, cloneErr
 		}
-		planTools[index] = runtime.PlanTool{
-			Component: entry.component,
+		owned := componentPlan(entry.component)
+		owned.Tools = append(owned.Tools, runtime.PlanTool{
 			Identity: session.ToolPlanIdentity{
 				Name: entry.Definition.Name, RegistrationID: entry.ID, Scope: entry.Scope,
 				SchemaHash: schemaHash, ExecutorHash: entry.Definition.Provenance.ExecutorHash,
@@ -441,48 +463,43 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 			Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 				return tools.Materialize(ctx, definition, scope)
 			},
-		}
+			Sequence: index,
+		})
 	}
-	planPrompts := make([]runtime.PlanPrompt, len(prompts))
 	for index, prompt := range prompts {
-		planPrompts[index] = runtime.PlanPrompt{
-			Component: prompt.component,
-			Identity:  session.PromptPlanIdentity{Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
-			Prompt: runtime.MountedPrompt{Name: prompt.Name, Order: prompt.Order, InstanceID: prompt.component.InstanceID, Provider: mountedPromptProvider{
-				callbackContext: prompt.callbackContext, next: prompt.Provider,
-			}},
-		}
+		owned := componentPlan(prompt.component)
+		owned.Prompts = append(owned.Prompts, runtime.PlanPrompt{
+			Identity: session.PromptPlanIdentity{Name: prompt.Name, RegistrationID: prompt.ID, Scope: prompt.Scope, Order: prompt.Order},
+			Provider: mountedPromptProvider{callbackContext: prompt.callbackContext, next: prompt.Provider}, Sequence: index,
+		})
 	}
-	planGuards := make([]runtime.PlanGuard, len(guards))
 	for index, guard := range guards {
-		planGuards[index] = runtime.PlanGuard{
-			Component: guard.component,
-			Identity:  session.GuardPlanIdentity{RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
-			Guard: runtime.MountedToolGuard{ID: guard.ID, Order: guard.Order, InstanceID: guard.component.InstanceID, Guard: mountedToolGuard{
-				callbackContext: guard.callbackContext, next: guard.Guard,
-			}},
-		}
+		owned := componentPlan(guard.component)
+		owned.Guards = append(owned.Guards, runtime.PlanGuard{
+			Identity: session.GuardPlanIdentity{RegistrationID: guard.ID, Scope: guard.Scope, Order: guard.Order},
+			Guard:    mountedToolGuard{callbackContext: guard.callbackContext, next: guard.Guard}, Sequence: index,
+		})
 	}
-	planRestrictions := make([]runtime.PlanRestriction, len(restrictions))
 	for index, restriction := range restrictions {
 		rules, rulesErr := runtime.CanonicalizeRestrictionRules(restriction.Allowed, restriction.Denied)
 		if rulesErr != nil {
 			snapshot.Release()
 			return nil, rulesErr
 		}
-		planRestrictions[index] = runtime.PlanRestriction{
-			Component: restriction.component,
-			Identity:  session.RestrictionPlanIdentity{RegistrationID: restriction.ID, Scope: restriction.Scope, RulesHash: rules.Hash},
-			Allowed:   rules.Allowed, Denied: rules.Denied,
-		}
+		owned := componentPlan(restriction.component)
+		owned.Restrictions = append(owned.Restrictions, runtime.PlanRestriction{
+			Identity: session.RestrictionPlanIdentity{RegistrationID: restriction.ID, Scope: restriction.Scope, RulesHash: rules.Hash},
+			Allowed:  rules.Allowed, Denied: rules.Denied, Sequence: index,
+		})
 	}
-	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: snapshot.Dispatch(), Tools: planTools, Prompts: planPrompts, Guards: planGuards, Restrictions: planRestrictions})
+	return runtime.NewRunPlan(runtime.RunPlanSpec{Dispatch: snapshot.Dispatch(), Components: planComponents})
 }
 
 type selectedComponent struct {
 	component       extension.Component
 	payload         componentPayload
 	callbackContext func(context.Context) context.Context
+	handlers        []extension.HandlerIdentity
 }
 
 func snapshotComponents(values []extension.MountedValue[componentPayload]) []selectedComponent {
@@ -490,7 +507,7 @@ func snapshotComponents(values []extension.MountedValue[componentPayload]) []sel
 	for index, value := range values {
 		mounted := value
 		result[index] = selectedComponent{
-			component: mounted.Component(), payload: mounted.Value(), callbackContext: mounted.CallbackContext,
+			component: mounted.Component(), payload: mounted.Value(), callbackContext: mounted.CallbackContext, handlers: mounted.Handlers(),
 		}
 	}
 	return result

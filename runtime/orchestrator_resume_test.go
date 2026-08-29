@@ -451,11 +451,12 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 	if err != nil {
 		t.Fatalf("create tool call: %v", err)
 	}
+	createdCall := created.Call
 	if status == session.ToolCallRunning {
-		created.ClaimedBy = owner
-		created.ClaimToken = "claim-resume"
-		created.StartedAt = now
-		if _, err := execution.ClaimToolCall(ctx, testClaimToolRequest(created, "event-claim-resume", time.Millisecond, now)); err != nil {
+		createdCall.ClaimedBy = owner
+		createdCall.ClaimToken = "claim-resume"
+		createdCall.StartedAt = now
+		if _, err := execution.ClaimToolCall(ctx, testClaimToolRequest(createdCall, "event-claim-resume", time.Millisecond, now)); err != nil {
 			t.Fatalf("claim tool call: %v", err)
 		}
 		time.Sleep(2 * time.Millisecond)

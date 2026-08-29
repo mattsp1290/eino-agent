@@ -45,6 +45,13 @@ type SettleToolCallRequest struct {
 	Event      ToolTransitionEvent
 }
 
+// ToolTransitionResult is the canonical call/event pair committed by one
+// atomic tool transition.
+type ToolTransitionResult struct {
+	Call  ToolCall
+	Event EventRecord
+}
+
 type toolTransitionPayload struct {
 	ID        ToolCallID        `json:"id"`
 	Name      string            `json:"name"`

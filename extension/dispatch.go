@@ -12,11 +12,19 @@ type delegatedError struct{ cause error }
 func (e *delegatedError) Error() string { return e.cause.Error() }
 func (e *delegatedError) Unwrap() error { return e.cause }
 
+type nextOutlivedError struct{ cause error }
+
+func (e *nextOutlivedError) Error() string { return ErrNextOutlivedCallback.Error() }
+func (e *nextOutlivedError) Unwrap() error { return e.cause }
+func (e *nextOutlivedError) Is(target error) bool {
+	return target == ErrNextOutlivedCallback
+}
+
 func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value T) {
-	if plan == nil || point.key == nil {
+	if plan == nil || point.key.signature == nil {
 		return
 	}
-	for _, entry := range matchingEntries(plan, point.key, entryNotification) {
+	for _, entry := range matchingEntries(plan, point.key, HandlerNotification) {
 		observer, ok := entry.callback.(Observer[T])
 		if !ok {
 			report(plan.reporter, ctx, callbackFailure(entry, "callback_type", errors.New("observer type mismatch")))
@@ -34,7 +42,7 @@ func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value
 }
 
 func RunHooks[T any](plan *Plan, ctx context.Context, point Hook[T], value T) error {
-	for _, entry := range matchingEntries(plan, point.key, entryHook) {
+	for _, entry := range matchingEntries(plan, point.key, HandlerHook) {
 		hook, ok := entry.callback.(HookFunc[T])
 		if !ok {
 			return errors.New("extension hook type mismatch")
@@ -70,7 +78,7 @@ func ApplyTransforms[T any](plan *Plan, ctx context.Context, point Transform[T],
 			return value, validateErr
 		}
 	}
-	for _, entry := range matchingEntries(plan, point.key, entryTransform) {
+	for _, entry := range matchingEntries(plan, point.key, HandlerTransform) {
 		transform, ok := entry.callback.(TransformFunc[T])
 		if !ok {
 			return value, errors.New("extension transform type mismatch")
@@ -106,7 +114,7 @@ func EvaluateGate[I, D any](plan *Plan, ctx context.Context, point Gate[I, D], i
 	if point.shouldContinue == nil {
 		return decision, fmt.Errorf("%w: nil gate continuation predicate", ErrInvalidContract)
 	}
-	for _, entry := range matchingEntries(plan, point.key, entryGate) {
+	for _, entry := range matchingEntries(plan, point.key, HandlerGate) {
 		gate, ok := entry.callback.(GateFunc[I, D])
 		if !ok {
 			return decision, errors.New("extension gate type mismatch")
@@ -141,7 +149,7 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 	if terminal == nil {
 		return zero, fmt.Errorf("%w: nil terminal", ErrInvalidRegistration)
 	}
-	entries := matchingEntries(plan, point.key, entryAround)
+	entries := matchingEntries(plan, point.key, HandlerAround)
 	var invoke func(int, context.Context, I) (O, error)
 	invoke = func(index int, currentCtx context.Context, candidate I) (O, error) {
 		if point.validateInput != nil {
@@ -167,24 +175,31 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 		}
 		var nextMu sync.Mutex
 		calls := 0
-		activeCalls := 0
+		activeCall := false
 		callbackOpen := true
+		nextDone := make(chan struct{})
 		var delegatedOutput O
 		var delegatedSucceeded bool
 		var delegatedFailure error
 		next := func(nextCtx context.Context, nextInput I) (O, error) {
 			nextMu.Lock()
+			if !callbackOpen {
+				nextMu.Unlock()
+				return zero, ErrNextOutlivedCallback
+			}
 			calls++
 			if calls != 1 {
 				nextMu.Unlock()
 				return zero, ErrNextCalledTwice
 			}
-			if !callbackOpen {
-				nextMu.Unlock()
-				return zero, ErrNextNotCalled
-			}
-			activeCalls++
+			activeCall = true
 			nextMu.Unlock()
+			defer func() {
+				nextMu.Lock()
+				activeCall = false
+				close(nextDone)
+				nextMu.Unlock()
+			}()
 			if nextCtx == nil {
 				nextCtx = currentCtx
 			}
@@ -192,14 +207,12 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 			if err != nil {
 				nextMu.Lock()
 				delegatedFailure = err
-				activeCalls--
 				nextMu.Unlock()
 				return zero, &delegatedError{cause: err}
 			}
 			out, err := invoke(index+1, nextCtx, cloned)
 			nextMu.Lock()
 			defer nextMu.Unlock()
-			activeCalls--
 			if err != nil {
 				delegatedFailure = err
 				return out, &delegatedError{cause: err}
@@ -215,8 +228,13 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 		out, callbackErr := callAround(callbackContext(currentCtx, entry.token), around, cloned, next)
 		nextMu.Lock()
 		callbackOpen = false
+		outlived := activeCall
+		nextMu.Unlock()
+		if outlived {
+			<-nextDone
+		}
+		nextMu.Lock()
 		finalCalls := calls
-		pendingCalls := activeCalls
 		finalDelegatedOutput := delegatedOutput
 		finalDelegatedSucceeded := delegatedSucceeded
 		finalDelegatedFailure := delegatedFailure
@@ -224,8 +242,8 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 		if finalCalls > 1 {
 			return zero, ErrNextCalledTwice
 		}
-		if pendingCalls != 0 {
-			return zero, ErrNextNotCalled
+		if outlived {
+			return zero, &nextOutlivedError{cause: finalDelegatedFailure}
 		}
 		if callbackErr == nil {
 			if finalCalls != 1 {
@@ -264,8 +282,8 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 	return invoke(0, ctx, cloned)
 }
 
-func matchingEntries(plan *Plan, key *pointKey, kind entryKind) []plannedEntry {
-	if plan == nil || key == nil {
+func matchingEntries(plan *Plan, key pointKey, kind HandlerKind) []plannedEntry {
+	if plan == nil || key.signature == nil {
 		return nil
 	}
 	entries := make([]plannedEntry, 0)

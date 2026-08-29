@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"sync"
 )
@@ -13,13 +14,14 @@ const maxReportedFailures = 64
 // Registry owns the complete lifecycle and immutable payload of mounted
 // components. T is supplied by the production host composing those payloads.
 type Registry[T any] struct {
-	mu       sync.Mutex
-	reporter Reporter
-	mounts   map[string]*mountState[T]
+	mu              sync.Mutex
+	reporter        Reporter
+	mounts          map[string]*mountState[T]
+	pointSignatures map[durablePointKey]reflect.Type
 }
 
 func NewRegistry[T any](reporter Reporter) *Registry[T] {
-	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T])}
+	return &Registry[T]{reporter: reporter, mounts: make(map[string]*mountState[T]), pointSignatures: make(map[durablePointKey]reflect.Type)}
 }
 
 type cleanupState struct {
@@ -60,7 +62,7 @@ func (s *stagingRegistrar) register(entry registrationEntry) error {
 		return err
 	}
 	for _, existing := range s.entries {
-		if existing.point == entry.point && existing.spec.Scope == entry.spec.Scope && existing.spec.ID == entry.spec.ID {
+		if existing.point.durablePointKey == entry.point.durablePointKey && existing.spec.Scope == entry.spec.Scope && existing.spec.ID == entry.spec.ID {
 			return fmt.Errorf("%w: %s", ErrDuplicateRegistration, entry.spec.ID)
 		}
 	}
@@ -159,6 +161,16 @@ func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selection
 	if _, exists := r.mounts[state.component.InstanceID]; exists {
 		return nil, fmt.Errorf("%w: %s", ErrDuplicateInstance, state.component.InstanceID)
 	}
+	candidateSignatures := make(map[durablePointKey]reflect.Type)
+	for _, entry := range state.entries {
+		if signature, exists := candidateSignatures[entry.point.durablePointKey]; exists && signature != entry.point.signature {
+			return nil, fmt.Errorf("%w: conflicting callback signature for %s", ErrInvalidContract, entry.contract.ID)
+		}
+		candidateSignatures[entry.point.durablePointKey] = entry.point.signature
+		if signature, exists := r.pointSignatures[entry.point.durablePointKey]; exists && signature != entry.point.signature {
+			return nil, fmt.Errorf("%w: conflicting callback signature for %s", ErrInvalidContract, entry.contract.ID)
+		}
+	}
 	candidate := CommitValue[T]{component: state.component, value: value}
 	if validate != nil {
 		active := make([]CommitValue[T], 0, len(r.mounts))
@@ -170,6 +182,9 @@ func (r *Registry[T]) CommitMount(prepared *PreparedMount[T], value T, selection
 		if err := callCommitValidator(validate, active, candidate); err != nil {
 			return nil, err
 		}
+	}
+	for key, signature := range candidateSignatures {
+		r.pointSignatures[key] = signature
 	}
 	state.value = value
 	state.selectionScopes = scopes
@@ -327,10 +342,11 @@ func callCleanup(ctx context.Context, cleanup Cleanup) (err error) {
 }
 
 type Plan struct {
-	entries  []plannedEntry
-	reporter Reporter
-	release  sync.Once
-	releases []func()
+	entries           []plannedEntry
+	handlerComponents []ComponentHandlers
+	reporter          Reporter
+	release           sync.Once
+	releases          []func()
 }
 
 type plannedEntry struct {
@@ -345,10 +361,14 @@ type MountedValue[T any] struct {
 	component Component
 	value     T
 	token     *callbackToken
+	handlers  []HandlerIdentity
 }
 
 func (v MountedValue[T]) Component() Component { return v.component }
 func (v MountedValue[T]) Value() T             { return v.value }
+func (v MountedValue[T]) Handlers() []HandlerIdentity {
+	return append([]HandlerIdentity(nil), v.handlers...)
+}
 func (v MountedValue[T]) CallbackContext(ctx context.Context) context.Context {
 	return callbackContext(ctx, v.token)
 }
@@ -404,16 +424,19 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 	entries := make([]plannedEntry, 0)
 	leased := make(map[*mountState[T]]struct{})
 	values := make([]MountedValue[T], 0)
+	handlerComponents := make([]ComponentHandlers, 0)
 	for _, state := range r.mounts {
 		if !state.active || allowed != nil && !allowed[state.component.InstanceID] {
 			continue
 		}
 		applies := false
+		handlers := make([]HandlerIdentity, 0)
 		for _, entry := range state.entries {
 			if !scopeApplies(entry.spec.Scope, target) {
 				continue
 			}
 			entries = append(entries, plannedEntry{registrationEntry: entry, component: state.component, token: state.token})
+			handlers = append(handlers, handlerIdentity(entry))
 			applies = true
 		}
 		for _, scope := range state.selectionScopes {
@@ -424,7 +447,10 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 		}
 		if applies {
 			leased[state] = struct{}{}
-			values = append(values, MountedValue[T]{component: state.component, value: state.value, token: state.token})
+			values = append(values, MountedValue[T]{component: state.component, value: state.value, token: state.token, handlers: handlers})
+			if len(handlers) > 0 {
+				handlerComponents = append(handlerComponents, ComponentHandlers{Component: state.component, Handlers: append([]HandlerIdentity(nil), handlers...)})
+			}
 		}
 	}
 	releases := make([]func(), 0, len(leased))
@@ -436,42 +462,38 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 	r.mu.Unlock()
 	sort.Slice(entries, func(i, j int) bool { return entryLess(entries[i], entries[j]) })
 	sort.Slice(values, func(i, j int) bool { return values[i].component.InstanceID < values[j].component.InstanceID })
-	dispatch := &Plan{entries: entries, reporter: r.reporter, releases: releases}
+	sort.Slice(handlerComponents, func(i, j int) bool {
+		return handlerComponents[i].Component.InstanceID < handlerComponents[j].Component.InstanceID
+	})
+	dispatch := &Plan{entries: entries, handlerComponents: handlerComponents, reporter: r.reporter, releases: releases}
 	return &Snapshot[T]{dispatch: dispatch, values: values}, nil
 }
 
-// PlanEntryDiagnostic describes a callback identity frozen into a plan.
-type PlanEntryDiagnostic struct {
-	InstanceID string
-	Artifact   Artifact
-	ID         string
-	Contract   Contract
-	Order      int
-	Scope      Scope
-	Kind       string
+type HandlerIdentity struct {
+	ID       string
+	Contract Contract
+	Order    int
+	Scope    Scope
+	Kind     HandlerKind
 }
 
-// Diagnostics returns identities only; callback values are never exposed.
-func (p *Plan) Diagnostics() []PlanEntryDiagnostic {
+type ComponentHandlers struct {
+	Component Component
+	Handlers  []HandlerIdentity
+}
+
+func handlerIdentity(entry registrationEntry) HandlerIdentity {
+	return HandlerIdentity{ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: entry.kind}
+}
+
+// HandlerComponents returns defensive, component-owned handler identities.
+func (p *Plan) HandlerComponents() []ComponentHandlers {
 	if p == nil {
 		return nil
 	}
-	result := make([]PlanEntryDiagnostic, 0, len(p.entries))
-	for _, entry := range p.entries {
-		kind := ""
-		switch entry.kind {
-		case entryNotification:
-			kind = "notification"
-		case entryHook:
-			kind = "hook"
-		case entryTransform:
-			kind = "transform"
-		case entryGate:
-			kind = "gate"
-		case entryAround:
-			kind = "around"
-		}
-		result = append(result, PlanEntryDiagnostic{InstanceID: entry.component.InstanceID, Artifact: entry.component.Artifact, ID: entry.spec.ID, Contract: entry.contract, Order: entry.spec.Order, Scope: entry.spec.Scope, Kind: kind})
+	result := make([]ComponentHandlers, len(p.handlerComponents))
+	for index, component := range p.handlerComponents {
+		result[index] = ComponentHandlers{Component: component.Component, Handlers: append([]HandlerIdentity(nil), component.Handlers...)}
 	}
 	return result
 }

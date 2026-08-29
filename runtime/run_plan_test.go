@@ -19,7 +19,7 @@ func mustTestRunPlan(spec RunPlanSpec) *RunPlan {
 }
 
 func newTestToolPlan(registry staticToolRegistry) *RunPlan {
-	return mustTestRunPlan(RunPlanSpec{Tools: testPlanTools(registry)})
+	return mustTestRunPlan(testToolPlanSpec(registry, nil))
 }
 
 func testPlanTools(registry staticToolRegistry) []PlanTool {
@@ -30,8 +30,7 @@ func testPlanTools(registry staticToolRegistry) []PlanTool {
 			panic(err)
 		}
 		capabilities[index] = PlanTool{
-			Component: testPlanComponent("test-tools"),
-			Identity:  testToolIdentity(tool.Name),
+			Identity: testToolIdentity(tool.Name), Sequence: index,
 			Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
 				return cloneToolChecked(tool)
 			},
@@ -41,11 +40,35 @@ func testPlanTools(registry staticToolRegistry) []PlanTool {
 }
 
 func newTestToolPlanWithDispatch(registry staticToolRegistry, dispatch *extension.Plan) *RunPlan {
-	return mustTestRunPlan(RunPlanSpec{Tools: testPlanTools(registry), Dispatch: dispatch})
+	return mustTestRunPlan(testToolPlanSpec(registry, dispatch))
 }
 
 func newTestDispatchPlan(dispatch *extension.Plan) *RunPlan {
-	return mustTestRunPlan(RunPlanSpec{Dispatch: dispatch})
+	return mustTestRunPlan(testDispatchPlanSpec(dispatch))
+}
+
+func testDispatchComponents(dispatch *extension.Plan) []PlanComponent {
+	if dispatch == nil {
+		return nil
+	}
+	owners := dispatch.HandlerComponents()
+	components := make([]PlanComponent, len(owners))
+	for index, owner := range owners {
+		components[index] = PlanComponent{Component: owner.Component, Handlers: owner.Handlers}
+	}
+	return components
+}
+
+func testDispatchPlanSpec(dispatch *extension.Plan) RunPlanSpec {
+	return RunPlanSpec{Dispatch: dispatch, Components: testDispatchComponents(dispatch)}
+}
+
+func testToolPlanSpec(registry staticToolRegistry, dispatch *extension.Plan) RunPlanSpec {
+	components := testDispatchComponents(dispatch)
+	if tools := testPlanTools(registry); len(tools) > 0 {
+		components = append(components, PlanComponent{Component: testPlanComponent("test-tools"), Tools: tools})
+	}
+	return RunPlanSpec{Dispatch: dispatch, Components: components}
 }
 
 func configureTestTools(orchestrator *StreamingOrchestrator, registry staticToolRegistry) {
@@ -124,7 +147,7 @@ func TestNewRunPlanRejectsRestrictionHashThatDoesNotMatchCanonicalRules(t *testi
 	identity := session.RestrictionPlanIdentity{
 		RegistrationID: "policy", RulesHash: "stale", Scope: extension.GlobalScope(),
 	}
-	_, err := NewRunPlan(RunPlanSpec{Restrictions: []PlanRestriction{{Component: testPlanComponent("restrictions"), Identity: identity, Allowed: []string{"echo"}}}})
+	_, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{{Component: testPlanComponent("restrictions"), Restrictions: []PlanRestriction{{Identity: identity, Allowed: []string{"echo"}}}}}})
 	if !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("NewRunPlan error = %v, want ErrExtensionPlanMismatch", err)
 	}
@@ -140,30 +163,28 @@ func TestNewRunPlanRetainsOwnersForHandlerlessCapabilities(t *testing.T) {
 	guardOwner := testPlanComponent("guard-only")
 	restrictionOwner := testPlanComponent("restriction-only")
 	plan, err := NewRunPlan(RunPlanSpec{
-		Tools: []PlanTool{{
-			Component: toolOwner,
-			Identity:  session.ToolPlanIdentity{Name: "echo", RegistrationID: "tool", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"},
-			Resolve:   func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
-		}},
-		Prompts: []PlanPrompt{{
-			Component: promptOwner,
-			Identity:  session.PromptPlanIdentity{Name: "prompt", RegistrationID: "prompt", Scope: extension.GlobalScope()},
-			Prompt: MountedPrompt{Name: "prompt", InstanceID: promptOwner.InstanceID, Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) {
-				return "prompt", nil
-			})},
-		}},
-		Guards: []PlanGuard{{
-			Component: guardOwner,
-			Identity:  session.GuardPlanIdentity{RegistrationID: "guard", Scope: extension.GlobalScope()},
-			Guard: MountedToolGuard{ID: "guard", InstanceID: guardOwner.InstanceID, Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
-				return ToolGuardResult{Decision: ToolGuardAbstain}, nil
-			})},
-		}},
-		Restrictions: []PlanRestriction{{
-			Component: restrictionOwner,
-			Identity:  session.RestrictionPlanIdentity{RegistrationID: "restriction", RulesHash: rules.Hash, Scope: extension.GlobalScope()},
-			Allowed:   rules.Allowed,
-		}},
+		Components: []PlanComponent{
+			{Component: toolOwner, Tools: []PlanTool{{
+				Identity: session.ToolPlanIdentity{Name: "echo", RegistrationID: "tool", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"},
+				Resolve:  func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
+			}}},
+			{Component: promptOwner, Prompts: []PlanPrompt{{
+				Identity: session.PromptPlanIdentity{Name: "prompt", RegistrationID: "prompt", Scope: extension.GlobalScope()},
+				Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) {
+					return "prompt", nil
+				}),
+			}}},
+			{Component: guardOwner, Guards: []PlanGuard{{
+				Identity: session.GuardPlanIdentity{RegistrationID: "guard", Scope: extension.GlobalScope()},
+				Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+					return ToolGuardResult{Decision: ToolGuardAbstain}, nil
+				}),
+			}}},
+			{Component: restrictionOwner, Restrictions: []PlanRestriction{{
+				Identity: session.RestrictionPlanIdentity{RegistrationID: "restriction", RulesHash: rules.Hash, Scope: extension.GlobalScope()},
+				Allowed:  rules.Allowed,
+			}}},
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,16 +227,64 @@ func TestNewRunPlanRetainsOwnersForHandlerlessCapabilities(t *testing.T) {
 	}
 }
 
-func TestNewRunPlanRejectsBehaviorWithDifferentComponentOwner(t *testing.T) {
+func TestNewRunPlanRejectsDuplicateComponentOwner(t *testing.T) {
 	owner := testPlanComponent("owner")
-	_, err := NewRunPlan(RunPlanSpec{Prompts: []PlanPrompt{{
-		Component: owner,
-		Identity:  session.PromptPlanIdentity{Name: "prompt", RegistrationID: "prompt", Scope: extension.GlobalScope()},
-		Prompt: MountedPrompt{Name: "prompt", InstanceID: "foreign", Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) {
-			return "", nil
-		})},
-	}}})
+	prompt := PlanPrompt{Identity: session.PromptPlanIdentity{Name: "prompt", RegistrationID: "prompt", Scope: extension.GlobalScope()}, Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "", nil })}
+	_, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{{Component: owner, Prompts: []PlanPrompt{prompt}}, {Component: owner, Prompts: []PlanPrompt{prompt}}}})
 	if !errors.Is(err, ErrExtensionPlanMismatch) {
 		t.Fatalf("NewRunPlan error = %v, want ErrExtensionPlanMismatch", err)
+	}
+}
+
+func TestNewRunPlanPreservesInterleavedExecutionSequences(t *testing.T) {
+	tool := func(name string, sequence int) PlanTool {
+		return PlanTool{Identity: session.ToolPlanIdentity{Name: name, RegistrationID: name, Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}, Sequence: sequence, Resolve: func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: name}, nil }}
+	}
+	prompt := func(name string, sequence int) PlanPrompt {
+		return PlanPrompt{Identity: session.PromptPlanIdentity{Name: name, RegistrationID: name, Scope: extension.GlobalScope(), Order: sequence}, Sequence: sequence, Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return name, nil })}
+	}
+	guard := func(name string, sequence int) PlanGuard {
+		return PlanGuard{Identity: session.GuardPlanIdentity{RegistrationID: name, Scope: extension.GlobalScope(), Order: sequence}, Sequence: sequence, Guard: ToolGuardFunc(func(context.Context, ToolGuardRequest) (ToolGuardResult, error) {
+			return ToolGuardResult{Decision: ToolGuardAbstain}, nil
+		})}
+	}
+	plan, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{
+		{Component: testPlanComponent("a"), Tools: []PlanTool{tool("a-1", 0), tool("a-3", 2)}, Prompts: []PlanPrompt{prompt("a-1", 0), prompt("a-3", 2)}, Guards: []PlanGuard{guard("a-1", 0), guard("a-3", 2)}},
+		{Component: testPlanComponent("b"), Tools: []PlanTool{tool("b-2", 1)}, Prompts: []PlanPrompt{prompt("b-2", 1)}, Guards: []PlanGuard{guard("b-2", 1)}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	if got := []string{plan.tools.capabilities[0].Identity.Name, plan.tools.capabilities[1].Identity.Name, plan.tools.capabilities[2].Identity.Name}; !reflect.DeepEqual(got, []string{"a-1", "b-2", "a-3"}) {
+		t.Fatalf("tool order = %v", got)
+	}
+	if got := []string{plan.prompts[0].Name, plan.prompts[1].Name, plan.prompts[2].Name}; !reflect.DeepEqual(got, []string{"a-1", "b-2", "a-3"}) {
+		t.Fatalf("prompt order = %v", got)
+	}
+	if got := []string{plan.guards[0].ID, plan.guards[1].ID, plan.guards[2].ID}; !reflect.DeepEqual(got, []string{"a-1", "b-2", "a-3"}) {
+		t.Fatalf("guard order = %v", got)
+	}
+}
+
+func TestNewRunPlanRejectsForgedHandlerOwnership(t *testing.T) {
+	registry := newTestExtensionRegistry(nil)
+	mount, err := registry.Mount(context.Background(), testExtensionComponent("handler-owner"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "handler", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := testDispatchPlanSpec(dispatch)
+	spec.Components[0].Handlers[0].ID = "forged"
+	if _, err := NewRunPlan(spec); !errors.Is(err, ErrExtensionPlanMismatch) {
+		t.Fatalf("forged handler error = %v", err)
+	}
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatalf("failed construction leaked dispatch lease: %v", err)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -321,11 +322,19 @@ func Run(t *testing.T, factory Factory) {
 		}
 		createdAt := time.Now().UTC()
 		createRequest := session.CreateToolCallRequest{Call: call, Event: toolEvent("event-create", createdAt)}
-		if _, err := execution.CreateToolCall(ctx, createRequest); err != nil {
+		created, err := execution.CreateToolCall(ctx, createRequest)
+		if err != nil {
 			t.Fatalf("create tool call: %v", err)
 		}
-		if _, err := execution.CreateToolCall(ctx, createRequest); err != nil {
+		if created.Call.ID != call.ID || created.Event.ID != createRequest.Event.ID || created.Event.ToolTransition != session.ToolTransitionPending {
+			t.Fatalf("create transition result = %#v", created)
+		}
+		createReplay, err := execution.CreateToolCall(ctx, createRequest)
+		if err != nil {
 			t.Fatalf("idempotent create replay: %v", err)
+		}
+		if !session.SameToolTransitionState(createReplay.Call, created.Call) || !reflect.DeepEqual(createReplay.Event, created.Event) {
+			t.Fatalf("create replay = %#v, want %#v", createReplay, created)
 		}
 		createRequest.Event.ID = "event-create-new-id"
 		if _, err := execution.CreateToolCall(ctx, createRequest); !errors.Is(err, session.ErrConflict) {
@@ -341,8 +350,11 @@ func Run(t *testing.T, factory Factory) {
 		if err != nil {
 			t.Fatalf("claim tool call: %v", err)
 		}
-		if claimed.Status != session.ToolCallRunning {
-			t.Fatalf("claimed status = %q, want %q", claimed.Status, session.ToolCallRunning)
+		if claimed.Call.Status != session.ToolCallRunning {
+			t.Fatalf("claimed status = %q, want %q", claimed.Call.Status, session.ToolCallRunning)
+		}
+		if claimed.Event.ID != "event-claim-1" || claimed.Event.ToolTransition != session.ToolTransitionRunning {
+			t.Fatalf("claim transition result = %#v", claimed)
 		}
 		if _, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: call.ID, ClaimedBy: "worker-2", ClaimToken: "claim-2", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolEvent("event-claim-2", startedAt)}); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("second claim err = %v, want ErrConflict", err)
@@ -361,19 +373,27 @@ func Run(t *testing.T, factory Factory) {
 		completedAt := startedAt.Add(time.Second)
 		output := json.RawMessage(`{"tool_call_id":"call-1","status":"completed","content":"ok"}`)
 		settlement := session.ToolSettlement{
-			ID: claimed.ID, ClaimedBy: claimed.ClaimedBy, ClaimToken: claimed.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
+			ID: claimed.Call.ID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
 			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, ParentID: msg.ID, Role: session.RoleTool, CreatedAt: completedAt, UpdatedAt: completedAt},
 			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolResult, Payload: output, CreatedAt: completedAt, UpdatedAt: completedAt},
 		}
 		settleRequest := session.SettleToolCallRequest{Settlement: settlement, Event: toolEvent("event-terminal", completedAt)}
-		if err := execution.SettleToolCall(ctx, settleRequest); err != nil {
+		settled, err := execution.SettleToolCall(ctx, settleRequest)
+		if err != nil {
 			t.Fatalf("settle tool call: %v", err)
 		}
-		if err := execution.SettleToolCall(ctx, settleRequest); err != nil {
+		if settled.Call.Status != session.ToolCallCompleted || settled.Event.ID != "event-terminal" || settled.Event.ToolTransition != session.ToolTransitionTerminal {
+			t.Fatalf("settle transition result = %#v", settled)
+		}
+		settleReplay, err := execution.SettleToolCall(ctx, settleRequest)
+		if err != nil {
 			t.Fatalf("idempotent settlement replay: %v", err)
 		}
+		if !reflect.DeepEqual(settleReplay, settled) {
+			t.Fatalf("settle replay = %#v, want %#v", settleReplay, settled)
+		}
 		settleRequest.Event.ID = "event-terminal-new-id"
-		if err := execution.SettleToolCall(ctx, settleRequest); !errors.Is(err, session.ErrConflict) {
+		if _, err := execution.SettleToolCall(ctx, settleRequest); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("new event id for terminal phase err = %v, want ErrConflict", err)
 		}
 		events, err := subject.Store.ListEvents(ctx, s.ID, session.EventCursor{Limit: 10})

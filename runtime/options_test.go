@@ -142,14 +142,13 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 	t.Parallel()
 	store := newAdmissionStore()
 	var toolsResolved, eventEmitted bool
-	toolPlan := mustTestRunPlan(RunPlanSpec{Tools: []PlanTool{{
-		Component: testPlanComponent("test-tools"),
-		Identity:  testToolIdentity("probe"),
+	toolPlan := mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{{Component: testPlanComponent("test-tools"), Tools: []PlanTool{{
+		Identity: testToolIdentity("probe"),
 		Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
 			toolsResolved = true
 			return Tool{Name: "probe", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })}, nil
 		},
-	}}})
+	}}}}})
 	orch, err := NewStreamingOrchestrator(
 		WithStore(store),
 		WithModelResolver(model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {

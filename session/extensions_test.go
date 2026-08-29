@@ -14,8 +14,8 @@ func TestExtensionPlanFingerprintCanonicalizesComponentsAndTypedCollections(t *t
 			{
 				InstanceID: "handlers", Artifact: testArtifact("handlers"),
 				Handlers: []RegistrationIdentity{
-					{ID: "same", Contract: "contract", Version: "2", Scope: extension.SessionScope("session-b"), Kind: HandlerNotification},
-					{ID: "same", Contract: "contract", Version: "1", Scope: extension.GlobalScope(), Kind: HandlerAround},
+					{ID: "same", Contract: "contract", Version: "2", Scope: extension.SessionScope("session-b"), Kind: extension.HandlerNotification},
+					{ID: "same", Contract: "contract", Version: "1", Scope: extension.GlobalScope(), Kind: extension.HandlerAround},
 				},
 			},
 			{
@@ -144,7 +144,7 @@ func TestExtensionPlanValidatesSemanticHandlerKinds(t *testing.T) {
 		InstanceID: "handlers", Artifact: testArtifact("handlers"),
 		Handlers: []RegistrationIdentity{{ID: "handler", Contract: "contract", Version: "1", Scope: extension.GlobalScope()}},
 	}}}
-	for _, kind := range []HandlerKind{HandlerNotification, HandlerHook, HandlerTransform, HandlerGate, HandlerAround} {
+	for _, kind := range []extension.HandlerKind{extension.HandlerNotification, extension.HandlerHook, extension.HandlerTransform, extension.HandlerGate, extension.HandlerAround} {
 		candidate := base.Clone()
 		candidate.Components[0].Handlers[0].Kind = kind
 		if err := ValidateExtensionPlan(candidate); err != nil {
@@ -163,8 +163,8 @@ func TestExtensionPlanRejectsDuplicateLogicalIdentitiesDespiteFingerprintFields(
 	tests := map[string]ComponentPlan{
 		"handler order": {
 			Handlers: []RegistrationIdentity{
-				{ID: "handler", Contract: "contract", Version: "1", Order: 1, Scope: global, Kind: HandlerNotification},
-				{ID: "handler", Contract: "contract", Version: "1", Order: 2, Scope: global, Kind: HandlerNotification},
+				{ID: "handler", Contract: "contract", Version: "1", Order: 1, Scope: global, Kind: extension.HandlerNotification},
+				{ID: "handler", Contract: "contract", Version: "1", Order: 2, Scope: global, Kind: extension.HandlerNotification},
 			},
 		},
 		"tool hashes": {Tools: []ToolPlanIdentity{

@@ -29,22 +29,24 @@ func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant", SessionID: "session", RunID: "run", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	durable, err := execution.CreateToolCall(ctx, testCreateToolRequest(session.ToolCall{ID: "call", SessionID: "session", RunID: "run", MessageID: "assistant", ResultMessageID: "result-message", ResultPartID: "result-part", Name: "echo", Status: session.ToolCallPending}, "event-create", now))
+	created, err := execution.CreateToolCall(ctx, testCreateToolRequest(session.ToolCall{ID: "call", SessionID: "session", RunID: "run", MessageID: "assistant", ResultMessageID: "result-message", ResultPartID: "result-part", Name: "echo", Status: session.ToolCallPending}, "event-create", now))
 	if err != nil {
 		t.Fatal(err)
 	}
+	durable := created.Call
 	durable.ClaimedBy = "worker"
 	durable.ClaimToken = "claim"
-	durable, err = execution.ClaimToolCall(ctx, testClaimToolRequest(durable, "event-claim", time.Minute, now))
+	claimResult, err := execution.ClaimToolCall(ctx, testClaimToolRequest(durable, "event-claim", time.Minute, now))
 	if err != nil {
 		t.Fatal(err)
 	}
+	durable = claimResult.Call
 	call := ToolCall{ID: durable.ID, SessionID: durable.SessionID, RunID: durable.RunID, MessageID: durable.MessageID, ResultMessageID: durable.ResultMessageID, ResultPartID: durable.ResultPartID, Name: durable.Name}
 	settlement, _, err := BuildToolSettlement(ToolSettlementInput{Tool: Tool{Retention: RetentionPolicy{MaxInlineBytes: 100}}, Call: call, Claimed: durable, Disposition: ToolExecuted, Result: ToolResult{Output: "ok"}, CompletedAt: now.Add(time.Second)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := execution.SettleToolCall(ctx, testSettleToolRequest(settlement, "event-settle")); err != nil {
+	if _, err := execution.SettleToolCall(ctx, testSettleToolRequest(settlement, "event-settle")); err != nil {
 		t.Fatalf("settle tool call: %v", err)
 	}
 	settled, err := store.GetToolCall(ctx, durable.ID)

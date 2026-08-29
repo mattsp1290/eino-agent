@@ -139,27 +139,29 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		resultPartID := o.ids.NewPartID()
 		createdAt := o.now()
 		createEvent := toolTransitionEnvelope(o, snapshot, createdAt)
-		record, err := execution.store.CreateToolCall(ctx, session.CreateToolCallRequest{
+		created, err := execution.store.CreateToolCall(ctx, session.CreateToolCallRequest{
 			Call:  session.ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ResultMessageID: resultMessageID, ResultPartID: resultPartID, Name: call.Name, Pattern: call.Pattern, Input: cloneJSON(input), Status: session.ToolCallPending, RetrySafe: tool.RetrySafe, Metadata: cloneStringMap(tool.Metadata)},
 			Event: createEvent,
 		})
 		if err != nil {
 			return nil, err
 		}
+		record := created.Call
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
-		o.publishToolTransition(ctx, execution, record, createEvent)
+		execution.publishPersisted(context.WithoutCancel(ctx), o.events, created.Event)
 		startedAt := o.now()
 		claimEvent := toolTransitionEnvelope(o, snapshot, startedAt)
-		record, err = execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+		claimed, err := execution.store.ClaimToolCall(ctx, session.ClaimToolCallRequest{
 			ID: record.ID, ClaimedBy: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), StartedAt: startedAt,
 			LeaseDuration: o.lease(), Event: claimEvent,
 		})
 		if err != nil {
 			return nil, err
 		}
+		record = claimed.Call
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		extension.Notify(execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
-		o.publishToolTransition(ctx, execution, record, claimEvent)
+		execution.publishPersisted(context.WithoutCancel(ctx), o.events, claimed.Event)
 		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, call, record, prepared.middlewareErr)
 		if err != nil {
 			return nil, err
@@ -172,12 +174,4 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		}
 	}
 	return messages, nil
-}
-
-func (o *StreamingOrchestrator) publishToolTransition(ctx context.Context, execution *runExecution, call session.ToolCall, envelope session.ToolTransitionEvent) {
-	record, err := session.ToolTransitionRecord(call, envelope)
-	if err != nil {
-		return
-	}
-	execution.publishPersisted(context.WithoutCancel(ctx), o.events, record)
 }

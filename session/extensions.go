@@ -19,23 +19,13 @@ const ExtensionPlanSchemaVersion = 1
 // ModelRequestID identifies one durable provider-attempt audit record.
 type ModelRequestID string
 
-type HandlerKind string
-
-const (
-	HandlerNotification HandlerKind = "notification"
-	HandlerHook         HandlerKind = "hook"
-	HandlerTransform    HandlerKind = "transform"
-	HandlerGate         HandlerKind = "gate"
-	HandlerAround       HandlerKind = "around"
-)
-
 type RegistrationIdentity struct {
 	ID       string
 	Contract string
 	Version  string
 	Order    int
 	Scope    extension.Scope
-	Kind     HandlerKind
+	Kind     extension.HandlerKind
 }
 
 type ToolPlanIdentity struct {
@@ -203,9 +193,9 @@ func ValidateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
 	return nil
 }
 
-func validHandlerKind(kind HandlerKind) bool {
+func validHandlerKind(kind extension.HandlerKind) bool {
 	switch kind {
-	case HandlerNotification, HandlerHook, HandlerTransform, HandlerGate, HandlerAround:
+	case extension.HandlerNotification, extension.HandlerHook, extension.HandlerTransform, extension.HandlerGate, extension.HandlerAround:
 		return true
 	default:
 		return false
@@ -214,7 +204,7 @@ func validHandlerKind(kind HandlerKind) bool {
 
 type handlerIdentityKey struct {
 	RegistrationID, Contract, Version string
-	Kind                              HandlerKind
+	Kind                              extension.HandlerKind
 	Scope                             extension.Scope
 }
 

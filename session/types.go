@@ -378,9 +378,9 @@ type ExecutionStore interface {
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
 	AppendEvent(ctx context.Context, event EventRecord) (EventRecord, error)
-	CreateToolCall(ctx context.Context, request CreateToolCallRequest) (ToolCall, error)
-	ClaimToolCall(ctx context.Context, request ClaimToolCallRequest) (ToolCall, error)
-	SettleToolCall(ctx context.Context, request SettleToolCallRequest) error
+	CreateToolCall(ctx context.Context, request CreateToolCallRequest) (ToolTransitionResult, error)
+	ClaimToolCall(ctx context.Context, request ClaimToolCallRequest) (ToolTransitionResult, error)
+	SettleToolCall(ctx context.Context, request SettleToolCallRequest) (ToolTransitionResult, error)
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
 	ModelRequestWriter
