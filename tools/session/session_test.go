@@ -32,8 +32,7 @@ func TestSessionPlanIsScopedPerSession(t *testing.T) {
 func TestRetainedOutputIsBoundedAndSessionScoped(t *testing.T) {
 	t.Parallel()
 
-	state := NewState()
-	state.MaxRetainedBytes = 4
+	state := mustState(t, Limits{MaxRetainedBytes: 4, MaxSessionBytes: 100})
 	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
 	toolsA := resolve(t, registry, "session-a")
 	result := execute(t, toolsA[NameRetainedOutput], `{"id":"out-1","content":"abcdef"}`)
@@ -59,8 +58,7 @@ func TestRetainedOutputIsBoundedAndSessionScoped(t *testing.T) {
 func TestRetainedOutputTruncatesAtUTF8Boundary(t *testing.T) {
 	t.Parallel()
 
-	state := NewState()
-	state.MaxRetainedBytes = 4
+	state := mustState(t, Limits{MaxRetainedBytes: 4, MaxSessionBytes: 100})
 	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
 	tools := resolve(t, registry, "session-a")
 	result := execute(t, tools[NameRetainedOutput], `{"id":"out-utf8","content":"ééé"}`)
@@ -69,26 +67,48 @@ func TestRetainedOutputTruncatesAtUTF8Boundary(t *testing.T) {
 	}
 }
 
-func TestRetainedOutputHonorsAggregateSessionLimitAndZeroLimit(t *testing.T) {
+func TestRetainedOutputHonorsZeroPerOutputLimit(t *testing.T) {
 	t.Parallel()
 
-	state := NewState()
-	state.SetMaxRetainedBytes(0)
-	state.MaxSessionBytes = 3
+	state := mustState(t, Limits{MaxRetainedBytes: 0, MaxSessionBytes: 3})
 	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
 	tools := resolve(t, registry, "session-a")
 	execute(t, tools[NameRetainedOutput], `{"id":"first","content":"abcdef"}`)
 	if first, ok := state.GetRetainedOutput("session-a", "first"); !ok || first.Content != "" || !first.Truncated {
 		t.Fatalf("first retained = %+v ok=%t", first, ok)
 	}
+}
 
-	state.SetMaxRetainedBytes(10)
+func TestRetainedOutputHonorsAggregateAndZeroSessionLimits(t *testing.T) {
+	t.Parallel()
+
+	state := mustState(t, Limits{MaxRetainedBytes: 10, MaxSessionBytes: 3})
+	registry := mountSessionTools(t, extension.GlobalScope(), Options{State: state})
+	tools := resolve(t, registry, "session-a")
 	execute(t, tools[NameRetainedOutput], `{"id":"second","content":"abcdef"}`)
 	if second, ok := state.GetRetainedOutput("session-a", "second"); !ok || second.Content != "abc" || !second.Truncated {
 		t.Fatalf("second retained = %+v ok=%t", second, ok)
 	}
-	if listed := state.ListRetainedOutputs("session-a"); len(listed) != 2 {
-		t.Fatalf("listed retained outputs = %d, want 2", len(listed))
+
+	zeroState := mustState(t, Limits{MaxRetainedBytes: 10, MaxSessionBytes: 0})
+	zeroRegistry := mountSessionTools(t, extension.GlobalScope(), Options{State: zeroState})
+	zeroTools := resolve(t, zeroRegistry, "session-zero")
+	execute(t, zeroTools[NameRetainedOutput], `{"id":"zero","content":"abcdef"}`)
+	if output, ok := zeroState.GetRetainedOutput("session-zero", "zero"); !ok || output.Content != "" || !output.Truncated {
+		t.Fatalf("zero aggregate retained = %+v ok=%t", output, ok)
+	}
+}
+
+func TestNewStateRejectsNegativeLimitsAndDefaultsAreBounded(t *testing.T) {
+	t.Parallel()
+	for _, limits := range []Limits{{MaxRetainedBytes: -1}, {MaxSessionBytes: -1}} {
+		if _, err := NewState(limits); err == nil {
+			t.Fatalf("NewState(%+v) accepted negative limit", limits)
+		}
+	}
+	defaults := DefaultLimits()
+	if defaults.MaxRetainedBytes <= 0 || defaults.MaxSessionBytes <= 0 {
+		t.Fatalf("DefaultLimits = %+v", defaults)
 	}
 }
 
@@ -349,6 +369,15 @@ func mountSessionTools(t *testing.T, scope extension.Scope, options Options) *co
 		}
 	})
 	return registry
+}
+
+func mustState(t *testing.T, limits Limits) *State {
+	t.Helper()
+	state, err := NewState(limits)
+	if err != nil {
+		t.Fatalf("NewState error = %v", err)
+	}
+	return state
 }
 
 func sessionToolComponent() extension.Component {

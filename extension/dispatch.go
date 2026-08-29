@@ -12,12 +12,12 @@ type delegatedError struct{ cause error }
 func (e *delegatedError) Error() string { return e.cause.Error() }
 func (e *delegatedError) Unwrap() error { return e.cause }
 
-type nextOutlivedError struct{ cause error }
+type proceedOutlivedError struct{ cause error }
 
-func (e *nextOutlivedError) Error() string { return ErrNextOutlivedCallback.Error() }
-func (e *nextOutlivedError) Unwrap() error { return e.cause }
-func (e *nextOutlivedError) Is(target error) bool {
-	return target == ErrNextOutlivedCallback
+func (e *proceedOutlivedError) Error() string { return ErrProceedOutlivedCallback.Error() }
+func (e *proceedOutlivedError) Unwrap() error { return e.cause }
+func (e *proceedOutlivedError) Is(target error) bool {
+	return target == ErrProceedOutlivedCallback
 }
 
 func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value T) {
@@ -145,7 +145,7 @@ func EvaluateGate[I, D any](plan *Plan, ctx context.Context, point Gate[I, D], i
 	return decision, nil
 }
 
-func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAround[I, O], input I, terminal Next[I, O]) (O, error) {
+func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAround[I, O], input I, terminal func(context.Context) (O, error)) (O, error) {
 	var zero O
 	if terminal == nil {
 		return zero, fmt.Errorf("%w: nil terminal", ErrInvalidRegistration)
@@ -154,137 +154,107 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 		return zero, err
 	}
 	entries := matchingEntries(plan, point.base())
-	var invoke func(int, context.Context, I) (O, error)
-	invoke = func(index int, currentCtx context.Context, candidate I) (O, error) {
-		if point.definition.validateInput != nil {
-			if err := point.definition.validateInput(input, candidate); err != nil {
-				return zero, fmt.Errorf("%w: %v", ErrProtectedMutation, err)
-			}
-		}
+	var invoke func(int, context.Context) (O, error)
+	invoke = func(index int, currentCtx context.Context) (O, error) {
 		if index == len(entries) {
-			cloned, err := cloneInput(point.definition.clone, candidate)
-			if err != nil {
-				return zero, err
-			}
-			out, err := terminal(currentCtx, cloned)
+			out, err := terminal(currentCtx)
 			if err == nil && point.definition.validateOutput != nil {
 				err = point.definition.validateOutput(out)
 			}
 			return out, err
 		}
 		entry := entries[index]
-		around := entry.callback.(Around[I, O])
-		var nextMu sync.Mutex
+		around := entry.callback.(Around[I])
+		var proceedMu sync.Mutex
 		calls := 0
 		activeCall := false
 		callbackOpen := true
-		nextDone := make(chan struct{})
+		proceedDone := make(chan struct{})
 		var delegatedOutput O
 		var delegatedSucceeded bool
 		var delegatedFailure error
-		next := func(nextCtx context.Context, nextInput I) (O, error) {
-			nextMu.Lock()
+		proceed := func(nextCtx context.Context) error {
+			proceedMu.Lock()
 			if !callbackOpen {
-				nextMu.Unlock()
-				return zero, ErrNextOutlivedCallback
+				proceedMu.Unlock()
+				return ErrProceedOutlivedCallback
 			}
 			calls++
 			if calls != 1 {
-				nextMu.Unlock()
-				return zero, ErrNextCalledTwice
+				proceedMu.Unlock()
+				return ErrProceedCalledTwice
 			}
 			activeCall = true
-			nextMu.Unlock()
+			proceedMu.Unlock()
 			defer func() {
-				nextMu.Lock()
+				proceedMu.Lock()
 				activeCall = false
-				close(nextDone)
-				nextMu.Unlock()
+				close(proceedDone)
+				proceedMu.Unlock()
 			}()
 			if nextCtx == nil {
 				nextCtx = currentCtx
 			}
-			cloned, err := cloneInput(point.definition.clone, nextInput)
-			if err != nil {
-				nextMu.Lock()
-				delegatedFailure = err
-				nextMu.Unlock()
-				return zero, &delegatedError{cause: err}
-			}
-			out, err := invoke(index+1, nextCtx, cloned)
-			nextMu.Lock()
-			defer nextMu.Unlock()
-			if err != nil {
-				delegatedFailure = err
-				return out, &delegatedError{cause: err}
-			}
+			out, err := invoke(index+1, nextCtx)
+			proceedMu.Lock()
+			defer proceedMu.Unlock()
 			delegatedOutput = out
+			if err != nil {
+				delegatedFailure = err
+				return &delegatedError{cause: err}
+			}
 			delegatedSucceeded = true
-			return out, nil
+			return nil
 		}
-		cloned, err := cloneInput(point.definition.clone, candidate)
+		cloned, err := cloneInput(point.definition.clone, input)
 		if err != nil {
 			return zero, err
 		}
-		out, callbackErr := callAround(callbackContext(currentCtx, entry.token), around, cloned, next)
-		nextMu.Lock()
+		callbackErr := callAround(callbackContext(currentCtx, entry.token), around, cloned, proceed)
+		proceedMu.Lock()
 		callbackOpen = false
 		outlived := activeCall
-		nextMu.Unlock()
+		proceedMu.Unlock()
 		if outlived {
-			<-nextDone
+			<-proceedDone
 		}
-		nextMu.Lock()
+		proceedMu.Lock()
 		finalCalls := calls
 		finalDelegatedOutput := delegatedOutput
 		finalDelegatedSucceeded := delegatedSucceeded
 		finalDelegatedFailure := delegatedFailure
-		nextMu.Unlock()
+		proceedMu.Unlock()
 		if finalCalls > 1 {
-			return zero, ErrNextCalledTwice
+			return zero, ErrProceedCalledTwice
 		}
 		if outlived {
-			return zero, &nextOutlivedError{cause: finalDelegatedFailure}
+			return zero, &proceedOutlivedError{cause: finalDelegatedFailure}
 		}
 		if callbackErr == nil {
 			if finalCalls != 1 {
-				return zero, ErrNextNotCalled
+				return zero, ErrProceedNotCalled
 			}
 			if !finalDelegatedSucceeded {
 				if finalDelegatedFailure != nil {
 					return zero, finalDelegatedFailure
 				}
-				return zero, ErrNextNotCalled
+				return zero, ErrProceedNotCalled
 			}
 		}
 		if callbackErr != nil {
 			var delegated *delegatedError
 			if errors.As(callbackErr, &delegated) && callbackErr == delegated {
-				return out, delegated.cause
+				return finalDelegatedOutput, delegated.cause
 			}
 			callbackFailure := propagateCallbackFailure(plan, currentCtx, entry, callbackErr)
 			if finalDelegatedFailure != nil {
-				return out, errors.Join(finalDelegatedFailure, callbackFailure)
+				return finalDelegatedOutput, errors.Join(finalDelegatedFailure, callbackFailure)
 			}
-			return out, callbackFailure
+			return finalDelegatedOutput, callbackFailure
 		}
-		if point.definition.validateOutput != nil {
-			if validateErr := point.definition.validateOutput(out); validateErr != nil {
-				return zero, validateErr
-			}
-		}
-		if point.definition.validateDelegated != nil {
-			if validateErr := point.definition.validateDelegated(finalDelegatedOutput, out); validateErr != nil {
-				return zero, validateErr
-			}
-		}
-		return out, nil
+		return finalDelegatedOutput, nil
 	}
-	cloned, err := cloneInput(point.definition.clone, input)
-	if err != nil {
-		return zero, err
-	}
-	return invoke(0, ctx, cloned)
+	return invoke(0, ctx)
 }
 
 func matchingEntries(plan *Plan, point *pointDefinition) []plannedEntry {
@@ -344,13 +314,13 @@ func callGate[I, D any](ctx context.Context, gate GateFunc[I, D], input I) (out 
 	return gate(ctx, input)
 }
 
-func callAround[I, O any](ctx context.Context, around Around[I, O], input I, next Next[I, O]) (out O, err error) {
+func callAround[I any](ctx context.Context, around Around[I], input I, proceed Proceed) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			err = fmt.Errorf("extension around callback panic: %v", recovered)
 		}
 	}()
-	return around(ctx, input, next)
+	return around(ctx, input, proceed)
 }
 
 func cloneInput[T any](clone CloneFunc[T], input T) (T, error) {

@@ -312,27 +312,7 @@ func TestFinishRegisteredHookReturnsAfterRunError(t *testing.T) {
 	}
 }
 
-func TestContextContributionSourceIsUnambiguousAcrossInstancesAndScopes(t *testing.T) {
-	tests := []struct {
-		instanceID string
-		spec       extension.Registration
-	}{
-		{instanceID: "a/b", spec: extension.Registration{ID: "c", Scope: extension.GlobalScope()}},
-		{instanceID: "a", spec: extension.Registration{ID: "b/c", Scope: extension.GlobalScope()}},
-		{instanceID: "a/b", spec: extension.Registration{ID: "c", Scope: extension.SessionScope("session")}},
-		{instanceID: "other", spec: extension.Registration{ID: "c", Scope: extension.GlobalScope()}},
-	}
-	seen := map[string]bool{}
-	for _, test := range tests {
-		source := contextContributionSource(test.instanceID, test.spec, 0)
-		if seen[source] {
-			t.Fatalf("duplicate source %q for %#v", source, test)
-		}
-		seen[source] = true
-	}
-}
-
-func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) {
+func TestRegisteredContextSourcesRetainComponentOwnership(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	for _, instanceID := range []string{"context-one", "context-two"} {
 		instanceID := instanceID
@@ -359,10 +339,9 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	assembly := runtime.ContextAssembly{Metadata: runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session"}}
-	assembled, err := extension.ApplyTransforms(plan, context.Background(), runtime.ContextAssemblePoint, assembly)
-	if err != nil || len(assembled.Contributions) != 2 || assembled.Contributions[0].Source == assembled.Contributions[1].Source {
-		t.Fatalf("assembled contributions = %#v, %v", assembled.Contributions, err)
+	handlers := plan.HandlerComponents()
+	if len(handlers) != 2 || handlers[0].Component.InstanceID == handlers[1].Component.InstanceID {
+		t.Fatalf("context handlers = %#v", handlers)
 	}
 }
 
@@ -613,13 +592,10 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assembly := runtime.ContextAssembly{
-		RunID: "run", SessionID: "session", Base: []*einoschema.Message{einoschema.UserMessage("base")},
-		Metadata: runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", EpochID: "epoch", AgentName: "agent", AgentMode: "primary", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true},
-	}
-	assembly, err = extension.ApplyTransforms(plan, context.Background(), runtime.ContextAssemblePoint, assembly)
-	if err != nil || len(assembly.Contributions) != 1 || assembly.Contributions[0].Message.Content != "from-wasm" {
-		t.Fatalf("assembly = %#v, %v", assembly, err)
+	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", EpochID: "epoch", AgentName: "agent", AgentMode: "primary", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true}
+	messages, err := source.loadBoundedContext(context.Background(), metadata)
+	if err != nil || len(messages) != 1 || messages[0].Content != "from-wasm" {
+		t.Fatalf("context messages = %#v, %v", messages, err)
 	}
 	if contextTurn.AgentName != "agent" || contextTurn.AgentMode != "primary" || contextTurn.ProviderID != "provider" || contextTurn.ModelID != "model" || !contextTurn.HasSystemPrompt || contextTurn.RoleCounts.User != 1 {
 		t.Fatalf("registered context metadata = %#v", contextTurn)

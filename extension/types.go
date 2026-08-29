@@ -9,17 +9,17 @@ import (
 )
 
 var (
-	ErrInvalidContract       = errors.New("invalid extension contract")
-	ErrInvalidComponent      = errors.New("invalid extension component")
-	ErrInvalidRegistration   = errors.New("invalid extension registration")
-	ErrDuplicateRegistration = errors.New("duplicate extension registration")
-	ErrDuplicateInstance     = errors.New("duplicate extension instance")
-	ErrNextCalledTwice       = errors.New("extension next called more than once")
-	ErrNextNotCalled         = errors.New("extension next was not called")
-	ErrNextOutlivedCallback  = errors.New("extension next outlived its callback")
-	ErrProtectedMutation     = errors.New("extension changed protected input")
-	ErrMountClosed           = errors.New("extension mount closed")
-	ErrSelfClose             = errors.New("extension callback cannot wait for its own mount")
+	ErrInvalidContract         = errors.New("invalid extension contract")
+	ErrInvalidComponent        = errors.New("invalid extension component")
+	ErrInvalidRegistration     = errors.New("invalid extension registration")
+	ErrDuplicateRegistration   = errors.New("duplicate extension registration")
+	ErrDuplicateInstance       = errors.New("duplicate extension instance")
+	ErrProceedCalledTwice      = errors.New("extension proceed called more than once")
+	ErrProceedNotCalled        = errors.New("extension proceed was not called")
+	ErrProceedOutlivedCallback = errors.New("extension proceed outlived its callback")
+	ErrProtectedMutation       = errors.New("extension changed protected input")
+	ErrMountClosed             = errors.New("extension mount closed")
+	ErrSelfClose               = errors.New("extension callback cannot wait for its own mount")
 )
 
 type SourceKind string
@@ -70,18 +70,17 @@ type Contract struct {
 
 type CloneFunc[T any] func(T) (T, error)
 type ValidateFunc[T any] func(T) error
-type DelegatedOutputValidator[O any] func(delegated, returned O) error
 type NextValidator[I any] func(original, candidate I) error
 type ContinueFunc[D any] func(D) bool
 
-// Next synchronously delegates to the remainder of an around-callback chain.
+// Proceed synchronously delegates to the remainder of an around-callback chain.
 // It may be called at most once, must finish before the Around callback returns,
-// and does not support concurrent use.
-type Next[I, O any] func(context.Context, I) (O, error)
+// and does not support concurrent use. Terminal output remains host-owned.
+type Proceed func(context.Context) error
 
-// Around wraps a point and may synchronously call next at most once. A callback
-// must not retain next or call it concurrently.
-type Around[I, O any] func(context.Context, I, Next[I, O]) (O, error)
+// Around wraps a point and may synchronously call proceed at most once. A
+// callback receives an isolated input clone and cannot replace terminal output.
+type Around[I any] func(context.Context, I, Proceed) error
 type HookFunc[T any] func(context.Context, T) error
 type TransformFunc[T any] func(context.Context, T) (T, error)
 type GateFunc[I, D any] func(context.Context, I) (D, error)
@@ -215,15 +214,13 @@ type RequiredAround[I, O any] struct {
 }
 
 type aroundDefinition[I, O any] struct {
-	point             pointDefinition
-	clone             CloneFunc[I]
-	validateInput     NextValidator[I]
-	validateOutput    ValidateFunc[O]
-	validateDelegated DelegatedOutputValidator[O]
+	point          pointDefinition
+	clone          CloneFunc[I]
+	validateOutput ValidateFunc[O]
 }
 
-func NewRequiredAround[I, O any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateOutput ValidateFunc[O], validateDelegated DelegatedOutputValidator[O]) RequiredAround[I, O] {
-	return RequiredAround[I, O]{definition: &aroundDefinition[I, O]{point: newPointDefinition(contract, HandlerAround), clone: clone, validateInput: validateInput, validateOutput: validateOutput, validateDelegated: validateDelegated}}
+func NewRequiredAround[I, O any](contract Contract, clone CloneFunc[I], validateOutput ValidateFunc[O]) RequiredAround[I, O] {
+	return RequiredAround[I, O]{definition: &aroundDefinition[I, O]{point: newPointDefinition(contract, HandlerAround), clone: clone, validateOutput: validateOutput}}
 }
 
 func (p RequiredAround[I, O]) Contract() Contract { return pointContract(p.base()) }
@@ -341,7 +338,7 @@ func OnGate[I, D any](registrar Registrar, point Gate[I, D], spec Registration, 
 	return registerCallback(registrar, point.base(), spec, fn)
 }
 
-func OnAround[I, O any](registrar Registrar, point RequiredAround[I, O], spec Registration, fn Around[I, O]) error {
+func OnAround[I, O any](registrar Registrar, point RequiredAround[I, O], spec Registration, fn Around[I]) error {
 	if fn == nil {
 		return fmt.Errorf("%w: nil callback", ErrInvalidRegistration)
 	}

@@ -54,8 +54,8 @@ func BenchmarkInvokeTen(b *testing.B) {
 	for index := 0; index < 10; index++ {
 		id := string(rune('a' + index))
 		_, _ = registry.Mount(context.Background(), testComponent(id), InstallerFunc(func(_ context.Context, registrar Registrar) error {
-			return OnAround(registrar, testAround, spec(id, id, index, GlobalScope()), func(ctx context.Context, input testPayload, next Next[testPayload, string]) (string, error) {
-				return next(ctx, input)
+			return OnAround(registrar, testAround, spec(id, id, index, GlobalScope()), func(ctx context.Context, _ testPayload, proceed Proceed) error {
+				return proceed(ctx)
 			})
 		}))
 	}
@@ -63,7 +63,7 @@ func BenchmarkInvokeTen(b *testing.B) {
 	defer plan.Release()
 	b.ResetTimer()
 	for range b.N {
-		_, _ = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context, testPayload) (string, error) { return "ok", nil })
+		_, _ = InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context) (string, error) { return "ok", nil })
 	}
 }
 

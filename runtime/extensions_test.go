@@ -39,9 +39,8 @@ func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 	callbackErr := errors.New("middleware failed")
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-errors"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
-			result, err := next(ctx, input)
-			return result, errors.Join(err, callbackErr)
+		return extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, _ ToolExecution, proceed extension.Proceed) error {
+			return errors.Join(proceed(ctx), callbackErr)
 		})
 	}))
 	if err != nil {
@@ -69,10 +68,11 @@ func TestToolExecutionPreservesExecutorAndCallbackErrors(t *testing.T) {
 func TestToolMiddlewareCannotForgePermissionStateOrReceiveApproval(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("tool-permission-state"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, next extension.Next[ToolExecution, ToolResult]) (ToolResult, error) {
-			result, err := next(ctx, input)
-			result.Metadata = map[string]string{"permission_status": "denied", "permission_forged": "true"}
-			return result, err
+		if err := extension.OnAround(registrar, ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input ToolExecution, proceed extension.Proceed) error {
+			if input.Call.Approval != nil {
+				return errors.New("execution middleware received approval capability")
+			}
+			return proceed(ctx)
 		}); err != nil {
 			return err
 		}
@@ -112,49 +112,14 @@ func testExtensionComponent(id string) extension.Component {
 	return extension.Component{InstanceID: id, Artifact: extension.Artifact{Name: id, Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 }
 
-func TestModelStreamPointRejectsFabricatedSuccessfulReader(t *testing.T) {
-	registry := newTestExtensionRegistry(nil)
-	component := extension.Component{InstanceID: "stream-test", Artifact: extension.Artifact{Name: "stream-test", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
-	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "replace", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[model.StreamDelta]]) (*einoschema.StreamReader[model.StreamDelta], error) {
-			delegated, err := next(ctx, input)
-			if delegated != nil {
-				delegated.Close()
-			}
-			if err != nil {
-				return nil, err
-			}
-			reader, writer := einoschema.Pipe[model.StreamDelta](1)
-			writer.Close()
-			return reader, nil
-		})
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := registry.Snapshot(extension.GlobalScope())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer plan.Release()
-	_, err = extension.InvokeAround(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[model.StreamDelta], error) {
-		reader, writer := einoschema.Pipe[model.StreamDelta](1)
-		writer.Close()
-		return reader, nil
-	})
-	if !errors.Is(err, extension.ErrProtectedMutation) {
-		t.Fatalf("fabricated stream error = %v", err)
-	}
-}
-
 func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 	providerErr := errors.New("provider failure")
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-swallow", Artifact: extension.Artifact{Name: "stream-swallow", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[model.StreamDelta]]) (*einoschema.StreamReader[model.StreamDelta], error) {
-			_, _ = next(ctx, input)
-			return nil, nil
+		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "swallow", Scope: extension.GlobalScope()}, func(ctx context.Context, _ ModelStreamInput, proceed extension.Proceed) error {
+			_ = proceed(ctx)
+			return nil
 		})
 	}))
 	if err != nil {
@@ -165,7 +130,7 @@ func TestModelStreamPointRejectsSwallowedProviderFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.Release()
-	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[model.StreamDelta], error) {
+	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, ModelStreamInput{}, func(context.Context) (*einoschema.StreamReader[model.StreamDelta], error) {
 		return nil, providerErr
 	})
 	if reader != nil || !errors.Is(err, providerErr) {
@@ -177,7 +142,12 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "unrelated", Artifact: extension.Artifact{Name: "unrelated", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
+		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "inspect", Scope: extension.GlobalScope()}, func(ctx context.Context, value ModelStreamInput, proceed extension.Proceed) error {
+			if value.ProviderID != "provider" || value.ModelID != "model" || value.ContentHash != "hash" {
+				t.Fatalf("model middleware received wrong data: %#v", value)
+			}
+			return proceed(ctx)
+		})
 	}))
 	if err != nil {
 		t.Fatal(err)
@@ -189,11 +159,8 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	defer plan.Release()
 	terminalCalled := false
 	input := ModelStreamInput{ProviderID: "provider", ModelID: "model", ContentHash: "hash", Audited: AuditedModelInput{System: "system"}}
-	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, input, func(_ context.Context, value ModelStreamInput) (*einoschema.StreamReader[model.StreamDelta], error) {
+	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, input, func(context.Context) (*einoschema.StreamReader[model.StreamDelta], error) {
 		terminalCalled = true
-		if value.ProviderID != "provider" || value.ModelID != "model" || value.ContentHash != "hash" {
-			t.Fatalf("model stream terminal received wrong data: %#v", value)
-		}
 		reader, writer := einoschema.Pipe[model.StreamDelta](1)
 		writer.Close()
 		return reader, nil
@@ -204,25 +171,13 @@ func TestModelStreamValidationUsesDataOnlyView(t *testing.T) {
 	reader.Close()
 }
 
-func TestModelStreamValidationRejectsCanonicalDataReplacement(t *testing.T) {
-	original := ModelStreamInput{ProviderID: "provider", ModelID: "model", ContentHash: "hash"}
-	candidate, err := cloneModelStreamInput(original)
-	if err != nil {
-		t.Fatal(err)
-	}
-	candidate.ContentHash = "changed"
-	if err := validateModelStreamInput(original, candidate); !errors.Is(err, extension.ErrProtectedMutation) {
-		t.Fatalf("content hash replacement validation = %v", err)
-	}
-}
-
-func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *testing.T) {
+func TestModelStreamPointIsolatesNestedRequestMutation(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "stream-nested-mutation", Artifact: extension.Artifact{Name: "stream-nested-mutation", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, next extension.Next[ModelStreamInput, *einoschema.StreamReader[model.StreamDelta]]) (*einoschema.StreamReader[model.StreamDelta], error) {
+		return extension.OnAround(registrar, ModelStreamPoint, extension.Registration{ID: "mutate", Scope: extension.GlobalScope()}, func(ctx context.Context, input ModelStreamInput, proceed extension.Proceed) error {
 			input.Audited.Messages[0].Canonical[0] = '['
-			return next(ctx, input)
+			return proceed(ctx)
 		})
 	}))
 	if err != nil {
@@ -236,13 +191,16 @@ func TestModelStreamPointRejectsNestedRequestMutationWithoutAliasingOriginal(t *
 
 	original := ModelStreamInput{ContentHash: "hash", Audited: AuditedModelInput{Messages: []AuditedMessage{{Canonical: json.RawMessage(`{"role":"user","content":"original"}`)}}}}
 	providerCalled := false
-	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, original, func(context.Context, ModelStreamInput) (*einoschema.StreamReader[model.StreamDelta], error) {
+	reader, err := extension.InvokeAround(plan, context.Background(), ModelStreamPoint, original, func(context.Context) (*einoschema.StreamReader[model.StreamDelta], error) {
 		providerCalled = true
-		return nil, nil
+		reader, writer := einoschema.Pipe[model.StreamDelta](1)
+		writer.Close()
+		return reader, nil
 	})
-	if reader != nil || !errors.Is(err, extension.ErrProtectedMutation) || providerCalled {
+	if reader == nil || err != nil || !providerCalled {
 		t.Fatalf("reader=%v error=%v provider_called=%t", reader, err, providerCalled)
 	}
+	reader.Close()
 	if got := string(original.Audited.Messages[0].Canonical); got != `{"role":"user","content":"original"}` {
 		t.Fatalf("original request mutated through interceptor alias: %v", got)
 	}
@@ -257,7 +215,7 @@ func TestPublishedExtensionPointsAppearInCatalog(t *testing.T) {
 		RunAdmittedPoint.Contract(), RunStartedPoint.Contract(), RunSettledPoint.Contract(),
 		ModelRequestedPoint.Contract(), ModelCompletedPoint.Contract(), ToolPreparedPoint.Contract(),
 		ToolStartedPoint.Contract(), ToolSettledPoint.Contract(), EventPublishedPoint.Contract(),
-		RunBeforeExecutePoint.Contract(), ContextAssemblePoint.Contract(), TurnPreparePoint.Contract(), ModelStreamPoint.Contract(),
+		RunBeforeExecutePoint.Contract(), contextAssemblePoint.Contract(), TurnPreparePoint.Contract(), ModelStreamPoint.Contract(),
 		ToolPreparePoint.Contract(), ToolExecutePoint.Contract(), ToolResultTransformPoint.Contract(),
 	}
 	for _, contract := range contracts {
@@ -336,16 +294,6 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 }
 
 func TestProtectedViewsRejectCallableInjection(t *testing.T) {
-	modelInput := ModelStreamInput{ContentHash: "original"}
-	modelCandidate, err := cloneModelStreamInput(modelInput)
-	if err != nil {
-		t.Fatal(err)
-	}
-	modelCandidate.ContentHash = "changed"
-	if err := validateModelStreamInput(modelInput, modelCandidate); !errors.Is(err, extension.ErrProtectedMutation) {
-		t.Fatalf("streamer injection validation = %v", err)
-	}
-
 	tool := extensionTool(Tool{Name: "tool"})
 	toolCandidate, err := cloneToolChecked(tool)
 	if err != nil {
@@ -369,10 +317,9 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	component := extension.Component{InstanceID: "clone-failure", Artifact: extension.Artifact{Name: "clone-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var contextEntered, toolEntered bool
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := extension.OnTransform(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, input ContextAssembly) (ContextAssembly, error) {
+		if err := OnContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, _ ContextSourceInput) ([]*einoschema.Message, error) {
 			contextEntered = true
-			input.Base[0].Extra["nested"].(map[string]any)["value"] = "mutated"
-			return input, nil
+			return nil, nil
 		}); err != nil {
 			return err
 		}
@@ -393,7 +340,7 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	messageNested := map[string]any{"value": "original"}
 	message := einoschema.UserMessage("protected")
 	message.Extra = map[string]any{"nested": messageNested, "unsupported": make(chan struct{})}
-	_, err = extension.ApplyTransforms(plan, context.Background(), ContextAssemblePoint, ContextAssembly{Base: []*einoschema.Message{message}})
+	_, err = extension.ApplyTransforms(plan, context.Background(), contextAssemblePoint, contextAssembly{Base: []*einoschema.Message{message}})
 	if err == nil || contextEntered || messageNested["value"] != "original" {
 		t.Fatalf("context clone failure = %v entered=%t nested=%v", err, contextEntered, messageNested)
 	}

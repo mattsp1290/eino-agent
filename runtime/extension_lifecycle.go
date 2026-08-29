@@ -94,13 +94,11 @@ var (
 	RunBeforeExecutePoint = extension.NewGate(extension.Contract{ID: "eino-agent/runtime/run-before-execute", Version: "1"}, infallibleClone(func(value RunGateInput) RunGateInput { return value }), validateRunGateInput, validateRunDecision, RunDecision{Kind: RunContinue}, func(decision RunDecision) bool {
 		return decision.Kind == RunContinue
 	})
-	ContextAssemblePoint = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput)
-	TurnPreparePoint     = extension.NewHook(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, infallibleClone(cloneBoundedTurnMetadata), validateBoundedTurnMetadataInput)
-	ModelStreamPoint     = extension.NewRequiredAround(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateModelStreamInput, validateStreamReader, validateDelegatedStreamReader)
-	ToolPreparePoint     = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCallChecked, validatePreparedToolCallInput)
-	ToolExecutePoint     = extension.NewRequiredAround(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecutionChecked, validateToolExecutionInput, validateToolResult, func(_ ToolResult, returned ToolResult) error {
-		return validateToolResult(returned)
-	})
+	contextAssemblePoint     = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/context-assemble", Version: "1"}, cloneContextAssembly, validateContextAssemblyInput)
+	TurnPreparePoint         = extension.NewHook(extension.Contract{ID: "eino-agent/runtime/turn-prepare", Version: "1"}, infallibleClone(cloneBoundedTurnMetadata), validateBoundedTurnMetadataInput)
+	ModelStreamPoint         = extension.NewRequiredAround(extension.Contract{ID: "eino-agent/runtime/model-stream", Version: "1"}, cloneModelStreamInput, validateStreamReader)
+	ToolPreparePoint         = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/tool-prepare", Version: "1"}, clonePreparedToolCallChecked, validatePreparedToolCallInput)
+	ToolExecutePoint         = extension.NewRequiredAround(extension.Contract{ID: "eino-agent/runtime/tool-execute", Version: "1"}, cloneToolExecutionChecked, validateToolResult)
 	ToolResultTransformPoint = extension.NewTransform(extension.Contract{ID: "eino-agent/runtime/tool-result-transform", Version: "1"}, cloneToolResultTransformChecked, validateToolResultTransformInput)
 
 	RunAdmittedPoint    = extension.NewNotification(extension.Contract{ID: "eino-agent/runtime/run-admitted", Version: "1"}, infallibleClone(cloneRunAdmittedNotice))
@@ -117,7 +115,7 @@ var (
 // ExtensionPoints returns the complete canonical runtime point catalog.
 func ExtensionPoints() []extension.Point {
 	return []extension.Point{
-		RunBeforeExecutePoint, ContextAssemblePoint, TurnPreparePoint, ModelStreamPoint,
+		RunBeforeExecutePoint, contextAssemblePoint, TurnPreparePoint, ModelStreamPoint,
 		ToolPreparePoint, ToolExecutePoint, ToolResultTransformPoint,
 		RunAdmittedPoint, RunStartedPoint, RunSettledPoint, ModelRequestedPoint,
 		ModelCompletedPoint, ToolPreparedPoint, ToolStartedPoint, ToolSettledPoint,

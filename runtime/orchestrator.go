@@ -230,8 +230,8 @@ func (o *StreamingOrchestrator) runFresh(ctx context.Context, execution *runExec
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot) (TurnSnapshot, error) {
-	assembly := ContextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
-	assembled, err := extension.ApplyTransforms(execution.dispatch(), ctx, ContextAssemblePoint, assembly)
+	assembly := contextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
+	assembled, err := extension.ApplyTransforms(execution.dispatch(), ctx, contextAssemblePoint, assembly)
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
@@ -356,7 +356,7 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 		return newToolOutcome(call, ToolResult{}, toolPermissionAllowed, cloneErr)
 	}
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
-		return extension.InvokeAround(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context, _ ToolExecution) (ToolResult, error) {
+		return extension.InvokeAround(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context) (ToolResult, error) {
 			return tool.Executor.Execute(ctx, cloneToolCall(call))
 		})
 	})

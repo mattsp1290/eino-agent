@@ -20,17 +20,23 @@ const (
 	NameSubagent       = "session_subagent"
 	NameSkillLoad      = "session_skill_load"
 
-	defaultMaxRetainedBytes = 64 * 1024
+	defaultMaxRetainedBytes = int64(64 * 1024)
+	defaultMaxSessionBytes  = defaultMaxRetainedBytes * 4
 )
 
 type State struct {
-	mu               sync.RWMutex
-	plans            map[session.ID][]PlanItem
-	outputs          map[session.ID]map[string]RetainedOutput
-	outputBytes      map[session.ID]int64
+	mu          sync.RWMutex
+	plans       map[session.ID][]PlanItem
+	outputs     map[session.ID]map[string]RetainedOutput
+	outputBytes map[session.ID]int64
+	limits      Limits
+}
+
+// Limits are immutable retention bounds copied into State at construction.
+// Zero always means retain zero bytes.
+type Limits struct {
 	MaxRetainedBytes int64
 	MaxSessionBytes  int64
-	maxSet           bool
 }
 
 type PlanItem struct {
@@ -81,18 +87,19 @@ type Options struct {
 	Skills   SkillLoader
 }
 
-func NewState() *State {
+func DefaultLimits() Limits {
+	return Limits{MaxRetainedBytes: defaultMaxRetainedBytes, MaxSessionBytes: defaultMaxSessionBytes}
+}
+
+func NewState(limits Limits) (*State, error) {
+	if limits.MaxRetainedBytes < 0 || limits.MaxSessionBytes < 0 {
+		return nil, fmt.Errorf("session retention limits must be non-negative")
+	}
 	return &State{
 		plans:   map[session.ID][]PlanItem{},
 		outputs: map[session.ID]map[string]RetainedOutput{},
-	}
-}
-
-func (s *State) SetMaxRetainedBytes(limit int64) {
-	s.mu.Lock()
-	s.MaxRetainedBytes = limit
-	s.maxSet = true
-	s.mu.Unlock()
+		limits:  limits,
+	}, nil
 }
 
 func (s *State) GetRetainedOutput(sessionID session.ID, id string) (RetainedOutput, bool) {
@@ -119,7 +126,11 @@ func Mount(ctx context.Context, registry *composition.Registry, component extens
 		return nil, fmt.Errorf("%w: composition registry required", agenttools.ErrInvalidDefinition)
 	}
 	if options.State == nil {
-		options.State = NewState()
+		var err error
+		options.State, err = NewState(DefaultLimits())
+		if err != nil {
+			return nil, err
+		}
 	}
 	definitions := []agenttools.Definition{
 		planSetDefinition(options.State),
@@ -196,10 +207,10 @@ func retainOutputDefinition(state *State) agenttools.Definition {
 			if input.ID == "" {
 				return RetainedOutput{}, fmt.Errorf("id required")
 			}
-			limit := state.maxRetainedBytes()
+			limit := state.limits.MaxRetainedBytes
 			output := RetainedOutput{ID: input.ID, OriginalSize: int64(len(input.Content))}
 			content := input.Content
-			if limit >= 0 && int64(len(content)) > limit {
+			if int64(len(content)) > limit {
 				content = validUTF8Prefix(content, int(limit))
 				output.Truncated = true
 			}
@@ -214,14 +225,12 @@ func retainOutputDefinition(state *State) agenttools.Definition {
 			if previous, ok := state.outputs[sessionID][input.ID]; ok {
 				state.outputBytes[sessionID] -= previous.InlineSize
 			}
-			maxSessionBytes := state.maxSessionBytes()
-			if maxSessionBytes >= 0 {
-				available := maxSessionBytes - state.outputBytes[sessionID]
-				if available < output.InlineSize {
-					output.Content = validUTF8Prefix(output.Content, int(available))
-					output.InlineSize = int64(len(output.Content))
-					output.Truncated = true
-				}
+			maxSessionBytes := state.limits.MaxSessionBytes
+			available := maxSessionBytes - state.outputBytes[sessionID]
+			if available < output.InlineSize {
+				output.Content = validUTF8Prefix(output.Content, int(available))
+				output.InlineSize = int64(len(output.Content))
+				output.Truncated = true
 			}
 			state.outputs[sessionID][input.ID] = output
 			state.outputBytes[sessionID] += output.InlineSize
@@ -316,23 +325,6 @@ func (s *State) ensure() {
 	if s.outputBytes == nil {
 		s.outputBytes = map[session.ID]int64{}
 	}
-}
-
-func (s *State) maxRetainedBytes() int64 {
-	if s.maxSet {
-		return s.MaxRetainedBytes
-	}
-	if s.MaxRetainedBytes > 0 {
-		return s.MaxRetainedBytes
-	}
-	return defaultMaxRetainedBytes
-}
-
-func (s *State) maxSessionBytes() int64 {
-	if s.MaxSessionBytes != 0 {
-		return s.MaxSessionBytes
-	}
-	return defaultMaxRetainedBytes * 4
 }
 
 func clonePlan(src []PlanItem) []PlanItem {

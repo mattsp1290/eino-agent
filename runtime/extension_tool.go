@@ -161,13 +161,6 @@ func cloneToolExecutionChecked(value ToolExecution) (ToolExecution, error) {
 	return value, nil
 }
 
-func validateToolExecutionInput(original, candidate ToolExecution) error {
-	if !sameProtectedTool(original.Tool, candidate.Tool) || !sameProtectedToolCall(original.Call, candidate.Call) {
-		return extension.ErrProtectedMutation
-	}
-	return nil
-}
-
 func sameProtectedTool(left, right Tool) bool {
 	leftInfo, rightInfo := left.Info, right.Info
 	if left.Executor != nil || right.Executor != nil || left.InputDecoder != nil || right.InputDecoder != nil || left.Pattern != nil || right.Pattern != nil {

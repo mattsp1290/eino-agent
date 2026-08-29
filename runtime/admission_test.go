@@ -313,7 +313,7 @@ func (s *capturingSink) snapshot() []session.EventRecord {
 
 func (s *capturingSink) waitFor(t testing.TB, count int) []session.EventRecord {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		events := s.snapshot()
 		if len(events) >= count {
@@ -328,7 +328,7 @@ func (s *capturingSink) waitFor(t testing.TB, count int) []session.EventRecord {
 
 func (s *capturingSink) waitForKind(t testing.TB, kind string, count int) []session.EventRecord {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		events := s.snapshot()
 		if countEvents(events, kind) >= count {

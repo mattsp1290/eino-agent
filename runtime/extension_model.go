@@ -2,11 +2,9 @@ package runtime
 
 import (
 	"errors"
-	"reflect"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
-	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 )
 
@@ -33,23 +31,9 @@ func cloneModelStreamInput(value ModelStreamInput) (ModelStreamInput, error) {
 	return value, nil
 }
 
-func validateModelStreamInput(original, candidate ModelStreamInput) error {
-	if !reflect.DeepEqual(original, candidate) {
-		return extension.ErrProtectedMutation
-	}
-	return nil
-}
-
 func validateStreamReader(reader *einoschema.StreamReader[model.StreamDelta]) error {
 	if reader == nil {
 		return errors.New("nil provider stream")
-	}
-	return nil
-}
-
-func validateDelegatedStreamReader(delegated, returned *einoschema.StreamReader[model.StreamDelta]) error {
-	if delegated != returned {
-		return extension.ErrProtectedMutation
 	}
 	return nil
 }

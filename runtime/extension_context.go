@@ -79,19 +79,61 @@ type RunDecision struct {
 	Message string
 }
 
-type ContextAssembly struct {
+type contextAssembly struct {
 	SessionID     session.ID
 	RunID         session.RunID
 	EpochID       session.EpochID
 	Metadata      BoundedTurnMetadata
 	Base          []*einoschema.Message
-	Contributions []ContextContribution
+	Contributions []contextContribution
 }
 
-type ContextContribution struct {
+type contextContribution struct {
 	Source  string
 	Order   int
 	Message *einoschema.Message
+}
+
+// ContextSourceInput is the bounded, read-only runtime state exposed to a
+// context source. It excludes the base conversation and other sources' output.
+type ContextSourceInput struct {
+	SessionID session.ID
+	RunID     session.RunID
+	EpochID   session.EpochID
+	Metadata  BoundedTurnMetadata
+}
+
+// ContextSource returns independent context messages. The host owns their
+// source identity and ordering.
+type ContextSource func(context.Context, ContextSourceInput) ([]*einoschema.Message, error)
+
+// OnContextSource registers a context source without exposing cumulative
+// context assembly to the extension.
+func OnContextSource(registrar extension.Registrar, spec extension.Registration, source ContextSource) error {
+	if registrar == nil || source == nil {
+		return fmt.Errorf("%w: nil registrar or context source", extension.ErrInvalidRegistration)
+	}
+	instanceID := registrar.InstanceID()
+	return extension.OnTransform(registrar, contextAssemblePoint, spec, func(ctx context.Context, assembly contextAssembly) (contextAssembly, error) {
+		input := ContextSourceInput{
+			SessionID: assembly.SessionID,
+			RunID:     assembly.RunID,
+			EpochID:   assembly.EpochID,
+			Metadata:  cloneBoundedTurnMetadata(assembly.Metadata),
+		}
+		messages, err := source(ctx, input)
+		if err != nil {
+			return contextAssembly{}, err
+		}
+		for index, message := range messages {
+			assembly.Contributions = append(assembly.Contributions, contextContribution{
+				Source:  contextContributionSource(instanceID, spec, index),
+				Order:   spec.Order,
+				Message: message,
+			})
+		}
+		return assembly, nil
+	})
 }
 
 // BoundedTurnMetadata is the content-free turn projection exposed through
@@ -177,33 +219,33 @@ func validateRunDecision(decision RunDecision) error {
 	return nil
 }
 
-func cloneContextAssembly(value ContextAssembly) (ContextAssembly, error) {
+func cloneContextAssembly(value contextAssembly) (contextAssembly, error) {
 	value.Metadata = cloneBoundedTurnMetadata(value.Metadata)
 	var err error
 	value.Base, err = cloneProtectedMessages(value.Base)
 	if err != nil {
-		return ContextAssembly{}, err
+		return contextAssembly{}, err
 	}
 	contributions := value.Contributions
-	value.Contributions = make([]ContextContribution, len(contributions))
+	value.Contributions = make([]contextContribution, len(contributions))
 	for index, contribution := range contributions {
 		value.Contributions[index] = contribution
 		value.Contributions[index].Message, err = cloneMessageDeep(contribution.Message)
 		if err != nil {
-			return ContextAssembly{}, err
+			return contextAssembly{}, err
 		}
 	}
 	return value, nil
 }
 
-func validateContextAssemblyInput(original, candidate ContextAssembly) error {
+func validateContextAssemblyInput(original, candidate contextAssembly) error {
 	if original.SessionID != candidate.SessionID || original.RunID != candidate.RunID || original.EpochID != candidate.EpochID || !reflect.DeepEqual(original.Metadata, candidate.Metadata) || !reflect.DeepEqual(original.Base, candidate.Base) {
 		return extension.ErrProtectedMutation
 	}
 	return validateContextAssembly(candidate)
 }
 
-func validateContextAssembly(value ContextAssembly) error {
+func validateContextAssembly(value contextAssembly) error {
 	seen := make(map[string]bool, len(value.Contributions))
 	for _, contribution := range value.Contributions {
 		if contribution.Source == "" {
@@ -224,6 +266,11 @@ func validateContextAssembly(value ContextAssembly) error {
 		seen[contribution.Source] = true
 	}
 	return nil
+}
+
+func contextContributionSource(instanceID string, spec extension.Registration, index int) string {
+	parts := []string{instanceID, spec.ID, string(spec.Scope.Kind), spec.Scope.Key}
+	return fmt.Sprintf("context/%d:%s/%d:%s/%d:%s/%d:%s/%06d", len(parts[0]), parts[0], len(parts[1]), parts[1], len(parts[2]), parts[2], len(parts[3]), parts[3], index)
 }
 
 func validateContextContributionMessage(message *einoschema.Message) error {
@@ -318,11 +365,11 @@ func validateBoundedTurnMetadataInput(original, candidate BoundedTurnMetadata) e
 	return nil
 }
 
-func materializeContextAssembly(value ContextAssembly) ([]*einoschema.Message, error) {
+func materializeContextAssembly(value contextAssembly) ([]*einoschema.Message, error) {
 	if err := validateContextAssembly(value); err != nil {
 		return nil, err
 	}
-	contributions := append([]ContextContribution(nil), value.Contributions...)
+	contributions := append([]contextContribution(nil), value.Contributions...)
 	sort.Slice(contributions, func(i, j int) bool {
 		if contributions[i].Order != contributions[j].Order {
 			return contributions[i].Order < contributions[j].Order

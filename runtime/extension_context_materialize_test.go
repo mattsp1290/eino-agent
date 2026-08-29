@@ -18,13 +18,13 @@ func TestMaterializeContextAssemblyUsesSystemPreludeAndUserSuffix(t *testing.T) 
 		einoschema.AssistantMessage("base-assistant", nil),
 		einoschema.ToolMessage("base-tool", "call-1"),
 	}
-	contributions := []ContextContribution{
+	contributions := []contextContribution{
 		{Source: "user-b", Order: 20, Message: einoschema.UserMessage("user-b")},
 		{Source: "system-b", Order: 30, Message: einoschema.SystemMessage("system-b")},
 		{Source: "system-a", Order: 10, Message: einoschema.SystemMessage("system-a")},
 		{Source: "user-a", Order: 20, Message: einoschema.UserMessage("user-a")},
 	}
-	messages, err := materializeContextAssembly(ContextAssembly{Base: base, Contributions: contributions})
+	messages, err := materializeContextAssembly(contextAssembly{Base: base, Contributions: contributions})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestContextContributionRejectsNonTextSystemOrUserMessages(t *testing.T) {
 		message := message
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			_, err := materializeContextAssembly(ContextAssembly{Contributions: []ContextContribution{{Source: name, Message: message}}})
+			_, err := materializeContextAssembly(contextAssembly{Contributions: []contextContribution{{Source: name, Message: message}}})
 			if err == nil {
 				t.Fatal("unsupported contribution was accepted")
 			}
@@ -74,12 +74,11 @@ func TestContextContributionRejectsNonTextSystemOrUserMessages(t *testing.T) {
 func TestContextContributionReachesProviderInCanonicalOrder(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "context-order", Artifact: extension.Artifact{Name: "context-order", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.OnTransform(registrar, ContextAssemblePoint, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, assembly ContextAssembly) (ContextAssembly, error) {
-			assembly.Contributions = append(assembly.Contributions,
-				ContextContribution{Source: "native/system", Order: 10, Message: einoschema.SystemMessage("extension-system")},
-				ContextContribution{Source: "native/user", Order: 20, Message: einoschema.UserMessage("extension-user")},
-			)
-			return assembly, nil
+		return OnContextSource(registrar, extension.Registration{ID: "context", Order: 10, Scope: extension.GlobalScope()}, func(_ context.Context, _ ContextSourceInput) ([]*einoschema.Message, error) {
+			return []*einoschema.Message{
+				einoschema.SystemMessage("extension-system"),
+				einoschema.UserMessage("extension-user"),
+			}, nil
 		})
 	}))
 	if err != nil {
@@ -107,5 +106,39 @@ func TestContextContributionReachesProviderInCanonicalOrder(t *testing.T) {
 	}
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestContextSourcesAreIsolatedAndHostOwned(t *testing.T) {
+	registry := newTestExtensionRegistry(nil)
+	for index, instanceID := range []string{"a/b", "a"} {
+		index, instanceID := index, instanceID
+		_, err := registry.Mount(context.Background(), extension.Component{InstanceID: instanceID, Artifact: extension.Artifact{Name: instanceID, Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+			return OnContextSource(registrar, extension.Registration{ID: []string{"c", "b/c"}[index], Order: 20 - index, Scope: extension.GlobalScope()}, func(_ context.Context, input ContextSourceInput) ([]*einoschema.Message, error) {
+				if !reflect.DeepEqual(input.Metadata.ToolNames, []string{"original"}) {
+					t.Fatalf("source %d metadata = %#v", index, input.Metadata)
+				}
+				input.Metadata.ToolNames[0] = "mutated"
+				return []*einoschema.Message{einoschema.UserMessage(instanceID)}, nil
+			})
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	assembled, err := extension.ApplyTransforms(plan, context.Background(), contextAssemblePoint, contextAssembly{Metadata: BoundedTurnMetadata{ToolNames: []string{"original"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(assembled.Contributions) != 2 || assembled.Contributions[0].Source == assembled.Contributions[1].Source {
+		t.Fatalf("contributions = %#v", assembled.Contributions)
+	}
+	if assembled.Contributions[0].Order != 19 || assembled.Contributions[1].Order != 20 {
+		t.Fatalf("host orders = %d, %d", assembled.Contributions[0].Order, assembled.Contributions[1].Order)
 	}
 }

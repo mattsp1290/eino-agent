@@ -73,7 +73,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	}
 	extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecord.ID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
 	modelRequested = true
-	reader, err := extension.InvokeAround(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), Audited: audited, ContentHash: contentHash}, func(ctx context.Context, _ ModelStreamInput) (*einoschema.StreamReader[model.StreamDelta], error) {
+	reader, err := extension.InvokeAround(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), Audited: audited, ContentHash: contentHash}, func(ctx context.Context) (*einoschema.StreamReader[model.StreamDelta], error) {
 		return snapshot.Model.Streamer.StreamProvider(ctx, request)
 	})
 	if err != nil {

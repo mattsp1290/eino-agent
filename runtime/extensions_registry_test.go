@@ -30,8 +30,8 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 		}); err != nil {
 			return err
 		}
-		return extension.OnAround(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, input runtime.ToolExecution, next extension.Next[runtime.ToolExecution, runtime.ToolResult]) (runtime.ToolResult, error) {
-			return next(ctx, input)
+		return extension.OnAround(registrar, runtime.ToolExecutePoint, extension.Registration{ID: "execute", Scope: extension.GlobalScope()}, func(ctx context.Context, _ runtime.ToolExecution, proceed extension.Proceed) error {
+			return proceed(ctx)
 		})
 	}))
 	if err != nil {
@@ -56,7 +56,7 @@ func TestMaterializedToolPassesPlanPrepareAndExecuteValidation(t *testing.T) {
 
 	terminalErr := errors.New("terminal reached")
 	terminalCalled := false
-	_, err = extension.InvokeAround(plan, context.Background(), runtime.ToolExecutePoint, runtime.ToolExecution(prepared), func(_ context.Context, _ runtime.ToolExecution) (runtime.ToolResult, error) {
+	_, err = extension.InvokeAround(plan, context.Background(), runtime.ToolExecutePoint, runtime.ToolExecution(prepared), func(context.Context) (runtime.ToolResult, error) {
 		terminalCalled = true
 		return runtime.ToolResult{}, terminalErr
 	})
