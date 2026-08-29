@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"reflect"
@@ -231,7 +232,11 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 		t.Fatalf("create tool call: %v", err)
 	}
 	var executions atomic.Int64
-	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+	var patternCalls atomic.Int64
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Pattern: PermissionPatternResolverFunc(func(context.Context, json.RawMessage) (string, error) {
+		patternCalls.Add(1)
+		return "", errors.New("resume must reuse persisted pattern")
+	}), Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		executions.Add(1)
 		time.Sleep(10 * time.Millisecond)
 		return ToolResult{Output: "ok"}, nil
@@ -262,6 +267,9 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 	}
 	if executions.Load() != 1 {
 		t.Fatalf("tool executions = %d, want 1", executions.Load())
+	}
+	if patternCalls.Load() != 0 {
+		t.Fatalf("permission pattern resolver calls = %d, want 0 on resume", patternCalls.Load())
 	}
 	call, err := store.GetToolCall(ctx, "call-resume")
 	if err != nil {

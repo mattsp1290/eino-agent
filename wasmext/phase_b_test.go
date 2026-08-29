@@ -354,38 +354,6 @@ func TestRegisteredContextSourcesNamespaceContributionsByInstance(t *testing.T) 
 	}
 }
 
-func TestRegisteredContextSourceRejectsAssistantContribution(t *testing.T) {
-	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleAssistant, Text: "invented history"}}
-		return nil
-	}}
-	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("assistant-context")), contextSourceContract, fakeFactory(component))
-	if err != nil {
-		t.Fatal(err)
-	}
-	source := &loadedContextSource{module: module, component: component}
-	defer func() { _ = source.close() }()
-	registry := newTestExtensionRegistry(nil)
-	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "assistant-context", Artifact: extension.Artifact{Name: "assistant-context", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceWasm}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return registerContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, source)
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan, err := registry.Snapshot(extension.GlobalScope())
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = extension.ApplyTransforms(plan, context.Background(), runtime.ContextAssemblePoint, runtime.ContextAssembly{})
-	plan.Release()
-	if err == nil || !strings.Contains(err.Error(), "unsupported role") {
-		t.Fatalf("assistant context error = %v", err)
-	}
-	if err := mount.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestToolMiddlewareJSONMappingPreservesProtectedContainers(t *testing.T) {
 	component := &fakeComponent{}
 	component.call = func(_ context.Context, operation string, input, output any) error {

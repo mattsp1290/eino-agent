@@ -26,10 +26,11 @@ Concrete leaf behavior remains outside this package.
 complete set atomically through `composition.Registry`.
 
 `wasmext.Loader.LoadTool` also returns an ordinary `tools.Definition`. Its
-normalizer and executor validate bounded JSON, and the executor invokes the
-versioned `tool` WIT world. Mount it through `composition.Registrar.Tool` like
-a native definition; the Loader remains the single `Close(ctx)` lifecycle
-owner.
+normalizer and executor validate bounded JSON, and its required
+`permission-pattern(input-json)` guest export derives permission identity from
+the final normalized input before policy evaluation. There is no reserved JSON
+field fallback. Mount it through `composition.Registrar.Tool` like a native
+definition; the Loader remains the single `Close(ctx)` lifecycle owner.
 
 ## Materialization
 
@@ -59,6 +60,9 @@ second runtime contract.
 Runtime invokes `Pattern` after the final prepare transform and persists the
 result with the canonical object input. Runtime never probes generic JSON for
 permission field names. Definitions without a callback use the tool name.
+Wasm tool definitions always provide the required guest-backed callback, whose
+output is capped at 4,096 bytes before permission evaluation or tool-call
+persistence.
 
 The standard adapter cleans filesystem operation patterns into a lexical,
 workspace-relative namespace and persists that normalized input before

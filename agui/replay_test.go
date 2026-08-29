@@ -14,34 +14,6 @@ import (
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
-func TestRuntimeEventReconstructsModelFallbackRecord(t *testing.T) {
-	t.Parallel()
-
-	// The library owns only the record→event direction (runtimeEvent). The
-	// durable event→record projection is host-owned, so we hand-build the
-	// record and assert reconstruction copies Kind, ModelID, and Payload.
-	source := runtime.NewModelFallbackEvent("primary", "fallback", "circuit_breaker")
-	record := session.EventRecord{
-		ID:        "evt-fallback",
-		SessionID: "session-1",
-		RunID:     "run-1",
-		Kind:      string(runtime.EventModelFallbackEngaged),
-		ModelID:   source.ModelID,
-		Payload:   source.Payload,
-	}
-
-	event := runtimeEvent(record)
-	if event.Kind != runtime.EventModelFallbackEngaged {
-		t.Fatalf("Kind = %q, want %q", event.Kind, runtime.EventModelFallbackEngaged)
-	}
-	if event.ModelID != "fallback" {
-		t.Fatalf("ModelID = %q, want fallback", event.ModelID)
-	}
-	if string(event.Payload) != string(source.Payload) {
-		t.Fatalf("Payload = %s, want %s", event.Payload, source.Payload)
-	}
-}
-
 func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	t.Parallel()
 

@@ -83,7 +83,7 @@ func (t *Tail) Emit(_ context.Context, event runtime.Event) error {
 			case <-sub.events:
 			default:
 			}
-			sub.events <- runtime.Event{Kind: runtime.EventTailOverflow, SessionID: sub.sessionID}
+			sub.events <- runtime.Event{Kind: runtime.EventTailOverflow, SessionID: sub.sessionID, LiveOnly: true}
 			drop = append(drop, id)
 		}
 	}

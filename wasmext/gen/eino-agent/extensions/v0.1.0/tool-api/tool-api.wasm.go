@@ -16,6 +16,15 @@ func wasmexport_Metadata() (result *cm.Result[ToolMetadataShape, ToolMetadata, S
 	return
 }
 
+//go:wasmexport eino-agent:extensions/tool-api@0.1.0#permission-pattern
+//export eino-agent:extensions/tool-api@0.1.0#permission-pattern
+func wasmexport_PermissionPattern(inputJson0 *uint8, inputJson1 uint32) (result *cm.Result[StructuredErrorShape, string, StructuredError]) {
+	inputJSON := cm.LiftString[string]((*uint8)(inputJson0), (uint32)(inputJson1))
+	result_ := Exports.PermissionPattern(inputJSON)
+	result = &result_
+	return
+}
+
 //go:wasmexport eino-agent:extensions/tool-api@0.1.0#execute
 //export eino-agent:extensions/tool-api@0.1.0#execute
 func wasmexport_Execute(params *wasmexport_Execute_params) (result *cm.Result[StructuredErrorShape, string, StructuredError]) {

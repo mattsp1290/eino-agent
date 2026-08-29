@@ -11,7 +11,6 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/config"
-	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -43,14 +42,13 @@ type admittedRun struct {
 	Session          session.Session
 	Run              session.Run
 	AssistantMessage session.Message
+	Event            session.EventRecord
 	Snapshot         TurnSnapshot
 }
 
 type admitter struct {
-	Store      session.Store
-	Events     EventSink
-	Extensions *extension.Plan
-	Clock      func() time.Time
+	Store session.Store
+	Clock func() time.Time
 }
 
 func (a admitter) admit(ctx context.Context, request admissionRequest) (admittedRun, error) {
@@ -84,7 +82,6 @@ func (a admitter) admit(ctx context.Context, request admissionRequest) (admitted
 	}); err != nil {
 		return admittedRun{}, err
 	}
-	a.publishAdmission(ctx, admitted, request, now)
 	return admitted, nil
 }
 
@@ -122,34 +119,14 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 		return admittedRun{}, err
 	}
 	event := admissionEvent(request, sessionRecord.ID, runRecord.ID, assistantMessage.ID, now)
-	if _, err := executionStore.AppendEvent(ctx, event); err != nil {
+	committedEvent, err := executionStore.AppendEvent(ctx, event)
+	if err != nil {
 		return admittedRun{}, err
 	}
-	return buildAdmission(sessionRecord, runRecord, assistantMessage, snapshot, now), nil
+	return buildAdmission(sessionRecord, runRecord, assistantMessage, committedEvent, snapshot, now), nil
 }
 
-func (a admitter) publishAdmission(ctx context.Context, admitted admittedRun, request admissionRequest, now time.Time) {
-	if a.Events != nil {
-		event := admissionEvent(request, admitted.Session.ID, admitted.Run.ID, admitted.AssistantMessage.ID, now)
-		_ = a.Events.Emit(ctx, Event{
-			Kind:       EventRunStarted,
-			EventID:    event.ID,
-			SessionID:  admitted.Session.ID,
-			RunID:      admitted.Run.ID,
-			MessageID:  admitted.AssistantMessage.ID,
-			EpochID:    request.IDs.ContextEpochID,
-			ProviderID: event.ProviderID,
-			ModelID:    event.ModelID,
-			Payload:    cloneJSON(event.Payload),
-			Time:       now,
-		})
-	}
-	if a.Extensions != nil {
-		extension.Notify(a.Extensions, ctx, RunAdmittedPoint, RunAdmittedNotice{SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: request.ExtensionPlan, Metadata: boundedTurnMetadata(admitted.Snapshot), Time: now})
-	}
-}
-
-func buildAdmission(sessionRecord session.Session, runRecord session.Run, assistantMessage session.Message, snapshot TurnSnapshot, now time.Time) admittedRun {
+func buildAdmission(sessionRecord session.Session, runRecord session.Run, assistantMessage session.Message, event session.EventRecord, snapshot TurnSnapshot, now time.Time) admittedRun {
 	snapshot.RunID = runRecord.ID
 	snapshot.SessionID = sessionRecord.ID
 	snapshot.EpochID = runRecord.ContextEpoch
@@ -158,6 +135,7 @@ func buildAdmission(sessionRecord session.Session, runRecord session.Run, assist
 		Session:          sessionRecord,
 		Run:              runRecord,
 		AssistantMessage: assistantMessage,
+		Event:            event,
 		Snapshot:         snapshot,
 	}
 }

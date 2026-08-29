@@ -43,6 +43,11 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 				Name: "wasm-echo", Description: "echo JSON", ParametersJSONSchema: `{"type":"object"}`,
 				RetrySafe: true, RequiredPermissions: cm.ToList(permissions),
 			}
+		case "tool.permission-pattern":
+			component.mu.Lock()
+			component.lastInput = input
+			component.mu.Unlock()
+			*output.(*string) = "workspace.read:value-1"
 		case "tool.execute":
 			request := input.(toolExecuteRequest)
 			component.mu.Lock()
@@ -74,6 +79,16 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Materialize = %v", err)
 	}
+	pattern, err := materialized.Pattern.ResolvePermissionPattern(context.Background(), json.RawMessage(`{"value":1}`))
+	if err != nil || pattern != "workspace.read:value-1" {
+		t.Fatalf("permission pattern = %q, %v", pattern, err)
+	}
+	component.mu.Lock()
+	patternInput := component.lastInput
+	component.mu.Unlock()
+	if patternInput != `{"value":1}` {
+		t.Fatalf("permission input = %#v", patternInput)
+	}
 	decoded, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"value":1}`))
 	if err != nil {
 		t.Fatalf("DecodeToolInput error = %v", err)
@@ -99,6 +114,54 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		if strings.Contains(visible, secret) {
 			t.Fatalf("secret %q reached guest input", secret)
 		}
+	}
+}
+
+func TestToolPermissionPatternBounds(t *testing.T) {
+	tests := []struct {
+		name      string
+		output    string
+		maxOutput int64
+		wantKind  ErrorKind
+	}{
+		{name: "runtime maximum", output: strings.Repeat("x", 4096)},
+		{name: "over runtime maximum", output: strings.Repeat("x", 4097), wantKind: ErrorSize},
+		{name: "tighter module maximum", output: strings.Repeat("x", 33), maxOutput: 32, wantKind: ErrorSize},
+		{name: "empty", wantKind: ErrorContract},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			component := &fakeComponent{call: func(_ context.Context, operation string, _ any, output any) error {
+				switch operation {
+				case "tool.metadata":
+					*output.(*wittypes.ToolMetadata) = wittypes.ToolMetadata{Name: "bounded", ParametersJSONSchema: `{"type":"object"}`}
+				case "tool.permission-pattern":
+					*output.(*string) = test.output
+				}
+				return nil
+			}}
+			cfg := fixtureConfig(t, []byte(test.name))
+			cfg.Limits.MaxOutputBytes = test.maxOutput
+			loaded, err := openTool(context.Background(), cfg, fakeFactory(component))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = loaded.close() }()
+			materialized, err := tools.Materialize(context.Background(), loaded.definition, runtime.ToolScopeContext{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			pattern, err := materialized.Pattern.ResolvePermissionPattern(context.Background(), json.RawMessage(`{"value":1}`))
+			if test.wantKind != "" {
+				if !IsKind(err, test.wantKind) {
+					t.Fatalf("pattern error = %v, want %s", err, test.wantKind)
+				}
+				return
+			}
+			if err != nil || pattern != test.output {
+				t.Fatalf("pattern bytes = %d, error = %v", len(pattern), err)
+			}
+		})
 	}
 }
 
@@ -627,7 +690,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 		if modelTurns.Add(1) == 1 {
 			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
 				ID: "wasm-call", Type: "function", Function: einoschema.FunctionCall{
-					Name: "wasm_echo", Arguments: `{"permission_pattern":"allow","value":1}`,
+					Name: "wasm_echo", Arguments: `{"value":1}`,
 				},
 			}})}, nil
 		}
@@ -675,7 +738,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if toolCall.Status != session.ToolCallCompleted || !strings.Contains(string(toolCall.Input), `"permission_pattern":"allow"`) || !strings.Contains(string(toolCall.Output), `"echo"`) {
+	if toolCall.Status != session.ToolCallCompleted || toolCall.Pattern != "allow" || string(toolCall.Input) != `{"value":1}` || !strings.Contains(string(toolCall.Output), `"echo"`) {
 		t.Fatalf("durable tool call = %+v", toolCall)
 	}
 }
@@ -813,6 +876,10 @@ func (c *fakeComponent) invoke(ctx context.Context, operation string, input, out
 }
 func (c *fakeComponent) ToolMetadata(ctx context.Context) (output wittypes.ToolMetadata, err error) {
 	err = c.invoke(ctx, "tool.metadata", nil, &output)
+	return
+}
+func (c *fakeComponent) ToolPermissionPattern(ctx context.Context, input string) (output string, err error) {
+	err = c.invoke(ctx, "tool.permission-pattern", input, &output)
 	return
 }
 func (c *fakeComponent) ExecuteTool(ctx context.Context, input toolExecuteRequest) (output string, err error) {

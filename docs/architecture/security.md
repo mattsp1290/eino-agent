@@ -258,3 +258,6 @@ host clients, callbacks, raw event payloads, or opaque configuration. Native
 callback error text is bounded before persistence; trusted diagnostics retain
 the raw cause locally. See
 [`extension-points.md`](extension-points.md#scope-provenance-and-resume).
+Wasm permission-pattern derivation receives only final normalized tool JSON and
+is capped at 4,096 output bytes (or a tighter module limit). Context-source WIT
+output can encode only system and user text roles.

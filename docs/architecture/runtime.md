@@ -173,9 +173,11 @@ AG-UI adapters should:
 - persist settled message/part snapshots separately from SSE delivery state;
 - expose replay and live-tail APIs that are explicit about this distinction.
 
-The runtime persists non-live event projections through the current fenced
-execution capability before publication. External `EventSink` adapters are
-transport/observability consumers only and have no store mutation authority.
+The typed mutation that owns a durable fact persists its event through the
+current fenced execution capability and returns the committed record. Runtime
+then publishes that exact record. External `EventSink` adapters are
+transport/observability consumers only and have no store mutation authority;
+the generic sink never infers persistence from event kind or `LiveOnly`.
 Live-only SSE frames are not persisted as the replay source of truth.
 
 ## Tool Lifecycle

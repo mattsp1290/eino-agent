@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -120,13 +121,27 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 
 func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	store := newAdmissionStore()
+	store.normalizeEvent = func(event session.EventRecord) session.EventRecord {
+		event.Correlation = "stored:" + event.Kind
+		return event
+	}
 	runtimeSink := &capturingSink{}
 	registry := newTestExtensionRegistry(nil)
 	component := extension.Component{InstanceID: "admission-events", Artifact: extension.Artifact{Name: "admission-events", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var published []EventKind
+	var order []string
 	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
+		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event Event) error {
 			published = append(published, event.Kind)
+			if event.Kind == EventRunStarted {
+				order = append(order, "event-published")
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		return extension.On(registrar, RunAdmittedPoint, extension.Registration{ID: "admitted", Scope: extension.GlobalScope()}, func(context.Context, RunAdmittedNotice) error {
+			order = append(order, "run-admitted")
 			return nil
 		})
 	}))
@@ -163,6 +178,16 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	}
 	if publishedStarts != 1 {
 		t.Fatalf("published admission starts = %d, all events = %v", publishedStarts, published)
+	}
+	if !reflect.DeepEqual(order, []string{"event-published", "run-admitted"}) {
+		t.Fatalf("admission notification order = %v", order)
+	}
+	for _, event := range runtimeSink.events {
+		if event.Kind == EventRunStarted || event.Kind == EventRunFinished {
+			if event.Correlation != "stored:"+string(event.Kind) {
+				t.Fatalf("published %s correlation = %q, want store normalization", event.Kind, event.Correlation)
+			}
+		}
 	}
 }
 

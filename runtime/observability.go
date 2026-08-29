@@ -27,15 +27,6 @@ func (s ObservabilitySink) Emit(ctx context.Context, event Event) error {
 		return nil
 	}
 	switch event.Kind {
-	case EventContextEpochChanged:
-		s.Observer.Compaction(ctx, einoobs.CompactionEvent{
-			Correlation: eventCorrelation(event, "compaction"),
-			Reason:      "context_epoch_changed",
-			Time:        event.Time,
-			Metadata: einoobs.Metadata{
-				"epoch_id": string(event.EpochID),
-			},
-		})
 	case EventRunFinished:
 		if event.Error.Code != "" || event.Error.Message != "" {
 			s.Observer.Error(ctx, einoobs.ErrorEvent{

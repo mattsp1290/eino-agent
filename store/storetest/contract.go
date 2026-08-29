@@ -72,7 +72,7 @@ func Run(t *testing.T, factory Factory) {
 		admitted.Status = session.RunInterrupted
 		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
 		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
-		if err := execution.SettleRun(ctx, admitted, nil); err != nil {
+		if _, err := execution.SettleRun(ctx, admitted, nil); err != nil {
 			t.Fatalf("finish first run: %v", err)
 		}
 		if _, err := subject.Store.AdmitRun(ctx, run("run-3", s.ID, "owner-3"), time.Minute); err != nil {
@@ -92,7 +92,7 @@ func Run(t *testing.T, factory Factory) {
 		admitted.Status = session.RunCompleted
 		admitted.FinishedAt = admitted.CreatedAt.Add(time.Minute)
 		execution := subject.Store.Execution(session.RunFence{RunID: admitted.ID, ClaimToken: admitted.ClaimToken})
-		if err := execution.SettleRun(ctx, admitted, nil); err != nil {
+		if _, err := execution.SettleRun(ctx, admitted, nil); err != nil {
 			t.Fatalf("settle run: %v", err)
 		}
 		if _, err := subject.Store.AdmitRun(ctx, candidate, time.Minute); !errors.Is(err, session.ErrConflict) {

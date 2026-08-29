@@ -363,7 +363,7 @@ type ExecutionStore interface {
 	WithinTx(ctx context.Context, fn func(context.Context, ExecutionStore) error) error
 	StartRun(ctx context.Context, startedAt time.Time) (Run, error)
 	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
-	SettleRun(ctx context.Context, run Run, finalEvent *EventRecord) error
+	SettleRun(ctx context.Context, run Run, finalEvent *EventRecord) (*EventRecord, error)
 	AppendMessage(ctx context.Context, message Message) (Message, error)
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error

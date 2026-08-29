@@ -65,10 +65,10 @@ func (e *runExecution) eventSink(infrastructure EventSink) EventSink {
 	if e == nil {
 		return infrastructure
 	}
-	if e.store == nil && infrastructure == nil && e.dispatch() == nil {
+	if infrastructure == nil && e.dispatch() == nil {
 		return nil
 	}
-	return runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}
+	return runEventSink{infrastructure: infrastructure, plan: e.dispatch()}
 }
 
 func (e *runExecution) publishPersisted(ctx context.Context, infrastructure EventSink, record session.EventRecord) {
@@ -78,5 +78,15 @@ func (e *runExecution) publishPersisted(ctx context.Context, infrastructure Even
 		}
 		return
 	}
-	runEventSink{execution: e, infrastructure: infrastructure, plan: e.dispatch()}.publishPersisted(ctx, context.WithoutCancel(ctx), record)
+	e.publishPersistedWithNotificationContext(ctx, context.WithoutCancel(ctx), infrastructure, record)
+}
+
+func (e *runExecution) publishPersistedWithNotificationContext(infrastructureCtx, notificationCtx context.Context, infrastructure EventSink, record session.EventRecord) {
+	if e == nil {
+		if infrastructure != nil {
+			_ = infrastructure.Emit(infrastructureCtx, runtimeEventRecord(record))
+		}
+		return
+	}
+	runEventSink{infrastructure: infrastructure, plan: e.dispatch()}.publishPersisted(infrastructureCtx, notificationCtx, record)
 }

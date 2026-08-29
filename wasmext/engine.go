@@ -21,6 +21,7 @@ type compiledComponent interface {
 type toolComponent interface {
 	compiledComponent
 	ToolMetadata(context.Context) (wittypes.ToolMetadata, error)
+	ToolPermissionPattern(context.Context, string) (string, error)
 	ExecuteTool(context.Context, toolExecuteRequest) (string, error)
 }
 
@@ -65,7 +66,7 @@ type worldContract struct {
 
 var (
 	toolContract = worldContract{
-		world: "eino-agent:extensions/tool@0.1.0", exportName: "eino-agent:extensions/tool-api@0.1.0", functions: []string{"metadata", "execute"},
+		world: "eino-agent:extensions/tool@0.1.0", exportName: "eino-agent:extensions/tool-api@0.1.0", functions: []string{"metadata", "permission-pattern", "execute"},
 	}
 	permissionsPolicyContract = worldContract{
 		world: "eino-agent:extensions/permissions-policy@0.1.0", exportName: "eino-agent:extensions/permissions-policy-api@0.1.0", functions: []string{"decide"},

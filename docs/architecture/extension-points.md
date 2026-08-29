@@ -5,8 +5,8 @@ Date: 2026-08-20
 The extension system has three deliberately separate planes:
 
 - session records and the request ledger are durable facts;
-- `runtime.EventSink` carries live transport events with its existing
-  backpressure behavior;
+- `runtime.EventSink` carries live transport events and best-effort publications
+  of already-committed durable records with its existing backpressure behavior;
 - typed extension points are in-process semantic callbacks and contained
   observation. They never replace durable writes or transport delivery.
 

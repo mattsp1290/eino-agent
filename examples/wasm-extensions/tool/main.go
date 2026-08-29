@@ -14,6 +14,7 @@ import (
 
 func init() {
 	toolapi.Exports.Metadata = metadata
+	toolapi.Exports.PermissionPattern = permissionPattern
 	toolapi.Exports.Execute = execute
 }
 
@@ -26,6 +27,19 @@ func metadata() cm.Result[toolapi.ToolMetadataShape, toolapi.ToolMetadata, toola
 		RetrySafe:            true,
 		RequiredPermissions:  cm.ToList(permissions),
 	})
+}
+
+func permissionPattern(inputJSON string) cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError] {
+	switch {
+	case strings.Contains(inputJSON, `"mode":"pattern-empty"`):
+		return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]]("")
+	case strings.Contains(inputJSON, `"mode":"pattern-max"`):
+		return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]](strings.Repeat("x", 4096))
+	case strings.Contains(inputJSON, `"mode":"pattern-oversized"`):
+		return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]](strings.Repeat("x", 4097))
+	default:
+		return cm.OK[cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError]]("allow")
+	}
 }
 
 func execute(_ string, inputJSON string, _ toolapi.TurnMetadata) cm.Result[toolapi.StructuredErrorShape, string, toolapi.StructuredError] {

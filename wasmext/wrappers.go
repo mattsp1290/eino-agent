@@ -22,6 +22,8 @@ type loadedTool struct {
 	definition tools.Definition
 }
 
+const maxPermissionPatternBytes int64 = 4096
+
 func (t *loadedTool) close() error { return t.module.Close() }
 
 func openTool(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedTool, error) {
@@ -84,17 +86,25 @@ func toolDefinition(module *module, component toolComponent, metadata wittypes.T
 		}
 		return append(json.RawMessage(nil), raw...), nil
 	}
-	definition.Pattern = func(_ context.Context, raw json.RawMessage) (string, error) {
-		var value struct {
-			PermissionPattern string `json:"permission_pattern"`
+	definition.Pattern = func(ctx context.Context, raw json.RawMessage) (string, error) {
+		if err := validateBoundedJSON(raw, module.limits.MaxInputBytes); err != nil {
+			return "", extensionError(payloadErrorKind(err), module.identity, "tool.permission-pattern", err)
 		}
-		if err := json.Unmarshal(raw, &value); err != nil {
-			return "", extensionError(ErrorPayload, module.identity, "tool.permission-pattern", err)
+		var pattern string
+		if err := module.call(ctx, "tool.permission-pattern", len(raw), func(callCtx context.Context) error {
+			var callErr error
+			pattern, callErr = component.ToolPermissionPattern(callCtx, string(raw))
+			return callErr
+		}); err != nil {
+			return "", err
 		}
-		if value.PermissionPattern == "" {
-			return metadata.Name, nil
+		if int64(len(pattern)) > min(module.limits.MaxOutputBytes, maxPermissionPatternBytes) {
+			return "", extensionError(ErrorSize, module.identity, "tool.permission-pattern", errModuleTooLarge)
 		}
-		return value.PermissionPattern, nil
+		if strings.TrimSpace(pattern) == "" {
+			return "", extensionError(ErrorContract, module.identity, "tool.permission-pattern", errors.New("empty permission pattern"))
+		}
+		return pattern, nil
 	}
 	definition.Execute = func(ctx context.Context, execution tools.Execution) (json.RawMessage, error) {
 		raw := execution.Input
@@ -206,8 +216,6 @@ func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 			messages = append(messages, einoschema.SystemMessage(message.Text))
 		case wittypes.TextRoleUser:
 			messages = append(messages, einoschema.UserMessage(message.Text))
-		case wittypes.TextRoleAssistant:
-			messages = append(messages, einoschema.AssistantMessage(message.Text, nil))
 		default:
 			return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
 		}

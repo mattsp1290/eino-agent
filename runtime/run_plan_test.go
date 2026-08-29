@@ -50,15 +50,7 @@ func newTestDispatchPlan(dispatch *extension.Plan) *RunPlan {
 }
 
 func testDispatchComponents(dispatch *extension.Plan) []PlanComponent {
-	if dispatch == nil {
-		return nil
-	}
-	owners := dispatch.HandlerComponents()
-	components := make([]PlanComponent, len(owners))
-	for index, owner := range owners {
-		components[index] = PlanComponent{Component: owner.Component, Handlers: owner.Handlers}
-	}
-	return components
+	return nil
 }
 
 func testDispatchPlanSpec(dispatch *extension.Plan) RunPlanSpec {
@@ -306,7 +298,7 @@ func TestNewRunPlanOrdersGlobalGuardBeforeSessionGuard(t *testing.T) {
 	}
 }
 
-func TestNewRunPlanRejectsForgedHandlerOwnership(t *testing.T) {
+func TestNewRunPlanRejectsConflictingDispatchAndCapabilityOwner(t *testing.T) {
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("handler-owner"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "handler", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
@@ -318,10 +310,17 @@ func TestNewRunPlanRejectsForgedHandlerOwnership(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	spec := testDispatchPlanSpec(dispatch)
-	spec.Components[0].Handlers[0].ID = "forged"
+	owner := testPlanComponent("handler-owner")
+	owner.Artifact.Hash = "conflicting"
+	spec := RunPlanSpec{Dispatch: dispatch, Components: []PlanComponent{{
+		Component: owner,
+		Prompts: []PlanPrompt{{
+			Identity: session.PromptPlanIdentity{Name: "prompt", RegistrationID: "prompt", Scope: extension.GlobalScope()},
+			Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) { return "", nil }),
+		}},
+	}}}
 	if _, err := NewRunPlan(spec); !errors.Is(err, ErrExtensionPlanMismatch) {
-		t.Fatalf("forged handler error = %v", err)
+		t.Fatalf("conflicting owner error = %v", err)
 	}
 	if err := mount.Close(context.Background()); err != nil {
 		t.Fatalf("failed construction leaked dispatch lease: %v", err)

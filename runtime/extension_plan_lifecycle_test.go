@@ -309,9 +309,9 @@ type runLifecycleExecution struct {
 	terminalFinishErr error
 }
 
-func (s *runLifecycleExecution) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) error {
+func (s *runLifecycleExecution) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) (*session.EventRecord, error) {
 	if run.Terminal() && s.terminalFinishErr != nil {
-		return s.terminalFinishErr
+		return nil, s.terminalFinishErr
 	}
 	return s.ExecutionStore.SettleRun(ctx, run, event)
 }

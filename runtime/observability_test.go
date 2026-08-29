@@ -187,31 +187,6 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 	assertObservation(t, observations, "run", "canceled", "")
 }
 
-func TestObservabilitySinkRecordsCompactionWithoutPayloadLeak(t *testing.T) {
-	t.Parallel()
-
-	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
-	err := (ObservabilitySink{Observer: observer}).Emit(context.Background(), Event{
-		Kind:        EventContextEpochChanged,
-		SessionID:   "session-1",
-		RunID:       "run-1",
-		MessageID:   "summary-1",
-		EpochID:     "epoch-1",
-		Correlation: "trace-1",
-		Payload:     []byte(`{"summary":"SECRET compacted prompt"}`),
-	})
-	if err != nil {
-		t.Fatalf("Emit error = %v", err)
-	}
-	compaction := assertObservation(t, observer.Snapshot().Observations, "compaction", "ok", "trace-1")
-	if compaction.Attributes["metadata.epoch_id"] != "epoch-1" {
-		t.Fatalf("compaction attrs = %#v", compaction.Attributes)
-	}
-	if observationContains(observer.Snapshot().Observations, "SECRET compacted prompt") {
-		t.Fatalf("observations leaked compaction payload: %#v", observer.Snapshot().Observations)
-	}
-}
-
 func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.T) {
 	t.Parallel()
 

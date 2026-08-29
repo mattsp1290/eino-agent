@@ -85,6 +85,10 @@ guest log observations flow through its configured exporter with the
 host-configured module name and verified digest attached; otherwise logs are
 dropped.
 
+Permission-pattern output is additionally capped at 4,096 bytes (or a tighter
+configured output limit). Context-source guests can return only system and user
+text messages; assistant history remains a native validated boundary.
+
 The embedding host owns shutdown. Prefer `wasmext.NewLoader`, load wrappers
 through it, and call `Loader.Close(ctx)`. Close stops admission, interrupts
 in-flight work, drains within bounds, and releases compiled state once. Calls

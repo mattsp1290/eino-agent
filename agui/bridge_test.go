@@ -65,68 +65,6 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	}
 }
 
-func TestBridgeEmitsModelFallbackCustomEvent(t *testing.T) {
-	t.Parallel()
-
-	sink := newSSESink()
-	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	event := runtime.NewModelFallbackEvent("gpt-primary", "gpt-fallback", "circuit_breaker")
-	if err := bridge.Emit(context.Background(), event); err != nil {
-		t.Fatalf("Emit error = %v", err)
-	}
-
-	frames := frameData(t, sink.Bytes())
-	if len(frames) != 1 {
-		t.Fatalf("frames = %d, want 1", len(frames))
-	}
-	frame := frames[0]
-	if frame["type"] != "CUSTOM" {
-		t.Fatalf("frame type = %v, want CUSTOM", frame["type"])
-	}
-	if frame["name"] != "model_fallback_engaged" {
-		t.Fatalf("frame name = %v, want model_fallback_engaged", frame["name"])
-	}
-	value, ok := frame["value"].(map[string]any)
-	if !ok {
-		t.Fatalf("frame value = %#v, want map", frame["value"])
-	}
-	if value["from_model_id"] != "gpt-primary" || value["to_model_id"] != "gpt-fallback" {
-		t.Fatalf("value model transition = %#v", value)
-	}
-	if value["reason"] != "circuit_breaker" {
-		t.Fatalf("value reason = %v, want circuit_breaker", value["reason"])
-	}
-	// The custom value mirrors the durable payload's omitempty shape: empty
-	// optional keys are absent, not present as "".
-	for _, key := range []string{"from_provider_id", "to_provider_id"} {
-		if _, present := value[key]; present {
-			t.Fatalf("custom value should omit empty %q, got %#v", key, value)
-		}
-	}
-	if bridge.Err() != nil {
-		t.Fatalf("bridge error: %v", bridge.Err())
-	}
-}
-
-func TestBridgeModelFallbackNilPayloadDoesNotPanic(t *testing.T) {
-	t.Parallel()
-
-	sink := newSSESink()
-	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	// A host that bypasses NewModelFallbackEvent may leave Payload nil; the
-	// bridge must degrade to an empty custom value, not panic.
-	if err := bridge.Emit(context.Background(), runtime.Event{Kind: runtime.EventModelFallbackEngaged}); err != nil {
-		t.Fatalf("Emit error = %v", err)
-	}
-	frames := frameData(t, sink.Bytes())
-	if len(frames) != 1 || frames[0]["type"] != "CUSTOM" {
-		t.Fatalf("frames = %#v, want one CUSTOM frame", frames)
-	}
-	if value, ok := frames[0]["value"].(map[string]any); !ok || len(value) != 0 {
-		t.Fatalf("nil-payload custom value = %#v, want empty map", frames[0]["value"])
-	}
-}
-
 func TestBridgeDelegatesClientToolBinding(t *testing.T) {
 	t.Parallel()
 

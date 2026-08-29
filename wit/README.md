@@ -8,10 +8,11 @@ The project is pre-release and supports only this current schema. Regenerate
 the checked-in Go bindings with `make wit` after changing the WIT contract, then
 rebuild the checked-in guest components with `make wasm-fixtures`.
 
-Phase A includes host wrappers and example components for the `tool` and
-`permissions-policy` worlds. The `context-source`, `event-sink`, `hook`, and
-`tool-middleware` worlds reserve the Phase B contracts; their wrappers and
-examples follow the same versioned loading pattern.
+Host wrappers and checked-in example components cover the `tool`,
+`permissions-policy`, `context-source`, `event-sink`, `hook`, and
+`tool-middleware` worlds. Tool guests must export
+`permission-pattern(input-json)` over final normalized input; context-source
+messages can use only system or user text roles.
 
 All JSON strings and free-form text are subject to host-configured byte limits.
 The host exposes only `eino-agent:host/log@0.1.0`; filesystem, sockets,

@@ -10,7 +10,7 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func TestRunEventSinkPersistsOnlyIntermediateDurableEventsThroughFence(t *testing.T) {
+func TestRunEventSinkOnlyFansOut(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -27,24 +27,14 @@ func TestRunEventSinkPersistsOnlyIntermediateDurableEventsThroughFence(t *testin
 	execution.bindRun(run)
 	sink := execution.eventSink(infrastructure)
 
-	if err := sink.Emit(ctx, Event{Kind: EventContextEpochChanged, SessionID: run.SessionID, RunID: run.ID}); err != nil {
-		t.Fatalf("emit durable event: %v", err)
-	}
-	if len(store.events) != 1 {
-		t.Fatalf("durable events = %d, want 1", len(store.events))
-	}
-	if len(infrastructure.events) != 1 || infrastructure.events[0].EventID == "" {
-		t.Fatalf("infrastructure events = %#v, want generated durable event id", infrastructure.events)
-	}
-
 	if err := sink.Emit(ctx, Event{Kind: EventMessageDelta, SessionID: run.SessionID, RunID: run.ID, LiveOnly: true}); err != nil {
 		t.Fatalf("emit live event: %v", err)
 	}
-	if err := sink.Emit(ctx, Event{Kind: EventRunFinished, SessionID: run.SessionID, RunID: run.ID}); err != nil {
-		t.Fatalf("emit final notification: %v", err)
+	if len(store.events) != 0 {
+		t.Fatalf("fanout persisted %d events, want none", len(store.events))
 	}
-	if len(store.events) != 1 {
-		t.Fatalf("durable events after transport-only notifications = %d, want 1", len(store.events))
+	if len(infrastructure.events) != 1 || infrastructure.events[0].Kind != EventMessageDelta {
+		t.Fatalf("infrastructure events = %#v", infrastructure.events)
 	}
 }
 

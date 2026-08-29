@@ -60,7 +60,6 @@ type PlanRestriction struct {
 
 type PlanComponent struct {
 	Component    extension.Component
-	Handlers     []extension.HandlerIdentity
 	Tools        []PlanTool
 	Prompts      []PlanPrompt
 	Guards       []PlanGuard
@@ -97,7 +96,22 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if spec.Dispatch != nil {
 		authoritativeHandlers = spec.Dispatch.HandlerComponents()
 	}
-	matchedHandlers := make([]bool, len(authoritativeHandlers))
+	durableComponents := make(map[string]session.ComponentPlan, len(authoritativeHandlers)+len(components))
+	componentOwners := make(map[string]extension.Component, len(authoritativeHandlers)+len(components))
+	for _, owned := range authoritativeHandlers {
+		if err := extension.ValidateComponent(owned.Component); err != nil {
+			return fail(fmt.Errorf("%w: invalid handler owner", ErrExtensionPlanMismatch))
+		}
+		if _, exists := componentOwners[owned.Component.InstanceID]; exists {
+			return fail(fmt.Errorf("%w: duplicate handler owner", ErrExtensionPlanMismatch))
+		}
+		durable := session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
+		for _, handler := range owned.Handlers {
+			durable.Handlers = append(durable.Handlers, session.RegistrationIdentity{ID: handler.ID, Contract: handler.Contract.ID, Version: handler.Contract.Version, Order: handler.Order, Scope: handler.Scope, Kind: handler.Kind})
+		}
+		componentOwners[owned.Component.InstanceID] = owned.Component
+		durableComponents[owned.Component.InstanceID] = durable
+	}
 	type ownedTool struct {
 		owner string
 		value PlanTool
@@ -114,26 +128,16 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		if err := extension.ValidateComponent(owned.Component); err != nil || componentIndex > 0 && components[componentIndex-1].Component.InstanceID == owned.Component.InstanceID {
 			return fail(fmt.Errorf("%w: invalid or duplicate component owner", ErrExtensionPlanMismatch))
 		}
-		if len(owned.Handlers)+len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) == 0 {
+		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) == 0 {
 			return fail(fmt.Errorf("%w: empty component owner", ErrExtensionPlanMismatch))
 		}
-		var expected []extension.HandlerIdentity
-		for index, candidate := range authoritativeHandlers {
-			if candidate.Component.InstanceID == owned.Component.InstanceID {
-				if candidate.Component != owned.Component {
-					return fail(fmt.Errorf("%w: conflicting handler owner", ErrExtensionPlanMismatch))
-				}
-				expected = candidate.Handlers
-				matchedHandlers[index] = true
-				break
-			}
+		if existing, ok := componentOwners[owned.Component.InstanceID]; ok && existing != owned.Component {
+			return fail(fmt.Errorf("%w: conflicting component owner", ErrExtensionPlanMismatch))
 		}
-		if !sameHandlerIdentities(expected, owned.Handlers) {
-			return fail(fmt.Errorf("%w: dispatch handler identities differ", ErrExtensionPlanMismatch))
-		}
-		durable := session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
-		for _, handler := range owned.Handlers {
-			durable.Handlers = append(durable.Handlers, session.RegistrationIdentity{ID: handler.ID, Contract: handler.Contract.ID, Version: handler.Contract.Version, Order: handler.Order, Scope: handler.Scope, Kind: handler.Kind})
+		durable, ok := durableComponents[owned.Component.InstanceID]
+		if !ok {
+			durable = session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
+			componentOwners[owned.Component.InstanceID] = owned.Component
 		}
 		for _, capability := range owned.Tools {
 			if capability.Resolve == nil {
@@ -169,12 +173,15 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 			restrictions = append(restrictions, ownedRestriction{owner: owned.Component.InstanceID, value: capability})
 			durable.Restrictions = append(durable.Restrictions, capability.Identity)
 		}
-		descriptor.Components = append(descriptor.Components, durable)
+		durableComponents[owned.Component.InstanceID] = durable
 	}
-	for index, matched := range matchedHandlers {
-		if !matched && len(authoritativeHandlers[index].Handlers) > 0 {
-			return fail(fmt.Errorf("%w: dispatch handler owner omitted", ErrExtensionPlanMismatch))
-		}
+	componentIDs := make([]string, 0, len(durableComponents))
+	for instanceID := range durableComponents {
+		componentIDs = append(componentIDs, instanceID)
+	}
+	sort.Strings(componentIDs)
+	for _, instanceID := range componentIDs {
+		descriptor.Components = append(descriptor.Components, durableComponents[instanceID])
 	}
 	sort.Slice(tools, func(i, j int) bool {
 		return comparePlanTool(tools[i].owner, tools[i].value.Identity, tools[j].owner, tools[j].value.Identity) < 0
@@ -206,18 +213,6 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	plan.guards = sealedGuards
 	plan.descriptor = descriptor
 	return plan, nil
-}
-
-func sameHandlerIdentities(left, right []extension.HandlerIdentity) bool {
-	if len(left) != len(right) {
-		return false
-	}
-	for index := range left {
-		if left[index] != right[index] {
-			return false
-		}
-	}
-	return true
 }
 
 func comparePlanTool(leftOwner string, left session.ToolPlanIdentity, rightOwner string, right session.ToolPlanIdentity) int {

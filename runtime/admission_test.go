@@ -22,9 +22,8 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	sink := &capturingSink{}
 	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
-	admitter := admitter{Store: store, Events: sink, Clock: func() time.Time { return now }}
+	admitter := admitter{Store: store, Clock: func() time.Time { return now }}
 	request := testRunAdmission()
 	admitted, err := admitter.admit(context.Background(), request)
 	if err != nil {
@@ -60,11 +59,8 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].Trigger != "turn" || epochs[0].Reason != "run_admission" {
 		t.Fatalf("epochs = %#v", epochs)
 	}
-	if len(sink.events) != 1 || sink.events[0].Kind != EventRunStarted {
-		t.Fatalf("emitted events = %#v", sink.events)
-	}
-	if sink.events[0].EventID != events.Events[0].ID {
-		t.Fatalf("live event id = %q, want durable id %q", sink.events[0].EventID, events.Events[0].ID)
+	if !reflect.DeepEqual(admitted.Event, events.Events[0]) {
+		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[0])
 	}
 	request.Config.Agent.Options["temperature"] = "changed"
 	request.Input[0].Content = "changed"
@@ -137,8 +133,7 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	sink := &capturingSink{}
-	admitter := admitter{Store: store, Events: sink, Clock: func() time.Time { return time.Unix(1, 0) }}
+	admitter := admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
 	request := testRunAdmission()
 	if _, err := admitter.admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
@@ -147,22 +142,18 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	if !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("duplicate Admit error = %v, want ErrConflict", err)
 	}
-	if len(sink.events) != 1 {
-		t.Fatalf("duplicate replayed side effects: sink=%d", len(sink.events))
-	}
 }
 
 func TestAdmitCloneFailureHasNoDurableOrLiveSideEffects(t *testing.T) {
 	store := newAdmissionStore()
-	sink := &capturingSink{}
 	request := testRunAdmission()
 	request.Input[0].Extra = map[string]any{"unsupported": make(chan int)}
-	_, err := (admitter{Store: store, Events: sink}).admit(context.Background(), request)
+	_, err := (admitter{Store: store}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
-	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.events) != 0 || len(store.epochs) != 0 || len(sink.events) != 0 {
-		t.Fatalf("clone failure mutated state: sessions=%d runs=%d messages=%d events=%d epochs=%d live=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.events), len(store.epochs), len(sink.events))
+	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.events) != 0 || len(store.epochs) != 0 {
+		t.Fatalf("clone failure mutated state: sessions=%d runs=%d messages=%d events=%d epochs=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.events), len(store.epochs))
 	}
 }
 
@@ -264,21 +255,6 @@ func TestAdmitRejectsIncompleteResolvedModelBeforeStoreUse(t *testing.T) {
 	}
 }
 
-func TestLiveSinkFailureDoesNotFailAdmission(t *testing.T) {
-	t.Parallel()
-
-	store := newAdmissionStore()
-	errSink := errors.New("sink failed")
-	admitter := admitter{Store: store, Events: failingSink{err: errSink}}
-	admitted, err := admitter.admit(context.Background(), testRunAdmission())
-	if err != nil {
-		t.Fatalf("Admit error = %v, want success despite live sink failure", err)
-	}
-	if admitted.Run.ID != "run-1" {
-		t.Fatalf("admitted run = %+v", admitted.Run)
-	}
-}
-
 func testRunAdmission() admissionRequest {
 	selection := model.Selection{ProviderID: "openai", ModelID: "gpt-4.1"}
 	return admissionRequest{
@@ -332,14 +308,6 @@ func (s *capturingSink) Emit(_ context.Context, event Event) error {
 	return nil
 }
 
-type failingSink struct {
-	err error
-}
-
-func (s failingSink) Emit(context.Context, Event) error {
-	return s.err
-}
-
 type admissionStore struct {
 	sessions          map[session.ID]session.Session
 	runs              map[session.RunID]session.Run
@@ -352,6 +320,7 @@ type admissionStore struct {
 	appendEventErr    error
 	settleToolCallErr error
 	toolTransitionErr error
+	normalizeEvent    func(session.EventRecord) session.EventRecord
 	listMessagesCalls atomic.Int32
 	getRunCalls       atomic.Int32
 }
@@ -398,6 +367,7 @@ func (s *admissionStore) clone() *admissionStore {
 		appendEventErr:    s.appendEventErr,
 		settleToolCallErr: s.settleToolCallErr,
 		toolTransitionErr: s.toolTransitionErr,
+		normalizeEvent:    s.normalizeEvent,
 	}
 }
 
@@ -561,6 +531,9 @@ func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecor
 	}
 	if event.ToolTransition != "" || (event.Kind == session.ToolTransitionEventKind && event.ToolCallID != "") {
 		return session.EventRecord{}, session.ErrConflict
+	}
+	if s.normalizeEvent != nil {
+		event = s.normalizeEvent(event)
 	}
 	if existing, ok := s.events[event.ID]; ok {
 		if existing.Kind != event.Kind {
@@ -763,18 +736,18 @@ func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Dura
 	return run, nil
 }
 
-func (s *fakeExecutionStore) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) error {
+func (s *fakeExecutionStore) SettleRun(ctx context.Context, run session.Run, event *session.EventRecord) (*session.EventRecord, error) {
 	if !s.valid() || run.ID != s.fence.RunID || run.ClaimToken != s.fence.ClaimToken {
-		return session.ErrConflict
+		return nil, session.ErrConflict
 	}
 	if err := s.FinishRun(ctx, run); err != nil {
-		return err
+		return nil, err
 	}
 	if event != nil {
-		_, err := s.AppendEvent(ctx, *event)
-		return err
+		record, err := s.AppendEvent(ctx, *event)
+		return &record, err
 	}
-	return nil
+	return nil, nil
 }
 
 func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {

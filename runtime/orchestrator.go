@@ -97,8 +97,6 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		RunClaimToken:      string(o.ids.NewEventID()),
 	}
 	admitter := o.admitter()
-	admitter.Events = execution.eventSink(admitter.Events)
-	admitter.Extensions = execution.dispatch()
 	admitted, err := admitter.admit(ctx, admissionRequest{
 		IDs:             ids,
 		ParentMessageID: request.ParentID,
@@ -113,6 +111,11 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err != nil {
 		return nil, err
 	}
+	execution.publishPersistedWithNotificationContext(ctx, ctx, o.events, admitted.Event)
+	extension.Notify(execution.dispatch(), ctx, RunAdmittedPoint, RunAdmittedNotice{
+		SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor(),
+		Metadata: boundedTurnMetadata(admitted.Snapshot), Time: admitted.Snapshot.CreatedAt,
+	})
 	execution.bindRun(admitted.Run)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
@@ -413,14 +416,15 @@ func (o *StreamingOrchestrator) finish(ctx context.Context, execution *runExecut
 	}
 	finalEvent := o.finalRunEvent(run, result)
 	settled := true
-	if err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent); err != nil {
+	committedEvent, err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent)
+	if err != nil {
 		settled = false
 		if result.Error == nil {
 			result.Status = session.RunFailed
 			result.Error = err
 		}
 	} else {
-		o.publishRunFinished(ctx, execution, finalEvent, result)
+		o.publishRunFinished(ctx, execution, committedEvent)
 	}
 	return result, settled
 }
@@ -440,18 +444,11 @@ func (o *StreamingOrchestrator) finalRunEvent(run session.Run, result Result) *s
 	}
 }
 
-func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, execution *runExecution, event *session.EventRecord, result Result) {
+func (o *StreamingOrchestrator) publishRunFinished(ctx context.Context, execution *runExecution, event *session.EventRecord) {
 	if event == nil {
 		return
 	}
-	if sink := execution.eventSink(o.events); sink != nil {
-		_ = sink.Emit(context.WithoutCancel(ctx), Event{
-			Kind: EventRunFinished, EventID: event.ID, SessionID: event.SessionID, RunID: event.RunID,
-			MessageID: event.MessageID, ProviderID: event.ProviderID, ModelID: event.ModelID,
-			Usage: result.Usage, Error: eventError(result.Error), Redaction: RedactionClass(event.Redaction),
-			Payload: cloneJSON(event.Payload), Time: event.CreatedAt,
-		})
-	}
+	execution.publishPersisted(context.WithoutCancel(ctx), o.events, *event)
 }
 
 func (o *StreamingOrchestrator) validate(request Request) error {
@@ -482,7 +479,7 @@ func (o *StreamingOrchestrator) providerInput(ctx context.Context, request Reque
 }
 
 func (o *StreamingOrchestrator) admitter() admitter {
-	return admitter{Store: o.store, Events: o.events, Clock: o.clock}
+	return admitter{Store: o.store, Clock: o.clock}
 }
 
 func (o *StreamingOrchestrator) now() time.Time {

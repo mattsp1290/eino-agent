@@ -64,7 +64,6 @@ interface types {
   enum text-role {
     system,
     user,
-    assistant,
   }
 
   record text-message {
@@ -95,6 +94,9 @@ interface tool-api {
   use types.{structured-error, tool-metadata, turn-metadata};
 
   metadata: func() -> result<tool-metadata, structured-error>;
+  /// Derives the permission identity from final normalized tool input. This
+  /// value is evaluated by the host policy; it is not an authorization result.
+  permission-pattern: func(input-json: string) -> result<string, structured-error>;
   /// Input and output are normalized JSON documents whose byte bounds are
   /// enforced by the host on both sides of this call.
   execute: func(tool-call-id: string, input-json: string, turn: turn-metadata) -> result<string, structured-error>;

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"regexp"
 	"strings"
 )
@@ -109,7 +108,6 @@ type durablePointKey struct {
 // dispatching it, so copying a point cannot separate identity from semantics.
 type pointDefinition struct {
 	durablePointKey
-	signature reflect.Type
 }
 
 type Notification[T any] struct {
@@ -122,7 +120,7 @@ type notificationDefinition[T any] struct {
 }
 
 func NewNotification[T any](contract Contract, clone CloneFunc[T]) Notification[T] {
-	return Notification[T]{definition: &notificationDefinition[T]{point: newPointDefinition(contract, HandlerNotification, reflect.TypeFor[Observer[T]]()), clone: clone}}
+	return Notification[T]{definition: &notificationDefinition[T]{point: newPointDefinition(contract, HandlerNotification), clone: clone}}
 }
 
 func (p Notification[T]) Contract() Contract { return pointContract(p.base()) }
@@ -144,7 +142,7 @@ type hookDefinition[T any] struct {
 }
 
 func NewHook[T any](contract Contract, clone CloneFunc[T], validate NextValidator[T]) Hook[T] {
-	return Hook[T]{definition: &hookDefinition[T]{point: newPointDefinition(contract, HandlerHook, reflect.TypeFor[HookFunc[T]]()), clone: clone, validate: validate}}
+	return Hook[T]{definition: &hookDefinition[T]{point: newPointDefinition(contract, HandlerHook), clone: clone, validate: validate}}
 }
 
 func (p Hook[T]) Contract() Contract { return pointContract(p.base()) }
@@ -166,7 +164,7 @@ type transformDefinition[T any] struct {
 }
 
 func NewTransform[T any](contract Contract, clone CloneFunc[T], validate NextValidator[T]) Transform[T] {
-	return Transform[T]{definition: &transformDefinition[T]{point: newPointDefinition(contract, HandlerTransform, reflect.TypeFor[TransformFunc[T]]()), clone: clone, validate: validate}}
+	return Transform[T]{definition: &transformDefinition[T]{point: newPointDefinition(contract, HandlerTransform), clone: clone, validate: validate}}
 }
 
 func (p Transform[T]) Contract() Contract { return pointContract(p.base()) }
@@ -191,7 +189,7 @@ type gateDefinition[I, D any] struct {
 }
 
 func NewGate[I, D any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateDecision ValidateFunc[D], continueDecision D, shouldContinue ContinueFunc[D]) Gate[I, D] {
-	return Gate[I, D]{definition: &gateDefinition[I, D]{point: newPointDefinition(contract, HandlerGate, reflect.TypeFor[GateFunc[I, D]]()), clone: clone, validateInput: validateInput, validateDecision: validateDecision, continueDecision: continueDecision, shouldContinue: shouldContinue}}
+	return Gate[I, D]{definition: &gateDefinition[I, D]{point: newPointDefinition(contract, HandlerGate), clone: clone, validateInput: validateInput, validateDecision: validateDecision, continueDecision: continueDecision, shouldContinue: shouldContinue}}
 }
 
 func (p Gate[I, D]) Contract() Contract { return pointContract(p.base()) }
@@ -215,7 +213,7 @@ type aroundDefinition[I, O any] struct {
 }
 
 func NewRequiredAround[I, O any](contract Contract, clone CloneFunc[I], validateInput NextValidator[I], validateOutput ValidateFunc[O], validateDelegated DelegatedOutputValidator[O]) RequiredAround[I, O] {
-	return RequiredAround[I, O]{definition: &aroundDefinition[I, O]{point: newPointDefinition(contract, HandlerAround, reflect.TypeFor[Around[I, O]]()), clone: clone, validateInput: validateInput, validateOutput: validateOutput, validateDelegated: validateDelegated}}
+	return RequiredAround[I, O]{definition: &aroundDefinition[I, O]{point: newPointDefinition(contract, HandlerAround), clone: clone, validateInput: validateInput, validateOutput: validateOutput, validateDelegated: validateDelegated}}
 }
 
 func (p RequiredAround[I, O]) Contract() Contract { return pointContract(p.base()) }
@@ -226,8 +224,8 @@ func (p RequiredAround[I, O]) base() *pointDefinition {
 	return &p.definition.point
 }
 
-func newPointDefinition(contract Contract, kind HandlerKind, signature reflect.Type) pointDefinition {
-	return pointDefinition{durablePointKey: durablePointKey{contract: contract, kind: kind}, signature: signature}
+func newPointDefinition(contract Contract, kind HandlerKind) pointDefinition {
+	return pointDefinition{durablePointKey: durablePointKey{contract: contract, kind: kind}}
 }
 
 func pointContract(definition *pointDefinition) Contract {
@@ -368,7 +366,7 @@ func ValidateContract(contract Contract) error {
 }
 
 func validatePoint(point *pointDefinition) error {
-	if point == nil || point.signature == nil || point.kind == "" {
+	if point == nil || point.kind == "" {
 		return fmt.Errorf("%w: stable id and version required", ErrInvalidContract)
 	}
 	return ValidateContract(point.contract)

@@ -113,11 +113,12 @@ func (e *executionStore) RenewRunLease(ctx context.Context, leaseDuration time.D
 	return renewed, err
 }
 
-func (e *executionStore) SettleRun(ctx context.Context, run session.Run, finalEvent *session.EventRecord) error {
+func (e *executionStore) SettleRun(ctx context.Context, run session.Run, finalEvent *session.EventRecord) (*session.EventRecord, error) {
 	if run.ID != e.fence.RunID || run.ClaimToken != e.fence.ClaimToken || !run.Terminal() {
-		return session.ErrConflict
+		return nil, session.ErrConflict
 	}
-	return e.withFenceState(ctx, true, func(store *Store, current session.Run) error {
+	var committed *session.EventRecord
+	err := e.withFenceState(ctx, true, func(store *Store, current session.Run) error {
 		if !sameRunExecution(current, run) {
 			return session.ErrConflict
 		}
@@ -128,11 +129,15 @@ func (e *executionStore) SettleRun(ctx context.Context, run session.Run, finalEv
 			return err
 		}
 		if finalEvent != nil {
-			_, err := store.appendEvent(ctx, *finalEvent)
+			record, err := store.appendEvent(ctx, *finalEvent)
+			if err == nil {
+				committed = &record
+			}
 			return err
 		}
 		return nil
 	})
+	return committed, err
 }
 
 func (e *executionStore) AppendMessage(ctx context.Context, record session.Message) (session.Message, error) {

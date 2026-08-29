@@ -433,7 +433,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	}
 	planComponents := make([]runtime.PlanComponent, 0, len(components))
 	for _, mounted := range components {
-		owned := runtime.PlanComponent{Component: mounted.component, Handlers: append([]extension.HandlerIdentity(nil), mounted.handlers...)}
+		owned := runtime.PlanComponent{Component: mounted.component}
 		for _, registration := range mounted.payload.tools {
 			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) || selectTool != nil && !selectTool(mounted.component, registration) {
 				continue
@@ -491,7 +491,7 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 				Allowed:  rules.Allowed, Denied: rules.Denied,
 			})
 		}
-		if len(owned.Handlers)+len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
+		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
 			planComponents = append(planComponents, owned)
 		}
 	}
@@ -502,16 +502,13 @@ type selectedComponent struct {
 	component       extension.Component
 	payload         componentPayload
 	callbackContext func(context.Context) context.Context
-	handlers        []extension.HandlerIdentity
 }
 
 func snapshotComponents(values []extension.MountedValue[componentPayload]) []selectedComponent {
 	result := make([]selectedComponent, len(values))
 	for index, value := range values {
 		mounted := value
-		result[index] = selectedComponent{
-			component: mounted.Component(), payload: mounted.Value(), callbackContext: mounted.CallbackContext, handlers: mounted.Handlers(),
-		}
+		result[index] = selectedComponent{component: mounted.Component(), payload: mounted.Value(), callbackContext: mounted.CallbackContext}
 	}
 	return result
 }

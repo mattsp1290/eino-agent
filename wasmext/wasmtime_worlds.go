@@ -28,6 +28,22 @@ func (c *wasmtimeComponent) ToolMetadata(ctx context.Context) (wittypes.ToolMeta
 	return output, err
 }
 
+func (c *wasmtimeComponent) ToolPermissionPattern(ctx context.Context, inputJSON string) (string, error) {
+	arguments := make([]C.wasmtime_component_val_t, 1)
+	setComponentString(&arguments[0], inputJSON)
+	limit := min(c.limits.MaxOutputBytes, maxPermissionPatternBytes)
+	var output string
+	err := c.invokeABI(ctx, "permission-pattern", arguments, func(result *C.wasmtime_component_val_t) error {
+		payload, err := componentResult(result)
+		if err != nil {
+			return err
+		}
+		output, err = componentString(payload, limit)
+		return err
+	})
+	return output, err
+}
+
 func (c *wasmtimeComponent) ExecuteTool(ctx context.Context, request toolExecuteRequest) (string, error) {
 	arguments := make([]C.wasmtime_component_val_t, 3)
 	setComponentString(&arguments[0], request.ToolCallID)
@@ -205,8 +221,6 @@ func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Te
 			message.Role = wittypes.TextRoleSystem
 		case "user":
 			message.Role = wittypes.TextRoleUser
-		case "assistant":
-			message.Role = wittypes.TextRoleAssistant
 		default:
 			return errors.New("component returned an invalid text role")
 		}

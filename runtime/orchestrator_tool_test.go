@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -324,6 +325,39 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 	}
 	if !strings.Contains(string(call.Output), "blocked") {
 		t.Fatalf("tool output = %s, want denied payload", call.Output)
+	}
+}
+
+func TestStreamingOrchestratorPatternFailurePrecedesPolicyAndPersistence(t *testing.T) {
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+			ID: "call-pattern-failure", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"value":1}`},
+		}})}, nil
+	}))
+	patternErr := errors.New("pattern failed")
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
+		Name: "echo",
+		Pattern: PermissionPatternResolverFunc(func(context.Context, json.RawMessage) (string, error) {
+			return "", patternErr
+		}),
+		Scope: ToolScope{Permissions: []string{"tool.execute"}},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			t.Fatal("executor ran after pattern failure")
+			return ToolResult{}, nil
+		}),
+	}}})
+	var policyCalls atomic.Int32
+	orch.permissions = permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+		policyCalls.Add(1)
+		return permissions.Decision{Action: permissions.ActionAllow}, nil
+	})
+	result := startAndWait(t, orch)
+	if !errors.Is(result.Error, patternErr) {
+		t.Fatalf("result = %+v, want pattern failure", result)
+	}
+	if policyCalls.Load() != 0 || len(store.toolCalls) != 0 {
+		t.Fatalf("policy calls = %d, durable calls = %d", policyCalls.Load(), len(store.toolCalls))
 	}
 }
 

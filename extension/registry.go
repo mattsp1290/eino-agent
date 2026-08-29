@@ -363,14 +363,10 @@ type MountedValue[T any] struct {
 	component Component
 	value     T
 	token     *callbackToken
-	handlers  []HandlerIdentity
 }
 
 func (v MountedValue[T]) Component() Component { return v.component }
 func (v MountedValue[T]) Value() T             { return v.value }
-func (v MountedValue[T]) Handlers() []HandlerIdentity {
-	return append([]HandlerIdentity(nil), v.handlers...)
-}
 func (v MountedValue[T]) CallbackContext(ctx context.Context) context.Context {
 	return callbackContext(ctx, v.token)
 }
@@ -449,7 +445,7 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 		}
 		if applies {
 			leased[state] = struct{}{}
-			values = append(values, MountedValue[T]{component: state.component, value: state.value, token: state.token, handlers: handlers})
+			values = append(values, MountedValue[T]{component: state.component, value: state.value, token: state.token})
 			if len(handlers) > 0 {
 				handlerComponents = append(handlerComponents, ComponentHandlers{Component: state.component, Handlers: append([]HandlerIdentity(nil), handlers...)})
 			}

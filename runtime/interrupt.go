@@ -245,7 +245,8 @@ func (o *StreamingOrchestrator) finishResume(ctx context.Context, execution *run
 		run.Error = result.Error.Error()
 	}
 	finalEvent := o.finalRunEvent(run, result)
-	if err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent); err != nil {
+	committedEvent, err := execution.store.SettleRun(context.WithoutCancel(ctx), run, finalEvent)
+	if err != nil {
 		if result.Error == nil {
 			result.Status = session.RunFailed
 			result.Error = err
@@ -254,7 +255,7 @@ func (o *StreamingOrchestrator) finishResume(ctx context.Context, execution *run
 		if settled != nil {
 			*settled = true
 		}
-		o.publishRunFinished(ctx, execution, finalEvent, result)
+		o.publishRunFinished(ctx, execution, committedEvent)
 	}
 	return result
 }

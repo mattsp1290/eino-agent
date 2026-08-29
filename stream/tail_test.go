@@ -47,7 +47,7 @@ func TestTailDisconnectsSlowSubscriberWhenQueueBounded(t *testing.T) {
 	}
 	_ = tail.Emit(context.Background(), runtime.Event{Kind: runtime.EventMessageDelta, SessionID: "session-1"})
 	_ = tail.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunFinished, SessionID: "session-1"})
-	if event, ok := <-events; !ok || event.Kind != runtime.EventTailOverflow {
+	if event, ok := <-events; !ok || event.Kind != runtime.EventTailOverflow || !event.LiveOnly {
 		t.Fatalf("overflow event = %+v ok=%t, want tail overflow", event, ok)
 	}
 	if _, ok := <-events; ok {

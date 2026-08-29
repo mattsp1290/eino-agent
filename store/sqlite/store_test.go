@@ -395,21 +395,26 @@ func TestFinishRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 	run.Status = session.RunCompleted
 	run.FinishedAt = now.Add(time.Second)
 	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-	if err := execution.SettleRun(ctx, run, nil); err != nil {
+	finalEvent := session.EventRecord{ID: "event-run-finished", SessionID: run.SessionID, RunID: run.ID, Kind: "run_finished", CreatedAt: run.FinishedAt}
+	committedEvent, err := execution.SettleRun(ctx, run, &finalEvent)
+	if err != nil {
 		t.Fatalf("finish run: %v", err)
 	}
-	if err := execution.SettleRun(ctx, run, nil); err != nil {
+	if committedEvent == nil || !reflect.DeepEqual(*committedEvent, finalEvent) {
+		t.Fatalf("committed event = %#v, want %#v", committedEvent, finalEvent)
+	}
+	if _, err := execution.SettleRun(ctx, run, nil); err != nil {
 		t.Fatalf("idempotent finish run: %v", err)
 	}
 	conflict := run
 	conflict.Status = session.RunFailed
 	conflict.Error = "different"
-	if err := execution.SettleRun(ctx, conflict, nil); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.SettleRun(ctx, conflict, nil); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("conflicting finish err = %v, want ErrConflict", err)
 	}
 	stale := run
 	stale.Status = session.RunRunning
-	if err := execution.SettleRun(ctx, stale, nil); !errors.Is(err, session.ErrConflict) {
+	if _, err := execution.SettleRun(ctx, stale, nil); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale nonterminal update err = %v, want ErrConflict", err)
 	}
 }
@@ -507,7 +512,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	staleRun.ClaimToken = run.ClaimToken
 	staleRun.Status = session.RunCompleted
 	staleRun.FinishedAt = time.Now().UTC()
-	if err := oldExecution.SettleRun(ctx, staleRun, nil); !errors.Is(err, session.ErrConflict) {
+	if _, err := oldExecution.SettleRun(ctx, staleRun, nil); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale SettleRun error = %v", err)
 	}
 	if batch, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{}); err != nil || len(batch.Messages) != 0 || len(batch.Parts) != 0 {
@@ -536,7 +541,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	foreignSettlement.SessionID = "another-session"
 	foreignSettlement.Status = session.RunCompleted
 	foreignSettlement.FinishedAt = now
-	if err := currentExecution.SettleRun(ctx, foreignSettlement, nil); !errors.Is(err, session.ErrConflict) {
+	if _, err := currentExecution.SettleRun(ctx, foreignSettlement, nil); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("cross-session SettleRun error = %v", err)
 	}
 	if _, err := currentExecution.AppendMessage(ctx, session.Message{ID: "winner-message", SessionID: winner.SessionID, RunID: winner.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
