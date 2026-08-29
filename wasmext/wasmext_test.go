@@ -69,8 +69,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 	snapshot := runtime.TurnSnapshot{
 		RunID: "run-1", SessionID: "session-1", EpochID: "epoch-1",
 		Config: config.Snapshot{
-			Agent:     config.Agent{Name: "agent", Mode: "primary", Options: map[string]string{"SECRET": "agent-secret"}},
-			Providers: []config.ProviderConfig{{Options: map[string]string{"TOKEN": "provider-secret"}}},
+			Agent: config.Agent{Name: "agent", Mode: "primary", Options: map[string]string{"SECRET": "agent-secret"}},
 		},
 		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.Message{einoschema.SystemMessage("secret conversation"), einoschema.UserMessage("secret user")},
 		SystemPrompt: "secret system prompt",

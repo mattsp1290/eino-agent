@@ -7,12 +7,10 @@ import (
 	"fmt"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
-	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
 	aguiemitter "github.com/mattsp1290/eino-agui/emitter"
-	aguitools "github.com/mattsp1290/eino-agui/tools"
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -48,15 +46,6 @@ func (b *Bridge) EncErr() error {
 		return nil
 	}
 	return b.emit.EncErr()
-}
-
-// Emitter exposes the concrete eino-agui emitter for packages that delegate
-// directly to eino-agui stream tapping.
-func (b *Bridge) Emitter() *aguiemitter.Emitter {
-	if b == nil {
-		return nil
-	}
-	return b.emit
 }
 
 // Emit implements runtime.EventSink.
@@ -149,17 +138,6 @@ func (b *Bridge) ReasoningEncryptedValue(subtype aguievents.ReasoningEncryptedVa
 		return
 	}
 	b.emit.ReasoningEncryptedValue(subtype, entityID, encryptedValue)
-}
-
-// ClientToolInfos delegates AG-UI client tool binding to eino-agui/tools.
-func ClientToolInfos(tools []aguitypes.Tool, opts ...aguitools.SchemaOption) ([]*einoschema.ToolInfo, error) {
-	return aguitools.ClientToolInfos(tools, opts...)
-}
-
-// ClassifyToolCalls delegates AG-UI client/server tool partitioning to
-// eino-agui/tools.
-func ClassifyToolCalls(calls []einoschema.ToolCall, clientNames map[string]bool) (server, client []einoschema.ToolCall) {
-	return aguitools.ClassifyToolCalls(calls, clientNames)
 }
 
 func (b *Bridge) emitMessageDelta(event runtime.Event) {

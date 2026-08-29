@@ -14,7 +14,6 @@ import (
 	"github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
 	"github.com/mattsp1290/eino-agui/emitter"
-	"github.com/mattsp1290/eino-agui/stream"
 	aguitools "github.com/mattsp1290/eino-agui/tools"
 )
 
@@ -23,7 +22,6 @@ var (
 
 	_ = convert.ToEinoMessages
 	_ = emitter.NewEmitter
-	_ = stream.StreamTurn
 	_ = aguitools.ClientToolInfos
 
 	_ = einoobs.New

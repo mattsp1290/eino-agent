@@ -14,7 +14,6 @@ import (
 	"sync"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
 
 	agentagui "github.com/mattsp1290/eino-agent/agui"
@@ -147,11 +146,4 @@ func InterruptHandler(lookup func(context.Context, *http.Request) (transport.Int
 // messages, parts, runs, tool calls, context epochs, and replayable events.
 func OpenLocalStore(ctx context.Context, path string) (*sqlitestore.Store, error) {
 	return sqlitestore.Open(ctx, path)
-}
-
-// ClientToolInfos exposes the lower-level conversion when the consuming server
-// needs to bind AG-UI client tools directly to an Eino model outside the full
-// runtime orchestrator.
-func ClientToolInfos(tools []aguitypes.Tool) ([]*einoschema.ToolInfo, error) {
-	return agentagui.ClientToolInfos(tools)
 }

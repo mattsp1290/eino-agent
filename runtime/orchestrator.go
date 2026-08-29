@@ -226,7 +226,7 @@ func (o *StreamingOrchestrator) runFresh(ctx context.Context, execution *runExec
 		lifecycle.result.Error = err
 		return
 	}
-	lifecycle.result = o.executeAttempts(ctx, execution, snapshot, admitted.AssistantMessage.ID, &lifecycle.usage)
+	lifecycle.result = o.executeTurn(ctx, execution, snapshot, admitted.AssistantMessage.ID, &lifecycle.usage)
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot) (TurnSnapshot, error) {
@@ -264,66 +264,40 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	return snapshot, nil
 }
 
-func (o *StreamingOrchestrator) executeAttempts(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
-	attempts := o.attempts()
-	var last error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		result, err := o.executeOne(ctx, execution, snapshot, messageID, attempt, usage)
-		if err == nil {
-			return result
-		}
-		if ctx.Err() != nil {
-			o.observeError(ctx, snapshot, messageID, "provider_stream", err)
-			return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: ctx.Err()}
-		}
-		last = err
-		if !retryable(err) || attempt == attempts {
-			break
-		}
-		o.observeRetry(ctx, snapshot, messageID, attempt, attempts, err)
-	}
-	if errors.Is(last, context.Canceled) {
-		o.observeError(ctx, snapshot, messageID, "provider_stream", last)
-		return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: last}
-	}
-	o.observeError(ctx, snapshot, messageID, "provider_stream", last)
-	return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunFailed, Error: last}
-}
-
-func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, attempt int, usage *model.Usage) (Result, error) {
+func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
 	messages := cloneMessages(snapshot.Messages)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
-		msg, err := o.streamModel(ctx, execution, snapshot, currentMessageID, messages, attempt, turn+1, usage)
+		msg, err := o.streamModelAttempts(ctx, execution, snapshot, currentMessageID, messages, turn+1, usage)
 		if err != nil {
-			return Result{}, err
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
 		normalizeToolCallIDs(msg, o.ids)
 		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, msg.ToolCalls)
 		if err != nil {
-			return Result{}, err
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
 		for index := range preparedCalls {
 			msg.ToolCalls[index] = preparedCalls[index].schemaCall
 		}
 		if err := o.persistAssistant(ctx, execution, snapshot, currentMessageID, msg); err != nil {
-			return Result{}, err
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
 		if len(msg.ToolCalls) == 0 {
-			return Result{RunID: snapshot.RunID, MessageID: currentMessageID, Status: session.RunCompleted}, nil
+			return Result{RunID: snapshot.RunID, MessageID: currentMessageID, Status: session.RunCompleted}
 		}
 		if turn >= o.toolTurns() {
-			return Result{}, model.Error{Code: "tool_turn_limit_exceeded", Message: "model exceeded tool turn limit", Cause: model.ErrProviderRejected}
+			return o.executionFailure(ctx, snapshot, currentMessageID, model.Error{Code: "tool_turn_limit_exceeded", Message: "model exceeded tool turn limit", Cause: model.ErrProviderRejected})
 		}
 		messages = append(messages, msg)
 		toolMessages, err := o.executePreparedTools(ctx, execution, snapshot, currentMessageID, preparedCalls)
 		if err != nil {
-			return Result{}, err
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
 		messages = append(messages, toolMessages...)
-		currentMessageID = o.ids.NewMessageID()
+		nextMessageID := o.ids.NewMessageID()
 		if _, err := execution.store.AppendMessage(ctx, session.Message{
-			ID:        currentMessageID,
+			ID:        nextMessageID,
 			SessionID: snapshot.SessionID,
 			RunID:     snapshot.RunID,
 			ParentID:  messageID,
@@ -333,9 +307,38 @@ func (o *StreamingOrchestrator) executeOne(ctx context.Context, execution *runEx
 			CreatedAt: o.now(),
 			UpdatedAt: o.now(),
 		}); err != nil {
-			return Result{}, err
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
+		currentMessageID = nextMessageID
 	}
+}
+
+func (o *StreamingOrchestrator) streamModelAttempts(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, step int, usage *model.Usage) (*einoschema.Message, error) {
+	attempts := o.attempts()
+	var last error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		message, receivedDelta, err := o.streamModel(ctx, execution, snapshot, messageID, messages, attempt, step, usage)
+		if err == nil {
+			return message, nil
+		}
+		last = err
+		if ctx.Err() != nil || receivedDelta || !retryable(err) || attempt == attempts {
+			break
+		}
+		o.observeRetry(ctx, snapshot, messageID, attempt, attempts, err)
+	}
+	return nil, last
+}
+
+func (o *StreamingOrchestrator) executionFailure(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, err error) Result {
+	o.observeError(ctx, snapshot, messageID, "provider_stream", err)
+	if ctx.Err() != nil {
+		return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: ctx.Err()}
+	}
+	if errors.Is(err, context.Canceled) {
+		return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: err}
+	}
+	return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunFailed, Error: err}
 }
 
 func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, execution *runExecution, tool Tool, call ToolCall) toolOutcome {

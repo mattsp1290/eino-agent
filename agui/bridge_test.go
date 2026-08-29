@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
-	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -62,34 +61,6 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	}
 	if bridge.Err() != nil || bridge.EncErr() != nil {
 		t.Fatalf("bridge errors: transport=%v encoding=%v", bridge.Err(), bridge.EncErr())
-	}
-}
-
-func TestBridgeDelegatesClientToolBinding(t *testing.T) {
-	t.Parallel()
-
-	infos, err := ClientToolInfos([]aguitypes.Tool{{
-		Name:        "client_lookup",
-		Description: "lookup in client",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"query": map[string]any{"type": "string"},
-			},
-		},
-	}})
-	if err != nil {
-		t.Fatalf("ClientToolInfos error = %v", err)
-	}
-	if len(infos) != 1 || infos[0].Name != "client_lookup" {
-		t.Fatalf("tool infos = %#v", infos)
-	}
-	server, client := ClassifyToolCalls([]einoschema.ToolCall{
-		{ID: "server-1", Function: einoschema.FunctionCall{Name: "server_tool"}},
-		{ID: "client-1", Function: einoschema.FunctionCall{Name: "client_lookup"}},
-	}, map[string]bool{"client_lookup": true})
-	if len(server) != 1 || server[0].ID != "server-1" || len(client) != 1 || client[0].ID != "client-1" {
-		t.Fatalf("classified server=%#v client=%#v", server, client)
 	}
 }
 

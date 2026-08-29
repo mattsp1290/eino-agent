@@ -279,12 +279,6 @@ func testRunAdmission() admissionRequest {
 				"workspace_id":   "workspace-1",
 				"workspace_root": os.TempDir(),
 			},
-			Plugins: []config.Plugin{{
-				Name:    "plugin",
-				Version: "1.0.0",
-				Hash:    "abc",
-				Source:  "test",
-			}},
 		},
 		Model: model.Resolved{
 			Provider: model.Provider{ID: "openai"},
@@ -318,6 +312,8 @@ type admissionStore struct {
 	epochs            map[session.EpochID]session.ContextEpoch
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	appendEventErr    error
+	appendPartErrAt   int
+	appendPartCalls   int
 	settleToolCallErr error
 	toolTransitionErr error
 	normalizeEvent    func(session.EventRecord) session.EventRecord
@@ -365,6 +361,7 @@ func (s *admissionStore) clone() *admissionStore {
 		epochs:            cloneMap(s.epochs),
 		modelRequests:     cloneMap(s.modelRequests),
 		appendEventErr:    s.appendEventErr,
+		appendPartErrAt:   s.appendPartErrAt,
 		settleToolCallErr: s.settleToolCallErr,
 		toolTransitionErr: s.toolTransitionErr,
 		normalizeEvent:    s.normalizeEvent,
@@ -478,6 +475,10 @@ func (s *admissionStore) AppendMessage(_ context.Context, message session.Messag
 }
 
 func (s *admissionStore) AppendPart(_ context.Context, part session.Part) (session.Part, error) {
+	s.appendPartCalls++
+	if s.appendPartErrAt > 0 && s.appendPartCalls == s.appendPartErrAt {
+		return session.Part{}, errors.New("injected append part failure")
+	}
 	if existing, ok := s.parts[part.ID]; ok {
 		if existing.Kind != part.Kind {
 			return session.Part{}, session.ErrConflict

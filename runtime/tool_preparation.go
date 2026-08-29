@@ -17,32 +17,33 @@ func (o *StreamingOrchestrator) persistAssistant(ctx context.Context, execution 
 	if err != nil {
 		return err
 	}
+	parts := make([]session.Part, 0, 2+len(calls))
 	ordinal := int64(0)
+	now := o.now()
 	if msg.Content != "" {
-		if err := execution.appendPart(ctx, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
-			return err
-		}
+		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: now, UpdatedAt: now})
 		ordinal++
 	}
 	if msg.ReasoningContent != "" {
-		if err := execution.appendPart(ctx, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
-			return err
-		}
+		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: now, UpdatedAt: now})
 		ordinal++
 	}
 	for _, call := range calls {
 		payload := toolCallPayload{ID: call.call.ID, Name: call.call.Function.Name, Arguments: call.arguments}
-		if err := execution.appendPart(ctx, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: o.now(), UpdatedAt: o.now()}); err != nil {
-			return err
-		}
+		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: now, UpdatedAt: now})
 		ordinal++
 	}
-	return nil
-}
-
-func (e *runExecution) appendPart(ctx context.Context, part session.Part) error {
-	_, err := e.store.AppendPart(ctx, part)
-	return err
+	if len(parts) == 0 {
+		return nil
+	}
+	return execution.store.WithinTx(ctx, func(ctx context.Context, store session.ExecutionStore) error {
+		for _, part := range parts {
+			if _, err := store.AppendPart(ctx, part); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 type normalizedToolCall struct {

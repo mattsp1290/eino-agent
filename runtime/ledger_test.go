@@ -130,7 +130,69 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 	}
 }
 
-func TestLedgerRetryPreservesCumulativeUsageIncludingTerminalErrorDelta(t *testing.T) {
+func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
+	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	providerCalls := 0
+	toolExecutions := 0
+	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.Message, error) {
+		providerCalls++
+		switch providerCalls {
+		case 1:
+			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
+				ID: "call-once", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`},
+			}})}, nil
+		case 2:
+			return nil, model.Error{Code: "temporary", Message: "retry second step", Retryable: true}
+		default:
+			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		}
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()), WithAttempts(2),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configureTestTools(orchestrator, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		toolExecutions++
+		return ToolResult{Output: "ok"}, nil
+	})}}})
+
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "tool-retry-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	if result.Error != nil || result.Status != session.RunCompleted || providerCalls != 3 || toolExecutions != 1 {
+		t.Fatalf("result=%#v provider calls=%d tool executions=%d", result, providerCalls, toolExecutions)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-once")
+	if err != nil || call.Status != session.ToolCallCompleted {
+		t.Fatalf("tool call=%#v error=%v", call, err)
+	}
+	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil || len(batch.Records) != 3 {
+		t.Fatalf("records=%#v error=%v", batch.Records, err)
+	}
+	want := map[[2]int]session.ModelRequestState{
+		{1, 1}: session.ModelRequestCompleted,
+		{2, 1}: session.ModelRequestFailed,
+		{2, 2}: session.ModelRequestCompleted,
+	}
+	for _, record := range batch.Records {
+		key := [2]int{record.Step, record.Attempt}
+		if want[key] != record.State {
+			t.Fatalf("record=%#v want state=%q", record, want[key])
+		}
+		delete(want, key)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing ledger records: %#v", want)
+	}
+}
+
+func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -144,13 +206,9 @@ func TestLedgerRetryPreservesCumulativeUsageIncludingTerminalErrorDelta(t *testi
 	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 		attempts++
 		reader, writer := einoschema.Pipe[model.StreamDelta](3)
-		if attempts == 1 {
-			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-a", nil), Usage: model.Usage{InputTokens: 3}}, nil)
-			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-b", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 2}}, nil)
-			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("ignored", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}}, model.Error{Code: "temporary", Message: "retry", Retryable: true})
-		} else {
-			_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil), Usage: model.Usage{InputTokens: 5, OutputTokens: 1, CacheReadTokens: 2}}, nil)
-		}
+		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-a", nil), Usage: model.Usage{InputTokens: 3}}, nil)
+		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-b", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 2}}, nil)
+		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("ignored", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}}, model.Error{Code: "temporary", Message: "do not retry", Retryable: true})
 		writer.Close()
 		return reader, nil
 	})
@@ -162,11 +220,11 @@ func TestLedgerRetryPreservesCumulativeUsageIncludingTerminalErrorDelta(t *testi
 		t.Fatal(err)
 	}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "partial-usage-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
-	want := Usage{InputTokens: 8, OutputTokens: 5, ReasoningTokens: 1, CacheReadTokens: 2}
-	if result.Error != nil || result.Usage != want || attempts != 2 {
+	want := Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}
+	if result.Status != session.RunFailed || result.Error == nil || result.Usage != want || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d want usage=%#v", result, attempts, want)
 	}
-	if len(completed) != 2 || completed[0].Usage != (Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}) || completed[0].Error.Code == "" || completed[1].Usage != (Usage{InputTokens: 5, OutputTokens: 1, CacheReadTokens: 2}) {
+	if len(completed) != 1 || completed[0].Usage != want || completed[0].Error.Code == "" {
 		t.Fatalf("completed notices = %#v", completed)
 	}
 	batch, err := store.ListEvents(context.Background(), "partial-usage-session", session.EventCursor{Limit: 100})
@@ -179,7 +237,7 @@ func TestLedgerRetryPreservesCumulativeUsageIncludingTerminalErrorDelta(t *testi
 			finished = append(finished, event)
 		}
 	}
-	if len(finished) != 1 || finished[0].Usage != (session.Usage{InputTokens: 8, OutputTokens: 5, ReasoningTokens: 1, CacheReadTokens: 2}) {
+	if len(finished) != 1 || finished[0].Usage != (session.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}) {
 		t.Fatalf("run-finished events = %#v", finished)
 	}
 }

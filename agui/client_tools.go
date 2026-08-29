@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
+	aguitools "github.com/mattsp1290/eino-agui/tools"
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -70,7 +71,7 @@ func (s ClientToolSnapshot) Definitions(dispatcher ClientToolDispatcher) ([]agen
 	if err != nil {
 		return nil, err
 	}
-	infos, err := ClientToolInfos(frozen.Tools)
+	infos, err := aguitools.ClientToolInfos(frozen.Tools)
 	if err != nil {
 		return nil, err
 	}

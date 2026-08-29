@@ -165,13 +165,6 @@ func TestMountClientToolsValidatesIdentityAndDispatcher(t *testing.T) {
 	}
 }
 
-func TestClientNames(t *testing.T) {
-	names := ClientNames([]aguitypes.Tool{clientTool("client_lookup"), clientTool("server_tool"), {}}, map[string]bool{"server_tool": true})
-	if !names["client_lookup"] || len(names) != 1 {
-		t.Fatalf("ClientNames = %#v", names)
-	}
-}
-
 func clientSnapshot(sessionID session.ID, dispatcherID string) agentagui.ClientToolSnapshot {
 	return agentagui.ClientToolSnapshot{SessionID: sessionID, Generation: 1, DispatcherArtifactID: dispatcherID, Tools: []aguitypes.Tool{clientTool("client_lookup")}}
 }

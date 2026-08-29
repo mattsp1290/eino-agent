@@ -13,7 +13,7 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (message *einoschema.Message, err error) {
+func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (message *einoschema.Message, receivedDelta bool, err error) {
 	queue := newEventQueue(ctx, o.queueSize, execution.eventSink(o.events))
 	defer queue.close()
 	obsStream := o.startObservedStream(ctx, snapshot, messageID, attempt)
@@ -56,22 +56,22 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	request.System, err = o.renderSystemPrompt(ctx, execution.plan, snapshot, attempt, step)
 	if err != nil {
 		streamErr = err
-		return nil, err
+		return nil, false, err
 	}
 	request, audited, contentHash, err := auditModelRequest(request, o.modelRequestSafeOptions, o.modelRequestMaxBytes)
 	if err != nil {
 		streamErr = err
-		return nil, err
+		return nil, false, err
 	}
 	requestRecord, err = o.prepareModelRequest(ctx, execution, snapshot, request, audited, contentHash, messageID, attempt, step)
 	if err != nil {
 		streamErr = err
-		return nil, err
+		return nil, false, err
 	}
 	request.IdempotencyKey = string(requestRecord.ID)
 	if err = updateModelRequest(ctx, execution.store, &requestRecord, session.ModelRequestDispatchStarted, nil, o.now()); err != nil {
 		streamErr = err
-		return nil, err
+		return nil, false, err
 	}
 	extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID), RequestRecordID: requestRecord.ID, MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash})
 	modelRequested = true
@@ -80,18 +80,18 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	})
 	if err != nil {
 		streamErr = err
-		return nil, err
+		return nil, false, err
 	}
 	if reader == nil {
 		streamErr = model.Error{Code: "nil_provider_stream", Message: "provider returned nil stream"}
-		return nil, streamErr
+		return nil, false, streamErr
 	}
 	defer reader.Close()
 	var chunks []*einoschema.Message
 	for {
 		if err := ctx.Err(); err != nil {
 			streamErr = err
-			return nil, err
+			return nil, receivedDelta, err
 		}
 		delta, err := reader.Recv()
 		streamUsage = mergeUsage(streamUsage, delta.Usage)
@@ -100,16 +100,17 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		}
 		if err != nil {
 			streamErr = err
-			return nil, err
+			return nil, receivedDelta, err
 		}
 		if err := ctx.Err(); err != nil {
 			streamErr = err
-			return nil, err
+			return nil, receivedDelta, err
 		}
 		if delta.Message == nil {
 			streamErr = model.Error{Code: "malformed_provider_stream", Message: "provider returned nil message chunk"}
-			return nil, streamErr
+			return nil, receivedDelta, streamErr
 		}
+		receivedDelta = true
 		o.observeStreamChunk(obsStream, int64(len(chunks)))
 		chunks = append(chunks, delta.Message)
 		if err := queue.emit(Event{
@@ -120,19 +121,19 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 			LiveOnly: true, Time: o.now(),
 		}); err != nil {
 			streamErr = err
-			return nil, err
+			return nil, receivedDelta, err
 		}
 	}
 	if len(chunks) == 0 {
-		return einoschema.AssistantMessage("", nil), nil
+		return einoschema.AssistantMessage("", nil), false, nil
 	}
 	msg, err := einoschema.ConcatMessages(chunks)
 	if err != nil {
 		streamErr = model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
-		return nil, streamErr
+		return nil, receivedDelta, streamErr
 	}
 	streamUsage = resolveStreamUsage(streamUsage, msg)
-	return msg, nil
+	return msg, receivedDelta, nil
 }
 
 func resolveStreamUsage(observed model.Usage, msg *einoschema.Message) model.Usage {

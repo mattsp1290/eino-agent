@@ -89,18 +89,3 @@ func clientComponent(snapshot agentagui.ClientToolSnapshot) (extension.Component
 		},
 	}, nil
 }
-
-// ClientNames returns the current client tool name set for call classification.
-func ClientNames(tools []aguitypes.Tool, blockedNames ...map[string]bool) map[string]bool {
-	result := make(map[string]bool, len(tools))
-	blocked := map[string]bool{}
-	if len(blockedNames) > 0 {
-		blocked = blockedNames[0]
-	}
-	for _, tool := range tools {
-		if tool.Name != "" && !blocked[tool.Name] {
-			result[tool.Name] = true
-		}
-	}
-	return result
-}

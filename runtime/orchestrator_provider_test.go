@@ -115,6 +115,36 @@ func TestStreamingOrchestratorRetriesRetryableProviderErrors(t *testing.T) {
 	}
 }
 
+func TestStreamingOrchestratorRollsBackIncompleteAssistantParts(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	store.appendPartErrAt = 2
+	var toolCalls int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		msg := einoschema.AssistantMessage("answer", []einoschema.ToolCall{{
+			ID: "call-atomic", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`},
+		}})
+		msg.ReasoningContent = "reasoning"
+		return []*einoschema.Message{msg}, nil
+	}))
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		toolCalls++
+		return ToolResult{Output: "unexpected"}, nil
+	})}}})
+
+	result := startAndWait(t, orch)
+	if result.Status != session.RunFailed || result.Error == nil {
+		t.Fatalf("result = %+v, want failed persistence", result)
+	}
+	if len(store.parts) != 0 {
+		t.Fatalf("parts = %#v, want transaction rollback", store.parts)
+	}
+	if toolCalls != 0 {
+		t.Fatalf("tool calls = %d, want 0", toolCalls)
+	}
+}
+
 func TestStreamingOrchestratorBoundedQueueAppliesBackpressure(t *testing.T) {
 	t.Parallel()
 
