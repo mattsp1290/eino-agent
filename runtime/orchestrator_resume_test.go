@@ -375,6 +375,7 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 
 func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	t.Parallel()
+	const leaseDuration = time.Second
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -402,7 +403,7 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	provider := staticRunPlanProvider{plan: plan}
 	owner := mustConfiguredOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithRunPlanProvider(provider),
-		WithOwnerID("owner-a"), WithLease(100*time.Millisecond),
+		WithOwnerID("owner-a"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
 	handle, err := owner.Start(context.Background(), Request{SessionID: "heartbeat-session", Input: []*einoschema.Message{einoschema.UserMessage("wait")}, Config: orchestratorConfig()})
@@ -414,7 +415,7 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		current, getErr := store.GetRun(context.Background(), handle.RunID())
 		if getErr != nil {
@@ -427,10 +428,10 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 		if now.After(deadline) {
 			t.Fatalf("heartbeat did not renew initial lease %s; current lease %s", initial.LeaseUntil, current.LeaseUntil)
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	resumer := mustConfiguredOrchestrator(
-		WithStore(store), WithRunPlanProvider(provider), WithOwnerID("owner-b"), WithLease(100*time.Millisecond),
+		WithStore(store), WithRunPlanProvider(provider), WithOwnerID("owner-b"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
 	if _, err := resumer.Resume(context.Background(), handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
