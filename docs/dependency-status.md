@@ -1,6 +1,7 @@
 # Dependency Status
 
 Date: 2026-06-27
+Last updated: 2026-08-30
 
 This note records the prerequisite state for `eino-agent` before runtime
 implementation starts. The exact pins below are the initial baseline. Do not
@@ -12,6 +13,12 @@ bead with compatibility gates instead.
 No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
+
+The root module graph correction is preparing release candidate `v0.1.3`.
+That root pin is not supported until its post-tag external-consumer check
+passes. Its generated-bindings dependency is already published as module
+version `v0.1.0` through repository tag `wasmext/gen/v0.1.0` at commit
+`f8a2784061bb9df52ccb0db3a431c5100a99b798`.
 
 The previously missing response artifacts now exist in this inspected local
 agent workspace. They are stored outside this repository under
@@ -41,6 +48,7 @@ status.
 | `github.com/mattsp1290/eino-tools` | commit `63a3c99272c2359e24484698f2bd62e6fac849b6`, pseudo-version `v0.1.1-0.20260825160656-63a3c99272c2` | `~/git/eino-tools`, completed catalog commits `cc35e50` and `63a3c99`, and `.agents/requests/eino-agent-composition-tool-registration/` |
 | `github.com/mattsp1290/eino-obs` | commit `a9a6f8bb478b479c1e48ab353261a60c4a19195a` | `~/git/eino-obs`, `README.md`, root/exporter/fake/exporter/datadog packages |
 | `github.com/mattsp1290/ensemble` | commit `a709ad8ed2e9d8962b73b228859433cc6554ee2c` for current discovery only | `~/git/ensemble`, `eino-agui/docs/decisions/0002-ensemble-shared-surface.md` |
+| `github.com/mattsp1290/eino-agent/wasmext/gen` | version `v0.1.0`, tag `wasmext/gen/v0.1.0`, commit `f8a2784061bb9df52ccb0db3a431c5100a99b798` | Fresh-cache standard-proxy download plus `make external-consumer-check`; the root `v0.1.3` release candidate remains unverified until its separate post-tag gate. |
 
 Version floors and shared dependency pins:
 
@@ -70,6 +78,15 @@ No required prerequisite response artifact is missing in the inspected local
 workspace.
 
 ## Validation Run
+
+The module-graph release candidate adds `make external-consumer-check`. It
+creates a fresh unrelated main module, imports `runtime`, `store/sqlite`,
+`stream`, `composition`, `model`, and `providers/fake`, and runs `go mod tidy`,
+`go list -m all`, `go mod verify`, `go test ./...`, and `go build ./...`. Local
+mode replaces only the root checkout and proves the dependency module's local
+replacement is ignored. Published mode adds no replacement and rejects
+nonstandard proxy, checksum, private-module, `GOFLAGS`, workspace, vendor, or
+checkout selection before it can support the root release candidate.
 
 Validation performed locally on 2026-06-27:
 
