@@ -9,16 +9,14 @@ policy.
 For a runnable starting point, see `examples/minimal-server` and
 `docs/examples/minimal-server.md`.
 
-## Installation Release Candidate
+## Installation
 
-The planned root pin `github.com/mattsp1290/eino-agent@v0.1.3` is a release
-candidate, not a supported or usable pin yet. It requires Go 1.26.3 and will
-be promoted to the supported pin only after the tag is published and an
-unrelated module verifies the complete graph through the standard public Go
-proxy and checksum database with no replacement, workspace, vendor tree, or
-checkout access.
+The supported root pin is `github.com/mattsp1290/eino-agent@v0.1.3` and
+requires Go 1.26.3. An unrelated module verified its complete graph through
+the standard public Go proxy and checksum database with no replacement,
+workspace, vendor tree, or checkout access.
 
-The release candidate depends on the separately published generated-bindings
+The release depends on the separately published generated-bindings
 module `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, whose repository
 tag is `wasmext/gen/v0.1.0`. Consumers must not add a workaround for that
 internal dependency.

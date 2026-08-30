@@ -14,10 +14,10 @@ No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
 
-The root module graph correction is preparing release candidate `v0.1.3`.
-That root pin is not supported until its post-tag external-consumer check
-passes. Its generated-bindings dependency is already published as module
-version `v0.1.0` through repository tag `wasmext/gen/v0.1.0` at commit
+The supported root pin is `v0.1.3` at commit
+`5e4f3ad2cc4b608379d22fa153940878b9110bc1`. Its generated-bindings
+dependency is published as module version `v0.1.0` through repository tag
+`wasmext/gen/v0.1.0` at commit
 `f8a2784061bb9df52ccb0db3a431c5100a99b798`.
 
 The previously missing response artifacts now exist in this inspected local
@@ -48,7 +48,8 @@ status.
 | `github.com/mattsp1290/eino-tools` | commit `63a3c99272c2359e24484698f2bd62e6fac849b6`, pseudo-version `v0.1.1-0.20260825160656-63a3c99272c2` | `~/git/eino-tools`, completed catalog commits `cc35e50` and `63a3c99`, and `.agents/requests/eino-agent-composition-tool-registration/` |
 | `github.com/mattsp1290/eino-obs` | commit `a9a6f8bb478b479c1e48ab353261a60c4a19195a` | `~/git/eino-obs`, `README.md`, root/exporter/fake/exporter/datadog packages |
 | `github.com/mattsp1290/ensemble` | commit `a709ad8ed2e9d8962b73b228859433cc6554ee2c` for current discovery only | `~/git/ensemble`, `eino-agui/docs/decisions/0002-ensemble-shared-surface.md` |
-| `github.com/mattsp1290/eino-agent/wasmext/gen` | version `v0.1.0`, tag `wasmext/gen/v0.1.0`, commit `f8a2784061bb9df52ccb0db3a431c5100a99b798` | Fresh-cache standard-proxy download plus `make external-consumer-check`; the root `v0.1.3` release candidate remains unverified until its separate post-tag gate. |
+| `github.com/mattsp1290/eino-agent` | version `v0.1.3`, commit `5e4f3ad2cc4b608379d22fa153940878b9110bc1` | `make check` on the exact commit plus a fresh published-mode consumer using Go 1.26.3, `proxy.golang.org`, and `sum.golang.org`. |
+| `github.com/mattsp1290/eino-agent/wasmext/gen` | version `v0.1.0`, tag `wasmext/gen/v0.1.0`, commit `f8a2784061bb9df52ccb0db3a431c5100a99b798` | Fresh-cache standard-proxy download plus the local and published external-consumer gates; no consumer replacement is required. |
 
 Version floors and shared dependency pins:
 
@@ -79,14 +80,24 @@ workspace.
 
 ## Validation Run
 
-The module-graph release candidate adds `make external-consumer-check`. It
+The module-graph release adds `make external-consumer-check`. It
 creates a fresh unrelated main module, imports `runtime`, `store/sqlite`,
 `stream`, `composition`, `model`, and `providers/fake`, and runs `go mod tidy`,
 `go list -m all`, `go mod verify`, `go test ./...`, and `go build ./...`. Local
 mode replaces only the root checkout and proves the dependency module's local
 replacement is ignored. Published mode adds no replacement and rejects
 nonstandard proxy, checksum, private-module, `GOFLAGS`, workspace, vendor, or
-checkout selection before it can support the root release candidate.
+checkout selection.
+
+Post-tag validation performed on 2026-08-30:
+
+- `make check` passed on exact commit
+  `5e4f3ad2cc4b608379d22fa153940878b9110bc1`.
+- Remote annotated tag `v0.1.3` peeled to that exact commit.
+- `EINO_AGENT_CONSUMER_VERSION=v0.1.3 testdata/external-consumer/check.sh`
+  passed from a fresh published-mode consumer with Go 1.26.3,
+  `GOPROXY=https://proxy.golang.org,direct`, `GOSUMDB=sum.golang.org`, and
+  empty `GOFLAGS`, `GOPRIVATE`, `GONOSUMDB`, and `GONOPROXY`.
 
 Validation performed locally on 2026-06-27:
 
