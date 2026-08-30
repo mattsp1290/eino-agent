@@ -5,11 +5,14 @@ set -euo pipefail
 readonly root_module="github.com/mattsp1290/eino-agent"
 readonly nested_module="${root_module}/wasmext/gen"
 readonly nested_version="v0.1.0"
-readonly script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly repository_root="$(cd -- "${script_dir}/../.." && pwd -P)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly script_dir
+repository_root="$(cd -- "${script_dir}/../.." && pwd -P)"
+readonly repository_root
 
 temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/eino-agent-consumer.XXXXXX")"
-readonly temporary_root="$(cd -- "${temporary_root}" && pwd -P)"
+temporary_root="$(cd -- "${temporary_root}" && pwd -P)"
+readonly temporary_root
 readonly consumer_dir="${temporary_root}/consumer"
 readonly module_cache="${temporary_root}/module-cache"
 
@@ -73,6 +76,10 @@ cp -f -- "${script_dir}/consumer.go" "${consumer_dir}/consumer.go"
 cd -- "${consumer_dir}"
 
 go_command=(env GOWORK=off GOMODCACHE="${module_cache}" go)
+if [[ "${mode}" == "published" ]]; then
+	go_command=(env GOWORK=off GOMODCACHE="${module_cache}" GOPROXY=https://proxy.golang.org go)
+	printf 'MODULE_DOWNLOAD_GOPROXY=https://proxy.golang.org\n'
+fi
 "${go_command[@]}" mod init example.com/eino-agent-external-consumer
 "${go_command[@]}" mod edit -go=1.26.3
 "${go_command[@]}" mod edit -require="${root_module}@${required_version}"
