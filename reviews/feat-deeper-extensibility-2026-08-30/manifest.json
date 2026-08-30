@@ -1,0 +1,19 @@
+{
+  "schema_version": "review-v1",
+  "branch": "feat/deeper-extensibility",
+  "base_ref": "main",
+  "head_sha": "684810f16f8755f237588d1c1cfaa83661e5498e",
+  "pass": true,
+  "reviewers": [
+    {
+      "slug": "panic-lifecycle-verifier",
+      "display_name": "Panic & Lifecycle Verifier",
+      "role": "Verify panic conversion, resource release, durable ordering, and concurrency correctness after the fix pass."
+    },
+    {
+      "slug": "portability-hermeticity-verifier",
+      "display_name": "Portability & Hermeticity Verifier",
+      "role": "Verify cross-platform compilation, host-independence, test determinism, and integration contracts after the fix pass."
+    }
+  ]
+}
