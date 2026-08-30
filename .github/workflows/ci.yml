@@ -47,5 +47,8 @@ jobs:
       - name: Tidy
         run: make mod-tidy-check
 
+      - name: Check external consumer
+        run: make external-consumer-check
+
       - name: Lint
         run: make lint

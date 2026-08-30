@@ -19,13 +19,13 @@ BIN_DIR := $(CURDIR)/.bin
 GOIMPORTS := $(BIN_DIR)/goimports
 GOLANGCI_LINT := $(BIN_DIR)/golangci-lint
 
-.PHONY: check fmt fmt-check lint mod-tidy-check race test tools vet wasm-fixtures windows-compile wit wit-check
+.PHONY: check external-consumer-check fmt fmt-check lint mod-tidy-check race test tools vet wasm-fixtures windows-compile wit wit-check
 
-check: fmt-check vet test race mod-tidy-check lint windows-compile wit-check
+check: fmt-check vet test race mod-tidy-check lint windows-compile wit-check external-consumer-check
 
 wit:
 	rm -rf wasmext/gen/eino-agent
-	go -C wasmext/gen generate .
+	GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) go -C wasmext/gen generate .
 
 wit-check:
 	$(MAKE) wit
@@ -92,6 +92,9 @@ mod-tidy-check:
 	GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) go -C wasmext/gen mod tidy -diff
 	GOTOOLCHAIN=$(GUEST_GOTOOLCHAIN) go -C examples/wasm-extensions mod tidy -diff
 	go -C $(TOOLS_DIR) mod tidy -diff
+
+external-consumer-check:
+	testdata/external-consumer/check.sh
 
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run ./...

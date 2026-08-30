@@ -6,13 +6,15 @@ require (
 	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9
 	github.com/cloudwego/eino v0.8.13
 	github.com/eino-contrib/jsonschema v1.0.3
-	github.com/mattsp1290/eino-agent/wasmext/gen v0.0.0
+	github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0
 	github.com/mattsp1290/eino-agui v0.1.1
 	github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b
 	github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2
 	modernc.org/sqlite v1.53.0
 )
 
+// Keep generated bindings local for coordinated repository development.
+// Dependency modules ignore this replacement when eino-agent is consumed.
 replace github.com/mattsp1290/eino-agent/wasmext/gen => ./wasmext/gen
 
 require (
