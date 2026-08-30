@@ -30,6 +30,8 @@ type ToolRegistration struct {
 	Scope          extension.Scope
 	SourceIdentity ToolSourceIdentity
 	Definition     tools.Definition
+	schemaHash     string
+	executorHash   string
 }
 
 type PromptRegistration struct {
@@ -155,6 +157,11 @@ func (r *Registrar) Tool(registration ToolRegistration) error {
 		return fmt.Errorf("freeze composed tool %q: %w", registration.Definition.Name, err)
 	}
 	registration.Definition = frozen
+	registration.schemaHash, err = composedToolSchemaHash(registration)
+	if err != nil {
+		return fmt.Errorf("hash composed tool %q: %w", registration.Definition.Name, err)
+	}
+	registration.executorHash = composedToolExecutorHash(registration.SourceIdentity.executorHash, r.component.Artifact.Hash)
 	r.tools = append(r.tools, registration)
 	return nil
 }
@@ -350,115 +357,12 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 	if sessionID != "" {
 		target = extension.SessionScope(string(sessionID))
 	}
-	var snapshot *extension.Snapshot[componentPayload]
-	var err error
-	if instances == nil {
-		snapshot, err = r.extensions.Snapshot(target)
-	} else {
-		ids := make([]string, 0, len(instances))
-		for id := range instances {
-			ids = append(ids, id)
-		}
-		snapshot, err = r.extensions.SnapshotInstances(target, ids)
-	}
+	snapshot, err := r.snapshotForPlan(target, instances)
 	if err != nil {
 		return nil, err
 	}
-	components := snapshotComponents(snapshot.Values())
-	type promptOwner struct {
-		instanceID, registrationID string
-		scope                      extension.Scope
-	}
-	promptWinners := make(map[string]promptOwner)
-	for _, mounted := range components {
-		for _, registration := range mounted.payload.prompts {
-			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
-				continue
-			}
-			current, exists := promptWinners[registration.Name]
-			if !exists || current.scope.Kind == extension.ScopeGlobal && registration.Scope.Kind == extension.ScopeSession {
-				promptWinners[registration.Name] = promptOwner{instanceID: mounted.component.InstanceID, registrationID: registration.ID, scope: registration.Scope}
-			}
-		}
-	}
-	planComponents := make([]runtime.PlanComponent, 0, len(components))
-	for _, mounted := range components {
-		owned := runtime.PlanComponent{Component: mounted.component}
-		for _, registration := range mounted.payload.tools {
-			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) || selectTool != nil && !selectTool(mounted.component, registration) {
-				continue
-			}
-			schemaHash, hashErr := composedToolSchemaHash(registration)
-			if hashErr != nil {
-				snapshot.Release()
-				return nil, hashErr
-			}
-			definition, cloneErr := mountToolDefinition(mounted.callbackContext, registration.Definition).Clone()
-			if cloneErr != nil {
-				snapshot.Release()
-				return nil, cloneErr
-			}
-			executorHash, hashErr := composedToolExecutorHash(registration.SourceIdentity.executorHash, mounted.component.Artifact.Hash)
-			if hashErr != nil {
-				snapshot.Release()
-				return nil, hashErr
-			}
-			owned.Tools = append(owned.Tools, runtime.PlanTool{
-				Name: registration.Definition.Name, RegistrationID: registration.ID, Scope: registration.Scope,
-				SchemaHash: schemaHash, ExecutorHash: executorHash, Order: registration.Order,
-				Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
-					return tools.Materialize(ctx, definition, scope)
-				},
-			})
-		}
-		for _, registration := range mounted.payload.prompts {
-			winner, ok := promptWinners[registration.Name]
-			if !ok || winner != (promptOwner{instanceID: mounted.component.InstanceID, registrationID: registration.ID, scope: registration.Scope}) {
-				continue
-			}
-			owned.Prompts = append(owned.Prompts, runtime.PlanPrompt{
-				Name: registration.Name, RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order,
-				Provider: mountedPromptProvider{callbackContext: mounted.callbackContext, next: registration.Provider},
-			})
-		}
-		for _, registration := range mounted.payload.guards {
-			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
-				continue
-			}
-			owned.Guards = append(owned.Guards, runtime.PlanGuard{
-				RegistrationID: registration.ID, Scope: registration.Scope, Order: registration.Order,
-				Guard: mountedToolGuard{callbackContext: mounted.callbackContext, next: registration.Guard},
-			})
-		}
-		for _, registration := range mounted.payload.restrictions {
-			if !capabilityApplies(mounted.component.InstanceID, registration.Scope, target, instances) {
-				continue
-			}
-			owned.Restrictions = append(owned.Restrictions, runtime.PlanRestriction{
-				RegistrationID: registration.ID, Scope: registration.Scope,
-				Allowed: registration.Allowed, Denied: registration.Denied,
-			})
-		}
-		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
-			planComponents = append(planComponents, owned)
-		}
-	}
-	return runtime.NewRunPlan(runtime.RunPlanSpec{SessionID: sessionID, Dispatch: snapshot.Dispatch(), Components: planComponents})
-}
-
-type selectedComponent struct {
-	component       extension.Component
-	payload         componentPayload
-	callbackContext func(context.Context) context.Context
-}
-
-func snapshotComponents(values []extension.MountedValue[componentPayload]) []selectedComponent {
-	result := make([]selectedComponent, len(values))
-	for index, value := range values {
-		mounted := value
-		result[index] = selectedComponent{component: mounted.Component(), payload: mounted.Value(), callbackContext: mounted.CallbackContext}
-	}
-	return result
+	selection := newPlanSelection(target, selectTool, snapshot.Values())
+	return runtime.NewRunPlan(runtime.RunPlanSpec{SessionID: sessionID, Dispatch: snapshot.Dispatch(), Components: selection.components()})
 }
 
 type planToolSelector func(extension.Component, ToolRegistration) bool
@@ -493,13 +397,6 @@ func persistedToolSelector(identities map[planToolIdentity]bool) planToolSelecto
 			InstanceID: component.InstanceID, Scope: entry.Scope, RegistrationID: entry.ID, ToolName: entry.Definition.Name,
 		}]
 	}
-}
-
-func capabilityApplies(instanceID string, scope, target extension.Scope, instances map[string]bool) bool {
-	if instances != nil && !instances[instanceID] {
-		return false
-	}
-	return scope.Kind == extension.ScopeGlobal || scope.Kind == extension.ScopeSession && target.Kind == extension.ScopeSession && scope.Key == target.Key
 }
 
 func toolSchemaHash(definition tools.Definition) (string, error) {

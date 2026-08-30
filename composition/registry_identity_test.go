@@ -96,9 +96,9 @@ func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 	if descriptor(base.Order).Fingerprint == descriptor(changedOrder.Order).Fingerprint {
 		t.Fatal("tool order did not change plan fingerprint")
 	}
-	baseExecutor, _ := composedToolExecutorHash(executorA, "artifact")
-	changedExecutor, _ := composedToolExecutorHash(executorB, "artifact")
-	changedArtifact, _ := composedToolExecutorHash(executorA, "artifact-v2")
+	baseExecutor := composedToolExecutorHash(executorA, "artifact")
+	changedExecutor := composedToolExecutorHash(executorB, "artifact")
+	changedArtifact := composedToolExecutorHash(executorA, "artifact-v2")
 	if baseExecutor == changedExecutor || baseExecutor == changedArtifact {
 		t.Fatal("executor identity ignored source/artifact")
 	}

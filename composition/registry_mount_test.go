@@ -163,11 +163,18 @@ func TestMountRejectsInvalidToolDefinitionsAtomically(t *testing.T) {
 			component := component("invalid-tool")
 			invalid := definition("broken", "broken")
 			test.mutate(&invalid)
+			cleanups := 0
 			_, err = registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+				if err := registrar.Defer(func(context.Context) error { cleanups++; return nil }); err != nil {
+					return err
+				}
 				return registrar.Tool(ToolRegistration{ID: "broken", Scope: extension.GlobalScope(), Definition: invalid})
 			}))
 			if !errors.Is(err, tools.ErrInvalidDefinition) {
 				t.Fatalf("Mount error = %v, want ErrInvalidDefinition", err)
+			}
+			if cleanups != 1 {
+				t.Fatalf("mount preparation cleanups = %d, want 1", cleanups)
 			}
 			assertRegistryEmpty(t, registry)
 			plan, planErr := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})

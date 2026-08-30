@@ -93,7 +93,7 @@ func FuzzSessionScope(f *testing.F) {
 		if registered == "" || target == "" {
 			t.Skip()
 		}
-		applies := scopeApplies(SessionScope(registered), SessionScope(target))
+		applies := ScopeApplies(SessionScope(registered), SessionScope(target))
 		if applies != (registered == target) {
 			t.Fatalf("scope result = %t", applies)
 		}

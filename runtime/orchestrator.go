@@ -318,15 +318,15 @@ func (o *StreamingOrchestrator) streamModelAttempts(ctx context.Context, executi
 	attempts := o.attempts()
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		message, receivedDelta, err := o.streamModel(ctx, execution, snapshot, messageID, messages, attempt, step, usage)
-		if err == nil {
-			return message, nil
+		result := o.streamModel(ctx, execution, snapshot, messageID, messages, attempt, step, usage)
+		if result.err == nil {
+			return result.message, nil
 		}
-		last = err
-		if ctx.Err() != nil || receivedDelta || !retryable(err) || attempt == attempts {
+		last = result.err
+		if ctx.Err() != nil || result.receivedDelta || !retryable(result.err) || attempt == attempts {
 			break
 		}
-		o.observeRetry(ctx, snapshot, messageID, attempt, attempts, err)
+		o.observeRetry(ctx, snapshot, messageID, attempt, attempts, result.err)
 	}
 	return nil, last
 }

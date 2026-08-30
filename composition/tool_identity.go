@@ -56,12 +56,13 @@ func composedToolSchemaHash(registration ToolRegistration) (string, error) {
 	})
 }
 
-func composedToolExecutorHash(sourceHash, artifactHash string) (string, error) {
-	return hashToolIdentity(struct {
+func composedToolExecutorHash(sourceHash, artifactHash string) string {
+	raw, _ := json.Marshal(struct {
 		Version      string `json:"version"`
 		SourceHash   string `json:"source_hash"`
 		ArtifactHash string `json:"artifact_hash"`
 	}{Version: toolExecutorIdentityVersion, SourceHash: sourceHash, ArtifactHash: artifactHash})
+	return hashToolIdentityBytes(raw)
 }
 
 func hashToolIdentity(value any) (string, error) {
@@ -69,8 +70,12 @@ func hashToolIdentity(value any) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return hashToolIdentityBytes(raw), nil
+}
+
+func hashToolIdentityBytes(raw []byte) string {
 	digest := sha256.Sum256(raw)
-	return hex.EncodeToString(digest[:]), nil
+	return hex.EncodeToString(digest[:])
 }
 
 func validSHA256Hex(value string) bool {

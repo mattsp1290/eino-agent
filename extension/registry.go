@@ -442,7 +442,7 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 		applies := false
 		handlers := make([]HandlerIdentity, 0)
 		for _, entry := range state.entries {
-			if !scopeApplies(entry.spec.Scope, target) {
+			if !ScopeApplies(entry.spec.Scope, target) {
 				continue
 			}
 			leasedState := state
@@ -461,7 +461,7 @@ func (r *Registry[T]) snapshot(target Scope, allowed map[string]bool) (*Snapshot
 			applies = true
 		}
 		for _, scope := range state.selectionScopes {
-			if scopeApplies(scope, target) {
+			if ScopeApplies(scope, target) {
 				applies = true
 				break
 			}
@@ -520,7 +520,9 @@ func (p *Plan) HandlerComponents() []ComponentHandlers {
 	return result
 }
 
-func scopeApplies(registration, target Scope) bool {
+// ScopeApplies reports whether a validated registration scope participates in
+// a validated target scope.
+func ScopeApplies(registration, target Scope) bool {
 	return registration.Kind == ScopeGlobal || registration.Kind == ScopeSession && target.Kind == ScopeSession && registration.Key == target.Key
 }
 
