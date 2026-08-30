@@ -217,6 +217,35 @@ func TestModuleTimeoutActivelyInterruptsGuest(t *testing.T) {
 	}
 }
 
+func TestModuleInvocationPanicIsClassifiedAndReleasesGate(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int32
+	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+		if calls.Add(1) == 1 {
+			panic("component panic")
+		}
+		output.(*wittypes.PermissionDecision).Action = wittypes.PermissionActionAllow
+		return nil
+	}}
+	policy, err := loadPermissionsPolicy(context.Background(), fixtureConfig(t, []byte("panicking component")), fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := policy.Decide(context.Background(), permissions.Request{}); !IsKind(err, ErrorTrap) {
+		t.Fatalf("panic error = %v, want trap", err)
+	}
+	decision, err := policy.Decide(context.Background(), permissions.Request{})
+	if err != nil || decision.Action != permissions.ActionAllow {
+		t.Fatalf("call after panic = %+v, %v", decision, err)
+	}
+	if err := policy.close(); err != nil {
+		t.Fatalf("Close after panic = %v", err)
+	}
+	if !component.closed.Load() {
+		t.Fatal("component was not closed after recovered panic")
+	}
+}
+
 func TestModuleTimeoutQuarantinesStubbornWorkerUntilItExits(t *testing.T) {
 	t.Parallel()
 	started := make(chan struct{})
@@ -536,6 +565,23 @@ func TestCheckedInPhaseAComponentsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestCheckedInGuestLogExporterPanicIsContained(t *testing.T) {
+	requireCGO(t)
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	cfg := checkedInFixtureConfig(t, root, "tool.wasm")
+	cfg.Observer = einoobs.New(einoobs.Config{Exporter: panickingExporter{}})
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+	definition, err := loadToolForTest(loader, context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := executeLoadedDefinition(context.Background(), definition, `{"value":1}`)
+	if err != nil || !strings.Contains(string(output.Structured), `"echo"`) {
+		t.Fatalf("Execute after exporter panic = %s, %v", output.Structured, err)
+	}
+}
+
 func TestCheckedInToolFailuresAreBoundedAndClassified(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
@@ -786,6 +832,15 @@ type signalExporter struct {
 	once    sync.Once
 	entered chan struct{}
 }
+
+type panickingExporter struct{}
+
+func (panickingExporter) Export(context.Context, []einoobs.Observation) error {
+	panic("exporter panic")
+}
+
+func (panickingExporter) Flush(context.Context) error    { return nil }
+func (panickingExporter) Shutdown(context.Context) error { return nil }
 
 func (e *signalExporter) Export(context.Context, []einoobs.Observation) error {
 	e.once.Do(func() { close(e.entered) })

@@ -181,6 +181,11 @@ func (m *module) call(ctx context.Context, operation string, inputBytes int, inv
 	go func() {
 		defer m.inFlight.Done()
 		defer func() { m.callGate <- struct{}{} }()
+		defer func() {
+			if recover() != nil {
+				done <- errors.New("component invocation panicked")
+			}
+		}()
 		done <- invoke(callCtx)
 	}()
 	select {

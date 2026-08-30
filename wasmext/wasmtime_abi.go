@@ -42,6 +42,7 @@ var (
 
 //export wasmextHostLog
 func wasmextHostLog(id C.uint64_t, levelData *C.char, levelSize C.size_t, messageData *C.char, messageSize C.size_t) {
+	defer func() { _ = recover() }()
 	stateValue, ok := hostLogStates.Load(uint64(id))
 	if !ok {
 		return

@@ -19,9 +19,9 @@ BIN_DIR := $(CURDIR)/.bin
 GOIMPORTS := $(BIN_DIR)/goimports
 GOLANGCI_LINT := $(BIN_DIR)/golangci-lint
 
-.PHONY: check fmt fmt-check lint mod-tidy-check race test tools vet wasm-fixtures wit wit-check
+.PHONY: check fmt fmt-check lint mod-tidy-check race test tools vet wasm-fixtures windows-compile wit wit-check
 
-check: fmt-check vet test race mod-tidy-check lint wit-check
+check: fmt-check vet test race mod-tidy-check lint windows-compile wit-check
 
 wit:
 	rm -rf wasmext/gen/eino-agent
@@ -83,6 +83,9 @@ test:
 
 race:
 	$(GO_TEST) -race ./...
+
+windows-compile:
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO_TEST) -exec=true ./tools/einotools
 
 mod-tidy-check:
 	go mod tidy -diff

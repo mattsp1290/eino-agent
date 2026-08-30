@@ -1,0 +1,9 @@
+# Positive Notes
+
+- `tools/einotools/einotools_test.go:41-45`, `119-123`, `188-194`, and `247-252` now pass explicit catalog options instead of depending on the developer or CI host having `rg` installed.
+- `tools/einotools/einotools_test.go:291-304` creates test-local readable executables for both ripgrep and the shell, preserving the external catalog's executable validation while removing ambient `PATH` coupling. Running the package with `PATH=/usr/bin:/bin`, where `rg` is absent, passes.
+- `runtime/orchestrator_tool_test.go:103` uses test-local queue capacity large enough for the pending, running, and completed events. This keeps `TestToolTransitionTransportPanicIsPostCommitBestEffort` focused on panic containment rather than the separately tested overflow policy.
+- `runtime/event_sink.go:30-35` contains sink panics at the infrastructure boundary, while `runtime/tool_preparation.go:67` and `runtime/tool_execution.go:149-166` publish only after durable transitions. The repaired test's durable-call assertion at `runtime/orchestrator_tool_test.go:112-115` pins that ownership split.
+- `runtime/event_queue.go:25-35` gives each run a bounded asynchronous dispatcher and `runtime/event_queue.go:39-52` clones accepted events before transport delivery, preventing caller mutation and a blocked/panicking sink from rolling durable execution back.
+- `wasmext/engine_stub.go:1-11` and `wasmext/engine_wasmtime.go:1-12` cleanly separate cgo-disabled builds from the Wasmtime implementation. The complete suite passes with `CGO_ENABLED=0`.
+- `tools/einotools/einotools_windows_test.go:17-37` has the right behavioral intent: unsupported host catalog construction must preserve `catalog.ErrUnsupportedPlatform` and leave the composition registry unpublished. Only the assignment typo prevents that contract from compiling.

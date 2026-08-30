@@ -22,7 +22,7 @@ func TestMountStandardPreservesUnsupportedPlatformError(t *testing.T) {
 	component := extension.Component{InstanceID: "windows", Artifact: extension.Artifact{
 		Name: "eino-tools-standard", Version: "test", Hash: "adapter", ConfigHash: "catalog", SourceKind: extension.SourceNative,
 	}}
-	_, err := MountStandard(context.Background(), registry, component, Options{Scope: extension.GlobalScope()})
+	_, err = MountStandard(context.Background(), registry, component, Options{Scope: extension.GlobalScope()})
 	if !errors.Is(err, catalog.ErrUnsupportedPlatform) {
 		t.Fatalf("MountStandard error = %v, want ErrUnsupportedPlatform", err)
 	}

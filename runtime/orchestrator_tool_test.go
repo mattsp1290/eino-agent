@@ -6,6 +6,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 
 func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 	store := newAdmissionStore()
-	sink := &selectiveToolPanickingSink{}
+	sink := &selectiveToolPanickingSink{delivered: make(chan struct{})}
 	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		for _, msg := range request.Messages {
 			if msg.Role == einoschema.Tool {
@@ -113,11 +114,10 @@ func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 	if err != nil || call.Status != session.ToolCallCompleted {
 		t.Fatalf("durable call = %+v, %v", call, err)
 	}
-	deadline := time.Now().Add(time.Second)
-	for sink.toolEvents.Load() != 3 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if got := sink.toolEvents.Load(); got != 3 {
+	select {
+	case <-sink.delivered:
+	case <-time.After(time.Second):
+		got := sink.toolEvents.Load()
 		t.Fatalf("tool event delivery attempts = %d, want 3", got)
 	}
 }
@@ -142,11 +142,15 @@ func TestToolTransitionPersistenceFailureFailsMutation(t *testing.T) {
 
 type selectiveToolPanickingSink struct {
 	toolEvents atomic.Int32
+	delivered  chan struct{}
+	once       sync.Once
 }
 
 func (s *selectiveToolPanickingSink) Emit(_ context.Context, event session.EventRecord) {
 	if event.Kind == EventToolCallUpdated {
-		s.toolEvents.Add(1)
+		if s.toolEvents.Add(1) == 3 {
+			s.once.Do(func() { close(s.delivered) })
+		}
 		panic("transport unavailable")
 	}
 }
