@@ -116,10 +116,6 @@ type ModuleConfig struct {
 	// Observer receives bounded guest log observations with the configured
 	// module name and verified digest attached. A nil observer drops guest logs.
 	Observer *einoobs.Observer
-	// GuestConfig is reserved for bounded, non-secret extension configuration.
-	// v0.1 worlds currently expose no configuration import, so these values are
-	// validated and retained by the host but never sent to a guest.
-	GuestConfig map[string]string
 }
 
 type moduleIdentity struct{ name, hash string }

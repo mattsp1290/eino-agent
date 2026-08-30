@@ -3,7 +3,12 @@ package runtime
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,11 +23,10 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	sink := &capturingSink{}
 	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
-	admitter := Admitter{Store: store, Events: sink, Hooks: []Hook{capturingHook{}}, Clock: func() time.Time { return now }}
-	request := admissionRequest()
-	admitted, err := admitter.Admit(context.Background(), request)
+	admitter := admitter{Store: store, Clock: func() time.Time { return now }}
+	request := testRunAdmission()
+	admitted, err := admitter.admit(context.Background(), request)
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
@@ -56,11 +60,8 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].Trigger != "turn" || epochs[0].Reason != "run_admission" {
 		t.Fatalf("epochs = %#v", epochs)
 	}
-	if len(sink.events) != 1 || sink.events[0].Kind != EventRunStarted {
-		t.Fatalf("emitted events = %#v", sink.events)
-	}
-	if sink.events[0].EventID != events.Events[0].ID {
-		t.Fatalf("live event id = %q, want durable id %q", sink.events[0].EventID, events.Events[0].ID)
+	if !reflect.DeepEqual(admitted.Event, events.Events[0]) {
+		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[0])
 	}
 	request.Config.Agent.Options["temperature"] = "changed"
 	request.Input[0].Content = "changed"
@@ -75,11 +76,57 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 func TestAdmitRequiresContextEpochID(t *testing.T) {
 	t.Parallel()
 
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.IDs.ContextEpochID = ""
-	_, err := (Admitter{Store: newAdmissionStore()}).Admit(context.Background(), request)
+	_, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
+	}
+}
+
+func TestAdmitPersistsResolvedWorkspaceAcrossSymlinkRetarget(t *testing.T) {
+	parent := t.TempDir()
+	first := filepath.Join(parent, "first")
+	second := filepath.Join(parent, "second")
+	if err := os.Mkdir(first, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "workspace")
+	if err := os.Symlink(first, alias); err != nil {
+		t.Fatal(err)
+	}
+	request := testRunAdmission()
+	request.Config.Metadata["workspace_root"] = alias
+	admitted, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := filepath.EvalSymlinks(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Run.Config["workspace_root"] != resolved || admitted.Snapshot.Config.Metadata["workspace_root"] != resolved {
+		t.Fatalf("workspace identity = run %q snapshot %q, want %q", admitted.Run.Config["workspace_root"], admitted.Snapshot.Config.Metadata["workspace_root"], resolved)
+	}
+	if err := os.Remove(alias); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(second, alias); err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Run.Config["workspace_root"] != resolved {
+		t.Fatalf("retarget changed persisted root to %q", admitted.Run.Config["workspace_root"])
+	}
+}
+
+func TestAdmitRejectsNonexistentWorkspace(t *testing.T) {
+	request := testRunAdmission()
+	request.Config.Metadata["workspace_root"] = filepath.Join(t.TempDir(), "missing")
+	if _, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request); err == nil {
+		t.Fatal("expected nonexistent workspace rejection")
 	}
 }
 
@@ -87,28 +134,56 @@ func TestAdmitRejectsDuplicateActiveRun(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	sink := &capturingSink{}
-	hook := &countingHook{}
-	admitter := Admitter{Store: store, Events: sink, Hooks: []Hook{hook}, Clock: func() time.Time { return time.Unix(1, 0) }}
-	request := admissionRequest()
-	if _, err := admitter.Admit(context.Background(), request); err != nil {
+	admitter := admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
+	request := testRunAdmission()
+	if _, err := admitter.admit(context.Background(), request); err != nil {
 		t.Fatalf("first Admit error = %v", err)
 	}
-	again, err := admitter.Admit(context.Background(), request)
-	if err == nil {
-		if again.Run.ID != "run-1" || again.AssistantMessage.ID != "assistant-1" {
-			t.Fatalf("idempotent duplicate identity = %+v", again)
-		}
-		if !again.AlreadyAdmitted {
-			t.Fatal("duplicate admission did not report AlreadyAdmitted")
-		}
-		if hook.calls != 1 || len(sink.events) != 1 {
-			t.Fatalf("duplicate replayed side effects: hook=%d sink=%d", hook.calls, len(sink.events))
-		}
-		return
+	_, err := admitter.admit(context.Background(), request)
+	if !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("duplicate Admit error = %v, want ErrConflict", err)
 	}
-	if !errors.Is(err, session.ErrSessionBusy) && !errors.Is(err, session.ErrConflict) {
-		t.Fatalf("duplicate Admit error = %v, want idempotent or explicit busy/conflict", err)
+}
+
+func TestAdmitCloneFailureHasNoDurableOrLiveSideEffects(t *testing.T) {
+	store := newAdmissionStore()
+	request := testRunAdmission()
+	request.Input[0].Extra = map[string]any{"unsupported": make(chan int)}
+	_, err := (admitter{Store: store}).admit(context.Background(), request)
+	if !errors.Is(err, ErrInvalidAdmission) {
+		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
+	}
+	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.events) != 0 || len(store.epochs) != 0 {
+		t.Fatalf("clone failure mutated state: sessions=%d runs=%d messages=%d events=%d epochs=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.events), len(store.epochs))
+	}
+}
+
+func TestAdmitRejectsEveryRepeatedRunID(t *testing.T) {
+	tests := map[string]func(*admissionRequest){
+		"session":           func(r *admissionRequest) { r.IDs.SessionID = "other-session" },
+		"epoch":             func(r *admissionRequest) { r.IDs.ContextEpochID = "other-epoch" },
+		"assistant message": func(r *admissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
+		"parent message":    func(r *admissionRequest) { r.ParentMessageID = "other-parent" },
+		"config":            func(r *admissionRequest) { r.Config.Agent.Mode = "other-mode" },
+		"model": func(r *admissionRequest) {
+			r.Config.Model.ModelID = "other-model"
+			r.Model.Model.ID = "other-model"
+		},
+		"input": func(r *admissionRequest) { r.Input = []*einoschema.Message{{Role: "user", Content: "other-input"}} },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			store := newAdmissionStore()
+			admitter := admitter{Store: store}
+			request := testRunAdmission()
+			if _, err := admitter.admit(context.Background(), request); err != nil {
+				t.Fatal(err)
+			}
+			mutate(&request)
+			if _, err := admitter.admit(context.Background(), request); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("retry error = %v, want ErrConflict", err)
+			}
+		})
 	}
 }
 
@@ -117,8 +192,8 @@ func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.
 
 	store := newAdmissionStore()
 	store.appendEventErr = errors.New("append event failed")
-	admitter := Admitter{Store: store}
-	_, err := admitter.Admit(context.Background(), admissionRequest())
+	admitter := admitter{Store: store}
+	_, err := admitter.admit(context.Background(), testRunAdmission())
 	if !errors.Is(err, store.appendEventErr) {
 		t.Fatalf("Admit error = %v, want append event failure", err)
 	}
@@ -138,8 +213,8 @@ func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	admitter := Admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
-	admitted, err := admitter.Admit(context.Background(), admissionRequest())
+	admitter := admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
+	admitted, err := admitter.admit(context.Background(), testRunAdmission())
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
@@ -166,70 +241,31 @@ func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
 	}
 }
 
-func TestAdmitFallsBackToConfigModelIdentity(t *testing.T) {
+func TestAdmitRejectsIncompleteResolvedModelBeforeStoreUse(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	request := admissionRequest()
+	request := testRunAdmission()
 	request.Model = model.Resolved{}
-	admitted, err := (Admitter{Store: store}).Admit(context.Background(), request)
-	if err != nil {
-		t.Fatalf("Admit error = %v", err)
+	_, err := (admitter{Store: store}).admit(context.Background(), request)
+	if !errors.Is(err, ErrInvalidAdmission) {
+		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
 	}
-	if admitted.Run.ProviderID != "openai" || admitted.Run.ModelID != "gpt-4.1" {
-		t.Fatalf("run model identity = %q/%q", admitted.Run.ProviderID, admitted.Run.ModelID)
-	}
-}
-
-func TestBeforeRunHookFailureDoesNotEraseAdmission(t *testing.T) {
-	t.Parallel()
-
-	store := newAdmissionStore()
-	errHook := errors.New("hook failed")
-	admitter := Admitter{
-		Store: store,
-		Hooks: []Hook{failingBeforeRunHook{err: errHook}},
-	}
-	_, err := admitter.Admit(context.Background(), admissionRequest())
-	if !errors.Is(err, errHook) {
-		t.Fatalf("Admit error = %v, want hook error", err)
-	}
-	if _, err := store.GetRun(context.Background(), "run-1"); err != nil {
-		t.Fatalf("run missing after hook failure: %v", err)
-	}
-	batch, err := store.ListMessages(context.Background(), "session-1", session.ReplayCursor{Limit: 10})
-	if err != nil {
-		t.Fatalf("ListMessages error = %v", err)
-	}
-	if len(batch.Messages) != 1 {
-		t.Fatalf("messages after hook failure = %#v", batch.Messages)
+	if store.getRunCalls.Load() != 0 || len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.events) != 0 {
+		t.Fatalf("invalid admission touched store: sessions=%d runs=%d messages=%d events=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.events))
 	}
 }
 
-func TestLiveSinkFailureDoesNotFailAdmission(t *testing.T) {
-	t.Parallel()
-
-	store := newAdmissionStore()
-	errSink := errors.New("sink failed")
-	admitter := Admitter{Store: store, Events: failingSink{err: errSink}}
-	admitted, err := admitter.Admit(context.Background(), admissionRequest())
-	if err != nil {
-		t.Fatalf("Admit error = %v, want success despite live sink failure", err)
-	}
-	if admitted.Run.ID != "run-1" {
-		t.Fatalf("admitted run = %+v", admitted.Run)
-	}
-}
-
-func admissionRequest() AdmissionRequest {
+func testRunAdmission() admissionRequest {
 	selection := model.Selection{ProviderID: "openai", ModelID: "gpt-4.1"}
-	return AdmissionRequest{
-		IDs: AdmissionIDs{
+	return admissionRequest{
+		IDs: admissionIDs{
 			SessionID:          "session-1",
 			RunID:              "run-1",
 			AssistantMessageID: "assistant-1",
 			ContextEpochID:     "epoch-1",
 			EventID:            "event-1",
+			RunClaimToken:      "claim-run-1",
 		},
 		ParentMessageID: "user-1",
 		Config: config.Snapshot{
@@ -242,77 +278,68 @@ func admissionRequest() AdmissionRequest {
 			Model: selection,
 			Metadata: map[string]string{
 				"workspace_id":   "workspace-1",
-				"workspace_root": "/workspace",
+				"workspace_root": os.TempDir(),
 			},
-			Plugins: []config.Plugin{{
-				Name:    "plugin",
-				Version: "1.0.0",
-				Hash:    "abc",
-				Source:  "test",
-			}},
 		},
 		Model: model.Resolved{
 			Provider: model.Provider{ID: "openai"},
 			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
+			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }),
 		},
-		Input:    []*einoschema.Message{{Role: "user", Content: "hello"}},
-		OwnerID:  "owner-1",
-		Metadata: map[string]string{"request": "admission"},
+		Input:         []*einoschema.Message{{Role: "user", Content: "hello"}},
+		OwnerID:       "owner-1",
+		LeaseDuration: time.Minute,
+		Metadata:      map[string]string{"request": "admission"},
+		ExtensionPlan: emptyTestPlanDescriptor(),
 	}
 }
 
 type capturingSink struct {
-	events []Event
+	mu     sync.Mutex
+	events []session.EventRecord
 }
 
-func (s *capturingSink) Emit(_ context.Context, event Event) error {
+func (s *capturingSink) Emit(_ context.Context, event session.EventRecord) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.events = append(s.events, event)
-	return nil
 }
 
-type failingSink struct {
-	err error
+func (s *capturingSink) snapshot() []session.EventRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]session.EventRecord(nil), s.events...)
 }
 
-func (s failingSink) Emit(context.Context, Event) error {
-	return s.err
+func (s *capturingSink) waitFor(t testing.TB, count int) []session.EventRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		events := s.snapshot()
+		if len(events) >= count {
+			return events
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink events = %#v, want at least %d", events, count)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
-type capturingHook struct{}
-
-func (capturingHook) BeforeRun(context.Context, session.Run) error { return nil }
-func (capturingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
-	return TurnSnapshot{}, nil
+func (s *capturingSink) waitForKind(t testing.TB, kind string, count int) []session.EventRecord {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		events := s.snapshot()
+		if countEvents(events, kind) >= count {
+			return events
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink events = %#v, want at least %d of kind %q", events, count, kind)
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
-func (capturingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
-func (capturingHook) AfterRun(context.Context, Result) error                { return nil }
-
-type countingHook struct {
-	calls int
-}
-
-func (h *countingHook) BeforeRun(context.Context, session.Run) error {
-	h.calls++
-	return nil
-}
-func (h *countingHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
-	return TurnSnapshot{}, nil
-}
-func (h *countingHook) AfterTurn(context.Context, TurnSnapshot, Result) error { return nil }
-func (h *countingHook) AfterRun(context.Context, Result) error                { return nil }
-
-type failingBeforeRunHook struct {
-	err error
-}
-
-func (h failingBeforeRunHook) BeforeRun(context.Context, session.Run) error { return h.err }
-func (h failingBeforeRunHook) BeforeTurn(context.Context, TurnSnapshot) (TurnSnapshot, error) {
-	return TurnSnapshot{}, nil
-}
-func (h failingBeforeRunHook) AfterTurn(context.Context, TurnSnapshot, Result) error {
-	return nil
-}
-func (h failingBeforeRunHook) AfterRun(context.Context, Result) error { return nil }
 
 type admissionStore struct {
 	sessions          map[session.ID]session.Session
@@ -322,23 +349,33 @@ type admissionStore struct {
 	events            map[session.EventID]session.EventRecord
 	toolCalls         map[session.ToolCallID]session.ToolCall
 	epochs            map[session.EpochID]session.ContextEpoch
+	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	appendEventErr    error
-	finishToolCallErr error
+	appendPartErrAt   int
+	appendPartCalls   int
+	settleToolCallErr error
+	toolTransitionErr error
+	createToolErrAt   int
+	createToolCalls   int
+	normalizeEvent    func(session.EventRecord) session.EventRecord
+	listMessagesCalls atomic.Int32
+	getRunCalls       atomic.Int32
 }
 
 func newAdmissionStore() *admissionStore {
 	return &admissionStore{
-		sessions:  map[session.ID]session.Session{},
-		runs:      map[session.RunID]session.Run{},
-		messages:  map[session.MessageID]session.Message{},
-		parts:     map[session.PartID]session.Part{},
-		events:    map[session.EventID]session.EventRecord{},
-		toolCalls: map[session.ToolCallID]session.ToolCall{},
-		epochs:    map[session.EpochID]session.ContextEpoch{},
+		sessions:      map[session.ID]session.Session{},
+		runs:          map[session.RunID]session.Run{},
+		messages:      map[session.MessageID]session.Message{},
+		parts:         map[session.PartID]session.Part{},
+		events:        map[session.EventID]session.EventRecord{},
+		toolCalls:     map[session.ToolCallID]session.ToolCall{},
+		epochs:        map[session.EpochID]session.ContextEpoch{},
+		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
 	}
 }
 
-func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Tx) error) error {
+func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
 	tx := s.clone()
 	if err := fn(ctx, tx); err != nil {
 		return err
@@ -350,6 +387,7 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.events = tx.events
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
+	s.modelRequests = tx.modelRequests
 	return nil
 }
 
@@ -362,8 +400,15 @@ func (s *admissionStore) clone() *admissionStore {
 		events:            cloneMap(s.events),
 		toolCalls:         cloneMap(s.toolCalls),
 		epochs:            cloneMap(s.epochs),
+		modelRequests:     cloneMap(s.modelRequests),
 		appendEventErr:    s.appendEventErr,
-		finishToolCallErr: s.finishToolCallErr,
+		appendPartErrAt:   s.appendPartErrAt,
+		appendPartCalls:   s.appendPartCalls,
+		settleToolCallErr: s.settleToolCallErr,
+		toolTransitionErr: s.toolTransitionErr,
+		createToolErrAt:   s.createToolErrAt,
+		createToolCalls:   s.createToolCalls,
+		normalizeEvent:    s.normalizeEvent,
 	}
 }
 
@@ -388,11 +433,8 @@ func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.S
 
 func (s *admissionStore) UpdateSession(context.Context, session.Session) error { return nil }
 
-func (s *admissionStore) AdmitRun(_ context.Context, run session.Run) (session.Run, error) {
-	if existing, ok := s.runs[run.ID]; ok {
-		if sameRun(existing, run) {
-			return existing, nil
-		}
+func (s *admissionStore) AdmitRun(_ context.Context, run session.Run, leaseDuration time.Duration) (session.Run, error) {
+	if _, ok := s.runs[run.ID]; ok {
 		return session.Run{}, session.ErrConflict
 	}
 	for _, existing := range s.runs {
@@ -400,11 +442,33 @@ func (s *admissionStore) AdmitRun(_ context.Context, run session.Run) (session.R
 			return session.Run{}, session.ErrSessionBusy
 		}
 	}
+	run.LeaseUntil = time.Now().UTC().Add(leaseDuration)
 	s.runs[run.ID] = run
 	return run, nil
 }
 
+func (s *admissionStore) ClaimRun(_ context.Context, claim session.RunClaim) (session.Run, error) {
+	run, ok := s.runs[claim.RunID]
+	if !ok {
+		return session.Run{}, session.ErrNotFound
+	}
+	if run.Terminal() || run.LeaseUntil.After(time.Now().UTC()) {
+		return session.Run{}, session.ErrSessionBusy
+	}
+	run.OwnerID = claim.OwnerID
+	run.ClaimToken = claim.ClaimToken
+	run.Status = session.RunRunning
+	run.LeaseUntil = time.Now().UTC().Add(claim.LeaseDuration)
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *admissionStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &fakeExecutionStore{admissionStore: s, fence: fence}
+}
+
 func (s *admissionStore) GetRun(_ context.Context, id session.RunID) (session.Run, error) {
+	s.getRunCalls.Add(1)
 	run, ok := s.runs[id]
 	if !ok {
 		return session.Run{}, session.ErrNotFound
@@ -455,6 +519,10 @@ func (s *admissionStore) AppendMessage(_ context.Context, message session.Messag
 }
 
 func (s *admissionStore) AppendPart(_ context.Context, part session.Part) (session.Part, error) {
+	s.appendPartCalls++
+	if s.appendPartErrAt > 0 && s.appendPartCalls == s.appendPartErrAt {
+		return session.Part{}, errors.New("injected append part failure")
+	}
 	if existing, ok := s.parts[part.ID]; ok {
 		if existing.Kind != part.Kind {
 			return session.Part{}, session.ErrConflict
@@ -474,6 +542,7 @@ func (s *admissionStore) UpdatePart(_ context.Context, part session.Part) error 
 }
 
 func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _ session.ReplayCursor) (session.ReplayBatch, error) {
+	s.listMessagesCalls.Add(1)
 	var messages []session.Message
 	for _, message := range s.messages {
 		if message.SessionID == sessionID {
@@ -505,6 +574,12 @@ func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecor
 	if s.appendEventErr != nil {
 		return session.EventRecord{}, s.appendEventErr
 	}
+	if event.ToolTransition != "" || (event.Kind == session.ToolTransitionEventKind && event.ToolCallID != "") {
+		return session.EventRecord{}, session.ErrConflict
+	}
+	if s.normalizeEvent != nil {
+		event = s.normalizeEvent(event)
+	}
 	if existing, ok := s.events[event.ID]; ok {
 		if existing.Kind != event.Kind {
 			return session.EventRecord{}, session.ErrConflict
@@ -533,15 +608,34 @@ func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ s
 	return session.EventBatch{Events: events}, nil
 }
 
-func (s *admissionStore) CreateToolCall(_ context.Context, call session.ToolCall) (session.ToolCall, error) {
+func (s *admissionStore) CreateToolCall(_ context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
+	s.createToolCalls++
+	if s.createToolErrAt > 0 && s.createToolCalls == s.createToolErrAt {
+		return session.ToolTransitionResult{}, errors.New("injected create tool failure")
+	}
+	if s.toolTransitionErr != nil {
+		return session.ToolTransitionResult{}, s.toolTransitionErr
+	}
+	call := request.Call
 	if existing, ok := s.toolCalls[call.ID]; ok {
 		if existing.Name != call.Name {
-			return session.ToolCall{}, session.ErrConflict
+			return session.ToolTransitionResult{}, session.ErrConflict
 		}
-		return existing, nil
+		return session.ToolTransitionResult{Call: existing, Event: s.events[request.Event.ID]}, nil
+	}
+	event, err := session.ToolTransitionRecord(call, request.Event)
+	if err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	if request.RequestPart.ID == "" || request.RequestPart.ID != call.RequestPartID || request.RequestPart.Kind != session.PartToolCall {
+		return session.ToolTransitionResult{}, session.ErrConflict
+	}
+	if _, err := s.AppendPart(context.Background(), request.RequestPart); err != nil {
+		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
-	return call, nil
+	s.events[event.ID] = event
+	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
 func (s *admissionStore) GetToolCall(_ context.Context, id session.ToolCallID) (session.ToolCall, error) {
 	call, ok := s.toolCalls[id]
@@ -559,22 +653,51 @@ func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID sessio
 	}
 	return calls, nil
 }
-func (s *admissionStore) ClaimToolCall(_ context.Context, call session.ToolCall) (session.ToolCall, error) {
-	if _, ok := s.toolCalls[call.ID]; !ok {
-		return session.ToolCall{}, session.ErrNotFound
+func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
+	if s.toolTransitionErr != nil {
+		return session.ToolTransitionResult{}, s.toolTransitionErr
+	}
+	call, ok := s.toolCalls[request.ID]
+	if !ok {
+		return session.ToolTransitionResult{}, session.ErrNotFound
+	}
+	call.Status = session.ToolCallRunning
+	call.ClaimedBy = request.ClaimedBy
+	call.ClaimToken = request.ClaimToken
+	call.StartedAt = request.StartedAt
+	event, err := session.ToolTransitionRecord(call, request.Event)
+	if err != nil {
+		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
-	return call, nil
+	s.events[event.ID] = event
+	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
-func (s *admissionStore) FinishToolCall(_ context.Context, call session.ToolCall) error {
-	if s.finishToolCallErr != nil {
-		return s.finishToolCallErr
+func (s *admissionStore) SettleToolCall(_ context.Context, request session.SettleToolCallRequest) (session.ToolTransitionResult, error) {
+	if s.toolTransitionErr != nil {
+		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
-	if _, ok := s.toolCalls[call.ID]; !ok {
-		return session.ErrNotFound
+	settlement := request.Settlement
+	if s.settleToolCallErr != nil {
+		return session.ToolTransitionResult{}, s.settleToolCallErr
 	}
-	s.toolCalls[call.ID] = call
-	return nil
+	call, ok := s.toolCalls[settlement.ID]
+	if !ok {
+		return session.ToolTransitionResult{}, session.ErrNotFound
+	}
+	terminal, err := settlement.Apply(call)
+	if err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	event, err := session.ToolTransitionRecord(terminal, request.Event)
+	if err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	s.toolCalls[terminal.ID] = terminal
+	s.messages[settlement.ResultMessage.ID] = settlement.ResultMessage
+	s.parts[settlement.ResultPart.ID] = settlement.ResultPart
+	s.events[event.ID] = event
+	return session.ToolTransitionResult{Call: terminal, Event: event}, nil
 }
 func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.ContextEpoch) (session.ContextEpoch, error) {
 	if existing, ok := s.epochs[epoch.ID]; ok {
@@ -606,18 +729,6 @@ func (s *admissionStore) ListContextEpochs(_ context.Context, sessionID session.
 	return epochs, nil
 }
 
-func sameRun(left session.Run, right session.Run) bool {
-	return left.ID == right.ID &&
-		left.SessionID == right.SessionID &&
-		left.ParentMsgID == right.ParentMsgID &&
-		left.OwnerID == right.OwnerID &&
-		left.Agent == right.Agent &&
-		left.ProviderID == right.ProviderID &&
-		left.ModelID == right.ModelID &&
-		left.ContextEpoch == right.ContextEpoch &&
-		left.Status == right.Status
-}
-
 func sameEpoch(left session.ContextEpoch, right session.ContextEpoch) bool {
 	return left.ID == right.ID &&
 		left.SessionID == right.SessionID &&
@@ -632,3 +743,181 @@ func sameEpoch(left session.ContextEpoch, right session.ContextEpoch) bool {
 		left.Reason == right.Reason &&
 		left.NextAction == right.NextAction
 }
+
+type fakeExecutionStore struct {
+	*admissionStore
+	fence session.RunFence
+}
+
+func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Context, session.ExecutionStore) error) error {
+	tx := s.clone()
+	if err := fn(ctx, &fakeExecutionStore{admissionStore: tx, fence: s.fence}); err != nil {
+		return err
+	}
+	s.sessions = tx.sessions
+	s.runs = tx.runs
+	s.messages = tx.messages
+	s.parts = tx.parts
+	s.events = tx.events
+	s.toolCalls = tx.toolCalls
+	s.epochs = tx.epochs
+	s.modelRequests = tx.modelRequests
+	return nil
+}
+
+func (s *fakeExecutionStore) valid() bool {
+	run, ok := s.runs[s.fence.RunID]
+	return ok && !run.Terminal() && run.ClaimToken == s.fence.ClaimToken
+}
+
+func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (session.Run, error) {
+	if !s.valid() {
+		return session.Run{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	run.Status = session.RunRunning
+	run.StartedAt = startedAt
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Duration) (session.Run, error) {
+	if !s.valid() {
+		return session.Run{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	run.LeaseUntil = time.Now().UTC().Add(duration)
+	s.runs[run.ID] = run
+	return run, nil
+}
+
+func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	if !s.valid() {
+		return session.RunSettlementResult{}, session.ErrConflict
+	}
+	for _, call := range s.toolCalls {
+		if call.RunID == s.fence.RunID && !session.TerminalToolCall(call.Status) {
+			return session.RunSettlementResult{}, session.ErrConflict
+		}
+	}
+	run, err := session.ApplyRunSettlement(s.runs[s.fence.RunID], request.Settlement)
+	if err != nil {
+		return session.RunSettlementResult{}, err
+	}
+	event, err := session.RunSettlementRecord(run, request.Event)
+	if err != nil {
+		return session.RunSettlementResult{}, err
+	}
+	if err := s.FinishRun(ctx, run); err != nil {
+		return session.RunSettlementResult{}, err
+	}
+	record, err := s.AppendEvent(ctx, event)
+	return session.RunSettlementResult{Run: run, Event: record}, err
+}
+
+func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
+	if !s.valid() {
+		return session.ToolTransitionResult{}, session.ErrConflict
+	}
+	claimed, err := s.admissionStore.ClaimToolCall(ctx, request)
+	if err != nil {
+		return session.ToolTransitionResult{}, err
+	}
+	claimed.Call.LeaseUntil = time.Now().UTC().Add(request.LeaseDuration)
+	s.toolCalls[claimed.Call.ID] = claimed.Call
+	return claimed, nil
+}
+
+func (s *fakeExecutionStore) CreateModelRequest(_ context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
+	if !s.valid() || record.ID == "" || record.RunID != s.fence.RunID || record.State != session.ModelRequestPrepared {
+		return session.ModelRequestRecord{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	if record.SessionID != run.SessionID {
+		return session.ModelRequestRecord{}, session.ErrConflict
+	}
+	if existing, ok := s.modelRequests[record.ID]; ok {
+		if !reflect.DeepEqual(existing, record) {
+			return session.ModelRequestRecord{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.modelRequests[record.ID] = record
+	return record, nil
+}
+
+func (s *fakeExecutionStore) UpdateModelRequest(_ context.Context, record session.ModelRequestRecord) error {
+	if !s.valid() || record.RunID != s.fence.RunID {
+		return session.ErrConflict
+	}
+	current, ok := s.modelRequests[record.ID]
+	if !ok {
+		return session.ErrNotFound
+	}
+	left, right := current, record
+	left.State, right.State = "", ""
+	left.ErrorCode, right.ErrorCode = "", ""
+	left.UpdatedAt, right.UpdatedAt = time.Time{}, time.Time{}
+	if !reflect.DeepEqual(left, right) {
+		return session.ErrConflict
+	}
+	if current.State == record.State {
+		if reflect.DeepEqual(current, record) {
+			return nil
+		}
+		return session.ErrConflict
+	}
+	if !session.ValidModelRequestTransition(current.State, record.State) {
+		return session.ErrConflict
+	}
+	s.modelRequests[record.ID] = record
+	return nil
+}
+
+func (s *admissionStore) GetModelRequest(_ context.Context, id session.ModelRequestID) (session.ModelRequestRecord, error) {
+	record, ok := s.modelRequests[id]
+	if !ok {
+		return session.ModelRequestRecord{}, session.ErrNotFound
+	}
+	return record, nil
+}
+
+func (s *admissionStore) ListModelRequests(_ context.Context, runID session.RunID, cursor session.ModelRequestCursor) (session.ModelRequestBatch, error) {
+	limit := cursor.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	var records []session.ModelRequestRecord
+	for _, record := range s.modelRequests {
+		if record.RunID == runID {
+			records = append(records, record)
+		}
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if !records[i].CreatedAt.Equal(records[j].CreatedAt) {
+			return records[i].CreatedAt.Before(records[j].CreatedAt)
+		}
+		return records[i].ID < records[j].ID
+	})
+	if cursor.AfterID != "" {
+		after, ok := s.modelRequests[cursor.AfterID]
+		if !ok {
+			return session.ModelRequestBatch{}, session.ErrNotFound
+		}
+		filtered := records[:0]
+		for _, record := range records {
+			if record.CreatedAt.After(after.CreatedAt) || record.CreatedAt.Equal(after.CreatedAt) && record.ID > after.ID {
+				filtered = append(filtered, record)
+			}
+		}
+		records = filtered
+	}
+	next := session.ModelRequestCursor{}
+	if len(records) > limit {
+		next = session.ModelRequestCursor{AfterID: records[limit-1].ID, Limit: limit}
+		records = records[:limit]
+	}
+	return session.ModelRequestBatch{Records: records, Next: next}, nil
+}
+
+var _ session.ExecutionStore = (*fakeExecutionStore)(nil)

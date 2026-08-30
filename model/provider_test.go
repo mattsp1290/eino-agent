@@ -5,7 +5,6 @@ import (
 	"errors"
 	"testing"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 )
 
@@ -34,7 +33,7 @@ func TestAdapterResolverResolvesAdapterAndClonesRuntime(t *testing.T) {
 	if adapter.runtime.Auth["token"] != "secret" || adapter.runtime.Options["temperature"] != "0" {
 		t.Fatalf("adapter runtime leaked caller mutation: %#v", adapter.runtime)
 	}
-	if resolved.Provider.ID != "fake" || resolved.Model.ID != "m1" || resolved.Client == nil {
+	if resolved.Provider.ID != "fake" || resolved.Model.ID != "m1" || resolved.Streamer == nil {
 		t.Fatalf("resolved = %#v", resolved)
 	}
 	if _, ok := resolved.Provider.Options["token"]; ok {
@@ -72,6 +71,40 @@ func TestAdapterResolverReportsMissingProvider(t *testing.T) {
 	}
 }
 
+func TestValidateResolved(t *testing.T) {
+	t.Parallel()
+
+	selection := Selection{ProviderID: "fake", ModelID: "m1"}
+	valid := Resolved{
+		Provider: Provider{ID: "fake"},
+		Model:    Descriptor{ID: "m1", ProviderID: "fake"},
+		Streamer: &testAdapter{},
+	}
+	tests := []struct {
+		name     string
+		resolved Resolved
+	}{
+		{name: "provider missing", resolved: Resolved{Model: valid.Model, Streamer: valid.Streamer}},
+		{name: "model missing", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ProviderID: "fake"}, Streamer: valid.Streamer}},
+		{name: "descriptor provider missing", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ID: "m1"}, Streamer: valid.Streamer}},
+		{name: "descriptor provider mismatch", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ID: "m1", ProviderID: "other"}, Streamer: valid.Streamer}},
+		{name: "selected provider mismatch", resolved: Resolved{Provider: Provider{ID: "other"}, Model: Descriptor{ID: "m1", ProviderID: "other"}, Streamer: valid.Streamer}},
+		{name: "selected model mismatch", resolved: Resolved{Provider: valid.Provider, Model: Descriptor{ID: "other", ProviderID: "fake"}, Streamer: valid.Streamer}},
+		{name: "streamer missing", resolved: Resolved{Provider: valid.Provider, Model: valid.Model}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if err := ValidateResolved(selection, test.resolved); !errors.Is(err, ErrInvalidResolution) {
+				t.Fatalf("ValidateResolved error = %v, want ErrInvalidResolution", err)
+			}
+		})
+	}
+	if err := ValidateResolved(selection, valid); err != nil {
+		t.Fatalf("ValidateResolved(valid) error = %v", err)
+	}
+}
+
 func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
 	t.Parallel()
 
@@ -102,6 +135,8 @@ func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
 func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	t.Parallel()
 
+	index := 3
+	url := "https://example.test/image.png"
 	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
 		"text": {Type: einoschema.String, Required: true},
 	})
@@ -109,34 +144,79 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 		Identity: Identity{TraceAttributes: map[string]string{"trace": "value"}},
 		Messages: []*einoschema.Message{{
 			Content: "hello",
-			Extra:   map[string]any{"key": "value"},
+			ToolCalls: []einoschema.ToolCall{{
+				Index: &index,
+			}},
+			UserInputMultiContent: []einoschema.MessageInputPart{{
+				Type:  einoschema.ChatMessagePartTypeImageURL,
+				Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{URL: &url}},
+			}},
 		}},
 		Tools: []*einoschema.ToolInfo{{
 			Name:        "tool",
 			ParamsOneOf: params,
-			Extra:       map[string]any{"key": "value"},
 		}},
 		Options: map[string]string{"temperature": "0"},
 	}
 
-	cloned := request.Clone()
+	cloned, err := request.Clone()
+	if err != nil {
+		t.Fatal(err)
+	}
 	cloned.Identity.TraceAttributes["trace"] = "changed"
 	cloned.Messages[0].Content = "changed"
-	cloned.Messages[0].Extra["key"] = "changed"
+	*cloned.Messages[0].ToolCalls[0].Index = 4
+	*cloned.Messages[0].UserInputMultiContent[0].Image.URL = "changed"
 	cloned.Tools[0].Name = "changed"
-	cloned.Tools[0].Extra["key"] = "changed"
 	cloned.Options["temperature"] = "1"
 
 	if request.Identity.TraceAttributes["trace"] != "value" ||
 		request.Messages[0].Content != "hello" ||
-		request.Messages[0].Extra["key"] != "value" ||
+		index != 3 ||
+		url != "https://example.test/image.png" ||
 		request.Tools[0].Name != "tool" ||
-		request.Tools[0].Extra["key"] != "value" ||
 		request.Options["temperature"] != "0" {
 		t.Fatalf("request mutated after clone: %#v", request)
 	}
 	if cloned.Tools[0].ParamsOneOf == nil || cloned.Tools[0].ParamsOneOf == params {
 		t.Fatal("tool parameter schema was not cloned")
+	}
+}
+
+func TestRequestCloneRejectsUnsupportedMetadata(t *testing.T) {
+	t.Parallel()
+	tests := map[string]Request{
+		"message extra": {Messages: []*einoschema.Message{{Extra: map[string]any{"value": 1}}}},
+		"tool extra":    {Tools: []*einoschema.ToolInfo{{Name: "tool", Extra: map[string]any{"value": 1}}}},
+		//nolint:staticcheck // The clone boundary must reject the deprecated field.
+		"deprecated MultiContent": {Messages: []*einoschema.Message{{MultiContent: []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}}}},
+		"streaming metadata": {Messages: []*einoschema.Message{{AssistantGenMultiContent: []einoschema.MessageOutputPart{{
+			Type: einoschema.ChatMessagePartTypeText, Text: "chunk", StreamingMeta: &einoschema.MessageStreamingMeta{Index: 1},
+		}}}}},
+	}
+	for name, request := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := request.Clone(); err == nil {
+				t.Fatal("Clone succeeded for unsupported metadata")
+			}
+		})
+	}
+}
+
+func TestUsageFromMessageMapsDetailedEinoUsage(t *testing.T) {
+	message := einoschema.AssistantMessage("done", nil)
+	message.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+		PromptTokens: 11, CompletionTokens: 7,
+		CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 3},
+		PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 5},
+	}}
+	got := UsageFromMessage(message)
+	want := Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3, CacheReadTokens: 5}
+	if got != want {
+		t.Fatalf("usage = %#v, want %#v", got, want)
+	}
+	if got := UsageFromMessage(nil); got != (Usage{}) {
+		t.Fatalf("nil message usage = %#v", got)
 	}
 }
 
@@ -155,17 +235,17 @@ func (a *testAdapter) Models(context.Context) ([]Descriptor, error) {
 	return a.models, nil
 }
 
-func (a *testAdapter) Build(_ context.Context, _ Selection, runtime Runtime) (einomodel.ToolCallingChatModel, error) {
+func (a *testAdapter) Build(_ context.Context, _ Selection, runtime Runtime) (Streamer, error) {
 	a.runtime = runtime
-	return testModel{}, nil
+	return a, nil
 }
 
 func (a *testAdapter) Available(context.Context, Runtime) error {
 	return a.availableErr
 }
 
-func (a *testAdapter) StreamProvider(context.Context, Request) (*einoschema.StreamReader[*einoschema.Message], error) {
-	return einoschema.StreamReaderFromArray([]*einoschema.Message{}), nil
+func (a *testAdapter) StreamProvider(context.Context, Request) (*einoschema.StreamReader[StreamDelta], error) {
+	return einoschema.StreamReaderFromArray([]StreamDelta{}), nil
 }
 
 type testCatalog struct {
@@ -186,18 +266,4 @@ func (c testCatalog) GetModel(context.Context, ProviderID, ID) (Descriptor, erro
 
 func (c testCatalog) DefaultModel(context.Context) (Selection, error) {
 	return Selection{ProviderID: c.descriptor.ProviderID, ModelID: c.descriptor.ID}, nil
-}
-
-type testModel struct{}
-
-func (testModel) Generate(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.Message, error) {
-	return einoschema.AssistantMessage("", nil), nil
-}
-
-func (testModel) Stream(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
-	return einoschema.StreamReaderFromArray([]*einoschema.Message{}), nil
-}
-
-func (testModel) WithTools([]*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
-	return testModel{}, nil
 }

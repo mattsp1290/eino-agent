@@ -10,235 +10,198 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	agentagui "github.com/mattsp1290/eino-agent/agui"
-	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/composition"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
 )
 
-func TestRegistryCombinesServerAndClientTools(t *testing.T) {
-	t.Parallel()
-
-	server := agenttools.NewRegistry()
-	if _, err := server.Register(serverDefinition("server_echo")); err != nil {
-		t.Fatalf("Register server tool error = %v", err)
-	}
-	registry := NewRegistry(server, testDispatcher())
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{
-		SessionID:  "session-1",
-		Generation: 1,
-		Tools:      []aguitypes.Tool{clientTool("client_lookup")},
-	}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	materialized, err := registry.ResolveTools(context.Background(), snapshot("session-1"))
+func TestMountClientToolsPublishesSessionScopedPlanTool(t *testing.T) {
+	registry, err := composition.NewRegistry(nil)
 	if err != nil {
-		t.Fatalf("ResolveTools error = %v", err)
+		t.Fatal(err)
 	}
-	if got := names(materialized); len(got) != 2 || got[0] != "server_echo" || got[1] != "client_lookup" {
-		t.Fatalf("materialized = %#v", got)
-	}
-}
-
-func TestRegistryClientToolsAreSessionScoped(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry(nil, testDispatcher())
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{
-		SessionID:  "session-a",
-		Generation: 1,
-		Tools:      []aguitypes.Tool{clientTool("client_a")},
-	}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	a, err := registry.ResolveTools(context.Background(), snapshot("session-a"))
+	mount, err := MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
 	if err != nil {
-		t.Fatalf("ResolveTools A error = %v", err)
+		t.Fatal(err)
 	}
-	b, err := registry.ResolveTools(context.Background(), snapshot("session-b"))
+	defer func() { _ = mount.Close(context.Background()) }()
+
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
 	if err != nil {
-		t.Fatalf("ResolveTools B error = %v", err)
+		t.Fatal(err)
 	}
-	if len(a) != 1 || a[0].Name != "client_a" {
-		t.Fatalf("session A tools = %#v", names(a))
+	defer plan.Release()
+	resolved, err := plan.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-a"})
+	if err != nil || len(resolved) != 1 || resolved[0].Name != "client_lookup" {
+		t.Fatalf("resolved = %#v, %v", resolved, err)
 	}
-	if len(b) != 0 {
-		t.Fatalf("session B tools = %#v", names(b))
-	}
-}
-
-func TestRegistryRejectsStaleClientDefinitions(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry(nil, testDispatcher())
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{SessionID: "session-1", Generation: 2, Tools: []aguitypes.Tool{clientTool("new")}}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	err := registry.SetClientTools(agentagui.ClientToolSnapshot{SessionID: "session-1", Generation: 1, Tools: []aguitypes.Tool{clientTool("old")}})
-	if !errors.Is(err, agenttools.ErrStaleRegistration) {
-		t.Fatalf("stale SetClientTools error = %v, want ErrStaleRegistration", err)
-	}
-	materialized, err := registry.ResolveTools(context.Background(), snapshot("session-1"))
+	normalized, err := resolved[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"query":"hi"}`))
 	if err != nil {
-		t.Fatalf("ResolveTools error = %v", err)
+		t.Fatal(err)
 	}
-	if len(materialized) != 1 || materialized[0].Name != "new" {
-		t.Fatalf("materialized = %#v", names(materialized))
+	result, err := resolved[0].Executor.Execute(context.Background(), runtime.ToolCall{ID: "call", Input: normalized})
+	if err != nil || string(result.Structured) != `{"client":true}` {
+		t.Fatalf("result = %#v, %v", result, err)
 	}
-}
 
-func TestRegistryRejectsStaleClientDefinitionsAfterClear(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry(nil, testDispatcher())
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{SessionID: "session-1", Generation: 5, Tools: []aguitypes.Tool{clientTool("new")}}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	registry.ClearClientTools("session-1")
-	err := registry.SetClientTools(agentagui.ClientToolSnapshot{SessionID: "session-1", Generation: 3, Tools: []aguitypes.Tool{clientTool("old")}})
-	if !errors.Is(err, agenttools.ErrStaleRegistration) {
-		t.Fatalf("stale SetClientTools after clear error = %v, want ErrStaleRegistration", err)
-	}
-	materialized, err := registry.ResolveTools(context.Background(), snapshot("session-1"))
+	other, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-b"})
 	if err != nil {
-		t.Fatalf("ResolveTools error = %v", err)
+		t.Fatal(err)
 	}
-	if len(materialized) != 0 {
-		t.Fatalf("materialized = %#v, want none after clear", names(materialized))
-	}
-}
-
-func TestRegistryRejectsEmptySessionClientDefinitions(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry(nil, testDispatcher())
-	err := registry.SetClientTools(agentagui.ClientToolSnapshot{Generation: 1, Tools: []aguitypes.Tool{clientTool("client")}})
-	if !errors.Is(err, agenttools.ErrInvalidDefinition) {
-		t.Fatalf("empty session SetClientTools error = %v, want ErrInvalidDefinition", err)
+	defer other.Release()
+	otherTools, err := other.ResolveTools(context.Background(), runtime.ToolScopeContext{SessionID: "session-b"})
+	if err != nil || len(otherTools) != 0 {
+		t.Fatalf("other session tools = %#v, %v", otherTools, err)
 	}
 }
 
-func TestRegistryHonorsEnabledDisabledForClientTools(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry(nil, testDispatcher())
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{
-		SessionID:  "session-1",
-		Generation: 1,
-		Tools:      []aguitypes.Tool{clientTool("client_a"), clientTool("client_b")},
-	}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	snap := snapshot("session-1")
-	snap.Config.Tools.Enabled = []string{"client_a", "client_b"}
-	snap.Config.Tools.Disabled = []string{"client_b"}
-	materialized, err := registry.ResolveTools(context.Background(), snap)
+func TestDispatcherArtifactIdentityParticipatesInResumeFingerprint(t *testing.T) {
+	registry, err := composition.NewRegistry(nil)
 	if err != nil {
-		t.Fatalf("ResolveTools error = %v", err)
+		t.Fatal(err)
 	}
-	if len(materialized) != 1 || materialized[0].Name != "client_a" {
-		t.Fatalf("materialized = %#v", names(materialized))
-	}
-}
-
-func TestRegistryRequiresDispatcherForClientTools(t *testing.T) {
-	t.Parallel()
-
-	registry := NewRegistry(nil, nil)
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{SessionID: "session-1", Generation: 1, Tools: []aguitypes.Tool{clientTool("client")}}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	_, err := registry.ResolveTools(context.Background(), snapshot("session-1"))
-	if !errors.Is(err, agentagui.ErrClientToolDispatchRequired) {
-		t.Fatalf("ResolveTools error = %v, want ErrClientToolDispatchRequired", err)
-	}
-}
-
-func TestRegistryServerToolWinsNameConflictWithoutMutation(t *testing.T) {
-	t.Parallel()
-
-	server := agenttools.NewRegistry()
-	if _, err := server.Register(serverDefinition("shared")); err != nil {
-		t.Fatalf("Register server tool error = %v", err)
-	}
-	registry := NewRegistry(server, testDispatcher())
-	if err := registry.SetClientTools(agentagui.ClientToolSnapshot{SessionID: "session-1", Generation: 1, Tools: []aguitypes.Tool{clientTool("shared")}}); err != nil {
-		t.Fatalf("SetClientTools error = %v", err)
-	}
-	first, err := registry.ResolveTools(context.Background(), snapshot("session-1"))
+	first, err := MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
 	if err != nil {
-		t.Fatalf("ResolveTools error = %v", err)
+		t.Fatal(err)
 	}
-	if len(first) != 1 || first[0].Name != "shared" || first[0].Metadata[agentagui.MetadataClientTool] == "true" {
-		t.Fatalf("materialized = %#v", first)
-	}
-	first[0].Info.Name = "mutated"
-	again, err := registry.ResolveTools(context.Background(), snapshot("session-1"))
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
 	if err != nil {
-		t.Fatalf("ResolveTools again error = %v", err)
+		t.Fatal(err)
 	}
-	if again[0].Info.Name != "shared" {
-		t.Fatalf("shared model info mutation leaked: %q", again[0].Info.Name)
+	descriptor := plan.Descriptor()
+	plan.Release()
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	second, err := MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v2"), dispatcher())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close(context.Background()) }()
+	assertAGUIResumePlanDrift(t, registry, descriptor)
+}
+
+func TestClientGenerationParticipatesInResumeFingerprint(t *testing.T) {
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstSnapshot := clientSnapshot("session-a", "dispatcher-v1")
+	first, err := MountClientTools(context.Background(), registry, firstSnapshot, dispatcher())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := plan.Descriptor()
+	plan.Release()
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	secondSnapshot := clientSnapshot("session-a", "dispatcher-v1")
+	secondSnapshot.Generation = 2
+	second, err := MountClientTools(context.Background(), registry, secondSnapshot, dispatcher())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = second.Close(context.Background()) }()
+	assertAGUIResumePlanDrift(t, registry, descriptor)
+}
+
+func aguiResumePlanRequest(sessionID session.ID, descriptor session.ExtensionPlanDescriptor) runtime.ResumePlanRequest {
+	plan, _ := session.VerifyExtensionPlanForSession(sessionID, descriptor)
+	return runtime.ResumePlanRequest{SessionID: sessionID, Plan: plan}
+}
+
+func assertAGUIResumePlanDrift(t *testing.T, registry *composition.Registry, persisted session.ExtensionPlanDescriptor) {
+	t.Helper()
+	plan, err := registry.AcquireResumePlan(context.Background(), aguiResumePlanRequest("session-a", persisted))
+	if err != nil {
+		t.Fatalf("AcquireResumePlan error = %v", err)
+	}
+	defer plan.Release()
+	if plan.Descriptor().Fingerprint == persisted.Fingerprint {
+		t.Fatal("drifted AG-UI composition retained persisted fingerprint")
 	}
 }
 
-func TestClientNames(t *testing.T) {
-	t.Parallel()
-
-	names := ClientNames([]aguitypes.Tool{clientTool("client_lookup"), clientTool("server_tool"), aguitypes.Tool{}}, map[string]bool{"server_tool": true})
-	if !names["client_lookup"] || len(names) != 1 {
-		t.Fatalf("ClientNames = %#v", names)
+func TestGlobalAndClientToolNameCollisionsAreRejectedInEitherMountOrder(t *testing.T) {
+	for _, clientFirst := range []bool{false, true} {
+		t.Run(map[bool]string{false: "global-first", true: "client-first"}[clientFirst], func(t *testing.T) {
+			registry, err := composition.NewRegistry(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var first *composition.Mount
+			if clientFirst {
+				first, err = MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
+			} else {
+				first, err = mountGlobalTool(registry, "client_lookup")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = first.Close(context.Background()) }()
+			if clientFirst {
+				_, err = mountGlobalTool(registry, "client_lookup")
+			} else {
+				_, err = MountClientTools(context.Background(), registry, clientSnapshot("session-a", "dispatcher-v1"), dispatcher())
+			}
+			if !errors.Is(err, agenttools.ErrDuplicateRegistration) {
+				t.Fatalf("collision error = %v", err)
+			}
+		})
 	}
 }
 
-func serverDefinition(name string) agenttools.Definition {
-	return agenttools.Definition{
-		Name:        name,
-		Description: "server tool",
-		Parameters:  einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
-		Decode: func(_ context.Context, raw json.RawMessage) (any, error) {
-			var value map[string]any
-			return value, json.Unmarshal(raw, &value)
-		},
-		Encode: func(_ context.Context, value any) (json.RawMessage, error) {
-			return json.Marshal(value)
-		},
-		Execute: func(context.Context, agenttools.Execution) (any, error) {
-			return map[string]string{"ok": "true"}, nil
-		},
+func TestMountClientToolsValidatesIdentityAndDispatcher(t *testing.T) {
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
 	}
+	for name, snapshot := range map[string]agentagui.ClientToolSnapshot{
+		"session":             {Generation: 1, DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}},
+		"generation":          {SessionID: "session", DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}},
+		"dispatcher identity": {SessionID: "session", Generation: 1, Tools: []aguitypes.Tool{clientTool("client")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := MountClientTools(context.Background(), registry, snapshot, dispatcher()); !errors.Is(err, agenttools.ErrInvalidDefinition) {
+				t.Fatalf("error = %v", err)
+			}
+		})
+	}
+	if _, err := MountClientTools(context.Background(), registry, clientSnapshot("session", "dispatcher"), nil); !errors.Is(err, agentagui.ErrClientToolDispatchRequired) {
+		t.Fatalf("missing dispatcher error = %v", err)
+	}
+}
+
+func clientSnapshot(sessionID session.ID, dispatcherID string) agentagui.ClientToolSnapshot {
+	return agentagui.ClientToolSnapshot{SessionID: sessionID, Generation: 1, DispatcherArtifactID: dispatcherID, Tools: []aguitypes.Tool{clientTool("client_lookup")}}
 }
 
 func clientTool(name string) aguitypes.Tool {
-	return aguitypes.Tool{
-		Name:        name,
-		Description: "client tool",
-		Parameters:  map[string]any{"type": "object"},
-	}
+	return aguitypes.Tool{Name: name, Description: "client tool", Parameters: map[string]any{"type": "object"}}
 }
 
-func snapshot(id session.ID) runtime.TurnSnapshot {
-	return runtime.TurnSnapshot{
-		SessionID: id,
-		Config: config.Snapshot{
-			Metadata: map[string]string{
-				"workspace_id":   "workspace-" + string(id),
-				"workspace_root": "/workspace/" + string(id),
-			},
-		},
-	}
-}
-
-func names(tools []runtime.Tool) []string {
-	result := make([]string, 0, len(tools))
-	for _, tool := range tools {
-		result = append(result, tool.Name)
-	}
-	return result
-}
-
-func testDispatcher() agentagui.ClientToolDispatcher {
-	return agentagui.ClientToolDispatcherFunc(func(_ context.Context, call runtime.ToolCall) (runtime.ToolResult, error) {
-		return runtime.ToolResult{Output: string(call.Input)}, nil
+func dispatcher() agentagui.ClientToolDispatcher {
+	return agentagui.ClientToolDispatcherFunc(func(context.Context, runtime.ToolCall) (json.RawMessage, error) {
+		return json.RawMessage(`{"client":true}`), nil
 	})
+}
+
+func mountGlobalTool(registry *composition.Registry, name string) (*composition.Mount, error) {
+	component := extension.Component{InstanceID: "server-" + name, Artifact: extension.Artifact{Name: "server-tools", Version: "1", Hash: "server-hash", ConfigHash: "server-config", SourceKind: extension.SourceNative}}
+	return registry.Mount(context.Background(), component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+		definition := agenttools.Definition{
+			Name: name, Description: "server", Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
+			Execute: func(context.Context, agenttools.Execution) (json.RawMessage, error) {
+				return json.RawMessage(`{}`), nil
+			},
+		}
+		return registrar.Tool(composition.ToolRegistration{ID: name, Scope: extension.GlobalScope(), Definition: definition})
+	}))
 }

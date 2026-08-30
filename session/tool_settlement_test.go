@@ -11,16 +11,19 @@ func TestToolSettlementApplyIsIdempotent(t *testing.T) {
 	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
 	settlement := ToolSettlement{
 		ID:          "call-1",
+		ClaimedBy:   "worker",
+		ClaimToken:  "token",
 		Status:      ToolCallCompleted,
 		Output:      json.RawMessage(`{"content":"ok"}`),
 		Metadata:    map[string]string{"output_status": "completed"},
 		CompletedAt: now,
 	}
 	call := ToolCall{
-		ID:        "call-1",
-		Status:    ToolCallRunning,
-		Metadata:  map[string]string{"tool": "read"},
-		ClaimedBy: "worker",
+		ID:         "call-1",
+		Status:     ToolCallRunning,
+		Metadata:   map[string]string{"tool": "read"},
+		ClaimedBy:  "worker",
+		ClaimToken: "token",
 	}
 	settled, err := settlement.Apply(call)
 	if err != nil {
@@ -49,10 +52,14 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 		Output:      json.RawMessage(`{"content":"ok"}`),
 		Metadata:    map[string]string{"output_status": "completed"},
 		CompletedAt: now,
+		ClaimedBy:   "worker",
+		ClaimToken:  "token",
 	}
 	tests := map[string]ToolSettlement{
 		"output": {
 			ID:          "call-1",
+			ClaimedBy:   "worker",
+			ClaimToken:  "token",
 			Status:      ToolCallCompleted,
 			Output:      json.RawMessage(`{"content":"different"}`),
 			Metadata:    map[string]string{"output_status": "completed"},
@@ -60,6 +67,8 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 		},
 		"metadata": {
 			ID:          "call-1",
+			ClaimedBy:   "worker",
+			ClaimToken:  "token",
 			Status:      ToolCallCompleted,
 			Output:      json.RawMessage(`{"content":"ok"}`),
 			Metadata:    map[string]string{"output_status": "changed"},
@@ -67,16 +76,20 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 		},
 		"completed_at": {
 			ID:          "call-1",
+			ClaimedBy:   "worker",
+			ClaimToken:  "token",
 			Status:      ToolCallCompleted,
 			Output:      json.RawMessage(`{"content":"ok"}`),
 			Metadata:    map[string]string{"output_status": "completed"},
 			CompletedAt: now.Add(time.Second),
 		},
 		"missing_completed_at": {
-			ID:       "call-1",
-			Status:   ToolCallCompleted,
-			Output:   json.RawMessage(`{"content":"ok"}`),
-			Metadata: map[string]string{"output_status": "completed"},
+			ID:         "call-1",
+			ClaimedBy:  "worker",
+			ClaimToken: "token",
+			Status:     ToolCallCompleted,
+			Output:     json.RawMessage(`{"content":"ok"}`),
+			Metadata:   map[string]string{"output_status": "completed"},
 		},
 	}
 	for name, conflict := range tests {
@@ -88,25 +101,54 @@ func TestToolSettlementApplyRejectsConflictingTerminalState(t *testing.T) {
 	}
 }
 
-func TestToolSettlementApplyPopulatesMissingCompletionTime(t *testing.T) {
+func TestToolSettlementApplyDistinguishesLargeJSONIntegers(t *testing.T) {
+	now := time.Date(2026, 6, 27, 10, 0, 0, 0, time.UTC)
+	call := ToolCall{ID: "call-1", Status: ToolCallCompleted, Output: json.RawMessage(`9007199254740992`), CompletedAt: now, ClaimedBy: "worker", ClaimToken: "token"}
+	settlement := ToolSettlement{ID: call.ID, Status: call.Status, Output: json.RawMessage(`9007199254740993`), CompletedAt: now, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken}
+	if _, err := settlement.Apply(call); !errors.Is(err, ErrConflict) {
+		t.Fatalf("large integer collision = %v, want ErrConflict", err)
+	}
+}
+
+func TestToolSettlementApplyRejectsMissingCompletionTimeForRunningCall(t *testing.T) {
 	settlement := ToolSettlement{
-		ID:       "call-1",
-		Status:   ToolCallCompleted,
-		Output:   json.RawMessage(`{"content":"ok"}`),
-		Metadata: map[string]string{"output_status": "completed"},
+		ID:         "call-1",
+		ClaimedBy:  "worker",
+		ClaimToken: "token",
+		Status:     ToolCallCompleted,
+		Output:     json.RawMessage(`{"content":"ok"}`),
+		Metadata:   map[string]string{"output_status": "completed"},
 	}
-	settled, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning})
-	if err != nil {
-		t.Fatalf("apply settlement: %v", err)
-	}
-	if settled.CompletedAt.IsZero() {
-		t.Fatalf("CompletedAt was not populated")
+	if _, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning, ClaimedBy: "worker", ClaimToken: "token"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("missing completion time error = %v, want ErrConflict", err)
 	}
 }
 
 func TestToolSettlementApplyRejectsNonterminalSettlement(t *testing.T) {
-	settlement := ToolSettlement{ID: "call-1", Status: ToolCallRunning}
-	if _, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning}); !errors.Is(err, ErrConflict) {
+	settlement := ToolSettlement{ID: "call-1", ClaimedBy: "worker", ClaimToken: "token", Status: ToolCallRunning}
+	if _, err := settlement.Apply(ToolCall{ID: "call-1", Status: ToolCallRunning, ClaimedBy: "worker", ClaimToken: "token"}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("nonterminal settlement err = %v, want ErrConflict", err)
+	}
+}
+
+func TestToolSettlementApplyRejectsMissingOrMismatchedClaim(t *testing.T) {
+	call := ToolCall{ID: "call-1", Status: ToolCallRunning, ClaimedBy: "worker", ClaimToken: "token"}
+	for name, settlement := range map[string]ToolSettlement{
+		"missing":           {ID: call.ID, Status: ToolCallCompleted},
+		"wrong owner":       {ID: call.ID, ClaimedBy: "stale", ClaimToken: call.ClaimToken, Status: ToolCallCompleted},
+		"wrong claim token": {ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: "stale", Status: ToolCallCompleted},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := settlement.Apply(call); !errors.Is(err, ErrConflict) {
+				t.Fatalf("Apply error = %v, want ErrConflict", err)
+			}
+		})
+	}
+
+	call.Status = ToolCallCompleted
+	call.CompletedAt = time.Now().UTC()
+	terminalRetry := ToolSettlement{ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: "stale", Status: call.Status, CompletedAt: call.CompletedAt}
+	if _, err := terminalRetry.Apply(call); !errors.Is(err, ErrConflict) {
+		t.Fatalf("terminal stale claim error = %v, want ErrConflict", err)
 	}
 }

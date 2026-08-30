@@ -2,37 +2,50 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"strings"
 
 	"github.com/mattsp1290/eino-agent/permissions"
 )
 
-// ExecuteToolWithPermissions checks policy and approval hooks before executing
-// a materialized tool. Denial, missing approval, and interruption are returned
-// as model-visible tool output; operational policy failures are returned as
-// errors for runtime settlement.
-func ExecuteToolWithPermissions(ctx context.Context, tool Tool, call ToolCall, policy permissions.Policy) (ToolResult, error) {
+type toolPermissionState uint8
+
+const (
+	toolPermissionAllowed toolPermissionState = iota
+	toolPermissionDenied
+	toolPermissionApprovalRequired
+	toolPermissionInterrupted
+)
+
+type toolPermissionExecution struct {
+	Result ToolResult
+	State  toolPermissionState
+}
+
+// executeToolWithPermissions checks policy and approval hooks while keeping
+// the authoritative decision out of callback-controlled result metadata.
+func executeToolWithPermissions(ctx context.Context, tool Tool, call ToolCall, policy permissions.Policy) (toolPermissionExecution, error) {
 	if policy == nil {
-		return tool.Executor.Execute(ctx, call)
+		result, err := tool.Executor.Execute(ctx, call)
+		return toolPermissionExecution{Result: result, State: toolPermissionAllowed}, err
 	}
 	for _, permission := range toolPermissions(tool, call) {
 		request := permissionRequest(tool, call, permission)
 		decision, err := policy.Decide(ctx, request)
 		if err != nil {
 			if errors.Is(err, permissions.ErrInterrupted) {
-				return modelVisiblePermissionResult("interrupted", "tool call interrupted during permission check"), nil
+				return permissionExecution(toolPermissionInterrupted, "tool call interrupted during permission check"), nil
 			}
-			return ToolResult{}, err
+			return toolPermissionExecution{State: toolPermissionAllowed}, err
 		}
 		switch decision.Action {
 		case permissions.ActionAllow:
 			continue
 		case permissions.ActionDeny:
-			return modelVisiblePermissionResult("denied", messageOrDefault(decision.Message, "tool call denied by policy")), nil
+			return permissionExecution(toolPermissionDenied, messageOrDefault(decision.Message, "tool call denied by policy")), nil
 		case permissions.ActionAsk:
 			if call.Approval == nil {
-				return modelVisiblePermissionResult("approval_required", messageOrDefault(decision.Message, "tool call requires approval")), nil
+				return permissionExecution(toolPermissionApprovalRequired, messageOrDefault(decision.Message, "tool call requires approval")), nil
 			}
 			err := call.Approval.Ask(ctx, ApprovalRequest{
 				SessionID:  call.SessionID,
@@ -46,20 +59,54 @@ func ExecuteToolWithPermissions(ctx context.Context, tool Tool, call ToolCall, p
 				continue
 			}
 			if errors.Is(err, permissions.ErrInterrupted) {
-				return modelVisiblePermissionResult("interrupted", "tool call interrupted while waiting for approval"), nil
+				return permissionExecution(toolPermissionInterrupted, "tool call interrupted while waiting for approval"), nil
 			}
 			if errors.Is(err, permissions.ErrDenied) {
-				return modelVisiblePermissionResult("denied", err.Error()), nil
+				return permissionExecution(toolPermissionDenied, err.Error()), nil
 			}
 			if errors.Is(err, permissions.ErrApprovalRequired) {
-				return modelVisiblePermissionResult("approval_required", err.Error()), nil
+				return permissionExecution(toolPermissionApprovalRequired, err.Error()), nil
 			}
-			return ToolResult{}, err
+			return toolPermissionExecution{State: toolPermissionAllowed}, err
 		default:
-			return ToolResult{}, permissions.ErrOperational
+			return toolPermissionExecution{State: toolPermissionAllowed}, permissions.ErrOperational
 		}
 	}
-	return tool.Executor.Execute(ctx, call)
+	result, err := tool.Executor.Execute(ctx, call)
+	return toolPermissionExecution{Result: result, State: toolPermissionAllowed}, err
+}
+
+func permissionExecution(state toolPermissionState, message string) toolPermissionExecution {
+	return toolPermissionExecution{Result: modelVisiblePermissionResult(permissionStatus(state), message), State: state}
+}
+
+func permissionStatus(state toolPermissionState) string {
+	switch state {
+	case toolPermissionDenied:
+		return "denied"
+	case toolPermissionApprovalRequired:
+		return "approval_required"
+	case toolPermissionInterrupted:
+		return "interrupted"
+	default:
+		return ""
+	}
+}
+
+func protectPermissionResult(result ToolResult, state toolPermissionState) ToolResult {
+	result = cloneRuntimeToolResult(result)
+	for key := range result.Metadata {
+		if strings.HasPrefix(key, "permission_") {
+			delete(result.Metadata, key)
+		}
+	}
+	if status := permissionStatus(state); status != "" {
+		if result.Metadata == nil {
+			result.Metadata = make(map[string]string)
+		}
+		result.Metadata["permission_status"] = status
+	}
+	return result
 }
 
 func toolPermissions(tool Tool, call ToolCall) []string {
@@ -96,7 +143,7 @@ func modelVisiblePermissionResult(code string, message string) ToolResult {
 		"status":  code,
 		"message": message,
 	}
-	raw, _ := json.Marshal(payload)
+	raw := mustJSON(payload)
 	return ToolResult{
 		Output:     message,
 		Structured: raw,

@@ -57,7 +57,6 @@ This option avoids changing ensemble's primary HTTP/API surface at first, but it
 | `unsupported_tool_call`, `malformed_tool_call` | validator/audit event; do not imply executed tool start/finish | Durable audit/status record | validation/error classification |
 | `notification` | `EventMessageDelta` or settled assistant message, depending on product semantics | Live-only unless persisted as a message | user-visible progress |
 | `other_message` | omitted from AG-UI by default | Omit | forensic-only, redacted |
-| `model_fallback_engaged` | optional custom event or omitted | Usually omit from AG-UI replay | fallback observation |
 | `run_finalized`, `run_failed` | `EventRunFinished` | Durable | terminal run observation |
 
 `notification` is the hardest product decision. If it is user-visible chat content, the adapter must also persist a replayable `session.Message`/`session.Part`; if it is progress text, keep it live-only.

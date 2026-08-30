@@ -22,20 +22,11 @@ type ObservabilitySink struct {
 	Observer *einoobs.Observer
 }
 
-func (s ObservabilitySink) Emit(ctx context.Context, event Event) error {
+func (s ObservabilitySink) Emit(ctx context.Context, event session.EventRecord) {
 	if s.Observer == nil {
-		return nil
+		return
 	}
 	switch event.Kind {
-	case EventContextEpochChanged:
-		s.Observer.Compaction(ctx, einoobs.CompactionEvent{
-			Correlation: eventCorrelation(event, "compaction"),
-			Reason:      "context_epoch_changed",
-			Time:        event.Time,
-			Metadata: einoobs.Metadata{
-				"epoch_id": string(event.EpochID),
-			},
-		})
 	case EventRunFinished:
 		if event.Error.Code != "" || event.Error.Message != "" {
 			s.Observer.Error(ctx, einoobs.ErrorEvent{
@@ -44,20 +35,19 @@ func (s ObservabilitySink) Emit(ctx context.Context, event Event) error {
 				Classification: firstNonEmpty(event.Error.Code, "run_error"),
 				Err:            observationErrorFromClassification(firstNonEmpty(event.Error.Code, "run_error")),
 				Retryable:      event.Error.Retryable,
-				Time:           event.Time,
+				Time:           event.CreatedAt,
 			})
 		}
 	}
-	return nil
 }
 
 func (o *StreamingOrchestrator) startObservedRun(ctx context.Context, run session.Run, messageID session.MessageID, start time.Time) observedRun {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return observedRun{}
 	}
 	corr := o.runCorrelation(run, messageID, "session")
 	corr.ObservationID = observationID("session", string(run.SessionID), string(run.ID))
-	obsSession := o.Observer.StartSession(ctx, einoobs.SessionStart{
+	obsSession := o.observer.StartSession(ctx, einoobs.SessionStart{
 		Correlation: corr,
 		Name:        "session",
 		StartTime:   start,
@@ -106,12 +96,12 @@ func (o *StreamingOrchestrator) finishObservedRun(observed observedRun, result R
 }
 
 func (o *StreamingOrchestrator) startObservedStream(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int) *einoobs.Stream {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return nil
 	}
 	corr := o.snapshotCorrelation(snapshot, messageID, "stream")
 	corr.ObservationID = observationID("stream", string(snapshot.RunID), string(messageID), fmt.Sprintf("attempt-%d", attempt))
-	return o.Observer.StartStream(ctx, einoobs.StreamStart{
+	return o.observer.StartStream(ctx, einoobs.StreamStart{
 		Correlation: corr,
 		ProviderModel: einoobs.ProviderModel{
 			Provider: string(snapshot.Model.Provider.ID),
@@ -128,10 +118,10 @@ func (o *StreamingOrchestrator) startObservedStream(ctx context.Context, snapsho
 }
 
 func (o *StreamingOrchestrator) observeRetry(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int, attempts int, err error) {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return
 	}
-	o.Observer.Retry(ctx, einoobs.RetryEvent{
+	o.observer.Retry(ctx, einoobs.RetryEvent{
 		Correlation:    o.snapshotCorrelation(snapshot, messageID, "retry"),
 		Attempt:        int64(attempt),
 		MaxAttempts:    int64(attempts),
@@ -145,11 +135,11 @@ func (o *StreamingOrchestrator) observeRetry(ctx context.Context, snapshot TurnS
 }
 
 func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, operation string, err error) {
-	if o == nil || o.Observer == nil || err == nil {
+	if o == nil || o.observer == nil || err == nil {
 		return
 	}
 	if errors.Is(err, context.Canceled) {
-		o.Observer.Cancellation(ctx, einoobs.CancellationEvent{
+		o.observer.Cancellation(ctx, einoobs.CancellationEvent{
 			Correlation:    o.snapshotCorrelation(snapshot, messageID, "cancellation"),
 			Operation:      operation,
 			Classification: "canceled",
@@ -159,7 +149,7 @@ func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnS
 		})
 		return
 	}
-	o.Observer.Error(ctx, einoobs.ErrorEvent{
+	o.observer.Error(ctx, einoobs.ErrorEvent{
 		Correlation:    o.snapshotCorrelation(snapshot, messageID, "error"),
 		Operation:      operation,
 		Classification: errorClassification(err, "error"),
@@ -170,10 +160,10 @@ func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnS
 }
 
 func (o *StreamingOrchestrator) observeInterrupt(ctx context.Context, run session.Run, messageID session.MessageID, reason string) {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return
 	}
-	o.Observer.Interrupt(ctx, einoobs.InterruptEvent{
+	o.observer.Interrupt(ctx, einoobs.InterruptEvent{
 		Correlation: o.runCorrelation(run, messageID, "interrupt"),
 		Reason:      reason,
 		Status:      "requested",
@@ -182,10 +172,10 @@ func (o *StreamingOrchestrator) observeInterrupt(ctx context.Context, run sessio
 }
 
 func (o *StreamingOrchestrator) observeResume(ctx context.Context, run session.Run, reason string) {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return
 	}
-	o.Observer.Resume(ctx, einoobs.ResumeEvent{
+	o.observer.Resume(ctx, einoobs.ResumeEvent{
 		Correlation: o.runCorrelation(run, "", "resume"),
 		Reason:      reason,
 		Status:      "started",
@@ -194,13 +184,13 @@ func (o *StreamingOrchestrator) observeResume(ctx context.Context, run session.R
 }
 
 func (o *StreamingOrchestrator) observeToolsResolved(ctx context.Context, snapshot TurnSnapshot, tools []Tool) {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return
 	}
 	for _, tool := range tools {
 		corr := o.snapshotCorrelation(snapshot, "", "tool.registered")
 		corr.ObservationID = observationID("tool.registered", string(snapshot.RunID), tool.Name)
-		o.Observer.ToolRegistered(ctx, einoobs.ToolRegistered{
+		o.observer.ToolRegistered(ctx, einoobs.ToolRegistered{
 			Correlation: corr,
 			ToolName:    tool.Name,
 			ToolKind:    "server",
@@ -213,10 +203,10 @@ func (o *StreamingOrchestrator) observeToolsResolved(ctx context.Context, snapsh
 }
 
 func (o *StreamingOrchestrator) observeToolMaterialized(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall) {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return
 	}
-	o.Observer.ToolMaterialized(ctx, einoobs.ToolMaterialized{
+	o.observer.ToolMaterialized(ctx, einoobs.ToolMaterialized{
 		Correlation: o.toolCorrelation(snapshot, call, "tool.materialized"),
 		ToolCallID:  string(call.ID),
 		ToolName:    tool.Name,
@@ -226,10 +216,10 @@ func (o *StreamingOrchestrator) observeToolMaterialized(ctx context.Context, sna
 }
 
 func (o *StreamingOrchestrator) startObservedToolCall(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall) *einoobs.ToolCall {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return nil
 	}
-	return o.Observer.StartToolCall(ctx, einoobs.ToolCallStart{
+	return o.observer.StartToolCall(ctx, einoobs.ToolCallStart{
 		Correlation: o.toolCorrelation(snapshot, call, "tool.call"),
 		ToolCallID:  string(call.ID),
 		ToolName:    tool.Name,
@@ -258,7 +248,7 @@ func (o *StreamingOrchestrator) finishObservedToolCall(observed *einoobs.ToolCal
 }
 
 func (o *StreamingOrchestrator) observeToolSettled(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall, status session.ToolCallStatus, latency time.Duration, err error, metadata map[string]string) {
-	if o == nil || o.Observer == nil {
+	if o == nil || o.observer == nil {
 		return
 	}
 	classification := toolClassification(status, err, metadata)
@@ -283,7 +273,7 @@ func (o *StreamingOrchestrator) observeToolSettled(ctx context.Context, snapshot
 			Retryable:      false,
 		}
 	}
-	o.Observer.ToolSettled(ctx, event)
+	o.observer.ToolSettled(ctx, event)
 }
 
 func (o *StreamingOrchestrator) observeStreamChunk(stream *einoobs.Stream, index int64) {
@@ -326,7 +316,7 @@ func (o *StreamingOrchestrator) runCorrelation(run session.Run, messageID sessio
 		AssistantMessageID: string(messageID),
 		Provider:           run.ProviderID,
 		Model:              run.ModelID,
-		TraceID:            o.Trace.TraceID,
+		TraceID:            o.trace.TraceID,
 		ObservationID:      observationID(kind, string(run.ID)),
 	}
 }
@@ -339,7 +329,7 @@ func (o *StreamingOrchestrator) snapshotCorrelation(snapshot TurnSnapshot, messa
 		AssistantMessageID:  string(messageID),
 		Provider:            string(snapshot.Model.Provider.ID),
 		Model:               string(snapshot.Model.Model.ID),
-		TraceID:             o.Trace.TraceID,
+		TraceID:             o.trace.TraceID,
 		ObservationID:       observationID(kind, string(snapshot.RunID), string(messageID)),
 		ParentObservationID: observationID("run", string(snapshot.RunID)),
 	}
@@ -362,7 +352,7 @@ func observationID(parts ...string) string {
 	return strings.Join(kept, ":")
 }
 
-func eventCorrelation(event Event, kind string) einoobs.Correlation {
+func eventCorrelation(event session.EventRecord, kind string) einoobs.Correlation {
 	return einoobs.Correlation{
 		SessionID:           string(event.SessionID),
 		RunID:               string(event.RunID),
@@ -403,11 +393,9 @@ func addUsage(a, b model.Usage) model.Usage {
 	}
 }
 
-// runtimeUsage maps a provider-level model.Usage to the transport-neutral
-// runtime Usage carried on events. The field sets are identical; this is the
-// package boundary conversion.
-func runtimeUsage(u model.Usage) Usage {
-	return Usage{
+// runtimeUsage maps provider-level usage to the durable event usage contract.
+func runtimeUsage(u model.Usage) session.Usage {
+	return session.Usage{
 		InputTokens:      u.InputTokens,
 		OutputTokens:     u.OutputTokens,
 		ReasoningTokens:  u.ReasoningTokens,

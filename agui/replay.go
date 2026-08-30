@@ -14,7 +14,7 @@ var ErrTailOverflow = errors.New("agui live tail overflow")
 
 // EventTail provides live runtime events for reconnecting AG-UI transports.
 type EventTail interface {
-	Subscribe(ctx context.Context, sessionID session.ID) (<-chan runtime.Event, error)
+	Subscribe(ctx context.Context, sessionID session.ID) (<-chan session.EventRecord, error)
 }
 
 // Replay emits durable events after cursor through bridge. Live-only deltas are
@@ -48,7 +48,8 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 				next = session.EventCursor{AfterEventID: record.ID, Limit: cursor.Limit}
 				continue
 			}
-			if err := bridge.Emit(ctx, runtimeEvent(record)); err != nil {
+			bridge.Emit(ctx, record)
+			if err := bridge.Err(); err != nil {
 				return next, seen, err
 			}
 			next = session.EventCursor{AfterEventID: record.ID, Limit: cursor.Limit}
@@ -63,7 +64,7 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 // Reconnect subscribes to live tailing, replays durable events, then forwards
 // live events until ctx is canceled or the tail disconnects.
 func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail EventTail, sessionID session.ID, cursor session.EventCursor) (session.EventCursor, error) {
-	var live <-chan runtime.Event
+	var live <-chan session.EventRecord
 	subCtx, subCancel := context.WithCancel(ctx)
 	defer subCancel()
 	if tail != nil {
@@ -95,15 +96,16 @@ func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail Ev
 			if event.Kind == runtime.EventTailOverflow {
 				return next, ErrTailOverflow
 			}
-			if event.EventID != "" && seen[event.EventID] {
+			if event.ID != "" && seen[event.ID] {
 				continue
 			}
-			if err := bridge.Emit(ctx, event); err != nil {
+			bridge.Emit(ctx, event)
+			if err := bridge.Err(); err != nil {
 				return next, err
 			}
-			if event.EventID != "" {
-				seen[event.EventID] = true
-				next = session.EventCursor{AfterEventID: event.EventID, Limit: cursor.Limit}
+			if event.ID != "" {
+				seen[event.ID] = true
+				next = session.EventCursor{AfterEventID: event.ID, Limit: cursor.Limit}
 			}
 		}
 	}
@@ -122,38 +124,4 @@ func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Stor
 	}
 	bridge.MessagesSnapshot(messages)
 	return nil
-}
-
-func runtimeEvent(record session.EventRecord) runtime.Event {
-	return runtime.Event{
-		Kind:        runtime.EventKind(record.Kind),
-		EventID:     record.ID,
-		SessionID:   record.SessionID,
-		RunID:       record.RunID,
-		MessageID:   record.MessageID,
-		PartID:      record.PartID,
-		ToolCallID:  record.ToolCallID,
-		EpochID:     record.EpochID,
-		ProviderID:  record.ProviderID,
-		ModelID:     record.ModelID,
-		ParentID:    record.ParentID,
-		Correlation: record.Correlation,
-		Usage: runtime.Usage{
-			InputTokens:      record.Usage.InputTokens,
-			OutputTokens:     record.Usage.OutputTokens,
-			ReasoningTokens:  record.Usage.ReasoningTokens,
-			CacheReadTokens:  record.Usage.CacheReadTokens,
-			CacheWriteTokens: record.Usage.CacheWriteTokens,
-			Cost:             record.Usage.Cost,
-		},
-		Error: runtime.EventError{
-			Code:      record.Error.Code,
-			Message:   record.Error.Message,
-			Retryable: record.Error.Retryable,
-		},
-		Redaction: runtime.RedactionClass(record.Redaction),
-		Payload:   cloneRaw(record.Payload),
-		LiveOnly:  record.LiveOnly,
-		Time:      record.CreatedAt,
-	}
 }

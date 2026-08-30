@@ -17,21 +17,20 @@ import (
 type RunEventKind string
 
 const (
-	EventRunStarted           RunEventKind = "run_started"
-	EventSessionStarted       RunEventKind = "session_started"
-	EventTurnStarted          RunEventKind = "turn_started"
-	EventTurnCompleted        RunEventKind = "turn_completed"
-	EventTurnFailed           RunEventKind = "turn_failed"
-	EventTurnCancelled        RunEventKind = "turn_cancelled"
-	EventToolCallStarted      RunEventKind = "tool_call_started"
-	EventToolCallFinished     RunEventKind = "tool_call_finished"
-	EventUnsupportedToolCall  RunEventKind = "unsupported_tool_call"
-	EventMalformedToolCall    RunEventKind = "malformed_tool_call"
-	EventModelFallbackEngaged RunEventKind = "model_fallback_engaged"
-	EventNotification         RunEventKind = "notification"
-	EventOtherMessage         RunEventKind = "other_message"
-	EventRunFinalized         RunEventKind = "run_finalized"
-	EventRunFailed            RunEventKind = "run_failed"
+	EventRunStarted          RunEventKind = "run_started"
+	EventSessionStarted      RunEventKind = "session_started"
+	EventTurnStarted         RunEventKind = "turn_started"
+	EventTurnCompleted       RunEventKind = "turn_completed"
+	EventTurnFailed          RunEventKind = "turn_failed"
+	EventTurnCancelled       RunEventKind = "turn_cancelled"
+	EventToolCallStarted     RunEventKind = "tool_call_started"
+	EventToolCallFinished    RunEventKind = "tool_call_finished"
+	EventUnsupportedToolCall RunEventKind = "unsupported_tool_call"
+	EventMalformedToolCall   RunEventKind = "malformed_tool_call"
+	EventNotification        RunEventKind = "notification"
+	EventOtherMessage        RunEventKind = "other_message"
+	EventRunFinalized        RunEventKind = "run_finalized"
+	EventRunFailed           RunEventKind = "run_failed"
 )
 
 // RunEvent is the adapter-facing projection of ensemble's dispatcher.RunEvent.
@@ -52,8 +51,6 @@ type RunEvent struct {
 	FinalStatus   string
 	InputTokens   int64
 	OutputTokens  int64
-	FromModel     string
-	ToModel       string
 }
 
 // Disposition describes how the adapter should treat one ensemble event.
@@ -67,7 +64,7 @@ const (
 
 // MappedEvent is the planned eino-agent projection for one ensemble event.
 type MappedEvent struct {
-	RuntimeEvent runtime.Event
+	RuntimeEvent session.EventRecord
 	Disposition  Disposition
 	Observation  string
 }
@@ -76,23 +73,22 @@ type MappedEvent struct {
 // runtime event vocabulary. It is illustrative: a production adapter must add
 // ID generation, store persistence, and AG-UI bridge wiring around this mapping.
 func MapRunEvent(event RunEvent) MappedEvent {
-	base := runtime.Event{
+	base := session.EventRecord{
 		SessionID: session.ID(first(event.ThreadID, event.SessionID)),
 		RunID:     session.RunID(event.RunAttemptID),
-		Usage: runtime.Usage{
+		Usage: session.Usage{
 			InputTokens:  event.InputTokens,
 			OutputTokens: event.OutputTokens,
 		},
-		Payload: payload(event),
-		Time:    event.Time,
+		Payload:   payload(event),
+		CreatedAt: event.Time,
 	}
 	switch event.Kind {
 	case EventRunStarted:
 		base.Kind = runtime.EventRunStarted
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "run"}
 	case EventSessionStarted, EventTurnStarted, EventTurnCompleted:
-		base.Kind = runtime.EventContextEpochChanged
-		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "turn"}
+		return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "turn"}
 	case EventNotification:
 		base.Kind = runtime.EventMessageDelta
 		base.Payload = payload(map[string]string{"content": event.Message})
@@ -100,14 +96,6 @@ func MapRunEvent(event RunEvent) MappedEvent {
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionLiveOnly, Observation: "message"}
 	case EventOtherMessage:
 		return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "forensic"}
-	case EventModelFallbackEngaged:
-		base.Kind = runtime.EventModelFallbackEngaged
-		base.ModelID = event.ToModel
-		base.Payload = payload(runtime.ModelFallbackPayload{
-			FromModelID: event.FromModel,
-			ToModelID:   event.ToModel,
-		})
-		return MappedEvent{RuntimeEvent: base, Disposition: DispositionDurable, Observation: "model"}
 	case EventToolCallStarted, EventToolCallFinished:
 		if event.ToolCallID == "" {
 			return MappedEvent{RuntimeEvent: base, Disposition: DispositionOmit, Observation: "tool_uncorrelated"}
@@ -133,7 +121,10 @@ func MapRunEvent(event RunEvent) MappedEvent {
 }
 
 func payload(value any) json.RawMessage {
-	raw, _ := json.Marshal(value)
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return json.RawMessage("null")
+	}
 	return raw
 }
 

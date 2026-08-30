@@ -10,7 +10,7 @@ This sketch maps the current `ag-ui-go-server-example` shape to stable `eino-age
 | AG-UI messages to Eino messages | Use `eino-agui/convert.ToEinoMessages`, as shown by `examples/ag-ui-go-server-example/sketch.go` |
 | SSE stream/reconnect boilerplate | `transport.SSEHandler` with `session.Store`, `stream.Tail`, route-owned session lookup, and `after` cursor parsing |
 | Local paused/history storage | `store/sqlite.Open` for durable sessions, runs, messages, parts, tool calls, epochs, and replayable events |
-| Client-defined AG-UI tools | `tools/agui.Registry.SetClientTools` plus `agui.ClientToolSnapshot` |
+| Client-defined AG-UI tools | `tools/agui.MountClientTools` plus `composition.Registry` and `agui.ClientToolSnapshot` |
 | Interrupt route | `transport.InterruptHandler` and an app-owned active-handle lookup |
 
 ## Sketch
@@ -21,14 +21,14 @@ Core flow:
 
 1. Open local storage with `store/sqlite.Open`.
 2. Build a `stream.Tail` for live fanout.
-3. Build a composite `runtime.EventSink` that appends non-live events to `session.Store.AppendEvent` and then emits every event to the `stream.Tail`; use that composite sink for `StreamingOrchestrator.Events`, and pass only the tail to `transport.SSEHandler`.
-4. Build `tools/agui.Registry` with any server tool registry and an AG-UI client-tool dispatcher.
-5. For each AG-UI run request, convert messages and install client tools for that session.
+3. Pass the `stream.Tail` through `runtime.WithEventSink` for live fanout, and pass the same tail to `transport.SSEHandler`.
+4. Build one `composition.Registry`, mount server tools into it, and install it with `runtime.WithRunPlanProvider`.
+5. For each AG-UI run request, close the prior session mount, convert messages, and publish client tools with `tools/agui.MountClientTools`.
 6. Call `runtime.StreamingOrchestrator.Start`.
 7. Serve replay/reconnect through `transport.SSEHandler`.
 8. Serve interrupts through `transport.InterruptHandler`.
 
-Do not pass `stream.Tail` alone as `StreamingOrchestrator.Events`: it is a live fanout, not durable event storage. The minimal server example includes a concrete durable-plus-live sink pattern.
+`runtime.EventSink` is for live delivery and observation. The runtime commits replayable events through the run-fenced `session.ExecutionStore` before forwarding copies to the tail; consumers must not append those copies to durable storage again.
 
 ## POST-SSE Route Shape
 
@@ -54,13 +54,24 @@ Moving to a separate `POST -> 202 Accepted` start route plus `GET /events` recon
 
 ## Client Tools
 
-AG-UI `RunAgentInput.tools` has no revision field. `tools/agui.Registry` uses generations to reject stale delayed updates, so the consuming server must maintain a monotonic per-session counter and start at `1`. If a request has an empty tool list, clear that session's registered client tools so old frontend tools are not exposed to later runs.
+AG-UI `RunAgentInput.tools` has no revision field, so the consuming server owns
+a monotonic per-session generation starting at `1`. It also supplies a
+restart-stable dispatcher artifact ID and changes that ID whenever dispatcher
+behavior changes. The generation, dispatcher identity, schemas, permissions,
+and metadata are sealed into the run-plan fingerprint. An empty tool list means
+the host closes the prior mount and publishes no replacement.
+
+The dispatcher returns one valid JSON value. Invalid JSON and dispatcher errors
+fail the tool call; this adapter has no attachment or per-call result-metadata
+side channel.
 
 ## AG-UI Resume
 
 `RunAgentInput.resume` in the current app is a streamed AG-UI resume path for human-in-the-loop approvals. `transport.ResumeHandler` is different: it is a control-plane helper around `runtime.Resume` and returns `202 Accepted`, not a replacement for the POST-SSE AG-UI resume response.
 
-Until a dedicated AG-UI resume adapter maps resume entries to durable runtime tool-call settlement inside the same SSE response, keep the app-owned resume branch for compatibility. The sketch's `StartRequest` rejects resume payloads to prevent accidentally admitting them as fresh runtime starts.
+The sketch's `StartRequest` rejects AG-UI resume payloads because this adapter
+does not implement their approval semantics. A consuming application must map
+those entries explicitly to durable runtime settlement before accepting them.
 
 ## Stable APIs Used
 
@@ -69,7 +80,7 @@ Until a dedicated AG-UI resume adapter maps resume entries to durable runtime to
 - `stream.Tail`
 - `transport.SSEHandler`, `transport.InterruptHandler`
 - `agui.ClientToolSnapshot`, `agui.ClientToolDispatcher`
-- `tools/agui.Registry`
+- `composition.Registry`, `tools/agui.MountClientTools`
 
 ## Consumer-Owned Work
 
@@ -80,6 +91,6 @@ The integration should keep these in `ag-ui-go-server-example`:
 - product prompts and route-specific posture;
 - auth and tenant/session lookup;
 - UI state payloads;
-- any compatibility route that still needs the original in-memory resume semantics.
+- explicit product-specific AG-UI approval/resume semantics.
 
 The runtime can replace the reusable session/run/tool/replay layers without changing those application-owned concerns.

@@ -57,20 +57,7 @@ func (c Config) WithDefaults() Config {
 		next.Agents[name] = agent
 	}
 	next.Models = cloneSlice(c.Models)
-	next.Providers = cloneSlice(c.Providers)
-	for i := range next.Providers {
-		next.Providers[i].Options = cloneMap(c.Providers[i].Options)
-	}
 	next.Tools = c.Tools.WithDefaults()
-	next.ContextSources = cloneSlice(c.ContextSources)
-	for i := range next.ContextSources {
-		next.ContextSources[i].Options = cloneMap(c.ContextSources[i].Options)
-	}
-	next.Hooks = cloneSlice(c.Hooks)
-	for i := range next.Hooks {
-		next.Hooks[i].Options = cloneMap(c.Hooks[i].Options)
-	}
-	next.Plugins = cloneSlice(c.Plugins)
 	next.Observability = c.Observability.WithDefaults()
 	next.Metadata = cloneMap(c.Metadata)
 	return next
@@ -148,15 +135,11 @@ func (c Config) SnapshotForAgent(ctx context.Context, agentName string, catalog 
 		return Snapshot{}, validationError(ValidationUnknownAgent, "agent", agentName)
 	}
 	return Snapshot{
-		Agent:          agent,
-		Model:          agent.Model,
-		Providers:      next.Providers,
-		Tools:          next.Tools,
-		ContextSources: next.ContextSources,
-		Hooks:          next.Hooks,
-		Plugins:        next.Plugins,
-		Observability:  next.Observability,
-		Metadata:       next.Metadata,
+		Agent:         agent,
+		Model:         agent.Model,
+		Tools:         next.Tools,
+		Observability: next.Observability,
+		Metadata:      next.Metadata,
 	}.Clone(), nil
 }
 

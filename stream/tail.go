@@ -20,7 +20,7 @@ type Tail struct {
 
 type tailSub struct {
 	sessionID session.ID
-	events    chan runtime.Event
+	events    chan session.EventRecord
 }
 
 // NewTail creates a bounded in-process event tail.
@@ -33,7 +33,7 @@ func NewTail(size int) *Tail {
 
 // Subscribe returns a bounded stream of live events for one session. Canceling
 // ctx disconnects the subscription.
-func (t *Tail) Subscribe(ctx context.Context, sessionID session.ID) (<-chan runtime.Event, error) {
+func (t *Tail) Subscribe(ctx context.Context, sessionID session.ID) (<-chan session.EventRecord, error) {
 	if t == nil {
 		t = NewTail(0)
 	}
@@ -43,13 +43,13 @@ func (t *Tail) Subscribe(ctx context.Context, sessionID session.ID) (<-chan runt
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
-		ch := make(chan runtime.Event)
+		ch := make(chan session.EventRecord)
 		close(ch)
 		return ch, nil
 	}
 	t.next++
 	id := t.next
-	sub := &tailSub{sessionID: sessionID, events: make(chan runtime.Event, t.size)}
+	sub := &tailSub{sessionID: sessionID, events: make(chan session.EventRecord, t.size)}
 	t.subs[id] = sub
 	t.mu.Unlock()
 
@@ -62,14 +62,14 @@ func (t *Tail) Subscribe(ctx context.Context, sessionID session.ID) (<-chan runt
 
 // Emit implements runtime.EventSink. Slow subscribers are disconnected instead
 // of applying unbounded memory pressure or blocking the producer.
-func (t *Tail) Emit(_ context.Context, event runtime.Event) error {
+func (t *Tail) Emit(_ context.Context, event session.EventRecord) {
 	if t == nil {
-		return nil
+		return
 	}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
-		return nil
+		return
 	}
 	var drop []uint64
 	for id, sub := range t.subs {
@@ -77,13 +77,13 @@ func (t *Tail) Emit(_ context.Context, event runtime.Event) error {
 			continue
 		}
 		select {
-		case sub.events <- event:
+		case sub.events <- cloneEvent(event):
 		default:
 			select {
 			case <-sub.events:
 			default:
 			}
-			sub.events <- runtime.Event{Kind: runtime.EventTailOverflow, SessionID: sub.sessionID}
+			sub.events <- session.EventRecord{Kind: runtime.EventTailOverflow, SessionID: sub.sessionID, LiveOnly: true}
 			drop = append(drop, id)
 		}
 	}
@@ -93,7 +93,11 @@ func (t *Tail) Emit(_ context.Context, event runtime.Event) error {
 		close(sub.events)
 	}
 	t.mu.Unlock()
-	return nil
+}
+
+func cloneEvent(event session.EventRecord) session.EventRecord {
+	event.Payload = append([]byte(nil), event.Payload...)
+	return event
 }
 
 // Close disconnects all subscribers.

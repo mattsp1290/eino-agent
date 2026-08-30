@@ -14,34 +14,6 @@ import (
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
-func TestRuntimeEventReconstructsModelFallbackRecord(t *testing.T) {
-	t.Parallel()
-
-	// The library owns only the record→event direction (runtimeEvent). The
-	// durable event→record projection is host-owned, so we hand-build the
-	// record and assert reconstruction copies Kind, ModelID, and Payload.
-	source := runtime.NewModelFallbackEvent("primary", "fallback", "circuit_breaker")
-	record := session.EventRecord{
-		ID:        "evt-fallback",
-		SessionID: "session-1",
-		RunID:     "run-1",
-		Kind:      string(runtime.EventModelFallbackEngaged),
-		ModelID:   source.ModelID,
-		Payload:   source.Payload,
-	}
-
-	event := runtimeEvent(record)
-	if event.Kind != runtime.EventModelFallbackEngaged {
-		t.Fatalf("Kind = %q, want %q", event.Kind, runtime.EventModelFallbackEngaged)
-	}
-	if event.ModelID != "fallback" {
-		t.Fatalf("ModelID = %q, want fallback", event.ModelID)
-	}
-	if string(event.Payload) != string(source.Payload) {
-		t.Fatalf("Payload = %s, want %s", event.Payload, source.Payload)
-	}
-}
-
 func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	t.Parallel()
 
@@ -83,13 +55,13 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 		done <- err
 	}()
 	<-tail.subscribed
-	tail.events <- runtime.Event{
+	tail.events <- session.EventRecord{
 		Kind:      runtime.EventRunFinished,
-		EventID:   "evt-finished",
+		ID:        "evt-finished",
 		SessionID: "session-replay",
 		MessageID: "assistant-1",
 	}
-	tail.events <- runtime.Event{
+	tail.events <- session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
 		SessionID: "session-replay",
 		MessageID: "assistant-1",
@@ -121,7 +93,7 @@ func TestReconnectReportsTailOverflow(t *testing.T) {
 		done <- err
 	}()
 	<-tail.subscribed
-	tail.events <- runtime.Event{Kind: runtime.EventTailOverflow, SessionID: "session-replay"}
+	tail.events <- session.EventRecord{Kind: runtime.EventTailOverflow, SessionID: "session-replay"}
 	if err := <-done; !errors.Is(err, ErrTailOverflow) {
 		t.Fatalf("Reconnect err = %v, want ErrTailOverflow", err)
 	}
@@ -163,43 +135,50 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-replay", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "run-1", SessionID: "session-replay", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-1", SessionID: "session-replay", OwnerID: "owner", ClaimToken: "claim-replay", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
-	if _, err := store.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := store.AppendPart(ctx, session.Part{ID: "part-text", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartText, Ordinal: 10, Payload: []byte(`{"text":"settled"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-text", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartText, Ordinal: 10, Payload: []byte(`{"text":"settled"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append part: %v", err)
 	}
 	events := []session.EventRecord{
 		{ID: "evt-started", SessionID: "session-replay", RunID: "run-1", MessageID: "assistant-1", Kind: string(runtime.EventRunStarted), CreatedAt: now},
 		{ID: "evt-live", SessionID: "session-replay", RunID: "run-1", MessageID: "assistant-1", Kind: string(runtime.EventMessageDelta), Payload: []byte(`{"content":"durable?"}`), LiveOnly: true, CreatedAt: now.Add(time.Second)},
-		{ID: "evt-finished", SessionID: "session-replay", RunID: "run-1", MessageID: "assistant-1", Kind: string(runtime.EventRunFinished), CreatedAt: now.Add(2 * time.Second)},
 	}
 	for _, event := range events {
-		if _, err := store.AppendEvent(ctx, event); err != nil {
+		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("append event %s: %v", event.ID, err)
 		}
+	}
+	if _, err := execution.SettleRun(ctx, session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: now.Add(2 * time.Second)},
+		Event:      session.RunSettlementEvent{ID: "evt-finished", MessageID: "assistant-1"},
+	}); err != nil {
+		t.Fatalf("settle run: %v", err)
 	}
 	return store
 }
 
 type replayTail struct {
-	events     chan runtime.Event
+	events     chan session.EventRecord
 	subscribed chan struct{}
 	canceled   chan struct{}
 }
 
 func newReplayTail() *replayTail {
 	return &replayTail{
-		events:     make(chan runtime.Event),
+		events:     make(chan session.EventRecord),
 		subscribed: make(chan struct{}),
 		canceled:   make(chan struct{}),
 	}
 }
 
-func (t *replayTail) Subscribe(ctx context.Context, _ session.ID) (<-chan runtime.Event, error) {
+func (t *replayTail) Subscribe(ctx context.Context, _ session.ID) (<-chan session.EventRecord, error) {
 	close(t.subscribed)
 	go func() {
 		<-ctx.Done()

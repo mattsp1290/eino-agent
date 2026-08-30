@@ -109,10 +109,14 @@ func part(id session.PartID, messageID session.MessageID, kind session.PartKind,
 }
 
 type boundaryStore struct {
-	session.Store
+	session.ExecutionStore
 	messages      []session.Message
 	parts         []session.Part
 	finishedEpoch session.ContextEpoch
+}
+
+func (s *boundaryStore) WithinTx(ctx context.Context, fn func(context.Context, session.ExecutionStore) error) error {
+	return fn(ctx, s)
 }
 
 func (s *boundaryStore) AppendMessage(_ context.Context, message session.Message) (session.Message, error) {

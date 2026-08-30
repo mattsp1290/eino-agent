@@ -29,7 +29,7 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 			part("p2", "assistant-1", session.PartToolCall, 20, `{"id":"call-1","name":"file_read","arguments":{"path":"README.md"}}`),
 			part("p1", "assistant-1", session.PartText, 10, `{"text":"I will read it."}`),
 			part("p0", "user-1", session.PartText, 10, `{"text":"Read README"}`),
-			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","content":"README contents"}`),
+			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","status":"completed","content":"README contents"}`),
 			part("reasoning", "assistant-2", session.PartReasoning, 5, `{"text":"LIVE_ONLY_STYLE_REASONING"}`),
 			part("state", "assistant-2", session.PartState, 6, `{"text":"LIVE_ONLY_STYLE_STATE"}`),
 			part("p4", "assistant-2", session.PartText, 10, `{"text":"Summary"}`),
@@ -51,7 +51,7 @@ func TestProjectToolResultStructuredAndExpectedFailurePayloads(t *testing.T) {
 	batch := session.ReplayBatch{
 		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
 		Parts: []session.Part{
-			part("structured", "assistant-1", session.PartToolResult, 10, `{"tool_call_id":"call-1","status":"completed","structured":{"ok":true}}`),
+			part("structured", "assistant-1", session.PartToolResult, 10, `{"tool_call_id":"call-1","status":"completed","structured":{"ok":true},"original_size":11,"inline_size":11,"external":false}`),
 			part("failure", "assistant-1", session.PartToolResult, 20, `{"tool_call_id":"call-2","status":"expected_failure","content":"denied"}`),
 		},
 	}
@@ -68,6 +68,59 @@ func TestProjectToolResultStructuredAndExpectedFailurePayloads(t *testing.T) {
 	}
 	if projected[2].ToolCallID != "call-2" || projected[2].Content == "denied" {
 		t.Fatalf("expected failure projection = %#v", projected[2])
+	}
+}
+
+func TestProjectRejectsNonCanonicalTextPayloads(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		kind    session.PartKind
+		payload string
+	}{
+		"bare string":         {kind: session.PartText, payload: `"legacy"`},
+		"content alias":       {kind: session.PartText, payload: `{"content":"legacy"}`},
+		"raw alias":           {kind: session.PartText, payload: `{"raw":{"value":1}}`},
+		"missing text":        {kind: session.PartText, payload: `{}`},
+		"null":                {kind: session.PartText, payload: `null`},
+		"trailing value":      {kind: session.PartText, payload: `{"text":"ok"} {}`},
+		"unknown field":       {kind: session.PartText, payload: `{"text":"ok","extra":true}`},
+		"compaction metadata": {kind: session.PartCompaction, payload: `{"text":"summary"}`},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Project(session.ReplayBatch{
+				Messages: []session.Message{message("message", session.RoleUser)},
+				Parts:    []session.Part{part("part", "message", test.kind, 0, test.payload)},
+			}, Options{IncludeReasoning: true, IncludeState: true})
+			if err == nil {
+				t.Fatal("non-canonical payload was accepted")
+			}
+		})
+	}
+}
+
+func TestProjectRejectsNonCanonicalToolResultPayloads(t *testing.T) {
+	t.Parallel()
+	for name, payload := range map[string]string{
+		"text fallback":   `{"text":"legacy","tool_call_id":"call"}`,
+		"missing call id": `{"status":"completed","content":"ok"}`,
+		"missing status":  `{"tool_call_id":"call","content":"ok"}`,
+		"unknown status":  `{"tool_call_id":"call","status":"future"}`,
+		"unknown field":   `{"tool_call_id":"call","status":"completed","extra":true}`,
+		"null":            `null`,
+		"trailing value":  `{"tool_call_id":"call","status":"completed"} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Project(session.ReplayBatch{
+				Messages: []session.Message{message("message", session.RoleTool)},
+				Parts:    []session.Part{part("part", "message", session.PartToolResult, 0, payload)},
+			}, Options{})
+			if err == nil {
+				t.Fatal("non-canonical payload was accepted")
+			}
+		})
 	}
 }
 
@@ -103,7 +156,7 @@ func TestProjectCompactionBoundaryIncludesSummary(t *testing.T) {
 	batch := session.ReplayBatch{
 		Messages: []session.Message{message("summary", session.RoleSystem)},
 		Parts: []session.Part{
-			part("compaction", "summary", session.PartCompaction, 10, `{"text":"Earlier context summary."}`),
+			part("compaction", "summary", session.PartCompaction, 10, `{"text":"Earlier context summary.","epoch_id":"epoch","redacted":true}`),
 			part("text", "summary", session.PartText, 20, `{"text":" Tail instruction."}`),
 		},
 	}
@@ -125,7 +178,7 @@ func TestProjectEpochExcludesCompactedRawHistory(t *testing.T) {
 		},
 		Parts: []session.Part{
 			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
-			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely."}`),
+			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
 			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
 		},
 	}
@@ -154,7 +207,7 @@ func TestProjectEpochWithNoTailIncludesSummaryOnly(t *testing.T) {
 		},
 		Parts: []session.Part{
 			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
-			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely."}`),
+			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
 		},
 	}
 	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
@@ -185,7 +238,7 @@ func TestProjectEpochPlacesSummaryBeforeRetainedTail(t *testing.T) {
 		Parts: []session.Part{
 			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
 			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
-			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely."}`),
+			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
 		},
 	}
 	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{

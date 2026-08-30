@@ -82,23 +82,20 @@ func NewBoundary(epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunI
 }
 
 // AppendBoundary appends the replayable summary message and compaction part.
-func AppendBoundary(ctx context.Context, store session.Store, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {
+func AppendBoundary(ctx context.Context, store session.ExecutionStore, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {
 	if store == nil {
 		return Boundary{}, fmt.Errorf("store required")
 	}
-	if transactor, ok := store.(session.Transactor); ok {
-		var boundary Boundary
-		err := transactor.WithinTx(ctx, func(ctx context.Context, tx session.Tx) error {
-			var err error
-			boundary, err = appendBoundaryRecords(ctx, tx, epoch, ids, runID, now, summary)
-			return err
-		})
-		return boundary, err
-	}
-	return appendBoundaryRecords(ctx, store, epoch, ids, runID, now, summary)
+	var boundary Boundary
+	err := store.WithinTx(ctx, func(ctx context.Context, tx session.ExecutionStore) error {
+		var err error
+		boundary, err = appendBoundaryRecords(ctx, tx, epoch, ids, runID, now, summary)
+		return err
+	})
+	return boundary, err
 }
 
-func appendBoundaryRecords(ctx context.Context, store session.Store, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {
+func appendBoundaryRecords(ctx context.Context, store session.ExecutionStore, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {
 	boundary, err := NewBoundary(epoch, ids, runID, now, summary)
 	if err != nil {
 		return Boundary{}, err

@@ -31,3 +31,25 @@ func TestCorePackagesDoNotDependOnWasmRuntimeOrBindings(t *testing.T) {
 		})
 	}
 }
+
+func TestExtensionKernelHasNoRuntimeDomainDependencies(t *testing.T) {
+	t.Parallel()
+	command := exec.Command("go", "list", "-deps", "github.com/mattsp1290/eino-agent/extension")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("go list -deps: %v\n%s", err, output)
+	}
+	dependencies := string(output)
+	for _, forbidden := range []string{
+		"github.com/mattsp1290/eino-agent/runtime",
+		"github.com/mattsp1290/eino-agent/session",
+		"github.com/mattsp1290/eino-agent/model",
+		"github.com/mattsp1290/eino-agent/tools",
+		"github.com/cloudwego/eino",
+		"github.com/bytecodealliance/wasmtime-go",
+	} {
+		if strings.Contains(dependencies, forbidden) {
+			t.Errorf("extension depends on %s", forbidden)
+		}
+	}
+}

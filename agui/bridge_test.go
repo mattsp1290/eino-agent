@@ -11,11 +11,11 @@ import (
 	"testing"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
-	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
 )
 
 func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
@@ -23,13 +23,13 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 
 	sink := newSSESink()
 	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	_ = bridge.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunStarted})
-	_ = bridge.Emit(context.Background(), runtime.Event{
+	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted})
+	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
 		MessageID: "assistant-1",
 		Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
 	})
-	_ = bridge.Emit(context.Background(), runtime.Event{
+	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:       runtime.EventToolCallUpdated,
 		MessageID:  "tool-message-1",
 		ToolCallID: "tool-1",
@@ -47,7 +47,7 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	bridge.StepFinished("model")
 	bridge.Custom("agent_note", map[string]any{"ok": true})
 	bridge.ReasoningEncryptedValue(aguievents.ReasoningEncryptedValueSubtypeMessage, "assistant-1", "ciphertext")
-	_ = bridge.Emit(context.Background(), runtime.Event{Kind: runtime.EventRunFinished})
+	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunFinished})
 
 	frames := frameData(t, sink.Bytes())
 	fixture := readGolden(t, "../testdata/agui/full_surface_events.json")
@@ -62,96 +62,6 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	}
 	if bridge.Err() != nil || bridge.EncErr() != nil {
 		t.Fatalf("bridge errors: transport=%v encoding=%v", bridge.Err(), bridge.EncErr())
-	}
-}
-
-func TestBridgeEmitsModelFallbackCustomEvent(t *testing.T) {
-	t.Parallel()
-
-	sink := newSSESink()
-	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	event := runtime.NewModelFallbackEvent("gpt-primary", "gpt-fallback", "circuit_breaker")
-	if err := bridge.Emit(context.Background(), event); err != nil {
-		t.Fatalf("Emit error = %v", err)
-	}
-
-	frames := frameData(t, sink.Bytes())
-	if len(frames) != 1 {
-		t.Fatalf("frames = %d, want 1", len(frames))
-	}
-	frame := frames[0]
-	if frame["type"] != "CUSTOM" {
-		t.Fatalf("frame type = %v, want CUSTOM", frame["type"])
-	}
-	if frame["name"] != "model_fallback_engaged" {
-		t.Fatalf("frame name = %v, want model_fallback_engaged", frame["name"])
-	}
-	value, ok := frame["value"].(map[string]any)
-	if !ok {
-		t.Fatalf("frame value = %#v, want map", frame["value"])
-	}
-	if value["from_model_id"] != "gpt-primary" || value["to_model_id"] != "gpt-fallback" {
-		t.Fatalf("value model transition = %#v", value)
-	}
-	if value["reason"] != "circuit_breaker" {
-		t.Fatalf("value reason = %v, want circuit_breaker", value["reason"])
-	}
-	// The custom value mirrors the durable payload's omitempty shape: empty
-	// optional keys are absent, not present as "".
-	for _, key := range []string{"from_provider_id", "to_provider_id"} {
-		if _, present := value[key]; present {
-			t.Fatalf("custom value should omit empty %q, got %#v", key, value)
-		}
-	}
-	if bridge.Err() != nil {
-		t.Fatalf("bridge error: %v", bridge.Err())
-	}
-}
-
-func TestBridgeModelFallbackNilPayloadDoesNotPanic(t *testing.T) {
-	t.Parallel()
-
-	sink := newSSESink()
-	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	// A host that bypasses NewModelFallbackEvent may leave Payload nil; the
-	// bridge must degrade to an empty custom value, not panic.
-	if err := bridge.Emit(context.Background(), runtime.Event{Kind: runtime.EventModelFallbackEngaged}); err != nil {
-		t.Fatalf("Emit error = %v", err)
-	}
-	frames := frameData(t, sink.Bytes())
-	if len(frames) != 1 || frames[0]["type"] != "CUSTOM" {
-		t.Fatalf("frames = %#v, want one CUSTOM frame", frames)
-	}
-	if value, ok := frames[0]["value"].(map[string]any); !ok || len(value) != 0 {
-		t.Fatalf("nil-payload custom value = %#v, want empty map", frames[0]["value"])
-	}
-}
-
-func TestBridgeDelegatesClientToolBinding(t *testing.T) {
-	t.Parallel()
-
-	infos, err := ClientToolInfos([]aguitypes.Tool{{
-		Name:        "client_lookup",
-		Description: "lookup in client",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"query": map[string]any{"type": "string"},
-			},
-		},
-	}})
-	if err != nil {
-		t.Fatalf("ClientToolInfos error = %v", err)
-	}
-	if len(infos) != 1 || infos[0].Name != "client_lookup" {
-		t.Fatalf("tool infos = %#v", infos)
-	}
-	server, client := ClassifyToolCalls([]einoschema.ToolCall{
-		{ID: "server-1", Function: einoschema.FunctionCall{Name: "server_tool"}},
-		{ID: "client-1", Function: einoschema.FunctionCall{Name: "client_lookup"}},
-	}, map[string]bool{"client_lookup": true})
-	if len(server) != 1 || server[0].ID != "server-1" || len(client) != 1 || client[0].ID != "client-1" {
-		t.Fatalf("classified server=%#v client=%#v", server, client)
 	}
 }
 

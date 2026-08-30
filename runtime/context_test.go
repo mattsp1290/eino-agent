@@ -76,7 +76,7 @@ func TestTurnSnapshotContextIdentityUsesResolvedModel(t *testing.T) {
 	}
 }
 
-func TestTurnSnapshotContextIdentityFallsBackToConfigModel(t *testing.T) {
+func TestTurnSnapshotContextIdentityDoesNotReconstructModelFromConfig(t *testing.T) {
 	t.Parallel()
 
 	snapshot := TurnSnapshot{
@@ -89,8 +89,8 @@ func TestTurnSnapshotContextIdentityFallsBackToConfigModel(t *testing.T) {
 	}
 
 	identity := snapshot.ContextIdentity("", "", agentcontext.TraceContext{})
-	if identity.ProviderID != "configured-provider" || identity.ModelID != "configured-model" {
-		t.Fatalf("provider/model = %q/%q, want configured-provider/configured-model", identity.ProviderID, identity.ModelID)
+	if identity.ProviderID != "" || identity.ModelID != "" {
+		t.Fatalf("provider/model = %q/%q, want empty resolved identity", identity.ProviderID, identity.ModelID)
 	}
 }
 

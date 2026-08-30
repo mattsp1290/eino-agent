@@ -38,7 +38,7 @@ status.
 | Dependency | Pin | Evidence |
 | --- | --- | --- |
 | `github.com/mattsp1290/eino-agui` | tag `v0.1.1`, commit `453c69c9bdb1006c585407510342ea5a03d1b48d` | `~/git/eino-agui`, `go.mod`, `README.md`, `docs/decisions/0002-ensemble-shared-surface.md` |
-| `github.com/mattsp1290/eino-tools` | commit `e6ee664be93bb830b4bf6215907865b6366662b5` | `~/git/eino-tools`, response artifact `~/.agents/projects/eino-tools/responses/2026-06-26-coding-agent-tool-parity-for-eino-agent.md` |
+| `github.com/mattsp1290/eino-tools` | commit `63a3c99272c2359e24484698f2bd62e6fac849b6`, pseudo-version `v0.1.1-0.20260825160656-63a3c99272c2` | `~/git/eino-tools`, completed catalog commits `cc35e50` and `63a3c99`, and `.agents/requests/eino-agent-composition-tool-registration/` |
 | `github.com/mattsp1290/eino-obs` | commit `a9a6f8bb478b479c1e48ab353261a60c4a19195a` | `~/git/eino-obs`, `README.md`, root/exporter/fake/exporter/datadog packages |
 | `github.com/mattsp1290/ensemble` | commit `a709ad8ed2e9d8962b73b228859433cc6554ee2c` for current discovery only | `~/git/ensemble`, `eino-agui/docs/decisions/0002-ensemble-shared-surface.md` |
 
@@ -104,13 +104,18 @@ contexts, interruption/resume, compaction, and consumer embedding APIs.
 
 ## Eino Tools Contract
 
-The `eino-tools` response marks the parity request complete at commit
-`e6ee664be93bb830b4bf6215907865b6366662b5`.
+The original parity request completed at `e6ee664`. The later
+`eino-agent-composition-tool-registration` request completed at `63a3c99` and
+adds the runtime-neutral `catalog` package now consumed by this repository.
 
 Important downstream decisions:
 
-- `eino-agent` must serialize `fileops`, `glob`, `search`, and `apply_patch`
-  calls per canonical workspace root.
+- `tools/einotools.MountStandard` translates the catalog into one atomic
+  composition mount and carries leaf schema/executor hashes into durable plan
+  identity.
+- The adapter serializes every catalog definition with `Concurrent=false`
+  through one process-wide, ref-counted lock domain. Workspace tools share the
+  canonical-root key; non-concurrent static tools share their catalog-ID key.
 - Independent workspace roots may run concurrently.
 - `web_search` is out of scope for `eino-tools`; `eino-agent` owns the
   model-facing schema and runtime connector policy.

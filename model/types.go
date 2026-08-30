@@ -2,8 +2,6 @@ package model
 
 import (
 	"context"
-
-	einomodel "github.com/cloudwego/eino/components/model"
 )
 
 // ProviderID identifies a provider adapter.
@@ -57,8 +55,7 @@ type Catalog interface {
 	DefaultModel(ctx context.Context) (Selection, error)
 }
 
-// Resolver turns a selected model into an immutable Eino chat model for one
-// turn snapshot. Implementations may return a model with no tools bound yet.
+// Resolver turns a selected model into one immutable streaming transport.
 type Resolver interface {
 	Resolve(ctx context.Context, selection Selection, runtime Runtime) (Resolved, error)
 }
@@ -67,7 +64,6 @@ type Resolver interface {
 type Resolved struct {
 	Provider Provider
 	Model    Descriptor
-	Client   einomodel.ToolCallingChatModel
 	Streamer Streamer
 }
 

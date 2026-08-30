@@ -21,17 +21,21 @@ func FreezeTurnSnapshot(
 	messages []*einoschema.Message,
 	systemPrompt string,
 	now time.Time,
-) TurnSnapshot {
+) (TurnSnapshot, error) {
+	request, err := (model.Request{Messages: messages}).Clone()
+	if err != nil {
+		return TurnSnapshot{}, err
+	}
 	return TurnSnapshot{
 		RunID:        runID,
 		SessionID:    sessionID,
 		EpochID:      epochID,
 		Config:       snapshot.Clone(),
 		Model:        cloneResolved(resolved),
-		Messages:     cloneMessages(messages),
+		Messages:     request.Messages,
 		SystemPrompt: systemPrompt,
 		CreatedAt:    now,
-	}
+	}, nil
 }
 
 func cloneResolved(resolved model.Resolved) model.Resolved {
@@ -41,41 +45,6 @@ func cloneResolved(resolved model.Resolved) model.Resolved {
 	next.Model.Capabilities = cloneBoolMap(resolved.Model.Capabilities)
 	next.Model.Options = cloneStringMap(resolved.Model.Options)
 	return next
-}
-
-func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
-	if src == nil {
-		return nil
-	}
-	dst := make([]*einoschema.Message, len(src))
-	for i, msg := range src {
-		if msg == nil {
-			continue
-		}
-		clone := *msg
-		clone.MultiContent = cloneSlice(msg.MultiContent)
-		clone.UserInputMultiContent = cloneSlice(msg.UserInputMultiContent)
-		clone.AssistantGenMultiContent = cloneSlice(msg.AssistantGenMultiContent)
-		clone.ToolCalls = cloneSlice(msg.ToolCalls)
-		if msg.ResponseMeta != nil {
-			responseMeta := *msg.ResponseMeta
-			clone.ResponseMeta = &responseMeta
-		}
-		clone.Extra = cloneAnyMap(msg.Extra)
-		dst[i] = &clone
-	}
-	return dst
-}
-
-func cloneAnyMap(src map[string]any) map[string]any {
-	if src == nil {
-		return nil
-	}
-	dst := make(map[string]any, len(src))
-	for key, value := range src {
-		dst[key] = value
-	}
-	return dst
 }
 
 func cloneBoolMap(src map[string]bool) map[string]bool {

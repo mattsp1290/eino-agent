@@ -16,15 +16,11 @@ type Scope struct {
 
 // Snapshot is the immutable configuration captured for run admission.
 type Snapshot struct {
-	Agent          Agent
-	Model          model.Selection
-	Providers      []ProviderConfig
-	Tools          ToolConfig
-	ContextSources []ContextSource
-	Hooks          []Hook
-	Plugins        []Plugin
-	Observability  ObservabilityConfig
-	Metadata       map[string]string
+	Agent         Agent
+	Model         model.Selection
+	Tools         ToolConfig
+	Observability ObservabilityConfig
+	Metadata      map[string]string
 }
 
 // Clone returns a deep copy of the snapshot maps and slices owned by this
@@ -32,23 +28,10 @@ type Snapshot struct {
 // before retaining a snapshot for an in-flight run.
 func (s Snapshot) Clone() Snapshot {
 	next := s
-	next.Providers = cloneSlice(s.Providers)
-	next.ContextSources = cloneSlice(s.ContextSources)
-	next.Hooks = cloneSlice(s.Hooks)
-	next.Plugins = cloneSlice(s.Plugins)
 	next.Metadata = cloneMap(s.Metadata)
 	next.Agent.Options = cloneMap(s.Agent.Options)
 	next.Tools = s.Tools.Clone()
 	next.Observability = s.Observability.Clone()
-	for i := range next.Providers {
-		next.Providers[i].Options = cloneMap(s.Providers[i].Options)
-	}
-	for i := range next.ContextSources {
-		next.ContextSources[i].Options = cloneMap(s.ContextSources[i].Options)
-	}
-	for i := range next.Hooks {
-		next.Hooks[i].Options = cloneMap(s.Hooks[i].Options)
-	}
 	return next
 }
 
@@ -65,22 +48,12 @@ type Agent struct {
 // named agents and catalog choices before admission selects one immutable
 // Snapshot for a run.
 type Config struct {
-	DefaultAgent   string
-	Agents         map[string]Agent
-	Models         []model.Selection
-	Providers      []ProviderConfig
-	Tools          ToolConfig
-	ContextSources []ContextSource
-	Hooks          []Hook
-	Plugins        []Plugin
-	Observability  ObservabilityConfig
-	Metadata       map[string]string
-}
-
-// ProviderConfig contains provider-specific config before model resolution.
-type ProviderConfig struct {
-	ProviderID model.ProviderID
-	Options    map[string]string
+	DefaultAgent  string
+	Agents        map[string]Agent
+	Models        []model.Selection
+	Tools         ToolConfig
+	Observability ObservabilityConfig
+	Metadata      map[string]string
 }
 
 // ToolConfig controls tool materialization for a run snapshot.
@@ -135,31 +108,6 @@ func (c ObservabilityConfig) Clone() ObservabilityConfig {
 	next.Summary.AllowedKinds = cloneSlice(c.Summary.AllowedKinds)
 	next.Summary.ForbiddenInputs = cloneSlice(c.Summary.ForbiddenInputs)
 	return next
-}
-
-// ContextSource describes a configured source of prompt/context material.
-type ContextSource struct {
-	Name     string
-	Type     string
-	Location string
-	Options  map[string]string
-}
-
-// Hook describes a deterministic extension registration.
-type Hook struct {
-	Name    string
-	Source  string
-	Version string
-	Options map[string]string
-}
-
-// Plugin describes an extension bundle available to runtime hooks.
-type Plugin struct {
-	Name    string
-	Source  string
-	Version string
-	Hash    string
-	Scope   string
 }
 
 // Loader returns a validated configuration snapshot for one runtime scope.

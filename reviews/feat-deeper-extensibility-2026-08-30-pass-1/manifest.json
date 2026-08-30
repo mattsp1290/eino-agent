@@ -1,0 +1,19 @@
+{
+  "schema_version": "review-v1",
+  "branch": "feat/deeper-extensibility",
+  "base_ref": "main",
+  "head_sha": "78f4a2541a62e97d0c85cb2f8ac8d80c57c4b491",
+  "pass": null,
+  "reviewers": [
+    {
+      "slug": "concurrency-failure-semantics",
+      "display_name": "Concurrency & Failure Semantics",
+      "role": "Audit durable ordering, panic containment, queue behavior, races, and failure-state correctness."
+    },
+    {
+      "slug": "environment-integration-contracts",
+      "display_name": "Environment & Integration Contracts",
+      "role": "Audit host dependency assumptions, integration boundaries, validation, and long-term maintainability."
+    }
+  ]
+}

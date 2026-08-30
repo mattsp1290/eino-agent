@@ -109,8 +109,8 @@ Evidence:
 - `runtime.TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak`
 - `runtime.TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure`
 - `runtime.TestStreamingOrchestratorRecordsOperationalToolFailure`
-- `tools.TestEncodeModelOutputRedactsRawAndStructuredPayload`
-- `tools.TestEncodeModelOutputSuppressesToolControlledFieldsWhenTruncated`
+- `runtime.TestEncodeToolOutputRedactsRawAndStructuredPayload`
+- `runtime.TestEncodeToolOutputSuppressesToolControlledFieldsWhenTruncated`
 - `obs.TestDefaultFieldsForbidRawContent`
 - `config.TestObservabilityRedactionDefaultsAreSafe`
 
@@ -137,17 +137,26 @@ Evidence:
 ## Tool Output Bounds
 
 Tool output is never allowed to grow unbounded in replayable model context.
-Runtime and tool package encoders enforce UTF-8-safe truncation, structured
+The runtime's canonical encoder enforces UTF-8-safe truncation, structured
 payload bounds, redaction, and external-retention signaling.
 
 Evidence:
 
 - `runtime.TestStreamingOrchestratorBoundsToolOutput`
-- `tools.TestEncodeModelOutputTruncatesOversizedContent`
-- `tools.TestEncodeModelOutputBoundsStructuredPayload`
+- `runtime.TestEncodeToolOutputTruncatesOversizedContent`
+- `runtime.TestEncodeToolOutputBoundsStructuredPayload`
 - `tools/session.TestRetainedOutputIsBoundedAndSessionScoped`
 - `tools/session.TestRetainedOutputHonorsAggregateSessionLimitAndZeroLimit`
-- `tools/einotools.TestFileReadWrapperPreservesEinoToolsContract`
+- `tools/einotools.TestMountStandardPublishesCatalogOrderAndExecutesFileRead`
+
+The standard adapter persists cleaned lexical workspace-relative paths as
+permission patterns and leaf input. Workspace admission owns symlink policy
+inside the canonical root. Shell commands, URLs, and tracker targets use their
+normalized operation identity, bounded to 4096 bytes. Apply-patch and user
+interaction use generic patterns so patch contents and questions do not leak
+into permission metadata. The default MCP user-interaction result is a pending
+envelope; a hosting application must supply durable correlation and answer
+delivery.
 
 ## Tokens and Credentials
 
@@ -169,7 +178,7 @@ Evidence:
 
 ## Retry Bounds
 
-Provider retries are bounded by `StreamingOrchestrator.Attempts`. Only
+Provider retries are bounded by the constructor's `runtime.WithAttempts` value. Only
 `model.Error` values with `Retryable` set are retried; cancellation is not
 retried. Tool execution is not automatically rerun on resume unless a durable
 pending call is safely claimed. Running calls found during resume are marked
@@ -233,3 +242,22 @@ Before production embedding, host applications should verify:
   host policy;
 - external attachment stores enforce access control independently of model-facing
   attachment IDs.
+
+## Extension scope and protected policy
+
+Extension scope is deterministic routing for trusted in-process code, not an
+authorization or sandbox boundary. Only global and exact-session scopes exist.
+Mounted guards are monotonic (`deny`/`abstain`), run on final normalized input,
+and cannot bypass the core permission/approval loop. Tool execution and result
+points protect identity, disposition, permission metadata, and raw/classified
+errors from mutation.
+
+Wasm guests receive curated DTOs only. They cannot select a point by string,
+request global authority, replace provider identity, or receive credentials,
+host clients, callbacks, raw event payloads, or opaque configuration. Native
+callback error text is bounded before persistence; trusted diagnostics retain
+the raw cause locally. See
+[`extension-points.md`](extension-points.md#scope-provenance-and-resume).
+Wasm permission-pattern derivation receives only final normalized tool JSON and
+is capped at 4,096 output bytes (or a tighter module limit). Context-source WIT
+output can encode only system and user text roles.

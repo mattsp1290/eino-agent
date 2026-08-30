@@ -63,34 +63,41 @@ const (
 	RunCompleted RunStatus = "completed"
 )
 
-// ComponentVersion records the runtime dependency identity captured at run
-// admission, for example a plugin, provider adapter, or config source.
-type ComponentVersion struct {
-	Name    string
-	Version string
-	Hash    string
-	Source  string
-}
-
 // Run records one admitted execution attempt before provider streaming starts.
 type Run struct {
-	ID           RunID
-	SessionID    ID
-	ParentRunID  RunID
-	ParentMsgID  MessageID
-	OwnerID      string
-	LeaseUntil   time.Time
-	Agent        string
-	ProviderID   string
-	ModelID      string
-	ContextEpoch EpochID
-	Status       RunStatus
-	Config       map[string]string
-	Components   []ComponentVersion
-	CreatedAt    time.Time
-	StartedAt    time.Time
-	FinishedAt   time.Time
-	Error        string
+	ID            RunID
+	SessionID     ID
+	ParentRunID   RunID
+	ParentMsgID   MessageID
+	OwnerID       string
+	ClaimToken    string
+	LeaseUntil    time.Time
+	Agent         string
+	ProviderID    string
+	ModelID       string
+	ContextEpoch  EpochID
+	Status        RunStatus
+	Config        map[string]string
+	ExtensionPlan ExtensionPlanDescriptor
+	CreatedAt     time.Time
+	StartedAt     time.Time
+	FinishedAt    time.Time
+	Error         string
+}
+
+// RunFence identifies the one execution currently authorized to mutate a run.
+type RunFence struct {
+	RunID      RunID
+	ClaimToken string
+}
+
+// RunClaim requests atomic ownership of an expired nonterminal run. Stores use
+// their own clock to compare expiry and stamp the returned lease deadline.
+type RunClaim struct {
+	RunID         RunID
+	OwnerID       string
+	ClaimToken    string
+	LeaseDuration time.Duration
 }
 
 // Terminal reports whether the run no longer owns execution.
@@ -178,24 +185,38 @@ const (
 	ToolCallInterrupted ToolCallStatus = "interrupted"
 )
 
+// ToolTransitionPhase is the durable uniqueness domain for tool lifecycle
+// events. All terminal statuses intentionally share one phase.
+type ToolTransitionPhase string
+
+const (
+	ToolTransitionPending  ToolTransitionPhase = "pending"
+	ToolTransitionRunning  ToolTransitionPhase = "running"
+	ToolTransitionTerminal ToolTransitionPhase = "terminal"
+)
+
 // ToolCall is the durable execution envelope for one tool invocation.
 type ToolCall struct {
-	ID          ToolCallID
-	SessionID   ID
-	RunID       RunID
-	MessageID   MessageID
-	Name        string
-	Input       json.RawMessage
-	Output      json.RawMessage
-	Status      ToolCallStatus
-	RetrySafe   bool
-	Metadata    map[string]string
-	ClaimedBy   string
-	ClaimToken  string
-	LeaseUntil  time.Time
-	StartedAt   time.Time
-	CompletedAt time.Time
-	Error       string
+	ID              ToolCallID
+	SessionID       ID
+	RunID           RunID
+	MessageID       MessageID
+	RequestPartID   PartID
+	ResultMessageID MessageID
+	ResultPartID    PartID
+	Name            string
+	Pattern         string
+	Input           json.RawMessage
+	Output          json.RawMessage
+	Status          ToolCallStatus
+	RetrySafe       bool
+	Metadata        map[string]string
+	ClaimedBy       string
+	ClaimToken      string
+	LeaseUntil      time.Time
+	StartedAt       time.Time
+	CompletedAt     time.Time
+	Error           string
 }
 
 // ContextEpoch records the history segment used to build provider context.
@@ -231,7 +252,6 @@ const (
 // ReplayCursor selects a stable page of replayable history.
 type ReplayCursor struct {
 	AfterMessageID MessageID
-	AfterPartID    PartID
 	Limit          int
 }
 
@@ -249,24 +269,27 @@ type EventID string
 // richer typed events into this durable envelope without making session depend
 // on the runtime package.
 type EventRecord struct {
-	ID          EventID
-	SessionID   ID
-	RunID       RunID
-	MessageID   MessageID
-	PartID      PartID
-	ToolCallID  ToolCallID
-	EpochID     EpochID
-	ProviderID  string
-	ModelID     string
-	ParentID    string
-	Kind        string
-	Correlation string
-	Usage       Usage
-	Error       EventError
-	Redaction   RedactionClass
-	Payload     json.RawMessage
-	LiveOnly    bool
-	CreatedAt   time.Time
+	ID         EventID
+	SessionID  ID
+	RunID      RunID
+	MessageID  MessageID
+	PartID     PartID
+	ToolCallID ToolCallID
+	// ToolTransition identifies a canonical tool state transition. Only the
+	// typed tool mutation methods may persist records with this field set.
+	ToolTransition ToolTransitionPhase
+	EpochID        EpochID
+	ProviderID     string
+	ModelID        string
+	ParentID       string
+	Kind           string
+	Correlation    string
+	Usage          Usage
+	Error          EventError
+	Redaction      RedactionClass
+	Payload        json.RawMessage
+	LiveOnly       bool
+	CreatedAt      time.Time
 }
 
 // Usage records provider usage data in a store-level event projection.
@@ -314,45 +337,49 @@ type EventBatch struct {
 // provide locking and transactions; callers should not infer durability from
 // live AG-UI transport delivery.
 type Store interface {
+	ModelRequestReader
+	WithinTx(ctx context.Context, fn func(context.Context, Store) error) error
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSession(ctx context.Context, id ID) (Session, error)
 	UpdateSession(ctx context.Context, session Session) error
 	// AdmitRun atomically creates a run and makes it the active owner for its
-	// session. Implementations return ErrSessionBusy when another nonterminal
-	// run owns the session.
-	AdmitRun(ctx context.Context, run Run) (Run, error)
+	// session. Every existing run ID returns ErrConflict; implementations return
+	// ErrSessionBusy when another nonterminal run owns the session.
+	AdmitRun(ctx context.Context, run Run, leaseDuration time.Duration) (Run, error)
+	ClaimRun(ctx context.Context, claim RunClaim) (Run, error)
+	// Execution returns a non-nil fenced mutation capability. Store failures are
+	// reported by capability methods; nil is a store contract violation.
+	Execution(fence RunFence) ExecutionStore
 	GetRun(ctx context.Context, id RunID) (Run, error)
 	ActiveRun(ctx context.Context, sessionID ID) (Run, error)
 	ListUnfinishedRuns(ctx context.Context) ([]Run, error)
-	RenewRunLease(ctx context.Context, runID RunID, ownerID string, until time.Time) error
-	FinishRun(ctx context.Context, run Run) error
+	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
+	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
+	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
+	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
+}
+
+// ExecutionStore is the run-fenced mutation capability used after admission or
+// resume. Implementations must verify the fence atomically with every write.
+type ExecutionStore interface {
+	WithinTx(ctx context.Context, fn func(context.Context, ExecutionStore) error) error
+	StartRun(ctx context.Context, startedAt time.Time) (Run, error)
+	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
+	SettleRun(ctx context.Context, request SettleRunRequest) (RunSettlementResult, error)
 	AppendMessage(ctx context.Context, message Message) (Message, error)
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
-	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
 	AppendEvent(ctx context.Context, event EventRecord) (EventRecord, error)
-	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
-	CreateToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
-	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
-	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
-	ClaimToolCall(ctx context.Context, call ToolCall) (ToolCall, error)
-	FinishToolCall(ctx context.Context, call ToolCall) error
+	CreateToolCall(ctx context.Context, request CreateToolCallRequest) (ToolTransitionResult, error)
+	ClaimToolCall(ctx context.Context, request ClaimToolCallRequest) (ToolTransitionResult, error)
+	SettleToolCall(ctx context.Context, request SettleToolCallRequest) (ToolTransitionResult, error)
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
+	ModelRequestWriter
 }
 
 // ContextEpochReader replays durable context epoch records for audit and
 // compaction-aware history projection.
 type ContextEpochReader interface {
 	ListContextEpochs(ctx context.Context, sessionID ID) ([]ContextEpoch, error)
-}
-
-// Tx is a store view scoped to one implementation-defined transaction.
-type Tx interface {
-	Store
-}
-
-// Transactor runs store operations inside one transaction.
-type Transactor interface {
-	WithinTx(ctx context.Context, fn func(context.Context, Tx) error) error
 }

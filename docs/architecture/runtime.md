@@ -44,7 +44,8 @@ thin:
 
 - `agui` or `transport/agui`: HTTP/SSE admission and replay/tail APIs that use
   `eino-agui`.
-- `tools`: adapters that wrap `eino-tools` packages in `runtime.Tool`.
+- `tools/einotools`: composition-native translation of the deterministic
+  `eino-tools/catalog` bundle into frozen `runtime.Tool` capabilities.
 - `observability`: adapters that map `runtime.Event` and durable records into
   `eino-obs`.
 - `store/*`: concrete `session.Store` implementations.
@@ -93,9 +94,8 @@ The `session.Store` interface is intentionally centered on durable facts:
 - tool-call claim and settlement records;
 - context epoch start/finish records.
 
-The `session.Transactor` interface is separate so concrete stores can provide
-SQL, embedded log, or in-memory test transactions without shaping every runtime
-method around one database.
+`session.Store.WithinTx` is mandatory so every supported backend provides the
+same store-owned atomic admission boundary.
 
 Store implementations must provide these invariants:
 
@@ -104,8 +104,12 @@ Store implementations must provide these invariants:
 - only one nonterminal run owns a session unless a future branch design
   explicitly allows parallel ownership;
 - `ErrSessionBusy` is returned when admission conflicts with an active owner;
-- leases and owner IDs support stale-owner detection without relying on process
-  IDs alone;
+- each execution has a unique claim token; owner IDs are diagnostic labels and
+  never grant mutation authority;
+- the store clock stamps and compares run/tool leases, while a run heartbeat
+  renews the lease during long model and tool calls;
+- resume atomically replaces the token only after the store-timed lease expires,
+  and stale-token writes return `session.ErrConflict`;
 - replay reads come from messages and parts, not from captured SSE frames;
 - unfinished runs and tool calls can be detected after restart;
 - non-idempotent unfinished tool calls are not automatically rerun.
@@ -116,9 +120,9 @@ or to retry only when an explicit retry-safe contract allows it.
 
 ## Turn Snapshots and Context Epochs
 
-`runtime.TurnSnapshot` is the immutable-by-contract state for one provider
-request. Runtime admission must clone `config.Snapshot` and each retained
-snapshot container before exposing it to hooks or provider execution. It
+`runtime.TurnSnapshot` is internal state for one provider request. Runtime
+admission checks and deep-clones `config.Snapshot` and the complete supported
+Eino message graph before any durable write. It
 captures:
 
 - durable run/session/context epoch IDs;
@@ -129,8 +133,24 @@ captures:
 - resolved system prompt;
 - creation time.
 
-Runtime setters, config reloads, hook changes, and user follow-ups affect future
+Fresh-run resolver output is complete and authoritative: admission validates
+the nested provider and model descriptor identities and never substitutes the
+configured selection. Resume paths that only settle recorded tool work do not
+invent a live streamer; any future resumed model dispatch must resolve and
+validate again first.
+
+Config reloads, composition mount changes, and user follow-ups affect future
 turn snapshots only. They do not mutate an in-flight model call.
+
+Each fresh or resumed run also owns an explicit internal execution object. It
+holds the frozen `RunPlan`, extension dispatch, composed event sink, and the
+`session.ExecutionStore` capability bound to the current run claim token, and is
+passed through admission, request-ledger, model, tool, settlement, and resume
+boundaries. Run-plan state is never hidden in `context.Context`; contexts carry
+cancellation and deadlines only. The execution object releases its frozen plan
+exactly once when the run goroutine exits. The scoped store fences history,
+event, model-ledger, tool, context-epoch, lease, and terminal writes. Terminal
+run state and its final durable event commit atomically before live notification.
 
 Compaction creates a new `session.ContextEpoch`. A context epoch records the
 parent epoch, summarized message range, summary message, retained tail start,
@@ -153,8 +173,12 @@ AG-UI adapters should:
 - persist settled message/part snapshots separately from SSE delivery state;
 - expose replay and live-tail APIs that are explicit about this distinction.
 
-The durable store should not persist old SSE frames as the replay source of
-truth.
+The typed mutation that owns a durable fact persists its event through the
+current fenced execution capability and returns the committed record. Runtime
+then publishes that exact record. External `EventSink` adapters are
+transport/observability consumers only and have no store mutation authority;
+the generic sink never infers persistence from event kind or `LiveOnly`.
+Live-only SSE frames are not persisted as the replay source of truth.
 
 ## Tool Lifecycle
 
@@ -163,6 +187,11 @@ contains Eino `ToolInfo`, an executor, retry-safety metadata, and runtime
 metadata. The concrete leaf behavior should come from `eino-tools` where
 possible.
 
+Run admission resolves an existing workspace root to one canonical absolute
+directory before persistence. Initial execution and resume use that stored
+authority root. Standard catalog tool order remains stable through composition
+and provider request construction and participates in durable identity.
+
 Every tool call follows this durable lifecycle:
 
 1. model requests a tool call;
@@ -170,19 +199,21 @@ Every tool call follows this durable lifecycle:
 3. runtime claims the call with an owner and claim token before executing it;
 4. tool receives `context.Context`, session/run/message/call IDs, and an
    approval requester;
-5. runtime records output, attachments, metadata, or error;
-6. runtime writes a tool-result message/part for the next provider context;
+5. runtime converts the protected outcome to one bounded canonical output;
+6. runtime settles the call and reserved tool-result message/part through one
+   shared fresh/resume operation;
 7. observability receives tool start/end/error events.
 
 If interruption happens while a call is running, runtime settles the durable
 record as interrupted. Automatic retry is allowed only when the tool declares it
 retry-safe and the store proves the prior call did not settle.
 
-Tool materialization includes scope and scheduling metadata. Filesystem-like
-tools should use a canonical workspace-root concurrency key and sequential
-execution so `file_read`, `file_write`, `file_edit`, search, shell, and patch
-operations do not corrupt shared workspace state. Tool input decoding and output
-retention are runtime policy, not hidden metadata conventions.
+Tool materialization receives only bounded scope data, and execution receives
+only durable call data plus content-free turn metadata. Filesystem-like tools
+own synchronization around canonical workspace roots so `file_read`,
+`file_write`, `file_edit`, search, shell, and patch operations do not corrupt
+shared state. Tool input decoding and output retention are runtime policy, not
+hidden metadata conventions.
 
 ## Provider and Model Resolution
 
@@ -190,8 +221,10 @@ The `model` package separates metadata from concrete clients:
 
 - `Catalog` lists providers, models, capabilities, and defaults.
 - `AuthResolver` resolves credentials at request time.
-- `Resolver` builds an Eino `ToolCallingChatModel` for one selected model and
-  runtime environment.
+- `Resolver` returns one immutable `model.Resolved` value whose execution
+  surface is a `model.Streamer` for the selected model and runtime environment.
+  Provider adapters may bind an Eino chat model internally, but that SDK type
+  does not cross the `model` package boundary.
 
 Runtime captures the selected provider/model in `session.Run` and captures
 component versions in the run metadata. Provider-specific SDK concerns stay
@@ -240,13 +273,15 @@ bead owns exact redaction defaults and exported attribute names.
 
 Host applications embed the runtime by providing:
 
-- a `session.Store` and optional `session.Transactor`;
+- a transactional `session.Store`;
 - a `config.Loader` and `config.Validator`;
 - a `model.Catalog`, `model.AuthResolver`, and `model.Resolver`;
-- a `runtime.ToolRegistry`;
-- optional `runtime.ContextSource` implementations;
-- optional `runtime.Hook` implementations;
+- a `runtime.RunPlanProvider`, normally `composition.Registry`, for tools,
+  prompts, guards, and typed extension handlers;
 - one or more `runtime.EventSink` adapters for AG-UI and observability.
+
+Event sinks receive copies only after any required durable write; they must not
+write session state themselves.
 
 The host remains responsible for HTTP routing, authentication, tenancy,
 deployment-specific config discovery, concrete database selection, and UI
@@ -257,33 +292,35 @@ policy.
 `runtime.NewStreamingOrchestrator` applies functional options in order and
 validates the complete construction before a run can start. `Store`, `Model`,
 and `IDs` are required and are all named in one construction error when
-missing. Later scalar options override earlier ones; context sources, hooks,
-and tool middleware append deterministically. Nil interface dependencies are
-errors. Existing zero-value fallbacks and struct-literal construction remain
-supported.
+missing. Later scalar options override earlier ones, and nil interface
+dependencies are errors. The run-plan provider is the sole executable
+extension source; it is required even for a host that always returns the
+fingerprinted empty plan.
 
-`Admit` is deliberately excluded from options. `admitter()` derives it from
-`Store`, `Transactor`, `Events`, `Hooks`, and `Clock`, which prevents a second
-independently configured dependency graph.
+`Admit` is deliberately excluded from options. The orchestrator derives it
+from its private store, event sink, extension plan, and clock, which prevents a
+second independently configured dependency graph.
 
-### Tool-call middleware save points
+### Tool transformation save points
 
-The `BeforeToolCall` chain runs in registration order after typed input decode.
-The runtime computes the permission pattern and persists the assistant
+`runtime.ToolPreparePoint` runs in registration order after typed input decode.
+The runtime derives the permission pattern from final normalized JSON and
+persists the assistant
 tool-call part, pending/running events, and durable call only from the final
 rewritten JSON. Permission checks and the executor see that same input. A
-before error still admits and settles a failed durable call and does not abort
+prepare error still admits and settles a failed durable call and does not abort
 unrelated sibling calls.
 
-The `AfterToolCall` chain runs in reverse order after execution and before
-encoding/settlement. Durable output, the terminal event, the tool-result part,
-and model-visible message all use the final patch. The executor error is
-immutable and remains authoritative.
+`runtime.ToolResultTransformPoint` runs transforms in registration order after
+execution and before encoding/settlement. Each callback receives the value
+returned by its predecessor. Durable output, the terminal event, the
+tool-result part, and model-visible message all use the final value. The
+executor error is immutable and remains authoritative.
 
-Resume never repeats `BeforeToolCall`: pending records already hold rewritten
-input. A pending call that is reclaimed and executed runs `AfterToolCall`; a
-running call settled interrupted without re-execution skips it. This is the
-exactly-once boundary for argument rewriting.
+Resume never repeats `ToolPreparePoint`: pending records already hold rewritten
+input. A pending call that is reclaimed and executed runs
+`ToolResultTransformPoint`; a running call settled interrupted without
+re-execution skips it. This is the exactly-once boundary for argument rewriting.
 
 ## Initial Public Interfaces
 
@@ -301,6 +338,21 @@ can build directly against them:
 - durable store interfaces and transaction boundaries;
 - minimal agent/model/provider/config implementation;
 - runtime context and context-source boundaries;
-- typed tool registry and scoped materialization;
+- typed tool definitions, composition-owned selection, and scoped materialization;
 - AG-UI event durability and replay rules;
 - Datadog observability redaction policy.
+
+## Frozen extension plans
+
+Admission freezes callbacks, tools, prompts, guards, and restrictions into one
+leased plan and persists its runtime-derived canonical descriptor. Each durable
+component record owns one instance/artifact identity and nested typed capability
+identities; handlerless tool, prompt, guard, and restriction components retain
+that ownership without relying on callback diagnostics. Resume
+resolves an exact current-schema fingerprint match before any durable state
+change. The authoritative point catalog and model and tool pipeline diagrams are in
+[`extension-points.md`](extension-points.md).
+
+The model-request ledger assigns one `(attempt, step)` record per
+adapter invocation. Here, a step is a provider request plus its resulting tool
+batch; it does not add a user-visible turn abstraction.

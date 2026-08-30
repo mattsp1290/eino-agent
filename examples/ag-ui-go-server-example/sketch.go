@@ -14,10 +14,10 @@ import (
 	"sync"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
 
 	agentagui "github.com/mattsp1290/eino-agent/agui"
+	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -31,9 +31,9 @@ import (
 // tool-call settlement adapter.
 var ErrAGUIResumeRequiresAppAdapter = errors.New("ag-ui resume requires app-owned streamed resume adapter")
 
-// ErrClientToolRegistryRequired reports a client-tool request without the
-// registry needed to materialize those tools into the runtime.
-var ErrClientToolRegistryRequired = errors.New("ag-ui client tool registry required")
+// ErrClientToolCompositionRequired reports a client-tool request without the
+// composition registry needed to seal those tools into run plans.
+var ErrClientToolCompositionRequired = errors.New("ag-ui client tool composition registry required")
 
 // RunInput is the subset of AG-UI RunAgentInput data that eino-agent needs at
 // admission time. The consuming server still owns its exact request body.
@@ -46,8 +46,11 @@ type RunInput struct {
 
 	// ClientToolGeneration is server-owned monotonic state. AG-UI RunAgentInput
 	// does not provide a generation; consumers should assign this with a
-	// per-session counter before calling SetClientTools.
+	// per-session counter before calling MountClientTools.
 	ClientToolGeneration uint64
+	// ClientToolDispatcherArtifactID identifies the executable client dispatch
+	// behavior and must change whenever that behavior changes.
+	ClientToolDispatcherArtifactID string
 }
 
 // StartRequest converts an AG-UI request body into an eino-agent runtime
@@ -91,25 +94,23 @@ func (g *ToolGenerations) Next(sessionID session.ID) uint64 {
 	return g.values[sessionID]
 }
 
-// SetClientTools installs per-session AG-UI client tool definitions into the
-// eino-agent tool registry. The registry combines these with any server-side
-// tools when runtime prepares a turn.
-func SetClientTools(registry *toolagui.Registry, sessionID session.ID, input RunInput) error {
+// MountClientTools seals per-session AG-UI client definitions into the
+// canonical composition registry. The host owns the returned mount and closes
+// the prior generation before publishing a replacement.
+func MountClientTools(ctx context.Context, registry *composition.Registry, dispatcher agentagui.ClientToolDispatcher, sessionID session.ID, input RunInput) (*composition.Mount, error) {
 	if registry == nil {
 		if len(input.Tools) == 0 {
-			return nil
+			return nil, nil
 		}
-		return ErrClientToolRegistryRequired
+		return nil, ErrClientToolCompositionRequired
 	}
 	if len(input.Tools) == 0 {
-		registry.ClearClientTools(sessionID)
-		return nil
+		return nil, nil
 	}
-	return registry.SetClientTools(agentagui.ClientToolSnapshot{
-		SessionID:  sessionID,
-		Generation: input.ClientToolGeneration,
-		Tools:      input.Tools,
-	})
+	return toolagui.MountClientTools(ctx, registry, agentagui.ClientToolSnapshot{
+		SessionID: sessionID, Generation: input.ClientToolGeneration,
+		DispatcherArtifactID: input.ClientToolDispatcherArtifactID, Tools: input.Tools,
+	}, dispatcher)
 }
 
 // ReplayHandler builds the AG-UI SSE endpoint for durable replay plus live
@@ -145,11 +146,4 @@ func InterruptHandler(lookup func(context.Context, *http.Request) (transport.Int
 // messages, parts, runs, tool calls, context epochs, and replayable events.
 func OpenLocalStore(ctx context.Context, path string) (*sqlitestore.Store, error) {
 	return sqlitestore.Open(ctx, path)
-}
-
-// ClientToolInfos exposes the lower-level conversion when the consuming server
-// needs to bind AG-UI client tools directly to an Eino model outside the full
-// runtime orchestrator.
-func ClientToolInfos(tools []aguitypes.Tool) ([]*einoschema.ToolInfo, error) {
-	return agentagui.ClientToolInfos(tools)
 }

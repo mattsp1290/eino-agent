@@ -2,60 +2,67 @@
 
 Date: 2026-08-09
 
-`eino-agent` exposes Go interfaces as its extension contract. Native functions,
-native structs, and Wasm-backed wrappers all enter the orchestrator through the
-same functional options; the orchestrator does not branch on implementation
-kind.
+`eino-agent` exposes typed Go contracts as its extension boundary. Native
+functions, native structs, and Wasm-backed wrappers are mounted into a
+`composition.Registry`, which supplies one immutable `runtime.RunPlan` per run.
+The orchestrator does not branch on implementation kind.
+
+Typed semantic callbacks, frozen capability plans, lifecycle, the producer/consumer
+catalog, exact pipelines, and request-ledger privacy are documented in
+[`extension-points.md`](extension-points.md).
 
 ## Construction and seams
 
-`runtime.NewStreamingOrchestrator` is the preferred constructor. It applies
-options in order, reports `Store`, `Model`, and `IDs` together when required
-dependencies are missing, and preserves the existing zero-value fallbacks for
-optional scalar, struct, function, and observer fields. Later scalar options
-replace earlier values. `WithContextSource`, `WithHook`, and
-`WithToolMiddleware` append in registration order.
+`runtime.NewStreamingOrchestrator` requires infrastructure dependencies and one
+`runtime.RunPlanProvider`, including for a zero-capability application.
+`composition.Registry` is the standard provider: a
+mount atomically stages typed callback registrations, tools, prompts, guards,
+restrictions, and cleanup. Each executable behavior carries its identity in
+the same plan record, so descriptor state cannot drift from execution state.
 
-`Admit` has no option. It is a derived aggregate synthesized from `Store`,
-`Transactor`, `Events`, `Hooks`, and `Clock`. Existing struct-literal
-construction remains supported.
+Admission has no option or public service object. The orchestrator constructs
+its private one-shot admission pipeline from the store, event sink, extension
+plan, and clock.
 
 | Seam | Native path | Wasm contract | Wrapper status |
 | --- | --- | --- | --- |
-| Tool | `tools.Definition` via `tools.Registry` and `runtime.WithToolRegistry` | `tool` | Phase A wrapper and fixture |
+| Tool | `composition.Registrar.Tool` with a `tools.Definition` | `tool` | Phase A wrapper and fixture |
 | Permission policy | `permissions.Policy` / `PolicyFunc` via `runtime.WithPermissions` | `permissions-policy` | Phase A wrapper and fixture |
-| Context source | `runtime.ContextSource` / `ContextSourceFunc` | `context-source` | Phase B WIT authored |
-| Event sink | `runtime.EventSink` / `EventSinkFunc` | `event-sink` | Phase B WIT authored |
-| Hook | `runtime.Hook` / `HookFuncs` | `hook` | Phase B WIT authored |
-| Tool middleware | `runtime.ToolMiddleware` / `ToolMiddlewareFuncs` | `tool-middleware` | Phase B WIT authored |
-| Persistence | `session.Store` and `session.Transactor` | none | Native only by design |
+| Context source | `extension.OnTransform` with `runtime.ContextAssemblePoint` | `context-source` | Implemented |
+| Event sink | `runtime.EventSink` / `EventSinkFunc` | `event-sink` | Implemented |
+| Hook | Typed lifecycle points in `runtime` | `hook` | Implemented |
+| Tool middleware | `runtime.ToolPreparePoint` and `runtime.ToolResultTransformPoint` | `tool-middleware` | Implemented |
+| Persistence | transactional `session.Store` | none | Native only by design |
 | Models/providers | `model.Resolver`, normally `model.AdapterResolver` | none | Native only by design |
 | Durable IDs | `runtime.IDGenerator` | none | Native only by design |
 
-The WIT package is `eino-agent:extensions@0.1.0`. Published packages are
-immutable; see `wit/README.md` for evolution rules. Generated bindings are
-committed under `wasmext/gen` and reproduced with `make wit`.
+The current pre-release WIT package is `eino-agent:extensions@0.1.0`; see
+`wit/README.md` for regeneration rules. Generated bindings are committed under
+`wasmext/gen` and reproduced with `make wit`.
 
-## Tool middleware
+## Tool transforms
 
-`BeforeToolCall` runs after typed input decoding and before any durable
-tool-call record is created. Middleware sees the output of the preceding
-middleware. The final JSON input determines `ToolCall.Pattern` and is the only
-input copied into the assistant tool-call part, pending/running/settled events,
-the durable tool-call record, permission and approval requests, and execution.
-Permissions therefore evaluate what will execute.
+`runtime.ToolPreparePoint` runs after typed input decoding and before any
+durable tool-call record is created. Each transform sees the output of the
+preceding transform. Runtime normalizes the final value to a deterministic,
+non-null JSON object, then the tool definition's explicit pattern resolver
+derives `ToolCall.Pattern` from that same input. Both input and pattern are
+persisted; permissions, approval, execution, settlement, and resume reuse them
+without generic JSON-key probing. A failed prepare keeps the validated tool-name
+fallback so its durable failure can settle without masking the original error.
 
-`AfterToolCall` runs after execution and before encoding or settlement. It runs
-in reverse registration order, producing an onion lifecycle. Its final result
+`runtime.ToolResultTransformPoint` runs after execution and before encoding or
+settlement. Transforms run in registration order, and each receives the value
+returned by its predecessor. The final result
 is used by durable output, the settled event, `PartToolResult`, and the next
 model-visible tool message. The executor error is informational and cannot be
 removed; a middleware error can turn a success into failure but cannot turn an
 executor failure into success.
 
 Pending calls resumed from storage already contain rewritten input, so resume
-does not run `BeforeToolCall` again. `AfterToolCall` runs when a pending call is
-actually re-executed. A call found running is settled interrupted without
-execution and skips both middleware phases.
+does not run `ToolPreparePoint` again. `ToolResultTransformPoint` runs when a
+pending call is actually re-executed. A call found running is settled
+interrupted without execution and skips both transformation phases.
 
 ## Wasm trust and lifecycle
 
@@ -78,6 +85,10 @@ guest log observations flow through its configured exporter with the
 host-configured module name and verified digest attached; otherwise logs are
 dropped.
 
+Permission-pattern output is additionally capped at 4,096 bytes (or a tighter
+configured output limit). Context-source guests can return only system and user
+text messages; assistant history remains a native validated boundary.
+
 The embedding host owns shutdown. Prefer `wasmext.NewLoader`, load wrappers
 through it, and call `Loader.Close(ctx)`. Close stops admission, interrupts
 in-flight work, drains within bounds, and releases compiled state once. Calls
@@ -94,23 +105,24 @@ small; current sink errors are discarded by runtime call sites.
 Wasmtime-go v47 supplies compilation, reflection, linking, stores, limits, and
 epoch interruption, but its published Go surface does not yet expose dynamic
 component-function calls or nested host-interface definitions. `wasmext`
-therefore keeps a small, Phase-A-specific lifting/lowering and host-linking
-layer over Wasmtime's official v47 C component API beside the engine adapter.
-That layer is internal, round-tripped against the checked-in guests, and does
-not change wrapper or orchestrator APIs. It can be replaced directly when the
-equivalent Go API is released.
+therefore keeps a small lifting/lowering and host-linking layer over Wasmtime's
+official v47 C component API. Host wrappers depend on narrow typed interfaces
+for the tool, permissions, context, event, hook, and middleware worlds; export
+names and codecs are selected by those typed methods rather than an
+`operation string`/`any` switchboard. The layer is internal and round-tripped
+against the checked-in guests.
 
 ## pi parity map
 
 | pi extension point | eino-agent seam | Native path | Wasm path / status |
 | --- | --- | --- | --- |
-| `customTools` | Tool registry | `tools.Definition`, `tools.Registry.Register`, `runtime.WithToolRegistry` | `wasmext.LoadTool`, `tool` world |
-| `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.LoadPermissionsPolicy`, `permissions-policy` world |
-| `tool_call` argument rewrite | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world, Phase B wrapper gap |
-| `tool_result` patch | Tool middleware | `runtime.ToolMiddleware`, `runtime.WithToolMiddleware` | `tool-middleware` world, Phase B wrapper gap |
-| `before_agent_start` / context | Context source and hook | `runtime.ContextSource`, `runtime.WithContextSource`, `runtime.Hook` | `context-source` and `hook` worlds, Phase B wrapper gap |
-| `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world, Phase B wrapper gap |
-| `sessionManager` | Session persistence | `session.Store`, `session.Transactor`, `runtime.WithStore`, `runtime.WithTransactor` | No Wasm path by design |
+| `customTools` | Tool plan | `tools.Definition`, `composition.Registrar.Tool` | `wasmext.Loader.LoadTool`, `tool` world |
+| `tool_call` veto | Permission policy | `permissions.Policy`, `permissions.PolicyFunc`, `runtime.WithPermissions` | `wasmext.Loader.LoadPermissionsPolicy`, `permissions-policy` world |
+| `tool_call` argument rewrite | Tool prepare point | `extension.OnTransform` with `runtime.ToolPreparePoint` | `wasmext.Loader.RegisterToolMiddleware` |
+| `tool_result` patch | Tool result point | `extension.OnTransform` with `runtime.ToolResultTransformPoint` | `wasmext.Loader.RegisterToolMiddleware` |
+| `before_agent_start` / context | Typed lifecycle points | `runtime.RunBeforeExecutePoint`, `runtime.ContextAssemblePoint` | `wasmext.Loader.RegisterContextSource`, `wasmext.Loader.RegisterHook` |
+| `subscribe(listener)` | Event sink | `runtime.EventSink`, `runtime.WithEventSink` | `event-sink` world and wrapper |
+| `sessionManager` | Session persistence | `session.Store`, `runtime.WithStore` | No Wasm path by design |
 | `registerProvider` | Model resolver | `model.AdapterResolver`, `runtime.WithModelResolver` | No Wasm path by design; models and credentials stay native |
 | Provider request/header interception | Adapter transport | Wrap `model.Adapter` | Gap by design; adapters own transport and credentials |
 | Model selection | Admission snapshot/resolver | `config.Snapshot.Model`, `model.Resolver` | No Wasm path by design |

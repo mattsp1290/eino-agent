@@ -6,15 +6,12 @@ import (
 	"io"
 	"testing"
 
-	einoschema "github.com/cloudwego/eino/schema"
-
 	"github.com/mattsp1290/eino-agent/model"
 )
 
-func TestStreamProviderEmitsCallbacksUsageAndChunks(t *testing.T) {
+func TestStreamProviderEmitsCumulativeUsageAndChunks(t *testing.T) {
 	t.Parallel()
 
-	observer := &recordingObserver{}
 	provider := &Provider{
 		ID: "fake",
 		Steps: []Step{
@@ -22,9 +19,12 @@ func TestStreamProviderEmitsCallbacksUsageAndChunks(t *testing.T) {
 			{Content: "world", Usage: model.Usage{OutputTokens: 2}},
 		},
 	}
-	reader, err := provider.StreamProvider(context.Background(), model.Request{
+	streamer, err := provider.Build(context.Background(), model.Selection{ProviderID: "fake", ModelID: "m1"}, model.Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := streamer.StreamProvider(context.Background(), model.Request{
 		Identity: model.Identity{ProviderID: "fake", ModelID: "m1"},
-		Observer: observer,
 	})
 	if err != nil {
 		t.Fatalf("StreamProvider error = %v", err)
@@ -32,36 +32,41 @@ func TestStreamProviderEmitsCallbacksUsageAndChunks(t *testing.T) {
 	defer reader.Close()
 
 	var content string
+	var usages []model.Usage
 	for {
-		msg, err := reader.Recv()
+		delta, err := reader.Recv()
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			t.Fatalf("Recv error = %v", err)
 		}
-		content += msg.Content
+		content += delta.Message.Content
+		usages = append(usages, delta.Usage)
 	}
 	if content != "hello world" {
 		t.Fatalf("content = %q, want hello world", content)
 	}
-	if observer.started != 1 || observer.ended != 1 || len(observer.deltas) != 2 {
-		t.Fatalf("observer started=%d ended=%d deltas=%d", observer.started, observer.ended, len(observer.deltas))
+	if len(usages) != 2 || usages[0].InputTokens != 3 || usages[0].OutputTokens != 0 {
+		t.Fatalf("first usage = %#v", usages)
 	}
-	if observer.response.Usage.InputTokens != 3 || observer.response.Usage.OutputTokens != 2 {
-		t.Fatalf("usage = %#v", observer.response.Usage)
+	if usages[1].InputTokens != 3 || usages[1].OutputTokens != 2 {
+		t.Fatalf("final usage = %#v", usages[1])
 	}
 }
 
 func TestStreamProviderNormalizesErrors(t *testing.T) {
 	t.Parallel()
 
-	observer := &recordingObserver{}
 	provider := &Provider{
 		ID:    "fake",
 		Steps: []Step{{Err: errors.New("boom")}},
 	}
-	reader, err := provider.StreamProvider(context.Background(), model.Request{Observer: observer})
+	streamer, err := provider.Build(context.Background(), model.Selection{ProviderID: "fake", ModelID: "m1"}, model.Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := streamer.StreamProvider(context.Background(), model.Request{})
 	if err != nil {
 		t.Fatalf("StreamProvider error = %v", err)
 	}
@@ -72,8 +77,8 @@ func TestStreamProviderNormalizesErrors(t *testing.T) {
 	if !errors.As(err, &providerErr) {
 		t.Fatalf("Recv error = %T %[1]v, want model.Error", err)
 	}
-	if observer.err.Code != "fake_provider_error" {
-		t.Fatalf("observer err = %#v", observer.err)
+	if providerErr.Code != "fake_provider_error" {
+		t.Fatalf("provider err = %#v", providerErr)
 	}
 }
 
@@ -84,25 +89,28 @@ func TestStreamProviderSnapshotsProviderState(t *testing.T) {
 		ID:    "fake",
 		Steps: []Step{{Content: "original"}},
 	}
-	reader, err := provider.StreamProvider(context.Background(), model.Request{
+	streamer, err := provider.Build(context.Background(), model.Selection{ProviderID: "fake", ModelID: "m1"}, model.Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.ID = "mutated"
+	provider.Steps = []Step{{Content: "mutated"}}
+	reader, err := streamer.StreamProvider(context.Background(), model.Request{
 		Identity: model.Identity{ModelID: "m1"},
 	})
 	if err != nil {
 		t.Fatalf("StreamProvider error = %v", err)
 	}
 	defer reader.Close()
-	provider.ID = "mutated"
-	provider.Steps = []Step{{Content: "mutated"}}
-
-	msg, err := reader.Recv()
+	delta, err := reader.Recv()
 	if err != nil {
 		t.Fatalf("Recv error = %v", err)
 	}
-	if msg.Content != "original" {
-		t.Fatalf("content = %q, want original", msg.Content)
+	if delta.Message.Content != "original" {
+		t.Fatalf("content = %q, want original", delta.Message.Content)
 	}
-	if msg.Extra["provider_id"] != "fake" {
-		t.Fatalf("provider id = %q, want fake", msg.Extra["provider_id"])
+	if delta.Message.Extra["provider_id"] != "fake" {
+		t.Fatalf("provider id = %q, want fake", delta.Message.Extra["provider_id"])
 	}
 }
 
@@ -126,7 +134,12 @@ func TestProviderSentinelErrorsPreserveRetryability(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Build error = %v", err)
 			}
-			_, err = built.Generate(context.Background(), nil)
+			reader, streamErr := built.StreamProvider(context.Background(), model.Request{})
+			if streamErr != nil {
+				t.Fatalf("StreamProvider error = %v", streamErr)
+			}
+			defer reader.Close()
+			_, err = reader.Recv()
 			var providerErr model.Error
 			if !errors.As(err, &providerErr) {
 				t.Fatalf("Generate error = %T %[1]v, want model.Error", err)
@@ -138,7 +151,7 @@ func TestProviderSentinelErrorsPreserveRetryability(t *testing.T) {
 	}
 }
 
-func TestBuildClonesRuntimeAndWithToolsDoesNotMutateBase(t *testing.T) {
+func TestBuildClonesRuntime(t *testing.T) {
 	t.Parallel()
 
 	provider := &Provider{ID: "fake", Steps: []Step{{Content: "ok"}}}
@@ -147,45 +160,9 @@ func TestBuildClonesRuntimeAndWithToolsDoesNotMutateBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Build error = %v", err)
 	}
-	base := built.(*chatModel)
+	base := built.(*providerStreamer)
 	runtime.Options["session"] = "changed"
 	if base.runtime.Options["session"] != "a" {
 		t.Fatalf("runtime options mutated to %q", base.runtime.Options["session"])
 	}
-	withTools, err := base.WithTools([]*einoschema.ToolInfo{{Name: "tool-a"}})
-	if err != nil {
-		t.Fatalf("WithTools error = %v", err)
-	}
-	withToolsModel := withTools.(*chatModel)
-	if len(base.tools) != 0 {
-		t.Fatalf("base tools mutated: %d", len(base.tools))
-	}
-	if len(withToolsModel.tools) != 1 || withToolsModel.tools[0].Name != "tool-a" {
-		t.Fatalf("withTools tools = %#v", withToolsModel.tools)
-	}
-}
-
-type recordingObserver struct {
-	started  int
-	ended    int
-	deltas   []model.StreamDelta
-	err      model.Error
-	response model.Response
-}
-
-func (o *recordingObserver) OnProviderStart(context.Context, model.Request) {
-	o.started++
-}
-
-func (o *recordingObserver) OnProviderDelta(_ context.Context, delta model.StreamDelta) {
-	o.deltas = append(o.deltas, delta)
-}
-
-func (o *recordingObserver) OnProviderError(_ context.Context, err model.Error) {
-	o.err = err
-}
-
-func (o *recordingObserver) OnProviderEnd(_ context.Context, response model.Response) {
-	o.ended++
-	o.response = response
 }

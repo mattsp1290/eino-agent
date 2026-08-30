@@ -1,0 +1,201 @@
+package composition
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/session"
+)
+
+func TestCapabilityRegistrarsShareCanonicalIdentifierValidation(t *testing.T) {
+	invalidID := "invalid\x00identity"
+	guard := runtime.ToolGuardFunc(func(context.Context, runtime.ToolGuardRequest) (runtime.ToolGuardResult, error) {
+		return runtime.ToolGuardResult{Decision: runtime.ToolGuardAbstain}, nil
+	})
+	installers := map[string]InstallerFunc{
+		"tool": func(_ context.Context, registrar *Registrar) error {
+			return registrar.Tool(ToolRegistration{ID: invalidID, Scope: extension.GlobalScope(), Definition: definition("tool", "tool")})
+		},
+		"prompt": func(_ context.Context, registrar *Registrar) error {
+			return registrar.Prompt(PromptRegistration{ID: invalidID, Name: "prompt", Scope: extension.GlobalScope(), Provider: runtime.PromptProviderFunc(func(context.Context, runtime.PromptContext) (string, error) { return "", nil })})
+		},
+		"guard": func(_ context.Context, registrar *Registrar) error {
+			return registrar.Guard(GuardRegistration{ID: invalidID, Scope: extension.GlobalScope(), Guard: guard})
+		},
+		"restriction": func(_ context.Context, registrar *Registrar) error {
+			return registrar.RestrictTools(RestrictionRegistration{ID: invalidID, Scope: extension.GlobalScope(), Allowed: []string{"tool"}})
+		},
+	}
+	for name, installer := range installers {
+		t.Run(name, func(t *testing.T) {
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = registry.Mount(context.Background(), component("invalid-"+name), installer)
+			if !errors.Is(err, extension.ErrInvalidRegistration) {
+				t.Fatalf("Mount error = %v, want ErrInvalidRegistration", err)
+			}
+			assertRegistryEmpty(t, registry)
+		})
+	}
+}
+
+func TestToolSchemaHashCanonicalizesMetadataOrder(t *testing.T) {
+	first := definition("metadata-tool", "stable")
+	first.Metadata = map[string]string{"alpha": "one", "beta": "two"}
+	second := definition("metadata-tool", "stable")
+	second.Metadata = map[string]string{"beta": "two", "alpha": "one"}
+	firstHash, err := toolSchemaHash(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondHash, err := toolSchemaHash(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstHash != secondHash {
+		t.Fatalf("equivalent metadata hashes differ: %s != %s", firstHash, secondHash)
+	}
+}
+
+func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
+	schemaA, schemaB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	executorA, executorB := strings.Repeat("c", 64), strings.Repeat("d", 64)
+	base := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceIdentity: mustToolSourceIdentity(t, schemaA, executorA), Definition: definition("echo", "v1")}
+	baseSchema, err := composedToolSchemaHash(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedSchema := base
+	changedSchema.SourceIdentity = mustToolSourceIdentity(t, schemaB, executorA)
+	changedSchemaHash, _ := composedToolSchemaHash(changedSchema)
+	changedOrder := base
+	changedOrder.Order++
+	changedOrderHash, _ := composedToolSchemaHash(changedOrder)
+	if baseSchema == changedSchemaHash || baseSchema != changedOrderHash {
+		t.Fatalf("schema identity source/order separation failed: base=%s source=%s order=%s", baseSchema, changedSchemaHash, changedOrderHash)
+	}
+	componentIdentity := component("tool-order").Artifact
+	descriptor := func(order int) session.ExtensionPlanDescriptor {
+		value := session.ExtensionPlanDescriptor{Components: []session.ComponentPlan{{
+			InstanceID: "tool-order", Artifact: componentIdentity,
+			Tools: []session.ToolPlanIdentity{{Name: "echo", RegistrationID: base.ID, Scope: base.Scope, SchemaHash: baseSchema, ExecutorHash: executorA, Order: order}},
+		}}}
+		sealed, sealErr := session.SealExtensionPlanForSession("", value)
+		err = sealErr
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sealed.Descriptor()
+	}
+	if descriptor(base.Order).Fingerprint == descriptor(changedOrder.Order).Fingerprint {
+		t.Fatal("tool order did not change plan fingerprint")
+	}
+	baseExecutor := composedToolExecutorHash(executorA, "artifact")
+	changedExecutor := composedToolExecutorHash(executorB, "artifact")
+	changedArtifact := composedToolExecutorHash(executorA, "artifact-v2")
+	if baseExecutor == changedExecutor || baseExecutor == changedArtifact {
+		t.Fatal("executor identity ignored source/artifact")
+	}
+}
+
+func TestToolSourceIdentityValidationIsAtomic(t *testing.T) {
+	_, err := NewToolSourceIdentity(strings.Repeat("a", 64), "")
+	if !errors.Is(err, extension.ErrInvalidRegistration) {
+		t.Fatalf("partial source identity error = %v", err)
+	}
+}
+
+func TestMountedToolSourceIdentityIsCallerImmutable(t *testing.T) {
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := ToolRegistration{
+		ID: "standard.echo", Scope: extension.GlobalScope(),
+		SourceIdentity: mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("c", 64)),
+		Definition:     definition("echo", "v1"),
+	}
+	mount, err := registry.Mount(context.Background(), component("source-copy"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.Tool(registration)
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstFingerprint := first.Descriptor().Fingerprint
+	first.Release()
+	registration.SourceIdentity.schemaHash = strings.Repeat("b", 64)
+	registration.SourceIdentity.executorHash = strings.Repeat("d", 64)
+	second, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Release()
+	if second.Descriptor().Fingerprint != firstFingerprint {
+		t.Fatal("caller mutation changed mounted tool identity")
+	}
+}
+
+func TestStrictResumeRejectsSourceIdentityAndOrderDrift(t *testing.T) {
+	for _, mutate := range []struct {
+		name string
+		fn   func(*ToolRegistration)
+	}{
+		{name: "schema", fn: func(registration *ToolRegistration) {
+			registration.SourceIdentity = mustToolSourceIdentity(t, strings.Repeat("b", 64), strings.Repeat("c", 64))
+		}},
+		{name: "executor", fn: func(registration *ToolRegistration) {
+			registration.SourceIdentity = mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("d", 64))
+		}},
+		{name: "order", fn: func(registration *ToolRegistration) { registration.Order++ }},
+	} {
+		t.Run(mutate.name, func(t *testing.T) {
+			registry, err := NewRegistry(nil, compositionNotice)
+			if err != nil {
+				t.Fatal(err)
+			}
+			component := component("source-resume")
+			registration := ToolRegistration{ID: "standard.echo", Order: 1000, Scope: extension.GlobalScope(), SourceIdentity: mustToolSourceIdentity(t, strings.Repeat("a", 64), strings.Repeat("c", 64)), Definition: definition("echo", "v1")}
+			mount := func(value ToolRegistration) *Mount {
+				mounted, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error { return registrar.Tool(value) }))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return mounted
+			}
+			firstMount := mount(registration)
+			plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			persisted := plan.Descriptor()
+			plan.Release()
+			if err := firstMount.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			mutate.fn(&registration)
+			secondMount := mount(registration)
+			defer func() { _ = secondMount.Close(context.Background()) }()
+			assertResumePlanDrift(t, registry, "session-a", persisted)
+		})
+	}
+}
+
+func mustToolSourceIdentity(t *testing.T, schemaHash, executorHash string) ToolSourceIdentity {
+	t.Helper()
+	identity, err := NewToolSourceIdentity(schemaHash, executorHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return identity
+}

@@ -168,21 +168,18 @@ type PermissionDecision struct {
 //
 //	enum text-role {
 //		system,
-//		user,
-//		assistant
+//		user
 //	}
 type TextRole uint8
 
 const (
 	TextRoleSystem TextRole = iota
 	TextRoleUser
-	TextRoleAssistant
 )
 
-var _TextRoleStrings = [3]string{
+var _TextRoleStrings = [2]string{
 	"system",
 	"user",
-	"assistant",
 }
 
 // String implements [fmt.Stringer], returning the enum case name of e.

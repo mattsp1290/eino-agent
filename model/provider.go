@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
 )
@@ -18,33 +18,28 @@ var (
 	ErrProviderRateLimited = errors.New("model provider rate limited")
 	// ErrProviderRejected reports a non-retryable provider request rejection.
 	ErrProviderRejected = errors.New("model provider rejected request")
+	// ErrInvalidResolution reports an incomplete or inconsistent resolved model.
+	ErrInvalidResolution = errors.New("invalid resolved model")
 )
 
-// StreamDelta is one normalized chunk from a provider stream.
+// StreamDelta is one normalized chunk from a provider stream. Usage is the
+// cumulative attempt-to-date provider usage at this point in the stream.
 type StreamDelta struct {
 	Message *einoschema.Message
 	Usage   Usage
-	Index   int64
-	Done    bool
-}
-
-// StreamObserver receives normalized provider stream callbacks. Runtime
-// adapters can use these callbacks for usage propagation and lifecycle events
-// without parsing provider-specific payloads.
-type StreamObserver interface {
-	OnProviderStart(ctx context.Context, request Request)
-	OnProviderDelta(ctx context.Context, delta StreamDelta)
-	OnProviderError(ctx context.Context, err Error)
-	OnProviderEnd(ctx context.Context, response Response)
 }
 
 // Request is the transport-neutral provider request shape.
 type Request struct {
 	Identity Identity
 	Messages []*einoschema.Message
+	System   string
 	Tools    []*einoschema.ToolInfo
 	Options  map[string]string
-	Observer StreamObserver
+	// IdempotencyKey is assigned by a ledger-enabled runtime. It is not part of
+	// the model-visible audited projection. Adapters whose provider transport
+	// accepts an idempotency key may read it directly.
+	IdempotencyKey string
 }
 
 // Identity is provider-visible request identity. It intentionally avoids
@@ -70,21 +65,21 @@ func (i Identity) Clone() Identity {
 	return next
 }
 
-// Clone returns a defensive copy of request containers. Message and tool info
-// pointers remain provider-owned values and must not be mutated by adapters.
-func (r Request) Clone() Request {
+// Clone returns a defensive copy of the complete mutable request graph.
+func (r Request) Clone() (Request, error) {
 	next := r
 	next.Identity = r.Identity.Clone()
-	next.Messages = cloneMessages(r.Messages)
-	next.Tools = cloneToolInfos(r.Tools)
+	var err error
+	next.Messages, err = cloneMessages(r.Messages)
+	if err != nil {
+		return Request{}, err
+	}
+	next.Tools, err = cloneToolInfos(r.Tools)
+	if err != nil {
+		return Request{}, err
+	}
 	next.Options = cloneMap(r.Options)
-	return next
-}
-
-// Response is the normalized terminal provider response.
-type Response struct {
-	Message *einoschema.Message
-	Usage   Usage
+	return next, nil
 }
 
 // Usage records provider token and cost data in model-layer terms.
@@ -124,11 +119,11 @@ func (e Error) Unwrap() error {
 	return e.Cause
 }
 
-// Adapter builds immutable Eino chat models for provider requests.
+// Adapter builds one immutable provider streamer for the selected model.
 type Adapter interface {
 	Provider() Provider
 	Models(ctx context.Context) ([]Descriptor, error)
-	Build(ctx context.Context, selection Selection, runtime Runtime) (einomodel.ToolCallingChatModel, error)
+	Build(ctx context.Context, selection Selection, runtime Runtime) (Streamer, error)
 }
 
 // OptionalAdapter describes adapter packages that may be registered by hosts or
@@ -139,10 +134,9 @@ type OptionalAdapter interface {
 	Available(ctx context.Context, runtime Runtime) error
 }
 
-// Streamer is an optional adapter capability for callers that want normalized
-// provider callbacks in addition to the raw Eino stream.
+// Streamer is the sole provider execution surface.
 type Streamer interface {
-	StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[*einoschema.Message], error)
+	StreamProvider(ctx context.Context, request Request) (*einoschema.StreamReader[StreamDelta], error)
 }
 
 // AdapterResolver resolves model selections through registered adapters.
@@ -161,6 +155,29 @@ func (fn ResolverFunc) Resolve(ctx context.Context, selection Selection, runtime
 
 var _ Resolver = ResolverFunc(nil)
 
+// ValidateResolved verifies that one resolution completely and consistently
+// satisfies the requested provider/model selection.
+func ValidateResolved(selection Selection, resolved Resolved) error {
+	switch {
+	case resolved.Provider.ID == "":
+		return fmt.Errorf("%w: provider id required", ErrInvalidResolution)
+	case resolved.Model.ID == "":
+		return fmt.Errorf("%w: model id required", ErrInvalidResolution)
+	case resolved.Model.ProviderID == "":
+		return fmt.Errorf("%w: model provider id required", ErrInvalidResolution)
+	case resolved.Model.ProviderID != resolved.Provider.ID:
+		return fmt.Errorf("%w: model provider %q does not match provider %q", ErrInvalidResolution, resolved.Model.ProviderID, resolved.Provider.ID)
+	case selection.ProviderID != "" && resolved.Provider.ID != selection.ProviderID:
+		return fmt.Errorf("%w: provider %q does not match selection %q", ErrInvalidResolution, resolved.Provider.ID, selection.ProviderID)
+	case selection.ModelID != "" && resolved.Model.ID != selection.ModelID:
+		return fmt.Errorf("%w: model %q does not match selection %q", ErrInvalidResolution, resolved.Model.ID, selection.ModelID)
+	case resolved.Streamer == nil:
+		return fmt.Errorf("%w: streamer required", ErrInvalidResolution)
+	default:
+		return nil
+	}
+}
+
 // Resolve builds an immutable model client for the selected provider/model.
 func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runtime Runtime) (Resolved, error) {
 	adapter, provider, err := r.adapterFor(ctx, selection.ProviderID, runtime)
@@ -171,16 +188,22 @@ func (r AdapterResolver) Resolve(ctx context.Context, selection Selection, runti
 	if err != nil {
 		return Resolved{}, err
 	}
-	client, err := adapter.Build(ctx, selection, cloneRuntime(runtime))
+	streamer, err := adapter.Build(ctx, selection, cloneRuntime(runtime))
 	if err != nil {
 		return Resolved{}, err
 	}
-	return Resolved{
+	if streamer == nil {
+		return Resolved{}, Error{Code: "provider_streamer_missing", Message: "provider adapter returned nil streamer", Cause: ErrProviderUnavailable}
+	}
+	resolved := Resolved{
 		Provider: provider,
 		Model:    descriptor,
-		Client:   client,
-		Streamer: streamerFor(adapter),
-	}, nil
+		Streamer: streamer,
+	}
+	if err := ValidateResolved(selection, resolved); err != nil {
+		return Resolved{}, err
+	}
+	return resolved, nil
 }
 
 func (r AdapterResolver) adapterFor(ctx context.Context, providerID ProviderID, runtime Runtime) (Adapter, Provider, error) {
@@ -232,14 +255,6 @@ func (r AdapterResolver) descriptorFor(ctx context.Context, adapter Adapter, sel
 	}
 }
 
-func streamerFor(adapter Adapter) Streamer {
-	streamer, ok := adapter.(Streamer)
-	if !ok {
-		return nil
-	}
-	return streamer
-}
-
 func cloneRuntime(src Runtime) Runtime {
 	next := src
 	next.Env = cloneMap(src.Env)
@@ -277,71 +292,112 @@ func cloneBoolMap(src map[string]bool) map[string]bool {
 	return dst
 }
 
-func cloneMessages(src []*einoschema.Message) []*einoschema.Message {
+func cloneMessages(src []*einoschema.Message) ([]*einoschema.Message, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	dst := make([]*einoschema.Message, len(src))
-	for i, message := range src {
+	for index, message := range src {
 		if message == nil {
 			continue
 		}
-		next := *message
-		next.MultiContent = cloneSlice(message.MultiContent)
-		next.UserInputMultiContent = cloneSlice(message.UserInputMultiContent)
-		next.AssistantGenMultiContent = cloneSlice(message.AssistantGenMultiContent)
-		next.ToolCalls = cloneSlice(message.ToolCalls)
-		next.Extra = cloneAnyMap(message.Extra)
-		dst[i] = &next
+		//nolint:staticcheck // The canonical boundary rejects the deprecated field.
+		if len(message.MultiContent) != 0 {
+			return nil, fmt.Errorf("clone message %d: deprecated MultiContent is unsupported", index)
+		}
+		for _, part := range message.AssistantGenMultiContent {
+			if part.StreamingMeta != nil {
+				return nil, fmt.Errorf("message %d contains non-copyable streaming metadata", index)
+			}
+		}
+		raw, err := json.Marshal(message)
+		if err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		if err := rejectExtraJSON(raw); err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		var cloned einoschema.Message
+		if err := json.Unmarshal(raw, &cloned); err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		dst[index] = &cloned
 	}
-	return dst
+	return dst, nil
 }
 
-func cloneToolInfos(src []*einoschema.ToolInfo) []*einoschema.ToolInfo {
+func cloneToolInfos(src []*einoschema.ToolInfo) ([]*einoschema.ToolInfo, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	dst := make([]*einoschema.ToolInfo, len(src))
-	for i, tool := range src {
+	for index, tool := range src {
 		if tool == nil {
 			continue
 		}
+		if len(tool.Extra) != 0 {
+			return nil, fmt.Errorf("tool %d contains unsupported extra metadata", index)
+		}
 		next := *tool
-		next.Extra = cloneAnyMap(tool.Extra)
-		next.ParamsOneOf = cloneParamsOneOf(tool.ParamsOneOf)
-		dst[i] = &next
+		var err error
+		next.ParamsOneOf, err = cloneParamsOneOf(tool.ParamsOneOf)
+		if err != nil {
+			return nil, fmt.Errorf("clone tool %d schema: %w", index, err)
+		}
+		dst[index] = &next
 	}
-	return dst
+	return dst, nil
 }
 
-func cloneParamsOneOf(src *einoschema.ParamsOneOf) *einoschema.ParamsOneOf {
+func cloneParamsOneOf(src *einoschema.ParamsOneOf) (*einoschema.ParamsOneOf, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	schema, err := src.ToJSONSchema()
 	if err != nil || schema == nil {
-		return src
+		if err == nil {
+			err = errors.New("nil JSON schema")
+		}
+		return nil, err
 	}
 	data, err := json.Marshal(schema)
 	if err != nil {
-		return src
+		return nil, err
 	}
 	var cloned jsonschema.Schema
 	if err := json.Unmarshal(data, &cloned); err != nil {
-		return src
+		return nil, err
 	}
-	return einoschema.NewParamsOneOfByJSONSchema(&cloned)
+	return einoschema.NewParamsOneOfByJSONSchema(&cloned), nil
 }
 
-func cloneAnyMap(src map[string]any) map[string]any {
-	if src == nil {
+func rejectExtraJSON(raw json.RawMessage) error {
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return err
+	}
+	var visit func(any) error
+	visit = func(current any) error {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, child := range typed {
+				if key == "extra" {
+					return errors.New("unsupported extra metadata")
+				}
+				if err := visit(child); err != nil {
+					return err
+				}
+			}
+		case []any:
+			for _, child := range typed {
+				if err := visit(child); err != nil {
+					return err
+				}
+			}
+		}
 		return nil
 	}
-	dst := make(map[string]any, len(src))
-	for key, value := range src {
-		dst[key] = value
-	}
-	return dst
+	return visit(value)
 }
 
 func cloneSlice[T any](src []T) []T {

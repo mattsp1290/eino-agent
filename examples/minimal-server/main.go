@@ -16,6 +16,7 @@ import (
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -77,22 +78,34 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	}
 	ids := &sequenceIDs{}
 	tail := stream.NewTail(64)
-	sink := eventSink{store: store, tail: tail, ids: ids, now: time.Now}
+	sink := eventSink{tail: tail}
 	snapshot := minimalConfig()
+	plans, err := composition.NewRegistry(nil)
+	if err != nil {
+		tail.Close()
+		_ = store.Close()
+		return nil, err
+	}
+	orchestrator, err := runtime.NewStreamingOrchestrator(
+		runtime.WithStore(store),
+		runtime.WithModelResolver(scriptedResolver{}),
+		runtime.WithEventSink(sink),
+		runtime.WithIDGenerator(ids),
+		runtime.WithRunPlanProvider(plans),
+		runtime.WithOwnerID("minimal-server"),
+		runtime.WithQueueSize(16),
+	)
+	if err != nil {
+		tail.Close()
+		_ = store.Close()
+		return nil, err
+	}
 	return &Server{
 		store:   store,
 		tail:    tail,
 		config:  snapshot,
 		handles: map[session.RunID]activeHandle{},
-		runtime: &runtime.StreamingOrchestrator{
-			Store:      store,
-			Transactor: store,
-			Model:      scriptedResolver{},
-			Events:     sink,
-			IDs:        ids,
-			OwnerID:    "minimal-server",
-			QueueSize:  16,
-		},
+		runtime: orchestrator,
 	}, nil
 }
 
@@ -345,9 +358,9 @@ func (scriptedResolver) Resolve(_ context.Context, selection model.Selection, _ 
 
 type scriptedStreamer struct{}
 
-func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[*einoschema.Message], error) {
+func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	delay := streamDelay(request.Options)
-	reader, writer := einoschema.Pipe[*einoschema.Message](2)
+	reader, writer := einoschema.Pipe[model.StreamDelta](2)
 	go func() {
 		defer writer.Close()
 		chunks := []*einoschema.Message{
@@ -357,11 +370,11 @@ func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Reques
 		for _, chunk := range chunks {
 			select {
 			case <-ctx.Done():
-				writer.Send(nil, ctx.Err())
+				writer.Send(model.StreamDelta{}, ctx.Err())
 				return
 			case <-time.After(delay):
 			}
-			if writer.Send(chunk, nil) {
+			if writer.Send(model.StreamDelta{Message: chunk}, nil) {
 				return
 			}
 		}
@@ -388,59 +401,11 @@ func lastUserText(messages []*einoschema.Message) string {
 }
 
 type eventSink struct {
-	store session.Store
-	tail  *stream.Tail
-	ids   runtime.IDGenerator
-	now   func() time.Time
+	tail *stream.Tail
 }
 
-func (s eventSink) Emit(ctx context.Context, event runtime.Event) error {
-	if !event.LiveOnly && event.Kind != runtime.EventRunStarted {
-		if event.EventID == "" && s.ids != nil {
-			event.EventID = s.ids.NewEventID()
-		}
-		if _, err := s.store.AppendEvent(ctx, eventRecord(event, s.now)); err != nil {
-			return err
-		}
-	}
-	return s.tail.Emit(ctx, event)
-}
-
-func eventRecord(event runtime.Event, now func() time.Time) session.EventRecord {
-	createdAt := event.Time
-	if createdAt.IsZero() {
-		createdAt = now().UTC()
-	}
-	return session.EventRecord{
-		ID:         event.EventID,
-		SessionID:  event.SessionID,
-		RunID:      event.RunID,
-		MessageID:  event.MessageID,
-		PartID:     event.PartID,
-		ToolCallID: event.ToolCallID,
-		EpochID:    event.EpochID,
-		ProviderID: event.ProviderID,
-		ModelID:    event.ModelID,
-		ParentID:   event.ParentID,
-		Kind:       string(event.Kind),
-		Usage: session.Usage{
-			InputTokens:      event.Usage.InputTokens,
-			OutputTokens:     event.Usage.OutputTokens,
-			ReasoningTokens:  event.Usage.ReasoningTokens,
-			CacheReadTokens:  event.Usage.CacheReadTokens,
-			CacheWriteTokens: event.Usage.CacheWriteTokens,
-			Cost:             event.Usage.Cost,
-		},
-		Error: session.EventError{
-			Code:      event.Error.Code,
-			Message:   event.Error.Message,
-			Retryable: event.Error.Retryable,
-		},
-		Redaction: session.RedactionClass(event.Redaction),
-		Payload:   event.Payload,
-		LiveOnly:  event.LiveOnly,
-		CreatedAt: createdAt,
-	}
+func (s eventSink) Emit(ctx context.Context, event session.EventRecord) {
+	s.tail.Emit(ctx, event)
 }
 
 type sequenceIDs struct {

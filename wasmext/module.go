@@ -18,15 +18,20 @@ import (
 )
 
 type module struct {
-	identity  moduleIdentity
-	limits    Limits
-	engine    engine
-	component compiledComponent
-	callGate  chan struct{}
-	mu        sync.Mutex
-	closed    bool
-	inFlight  sync.WaitGroup
-	closeOnce sync.Once
+	identity       moduleIdentity
+	limits         Limits
+	engine         engine
+	component      compiledComponent
+	callGate       chan struct{}
+	mu             sync.Mutex
+	closing        bool
+	closingCh      chan struct{}
+	shutdownCtx    context.Context
+	shutdownCancel context.CancelFunc
+	inFlight       sync.WaitGroup
+	shutdownOnce   sync.Once
+	finalized      chan struct{}
+	closeErr       error
 }
 
 func loadModule(ctx context.Context, cfg ModuleConfig, contract worldContract, factory engineFactory) (*module, error) {
@@ -34,13 +39,6 @@ func loadModule(ctx context.Context, cfg ModuleConfig, contract worldContract, f
 	identity := moduleIdentity{name: strings.TrimSpace(cfg.Name), hash: strings.ToLower(strings.TrimSpace(cfg.ExpectedSHA256))}
 	if identity.name == "" || len(identity.name) > 128 {
 		return nil, extensionError(ErrorConfig, identity, "load", errors.New("invalid module name"))
-	}
-	var configBytes int64
-	for key, value := range cfg.GuestConfig {
-		configBytes += int64(len(key) + len(value))
-	}
-	if configBytes > limits.MaxInputBytes {
-		return nil, extensionError(ErrorSize, identity, "load", errors.New("guest configuration exceeds bound"))
 	}
 	expected, err := hex.DecodeString(identity.hash)
 	if err != nil || len(expected) != sha256.Size {
@@ -75,7 +73,11 @@ func loadModule(ctx context.Context, cfg ModuleConfig, contract worldContract, f
 	}
 	callGate := make(chan struct{}, 1)
 	callGate <- struct{}{}
-	return &module{identity: identity, limits: limits, engine: engine, component: component, callGate: callGate}, nil
+	shutdownCtx, shutdownCancel := context.WithCancel(context.Background())
+	return &module{
+		identity: identity, limits: limits, engine: engine, component: component, callGate: callGate,
+		closingCh: make(chan struct{}), shutdownCtx: shutdownCtx, shutdownCancel: shutdownCancel, finalized: make(chan struct{}),
+	}, nil
 }
 
 var errModuleTooLarge = errors.New("module exceeds size bound")
@@ -139,34 +141,53 @@ func secureModulePath(root, path string) (string, error) {
 	return candidateReal, nil
 }
 
-func (m *module) call(ctx context.Context, operation string, inputBytes int, input, output any) error {
+func (m *module) call(ctx context.Context, operation string, inputBytes int, invoke func(context.Context) error) error {
 	if int64(inputBytes) > m.limits.MaxInputBytes {
 		return extensionError(ErrorSize, m.identity, operation, errors.New("input exceeds bound"))
 	}
 	m.mu.Lock()
-	if m.closed {
+	if m.closing {
 		m.mu.Unlock()
 		return extensionError(ErrorClosed, m.identity, operation, nil)
 	}
 	m.inFlight.Add(1)
 	m.mu.Unlock()
-	defer m.inFlight.Done()
+	callerOwnsReference := true
+	defer func() {
+		if callerOwnsReference {
+			m.inFlight.Done()
+		}
+	}()
 	select {
 	case <-ctx.Done():
 		return extensionError(ErrorTimeout, m.identity, operation, ctx.Err())
+	case <-m.closingCh:
+		return extensionError(ErrorClosed, m.identity, operation, nil)
 	case <-m.callGate:
 	}
-	defer func() { m.callGate <- struct{}{} }()
 	m.mu.Lock()
-	closed := m.closed
+	closing := m.closing
 	m.mu.Unlock()
-	if closed {
+	if closing {
+		m.callGate <- struct{}{}
 		return extensionError(ErrorClosed, m.identity, operation, nil)
 	}
 	callCtx, cancel := context.WithTimeout(ctx, m.limits.Timeout)
 	defer cancel()
+	stopShutdownCancel := context.AfterFunc(m.shutdownCtx, cancel)
+	defer stopShutdownCancel()
 	done := make(chan error, 1)
-	go func() { done <- m.component.Call(callCtx, operation, input, output) }()
+	callerOwnsReference = false
+	go func() {
+		defer m.inFlight.Done()
+		defer func() { m.callGate <- struct{}{} }()
+		defer func() {
+			if recover() != nil {
+				done <- errors.New("component invocation panicked")
+			}
+		}()
+		done <- invoke(callCtx)
+	}()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -179,31 +200,80 @@ func (m *module) call(ctx context.Context, operation string, inputBytes int, inp
 		return nil
 	case <-callCtx.Done():
 		m.component.Interrupt()
+		timer := time.NewTimer(m.limits.CloseDrain)
+		defer timer.Stop()
 		select {
-		case <-done:
-		case <-time.After(m.limits.CloseDrain):
+		case err := <-done:
+			m.mu.Lock()
+			closing := m.closing
+			m.mu.Unlock()
+			if closing && err != nil {
+				return extensionError(ErrorTrap, m.identity, operation, err)
+			}
+		case <-timer.C:
+			m.beginShutdown()
 		}
 		return extensionError(ErrorTimeout, m.identity, operation, callCtx.Err())
 	}
 }
 
+func componentAs[T any](m *module, operation string) (T, error) {
+	var zero T
+	component, ok := any(m.component).(T)
+	if !ok {
+		return zero, extensionError(ErrorContract, m.identity, operation, errors.New("compiled component does not implement world interface"))
+	}
+	return component, nil
+}
+
 func (m *module) Close() error {
-	var closeErr error
-	m.closeOnce.Do(func() {
+	if m == nil {
+		return nil
+	}
+	m.beginShutdown()
+	timer := time.NewTimer(m.limits.CloseDrain)
+	defer timer.Stop()
+	select {
+	case <-m.finalized:
+		return m.finalError()
+	case <-timer.C:
+		return extensionError(ErrorTimeout, m.identity, "close", context.DeadlineExceeded)
+	}
+}
+
+func (m *module) beginShutdown() {
+	m.shutdownOnce.Do(func() {
 		m.mu.Lock()
-		m.closed = true
+		m.closing = true
+		close(m.closingCh)
+		m.shutdownCancel()
 		m.mu.Unlock()
 		m.component.Interrupt()
-		done := make(chan struct{})
-		go func() { m.inFlight.Wait(); close(done) }()
-		select {
-		case <-done:
-		case <-time.After(m.limits.CloseDrain):
-			closeErr = extensionError(ErrorTimeout, m.identity, "close", context.DeadlineExceeded)
-		}
-		closeErr = errors.Join(closeErr, m.component.Close(), m.engine.Close())
+		go func() {
+			m.inFlight.Wait()
+			err := errors.Join(m.component.Close(), m.engine.Close())
+			m.mu.Lock()
+			m.closeErr = err
+			m.mu.Unlock()
+			close(m.finalized)
+		}()
 	})
-	return closeErr
+}
+
+func (m *module) waitFinalized(ctx context.Context) error {
+	m.beginShutdown()
+	select {
+	case <-m.finalized:
+		return m.finalError()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *module) finalError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closeErr
 }
 
 func validateBoundedJSON(raw []byte, limit int64) error {

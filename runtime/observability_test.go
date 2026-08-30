@@ -24,12 +24,17 @@ func TestStreamingOrchestratorRecordsNoNetworkObservations(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.Message, error) {
-		request.Observer.OnProviderEnd(ctx, model.Response{Usage: model.Usage{InputTokens: 3, OutputTokens: 2, ReasoningTokens: 1, CacheReadTokens: 4}})
-		return []*einoschema.Message{einoschema.AssistantMessage("hello", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		response := einoschema.AssistantMessage("hello", nil)
+		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+			PromptTokens: 3, CompletionTokens: 2,
+			CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 1},
+			PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 4},
+		}}
+		return []*einoschema.Message{response}, nil
 	}))
-	orch.Observer = observer
-	orch.Trace = agentcontext.TraceContext{TraceID: "trace-1"}
+	orch.observer = observer
+	orch.trace = agentcontext.TraceContext{TraceID: "trace-1"}
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -59,8 +64,8 @@ func TestStreamingOrchestratorRecordsRetryAndProviderError(t *testing.T) {
 		calls++
 		return nil, model.Error{Code: "rate_limited", Message: "SECRET prompt retry me", Retryable: true, Cause: model.ErrProviderRateLimited}
 	}))
-	orch.Attempts = 2
-	orch.Observer = observer
+	orch.attemptsValue = 2
+	orch.observer = observer
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed || calls != 2 {
 		t.Fatalf("result = %+v calls=%d", result, calls)
@@ -95,7 +100,7 @@ func TestStreamingOrchestratorRecordsCancellation(t *testing.T) {
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return nil, context.Canceled
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	result := startAndWait(t, orch)
 	if result.Status != session.RunInterrupted || !result.Interrupted {
 		t.Fatalf("result = %+v", result)
@@ -117,7 +122,7 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}))
-	orch.Observer = observer
+	orch.observer = observer
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		ParentID:  "user-1",
@@ -154,14 +159,14 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 		_ = store.Close()
 	}()
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
-	orch := &StreamingOrchestrator{
-		Store:    store,
-		Tools:    staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}},
-		IDs:      &sequenceIDs{},
-		OwnerID:  "owner-1",
-		Clock:    func() time.Time { return now },
-		Observer: observer,
-	}
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithOwnerID("owner-1"),
+		WithClock(func() time.Time { return now }),
+		WithObserver(observer),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
 	handle, err := orch.Resume(context.Background(), run.ID)
 	if err != nil {
 		t.Fatalf("Resume error = %v", err)
@@ -187,31 +192,6 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 	assertObservation(t, observations, "run", "canceled", "")
 }
 
-func TestObservabilitySinkRecordsCompactionWithoutPayloadLeak(t *testing.T) {
-	t.Parallel()
-
-	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
-	err := (ObservabilitySink{Observer: observer}).Emit(context.Background(), Event{
-		Kind:        EventContextEpochChanged,
-		SessionID:   "session-1",
-		RunID:       "run-1",
-		MessageID:   "summary-1",
-		EpochID:     "epoch-1",
-		Correlation: "trace-1",
-		Payload:     []byte(`{"summary":"SECRET compacted prompt"}`),
-	})
-	if err != nil {
-		t.Fatalf("Emit error = %v", err)
-	}
-	compaction := assertObservation(t, observer.Snapshot().Observations, "compaction", "ok", "trace-1")
-	if compaction.Attributes["metadata.epoch_id"] != "epoch-1" {
-		t.Fatalf("compaction attrs = %#v", compaction.Attributes)
-	}
-	if observationContains(observer.Snapshot().Observations, "SECRET compacted prompt") {
-		t.Fatalf("observations leaked compaction payload: %#v", observer.Snapshot().Observations)
-	}
-}
-
 func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.T) {
 	t.Parallel()
 
@@ -232,13 +212,13 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	orch.observer = observer
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "SECRET tool output"}, nil
 		}),
-	}}}
+	}}})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -277,13 +257,14 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 			Type: "function",
 			Function: einoschema.FunctionCall{
 				Name:      "echo",
-				Arguments: `{"permission_pattern":"SECRET danger pattern"}`,
+				Arguments: `{"target":"SECRET danger pattern"}`,
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
-		Name: "echo",
+	orch.observer = observer
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
+		Name:    "echo",
+		Pattern: permissionPatternField("target"),
 		Scope: ToolScope{
 			Permissions: []string{"shell"},
 		},
@@ -291,8 +272,8 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 			t.Fatal("executor should not run")
 			return ToolResult{}, nil
 		}),
-	}}}
-	orch.Permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+	}}})
+	orch.permissions = permissions.PolicyFunc(func(_ context.Context, request permissions.Request) (permissions.Decision, error) {
 		if request.Pattern != "SECRET danger pattern" {
 			t.Fatalf("permission pattern = %q", request.Pattern)
 		}
@@ -335,13 +316,13 @@ func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	orch.observer = observer
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{}, errors.New("SECRET operational detail")
 		}),
-	}}}
+	}}})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
@@ -370,8 +351,8 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
-	orch.Tools = staticToolRegistry{}
+	orch.observer = observer
+	configureTestTools(orch, staticToolRegistry{})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)
@@ -394,7 +375,7 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	store.finishToolCallErr = errors.New("SECRET settlement detail")
+	store.settleToolCallErr = errors.New("SECRET settlement detail")
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
 			ID:   "call-settle",
@@ -405,13 +386,13 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 			},
 		}})}, nil
 	}))
-	orch.Observer = observer
-	orch.Tools = staticToolRegistry{tools: []Tool{{
+	orch.observer = observer
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: "ok"}, nil
 		}),
-	}}}
+	}}})
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)

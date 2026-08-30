@@ -1,8 +1,6 @@
 // Package sqlite provides a local durable session store backed by SQLite.
 //
-// Migrations are deterministic and forward-only. The schema_version table
-// records applied versions; downgrades are intentionally unsupported because
-// older binaries may not understand records written by newer runtimes. Operators
-// that need rollback should restore a database backup captured before opening
-// it with the newer binary.
+// Empty databases are initialized from one current schema. Initialized
+// databases are opened only when their version and structure exactly match;
+// this pre-release package does not mutate or upgrade older schemas.
 package sqlite

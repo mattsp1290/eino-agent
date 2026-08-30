@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	einoschema "github.com/cloudwego/eino/schema"
-
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
@@ -225,23 +223,30 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-http", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
-	if _, err := store.AdmitRun(ctx, session.Run{ID: "run-http", SessionID: "session-http", OwnerID: "owner", Status: session.RunPending, CreatedAt: now}); err != nil {
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-http", SessionID: "session-http", OwnerID: "owner", ClaimToken: "claim-http", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
 		t.Fatalf("admit run: %v", err)
 	}
-	if _, err := store.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := store.AppendPart(ctx, session.Part{ID: "part-http", MessageID: "msg-http", SessionID: "session-http", RunID: "run-http", Kind: session.PartText, Payload: []byte(`{"text":"hello"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-http", MessageID: "msg-http", SessionID: "session-http", RunID: "run-http", Kind: session.PartText, Payload: []byte(`{"text":"hello"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append part: %v", err)
 	}
 	events := []session.EventRecord{
 		{ID: "evt-started", SessionID: "session-http", RunID: "run-http", MessageID: "msg-http", Kind: string(runtime.EventRunStarted), CreatedAt: now},
-		{ID: "evt-finished", SessionID: "session-http", RunID: "run-http", MessageID: "msg-http", Kind: string(runtime.EventRunFinished), CreatedAt: now.Add(time.Second)},
 	}
 	for _, event := range events {
-		if _, err := store.AppendEvent(ctx, event); err != nil {
+		if _, err := execution.AppendEvent(ctx, event); err != nil {
 			t.Fatalf("append event: %v", err)
 		}
+	}
+	if _, err := execution.SettleRun(ctx, session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: now.Add(time.Second)},
+		Event:      session.RunSettlementEvent{ID: "evt-finished", MessageID: "msg-http"},
+	}); err != nil {
+		t.Fatalf("settle run: %v", err)
 	}
 	return store
 }
@@ -252,8 +257,8 @@ type closingTail struct {
 	done chan struct{}
 }
 
-func (t *closingTail) Subscribe(context.Context, session.ID) (<-chan runtime.Event, error) {
-	ch := make(chan runtime.Event)
+func (t *closingTail) Subscribe(context.Context, session.ID) (<-chan session.EventRecord, error) {
+	ch := make(chan session.EventRecord)
 	close(ch)
 	return ch, nil
 }
@@ -263,13 +268,13 @@ type blockingTail struct {
 	canceled   chan struct{}
 }
 
-func (t *blockingTail) Subscribe(ctx context.Context, _ session.ID) (<-chan runtime.Event, error) {
+func (t *blockingTail) Subscribe(ctx context.Context, _ session.ID) (<-chan session.EventRecord, error) {
 	close(t.subscribed)
 	go func() {
 		<-ctx.Done()
 		close(t.canceled)
 	}()
-	return make(chan runtime.Event), nil
+	return make(chan session.EventRecord), nil
 }
 
 type interruptHandle struct {
@@ -292,6 +297,3 @@ func (h resumeHandle) Done() <-chan runtime.Result {
 	return ch
 }
 func (h resumeHandle) Interrupt(context.Context, string) error { return nil }
-func (h resumeHandle) FollowUp(context.Context, []*einoschema.Message) error {
-	return nil
-}

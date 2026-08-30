@@ -11,11 +11,16 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+func executeToolForTest(ctx context.Context, tool Tool, call ToolCall, policy permissions.Policy) (ToolResult, error) {
+	execution, err := executeToolWithPermissions(ctx, tool, call, policy)
+	return protectPermissionResult(execution.Result, execution.State), err
+}
+
 func TestExecuteToolWithPermissionsAllow(t *testing.T) {
 	t.Parallel()
 
 	tool := executableTool()
-	result, err := ExecuteToolWithPermissions(context.Background(), tool, toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	result, err := executeToolForTest(context.Background(), tool, toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{Action: permissions.ActionAllow}, nil
 	}))
 	if err != nil {
@@ -29,7 +34,7 @@ func TestExecuteToolWithPermissionsAllow(t *testing.T) {
 func TestExecuteToolWithPermissionsDenyIsModelVisible(t *testing.T) {
 	t.Parallel()
 
-	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	result, err := executeToolForTest(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{Action: permissions.ActionDeny, Message: "blocked"}, nil
 	}))
 	if err != nil {
@@ -41,7 +46,7 @@ func TestExecuteToolWithPermissionsDenyIsModelVisible(t *testing.T) {
 func TestExecuteToolWithPermissionsApprovalRequiredWithoutRequester(t *testing.T) {
 	t.Parallel()
 
-	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	result, err := executeToolForTest(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{Action: permissions.ActionAsk, Message: "needs approval"}, nil
 	}))
 	if err != nil {
@@ -57,7 +62,7 @@ func TestExecuteToolWithPermissionsApprovalInterruptionIsModelVisible(t *testing
 	call.Approval = approvalFunc(func(context.Context, ApprovalRequest) error {
 		return permissions.ErrInterrupted
 	})
-	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	result, err := executeToolForTest(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{Action: permissions.ActionAsk}, nil
 	}))
 	if err != nil {
@@ -73,7 +78,7 @@ func TestExecuteToolWithPermissionsApprovalDenialIsModelVisibleDenied(t *testing
 	call.Approval = approvalFunc(func(context.Context, ApprovalRequest) error {
 		return permissions.ErrDenied
 	})
-	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	result, err := executeToolForTest(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{Action: permissions.ActionAsk}, nil
 	}))
 	if err != nil {
@@ -85,7 +90,7 @@ func TestExecuteToolWithPermissionsApprovalDenialIsModelVisibleDenied(t *testing
 func TestExecuteToolWithPermissionsContextCancellationIsOperational(t *testing.T) {
 	t.Parallel()
 
-	_, err := ExecuteToolWithPermissions(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	_, err := executeToolForTest(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{}, context.Canceled
 	}))
 	if !errors.Is(err, context.Canceled) {
@@ -98,7 +103,7 @@ func TestExecuteToolWithPermissionsUsesOperationPattern(t *testing.T) {
 
 	call := toolCall()
 	call.Pattern = "rm -rf tmp"
-	result, err := ExecuteToolWithPermissions(context.Background(), executableTool(), call, permissions.StaticPolicy{Rules: []config.PermissionRule{
+	result, err := executeToolForTest(context.Background(), executableTool(), call, permissions.StaticPolicy{Rules: []config.PermissionRule{
 		{Permission: "shell", Pattern: "rm *", Action: config.PermissionActionDeny},
 	}})
 	if err != nil {
@@ -111,7 +116,7 @@ func TestExecuteToolWithPermissionsOperationalPolicyError(t *testing.T) {
 	t.Parallel()
 
 	errOperational := errors.New("policy store unavailable")
-	_, err := ExecuteToolWithPermissions(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	_, err := executeToolForTest(context.Background(), executableTool(), toolCall(), permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{}, errOperational
 	}))
 	if !errors.Is(err, errOperational) {
@@ -127,7 +132,7 @@ func TestExecuteToolWithPermissionsApprovalOperationalError(t *testing.T) {
 	call.Approval = approvalFunc(func(context.Context, ApprovalRequest) error {
 		return errApproval
 	})
-	_, err := ExecuteToolWithPermissions(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
+	_, err := executeToolForTest(context.Background(), executableTool(), call, permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
 		return permissions.Decision{Action: permissions.ActionAsk}, nil
 	}))
 	if !errors.Is(err, errApproval) {

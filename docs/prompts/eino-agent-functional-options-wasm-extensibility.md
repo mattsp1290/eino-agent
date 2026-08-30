@@ -80,12 +80,12 @@ with one `With<FieldName>` option per public dependency of
 `runtime.StreamingOrchestrator` (see `runtime/orchestrator.go`), including at
 least:
 
-- `WithStore(session.Store)`, `WithTransactor(session.Transactor)`
+- `WithStore(session.Store)`
 - `WithModelResolver(model.Resolver)` — provider registration flows through
   this option: hosts compose native adapters with
   `model.AdapterResolver{Adapters: ..., Catalog: ...}` (`model/provider.go`)
   and pass the resolver here.
-- `WithToolRegistry(ToolRegistry)`
+- `WithRunPlanProvider(RunPlanProvider)`
 - `WithContextSource(ContextSource)` — appendable, may be given multiple times
 - `WithEventSink(EventSink)`
 - `WithHook(Hook)` — appendable
@@ -99,10 +99,9 @@ least:
 - `WithHistory(history.Options)`
 - `WithObserver(*einoobs.Observer)`
 
-`Admit *Admitter` is intentionally excluded: it is a derived aggregate the
-orchestrator synthesizes from `Store`, `Transactor`, `Events`, `Hooks`, and
-`Clock` (`runtime/orchestrator.go`, `admitter()`), not an independent
-dependency. Document that carve-out in the constructor's doc comment.
+Admission is intentionally not an option or public dependency. The
+orchestrator constructs its private one-shot admission pipeline from the
+canonical store, event sink, extension plan, and clock.
 
 Rules:
 
@@ -113,7 +112,7 @@ Rules:
   deferring failure to `Start`. Supply the same defaults the zero-value struct
   currently receives for optional fields.
 - A nil value passed to an interface-typed option (`WithStore`,
-  `WithTransactor`, `WithModelResolver`, `WithToolRegistry`,
+  `WithModelResolver`, `WithRunPlanProvider`,
   `WithContextSource`, `WithEventSink`, `WithHook`, `WithPermissions`,
   `WithToolMiddleware`, `WithIDGenerator`) is a construction error, not a
   silent no-op. Func-,
@@ -122,19 +121,17 @@ Rules:
   `WithOwnerID`, `WithTrace`) and the pointer-typed `WithObserver` keep
   today's documented zero-value-means-default behavior
   (`runtime/orchestrator.go` fallbacks).
-- Do not remove or deprecate the exported struct fields in this milestone;
-  document the constructor as the preferred path.
-- Apply the same pattern to `tools.NewRegistry` only if it needs new
-  configuration for this work; do not gratuitously convert existing
-  constructors.
+- Keep orchestrator dependencies private and use the constructor as the sole
+  validated path.
+- Keep `composition.NewRegistry` as the sole registry constructor and publish
+  tool definitions through component mounts.
 
 ### 2. Function Adapters For Single-Method Seams
 
 Add `http.HandlerFunc`-style adapters so plain Go functions satisfy the
 single-method interfaces that participate in options. Net-new adapters:
 
-- `runtime.EventSinkFunc`, `runtime.ContextSourceFunc`,
-  `runtime.ToolRegistryFunc`
+- `runtime.EventSinkFunc`
 - `model.ResolverFunc`
 
 Already exist — do not re-add; add compile-time interface assertions and reuse
@@ -178,7 +175,8 @@ semantics are binding, grounded in `executeTools`
 (`runtime/orchestrator.go`) and the resume path (`runtime/interrupt.go`):
 
 - **Rewrite point**: the `BeforeToolCall` chain runs after
-  `InputDecoder.DecodeToolInput` and **before** `Store.CreateToolCall`. This
+  `InputDecoder.DecodeToolInput` and **before**
+  `ExecutionStore.CreateToolCall(CreateToolCallRequest)`. This
   is a deliberate resequencing of `executeTools`, not a one-line insertion:
   today the runtime `ToolCall` value is only assembled after the durable
   record and both status events; the implementation must assemble the
@@ -191,12 +189,13 @@ semantics are binding, grounded in `executeTools`
   want an original-input audit trail record it themselves from their own
   middleware.
 - **Patch point**: the `AfterToolCall` chain runs after `executeTool`
-  returns and **before** `encodeToolOutput`/`Store.FinishToolCall`. The
+  returns and **before**
+  `ExecutionStore.SettleToolCall(SettleToolCallRequest)`. The
   durable output, the settled tool-call event, the persisted
   `PartToolResult`, and the model-visible tool message all observe the
   patched result.
-- **Ordering**: `BeforeToolCall` runs in registration order and
-  `AfterToolCall` in reverse registration order (onion model). Permissions
+- **Ordering**: `BeforeToolCall` and `AfterToolCall` both run as transform
+  waterfalls in registration order. Permissions
   decide after the rewrite chain completes, so policy always evaluates what
   will actually execute.
 - **Exactly-once**: because rewrite precedes durable admission, resumed
@@ -247,7 +246,7 @@ proven):**
 - `event-sink` — `emit` receiving a bounded event DTO (kind, session/run
   identity, timestamps, bounded payload summary). Fire-and-forget from the
   guest's perspective; maps to `runtime.EventSink` and pi's `subscribe`.
-- `hook` — `before-run`, `before-turn`, `after-turn`, `after-run` receive the
+- `hook` — `before-run` and `after-run` receive the
   bounded snapshot DTO below and return only success or a structured error.
 - `tool-middleware` — `before-tool-call` receiving tool name, tool-call ID,
   the normalized JSON input, and the bounded turn metadata, returning a
@@ -276,7 +275,7 @@ patch" contract cannot be defined honestly yet. Revisit only after a
 config-side milestone establishes secret classification and patch/merge
 semantics.
 
-Explicitly not Wasm-extensible: `session.Store` and `session.Transactor`
+Explicitly not Wasm-extensible: transactional `session.Store`
 (chatty, transactional, latency-sensitive), `model.Resolver`, `model.Adapter`,
 and `model.Streamer` (model execution stays native), and `runtime.IDGenerator`
 (durable identity stays host-owned).
@@ -374,16 +373,16 @@ For each implemented world, `wasmext` exposes a constructor returning the
 seam's native Go type (Phase A first, Phase B when its wrappers land):
 
 ```go
-func LoadTool(ctx context.Context, cfg ModuleConfig) (tools.Definition, error)
-func LoadPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (permissions.Policy, error)
-func LoadContextSource(ctx context.Context, cfg ModuleConfig) (runtime.ContextSource, error)
-func LoadEventSink(ctx context.Context, cfg ModuleConfig) (runtime.EventSink, error)
-func LoadHook(ctx context.Context, cfg ModuleConfig) (runtime.Hook, error)
-func LoadToolMiddleware(ctx context.Context, cfg ModuleConfig) (runtime.ToolMiddleware, error)
+func OpenTool(ctx context.Context, cfg ModuleConfig) (*LoadedTool, error)
+func OpenPermissionsPolicy(ctx context.Context, cfg ModuleConfig) (*LoadedPermissionsPolicy, error)
+func OpenContextSource(ctx context.Context, cfg ModuleConfig) (*LoadedContextSource, error)
+func OpenEventSink(ctx context.Context, cfg ModuleConfig) (*LoadedEventSink, error)
+func OpenHook(ctx context.Context, cfg ModuleConfig) (*LoadedHook, error)
+func OpenToolMiddleware(ctx context.Context, cfg ModuleConfig) (*LoadedToolMiddleware, error)
 ```
 
-`ModuleConfig` carries path, expected SHA-256, per-call limits, and bounded
-non-secret guest configuration. Wrapper semantics:
+`ModuleConfig` carries path, expected SHA-256, and per-call limits. Wrapper
+semantics:
 
 - Wrappers translate between runtime types and WIT DTOs at the boundary,
   applying the bounds from section 4 in host code on both directions.
@@ -394,16 +393,16 @@ non-secret guest configuration. Wrapper semantics:
 - A guest error or resource-limit violation surfaces as an ordinary Go error
   from the wrapped method; the orchestrator's existing failure handling for
   that seam applies unchanged.
-- `LoadTool` returns a `tools.Definition` (a struct of closures, not an
+- `OpenTool` returns an explicit close handle whose `Definition` method returns
+  a `tools.Definition` (a struct of closures, not an
   interface) whose `Execute` performs the guest call and whose `Decode` and
   `Encode` are JSON passthroughs validating size bounds; `Normalize` is unset.
   It reaches the orchestrator the same way native definitions do:
-  `tools.NewRegistry()` → `Register(definition)` → `WithToolRegistry(registry)`.
-- The Wasm-backed `runtime.Hook` echoes its input snapshot unmodified from
-  `BeforeTurn`. This is a wrapper-implementation policy, not a change to
-  `runtime.Hook` — the interface's `BeforeTurn(ctx, TurnSnapshot)
-  (TurnSnapshot, error)` contract still permits native hooks to mutate, and
-  the orchestrator continues to apply returned snapshots.
+  `composition.Registry.Mount` → `Registrar.Tool` →
+  `runtime.WithRunPlanProvider(registry)`.
+- The Wasm hook world exposes only run-boundary notifications: `before-run`
+  receives admission metadata and `after-run` receives the same bounded
+  projection on the settlement notice. The adapter retains no per-run state.
 - `runtime.EventSink` reality check (verified): every `Emit` call site in the
   orchestrator and admitter discards the error today — behavior is
   silent-drop, with no observer logging, and the tool-call status emits are
@@ -418,18 +417,23 @@ non-secret guest configuration. Wrapper semantics:
 End-to-end, native and Wasm-backed dependencies wire in identically:
 
 ```go
-policy, err := wasmext.LoadPermissionsPolicy(ctx, wasmext.ModuleConfig{ /* ... */ })
+loader := wasmext.NewLoader()
+defer loader.Close(context.Background())
+policy, err := loader.LoadPermissionsPolicy(ctx, wasmext.ModuleConfig{ /* ... */ })
 // or: policy := permissions.PolicyFunc(func(ctx context.Context, req permissions.Request) (permissions.Decision, error) { /* ... */ })
 
-def, err := wasmext.LoadTool(ctx, wasmext.ModuleConfig{ /* ... */ })
-registry := tools.NewRegistry()
-_, err = registry.Register(def) // same registration path as a native tools.Definition
+def, err := loader.LoadTool(ctx, wasmext.ModuleConfig{ /* ... */ })
+registry := composition.NewRegistry(nil)
+mount, err := registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+    return registrar.Tool(composition.ToolRegistration{ID: "wasm-tool", Scope: extension.GlobalScope(), Definition: def})
+}))
+defer mount.Close(context.Background())
 
 orch, err := runtime.NewStreamingOrchestrator(
     runtime.WithStore(store),
     runtime.WithModelResolver(resolver),
     runtime.WithIDGenerator(ids),
-    runtime.WithToolRegistry(registry),
+    runtime.WithRunPlanProvider(registry),
     runtime.WithPermissions(policy),
 )
 // The embedder, not the orchestrator, later closes what it loaded:

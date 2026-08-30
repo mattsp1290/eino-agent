@@ -8,10 +8,10 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-// ProviderRequest builds the transport-neutral request passed to model
-// adapters for one turn. ToolInfo pointers remain owned by the materialized
-// tools; providers must treat them as immutable.
-func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, observer model.StreamObserver) model.Request {
+// ProviderRequest assembles the transport-neutral request for one turn. The
+// caller validates and takes canonical ownership of the complete graph before
+// dispatch.
+func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, messages []*einoschema.Message) model.Request {
 	tools := make([]*einoschema.ToolInfo, 0, len(s.Tools))
 	for _, tool := range s.Tools {
 		if tool.Info != nil {
@@ -20,11 +20,10 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 	}
 	return model.Request{
 		Identity: modelIdentity(s.ContextIdentity(messageID, "", trace)),
-		Messages: cloneSlice(s.Messages),
+		Messages: messages,
 		Tools:    tools,
-		Options:  cloneStringMap(s.Config.Agent.Options),
-		Observer: observer,
-	}.Clone()
+		Options:  s.Config.Agent.Options,
+	}
 }
 
 func modelIdentity(identity agentcontext.Identity) model.Identity {
@@ -39,6 +38,6 @@ func modelIdentity(identity agentcontext.Identity) model.Identity {
 		TraceID:            identity.Trace.TraceID,
 		SpanID:             identity.Trace.SpanID,
 		ParentSpanID:       identity.Trace.ParentSpanID,
-		TraceAttributes:    cloneStringMap(identity.Trace.Attributes),
+		TraceAttributes:    identity.Trace.Attributes,
 	}
 }

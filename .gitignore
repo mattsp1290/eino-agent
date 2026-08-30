@@ -38,3 +38,6 @@ go.work.sum
 
 # Tool binaries built from internal/tools nested module
 .bin/
+
+# Transient agent planning artifacts
+/.agents/plans/

@@ -25,10 +25,11 @@ The propagated identity includes:
 - model ID;
 - trace/span IDs and bounded attributes.
 
-`runtime.TurnSnapshot.ContextIdentity` derives provider/model identity from the
-resolved model when available, and falls back to the validated config selection
-before model resolution. This keeps context sources, tools, hooks, AG-UI
-adapters, and observability adapters aligned on the same identifiers.
+`runtime.TurnSnapshot.ContextIdentity` derives provider/model identity only from
+the resolved model. Fresh runs validate that resolution against the requested
+selection before history reads or admission; no downstream layer reconstructs
+identity from configuration. This keeps context sources, tools, hooks, AG-UI
+adapters, durable records, and observability aligned on the same identifiers.
 
 ## Context Source Kinds
 
@@ -65,6 +66,24 @@ processing.
 No runtime API wraps cancellation in a custom token. That keeps provider
 adapters, tools, and host integrations compatible with standard Go cancellation
 and future tracing middleware.
+
+## Runtime Extension Contributions
+
+The runtime context-assembly point accepts only text-only system and user
+messages. Contributions are sorted by order and source, then materialized in
+three fixed regions:
+
+```text
+system contribution prelude
+durable base history (unchanged)
+user contribution suffix
+```
+
+Assistant and tool roles are not context-source material. Tool calls,
+multimodal fields, names, reasoning, response metadata, `Extra`, and deprecated
+`MultiContent` are also rejected. This keeps extension-provided instructions
+from appearing after conversation history and prevents a context source from
+manufacturing durable dialogue or tool transitions.
 
 ## Portable References
 

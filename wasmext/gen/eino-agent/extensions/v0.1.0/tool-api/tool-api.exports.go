@@ -13,6 +13,14 @@ var Exports struct {
 	//	metadata: func() -> result<tool-metadata, structured-error>
 	Metadata func() (result cm.Result[ToolMetadataShape, ToolMetadata, StructuredError])
 
+	// PermissionPattern represents the caller-defined, exported function "permission-pattern".
+	//
+	// Derives the permission identity from final normalized tool input. This
+	// value is evaluated by the host policy; it is not an authorization result.
+	//
+	//	permission-pattern: func(input-json: string) -> result<string, structured-error>
+	PermissionPattern func(inputJSON string) (result cm.Result[StructuredErrorShape, string, StructuredError])
+
 	// Execute represents the caller-defined, exported function "execute".
 	//
 	// Input and output are normalized JSON documents whose byte bounds are

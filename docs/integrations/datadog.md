@@ -1,6 +1,6 @@
 # Datadog Exporter Wiring
 
-`eino-agent` records runtime observations through `github.com/mattsp1290/eino-obs`. The runtime takes an `*einoobs.Observer` on `runtime.StreamingOrchestrator.Observer`; applications decide whether that observer stays no-network or exports to Datadog.
+`eino-agent` records runtime observations through `github.com/mattsp1290/eino-obs`. Applications pass an `*einoobs.Observer` through `runtime.WithObserver`; applications decide whether that observer stays no-network or exports to Datadog.
 
 The buildable example in `examples/datadog` is safe by default:
 
@@ -18,7 +18,15 @@ observer, mode, err := datadogexample.NewObserverFromConfig(snapshot.Observabili
 if err != nil {
 	return err
 }
-datadogexample.AttachRuntimeObserver(orchestrator, observer)
+orchestrator, err := runtime.NewStreamingOrchestrator(
+    runtime.WithStore(store),
+    runtime.WithModelResolver(resolver),
+    runtime.WithIDGenerator(ids),
+    runtime.WithObserver(observer),
+)
+if err != nil {
+    return err
+}
 _ = mode // "no-network" unless Datadog export is explicitly enabled.
 ```
 

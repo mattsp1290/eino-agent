@@ -10,125 +10,119 @@ import (
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 
 	"github.com/mattsp1290/eino-agent/runtime"
-	"github.com/mattsp1290/eino-agent/session"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
 )
 
-func TestClientToolSnapshotMaterializesModelFacingTools(t *testing.T) {
-	t.Parallel()
-
-	tools, err := ClientToolSnapshot{
-		SessionID:  "session-1",
-		Generation: 7,
-		Tools:      []aguitypes.Tool{clientTool("client_lookup")},
-	}.RuntimeTools(testDispatcher(t))
+func TestClientToolSnapshotBuildsCanonicalDefinitions(t *testing.T) {
+	definitions, err := ClientToolSnapshot{
+		SessionID: "session-1", Generation: 7, DispatcherArtifactID: "dispatcher-v1",
+		Tools: []aguitypes.Tool{clientTool("client_lookup")},
+	}.Definitions(testDispatcher(t, json.RawMessage(`{"client":true}`)))
 	if err != nil {
-		t.Fatalf("RuntimeTools error = %v", err)
+		t.Fatal(err)
 	}
-	if len(tools) != 1 || tools[0].Name != "client_lookup" {
-		t.Fatalf("tools = %#v", tools)
+	if len(definitions) != 1 || definitions[0].Name != "client_lookup" {
+		t.Fatalf("definitions = %#v", definitions)
 	}
-	if tools[0].Metadata[MetadataClientTool] != "true" || tools[0].Metadata[MetadataClientToolGeneration] != "7" {
-		t.Fatalf("metadata = %#v", tools[0].Metadata)
+	definition := definitions[0]
+	if definition.Metadata[MetadataClientTool] != "true" || definition.Metadata[MetadataClientToolGeneration] != "7" {
+		t.Fatalf("metadata = %#v", definition.Metadata)
 	}
-	if got := tools[0].Scope.Permissions; len(got) != 1 || got[0] != PermissionClientTool {
-		t.Fatalf("permissions = %#v", got)
+	if len(definition.Permissions) != 1 || definition.Permissions[0] != PermissionClientTool {
+		t.Fatalf("permissions = %#v", definition.Permissions)
 	}
-	normalized, err := tools[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"query":"hi"}`))
+	materialized, err := agenttools.Materialize(context.Background(), definition, runtime.ToolScopeContext{})
 	if err != nil {
-		t.Fatalf("DecodeToolInput error = %v", err)
+		t.Fatal(err)
 	}
-	if string(normalized) != `{"query":"hi"}` {
-		t.Fatalf("normalized = %s", normalized)
-	}
-	result, err := tools[0].Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: normalized})
+	decoded, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{"query":"hi"}`))
 	if err != nil {
-		t.Fatalf("Execute error = %v", err)
+		t.Fatal(err)
 	}
-	if result.Output != `{"client":true}` {
-		t.Fatalf("client executor result = %#v", result)
+	output, err := materialized.Executor.Execute(context.Background(), runtime.ToolCall{Input: decoded, ID: "call-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(output.Structured) != `{"client":true}` {
+		t.Fatalf("encoded = %s", output.Structured)
 	}
 }
 
-func TestClientToolSnapshotRejectsMalformedInput(t *testing.T) {
-	t.Parallel()
-
-	tools, err := ClientToolSnapshot{SessionID: "session-1", Generation: 1, Tools: []aguitypes.Tool{clientTool("client_lookup")}}.RuntimeTools(testDispatcher(t))
+func TestClientToolDefinitionRejectsMalformedInputAndResult(t *testing.T) {
+	definitions, err := ClientToolSnapshot{SessionID: "session", Generation: 1, DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}}.Definitions(testDispatcher(t, json.RawMessage(`{`)))
 	if err != nil {
-		t.Fatalf("RuntimeTools error = %v", err)
+		t.Fatal(err)
 	}
-	_, err = tools[0].InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{`))
-	if !errors.Is(err, agenttools.ErrMalformedInput) {
-		t.Fatalf("DecodeToolInput error = %v, want ErrMalformedInput", err)
+	materialized, err := agenttools.Materialize(context.Background(), definitions[0], runtime.ToolScopeContext{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := materialized.InputDecoder.DecodeToolInput(context.Background(), json.RawMessage(`{`)); !errors.Is(err, agenttools.ErrMalformedInput) {
+		t.Fatalf("decode error = %v", err)
+	}
+	if _, err := materialized.Executor.Execute(context.Background(), runtime.ToolCall{ID: "call", Input: json.RawMessage(`{}`)}); err == nil {
+		t.Fatal("invalid dispatcher JSON result accepted")
 	}
 }
 
-func TestClientToolSnapshotClonesDefinitions(t *testing.T) {
-	t.Parallel()
-
-	snapshot := ClientToolSnapshot{
-		SessionID:  "session-1",
-		Generation: 1,
-		Tools:      []aguitypes.Tool{clientTool("client_lookup")},
-	}
-	tools, err := snapshot.RuntimeTools(testDispatcher(t))
+func TestClientToolSnapshotCloneIsCheckedAndIsolated(t *testing.T) {
+	snapshot := ClientToolSnapshot{SessionID: "session", Generation: 1, DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}}
+	cloned, err := snapshot.Clone()
 	if err != nil {
-		t.Fatalf("RuntimeTools error = %v", err)
+		t.Fatal(err)
 	}
-	tools[0].Info.Name = "mutated"
-	again, err := snapshot.RuntimeTools(testDispatcher(t))
-	if err != nil {
-		t.Fatalf("RuntimeTools again error = %v", err)
-	}
-	if again[0].Info.Name != "client_lookup" {
-		t.Fatalf("tool info shared mutable state: %q", again[0].Info.Name)
-	}
-	cloned := snapshot.Clone()
 	snapshot.Tools[0].Parameters.(map[string]any)["properties"].(map[string]any)["query"] = map[string]any{"type": "number"}
-	fromClone, err := cloned.RuntimeTools(testDispatcher(t))
+	definitions, err := cloned.Definitions(testDispatcher(t, json.RawMessage(`{}`)))
 	if err != nil {
-		t.Fatalf("RuntimeTools clone error = %v", err)
+		t.Fatal(err)
 	}
-	schema, err := fromClone[0].Info.ToJSONSchema()
+	schema, err := definitions[0].Parameters.ToJSONSchema()
 	if err != nil {
-		t.Fatalf("ToJSONSchema error = %v", err)
+		t.Fatal(err)
 	}
 	raw, _ := json.Marshal(schema)
 	if !strings.Contains(string(raw), `"type":"string"`) {
 		t.Fatalf("cloned schema was mutated: %s", raw)
 	}
+
+	unsupported := snapshot
+	unsupported.Tools = []aguitypes.Tool{{Name: "bad", Parameters: map[string]any{"bad": make(chan int)}}}
+	if _, err := unsupported.Clone(); err == nil {
+		t.Fatal("unsupported parameter graph cloned without error")
+	}
 }
 
 func TestClientToolSnapshotRequiresDispatcher(t *testing.T) {
-	t.Parallel()
-
-	_, err := ClientToolSnapshot{SessionID: "session-1", Generation: 1, Tools: []aguitypes.Tool{clientTool("client_lookup")}}.RuntimeTools(nil)
+	_, err := ClientToolSnapshot{SessionID: "session", Generation: 1, DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}}.Definitions(nil)
 	if !errors.Is(err, ErrClientToolDispatchRequired) {
-		t.Fatalf("RuntimeTools error = %v, want ErrClientToolDispatchRequired", err)
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestClientToolDefinitionPropagatesDispatcherError(t *testing.T) {
+	want := errors.New("dispatch failed")
+	dispatcher := ClientToolDispatcherFunc(func(context.Context, runtime.ToolCall) (json.RawMessage, error) { return nil, want })
+	definitions, err := ClientToolSnapshot{SessionID: "session", Generation: 1, DispatcherArtifactID: "dispatcher", Tools: []aguitypes.Tool{clientTool("client")}}.Definitions(dispatcher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := definitions[0].Execute(context.Background(), agenttools.Execution{Call: runtime.ToolCall{ID: "call"}}); !errors.Is(err, want) {
+		t.Fatalf("execute error = %v, want dispatcher error", err)
 	}
 }
 
 func clientTool(name string) aguitypes.Tool {
-	return aguitypes.Tool{
-		Name:        name,
-		Description: "client lookup",
-		Parameters: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"query": map[string]any{"type": "string"},
-			},
-		},
-	}
+	return aguitypes.Tool{Name: name, Description: "client lookup", Parameters: map[string]any{
+		"type": "object", "properties": map[string]any{"query": map[string]any{"type": "string"}},
+	}}
 }
 
-func testDispatcher(t *testing.T) ClientToolDispatcher {
+func testDispatcher(t *testing.T, result json.RawMessage) ClientToolDispatcher {
 	t.Helper()
-	return ClientToolDispatcherFunc(func(_ context.Context, call runtime.ToolCall) (runtime.ToolResult, error) {
+	return ClientToolDispatcherFunc(func(_ context.Context, call runtime.ToolCall) (json.RawMessage, error) {
 		if call.ID == "" {
 			t.Fatal("client tool call missing id")
 		}
-		return runtime.ToolResult{Output: `{"client":true}`}, nil
+		return result, nil
 	})
 }
-
-var _ = session.ID("")

@@ -15,7 +15,6 @@ import (
 	"github.com/mattsp1290/eino-obs/exporter/datadog"
 
 	"github.com/mattsp1290/eino-agent/config"
-	"github.com/mattsp1290/eino-agent/runtime"
 )
 
 const (
@@ -175,14 +174,6 @@ func scrubSecret(message, secret string) string {
 		return message
 	}
 	return strings.ReplaceAll(message, secret, "[redacted]")
-}
-
-// AttachRuntimeObserver wires the configured observer into the runtime.
-func AttachRuntimeObserver(orchestrator *runtime.StreamingOrchestrator, observer *einoobs.Observer) {
-	if orchestrator == nil {
-		return
-	}
-	orchestrator.Observer = observer
 }
 
 func boolEnv(raw string) (bool, error) {

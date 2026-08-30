@@ -2,163 +2,90 @@ package agui
 
 import (
 	"context"
-	"sync"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"strconv"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 
 	agentagui "github.com/mattsp1290/eino-agent/agui"
-	"github.com/mattsp1290/eino-agent/runtime"
+	"github.com/mattsp1290/eino-agent/composition"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
 )
 
-// Registry composes server-side tools with per-session AG-UI client tools.
-type Registry struct {
-	Server     runtime.ToolRegistry
-	Dispatcher agentagui.ClientToolDispatcher
-
-	mu          sync.RWMutex
-	clients     map[session.ID]agentagui.ClientToolSnapshot
-	generations map[session.ID]uint64
-}
-
-// NewRegistry returns a registry that resolves server tools plus client tools.
-func NewRegistry(server runtime.ToolRegistry, dispatcher agentagui.ClientToolDispatcher) *Registry {
-	return &Registry{
-		Server:      server,
-		Dispatcher:  dispatcher,
-		clients:     map[session.ID]agentagui.ClientToolSnapshot{},
-		generations: map[session.ID]uint64{},
+// MountClientTools publishes one immutable, session-scoped AG-UI client tool
+// generation through the canonical composition registry.
+func MountClientTools(ctx context.Context, registry *composition.Registry, snapshot agentagui.ClientToolSnapshot, dispatcher agentagui.ClientToolDispatcher) (*composition.Mount, error) {
+	if registry == nil || snapshot.SessionID == "" || snapshot.Generation == 0 || snapshot.DispatcherArtifactID == "" {
+		return nil, agenttools.ErrInvalidDefinition
 	}
-}
-
-// SetClientTools replaces the client tool definitions for one session. Older
-// generations are rejected so delayed client updates cannot overwrite newer
-// definitions.
-func (r *Registry) SetClientTools(snapshot agentagui.ClientToolSnapshot) error {
-	if snapshot.SessionID == "" {
-		return agenttools.ErrInvalidDefinition
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.clients == nil {
-		r.clients = map[session.ID]agentagui.ClientToolSnapshot{}
-	}
-	if r.generations == nil {
-		r.generations = map[session.ID]uint64{}
-	}
-	current := r.generations[snapshot.SessionID]
-	if snapshot.Generation <= current {
-		return agenttools.ErrStaleRegistration
-	}
-	r.generations[snapshot.SessionID] = snapshot.Generation
-	r.clients[snapshot.SessionID] = snapshot.Clone()
-	return nil
-}
-
-// ClearClientTools removes all client tool definitions for a session.
-func (r *Registry) ClearClientTools(sessionID session.ID) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.clients, sessionID)
-}
-
-// ResolveTools materializes server and session-scoped client tools.
-func (r *Registry) ResolveTools(ctx context.Context, snapshot runtime.TurnSnapshot) ([]runtime.Tool, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	result := []runtime.Tool{}
-	if r.Server != nil {
-		server, err := r.Server.ResolveTools(ctx, snapshot.Clone())
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, cloneRuntimeTools(server)...)
-	}
-	clientSnapshot, ok := r.clientSnapshot(snapshot.SessionID)
-	if !ok {
-		return result, nil
-	}
-	clientTools, err := clientSnapshot.RuntimeTools(r.Dispatcher)
+	definitions, err := snapshot.Definitions(dispatcher)
 	if err != nil {
 		return nil, err
 	}
-	serverNames := map[string]bool{}
-	for _, tool := range result {
-		serverNames[tool.Name] = true
+	if len(definitions) == 0 {
+		return nil, agenttools.ErrInvalidDefinition
 	}
-	enabled := enabledSet(snapshot)
-	disabled := disabledSet(snapshot)
-	for _, tool := range clientTools {
-		if serverNames[tool.Name] || !includeTool(tool.Name, enabled, disabled) {
-			continue
+	seen := make(map[string]bool, len(definitions))
+	for _, definition := range definitions {
+		if definition.Name == "" || seen[definition.Name] {
+			return nil, fmt.Errorf("%w: duplicate or empty client tool name %q", agenttools.ErrInvalidDefinition, definition.Name)
 		}
-		result = append(result, tool)
+		seen[definition.Name] = true
 	}
-	return result, nil
-}
-
-func (r *Registry) clientSnapshot(sessionID session.ID) (agentagui.ClientToolSnapshot, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	snapshot, ok := r.clients[sessionID]
-	return snapshot.Clone(), ok
-}
-
-func cloneRuntimeTools(src []runtime.Tool) []runtime.Tool {
-	if src == nil {
-		return nil
+	component, err := clientComponent(snapshot)
+	if err != nil {
+		return nil, err
 	}
-	dst := make([]runtime.Tool, len(src))
-	copy(dst, src)
-	return dst
-}
-
-// ClientNames returns the current client tool name set for call
-// classification.
-func ClientNames(tools []aguitypes.Tool, serverNames ...map[string]bool) map[string]bool {
-	result := make(map[string]bool, len(tools))
-	blocked := map[string]bool{}
-	if len(serverNames) > 0 {
-		blocked = serverNames[0]
-	}
-	for _, tool := range tools {
-		if tool.Name != "" && !blocked[tool.Name] {
-			result[tool.Name] = true
+	return registry.Mount(ctx, component, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+		for _, definition := range definitions {
+			if err := registrar.Tool(composition.ToolRegistration{
+				ID:    definition.Name,
+				Scope: extension.SessionScope(string(snapshot.SessionID)), Definition: definition,
+			}); err != nil {
+				return err
+			}
 		}
-	}
-	return result
-}
-
-func enabledSet(snapshot runtime.TurnSnapshot) map[string]bool {
-	if snapshot.Config.Tools.Enabled == nil {
 		return nil
-	}
-	result := make(map[string]bool, len(snapshot.Config.Tools.Enabled))
-	for _, name := range snapshot.Config.Tools.Enabled {
-		result[name] = true
-	}
-	return result
+	}))
 }
 
-func disabledSet(snapshot runtime.TurnSnapshot) map[string]bool {
-	if len(snapshot.Config.Tools.Disabled) == 0 {
-		return nil
+func clientComponent(snapshot agentagui.ClientToolSnapshot) (extension.Component, error) {
+	frozen, err := snapshot.Clone()
+	if err != nil {
+		return extension.Component{}, err
 	}
-	result := make(map[string]bool, len(snapshot.Config.Tools.Disabled))
-	for _, name := range snapshot.Config.Tools.Disabled {
-		result[name] = true
+	payload := struct {
+		SessionID            session.ID        `json:"session_id"`
+		Generation           uint64            `json:"generation"`
+		DispatcherArtifactID string            `json:"dispatcher_artifact_id"`
+		Tools                []aguitypes.Tool  `json:"tools"`
+		Permissions          []string          `json:"permissions,omitempty"`
+		Metadata             map[string]string `json:"metadata,omitempty"`
+	}{frozen.SessionID, frozen.Generation, frozen.DispatcherArtifactID, frozen.Tools, frozen.Permissions, frozen.Metadata}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return extension.Component{}, err
 	}
-	return result
-}
-
-func includeTool(name string, enabled map[string]bool, disabled map[string]bool) bool {
-	if disabled[name] {
-		return false
+	artifactSum := sha256.Sum256(raw)
+	configRaw, err := json.Marshal(struct {
+		SessionID  session.ID `json:"session_id"`
+		Generation uint64     `json:"generation"`
+	}{frozen.SessionID, frozen.Generation})
+	if err != nil {
+		return extension.Component{}, err
 	}
-	if enabled == nil {
-		return true
-	}
-	return enabled[name]
+	configSum := sha256.Sum256(configRaw)
+	sessionSum := sha256.Sum256([]byte(frozen.SessionID))
+	return extension.Component{
+		InstanceID: "agui-client-" + hex.EncodeToString(sessionSum[:8]) + "-" + strconv.FormatUint(frozen.Generation, 10),
+		Artifact: extension.Artifact{
+			Name: "agui-client-tools", Version: "1", Hash: hex.EncodeToString(artifactSum[:]),
+			ConfigHash: hex.EncodeToString(configSum[:]), SourceKind: extension.SourceNative,
+		},
+	}, nil
 }

@@ -4,11 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strconv"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	einoschema "github.com/cloudwego/eino/schema"
+	aguitools "github.com/mattsp1290/eino-agui/tools"
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
@@ -30,148 +29,113 @@ var ErrClientToolDispatchRequired = errors.New("client tool dispatcher required"
 // ClientToolDispatcher sends a model-requested AG-UI client tool call to the
 // host/client transport and returns the client-produced result.
 type ClientToolDispatcher interface {
-	ExecuteClientTool(ctx context.Context, call runtime.ToolCall) (runtime.ToolResult, error)
+	ExecuteClientTool(ctx context.Context, call runtime.ToolCall) (json.RawMessage, error)
 }
 
 // ClientToolDispatcherFunc adapts a function into a dispatcher.
-type ClientToolDispatcherFunc func(context.Context, runtime.ToolCall) (runtime.ToolResult, error)
+type ClientToolDispatcherFunc func(context.Context, runtime.ToolCall) (json.RawMessage, error)
 
-func (fn ClientToolDispatcherFunc) ExecuteClientTool(ctx context.Context, call runtime.ToolCall) (runtime.ToolResult, error) {
+func (fn ClientToolDispatcherFunc) ExecuteClientTool(ctx context.Context, call runtime.ToolCall) (json.RawMessage, error) {
 	return fn(ctx, call)
 }
 
 // ClientToolSnapshot is the client-defined tool set active for one session.
 type ClientToolSnapshot struct {
-	SessionID   session.ID
-	Generation  uint64
-	Tools       []aguitypes.Tool
-	Permissions []string
-	Metadata    map[string]string
+	SessionID            session.ID
+	Generation           uint64
+	DispatcherArtifactID string
+	Tools                []aguitypes.Tool
+	Permissions          []string
+	Metadata             map[string]string
 }
 
 // Clone returns a defensive copy of the snapshot containers.
-func (s ClientToolSnapshot) Clone() ClientToolSnapshot {
+func (s ClientToolSnapshot) Clone() (ClientToolSnapshot, error) {
 	next := s
-	next.Tools = cloneClientTools(s.Tools)
+	var err error
+	next.Tools, err = cloneClientTools(s.Tools)
+	if err != nil {
+		return ClientToolSnapshot{}, err
+	}
 	next.Permissions = cloneStrings(s.Permissions)
 	next.Metadata = cloneStringsMap(s.Metadata)
-	return next
+	return next, nil
 }
 
-// RuntimeTools converts client definitions into model-facing runtime tools.
-func (s ClientToolSnapshot) RuntimeTools(dispatcher ClientToolDispatcher) ([]runtime.Tool, error) {
+// Definitions converts client definitions into canonical typed tools.
+func (s ClientToolSnapshot) Definitions(dispatcher ClientToolDispatcher) ([]agenttools.Definition, error) {
 	if dispatcher == nil {
 		return nil, ErrClientToolDispatchRequired
 	}
-	infos, err := ClientToolInfos(s.Tools)
+	frozen, err := s.Clone()
 	if err != nil {
 		return nil, err
 	}
-	result := make([]runtime.Tool, 0, len(infos))
+	infos, err := aguitools.ClientToolInfos(frozen.Tools)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]agenttools.Definition, 0, len(infos))
 	for _, info := range infos {
 		if info == nil {
 			continue
 		}
-		metadata := cloneStringsMap(s.Metadata)
+		metadata := cloneStringsMap(frozen.Metadata)
 		if metadata == nil {
 			metadata = map[string]string{}
 		}
 		metadata[MetadataClientTool] = "true"
-		metadata[MetadataClientToolGeneration] = strconv.FormatUint(s.Generation, 10)
-		permissions := cloneStrings(s.Permissions)
+		metadata[MetadataClientToolGeneration] = strconv.FormatUint(frozen.Generation, 10)
+		permissions := cloneStrings(frozen.Permissions)
 		if len(permissions) == 0 {
 			permissions = []string{PermissionClientTool}
 		}
-		result = append(result, runtime.Tool{
-			Name:         info.Name,
-			Info:         cloneToolInfo(info),
-			Executor:     clientToolExecutor{dispatcher: dispatcher},
-			RetrySafe:    false,
-			Scope:        clientToolScope(s.SessionID, info.Name, permissions),
-			Concurrency:  runtime.ToolConcurrencyParallel,
-			InputDecoder: clientToolDecoder{},
-			Retention:    runtime.RetentionPolicy{MaxInlineBytes: 4096},
-			Metadata:     metadata,
+		result = append(result, agenttools.Definition{
+			Name: info.Name, Description: info.Desc, Parameters: info.ParamsOneOf,
+			Execute: func(ctx context.Context, execution agenttools.Execution) (json.RawMessage, error) {
+				if dispatcher == nil {
+					return nil, ErrClientToolDispatchRequired
+				}
+				return dispatcher.ExecuteClientTool(ctx, execution.Call)
+			},
+			Scope: func(context.Context, runtime.ToolScopeContext) runtime.ToolScope {
+				return runtime.ToolScope{Permissions: cloneStrings(permissions)}
+			},
+			Permissions: permissions, Retention: runtime.RetentionPolicy{MaxInlineBytes: 4096}, Metadata: metadata,
 		})
 	}
 	return result, nil
 }
 
-type clientToolDecoder struct{}
-
-func (clientToolDecoder) DecodeToolInput(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
-	if !json.Valid(raw) {
-		return nil, fmt.Errorf("%w: invalid json", agenttools.ErrMalformedInput)
-	}
-	return cloneRaw(raw), nil
-}
-
-type clientToolExecutor struct {
-	dispatcher ClientToolDispatcher
-}
-
-func (e clientToolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runtime.ToolResult, error) {
-	if e.dispatcher == nil {
-		return runtime.ToolResult{}, ErrClientToolDispatchRequired
-	}
-	return e.dispatcher.ExecuteClientTool(ctx, call)
-}
-
-func clientToolScope(sessionID session.ID, name string, permissions []string) runtime.ToolScope {
-	return runtime.ToolScope{
-		ConcurrencyKey: string(sessionID) + ":agui-client:" + name,
-		Permissions:    cloneStrings(permissions),
-	}
-}
-
-func cloneClientTools(src []aguitypes.Tool) []aguitypes.Tool {
+func cloneClientTools(src []aguitypes.Tool) ([]aguitypes.Tool, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	dst := make([]aguitypes.Tool, len(src))
 	for i, tool := range src {
 		dst[i] = tool
-		dst[i].Parameters = cloneJSONValue(tool.Parameters)
+		parameters, err := cloneJSONValue(tool.Parameters)
+		if err != nil {
+			return nil, err
+		}
+		dst[i].Parameters = parameters
 	}
-	return dst
+	return dst, nil
 }
 
-func cloneJSONValue(src any) any {
+func cloneJSONValue(src any) (any, error) {
 	if src == nil {
-		return nil
+		return nil, nil
 	}
 	raw, err := json.Marshal(src)
 	if err != nil {
-		return src
+		return nil, err
 	}
 	var dst any
 	if err := json.Unmarshal(raw, &dst); err != nil {
-		return src
+		return nil, err
 	}
-	return dst
-}
-
-func cloneToolInfo(src *einoschema.ToolInfo) *einoschema.ToolInfo {
-	if src == nil {
-		return nil
-	}
-	next := *src
-	if src.Extra != nil {
-		next.Extra = make(map[string]any, len(src.Extra))
-		for key, value := range src.Extra {
-			next.Extra[key] = value
-		}
-	}
-	return &next
-}
-
-func cloneRaw(src json.RawMessage) json.RawMessage {
-	if src == nil {
-		return nil
-	}
-	dst := make(json.RawMessage, len(src))
-	copy(dst, src)
-	return dst
+	return dst, nil
 }
 
 func cloneStrings(src []string) []string {

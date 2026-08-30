@@ -1,9 +1,11 @@
 package history
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -77,7 +79,7 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 		for _, part := range parts {
 			if part.Kind != session.PartToolCall {
 				if part.Kind == session.PartToolResult {
-					toolMessages, err := projectToolResults(message, []session.Part{part})
+					toolMessages, err := projectToolResults([]session.Part{part})
 					if err != nil {
 						return nil, err
 					}
@@ -93,13 +95,13 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 		}
 		return result, nil
 	case session.RoleTool:
-		return projectToolResults(message, parts)
+		return projectToolResults(parts)
 	default:
 		return nil, fmt.Errorf("unsupported session role %q", message.Role)
 	}
 }
 
-func projectToolResults(message session.Message, parts []session.Part) ([]*einoschema.Message, error) {
+func projectToolResults(parts []session.Part) ([]*einoschema.Message, error) {
 	result := []*einoschema.Message{}
 	for _, part := range parts {
 		if part.Kind != session.PartToolResult {
@@ -108,9 +110,6 @@ func projectToolResults(message session.Message, parts []session.Part) ([]*einos
 		toolCallID, content, err := decodeToolResult(part.Payload)
 		if err != nil {
 			return nil, err
-		}
-		if toolCallID == "" {
-			toolCallID = string(message.ID)
 		}
 		result = append(result, einoschema.ToolMessage(content, toolCallID))
 	}
@@ -195,73 +194,106 @@ func textContent(parts []session.Part, options Options) (string, error) {
 }
 
 func partText(part session.Part) (string, error) {
-	payload, err := decodeTextPayload(part.Payload)
-	if err != nil {
-		return "", fmt.Errorf("part %s payload: %w", part.ID, err)
+	switch part.Kind {
+	case session.PartText, session.PartReasoning, session.PartState:
+		payload, err := decodeCanonical[textPartPayload](part.Payload)
+		if err != nil {
+			return "", fmt.Errorf("part %s payload: %w", part.ID, err)
+		}
+		if payload.Text == nil {
+			return "", fmt.Errorf("part %s payload: text required", part.ID)
+		}
+		return *payload.Text, nil
+	case session.PartCompaction:
+		payload, err := decodeCanonical[compactionPartPayload](part.Payload)
+		if err != nil {
+			return "", fmt.Errorf("part %s payload: %w", part.ID, err)
+		}
+		if payload.Text == nil || payload.EpochID == "" || payload.Redacted == nil {
+			return "", fmt.Errorf("part %s payload: text, epoch_id, and redacted required", part.ID)
+		}
+		return *payload.Text, nil
+	default:
+		return "", fmt.Errorf("part %s: unsupported text payload kind %q", part.ID, part.Kind)
 	}
-	return payload.Text, nil
 }
 
-type textPayload struct {
-	Text       string          `json:"text"`
-	Content    string          `json:"content"`
-	ToolCallID string          `json:"tool_call_id"`
-	Raw        json.RawMessage `json:"raw"`
+type textPartPayload struct {
+	Text *string `json:"text"`
+}
+
+type compactionPartPayload struct {
+	Text             *string           `json:"text"`
+	EpochID          session.EpochID   `json:"epoch_id"`
+	SummarizedFromID session.MessageID `json:"summarized_from_id,omitempty"`
+	SummarizedToID   session.MessageID `json:"summarized_to_id,omitempty"`
+	TailStartID      session.MessageID `json:"tail_start_id,omitempty"`
+	Redacted         *bool             `json:"redacted"`
 }
 
 type toolResultPayload struct {
-	ToolCallID string          `json:"tool_call_id"`
-	Status     string          `json:"status"`
-	Content    string          `json:"content"`
-	Structured json.RawMessage `json:"structured"`
-	Truncated  bool            `json:"truncated"`
-	Redacted   bool            `json:"redacted"`
+	ToolCallID   string          `json:"tool_call_id"`
+	Status       string          `json:"status"`
+	Content      string          `json:"content,omitempty"`
+	Structured   json.RawMessage `json:"structured,omitempty"`
+	Truncated    bool            `json:"truncated,omitempty"`
+	OriginalSize int64           `json:"original_size,omitempty"`
+	InlineSize   int64           `json:"inline_size,omitempty"`
+	External     bool            `json:"external,omitempty"`
+	Redacted     bool            `json:"redacted,omitempty"`
 }
 
 func decodeToolResult(raw json.RawMessage) (string, string, error) {
-	var output toolResultPayload
-	if err := json.Unmarshal(raw, &output); err == nil && (output.ToolCallID != "" || output.Status != "" || len(output.Structured) > 0) {
-		content := output.Content
-		if content == "" && len(output.Structured) > 0 {
-			content = string(output.Structured)
-		}
-		if output.Status != "" && output.Status != "completed" {
-			status, _ := json.Marshal(map[string]any{
-				"status":    output.Status,
-				"content":   content,
-				"truncated": output.Truncated,
-				"redacted":  output.Redacted,
-			})
-			content = string(status)
-		}
-		return output.ToolCallID, content, nil
-	}
-	payload, err := decodeTextPayload(raw)
+	output, err := decodeCanonical[toolResultPayload](raw)
 	if err != nil {
 		return "", "", err
 	}
-	return payload.ToolCallID, payload.Text, nil
+	if output.ToolCallID == "" {
+		return "", "", fmt.Errorf("tool_call_id required")
+	}
+	switch output.Status {
+	case "completed", "expected_failure", "operational_failure", "interrupted":
+	default:
+		return "", "", fmt.Errorf("unsupported tool result status %q", output.Status)
+	}
+	if len(output.Structured) > 0 && !json.Valid(output.Structured) {
+		return "", "", fmt.Errorf("structured must contain a JSON value")
+	}
+	content := output.Content
+	if content == "" && len(output.Structured) > 0 {
+		content = string(output.Structured)
+	}
+	if output.Status != "completed" {
+		status, _ := json.Marshal(map[string]any{
+			"status":    output.Status,
+			"content":   content,
+			"truncated": output.Truncated,
+			"redacted":  output.Redacted,
+		})
+		content = string(status)
+	}
+	return output.ToolCallID, content, nil
 }
 
-func decodeTextPayload(raw json.RawMessage) (textPayload, error) {
-	if len(raw) == 0 {
-		return textPayload{}, nil
+func decodeCanonical[T any](raw json.RawMessage) (T, error) {
+	var value T
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return value, fmt.Errorf("JSON object required")
 	}
-	var text string
-	if err := json.Unmarshal(raw, &text); err == nil {
-		return textPayload{Text: text}, nil
+	decoder := json.NewDecoder(bytes.NewReader(trimmed))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, err
 	}
-	var payload textPayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return textPayload{}, err
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return value, fmt.Errorf("exactly one JSON value required")
+		}
+		return value, err
 	}
-	if payload.Text == "" {
-		payload.Text = payload.Content
-	}
-	if payload.Text == "" && len(payload.Raw) > 0 {
-		payload.Text = string(payload.Raw)
-	}
-	return payload, nil
+	return value, nil
 }
 
 type toolCallPayload struct {
@@ -271,9 +303,12 @@ type toolCallPayload struct {
 }
 
 func decodeToolCall(raw json.RawMessage) (einoschema.ToolCall, error) {
-	var payload toolCallPayload
-	if err := json.Unmarshal(raw, &payload); err != nil {
+	payload, err := decodeCanonical[toolCallPayload](raw)
+	if err != nil {
 		return einoschema.ToolCall{}, err
+	}
+	if payload.ID == "" || payload.Name == "" || len(payload.Arguments) == 0 {
+		return einoschema.ToolCall{}, fmt.Errorf("tool call id, name, and arguments required")
 	}
 	return einoschema.ToolCall{
 		ID:   payload.ID,

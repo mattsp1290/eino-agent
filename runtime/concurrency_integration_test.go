@@ -29,9 +29,13 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 		_ = store.Close()
 	}()
 	var executions atomic.Int64
-	orch := &StreamingOrchestrator{
-		Store: store,
-		Model: resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		executions.Add(1)
+		return ToolResult{Output: "tool ok"}, nil
+	})}}}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 			for _, msg := range request.Messages {
 				if msg.Role == einoschema.Tool {
 					return []*einoschema.Message{einoschema.AssistantMessage("ok:"+request.Identity.SessionID, nil)}, nil
@@ -45,16 +49,12 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 					Arguments: `{}`,
 				},
 			}})}, nil
-		})},
-		Tools: staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
-			executions.Add(1)
-			return ToolResult{Output: "tool ok"}, nil
-		})}}},
-		IDs:       &sequenceIDs{},
-		Clock:     func() time.Time { return time.Date(2026, 6, 28, 15, 0, 0, 0, time.UTC) },
-		OwnerID:   "owner",
-		QueueSize: 2,
-	}
+		})}),
+		WithClock(func() time.Time { return time.Date(2026, 6, 28, 15, 0, 0, 0, time.UTC) }),
+		WithOwnerID("owner"),
+		WithQueueSize(2),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
 
 	const sessions = 12
 	var wg sync.WaitGroup
@@ -107,18 +107,16 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 		_ = store.Close()
 	}()
 	started := make(chan struct{}, 16)
-	orch := &StreamingOrchestrator{
-		Store: store,
-		Model: resolvedModel{streamer: scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
 			started <- struct{}{}
 			<-ctx.Done()
 			return nil, ctx.Err()
-		})},
-		IDs:       &sequenceIDs{},
-		Clock:     func() time.Time { return time.Date(2026, 6, 28, 15, 30, 0, 0, time.UTC) },
-		OwnerID:   "owner",
-		QueueSize: 1,
-	}
+		})}),
+		WithClock(func() time.Time { return time.Date(2026, 6, 28, 15, 30, 0, 0, time.UTC) }),
+		WithOwnerID("owner"),
+	)
 
 	const sessions = 8
 	handles := make([]Handle, 0, sessions)
