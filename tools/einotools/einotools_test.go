@@ -20,6 +20,8 @@ import (
 	"github.com/mattsp1290/eino-tools/catalog"
 	"github.com/mattsp1290/eino-tools/fileops"
 	"github.com/mattsp1290/eino-tools/result"
+	"github.com/mattsp1290/eino-tools/search"
+	"github.com/mattsp1290/eino-tools/shell"
 	"github.com/mattsp1290/eino-tools/tracker"
 
 	"github.com/mattsp1290/eino-agent/composition"
@@ -39,7 +41,9 @@ func TestMountStandardPublishesCatalogOrderAndExecutesFileRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	component := standardComponent("standard")
-	mount, err := MountStandard(context.Background(), registry, component, Options{Scope: extension.GlobalScope()})
+	mount, err := MountStandard(context.Background(), registry, component, Options{
+		Catalog: hermeticCatalogOptions(t), Scope: extension.GlobalScope(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +119,7 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 		t.Fatal(err)
 	}
 	mount, err := MountStandard(ctx, plans, standardComponent("runtime"), Options{
-		Scope: extension.GlobalScope(),
+		Catalog: hermeticCatalogOptions(t), Scope: extension.GlobalScope(),
 		Permissions: map[string][]string{
 			catalog.IDFileRead: {"workspace.read"},
 		},
@@ -184,8 +188,10 @@ func TestMountStandardTrackerAndMCPPending(t *testing.T) {
 		t.Fatal(err)
 	}
 	writer := &closeWriter{}
+	catalogOptions := hermeticCatalogOptions(t)
+	catalogOptions.TrackerWriter = writer
 	mount, err := MountStandard(context.Background(), registry, standardComponent("tracker"), Options{
-		Scope: extension.GlobalScope(), Catalog: catalog.Options{TrackerWriter: writer},
+		Scope: extension.GlobalScope(), Catalog: catalogOptions,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -241,7 +247,7 @@ func TestMountStandardErrorsDoNotPublish(t *testing.T) {
 	assertNoPlanCapabilities(t, registry)
 
 	_, err = MountStandard(context.Background(), registry, standardComponent("unknown-policy"), Options{
-		Scope: extension.GlobalScope(), Permissions: map[string][]string{"standard.missing": {"read"}},
+		Catalog: hermeticCatalogOptions(t), Scope: extension.GlobalScope(), Permissions: map[string][]string{"standard.missing": {"read"}},
 	})
 	if !errors.Is(err, agenttools.ErrInvalidDefinition) {
 		t.Fatalf("unknown permissions error = %v", err)
@@ -265,7 +271,9 @@ func TestMountStandardErrorsDoNotPublish(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := mountStandard(context.Background(), registry, standardComponent(test.name), Options{Scope: extension.GlobalScope()}, func(options catalog.Options) ([]catalog.Definition, error) {
+			_, err := mountStandard(context.Background(), registry, standardComponent(test.name), Options{
+				Catalog: hermeticCatalogOptions(t), Scope: extension.GlobalScope(),
+			}, func(options catalog.Options) ([]catalog.Definition, error) {
 				definitions, err := catalog.Standard(options)
 				if err != nil {
 					return nil, err
@@ -277,6 +285,22 @@ func TestMountStandardErrorsDoNotPublish(t *testing.T) {
 			}
 			assertNoPlanCapabilities(t, registry)
 		})
+	}
+}
+
+func hermeticCatalogOptions(t *testing.T) catalog.Options {
+	t.Helper()
+	directory := t.TempDir()
+	writeExecutable := func(name string) string {
+		path := filepath.Join(directory, name)
+		if err := os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	return catalog.Options{
+		SearchOptions: &search.Options{RGBinary: writeExecutable("rg")},
+		ShellOptions:  &shell.Options{ShellBinary: writeExecutable("sh")},
 	}
 }
 

@@ -100,7 +100,7 @@ func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 			}
 		}
 		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-transport", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
-	}))
+	}), WithQueueSize(16))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		return ToolResult{Output: "ok"}, nil
 	})}}})
