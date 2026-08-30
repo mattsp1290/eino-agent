@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -660,36 +661,13 @@ func TestCreateToolCallDuplicateRequiresFullRecordMatch(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsUnsupportedSchemaVersion(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "store.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatalf("open raw sqlite db: %v", err)
-	}
-	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_version(version, applied_at) VALUES (3, 'now');`); err != nil {
-		t.Fatalf("seed schema version: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close raw sqlite db: %v", err)
-	}
-
-	st, err := Open(context.Background(), path)
-	if err == nil {
-		_ = st.Close()
-		t.Fatal("Open succeeded for unsupported schema version")
-	}
-	if !errors.Is(err, session.ErrConflict) {
-		t.Fatalf("Open err = %v, want ErrConflict", err)
-	}
-}
-
-func TestOpenRejectsIncompleteVersionOneDatabase(t *testing.T) {
+func TestOpenRejectsIncompleteNonemptyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE schema_version(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL); INSERT INTO schema_version(version, applied_at) VALUES (1, 'now');`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE sessions(id TEXT PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.Close()
@@ -703,7 +681,7 @@ func TestOpenRejectsIncompleteVersionOneDatabase(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsVersionOneSchemaDrift(t *testing.T) {
+func TestOpenRejectsSchemaDrift(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate string
@@ -740,6 +718,79 @@ func TestOpenRejectsVersionOneSchemaDrift(t *testing.T) {
 				t.Fatalf("Open err = %v, want ErrConflict", err)
 			}
 		})
+	}
+}
+
+func TestOpenRejectsExactDDLDrift(t *testing.T) {
+	tests := map[string][2]string{
+		"column affinity":   {"record BLOB NOT NULL", "record TEXT NOT NULL"},
+		"nullability":       {"updated_at TEXT NOT NULL", "updated_at TEXT"},
+		"foreign key":       {"FOREIGN KEY(session_id) REFERENCES sessions(id)", "CHECK (length(session_id) > 0)"},
+		"partial predicate": {"WHERE status IN ('pending', 'running')", "WHERE status = 'running'"},
+		"check constraint":  {"updated_at TEXT NOT NULL", "updated_at TEXT NOT NULL CHECK (updated_at <> '')"},
+		"collation":         {"id TEXT PRIMARY KEY", "id TEXT COLLATE NOCASE PRIMARY KEY"},
+		"generated column":  {"updated_at TEXT NOT NULL\n);", "updated_at TEXT NOT NULL,\n  normalized_id TEXT GENERATED ALWAYS AS (lower(id)) VIRTUAL\n);"},
+		"strict table":      {");\n\nCREATE TABLE IF NOT EXISTS runs", ") STRICT;\n\nCREATE TABLE IF NOT EXISTS runs"},
+		"without rowid":     {");\n\nCREATE TABLE IF NOT EXISTS runs", ") WITHOUT ROWID;\n\nCREATE TABLE IF NOT EXISTS runs"},
+		"deferrable key":    {"FOREIGN KEY(session_id) REFERENCES sessions(id)", "FOREIGN KEY(session_id) REFERENCES sessions(id) DEFERRABLE INITIALLY DEFERRED"},
+	}
+	for name, replacement := range tests {
+		t.Run(name, func(t *testing.T) {
+			definition := strings.Replace(currentSchema, replacement[0], replacement[1], 1)
+			if definition == currentSchema {
+				t.Fatal("test mutation did not change schema")
+			}
+			path := filepath.Join(t.TempDir(), "store.db")
+			db, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(definition); err != nil {
+				_ = db.Close()
+				t.Fatalf("seed drifted schema: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			store, err := Open(context.Background(), path)
+			if err == nil {
+				_ = store.Close()
+				t.Fatal("Open succeeded for drifted schema")
+			}
+			if !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("Open err = %v, want ErrConflict", err)
+			}
+		})
+	}
+}
+
+func TestConcurrentOpenInitializesCurrentSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "store.db")
+	const openers = 8
+	start := make(chan struct{})
+	results := make(chan error, openers)
+	var storesMu sync.Mutex
+	var stores []*Store
+	for range openers {
+		go func() {
+			<-start
+			store, err := Open(context.Background(), path)
+			if err == nil {
+				storesMu.Lock()
+				stores = append(stores, store)
+				storesMu.Unlock()
+			}
+			results <- err
+		}()
+	}
+	close(start)
+	for range openers {
+		if err := <-results; err != nil {
+			t.Errorf("concurrent Open: %v", err)
+		}
+	}
+	for _, store := range stores {
+		_ = store.Close()
 	}
 }
 

@@ -297,14 +297,14 @@ func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	persisted := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{{
+	persisted := session.ExtensionPlanDescriptor{Components: []session.ComponentPlan{{
 		InstanceID: "mixed", Artifact: extension.Artifact{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
 		Handlers: []session.RegistrationIdentity{
 			{ID: "a", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-a"), Kind: extension.HandlerNotification},
 			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-b"), Kind: extension.HandlerNotification},
 		},
 	}}}
-	sealed, _ := session.SealExtensionPlan(persisted)
+	sealed, _ := session.SealExtensionPlanForSession("", persisted)
 	persisted = sealed.Descriptor()
 	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		t.Fatalf("conflicting nested scopes = %v", err)
@@ -403,7 +403,7 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			} else {
 				entryOrder = owned.Guards[0].Order
 			}
-			if entryOrder != 10 || persisted.SchemaVersion != session.ExtensionPlanSchemaVersion {
+			if entryOrder != 10 || persisted.Fingerprint == "" {
 				t.Fatalf("ordered descriptor = %#v", persisted)
 			}
 			if err := firstMount.Close(context.Background()); err != nil {
@@ -413,37 +413,5 @@ func TestPromptAndGuardOrderParticipateInStrictFingerprint(t *testing.T) {
 			defer func() { _ = secondMount.Close(context.Background()) }()
 			assertResumePlanDrift(t, registry, "session-a", persisted)
 		})
-	}
-}
-
-func TestUnsupportedVersionTwoPlanIsRejected(t *testing.T) {
-	registry, err := NewRegistry(nil, compositionNotice)
-	if err != nil {
-		t.Fatal(err)
-	}
-	component := component("unsupported-version")
-	mount, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar *Registrar) error {
-		if err := extension.On(registrar.Extensions(), compositionNotice, extension.Registration{ID: "notice", Scope: extension.GlobalScope()}, func(context.Context, string) error { return nil }); err != nil {
-			return err
-		}
-		return registrar.Tool(ToolRegistration{ID: "tool", Scope: extension.GlobalScope(), Definition: definition("echo", "v1")})
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = mount.Close(context.Background()) }()
-	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	persisted := plan.Descriptor()
-	plan.Release()
-	persisted.SchemaVersion = 2
-	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
-	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("AcquireResumePlan schema v2 callback/tool plan = %v, want mismatch", err)
-	}
-	if resumed != nil {
-		resumed.Release()
 	}
 }

@@ -356,7 +356,7 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 		}})
 		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{PromptTokens: 10, CompletionTokens: 5}}
 		return []*einoschema.Message{response}, nil
-	}))
+	}), WithQueueSize(16))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {

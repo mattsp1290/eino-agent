@@ -98,6 +98,7 @@ func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 
 type capturingChatModel struct {
 	messages      []*einoschema.Message
+	cloneErr      error
 	toolBindings  int
 	streamOptions int
 }
@@ -107,7 +108,10 @@ func (m *capturingChatModel) Generate(context.Context, []*einoschema.Message, ..
 }
 
 func (m *capturingChatModel) Stream(_ context.Context, messages []*einoschema.Message, options ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
-	m.messages = cloneMessages(messages)
+	m.messages, m.cloneErr = cloneProtectedMessages(messages)
+	if m.cloneErr != nil {
+		return nil, m.cloneErr
+	}
 	m.streamOptions = len(options)
 	reader, writer := einoschema.Pipe[*einoschema.Message](1)
 	writer.Close()

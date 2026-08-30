@@ -219,6 +219,38 @@ func TestNewRunPlanRejectsDuplicateComponentOwner(t *testing.T) {
 	}
 }
 
+func TestNewRunPlanMergesMatchingHandlerAndCapabilityOwner(t *testing.T) {
+	owner := testPlanComponent("combined-owner")
+	registry := newTestExtensionRegistry(nil)
+	mount, err := registry.Mount(context.Background(), owner, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.On(registrar, ModelRequestedPoint, extension.Registration{ID: "handler", Scope: extension.GlobalScope()}, func(context.Context, ModelRequestedNotice) error { return nil })
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewRunPlan(RunPlanSpec{Dispatch: dispatch, Components: []PlanComponent{{
+		Component: owner,
+		Prompts: []PlanPrompt{{Name: "prompt", RegistrationID: "prompt", Scope: extension.GlobalScope(), Provider: PromptProviderFunc(func(context.Context, PromptContext) (string, error) {
+			return "", nil
+		})}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := plan.Descriptor()
+	plan.Release()
+	if len(descriptor.Components) != 1 || len(descriptor.Components[0].Handlers) != 1 || len(descriptor.Components[0].Prompts) != 1 {
+		t.Fatalf("combined descriptor = %#v", descriptor)
+	}
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestNewRunPlanRejectsReservedSystemPromptName(t *testing.T) {
 	_, err := NewRunPlan(RunPlanSpec{Components: []PlanComponent{{
 		Component: testPlanComponent("reserved-prompt"),

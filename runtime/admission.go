@@ -153,11 +153,6 @@ func freezeAdmission(request admissionRequest) (admissionRequest, error) {
 		request.Config.Metadata["workspace_root"] = root
 	}
 	request.Model = cloneResolved(request.Model)
-	cloned, err := (model.Request{Messages: request.Input}).Clone()
-	if err != nil {
-		return admissionRequest{}, err
-	}
-	request.Input = cloned.Messages
 	request.Metadata = cloneStringMap(request.Metadata)
 	request.ExtensionPlan = request.ExtensionPlan.Clone()
 	return request, nil

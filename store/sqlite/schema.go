@@ -4,7 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"slices"
+	"strings"
+	"sync"
 
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -14,137 +15,89 @@ type schemaReader interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-type indexSchema struct {
-	table   string
-	columns []string
-	unique  bool
-	partial bool
+type schemaObject struct {
+	kind string
+	sql  string
 }
 
-var currentTables = map[string][]string{
-	"schema_version": {"version", "applied_at"},
-	"sessions":       {"id", "record", "updated_at"},
-	"runs":           {"id", "session_id", "status", "owner_id", "claim_token", "lease_until", "record", "created_at"},
-	"messages":       {"id", "session_id", "run_id", "role", "record", "created_at"},
-	"parts":          {"id", "message_id", "session_id", "run_id", "ordinal", "record", "created_at"},
-	"events":         {"id", "session_id", "run_id", "kind", "tool_call_id", "tool_transition", "record", "created_at"},
-	"tool_calls":     {"id", "session_id", "run_id", "message_id", "status", "claimed_by", "claim_token", "record"},
-	"context_epochs": {"id", "session_id", "record", "closed_at"},
-	"model_requests": {"id", "run_id", "state", "attempt", "step", "record", "created_at"},
+var expectedSchema struct {
+	sync.Once
+	objects map[string]schemaObject
+	err     error
 }
 
-var currentIndexes = map[string]indexSchema{
-	"runs_session_active_idx":             {table: "runs", columns: []string{"session_id", "status"}},
-	"runs_session_active_unique_idx":      {table: "runs", columns: []string{"session_id"}, unique: true, partial: true},
-	"messages_replay_idx":                 {table: "messages", columns: []string{"session_id", "created_at", "id"}},
-	"parts_replay_idx":                    {table: "parts", columns: []string{"session_id", "message_id", "ordinal", "id"}},
-	"events_replay_idx":                   {table: "events", columns: []string{"session_id", "created_at", "id"}},
-	"events_tool_transition_unique_idx":   {table: "events", columns: []string{"tool_call_id", "tool_transition"}, unique: true, partial: true},
-	"events_run_finished_unique_idx":      {table: "events", columns: []string{"run_id", "kind"}, unique: true, partial: true},
-	"tool_calls_unfinished_idx":           {table: "tool_calls", columns: []string{"run_id", "status"}},
-	"model_requests_run_attempt_step_idx": {table: "model_requests", columns: []string{"run_id", "attempt", "step"}, unique: true},
-	"model_requests_run_created_idx":      {table: "model_requests", columns: []string{"run_id", "created_at", "id"}},
-}
-
-func emptySchema(ctx context.Context, db *sql.DB) (bool, error) {
+func emptySchema(ctx context.Context, db schemaReader) (bool, error) {
 	var count int
-	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`).Scan(&count)
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'`).Scan(&count)
 	return count == 0, err
 }
 
 func verifySchema(ctx context.Context, db schemaReader) error {
-	if err := verifySchemaVersion(ctx, db); err != nil {
-		return err
-	}
-	if err := verifySchemaObjects(ctx, db); err != nil {
-		return err
-	}
-	for table, columns := range currentTables {
-		if err := verifyNamedColumns(ctx, db, "table", table, columns); err != nil {
-			return err
-		}
-	}
-	for name, index := range currentIndexes {
-		if err := verifyNamedColumns(ctx, db, "index", name, index.columns); err != nil {
-			return err
-		}
-		var unique, partial int
-		if err := db.QueryRowContext(ctx, `SELECT "unique", partial FROM pragma_index_list(?) WHERE name = ?`, index.table, name).Scan(&unique, &partial); err != nil || (unique != 0) != index.unique || (partial != 0) != index.partial {
-			return fmt.Errorf("%w: sqlite index %s flags mismatch", session.ErrConflict, name)
-		}
-	}
-	return nil
-}
-
-func verifySchemaVersion(ctx context.Context, db schemaReader) error {
-	var version int
-	if err := db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_version`).Scan(&version); err != nil {
-		return fmt.Errorf("%w: sqlite schema version unavailable: %v", session.ErrConflict, err)
-	}
-	if version != 1 {
-		return fmt.Errorf("%w: unsupported sqlite schema version %d", session.ErrConflict, version)
-	}
-	return nil
-}
-
-func verifySchemaObjects(ctx context.Context, db schemaReader) error {
-	rows, err := db.QueryContext(ctx, `SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`)
+	want, err := currentSchemaObjects()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = rows.Close() }()
-	want := make(map[string]bool, len(currentTables)+len(currentIndexes))
-	for name := range currentTables {
-		want["table:"+name] = true
-	}
-	for name := range currentIndexes {
-		want["index:"+name] = true
-	}
-	for rows.Next() {
-		var kind, name string
-		if err := rows.Scan(&kind, &name); err != nil {
-			return err
-		}
-		key := kind + ":" + name
-		if !want[key] {
-			return fmt.Errorf("%w: unexpected sqlite schema object %s", session.ErrConflict, key)
-		}
-		delete(want, key)
-	}
-	if err := rows.Err(); err != nil {
+	got, err := readSchemaObjects(ctx, db)
+	if err != nil {
 		return err
 	}
-	if len(want) != 0 {
-		for missing := range want {
-			return fmt.Errorf("%w: missing sqlite schema object %s", session.ErrConflict, missing)
+	for name, expected := range want {
+		actual, ok := got[name]
+		if !ok {
+			return fmt.Errorf("%w: missing sqlite schema object %s:%s", session.ErrConflict, expected.kind, name)
 		}
+		if actual != expected {
+			return fmt.Errorf("%w: sqlite schema object %s:%s differs from current definition", session.ErrConflict, expected.kind, name)
+		}
+		delete(got, name)
+	}
+	for name, unexpected := range got {
+		return fmt.Errorf("%w: unexpected sqlite schema object %s:%s", session.ErrConflict, unexpected.kind, name)
 	}
 	return nil
 }
 
-func verifyNamedColumns(ctx context.Context, db schemaReader, kind, name string, want []string) error {
-	pragma := `SELECT name FROM pragma_table_info(?) ORDER BY cid`
-	if kind == "index" {
-		pragma = `SELECT name FROM pragma_index_info(?) ORDER BY seqno`
+func currentSchemaObjects() (map[string]schemaObject, error) {
+	expectedSchema.Do(func() {
+		db, err := sql.Open("sqlite", ":memory:")
+		if err != nil {
+			expectedSchema.err = err
+			return
+		}
+		defer func() { _ = db.Close() }()
+		if _, err = db.Exec(currentSchema); err != nil {
+			expectedSchema.err = err
+			return
+		}
+		expectedSchema.objects, expectedSchema.err = readSchemaObjects(context.Background(), db)
+	})
+	if expectedSchema.err != nil {
+		return nil, expectedSchema.err
 	}
-	rows, err := db.QueryContext(ctx, pragma, name)
+	result := make(map[string]schemaObject, len(expectedSchema.objects))
+	for name, object := range expectedSchema.objects {
+		result[name] = object
+	}
+	return result, nil
+}
+
+func readSchemaObjects(ctx context.Context, db schemaReader) (map[string]schemaObject, error) {
+	rows, err := db.QueryContext(ctx, `SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name`)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	var got []string
+	objects := make(map[string]schemaObject)
 	for rows.Next() {
-		var column string
-		if err := rows.Scan(&column); err != nil {
-			return err
+		var kind, name, definition string
+		if err := rows.Scan(&kind, &name, &definition); err != nil {
+			return nil, err
 		}
-		got = append(got, column)
+		objects[name] = schemaObject{kind: kind, sql: normalizeSchemaSQL(definition)}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if !slices.Equal(got, want) {
-		return fmt.Errorf("%w: sqlite %s %s columns are %v, want %v", session.ErrConflict, kind, name, got, want)
-	}
-	return nil
+	return objects, rows.Err()
+}
+
+func normalizeSchemaSQL(value string) string {
+	return strings.TrimSpace(value)
 }

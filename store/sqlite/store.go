@@ -10,8 +10,8 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-//go:embed migrations/001_sqlite_store.sql
-var migration001 string
+//go:embed schema.sql
+var currentSchema string
 
 // Store persists sessions in SQLite.
 type Store struct {
@@ -30,34 +30,42 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	empty, err := emptySchema(ctx, db)
+	conn, err := db.Conn(ctx)
 	if err != nil {
 		_ = db.Close()
 		return nil, err
 	}
-	if empty {
-		tx, err := db.BeginTx(ctx, nil)
-		if err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-		if _, err = tx.ExecContext(ctx, migration001); err == nil {
-			err = verifySchema(ctx, tx)
-		}
-		if err == nil {
-			err = tx.Commit()
-		} else {
-			_ = tx.Rollback()
-		}
-		if err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-	} else if err := verifySchema(ctx, db); err != nil {
+	defer func() { _ = conn.Close() }()
+	if err := initializeOrVerify(ctx, conn); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+func initializeOrVerify(ctx context.Context, conn *sql.Conn) (err error) {
+	if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
+		}
+	}()
+	empty, err := emptySchema(ctx, conn)
+	if err != nil {
+		return err
+	}
+	if empty {
+		if _, err = conn.ExecContext(ctx, currentSchema); err != nil {
+			return err
+		}
+	}
+	if err = verifySchema(ctx, conn); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, `COMMIT`)
+	return err
 }
 
 // Close closes the underlying database.

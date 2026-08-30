@@ -65,17 +65,6 @@ type TurnSnapshot struct {
 	CreatedAt    time.Time
 }
 
-// Clone returns a defensive copy of the snapshot container fields. Eino
-// messages are pointer values, so implementations that mutate message contents
-// must still clone the schema.Message values they own before mutation.
-func (s TurnSnapshot) Clone() TurnSnapshot {
-	next := s
-	next.Config = s.Config.Clone()
-	next.Messages = cloneSlice(s.Messages)
-	next.Tools = cloneSlice(s.Tools)
-	return next
-}
-
 // Tool describes one runtime-materialized tool available to a turn.
 type Tool struct {
 	Name         string

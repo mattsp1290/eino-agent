@@ -9,7 +9,6 @@ import (
 
 func TestExtensionPlanFingerprintCanonicalizesComponentsAndTypedCollections(t *testing.T) {
 	descriptor := ExtensionPlanDescriptor{
-		SchemaVersion: ExtensionPlanSchemaVersion,
 		Components: []ComponentPlan{
 			{
 				InstanceID: "handlers", Artifact: testArtifact("handlers"),
@@ -32,11 +31,11 @@ func TestExtensionPlanFingerprintCanonicalizesComponentsAndTypedCollections(t *t
 	reordered.Components[1].Handlers[0], reordered.Components[1].Handlers[1] = reordered.Components[1].Handlers[1], reordered.Components[1].Handlers[0]
 	reordered.Components[0].Guards[0], reordered.Components[0].Guards[1] = reordered.Components[0].Guards[1], reordered.Components[0].Guards[0]
 
-	first, err := fingerprintExtensionPlan(descriptor)
+	first, err := fingerprintExtensionPlan("session-b", descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fingerprintExtensionPlan(reordered)
+	second, err := fingerprintExtensionPlan("session-b", reordered)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,13 +45,13 @@ func TestExtensionPlanFingerprintCanonicalizesComponentsAndTypedCollections(t *t
 }
 
 func TestExtensionPlanFingerprintCanonicalizesEmptyComponentCollection(t *testing.T) {
-	nilCollections := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion}
-	emptyCollections := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{}}
-	first, err := fingerprintExtensionPlan(nilCollections)
+	nilCollections := ExtensionPlanDescriptor{}
+	emptyCollections := ExtensionPlanDescriptor{Components: []ComponentPlan{}}
+	first, err := fingerprintExtensionPlan("", nilCollections)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := fingerprintExtensionPlan(emptyCollections)
+	second, err := fingerprintExtensionPlan("", emptyCollections)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,52 +60,51 @@ func TestExtensionPlanFingerprintCanonicalizesEmptyComponentCollection(t *testin
 	}
 }
 
-func TestExtensionPlanSchemaV1JSONAndFingerprintGolden(t *testing.T) {
+func TestExtensionPlanJSONAndFingerprintGolden(t *testing.T) {
 	descriptor := ExtensionPlanDescriptor{
-		SchemaVersion: ExtensionPlanSchemaVersion,
 		Components: []ComponentPlan{{
 			InstanceID: "component",
 			Artifact:   extension.Artifact{Name: "artifact", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
 			Tools:      []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 		}},
 	}
-	const expectedJSON = `{"SchemaVersion":1,"Fingerprint":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor","Order":0}],"Prompts":null,"Guards":null,"Restrictions":null}]}`
+	const expectedJSON = `{"Fingerprint":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor","Order":0}],"Prompts":null,"Guards":null,"Restrictions":null}]}`
 	raw, err := json.Marshal(descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(raw) != expectedJSON {
-		t.Fatalf("schema-v1 JSON changed:\n got: %s\nwant: %s", raw, expectedJSON)
+		t.Fatalf("descriptor JSON changed:\n got: %s\nwant: %s", raw, expectedJSON)
 	}
-	fingerprint, err := fingerprintExtensionPlan(descriptor)
+	fingerprint, err := fingerprintExtensionPlan("", descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
-	const expectedFingerprint = "3f84a9c0b287ea01d84ae35bf94855fb6757d9412f02c3659ae9249d0b4a4d37"
+	const expectedFingerprint = "f47936e2385ec28496bcf84bcbb1392fc80a99bf3670b8d9d23e6ed0678a9031"
 	if fingerprint != expectedFingerprint {
-		t.Fatalf("schema-v1 fingerprint = %s", fingerprint)
+		t.Fatalf("descriptor fingerprint = %s", fingerprint)
 	}
 }
 
 func TestExtensionPlanRejectsDelimiterBearingIdentifiersButKeepsScopeKeysOpaque(t *testing.T) {
-	invalid := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+	invalid := ExtensionPlanDescriptor{Components: []ComponentPlan{{
 		InstanceID: "component", Artifact: testArtifact("delimiter"),
 		Tools: []ToolPlanIdentity{{Name: "tool", RegistrationID: "bad\x00registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 	}}}
-	if _, err := SealExtensionPlan(invalid); err == nil {
+	if _, err := SealExtensionPlanForSession("", invalid); err == nil {
 		t.Fatal("delimiter-bearing registration id was accepted")
 	}
 
 	valid := invalid.Clone()
 	valid.Components[0].Tools[0].RegistrationID = "registration"
 	valid.Components[0].Tools[0].Scope = extension.SessionScope("tenant\x00workspace")
-	if _, err := SealExtensionPlan(valid); err != nil {
+	if _, err := SealExtensionPlanForSession("tenant\x00workspace", valid); err != nil {
 		t.Fatalf("opaque scope key rejected: %v", err)
 	}
 }
 
 func TestExtensionPlanRejectsMalformedComponentAndTypedIdentity(t *testing.T) {
-	valid := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+	valid := ExtensionPlanDescriptor{Components: []ComponentPlan{{
 		InstanceID: "tool", Artifact: testArtifact("tool"),
 		Tools: []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 	}}}
@@ -118,7 +116,7 @@ func TestExtensionPlanRejectsMalformedComponentAndTypedIdentity(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			candidate := valid.Clone()
 			mutate(&candidate)
-			if _, err := SealExtensionPlan(candidate); err == nil {
+			if _, err := SealExtensionPlanForSession("", candidate); err == nil {
 				t.Fatal("SealExtensionPlan succeeded")
 			}
 		})
@@ -132,7 +130,7 @@ func TestExtensionPlanRejectsDuplicateAndEmptyComponents(t *testing.T) {
 		"empty":     {{InstanceID: "empty", Artifact: testArtifact("empty")}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := SealExtensionPlan(ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: components}); err == nil {
+			if _, err := SealExtensionPlanForSession("", ExtensionPlanDescriptor{Components: components}); err == nil {
 				t.Fatal("SealExtensionPlan accepted invalid components")
 			}
 		})
@@ -140,20 +138,20 @@ func TestExtensionPlanRejectsDuplicateAndEmptyComponents(t *testing.T) {
 }
 
 func TestExtensionPlanValidatesSemanticHandlerKinds(t *testing.T) {
-	base := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+	base := ExtensionPlanDescriptor{Components: []ComponentPlan{{
 		InstanceID: "handlers", Artifact: testArtifact("handlers"),
 		Handlers: []RegistrationIdentity{{ID: "handler", Contract: "contract", Version: "1", Scope: extension.GlobalScope()}},
 	}}}
 	for _, kind := range []extension.HandlerKind{extension.HandlerNotification, extension.HandlerHook, extension.HandlerTransform, extension.HandlerGate, extension.HandlerAround} {
 		candidate := base.Clone()
 		candidate.Components[0].Handlers[0].Kind = kind
-		if _, err := SealExtensionPlan(candidate); err != nil {
+		if _, err := SealExtensionPlanForSession("", candidate); err != nil {
 			t.Fatalf("semantic kind %q rejected: %v", kind, err)
 		}
 	}
 	invalid := base.Clone()
 	invalid.Components[0].Handlers[0].Kind = "interceptor"
-	if _, err := SealExtensionPlan(invalid); err == nil {
+	if _, err := SealExtensionPlanForSession("", invalid); err == nil {
 		t.Fatal("legacy interceptor handler kind was accepted")
 	}
 }
@@ -188,8 +186,8 @@ func TestExtensionPlanRejectsDuplicateLogicalIdentitiesDespiteFingerprintFields(
 		t.Run(name, func(t *testing.T) {
 			component.InstanceID = "component"
 			component.Artifact = testArtifact("duplicates")
-			descriptor := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{component}}
-			if _, err := SealExtensionPlan(descriptor); err == nil {
+			descriptor := ExtensionPlanDescriptor{Components: []ComponentPlan{component}}
+			if _, err := SealExtensionPlanForSession("", descriptor); err == nil {
 				t.Fatal("SealExtensionPlan accepted duplicate logical identities")
 			}
 		})
@@ -197,11 +195,11 @@ func TestExtensionPlanRejectsDuplicateLogicalIdentitiesDespiteFingerprintFields(
 }
 
 func TestSealedExtensionPlanVerifiesSessionAndOwnsCanonicalDescriptor(t *testing.T) {
-	descriptor := ExtensionPlanDescriptor{SchemaVersion: ExtensionPlanSchemaVersion, Components: []ComponentPlan{{
+	descriptor := ExtensionPlanDescriptor{Components: []ComponentPlan{{
 		InstanceID: "tool", Artifact: testArtifact("sealed"),
 		Tools: []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.SessionScope("session-a"), SchemaHash: "schema", ExecutorHash: "executor"}},
 	}}}
-	sealed, err := SealExtensionPlan(descriptor)
+	sealed, err := SealExtensionPlanForSession("session-a", descriptor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +216,7 @@ func TestSealedExtensionPlanVerifiesSessionAndOwnsCanonicalDescriptor(t *testing
 	if _, err := VerifyExtensionPlanForSession("session-a", tampered); err == nil {
 		t.Fatal("tampered persisted plan verified")
 	}
-	if _, err := SealExtensionPlan(persisted); err == nil {
+	if _, err := SealExtensionPlanForSession("", persisted); err == nil {
 		t.Fatal("persisted plan was accepted as newly reconstructed")
 	}
 	persisted.Components[0].InstanceID = "mutated-copy"
@@ -227,8 +225,35 @@ func TestSealedExtensionPlanVerifiesSessionAndOwnsCanonicalDescriptor(t *testing
 	}
 }
 
-func fingerprintExtensionPlan(descriptor ExtensionPlanDescriptor) (string, error) {
-	sealed, err := SealExtensionPlan(descriptor)
+func TestFreshExtensionPlanBindsEveryScopedIdentity(t *testing.T) {
+	scope := extension.SessionScope("session-a")
+	tests := map[string]ComponentPlan{
+		"handler":     {Handlers: []RegistrationIdentity{{ID: "handler", Contract: "contract", Version: "1", Scope: scope, Kind: extension.HandlerNotification}}},
+		"tool":        {Tools: []ToolPlanIdentity{{Name: "tool", RegistrationID: "tool", Scope: scope, SchemaHash: "schema", ExecutorHash: "executor"}}},
+		"prompt":      {Prompts: []PromptPlanIdentity{{Name: "prompt", RegistrationID: "prompt", Scope: scope}}},
+		"guard":       {Guards: []GuardPlanIdentity{{RegistrationID: "guard", Scope: scope}}},
+		"restriction": {Restrictions: []RestrictionPlanIdentity{{RegistrationID: "restriction", Scope: scope, RulesHash: "rules"}}},
+	}
+	for name, component := range tests {
+		t.Run(name, func(t *testing.T) {
+			component.InstanceID = name
+			component.Artifact = testArtifact(name)
+			descriptor := ExtensionPlanDescriptor{Components: []ComponentPlan{component}}
+			if _, err := SealExtensionPlanForSession("session-a", descriptor); err != nil {
+				t.Fatalf("matching session rejected: %v", err)
+			}
+			if _, err := SealExtensionPlanForSession("session-b", descriptor); err == nil {
+				t.Fatal("mismatched session accepted")
+			}
+			if _, err := SealExtensionPlanForSession("", descriptor); err == nil {
+				t.Fatal("missing session accepted")
+			}
+		})
+	}
+}
+
+func fingerprintExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) (string, error) {
+	sealed, err := SealExtensionPlanForSession(sessionID, descriptor)
 	if err != nil {
 		return "", err
 	}

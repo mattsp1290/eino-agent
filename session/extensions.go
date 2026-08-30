@@ -13,9 +13,6 @@ import (
 	"github.com/mattsp1290/eino-agent/extension"
 )
 
-// ExtensionPlanSchemaVersion is the only supported durable plan descriptor schema.
-const ExtensionPlanSchemaVersion = 1
-
 // ModelRequestID identifies one durable provider-attempt audit record.
 type ModelRequestID string
 
@@ -68,14 +65,13 @@ type ComponentPlan struct {
 // executable run plan. Component ownership is represented once around typed
 // capability collections.
 type ExtensionPlanDescriptor struct {
-	SchemaVersion int
-	Fingerprint   string
-	Components    []ComponentPlan
+	Fingerprint string
+	Components  []ComponentPlan
 }
 
 // SealedExtensionPlan is a validated, canonical extension-plan identity. The
-// zero value is invalid; callers obtain values through SealExtensionPlan or
-// VerifyExtensionPlanForSession.
+// zero value is invalid; callers obtain values through
+// SealExtensionPlanForSession or VerifyExtensionPlanForSession.
 type SealedExtensionPlan struct {
 	descriptor ExtensionPlanDescriptor
 }
@@ -110,109 +106,130 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 	return next
 }
 
-func validateExtensionPlan(descriptor ExtensionPlanDescriptor) error {
-	if descriptor.SchemaVersion != ExtensionPlanSchemaVersion {
-		return fmt.Errorf("unsupported extension plan schema %d", descriptor.SchemaVersion)
-	}
+func validateExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) error {
 	seenComponents := make(map[string]bool)
-	var sessionKey string
-	checkScope := func(scope extension.Scope) error {
-		if err := extension.ValidateScope(scope); err != nil {
+	for _, component := range descriptor.Components {
+		if err := validateComponentPlan(sessionID, component, seenComponents); err != nil {
 			return err
 		}
-		switch scope.Kind {
-		case extension.ScopeGlobal:
-		case extension.ScopeSession:
-			if sessionKey != "" && sessionKey != scope.Key {
-				return errors.New("extension plan contains multiple session keys")
-			}
-			sessionKey = scope.Key
-		}
-		return nil
 	}
+	return nil
+}
 
-	for _, component := range descriptor.Components {
-		if err := extension.ValidateComponent(extension.Component{InstanceID: component.InstanceID, Artifact: component.Artifact}); err != nil {
-			return fmt.Errorf("invalid extension component identity: %w", err)
+func validateComponentPlan(sessionID ID, component ComponentPlan, seen map[string]bool) error {
+	if err := extension.ValidateComponent(extension.Component{InstanceID: component.InstanceID, Artifact: component.Artifact}); err != nil {
+		return fmt.Errorf("invalid extension component identity: %w", err)
+	}
+	if seen[component.InstanceID] {
+		return errors.New("duplicate extension component identity")
+	}
+	seen[component.InstanceID] = true
+	if len(component.Handlers)+len(component.Tools)+len(component.Prompts)+len(component.Guards)+len(component.Restrictions) == 0 {
+		return errors.New("extension component plan has no behavior")
+	}
+	if err := validateHandlerIdentities(sessionID, component.Handlers); err != nil {
+		return err
+	}
+	if err := validateToolIdentities(sessionID, component.Tools); err != nil {
+		return err
+	}
+	if err := validatePromptIdentities(sessionID, component.Prompts); err != nil {
+		return err
+	}
+	if err := validateGuardIdentities(sessionID, component.Guards); err != nil {
+		return err
+	}
+	return validateRestrictionIdentities(sessionID, component.Restrictions)
+}
+
+func validatePlanScope(sessionID ID, scope extension.Scope) error {
+	if err := extension.ValidateScope(scope); err != nil {
+		return err
+	}
+	if scope.Kind == extension.ScopeSession && (sessionID == "" || scope.Key != string(sessionID)) {
+		return errors.New("extension plan session scope mismatch")
+	}
+	return nil
+}
+
+func validateHandlerIdentities(sessionID ID, values []RegistrationIdentity) error {
+	seen := make(map[handlerIdentityKey]bool, len(values))
+	for _, value := range values {
+		if extension.ValidateIdentifier(value.ID) != nil || extension.ValidateContract(extension.Contract{ID: value.Contract, Version: value.Version}) != nil || !validHandlerKind(value.Kind) {
+			return errors.New("invalid handler registration identity")
 		}
-		if seenComponents[component.InstanceID] {
-			return errors.New("duplicate extension component identity")
-		}
-		seenComponents[component.InstanceID] = true
-		if len(component.Handlers)+len(component.Tools)+len(component.Prompts)+len(component.Guards)+len(component.Restrictions) == 0 {
-			return errors.New("extension component plan has no behavior")
-		}
-		seenHandlers := make(map[handlerIdentityKey]bool)
-		seenTools := make(map[toolIdentityKey]bool)
-		seenPrompts := make(map[promptIdentityKey]bool)
-		seenGuards := make(map[guardIdentityKey]bool)
-		seenRestrictions := make(map[restrictionIdentityKey]bool)
-		for _, registration := range component.Handlers {
-			if extension.ValidateIdentifier(registration.ID) != nil || extension.ValidateContract(extension.Contract{ID: registration.Contract, Version: registration.Version}) != nil || !validHandlerKind(registration.Kind) {
-				return errors.New("invalid handler registration identity")
-			}
-			if err := checkScope(registration.Scope); err != nil {
-				return err
-			}
-			key := handlerIdentityKey{RegistrationID: registration.ID, Contract: registration.Contract, Version: registration.Version, Kind: registration.Kind, Scope: registration.Scope}
-			if seenHandlers[key] {
-				return errors.New("duplicate handler registration identity")
-			}
-			seenHandlers[key] = true
-		}
-		for _, identity := range component.Tools {
-			if extension.ValidateIdentifier(identity.Name) != nil || extension.ValidateIdentifier(identity.RegistrationID) != nil || identity.SchemaHash == "" || identity.ExecutorHash == "" {
-				return errors.New("invalid tool plan identity")
-			}
-			if err := checkScope(identity.Scope); err != nil {
-				return err
-			}
-			key := toolIdentityKey{RegistrationID: identity.RegistrationID, Name: identity.Name, Scope: identity.Scope}
-			if seenTools[key] {
-				return errors.New("duplicate extension plan identity")
-			}
-			seenTools[key] = true
-		}
-		for _, identity := range component.Prompts {
-			if extension.ValidateIdentifier(identity.Name) != nil || extension.ValidateIdentifier(identity.RegistrationID) != nil {
-				return errors.New("invalid prompt plan identity")
-			}
-			if err := checkScope(identity.Scope); err != nil {
-				return err
-			}
-			key := promptIdentityKey{RegistrationID: identity.RegistrationID, Name: identity.Name, Scope: identity.Scope}
-			if seenPrompts[key] {
-				return errors.New("duplicate extension plan identity")
-			}
-			seenPrompts[key] = true
-		}
-		for _, identity := range component.Guards {
-			if extension.ValidateIdentifier(identity.RegistrationID) != nil {
-				return errors.New("invalid guard plan identity")
-			}
-			if err := checkScope(identity.Scope); err != nil {
-				return err
-			}
-			key := guardIdentityKey{RegistrationID: identity.RegistrationID, Scope: identity.Scope}
-			if seenGuards[key] {
-				return errors.New("duplicate extension plan identity")
-			}
-			seenGuards[key] = true
-		}
-		for _, identity := range component.Restrictions {
-			if extension.ValidateIdentifier(identity.RegistrationID) != nil || strings.TrimSpace(identity.RulesHash) == "" {
-				return errors.New("invalid restriction plan identity")
-			}
-			if err := checkScope(identity.Scope); err != nil {
-				return err
-			}
-			key := restrictionIdentityKey{RegistrationID: identity.RegistrationID, Scope: identity.Scope}
-			if seenRestrictions[key] {
-				return errors.New("duplicate extension plan identity")
-			}
-			seenRestrictions[key] = true
+		key := handlerIdentityKey{RegistrationID: value.ID, Contract: value.Contract, Version: value.Version, Kind: value.Kind, Scope: value.Scope}
+		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
+			return err
 		}
 	}
+	return nil
+}
+
+func validateToolIdentities(sessionID ID, values []ToolPlanIdentity) error {
+	seen := make(map[toolIdentityKey]bool, len(values))
+	for _, value := range values {
+		if extension.ValidateIdentifier(value.Name) != nil || extension.ValidateIdentifier(value.RegistrationID) != nil || value.SchemaHash == "" || value.ExecutorHash == "" {
+			return errors.New("invalid tool plan identity")
+		}
+		key := toolIdentityKey{RegistrationID: value.RegistrationID, Name: value.Name, Scope: value.Scope}
+		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePromptIdentities(sessionID ID, values []PromptPlanIdentity) error {
+	seen := make(map[promptIdentityKey]bool, len(values))
+	for _, value := range values {
+		if extension.ValidateIdentifier(value.Name) != nil || extension.ValidateIdentifier(value.RegistrationID) != nil {
+			return errors.New("invalid prompt plan identity")
+		}
+		key := promptIdentityKey{RegistrationID: value.RegistrationID, Name: value.Name, Scope: value.Scope}
+		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateGuardIdentities(sessionID ID, values []GuardPlanIdentity) error {
+	seen := make(map[guardIdentityKey]bool, len(values))
+	for _, value := range values {
+		if extension.ValidateIdentifier(value.RegistrationID) != nil {
+			return errors.New("invalid guard plan identity")
+		}
+		key := guardIdentityKey{RegistrationID: value.RegistrationID, Scope: value.Scope}
+		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateRestrictionIdentities(sessionID ID, values []RestrictionPlanIdentity) error {
+	seen := make(map[restrictionIdentityKey]bool, len(values))
+	for _, value := range values {
+		if extension.ValidateIdentifier(value.RegistrationID) != nil || strings.TrimSpace(value.RulesHash) == "" {
+			return errors.New("invalid restriction plan identity")
+		}
+		key := restrictionIdentityKey{RegistrationID: value.RegistrationID, Scope: value.Scope}
+		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateUniqueScope[K comparable](sessionID ID, scope extension.Scope, seen map[K]bool, key K) error {
+	if err := validatePlanScope(sessionID, scope); err != nil {
+		return err
+	}
+	if seen[key] {
+		return errors.New("duplicate extension plan identity")
+	}
+	seen[key] = true
 	return nil
 }
 
@@ -251,13 +268,18 @@ type restrictionIdentityKey struct {
 	Scope          extension.Scope
 }
 
-// SealExtensionPlan validates and seals one newly reconstructed, fingerprintless
-// descriptor. The returned value owns a canonical defensive copy.
-func SealExtensionPlan(descriptor ExtensionPlanDescriptor) (SealedExtensionPlan, error) {
+// SealExtensionPlanForSession validates and seals one newly reconstructed,
+// fingerprintless descriptor for sessionID. The returned value owns a canonical
+// defensive copy. An empty sessionID permits global scopes only.
+func SealExtensionPlanForSession(sessionID ID, descriptor ExtensionPlanDescriptor) (SealedExtensionPlan, error) {
 	if descriptor.Fingerprint != "" {
 		return SealedExtensionPlan{}, errors.New("new extension plan already has a fingerprint")
 	}
-	next, err := canonicalExtensionPlan(descriptor)
+	return sealExtensionPlan(sessionID, descriptor)
+}
+
+func sealExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) (SealedExtensionPlan, error) {
+	next, err := canonicalExtensionPlan(sessionID, descriptor)
 	if err != nil {
 		return SealedExtensionPlan{}, err
 	}
@@ -278,24 +300,19 @@ func VerifyExtensionPlanForSession(sessionID ID, descriptor ExtensionPlanDescrip
 	}
 	want := descriptor.Fingerprint
 	descriptor.Fingerprint = ""
-	sealed, err := SealExtensionPlan(descriptor)
+	sealed, err := sealExtensionPlan(sessionID, descriptor)
 	if err != nil {
 		return SealedExtensionPlan{}, err
 	}
 	if sealed.Fingerprint() != want {
 		return SealedExtensionPlan{}, errors.New("extension plan fingerprint mismatch")
 	}
-	for _, component := range sealed.descriptor.Components {
-		if err := validateComponentSessionScopes(sessionID, component); err != nil {
-			return SealedExtensionPlan{}, err
-		}
-	}
 	return sealed, nil
 }
 
-func canonicalExtensionPlan(descriptor ExtensionPlanDescriptor) (ExtensionPlanDescriptor, error) {
+func canonicalExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) (ExtensionPlanDescriptor, error) {
 	descriptor.Fingerprint = ""
-	if err := validateExtensionPlan(descriptor); err != nil {
+	if err := validateExtensionPlan(sessionID, descriptor); err != nil {
 		return ExtensionPlanDescriptor{}, err
 	}
 	next := descriptor.Clone()
@@ -315,41 +332,6 @@ func canonicalExtensionPlan(descriptor ExtensionPlanDescriptor) (ExtensionPlanDe
 	sort.Slice(next.Components, func(i, j int) bool { return compareComponentPlan(next.Components[i], next.Components[j]) < 0 })
 	normalizeEmptyPlanSlices(&next)
 	return next, nil
-}
-
-func validateComponentSessionScopes(sessionID ID, component ComponentPlan) error {
-	validate := func(scope extension.Scope) error {
-		if scope.Kind == extension.ScopeSession && scope.Key != string(sessionID) {
-			return errors.New("extension plan session scope mismatch")
-		}
-		return nil
-	}
-	for _, identity := range component.Handlers {
-		if err := validate(identity.Scope); err != nil {
-			return err
-		}
-	}
-	for _, identity := range component.Tools {
-		if err := validate(identity.Scope); err != nil {
-			return err
-		}
-	}
-	for _, identity := range component.Prompts {
-		if err := validate(identity.Scope); err != nil {
-			return err
-		}
-	}
-	for _, identity := range component.Guards {
-		if err := validate(identity.Scope); err != nil {
-			return err
-		}
-	}
-	for _, identity := range component.Restrictions {
-		if err := validate(identity.Scope); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func normalizeEmptyPlanSlices(descriptor *ExtensionPlanDescriptor) {

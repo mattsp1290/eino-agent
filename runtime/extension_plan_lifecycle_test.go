@@ -22,7 +22,7 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 		t.Fatal(err)
 	}
 	descriptor := plan.Descriptor()
-	if descriptor.SchemaVersion != session.ExtensionPlanSchemaVersion || descriptor.Fingerprint == "" {
+	if descriptor.Fingerprint == "" {
 		t.Fatalf("empty descriptor = %#v", descriptor)
 	}
 	resumed, err := orchestrator.acquireResumePlan(context.Background(), "session", descriptor)
@@ -30,14 +30,14 @@ func TestEmptyPlanAcquiresAndResumesThroughRequiredProvider(t *testing.T) {
 		t.Fatalf("resume empty strict plan = %v", err)
 	}
 	resumedDescriptor := resumed.Descriptor()
-	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || resumedDescriptor.SchemaVersion != descriptor.SchemaVersion || len(resumedDescriptor.Components) != 0 {
+	if resumedDescriptor.Fingerprint != descriptor.Fingerprint || len(resumedDescriptor.Components) != 0 {
 		t.Fatalf("resumed descriptor = %#v, want %#v", resumedDescriptor, descriptor)
 	}
 }
 
 func TestAcquireResumePlanRejectsInvalidPersistedFingerprintBeforeProvider(t *testing.T) {
-	valid := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{handlerPlanEntryForTest("callbacks")}}
-	sealed, _ := session.SealExtensionPlan(valid)
+	valid := session.ExtensionPlanDescriptor{Components: []session.ComponentPlan{handlerPlanEntryForTest("callbacks")}}
+	sealed, _ := session.SealExtensionPlanForSession("", valid)
 	valid = sealed.Descriptor()
 	for name, descriptor := range map[string]session.ExtensionPlanDescriptor{
 		"missing": func() session.ExtensionPlanDescriptor { next := valid.Clone(); next.Fingerprint = ""; return next }(),
@@ -130,8 +130,8 @@ func TestRunPlanDescriptorReturnsDefensiveClone(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := plan.Descriptor()
-	first.SchemaVersion = 0
-	if plan.Descriptor().SchemaVersion != session.ExtensionPlanSchemaVersion {
+	first.Fingerprint = "mutated"
+	if plan.Descriptor().Fingerprint == "mutated" {
 		t.Fatal("descriptor mutation changed sealed plan")
 	}
 }

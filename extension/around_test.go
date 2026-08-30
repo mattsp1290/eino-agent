@@ -85,6 +85,56 @@ func TestRequiredAroundDrainsAdmittedProceedBeforeReturning(t *testing.T) {
 	}
 }
 
+func TestRequiredAroundPreservesOutlivedTerminalAndCallbackFailures(t *testing.T) {
+	terminalErr := errors.New("terminal secret")
+	callbackErr := errors.New("callback secret")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var diagnostics []Diagnostic
+	registry := newTestRegistry(ReporterFunc(func(_ context.Context, diagnostic Diagnostic) {
+		diagnostics = append(diagnostics, diagnostic)
+	}))
+	component := testComponent("outlived-failures")
+	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
+		return OnAround(registrar, testAround, spec(component.InstanceID, "around", 0, GlobalScope()), func(ctx context.Context, _ testPayload, proceed Proceed) error {
+			go func() { _ = proceed(ctx) }()
+			<-entered
+			return callbackErr
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.Snapshot(GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	result := make(chan error, 1)
+	go func() {
+		_, invokeErr := InvokeAround(plan, context.Background(), testAround, testPayload{Protected: "fixed"}, func(context.Context) (string, error) {
+			close(entered)
+			<-release
+			return "", terminalErr
+		})
+		result <- invokeErr
+	}()
+	select {
+	case invokeErr := <-result:
+		t.Fatalf("InvokeAround returned before terminal completed: %v", invokeErr)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	err = <-result
+	var bounded *CallbackError
+	if !errors.Is(err, ErrProceedOutlivedCallback) || !errors.Is(err, terminalErr) || !errors.Is(err, callbackErr) || !errors.As(err, &bounded) {
+		t.Fatalf("InvokeAround error = %v", err)
+	}
+	if len(diagnostics) != 1 || strings.Contains(err.Error(), terminalErr.Error()) || strings.Contains(err.Error(), callbackErr.Error()) {
+		t.Fatalf("diagnostics=%#v public error=%q", diagnostics, err)
+	}
+}
+
 func TestInterceptorOnionAndProceedGuard(t *testing.T) {
 	registry := newTestRegistry(nil)
 	var sequence []string
@@ -167,11 +217,12 @@ func TestAroundInputMutationIsIsolatedAndDelegationIsRequired(t *testing.T) {
 
 func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 	delegatedErr := errors.New("delegated failure")
+	var proceedErr error
 	registry := newTestRegistry(nil)
 	component := testComponent("swallow")
 	_, err := registry.Mount(context.Background(), component, InstallerFunc(func(_ context.Context, registrar Registrar) error {
 		return OnAround(registrar, testAround, spec(component.InstanceID, "swallow", 0, GlobalScope()), func(ctx context.Context, _ testPayload, proceed Proceed) error {
-			_ = proceed(ctx)
+			proceedErr = proceed(ctx)
 			return nil
 		})
 	}))
@@ -188,6 +239,9 @@ func TestRequiredDelegationCannotSwallowDelegatedFailure(t *testing.T) {
 	})
 	if output != "" || !errors.Is(err, delegatedErr) {
 		t.Fatalf("Invoke = %q, %v; want delegated failure", output, err)
+	}
+	if proceedErr != nil {
+		t.Fatalf("Proceed exposed terminal failure: %v", proceedErr)
 	}
 }
 

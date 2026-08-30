@@ -75,7 +75,8 @@ type ContinueFunc[D any] func(D) bool
 
 // Proceed synchronously delegates to the remainder of an around-callback chain.
 // It may be called at most once, must finish before the Around callback returns,
-// and does not support concurrent use. Terminal output remains host-owned.
+// and does not support concurrent use. Its result reports lifecycle misuse only;
+// terminal output and failure remain host-owned.
 type Proceed func(context.Context) error
 
 // Around wraps a point and may synchronously call proceed at most once. A

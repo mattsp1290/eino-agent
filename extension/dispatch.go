@@ -7,17 +7,77 @@ import (
 	"sync"
 )
 
-type delegatedError struct{ cause error }
-
-func (e *delegatedError) Error() string { return e.cause.Error() }
-func (e *delegatedError) Unwrap() error { return e.cause }
-
 type proceedOutlivedError struct{ cause error }
 
 func (e *proceedOutlivedError) Error() string { return ErrProceedOutlivedCallback.Error() }
 func (e *proceedOutlivedError) Unwrap() error { return e.cause }
 func (e *proceedOutlivedError) Is(target error) bool {
 	return target == ErrProceedOutlivedCallback
+}
+
+type aroundInvocation[O any] struct {
+	mu       sync.Mutex
+	open     bool
+	calls    int
+	active   bool
+	done     chan struct{}
+	output   O
+	terminal error
+}
+
+func newAroundInvocation[O any]() *aroundInvocation[O] {
+	return &aroundInvocation[O]{open: true, done: make(chan struct{})}
+}
+
+func (s *aroundInvocation[O]) proceed(ctx context.Context, fallback context.Context, next func(context.Context) (O, error)) error {
+	s.mu.Lock()
+	if !s.open {
+		s.mu.Unlock()
+		return ErrProceedOutlivedCallback
+	}
+	s.calls++
+	if s.calls != 1 {
+		s.mu.Unlock()
+		return ErrProceedCalledTwice
+	}
+	s.active = true
+	s.mu.Unlock()
+
+	var out O
+	var terminal error
+	defer func() {
+		s.mu.Lock()
+		s.output = out
+		s.terminal = terminal
+		s.active = false
+		close(s.done)
+		s.mu.Unlock()
+	}()
+	if ctx == nil {
+		ctx = fallback
+	}
+	out, terminal = next(ctx)
+	return nil
+}
+
+type aroundResult[O any] struct {
+	calls    int
+	outlived bool
+	output   O
+	terminal error
+}
+
+func (s *aroundInvocation[O]) closeAndDrain() aroundResult[O] {
+	s.mu.Lock()
+	s.open = false
+	outlived := s.active
+	s.mu.Unlock()
+	if outlived {
+		<-s.done
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return aroundResult[O]{calls: s.calls, outlived: outlived, output: s.output, terminal: s.terminal}
 }
 
 func Notify[T any](plan *Plan, ctx context.Context, point Notification[T], value T) {
@@ -165,94 +225,39 @@ func InvokeAround[I, O any](plan *Plan, ctx context.Context, point RequiredAroun
 		}
 		entry := entries[index]
 		around := entry.callback.(Around[I])
-		var proceedMu sync.Mutex
-		calls := 0
-		activeCall := false
-		callbackOpen := true
-		proceedDone := make(chan struct{})
-		var delegatedOutput O
-		var delegatedSucceeded bool
-		var delegatedFailure error
+		state := newAroundInvocation[O]()
 		proceed := func(nextCtx context.Context) error {
-			proceedMu.Lock()
-			if !callbackOpen {
-				proceedMu.Unlock()
-				return ErrProceedOutlivedCallback
-			}
-			calls++
-			if calls != 1 {
-				proceedMu.Unlock()
-				return ErrProceedCalledTwice
-			}
-			activeCall = true
-			proceedMu.Unlock()
-			defer func() {
-				proceedMu.Lock()
-				activeCall = false
-				close(proceedDone)
-				proceedMu.Unlock()
-			}()
-			if nextCtx == nil {
-				nextCtx = currentCtx
-			}
-			out, err := invoke(index+1, nextCtx)
-			proceedMu.Lock()
-			defer proceedMu.Unlock()
-			delegatedOutput = out
-			if err != nil {
-				delegatedFailure = err
-				return &delegatedError{cause: err}
-			}
-			delegatedSucceeded = true
-			return nil
+			return state.proceed(nextCtx, currentCtx, func(next context.Context) (O, error) {
+				return invoke(index+1, next)
+			})
 		}
 		cloned, err := cloneInput(point.definition.clone, input)
 		if err != nil {
 			return zero, err
 		}
 		callbackErr := callAround(callbackContext(currentCtx, entry.token), around, cloned, proceed)
-		proceedMu.Lock()
-		callbackOpen = false
-		outlived := activeCall
-		proceedMu.Unlock()
-		if outlived {
-			<-proceedDone
-		}
-		proceedMu.Lock()
-		finalCalls := calls
-		finalDelegatedOutput := delegatedOutput
-		finalDelegatedSucceeded := delegatedSucceeded
-		finalDelegatedFailure := delegatedFailure
-		proceedMu.Unlock()
-		if finalCalls > 1 {
+		result := state.closeAndDrain()
+		if result.calls > 1 {
 			return zero, ErrProceedCalledTwice
 		}
-		if outlived {
-			return zero, &proceedOutlivedError{cause: finalDelegatedFailure}
+		if result.outlived {
+			lifecycle := &proceedOutlivedError{cause: result.terminal}
+			if callbackErr != nil {
+				return zero, errors.Join(lifecycle, propagateCallbackFailure(plan, currentCtx, entry, callbackErr))
+			}
+			return zero, lifecycle
 		}
 		if callbackErr == nil {
-			if finalCalls != 1 {
+			if result.calls != 1 {
 				return zero, ErrProceedNotCalled
 			}
-			if !finalDelegatedSucceeded {
-				if finalDelegatedFailure != nil {
-					return zero, finalDelegatedFailure
-				}
-				return zero, ErrProceedNotCalled
-			}
+			return result.output, result.terminal
 		}
-		if callbackErr != nil {
-			var delegated *delegatedError
-			if errors.As(callbackErr, &delegated) && callbackErr == delegated {
-				return finalDelegatedOutput, delegated.cause
-			}
-			callbackFailure := propagateCallbackFailure(plan, currentCtx, entry, callbackErr)
-			if finalDelegatedFailure != nil {
-				return finalDelegatedOutput, errors.Join(finalDelegatedFailure, callbackFailure)
-			}
-			return finalDelegatedOutput, callbackFailure
+		callbackFailure := propagateCallbackFailure(plan, currentCtx, entry, callbackErr)
+		if result.terminal != nil {
+			return result.output, errors.Join(result.terminal, callbackFailure)
 		}
-		return finalDelegatedOutput, nil
+		return result.output, callbackFailure
 	}
 	return invoke(0, ctx)
 }

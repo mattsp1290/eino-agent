@@ -444,6 +444,70 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	}
 }
 
+func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*einoschema.Message)
+	}{
+		{name: "extra", mutate: func(message *einoschema.Message) {
+			message.Extra = map[string]any{"credential": "sentinel"}
+		}},
+		{name: "deprecated multi content", mutate: func(message *einoschema.Message) {
+			//nolint:staticcheck // The ownership boundary must reject this field.
+			message.MultiContent = []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}
+		}},
+		{name: "streaming metadata", mutate: func(message *einoschema.Message) {
+			message.AssistantGenMultiContent = []einoschema.MessageOutputPart{{
+				Type: einoschema.ChatMessagePartTypeText, Text: "partial",
+				StreamingMeta: &einoschema.MessageStreamingMeta{Index: 0},
+			}}
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = store.Close() }()
+			calls := 0
+			streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+				calls++
+				message := einoschema.AssistantMessage("", []einoschema.ToolCall{{
+					ID: "unsafe-call", Type: "function",
+					Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hello"}`},
+				}})
+				test.mutate(message)
+				return []*einoschema.Message{message}, nil
+			})
+			tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo"}, Executor: runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+				return ToolResult{Output: "hello"}, nil
+			})}
+			orchestrator, err := NewStreamingOrchestrator(
+				WithStore(store),
+				WithModelResolver(resolvedModel{streamer: streamer}),
+				WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})}),
+				WithIDGenerator(&sequenceIDs{}),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := startAndWaitRequest(t, orchestrator, Request{SessionID: session.ID("unsafe-output-" + strings.ReplaceAll(test.name, " ", "-")), Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+			if result.Status != session.RunFailed || result.Error == nil || calls != 1 {
+				t.Fatalf("result=%#v adapter calls=%d", result, calls)
+			}
+			run, err := store.GetRun(context.Background(), result.RunID)
+			if err != nil || run.Status != session.RunFailed {
+				t.Fatalf("durable run=%#v error=%v", run, err)
+			}
+			batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+			if err != nil || len(batch.Records) != 1 || batch.Records[0].Step != 1 || batch.Records[0].State != session.ModelRequestCompleted {
+				t.Fatalf("model request records=%#v error=%v", batch.Records, err)
+			}
+		})
+	}
+}
+
 func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {

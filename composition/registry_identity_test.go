@@ -82,11 +82,11 @@ func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 	}
 	componentIdentity := component("tool-order").Artifact
 	descriptor := func(order int) session.ExtensionPlanDescriptor {
-		value := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion, Components: []session.ComponentPlan{{
+		value := session.ExtensionPlanDescriptor{Components: []session.ComponentPlan{{
 			InstanceID: "tool-order", Artifact: componentIdentity,
 			Tools: []session.ToolPlanIdentity{{Name: "echo", RegistrationID: base.ID, Scope: base.Scope, SchemaHash: baseSchema, ExecutorHash: executorA, Order: order}},
 		}}}
-		sealed, sealErr := session.SealExtensionPlan(value)
+		sealed, sealErr := session.SealExtensionPlanForSession("", value)
 		err = sealErr
 		if err != nil {
 			t.Fatal(err)

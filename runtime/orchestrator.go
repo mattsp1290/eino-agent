@@ -230,7 +230,7 @@ func (o *StreamingOrchestrator) runFresh(ctx context.Context, execution *runExec
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot) (TurnSnapshot, error) {
-	assembly := contextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: cloneMessages(snapshot.Messages)}
+	assembly := contextAssembly{SessionID: snapshot.SessionID, RunID: snapshot.RunID, EpochID: snapshot.EpochID, Metadata: boundedTurnMetadata(snapshot), Base: snapshot.Messages}
 	assembled, err := extension.ApplyTransforms(execution.dispatch(), ctx, contextAssemblePoint, assembly)
 	if err != nil {
 		return TurnSnapshot{}, err
@@ -260,12 +260,12 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
-	o.observeToolsResolved(ctx, snapshot.Clone(), snapshot.Tools)
+	o.observeToolsResolved(ctx, snapshot, snapshot.Tools)
 	return snapshot, nil
 }
 
 func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
-	messages := cloneMessages(snapshot.Messages)
+	messages := append([]*einoschema.Message(nil), snapshot.Messages...)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
 		msg, err := o.streamModelAttempts(ctx, execution, snapshot, currentMessageID, messages, turn+1, usage)
@@ -475,8 +475,9 @@ func (o *StreamingOrchestrator) providerInput(ctx context.Context, request Reque
 	if err != nil && !errors.Is(err, session.ErrNotFound) {
 		return nil, err
 	}
-	messages := cloneMessages(historyMessages)
-	messages = append(messages, cloneMessages(request.Input)...)
+	messages := make([]*einoschema.Message, 0, len(historyMessages)+len(request.Input))
+	messages = append(messages, historyMessages...)
+	messages = append(messages, request.Input...)
 	return messages, nil
 }
 

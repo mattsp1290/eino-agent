@@ -97,168 +97,203 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	plan := &RunPlan{dispatch: spec.Dispatch, sessionID: spec.SessionID}
 	fail := func(err error) (*RunPlan, error) {
 		plan.release()
+		if !errors.Is(err, ErrExtensionPlanMismatch) {
+			err = fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		}
 		return nil, err
 	}
-	descriptor := session.ExtensionPlanDescriptor{SchemaVersion: session.ExtensionPlanSchemaVersion}
-	components := append([]PlanComponent(nil), spec.Components...)
-	sort.Slice(components, func(i, j int) bool { return components[i].Component.InstanceID < components[j].Component.InstanceID })
-	authoritativeHandlers := []extension.ComponentHandlers(nil)
-	if spec.Dispatch != nil {
-		authoritativeHandlers = spec.Dispatch.HandlerComponents()
-	}
-	durableComponents := make(map[string]session.ComponentPlan, len(authoritativeHandlers)+len(components))
-	componentOwners := make(map[string]extension.Component, len(authoritativeHandlers)+len(components))
-	for _, owned := range authoritativeHandlers {
-		if err := extension.ValidateComponent(owned.Component); err != nil {
-			return fail(fmt.Errorf("%w: invalid handler owner", ErrExtensionPlanMismatch))
-		}
-		if _, exists := componentOwners[owned.Component.InstanceID]; exists {
-			return fail(fmt.Errorf("%w: duplicate handler owner", ErrExtensionPlanMismatch))
-		}
-		durable := session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
-		for _, handler := range owned.Handlers {
-			if err := validatePlanScope(spec.SessionID, handler.Scope); err != nil {
-				return fail(err)
-			}
-			durable.Handlers = append(durable.Handlers, session.RegistrationIdentity{ID: handler.ID, Contract: handler.Contract.ID, Version: handler.Contract.Version, Order: handler.Order, Scope: handler.Scope, Kind: handler.Kind})
-		}
-		componentOwners[owned.Component.InstanceID] = owned.Component
-		durableComponents[owned.Component.InstanceID] = durable
-	}
-	type ownedTool struct {
-		owner string
-		value PlanTool
-	}
-	type ownedRestriction struct {
-		owner string
-		value PlanRestriction
-	}
-	var tools []ownedTool
-	var prompts []MountedPrompt
-	var guards []MountedToolGuard
-	var restrictions []ownedRestriction
-	for componentIndex, owned := range components {
-		if err := extension.ValidateComponent(owned.Component); err != nil || componentIndex > 0 && components[componentIndex-1].Component.InstanceID == owned.Component.InstanceID {
-			return fail(fmt.Errorf("%w: invalid or duplicate component owner", ErrExtensionPlanMismatch))
-		}
-		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) == 0 {
-			return fail(fmt.Errorf("%w: empty component owner", ErrExtensionPlanMismatch))
-		}
-		if existing, ok := componentOwners[owned.Component.InstanceID]; ok && existing != owned.Component {
-			return fail(fmt.Errorf("%w: conflicting component owner", ErrExtensionPlanMismatch))
-		}
-		durable, ok := durableComponents[owned.Component.InstanceID]
-		if !ok {
-			durable = session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
-			componentOwners[owned.Component.InstanceID] = owned.Component
-		}
-		for _, capability := range owned.Tools {
-			if extension.ValidateIdentifier(capability.Name) != nil || extension.ValidateIdentifier(capability.RegistrationID) != nil || capability.SchemaHash == "" || capability.ExecutorHash == "" || capability.Resolve == nil {
-				return fail(fmt.Errorf("%w: tool resolver required", ErrExtensionPlanMismatch))
-			}
-			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
-				return fail(err)
-			}
-			tools = append(tools, ownedTool{owner: owned.Component.InstanceID, value: capability})
-			durable.Tools = append(durable.Tools, toolPlanIdentity(capability))
-		}
-		for _, capability := range owned.Prompts {
-			if extension.ValidateIdentifier(capability.Name) != nil || extension.ValidateIdentifier(capability.RegistrationID) != nil || capability.Name == systemPromptSectionName || capability.Provider == nil {
-				return fail(fmt.Errorf("%w: prompt behavior required", ErrExtensionPlanMismatch))
-			}
-			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
-				return fail(err)
-			}
-			prompts = append(prompts, MountedPrompt{Name: capability.Name, ID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order, InstanceID: owned.Component.InstanceID, Provider: capability.Provider})
-			durable.Prompts = append(durable.Prompts, session.PromptPlanIdentity{Name: capability.Name, RegistrationID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order})
-		}
-		for _, capability := range owned.Guards {
-			if extension.ValidateIdentifier(capability.RegistrationID) != nil || capability.Guard == nil {
-				return fail(fmt.Errorf("%w: guard behavior required", ErrExtensionPlanMismatch))
-			}
-			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
-				return fail(err)
-			}
-			guards = append(guards, MountedToolGuard{ID: capability.RegistrationID, Order: capability.Order, InstanceID: owned.Component.InstanceID, Scope: capability.Scope, Guard: capability.Guard})
-			durable.Guards = append(durable.Guards, session.GuardPlanIdentity{RegistrationID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order})
-		}
-		for _, capability := range owned.Restrictions {
-			if extension.ValidateIdentifier(capability.RegistrationID) != nil {
-				return fail(fmt.Errorf("%w: invalid restriction registration", ErrExtensionPlanMismatch))
-			}
-			if err := validatePlanScope(spec.SessionID, capability.Scope); err != nil {
-				return fail(err)
-			}
-			rules, err := CanonicalizeRestrictionRules(capability.Allowed, capability.Denied)
-			if err != nil {
-				return fail(fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err))
-			}
-			capability.Allowed = rules.Allowed
-			capability.Denied = rules.Denied
-			restrictions = append(restrictions, ownedRestriction{owner: owned.Component.InstanceID, value: capability})
-			durable.Restrictions = append(durable.Restrictions, session.RestrictionPlanIdentity{RegistrationID: capability.RegistrationID, Scope: capability.Scope, RulesHash: rules.Hash})
-		}
-		durableComponents[owned.Component.InstanceID] = durable
-	}
-	componentIDs := make([]string, 0, len(durableComponents))
-	for instanceID := range durableComponents {
-		componentIDs = append(componentIDs, instanceID)
-	}
-	sort.Strings(componentIDs)
-	for _, instanceID := range componentIDs {
-		descriptor.Components = append(descriptor.Components, durableComponents[instanceID])
-	}
-	sort.Slice(tools, func(i, j int) bool {
-		return comparePlanTool(tools[i].owner, toolPlanIdentity(tools[i].value), tools[j].owner, toolPlanIdentity(tools[j].value)) < 0
-	})
-	sort.Slice(prompts, func(i, j int) bool { return compareMountedPrompt(prompts[i], prompts[j]) < 0 })
-	sort.Slice(guards, func(i, j int) bool { return compareMountedGuard(guards[i], guards[j]) < 0 })
-	sort.Slice(restrictions, func(i, j int) bool {
-		return comparePlanRestriction(restrictions[i].owner, restrictions[i].value, restrictions[j].owner, restrictions[j].value) < 0
-	})
-	toolNames := make(map[string]bool, len(tools))
-	for _, tool := range tools {
-		if toolNames[tool.value.Name] {
-			return fail(fmt.Errorf("%w: duplicate tool name %q", ErrExtensionPlanMismatch, tool.value.Name))
-		}
-		toolNames[tool.value.Name] = true
-	}
-	promptNames := make(map[string]bool, len(prompts))
-	for _, prompt := range prompts {
-		if promptNames[prompt.Name] {
-			return fail(fmt.Errorf("%w: duplicate prompt name %q", ErrExtensionPlanMismatch, prompt.Name))
-		}
-		promptNames[prompt.Name] = true
-	}
-	sealedTools := make([]PlanTool, len(tools))
-	sealedPrompts := make([]MountedPrompt, len(prompts))
-	sealedGuards := make([]MountedToolGuard, len(guards))
-	sealedRestrictions := make([]PlanRestriction, len(restrictions))
-	for index := range tools {
-		sealedTools[index] = tools[index].value
-	}
-	copy(sealedPrompts, prompts)
-	copy(sealedGuards, guards)
-	for index := range restrictions {
-		sealedRestrictions[index] = restrictions[index].value
-	}
-	sealed, err := session.SealExtensionPlan(descriptor)
+	compiled, err := compileRunPlan(spec)
 	if err != nil {
 		return fail(err)
 	}
-	plan.tools = sealedPlanTools{capabilities: sealedTools, restrictions: sealedRestrictions}
-	plan.prompts = sealedPrompts
-	plan.guards = sealedGuards
+	sealed, err := session.SealExtensionPlanForSession(spec.SessionID, compiled.descriptor)
+	if err != nil {
+		return fail(err)
+	}
+	plan.tools = sealedPlanTools{capabilities: compiled.tools, restrictions: compiled.restrictions}
+	plan.prompts = compiled.prompts
+	plan.guards = compiled.guards
 	plan.sealed = sealed
 	return plan, nil
 }
 
-func validatePlanScope(sessionID session.ID, scope extension.Scope) error {
-	if err := extension.ValidateScope(scope); err != nil {
-		return fmt.Errorf("%w: invalid capability scope", ErrExtensionPlanMismatch)
+type ownedPlanTool struct {
+	owner string
+	value PlanTool
+}
+
+type ownedPlanRestriction struct {
+	owner string
+	value PlanRestriction
+}
+
+type handlerFragment struct {
+	component extension.Component
+	durable   session.ComponentPlan
+	merged    bool
+}
+
+type compiledRunPlan struct {
+	descriptor   session.ExtensionPlanDescriptor
+	ownedTools   []ownedPlanTool
+	prompts      []MountedPrompt
+	guards       []MountedToolGuard
+	ownedRules   []ownedPlanRestriction
+	tools        []PlanTool
+	restrictions []PlanRestriction
+}
+
+func compileRunPlan(spec RunPlanSpec) (compiledRunPlan, error) {
+	compiled := compiledRunPlan{}
+	handlers := compileHandlerFragments(spec.Dispatch)
+	for _, owned := range spec.Components {
+		durable, err := compiled.compileCapabilities(owned)
+		if err != nil {
+			return compiledRunPlan{}, err
+		}
+		compiled.mergeCapabilityFragment(owned.Component, durable, handlers)
 	}
-	if scope.Kind == extension.ScopeSession && (sessionID == "" || scope.Key != string(sessionID)) {
-		return fmt.Errorf("%w: session scope does not match plan session", ErrExtensionPlanMismatch)
+	for _, fragment := range handlers {
+		if !fragment.merged {
+			compiled.descriptor.Components = append(compiled.descriptor.Components, fragment.durable)
+		}
+	}
+	if err := compiled.finalize(); err != nil {
+		return compiledRunPlan{}, err
+	}
+	return compiled, nil
+}
+
+func compileHandlerFragments(dispatch *extension.Plan) []*handlerFragment {
+	if dispatch == nil {
+		return nil
+	}
+	ownedHandlers := dispatch.HandlerComponents()
+	fragments := make([]*handlerFragment, 0, len(ownedHandlers))
+	for _, owned := range ownedHandlers {
+		durable := session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
+		for _, handler := range owned.Handlers {
+			durable.Handlers = append(durable.Handlers, session.RegistrationIdentity{ID: handler.ID, Contract: handler.Contract.ID, Version: handler.Contract.Version, Order: handler.Order, Scope: handler.Scope, Kind: handler.Kind})
+		}
+		fragments = append(fragments, &handlerFragment{component: owned.Component, durable: durable})
+	}
+	return fragments
+}
+
+func (c *compiledRunPlan) compileCapabilities(owned PlanComponent) (session.ComponentPlan, error) {
+	durable := session.ComponentPlan{InstanceID: owned.Component.InstanceID, Artifact: owned.Component.Artifact}
+	if err := c.compileTools(owned, &durable); err != nil {
+		return session.ComponentPlan{}, err
+	}
+	if err := c.compilePrompts(owned, &durable); err != nil {
+		return session.ComponentPlan{}, err
+	}
+	if err := c.compileGuards(owned, &durable); err != nil {
+		return session.ComponentPlan{}, err
+	}
+	if err := c.compileRestrictions(owned, &durable); err != nil {
+		return session.ComponentPlan{}, err
+	}
+	return durable, nil
+}
+
+func (c *compiledRunPlan) compileTools(owned PlanComponent, durable *session.ComponentPlan) error {
+	for _, capability := range owned.Tools {
+		if capability.Resolve == nil {
+			return fmt.Errorf("%w: tool resolver required", ErrExtensionPlanMismatch)
+		}
+		c.ownedTools = append(c.ownedTools, ownedPlanTool{owner: owned.Component.InstanceID, value: capability})
+		durable.Tools = append(durable.Tools, toolPlanIdentity(capability))
+	}
+	return nil
+}
+
+func (c *compiledRunPlan) compilePrompts(owned PlanComponent, durable *session.ComponentPlan) error {
+	for _, capability := range owned.Prompts {
+		if capability.Name == systemPromptSectionName || capability.Provider == nil {
+			return fmt.Errorf("%w: prompt behavior required", ErrExtensionPlanMismatch)
+		}
+		c.prompts = append(c.prompts, MountedPrompt{Name: capability.Name, ID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order, InstanceID: owned.Component.InstanceID, Provider: capability.Provider})
+		durable.Prompts = append(durable.Prompts, session.PromptPlanIdentity{Name: capability.Name, RegistrationID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order})
+	}
+	return nil
+}
+
+func (c *compiledRunPlan) compileGuards(owned PlanComponent, durable *session.ComponentPlan) error {
+	for _, capability := range owned.Guards {
+		if capability.Guard == nil {
+			return fmt.Errorf("%w: guard behavior required", ErrExtensionPlanMismatch)
+		}
+		c.guards = append(c.guards, MountedToolGuard{ID: capability.RegistrationID, Order: capability.Order, InstanceID: owned.Component.InstanceID, Scope: capability.Scope, Guard: capability.Guard})
+		durable.Guards = append(durable.Guards, session.GuardPlanIdentity{RegistrationID: capability.RegistrationID, Scope: capability.Scope, Order: capability.Order})
+	}
+	return nil
+}
+
+func (c *compiledRunPlan) compileRestrictions(owned PlanComponent, durable *session.ComponentPlan) error {
+	for _, capability := range owned.Restrictions {
+		rules, err := CanonicalizeRestrictionRules(capability.Allowed, capability.Denied)
+		if err != nil {
+			return fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		}
+		capability.Allowed, capability.Denied = rules.Allowed, rules.Denied
+		c.ownedRules = append(c.ownedRules, ownedPlanRestriction{owner: owned.Component.InstanceID, value: capability})
+		durable.Restrictions = append(durable.Restrictions, session.RestrictionPlanIdentity{RegistrationID: capability.RegistrationID, Scope: capability.Scope, RulesHash: rules.Hash})
+	}
+	return nil
+}
+
+func (c *compiledRunPlan) mergeCapabilityFragment(component extension.Component, durable session.ComponentPlan, handlers []*handlerFragment) {
+	behaviorCount := len(durable.Tools) + len(durable.Prompts) + len(durable.Guards) + len(durable.Restrictions)
+	if behaviorCount != 0 {
+		for _, fragment := range handlers {
+			if !fragment.merged && fragment.component == component {
+				fragment.merged = true
+				durable.Handlers = fragment.durable.Handlers
+				break
+			}
+		}
+	}
+	c.descriptor.Components = append(c.descriptor.Components, durable)
+}
+
+func (c *compiledRunPlan) finalize() error {
+	sort.Slice(c.ownedTools, func(i, j int) bool {
+		return comparePlanTool(c.ownedTools[i].owner, toolPlanIdentity(c.ownedTools[i].value), c.ownedTools[j].owner, toolPlanIdentity(c.ownedTools[j].value)) < 0
+	})
+	sort.Slice(c.prompts, func(i, j int) bool { return compareMountedPrompt(c.prompts[i], c.prompts[j]) < 0 })
+	sort.Slice(c.guards, func(i, j int) bool { return compareMountedGuard(c.guards[i], c.guards[j]) < 0 })
+	sort.Slice(c.ownedRules, func(i, j int) bool {
+		return comparePlanRestriction(c.ownedRules[i].owner, c.ownedRules[i].value, c.ownedRules[j].owner, c.ownedRules[j].value) < 0
+	})
+	if err := uniqueCapabilityNames(c.ownedTools, c.prompts); err != nil {
+		return err
+	}
+	c.tools = make([]PlanTool, len(c.ownedTools))
+	c.restrictions = make([]PlanRestriction, len(c.ownedRules))
+	for index := range c.ownedTools {
+		c.tools[index] = c.ownedTools[index].value
+	}
+	for index := range c.ownedRules {
+		c.restrictions[index] = c.ownedRules[index].value
+	}
+	return nil
+}
+
+func uniqueCapabilityNames(tools []ownedPlanTool, prompts []MountedPrompt) error {
+	seenTools := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		if seenTools[tool.value.Name] {
+			return fmt.Errorf("%w: duplicate tool name %q", ErrExtensionPlanMismatch, tool.value.Name)
+		}
+		seenTools[tool.value.Name] = true
+	}
+	seenPrompts := make(map[string]bool, len(prompts))
+	for _, prompt := range prompts {
+		if seenPrompts[prompt.Name] {
+			return fmt.Errorf("%w: duplicate prompt name %q", ErrExtensionPlanMismatch, prompt.Name)
+		}
+		seenPrompts[prompt.Name] = true
 	}
 	return nil
 }

@@ -39,7 +39,7 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 				Arguments: `{"text":"hi"}`,
 			},
 		}})}, nil
-	}))
+	}), WithQueueSize(16))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
