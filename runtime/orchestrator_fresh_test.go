@@ -95,9 +95,10 @@ func TestPreExecutionRejectionRetainsAdmittedPair(t *testing.T) {
 	}
 	var user, assistant session.Message
 	for _, message := range store.messages {
-		if message.Role == session.RoleUser {
+		switch message.Role {
+		case session.RoleUser:
 			user = message
-		} else if message.Role == session.RoleAssistant {
+		case session.RoleAssistant:
 			assistant = message
 		}
 	}
