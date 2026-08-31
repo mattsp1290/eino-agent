@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	einoobs "github.com/mattsp1290/eino-obs"
@@ -83,13 +85,11 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err := model.ValidateResolved(request.Config.Model, resolved); err != nil {
 		return nil, err
 	}
-	input, err := o.providerInput(ctx, request)
-	if err != nil {
-		return nil, err
-	}
 	ids := admissionIDs{
 		SessionID:          request.SessionID,
 		RunID:              o.ids.NewRunID(),
+		UserMessageID:      o.ids.NewMessageID(),
+		UserPartID:         o.ids.NewPartID(),
 		AssistantMessageID: o.ids.NewMessageID(),
 		ContextEpochID:     o.ids.NewEpochID(),
 		EventID:            o.ids.NewEventID(),
@@ -97,15 +97,15 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	}
 	admitter := o.admitter()
 	admitted, err := admitter.admit(ctx, admissionRequest{
-		IDs:             ids,
-		ParentMessageID: request.ParentID,
-		Config:          request.Config,
-		Model:           resolved,
-		Input:           input,
-		OwnerID:         o.ownerID(),
-		LeaseDuration:   o.lease(),
-		Metadata:        request.Metadata,
-		ExtensionPlan:   plan.Descriptor(),
+		IDs:           ids,
+		UserMessage:   request.Message,
+		History:       o.history,
+		Config:        request.Config,
+		Model:         resolved,
+		OwnerID:       o.ownerID(),
+		LeaseDuration: o.lease(),
+		Metadata:      request.Metadata,
+		ExtensionPlan: plan.Descriptor(),
 	})
 	if err != nil {
 		return nil, err
@@ -460,6 +460,12 @@ func (o *StreamingOrchestrator) validate(request Request) error {
 	if request.SessionID == "" {
 		return fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
 	}
+	if !utf8.ValidString(request.Message.Content) {
+		return fmt.Errorf("%w: message content must be valid UTF-8", ErrInvalidOrchestrator)
+	}
+	if strings.TrimSpace(request.Message.Content) == "" {
+		return fmt.Errorf("%w: message content required", ErrInvalidOrchestrator)
+	}
 	return nil
 }
 
@@ -468,17 +474,6 @@ func (o *StreamingOrchestrator) validateConfigured() error {
 		return fmt.Errorf("%w: use NewStreamingOrchestrator", ErrInvalidOrchestrator)
 	}
 	return nil
-}
-
-func (o *StreamingOrchestrator) providerInput(ctx context.Context, request Request) ([]*einoschema.Message, error) {
-	historyMessages, err := LoadHistory(ctx, o.store, request.SessionID, o.history)
-	if err != nil && !errors.Is(err, session.ErrNotFound) {
-		return nil, err
-	}
-	messages := make([]*einoschema.Message, 0, len(historyMessages)+len(request.Input))
-	messages = append(messages, historyMessages...)
-	messages = append(messages, request.Input...)
-	return messages, nil
 }
 
 func (o *StreamingOrchestrator) admitter() admitter {

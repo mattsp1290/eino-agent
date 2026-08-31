@@ -12,12 +12,20 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+// UserMessage is the one current user submission admitted by Start.
+//
+// Runtime owns its durable message and part identities. Callers must not copy
+// transcript history into this value.
+type UserMessage struct {
+	Content string
+}
+
 // Request admits a user-visible run. Implementations persist the run before
-// invoking Eino or emitting live AG-UI events.
+// invoking Eino or emitting live AG-UI events. Message contains only the
+// current submission; runtime loads prior durable history itself.
 type Request struct {
 	SessionID session.ID
-	ParentID  session.MessageID
-	Input     []*einoschema.Message
+	Message   UserMessage
 	Config    config.Snapshot
 	Metadata  map[string]string
 }

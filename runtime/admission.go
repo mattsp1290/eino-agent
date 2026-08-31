@@ -13,6 +13,7 @@ import (
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/session/history"
 )
 
 var ErrInvalidAdmission = errors.New("invalid admission")
@@ -20,6 +21,8 @@ var ErrInvalidAdmission = errors.New("invalid admission")
 type admissionIDs struct {
 	SessionID          session.ID
 	RunID              session.RunID
+	UserMessageID      session.MessageID
+	UserPartID         session.PartID
 	AssistantMessageID session.MessageID
 	ContextEpochID     session.EpochID
 	EventID            session.EventID
@@ -27,15 +30,15 @@ type admissionIDs struct {
 }
 
 type admissionRequest struct {
-	IDs             admissionIDs
-	ParentMessageID session.MessageID
-	Config          config.Snapshot
-	Model           model.Resolved
-	Input           []*einoschema.Message
-	OwnerID         string
-	LeaseDuration   time.Duration
-	Metadata        map[string]string
-	ExtensionPlan   session.ExtensionPlanDescriptor
+	IDs           admissionIDs
+	UserMessage   UserMessage
+	History       history.Options
+	Config        config.Snapshot
+	Model         model.Resolved
+	OwnerID       string
+	LeaseDuration time.Duration
+	Metadata      map[string]string
+	ExtensionPlan session.ExtensionPlanDescriptor
 }
 
 type admittedRun struct {
@@ -69,15 +72,10 @@ func (a admitter) admit(ctx context.Context, request admissionRequest) (admitted
 		return admittedRun{}, fmt.Errorf("%w: freeze request: %v", ErrInvalidAdmission, err)
 	}
 	now := a.now()
-	frozenSnapshot, err := FreezeTurnSnapshot(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, request.Input, request.Config.Agent.SystemPrompt, now)
-	if err != nil {
-		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
-	}
-
 	var admitted admittedRun
 	if err := a.Store.WithinTx(ctx, func(ctx context.Context, store session.Store) error {
 		var err error
-		admitted, err = admitDurable(ctx, store, request, frozenSnapshot, now)
+		admitted, err = admitDurable(ctx, store, request, now)
 		return err
 	}); err != nil {
 		return admittedRun{}, err
@@ -101,7 +99,7 @@ func (a admitter) now() time.Time {
 	return time.Now().UTC()
 }
 
-func admitDurable(ctx context.Context, store session.Store, request admissionRequest, snapshot TurnSnapshot, now time.Time) (admittedRun, error) {
+func admitDurable(ctx context.Context, store session.Store, request admissionRequest, now time.Time) (admittedRun, error) {
 	sessionRecord, err := store.CreateSession(ctx, admissionSession(request, now))
 	if err != nil {
 		return admittedRun{}, err
@@ -109,6 +107,17 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	runRecord, err := store.AdmitRun(ctx, admissionRun(request, sessionRecord.ID, now), request.LeaseDuration)
 	if err != nil {
 		return admittedRun{}, err
+	}
+	historyMessages, err := LoadHistory(ctx, store, sessionRecord.ID, request.History)
+	if err != nil {
+		return admittedRun{}, err
+	}
+	providerMessages := make([]*einoschema.Message, 0, len(historyMessages)+1)
+	providerMessages = append(providerMessages, historyMessages...)
+	providerMessages = append(providerMessages, einoschema.UserMessage(request.UserMessage.Content))
+	snapshot, err := FreezeTurnSnapshot(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, request.Config.Agent.SystemPrompt, now)
+	if err != nil {
+		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
 	}
 	executionStore := store.Execution(session.RunFence{RunID: runRecord.ID, ClaimToken: runRecord.ClaimToken})
 	if _, err := executionStore.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
@@ -153,9 +162,18 @@ func freezeAdmission(request admissionRequest) (admissionRequest, error) {
 		request.Config.Metadata["workspace_root"] = root
 	}
 	request.Model = cloneResolved(request.Model)
+	request.History = cloneHistoryOptions(request.History)
 	request.Metadata = cloneStringMap(request.Metadata)
 	request.ExtensionPlan = request.ExtensionPlan.Clone()
 	return request, nil
+}
+
+func cloneHistoryOptions(options history.Options) history.Options {
+	if options.Epoch != nil {
+		epoch := *options.Epoch
+		options.Epoch = &epoch
+	}
+	return options
 }
 
 func canonicalAdmissionWorkspace(root string) (string, error) {
@@ -179,6 +197,10 @@ func validateAdmissionIdentity(ids admissionIDs) error {
 		return fmt.Errorf("%w: session id required", ErrInvalidAdmission)
 	case ids.RunID == "":
 		return fmt.Errorf("%w: run id required", ErrInvalidAdmission)
+	case ids.UserMessageID == "":
+		return fmt.Errorf("%w: user message id required", ErrInvalidAdmission)
+	case ids.UserPartID == "":
+		return fmt.Errorf("%w: user part id required", ErrInvalidAdmission)
 	case ids.AssistantMessageID == "":
 		return fmt.Errorf("%w: assistant message id required", ErrInvalidAdmission)
 	case ids.ContextEpochID == "":
@@ -187,9 +209,24 @@ func validateAdmissionIdentity(ids admissionIDs) error {
 		return fmt.Errorf("%w: event id required", ErrInvalidAdmission)
 	case ids.RunClaimToken == "":
 		return fmt.Errorf("%w: run claim token required", ErrInvalidAdmission)
-	default:
-		return nil
 	}
+	generated := []string{
+		string(ids.RunID),
+		string(ids.UserMessageID),
+		string(ids.UserPartID),
+		string(ids.AssistantMessageID),
+		string(ids.ContextEpochID),
+		string(ids.EventID),
+		ids.RunClaimToken,
+	}
+	seen := make(map[string]struct{}, len(generated))
+	for _, id := range generated {
+		if _, exists := seen[id]; exists {
+			return fmt.Errorf("%w: generated admission ids must be distinct", ErrInvalidAdmission)
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
 }
 
 func admissionSession(request admissionRequest, now time.Time) session.Session {
@@ -209,7 +246,7 @@ func admissionRun(request admissionRequest, sessionID session.ID, now time.Time)
 	return session.Run{
 		ID:            request.IDs.RunID,
 		SessionID:     sessionID,
-		ParentMsgID:   request.ParentMessageID,
+		ParentMsgID:   request.IDs.UserMessageID,
 		OwnerID:       request.OwnerID,
 		ClaimToken:    request.IDs.RunClaimToken,
 		Agent:         request.Config.Agent.Name,
@@ -228,7 +265,7 @@ func admissionAssistantMessage(request admissionRequest, sessionID session.ID, r
 		ID:        request.IDs.AssistantMessageID,
 		SessionID: sessionID,
 		RunID:     runID,
-		ParentID:  request.ParentMessageID,
+		ParentID:  request.IDs.UserMessageID,
 		Role:      session.RoleAssistant,
 		Agent:     request.Config.Agent.Name,
 		ModelID:   string(request.Model.Model.ID),

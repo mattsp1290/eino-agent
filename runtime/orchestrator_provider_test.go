@@ -39,8 +39,7 @@ func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 	}))
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		ParentID:  "user-1",
-		Input:     []*einoschema.Message{einoschema.UserMessage("hello")},
+		Message:   UserMessage{Content: "hello"},
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
@@ -79,8 +78,7 @@ func TestStreamingOrchestratorCompletesWithBlockedInfrastructureSink(t *testing.
 	orch.queueSize = 1
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		ParentID:  "user-1",
-		Input:     []*einoschema.Message{einoschema.UserMessage("hello")},
+		Message:   UserMessage{Content: "hello"},
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
@@ -431,7 +429,7 @@ func TestStartRejectsInvalidResolvedModelBeforeHistoryReads(t *testing.T) {
 		}, nil
 	})
 	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithModelResolver(resolver))
-	_, err := orchestrator.Start(context.Background(), Request{SessionID: "session-1", Config: orchestratorConfig(), Input: []*einoschema.Message{einoschema.UserMessage("hello")}})
+	_, err := orchestrator.Start(context.Background(), Request{SessionID: "session-1", Config: orchestratorConfig(), Message: UserMessage{Content: "hello"}})
 	if !errors.Is(err, model.ErrInvalidResolution) {
 		t.Fatalf("Start error = %v, want ErrInvalidResolution", err)
 	}

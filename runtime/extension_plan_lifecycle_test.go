@@ -121,7 +121,7 @@ func TestStartReleasesAcquiredPlanWhenResolverPanics(t *testing.T) {
 			t.Fatalf("mount remained leased after panic: %v", err)
 		}
 	}()
-	_, _ = orchestrator.Start(context.Background(), Request{SessionID: "session", Config: orchestratorConfig()})
+	_, _ = orchestrator.Start(context.Background(), Request{SessionID: "session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 }
 
 func TestRunPlanDescriptorReturnsDefensiveClone(t *testing.T) {

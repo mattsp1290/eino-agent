@@ -96,7 +96,7 @@ func TestContextContributionReachesProviderInCanonicalOrder(t *testing.T) {
 		}
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	}), WithRunPlanProvider(staticRunPlanProvider{plan: plan}))
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "session", Input: []*einoschema.Message{einoschema.UserMessage("base-user")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "session", Message: UserMessage{Content: "base-user"}, Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatal(result.Error)
 	}

@@ -195,7 +195,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 	}
 	handle, err := s.runtime.Start(context.WithoutCancel(r.Context()), runtime.Request{
 		SessionID: sessionID,
-		Input:     messages,
+		Message:   runtime.UserMessage{Content: messages[len(messages)-1].Content},
 		Config:    s.config,
 		Metadata:  map[string]string{"example": "minimal-server"},
 	})

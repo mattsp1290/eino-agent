@@ -46,7 +46,7 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	config := orchestratorConfig()
 	config.Agent.SystemPrompt = "audited system"
 	config.Agent.Options["SECRET_TOKEN"] = "credential-sentinel"
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: config})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-session", Message: UserMessage{Content: "hello"}, Config: config})
 	if result.Error != nil {
 		t.Fatalf("result = %#v", result)
 	}
@@ -89,7 +89,7 @@ func TestModelRequestLedgerPersistsAndSetsIdempotencyKeyByDefault(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-default-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-default-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Error != nil || submitted.IdempotencyKey == "" {
 		t.Fatalf("result=%#v idempotency_key=%q", result, submitted.IdempotencyKey)
 	}
@@ -120,7 +120,7 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "retry-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "retry-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatalf("result = %#v", result)
 	}
@@ -163,7 +163,7 @@ func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
 		return ToolResult{Output: "ok"}, nil
 	})}}})
 
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "tool-retry-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "tool-retry-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Error != nil || result.Status != session.RunCompleted || providerCalls != 3 || toolExecutions != 1 {
 		t.Fatalf("result=%#v provider calls=%d tool executions=%d", result, providerCalls, toolExecutions)
 	}
@@ -219,7 +219,7 @@ func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "partial-usage-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "partial-usage-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	want := session.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}
 	if result.Status != session.RunFailed || result.Error == nil || result.Usage != want || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d want usage=%#v", result, attempts, want)
@@ -266,7 +266,7 @@ func TestLedgerCancellationAfterDispatchSettlesFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := orchestrator.Start(context.Background(), Request{SessionID: "cancel-ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	handle, err := orchestrator.Start(context.Background(), Request{SessionID: "cancel-ledger-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "terminal-ledger-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "terminal-ledger-failure-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if !errors.Is(result.Error, updateErr) || result.Usage != (session.Usage{InputTokens: 4, OutputTokens: 2}) {
 		t.Fatalf("result = %#v", result)
 	}
@@ -335,7 +335,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: provider panic") {
 		t.Fatalf("result = %#v", result)
 	}
@@ -381,7 +381,7 @@ func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "receive-panic-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "receive-panic-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	wantUsage := session.Usage{InputTokens: 5, OutputTokens: 2}
 	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: second receive") || result.Usage != wantUsage || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d", result, attempts)
@@ -419,7 +419,7 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "dispatch-start-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "dispatch-start-failure-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if !errors.Is(result.Error, updateErr) || called || len(sequence) != 0 || len(completed) != 0 {
 		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
 	}
@@ -447,7 +447,7 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "lifecycle-success-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "lifecycle-success-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Error != nil || strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Error.Code != "" {
 		t.Fatalf("result=%#v sequence=%#v completed=%#v", result, sequence, completed)
 	}
@@ -481,7 +481,7 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "tool-follow-up-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "tool-follow-up-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatalf("result = %#v", result)
 	}
@@ -539,7 +539,7 @@ func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result := startAndWaitRequest(t, orchestrator, Request{SessionID: session.ID("unsafe-output-" + strings.ReplaceAll(test.name, " ", "-")), Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+			result := startAndWaitRequest(t, orchestrator, Request{SessionID: session.ID("unsafe-output-" + strings.ReplaceAll(test.name, " ", "-")), Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 			if result.Status != session.RunFailed || result.Error == nil || calls != 1 {
 				t.Fatalf("result=%#v adapter calls=%d", result, calls)
 			}
@@ -552,39 +552,6 @@ func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
 				t.Fatalf("model request records=%#v error=%v", batch.Records, err)
 			}
 		})
-	}
-}
-
-func TestLedgerRejectsUnsafeExtraBeforeAdapterCall(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = store.Close() }()
-	var sequence []string
-	var completed []ModelCompletedNotice
-	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
-	defer cleanup()
-	called := false
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		called = true
-		return nil, nil
-	})
-	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
-	if err != nil {
-		t.Fatal(err)
-	}
-	orchestrator.plans = staticRunPlanProvider{plan: plan}
-	message := einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "unsafe-call", Extra: map[string]any{"credential": "sentinel"}}})
-	if _, err := orchestrator.Start(context.Background(), Request{SessionID: "unsafe-session", Input: []*einoschema.Message{message}, Config: orchestratorConfig()}); err == nil || called || len(sequence) != 0 || len(completed) != 0 {
-		t.Fatalf("start_error=%v adapter_called=%t sequence=%#v completed=%#v", err, called, sequence, completed)
-	}
-	batch, err := store.ListModelRequests(context.Background(), "run-1", session.ModelRequestCursor{Limit: 10})
-	if err != nil || len(batch.Records) != 0 {
-		t.Fatalf("unsafe request records=%#v error=%v", batch.Records, err)
-	}
-	if _, err := store.ActiveRun(context.Background(), "unsafe-session"); !errors.Is(err, session.ErrNotFound) {
-		t.Fatalf("unsafe admission created a run: %v", err)
 	}
 }
 
@@ -607,7 +574,7 @@ func TestLedgerAuditFailureAfterAdmissionSettlesRunWithoutDispatch(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "audit-failure-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "audit-failure-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if !errors.Is(result.Error, session.ErrModelRequestTooLarge) || result.Status != session.RunFailed || called {
 		t.Fatalf("result=%#v provider_called=%t", result, called)
 	}
@@ -762,7 +729,7 @@ func TestLedgerPassesDurableRecordIDThroughRequest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "idempotency-session", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "idempotency-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatalf("result = %#v", result)
 	}

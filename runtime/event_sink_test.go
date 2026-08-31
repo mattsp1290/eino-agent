@@ -100,7 +100,7 @@ func TestBlockedInfrastructureSinkCannotBlockAdmissionOrHandleDone(t *testing.T)
 		<-release
 	})), WithQueueSize(2))
 	handle, err := orch.Start(context.Background(), Request{
-		SessionID: "blocked-sink-session", ParentID: "user-1", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig(),
+		SessionID: "blocked-sink-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig(),
 	})
 	if err != nil {
 		t.Fatal(err)
