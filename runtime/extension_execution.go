@@ -52,6 +52,8 @@ func (e *runExecution) nextDurableMessageTime(ctx context.Context, sessionID ses
 	if !observed.After(e.durableMessageFloor) {
 		observed = e.durableMessageFloor.Add(time.Nanosecond)
 	}
+	// Allocation is monotonic per execution. Persistence failures may leave
+	// gaps and must never roll the floor backward.
 	e.durableMessageFloor = observed
 	return observed, nil
 }

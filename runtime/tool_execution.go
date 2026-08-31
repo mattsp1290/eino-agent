@@ -111,9 +111,14 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	observedTool := e.host.startObservedToolCall(ctx, snapshot, tool, call)
 	outcome := e.executeClaimedToolPipeline(ctx, tool, call, prepareErr)
 	completedAt := e.host.now()
+	failSettlement := func(err error) (settledTool, error) {
+		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
+		e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, session.ToolCallFailed, completedAt.Sub(claimed.StartedAt), err, nil)
+		return settledTool{}, err
+	}
 	messageAt, err := e.nextDurableMessageTime(ctx, snapshot.SessionID, completedAt)
 	if err != nil {
-		return settledTool{}, err
+		return failSettlement(err)
 	}
 	settlement, _, err := buildToolSettlement(ToolSettlementInput{
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
@@ -124,9 +129,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 		_, err = e.persistToolSettlement(ctx, claimed, settlement, eventEnvelope)
 	}
 	if err != nil {
-		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
-		e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, session.ToolCallFailed, completedAt.Sub(claimed.StartedAt), err, nil)
-		return settledTool{}, err
+		return failSettlement(err)
 	}
 	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: claimed.ID, ToolName: claimed.Name,
