@@ -107,6 +107,26 @@ func TestMinimalServerRejectsControlRouteMethods(t *testing.T) {
 	}
 }
 
+func TestMinimalServerRejectsNullTerminalMessage(t *testing.T) {
+	t.Parallel()
+
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/sessions/"+string(defaultSessionID)+"/runs",
+		strings.NewReader(`{"messages":[null]}`),
+	)
+	response := httptest.NewRecorder()
+
+	(&Server{}).ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "terminal message required") {
+		t.Fatalf("body = %q, want terminal message error", response.Body.String())
+	}
+}
+
 func TestMinimalServerCloseInterruptsActiveRunsBeforeClosingStore(t *testing.T) {
 	t.Parallel()
 

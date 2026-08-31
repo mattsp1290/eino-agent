@@ -290,6 +290,9 @@ func decodeRunMessages(r *http.Request) ([]*einoschema.Message, error) {
 		return nil, err
 	}
 	if len(payload.Messages) > 0 {
+		if payload.Messages[len(payload.Messages)-1] == nil {
+			return nil, fmt.Errorf("terminal message required")
+		}
 		return payload.Messages, nil
 	}
 	if strings.TrimSpace(payload.Message) == "" {
