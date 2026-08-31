@@ -64,6 +64,48 @@ func TestStreamingOrchestratorPreservesAcceptedUserMessageBytes(t *testing.T) {
 	}
 }
 
+func TestPreExecutionRejectionRetainsAdmittedPair(t *testing.T) {
+	store := newAdmissionStore()
+	registry := newTestExtensionRegistry(nil)
+	component := extension.Component{InstanceID: "reject-before-execution", Artifact: extension.Artifact{Name: "reject-before-execution", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	mount, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.OnGate(registrar, RunBeforeExecutePoint, extension.Registration{ID: "reject", Scope: extension.GlobalScope()}, func(context.Context, RunGateInput) (RunDecision, error) {
+			return RunDecision{Kind: RunReject, Code: "rejected", Message: "stop"}, nil
+		})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatal(err)
+	}
+	providerCalls := 0
+	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		providerCalls++
+		return nil, errors.New("provider should not be called")
+	}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
+	result := startAndWait(t, orchestrator)
+	if result.Status != session.RunFailed || result.Error == nil || providerCalls != 0 {
+		t.Fatalf("result = %+v, provider calls = %d", result, providerCalls)
+	}
+	if len(store.messages) != 2 || len(store.parts) != 1 {
+		t.Fatalf("durable admission = messages %#v parts %#v", store.messages, store.parts)
+	}
+	var user, assistant session.Message
+	for _, message := range store.messages {
+		if message.Role == session.RoleUser {
+			user = message
+		} else if message.Role == session.RoleAssistant {
+			assistant = message
+		}
+	}
+	if user.ID == "" || assistant.ID == "" || assistant.ParentID != user.ID {
+		t.Fatalf("admission parentage = user %#v assistant %#v", user, assistant)
+	}
+}
+
 func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -158,8 +200,13 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 			textParts = append(textParts, part)
 		}
 	}
-	if len(textParts) != 1 || string(textParts[0].Payload) != `{"text":"hello"}` {
+	if len(textParts) != 2 {
 		t.Fatalf("text parts = %#v", textParts)
+	}
+	for _, part := range textParts {
+		if string(part.Payload) != `{"text":"hello"}` || part.MessageID != "message-2" && part.MessageID != result.MessageID {
+			t.Fatalf("text part = %#v, want admitted user or settled assistant", part)
+		}
 	}
 }
 
@@ -286,11 +333,12 @@ func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T
 		t.Fatal(err)
 	}
 	_, _ = store.CreateSession(context.Background(), session.Session{
-		ID:        "session-1",
-		Directory: workspaceRoot,
-		Title:     "session-1",
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:          "session-1",
+		WorkspaceID: "workspace-1",
+		Directory:   workspaceRoot,
+		Title:       "session-1",
+		CreatedAt:   now,
+		UpdatedAt:   now,
 	})
 	_, _ = store.AppendMessage(context.Background(), session.Message{
 		ID:        "prior-assistant",

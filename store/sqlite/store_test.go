@@ -489,6 +489,60 @@ func TestListMessagesDoesNotDecodePartsOutsideCurrentPage(t *testing.T) {
 	}
 }
 
+func TestListMessagesOrdersNanosecondsBeforeLexicalIDs(t *testing.T) {
+	t.Parallel()
+
+	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+	userAt := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
+	assistantAt := userAt.Add(time.Nanosecond)
+	if _, err := st.CreateSession(ctx, session.Session{ID: "ordered-session", CreatedAt: userAt, UpdatedAt: userAt}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := st.AdmitRun(ctx, session.Run{ID: "ordered-run", SessionID: "ordered-session", OwnerID: "owner", ClaimToken: "claim", Status: session.RunPending, CreatedAt: userAt}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	for _, record := range []struct {
+		message session.Message
+		part    session.Part
+	}{
+		{
+			message: session.Message{ID: "z-user", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleUser, CreatedAt: userAt, UpdatedAt: userAt},
+			part:    session.Part{ID: "z-user-part", MessageID: "z-user", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Payload: json.RawMessage(`{"text":"user"}`), CreatedAt: userAt, UpdatedAt: userAt},
+		},
+		{
+			message: session.Message{ID: "a-assistant", SessionID: run.SessionID, RunID: run.ID, ParentID: "z-user", Role: session.RoleAssistant, CreatedAt: assistantAt, UpdatedAt: assistantAt},
+			part:    session.Part{ID: "a-assistant-part", MessageID: "a-assistant", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Payload: json.RawMessage(`{"text":"assistant"}`), CreatedAt: assistantAt, UpdatedAt: assistantAt},
+		},
+	} {
+		if _, err := execution.AppendMessage(ctx, record.message); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := execution.AppendPart(ctx, record.part); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	batch, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 10})
+	if err != nil || len(batch.Messages) != 2 || batch.Messages[0].ID != "z-user" || batch.Messages[1].ID != "a-assistant" {
+		t.Fatalf("initial replay = %#v, %v", batch, err)
+	}
+	first, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 1})
+	if err != nil || len(first.Messages) != 1 || first.Messages[0].ID != "z-user" || first.Next.AfterMessageID != "z-user" {
+		t.Fatalf("first page = %#v, %v", first, err)
+	}
+	second, err := st.ListMessages(ctx, run.SessionID, first.Next)
+	if err != nil || len(second.Messages) != 1 || second.Messages[0].ID != "a-assistant" || second.Next != (session.ReplayCursor{}) {
+		t.Fatalf("second page = %#v, %v", second, err)
+	}
+}
+
 func TestSettleRunRollsBackTerminalStateWhenEventInsertFails(t *testing.T) {
 	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {

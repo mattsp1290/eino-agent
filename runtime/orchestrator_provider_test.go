@@ -137,9 +137,7 @@ func TestStreamingOrchestratorRollsBackIncompleteAssistantParts(t *testing.T) {
 	if result.Status != session.RunFailed || result.Error == nil {
 		t.Fatalf("result = %+v, want failed persistence", result)
 	}
-	if len(store.parts) != 0 {
-		t.Fatalf("parts = %#v, want transaction rollback", store.parts)
-	}
+	assertOnlyAdmittedUserPart(t, store.parts)
 	if toolCalls != 0 {
 		t.Fatalf("tool calls = %d, want 0", toolCalls)
 	}
@@ -164,9 +162,10 @@ func TestStreamingOrchestratorRollsBackWholeTurnWhenSecondToolCreationFails(t *t
 	if result.Status != session.RunFailed || result.Error == nil {
 		t.Fatalf("result = %+v, want failed persistence", result)
 	}
-	if len(store.parts) != 0 || len(store.toolCalls) != 0 || executions != 0 {
+	if len(store.toolCalls) != 0 || executions != 0 {
 		t.Fatalf("rolled back turn: parts=%#v calls=%#v executions=%d", store.parts, store.toolCalls, executions)
 	}
+	assertOnlyAdmittedUserPart(t, store.parts)
 	for _, event := range store.events {
 		if event.ToolTransition == session.ToolTransitionPending {
 			t.Fatalf("pending event survived rollback: %#v", event)
@@ -245,9 +244,24 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
 	}
 	for _, part := range store.parts {
+		if part.MessageID == "message-2" {
+			continue
+		}
 		switch part.Kind {
 		case session.PartText, session.PartReasoning, session.PartToolCall:
 			t.Fatalf("assistant part persisted despite malformed arguments: kind=%s payload=%s", part.Kind, part.Payload)
+		}
+	}
+}
+
+func assertOnlyAdmittedUserPart(t *testing.T, parts map[session.PartID]session.Part) {
+	t.Helper()
+	if len(parts) != 1 {
+		t.Fatalf("parts = %#v, want only admitted user part", parts)
+	}
+	for _, part := range parts {
+		if part.MessageID != "message-2" || part.Kind != session.PartText || string(part.Payload) != `{"text":"hello"}` {
+			t.Fatalf("admitted user part = %#v", part)
 		}
 	}
 }

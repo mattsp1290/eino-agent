@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"time"
 
@@ -44,6 +45,8 @@ type admissionRequest struct {
 type admittedRun struct {
 	Session          session.Session
 	Run              session.Run
+	UserMessage      session.Message
+	UserPart         session.Part
 	AssistantMessage session.Message
 	Event            session.EventRecord
 	Snapshot         TurnSnapshot
@@ -100,7 +103,7 @@ func (a admitter) now() time.Time {
 }
 
 func admitDurable(ctx context.Context, store session.Store, request admissionRequest, now time.Time) (admittedRun, error) {
-	sessionRecord, err := store.CreateSession(ctx, admissionSession(request, now))
+	sessionRecord, err := getOrCreateAdmissionSession(ctx, store, request, now)
 	if err != nil {
 		return admittedRun{}, err
 	}
@@ -119,11 +122,28 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
 	}
+	latestMessageAt, err := latestAdmissionMessageTime(ctx, store, sessionRecord.ID)
+	if err != nil {
+		return admittedRun{}, err
+	}
+	userAt := now
+	if next := latestMessageAt.Add(time.Nanosecond); next.After(userAt) {
+		userAt = next
+	}
+	assistantAt := userAt.Add(time.Nanosecond)
 	executionStore := store.Execution(session.RunFence{RunID: runRecord.ID, ClaimToken: runRecord.ClaimToken})
 	if _, err := executionStore.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
 		return admittedRun{}, err
 	}
-	assistantMessage, err := executionStore.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, now))
+	userMessage, err := executionStore.AppendMessage(ctx, admissionUserMessage(request, sessionRecord.ID, runRecord.ID, userAt))
+	if err != nil {
+		return admittedRun{}, err
+	}
+	userPart, err := executionStore.AppendPart(ctx, admissionUserPart(request, sessionRecord.ID, runRecord.ID, userMessage.ID, userAt))
+	if err != nil {
+		return admittedRun{}, err
+	}
+	assistantMessage, err := executionStore.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, assistantAt))
 	if err != nil {
 		return admittedRun{}, err
 	}
@@ -132,10 +152,55 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	return buildAdmission(sessionRecord, runRecord, assistantMessage, committedEvent, snapshot, now), nil
+	return buildAdmission(sessionRecord, runRecord, userMessage, userPart, assistantMessage, committedEvent, snapshot, now), nil
 }
 
-func buildAdmission(sessionRecord session.Session, runRecord session.Run, assistantMessage session.Message, event session.EventRecord, snapshot TurnSnapshot, now time.Time) admittedRun {
+func getOrCreateAdmissionSession(ctx context.Context, store session.Store, request admissionRequest, now time.Time) (session.Session, error) {
+	candidate := admissionSession(request, now)
+	existing, err := store.GetSession(ctx, candidate.ID)
+	switch {
+	case err == nil:
+		if !sameAdmissionSessionIdentity(existing, candidate) {
+			return session.Session{}, session.ErrConflict
+		}
+		return existing, nil
+	case errors.Is(err, session.ErrNotFound):
+		return store.CreateSession(ctx, candidate)
+	default:
+		return session.Session{}, err
+	}
+}
+
+func sameAdmissionSessionIdentity(left, right session.Session) bool {
+	return left.ID == right.ID &&
+		left.ParentID == right.ParentID &&
+		left.WorkspaceID == right.WorkspaceID &&
+		left.Directory == right.Directory &&
+		left.Title == right.Title &&
+		maps.Equal(left.Metadata, right.Metadata)
+}
+
+func latestAdmissionMessageTime(ctx context.Context, store session.Store, sessionID session.ID) (time.Time, error) {
+	cursor := session.ReplayCursor{Limit: 100}
+	var latest time.Time
+	for {
+		batch, err := store.ListMessages(ctx, sessionID, cursor)
+		if err != nil {
+			return time.Time{}, err
+		}
+		for _, message := range batch.Messages {
+			if message.CreatedAt.After(latest) {
+				latest = message.CreatedAt
+			}
+		}
+		if batch.Next == (session.ReplayCursor{}) {
+			return latest, nil
+		}
+		cursor = batch.Next
+	}
+}
+
+func buildAdmission(sessionRecord session.Session, runRecord session.Run, userMessage session.Message, userPart session.Part, assistantMessage session.Message, event session.EventRecord, snapshot TurnSnapshot, now time.Time) admittedRun {
 	snapshot.RunID = runRecord.ID
 	snapshot.SessionID = sessionRecord.ID
 	snapshot.EpochID = runRecord.ContextEpoch
@@ -143,6 +208,8 @@ func buildAdmission(sessionRecord session.Session, runRecord session.Run, assist
 	return admittedRun{
 		Session:          sessionRecord,
 		Run:              runRecord,
+		UserMessage:      userMessage,
+		UserPart:         userPart,
 		AssistantMessage: assistantMessage,
 		Event:            event,
 		Snapshot:         snapshot,
@@ -257,6 +324,33 @@ func admissionRun(request admissionRequest, sessionID session.ID, now time.Time)
 		Config:        admissionConfig(request),
 		ExtensionPlan: request.ExtensionPlan.Clone(),
 		CreatedAt:     now,
+	}
+}
+
+func admissionUserMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time) session.Message {
+	return session.Message{
+		ID:        request.IDs.UserMessageID,
+		SessionID: sessionID,
+		RunID:     runID,
+		Role:      session.RoleUser,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func admissionUserPart(request admissionRequest, sessionID session.ID, runID session.RunID, messageID session.MessageID, now time.Time) session.Part {
+	return session.Part{
+		ID:        request.IDs.UserPartID,
+		MessageID: messageID,
+		SessionID: sessionID,
+		RunID:     runID,
+		Kind:      session.PartText,
+		Ordinal:   0,
+		Payload: mustJSON(struct {
+			Text string `json:"text"`
+		}{Text: request.UserMessage.Content}),
+		CreatedAt: now,
+		UpdatedAt: now,
 	}
 }
 

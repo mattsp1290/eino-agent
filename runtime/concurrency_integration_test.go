@@ -138,6 +138,17 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 			t.Fatal("timed out waiting for provider start")
 		}
 	}
+	if _, err := orch.Start(ctx, Request{
+		SessionID: "interrupt-session-a",
+		Message:   UserMessage{Content: "stale contender"},
+		Config:    orchestratorConfig(),
+	}); !errors.Is(err, session.ErrSessionBusy) {
+		t.Fatalf("contending Start error = %v, want ErrSessionBusy", err)
+	}
+	contended, err := store.ListMessages(ctx, "interrupt-session-a", session.ReplayCursor{Limit: 10})
+	if err != nil || len(contended.Messages) != 2 || len(contended.Parts) != 1 {
+		t.Fatalf("contended history = %#v, %v; want only first admission pair", contended, err)
+	}
 	var wg sync.WaitGroup
 	errs := make(chan error, len(handles))
 	for _, handle := range handles {
@@ -170,6 +181,10 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 		}
 		if _, err := store.ActiveRun(ctx, run.SessionID); !errors.Is(err, session.ErrNotFound) {
 			t.Fatalf("active run err = %v, want ErrNotFound", err)
+		}
+		batch, err := store.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 10})
+		if err != nil || len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant || len(batch.Parts) != 1 || string(batch.Parts[0].Payload) != `{"text":"hello"}` {
+			t.Fatalf("interrupted history = %#v, %v; want admitted user/assistant pair", batch, err)
 		}
 	}
 }
