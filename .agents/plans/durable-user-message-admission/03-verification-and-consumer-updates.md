@@ -136,6 +136,32 @@ Documentation must distinguish:
 
 ## Verification and acceptance criteria
 
+Before consumer updates, complete the review-discovered run-wide replay gate
+as its own PR. This is deliberately separate from the immutable admission-pair
+PR contract.
+
+- `runtime/orchestrator.go` (existing): initialize a run-local durable-message
+  ordering floor from the committed admission assistant and allocate every
+  follow-up assistant placeholder strictly after that floor.
+- `runtime/tool_execution.go` and `runtime/tool_settlement.go` (existing): use
+  the same sequencer for tool-result message and part timestamps without
+  changing tool status, output, parentage, or elapsed-time observations.
+- Existing runtime execution state may carry the private sequencing value; do
+  not widen `session.Store`, `session.ExecutionStore`, or public request types.
+- Add a real SQLite regression test with a frozen clock and reverse-lexical
+  message IDs. Close and reopen the database, paginate with `Limit: 1`, and
+  assert raw replay and `LoadHistory` both return user, tool-calling assistant,
+  tool result, and final assistant in conversational order.
+
+Focused run-wide ordering commands:
+
+```text
+go test ./runtime -run 'Tool.*History|History.*Tool|Frozen.*Tool|Tool.*Frozen'
+go test ./store/sqlite -run 'ListMessages'
+go test -race ./runtime ./store/sqlite
+git diff --check
+```
+
 Focused commands:
 
 ```text
@@ -149,6 +175,8 @@ git diff --check
 
 Acceptance:
 
+- frozen-clock tool loops remain chronological after SQLite restart and
+  one-record pagination, independent of message ID lexical order;
 - every scenario in the matrix asserts durable public behavior;
 - no example sends previous transcript messages to `Start`;
 - no test passes only because of a shadow history fixture;

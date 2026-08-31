@@ -89,6 +89,22 @@ func TestBuildToolSettlementClassifiesProtectedOutcomes(t *testing.T) {
 	}
 }
 
+func TestBuildToolSettlementSeparatesObservedCompletionFromDurableMessageOrder(t *testing.T) {
+	input := settlementTestInput(Tool{}, settlementTestCall(), ToolResult{Output: "ok"}, nil)
+	messageAt := input.CompletedAt.Add(time.Nanosecond)
+	settlement, _, err := buildToolSettlement(input, messageAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !settlement.CompletedAt.Equal(input.CompletedAt) {
+		t.Fatalf("completed at = %s, want observed %s", settlement.CompletedAt, input.CompletedAt)
+	}
+	if !settlement.ResultMessage.CreatedAt.Equal(messageAt) || !settlement.ResultMessage.UpdatedAt.Equal(messageAt) ||
+		!settlement.ResultPart.CreatedAt.Equal(messageAt) || !settlement.ResultPart.UpdatedAt.Equal(messageAt) {
+		t.Fatalf("durable result envelope = %+v, want message time %s", settlement, messageAt)
+	}
+}
+
 func TestBuildToolSettlementRequiresIdentityReservedIDsAndCompletionTime(t *testing.T) {
 	tests := []struct {
 		name   string

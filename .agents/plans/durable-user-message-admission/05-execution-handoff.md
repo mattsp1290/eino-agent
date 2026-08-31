@@ -102,7 +102,42 @@ Acceptance: all criteria in
 [02-atomic-persistence-and-ordering.md](02-atomic-persistence-and-ordering.md)
 pass.
 
-### 3. Prove lifecycle behavior and update consumers
+### 3. Preserve run-wide durable message order
+
+Result: tool results and follow-up assistant placeholders remain strictly after
+the assistant that requested the tool, even when the injected clock is frozen
+and generated IDs sort in the opposite direction.
+
+Change surface:
+
+- `runtime/orchestrator.go`, `runtime/tool_execution.go`, and
+  `runtime/tool_settlement.go` (existing).
+- Existing runtime execution state and focused runtime/SQLite tests needed to
+  prove close/reopen and one-record pagination order.
+- The revised plan files in this directory, which record the human-approved
+  review disposition and mandatory follow-up slice.
+
+Prerequisites and parallelization:
+
+- Depends on package 2 and its exact reviewed admission-pair head.
+- Must merge before consumer, full verification, or release work.
+- Do not change public APIs, store interfaces, schema, tool content, status,
+  parentage, or telemetry duration semantics.
+
+Verification:
+
+```text
+go test ./runtime -run 'Tool.*History|History.*Tool|Frozen.*Tool|Tool.*Frozen'
+go test ./store/sqlite -run 'ListMessages'
+go test -race ./runtime ./store/sqlite
+git diff --check
+```
+
+Acceptance: the run-wide ordering criteria in
+[03-verification-and-consumer-updates.md](03-verification-and-consumer-updates.md)
+pass after a real SQLite restart.
+
+### 4. Prove lifecycle behavior and update consumers
 
 Result: public tests, examples, architecture docs, and the external fixture all
 use runtime-owned admission and prove no duplicate history.
@@ -122,7 +157,7 @@ Change surface:
 
 Prerequisites and parallelization:
 
-- Depends on package 2.
+- Depends on package 3.
 - Documentation and adapter work may proceed in parallel after behavior and
   names are fixed.
 - Do not update supported release claims yet.
@@ -141,7 +176,7 @@ Acceptance: all criteria in
 [03-verification-and-consumer-updates.md](03-verification-and-consumer-updates.md)
 pass.
 
-### 4. Integrate, publish, verify, and respond
+### 5. Integrate, publish, verify, and respond
 
 Result: one public module pin implements the contract and the external response
 unblocks consumer verification.
@@ -156,7 +191,7 @@ Change surface:
 
 Prerequisites and parallelization:
 
-- Depends on packages 1 through 3 and the full repository gate.
+- Depends on packages 1 through 4 and the full repository gate.
 - Release commit, tag push, public verification, documentation evidence, and
   response writing are serial stop/go steps.
 - No feature-flag decision is required.
@@ -196,12 +231,14 @@ manifest, sum, fixture, or formatting drift. Preserve unrelated user changes.
    state or mutates prior session/transcript state.
 3. Replay gate: stop if two-run SQLite order depends on clock advancement,
    lexical IDs, reasoning options, or live events.
-4. Second-run gate: stop if the first prompt reaches the provider twice.
-5. Consistency gate: stop if a contender can read history before `AdmitRun` and
+4. Tool-loop replay gate: stop if tool results or follow-up assistants can sort
+   before the assistant that requested the tool under a frozen clock.
+5. Second-run gate: stop if the first prompt reaches the provider twice.
+6. Consistency gate: stop if a contender can read history before `AdmitRun` and
    later succeed with a stale snapshot.
-6. Release gate: reuse `v0.2.0` only when it peels to the intended commit;
+7. Release gate: reuse `v0.2.0` only when it peels to the intended commit;
    otherwise select the next unused minor version and update all pins.
-7. Response gate: do not write `completed` until public resolution and the
+8. Response gate: do not write `completed` until public resolution and the
    peeled SHA are independently verified.
 
 ## Final definition of done
@@ -218,6 +255,8 @@ manifest, sum, fixture, or formatting drift. Preserve unrelated user changes.
 - Run and assistant parentage use the generated user message ID.
 - Completion, failure, interruption, rollback, second-run, exact replay, and
   SQLite restart tests pass.
+- Frozen-clock tool loops replay chronologically after restart and cursor
+  pagination without relying on generated ID order.
 - Repository examples do not submit transcript history.
 - Public docs state ownership, ordering, compatibility, failure, and replay
   behavior.
@@ -236,6 +275,5 @@ manifest, sum, fixture, or formatting drift. Preserve unrelated user changes.
   file/media parts and provider projection.
 - Session branching and explicit previous-message parent selection remain out
   of scope.
-- No other deferred work is planned. File a Beads issue only if implementation
-  exposes a separate defect that cannot be fixed without expanding this
-  request.
+- No other deferred work is planned. The review-discovered tool-loop ordering
+  defect is approved in-scope package 3, not deferred work.

@@ -32,8 +32,10 @@ deprecated request fields.
   ordering, runtime and SQLite tests, public examples and documentation, the
   external-consumer fixture, release metadata, and the external response.
 - Unchanged boundaries: `session.Store`, `session.ExecutionStore`, the SQLite
-  schema, provider execution, tool execution, reasoning policy, and transport
-  ownership.
+  schema, provider execution semantics, reasoning policy, and transport
+  ownership. Tool and follow-up assistant persistence may change only to carry
+  a monotonic durable-message ordering key discovered during implementation
+  review.
 
 ## Requested outcome and success criteria
 
@@ -96,6 +98,9 @@ Success requires all of the following:
 - Allocate each admitted pair strictly after the session's latest durable
   message and make SQLite's text timestamp encoding fixed-width so replay order
   remains chronological under frozen clocks and opaque IDs.
+- Carry the committed assistant timestamp forward as a per-run ordering floor
+  so tool results and follow-up assistant placeholders remain chronological
+  under the same frozen-clock and opaque-ID conditions.
 - Update repository call sites, examples, tests, documentation, release
   metadata, and the external response.
 
@@ -108,7 +113,9 @@ Success requires all of the following:
   tool messages, reasoning, attachments, or multimodal Eino message graphs.
 - Do not add session branching, compaction UI, remote transport, provider
   selection, or tool-policy changes.
-- Do not change settled assistant/tool persistence or `history.Options`.
+- Do not change settled assistant/tool content, status, parentage, or
+  `history.Options`; the approved follow-up changes only their durable message
+  timestamps to preserve run order.
 - Do not add a SQLite data migration or compatibility reader for the old
   timestamp representation.
 
@@ -209,6 +216,10 @@ Success requires all of the following:
    `runtime.Request` is a semver-minor-breaking change from the `v0.1.x`
    series, so a new minor line is clearer than a patch tag or an unversioned
    SHA-only support claim.
+8. Sequence every message-bearing transition in a run after the prior durable
+   message. Admission-only offsets are insufficient because a frozen clock can
+   otherwise place a tool result or follow-up assistant before the assistant
+   that requested the tool after SQLite restart.
 
 ### Rejected alternatives
 
@@ -285,6 +296,9 @@ current prompt only
 - Stop if SQLite returns anything other than
   `user1, assistant1, user2, assistant2` for frozen clocks or
   reverse-lexicographic IDs. Do not mask this with test-only ID ordering.
+- Stop if a frozen-clock tool loop replays anything other than user,
+  tool-calling assistant, tool result, and final assistant order after SQLite
+  restart and one-record pagination.
 - Stop if a second provider request contains the first user prompt twice or
   depends on caller-supplied prior history.
 - Stop if a contender can read history before the active-run fence and later
@@ -303,6 +317,9 @@ current prompt only
 - Resolved: the first contract is text-only and runtime-owned.
 - Resolved: existing store transaction and fencing APIs are sufficient.
 - Resolved: publish a new minor release because the request shape changes.
+- Resolved: implementation review found that admission-only timestamp offsets
+  can reorder tool loops; the user approved a mandatory follow-up PR before
+  consumer and release work to make durable message times monotonic per run.
 - Blocking open questions: none.
 - Non-blocking open questions: none. A tag collision is an execution gate, not
   an unresolved design decision.

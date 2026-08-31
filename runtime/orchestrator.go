@@ -111,6 +111,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		return nil, err
 	}
 	execution := newRunExecution(o, plan, admitted.Run)
+	execution.seedDurableMessageFloor(admitted.AssistantMessage.CreatedAt)
 	execution.publishPersistedWithNotificationContext(ctx, ctx, admitted.Event)
 	extension.Notify(plan.dispatch, ctx, RunAdmittedPoint, RunAdmittedNotice{
 		SessionID: admitted.Session.ID, RunID: admitted.Run.ID, Plan: plan.Descriptor(),
@@ -297,6 +298,10 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 		}
 		messages = append(messages, toolMessages...)
 		nextMessageID := o.ids.NewMessageID()
+		messageAt, err := execution.nextDurableMessageTime(ctx, snapshot.SessionID, o.now())
+		if err != nil {
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
+		}
 		if _, err := execution.store.AppendMessage(ctx, session.Message{
 			ID:        nextMessageID,
 			SessionID: snapshot.SessionID,
@@ -305,8 +310,8 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 			Role:      session.RoleAssistant,
 			Agent:     snapshot.Config.Agent.Name,
 			ModelID:   string(snapshot.Model.Model.ID),
-			CreatedAt: o.now(),
-			UpdatedAt: o.now(),
+			CreatedAt: messageAt,
+			UpdatedAt: messageAt,
 		}); err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}

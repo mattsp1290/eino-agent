@@ -67,6 +67,10 @@ func (e *runExecution) terminalizeUnfinishedTools(ctx context.Context, snapshot 
 
 func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall, errText string) (session.ToolSettlement, error) {
 	completedAt := e.host.now()
+	messageAt, err := e.nextDurableMessageTime(ctx, run.SessionID, completedAt)
+	if err != nil {
+		return session.ToolSettlement{}, err
+	}
 	raw := cloneJSON(claimed.Output)
 	metadata := cloneStringMap(claimed.Metadata)
 	result := ToolResult{}
@@ -84,7 +88,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	}
 	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, Error: errText,
-		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt,
+		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,
 	})
 	if err != nil {
 		return session.ToolSettlement{}, err
@@ -107,10 +111,14 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	observedTool := e.host.startObservedToolCall(ctx, snapshot, tool, call)
 	outcome := e.executeClaimedToolPipeline(ctx, tool, call, prepareErr)
 	completedAt := e.host.now()
-	settlement, _, err := BuildToolSettlement(ToolSettlementInput{
+	messageAt, err := e.nextDurableMessageTime(ctx, snapshot.SessionID, completedAt)
+	if err != nil {
+		return settledTool{}, err
+	}
+	settlement, _, err := buildToolSettlement(ToolSettlementInput{
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
-	})
+	}, messageAt)
 	eventEnvelope := toolTransitionEnvelope(e.host, snapshot, completedAt)
 	if err == nil {
 		_, err = e.persistToolSettlement(ctx, claimed, settlement, eventEnvelope)
