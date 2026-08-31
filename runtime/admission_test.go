@@ -30,8 +30,14 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
-	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.AssistantMessage.ID != "assistant-1" {
+	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.UserMessage.ID != "user-1" || admitted.UserPart.ID != "user-part-1" || admitted.AssistantMessage.ID != "assistant-1" {
 		t.Fatalf("admitted identity = %+v", admitted)
+	}
+	if admitted.Run.ParentMsgID != admitted.UserMessage.ID || admitted.AssistantMessage.ParentID != admitted.UserMessage.ID {
+		t.Fatalf("admission parentage = run %q assistant %q user %q", admitted.Run.ParentMsgID, admitted.AssistantMessage.ParentID, admitted.UserMessage.ID)
+	}
+	if admitted.UserMessage.SessionID != admitted.Session.ID || admitted.UserMessage.RunID != admitted.Run.ID || admitted.UserMessage.ParentID != "" || admitted.UserMessage.Agent != "" || admitted.UserMessage.ModelID != "" {
+		t.Fatalf("user envelope = %#v", admitted.UserMessage)
 	}
 	if _, err := store.GetSession(context.Background(), "session-1"); err != nil {
 		t.Fatalf("session was not durable: %v", err)
@@ -43,8 +49,14 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list messages: %v", err)
 	}
-	if len(batch.Messages) != 1 || batch.Messages[0].Role != session.RoleAssistant {
+	if len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant {
 		t.Fatalf("messages = %#v", batch.Messages)
+	}
+	if len(batch.Parts) != 1 || batch.Parts[0].SessionID != admitted.Session.ID || batch.Parts[0].RunID != admitted.Run.ID || batch.Parts[0].MessageID != admitted.UserMessage.ID || batch.Parts[0].Ordinal != 0 || string(batch.Parts[0].Payload) != `{"text":"hello"}` {
+		t.Fatalf("parts = %#v", batch.Parts)
+	}
+	if !admitted.AssistantMessage.CreatedAt.Equal(admitted.UserMessage.CreatedAt.Add(time.Nanosecond)) {
+		t.Fatalf("message times = user %s assistant %s", admitted.UserMessage.CreatedAt, admitted.AssistantMessage.CreatedAt)
 	}
 	events, err := store.ListEvents(context.Background(), "session-1", session.EventCursor{Limit: 10})
 	if err != nil {
@@ -70,6 +82,9 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	}
 	if admitted.Snapshot.Messages[0].Content != "hello" {
 		t.Fatalf("snapshot messages mutated: %#v", admitted.Snapshot.Messages[0])
+	}
+	if string(admitted.UserPart.Payload) != `{"text":"hello"}` {
+		t.Fatalf("persisted user part mutated: %s", admitted.UserPart.Payload)
 	}
 }
 
@@ -124,12 +139,15 @@ func TestAdmitBuildsProviderInputFromFencedHistoryAndCurrentMessage(t *testing.T
 		}
 	}
 
-	admitted, err := (admitter{Store: store}).admit(context.Background(), request)
+	admitted, err := (admitter{Store: store, Clock: func() time.Time { return priorAt }}).admit(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(admitted.Snapshot.Messages) != 2 || admitted.Snapshot.Messages[0].Content != "prior" || admitted.Snapshot.Messages[1].Content != "hello" {
 		t.Fatalf("provider messages = %#v, want prior then current user", admitted.Snapshot.Messages)
+	}
+	if !admitted.UserMessage.CreatedAt.Equal(priorAt.Add(time.Nanosecond)) || !admitted.AssistantMessage.CreatedAt.Equal(priorAt.Add(2*time.Nanosecond)) {
+		t.Fatalf("admission times = user %s assistant %s, want after prior %s", admitted.UserMessage.CreatedAt, admitted.AssistantMessage.CreatedAt, priorAt)
 	}
 }
 
@@ -274,40 +292,22 @@ func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.
 	if err != nil {
 		t.Fatalf("ListMessages error = %v", err)
 	}
-	if len(batch.Messages) != 0 {
-		t.Fatalf("messages leaked after rollback: %#v", batch.Messages)
+	if len(batch.Messages) != 0 || len(batch.Parts) != 0 || len(store.sessions) != 0 || len(store.epochs) != 0 || len(store.events) != 0 {
+		t.Fatalf("admission leaked after rollback: messages=%#v parts=%#v sessions=%d epochs=%d events=%d", batch.Messages, batch.Parts, len(store.sessions), len(store.epochs), len(store.events))
 	}
 }
 
-func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
+func TestAdmitRollsBackUserAndSessionWhenUserPartFails(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	admitter := admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}
-	admitted, err := admitter.admit(context.Background(), testRunAdmission())
-	if err != nil {
-		t.Fatalf("Admit error = %v", err)
+	store.appendPartErrAt = 1
+	_, err := (admitter{Store: store}).admit(context.Background(), testRunAdmission())
+	if err == nil {
+		t.Fatal("Admit error = nil, want injected user-part failure")
 	}
-	failed := admitted.Run
-	failed.Status = session.RunFailed
-	failed.Error = "provider failed"
-	failed.FinishedAt = failed.CreatedAt.Add(time.Second)
-	if err := store.FinishRun(context.Background(), failed); err != nil {
-		t.Fatalf("FinishRun error = %v", err)
-	}
-	batch, err := store.ListMessages(context.Background(), admitted.Session.ID, session.ReplayCursor{Limit: 10})
-	if err != nil {
-		t.Fatalf("ListMessages error = %v", err)
-	}
-	if len(batch.Messages) != 1 || batch.Messages[0].ID != admitted.AssistantMessage.ID {
-		t.Fatalf("history after failure = %#v", batch.Messages)
-	}
-	gotRun, err := store.GetRun(context.Background(), admitted.Run.ID)
-	if err != nil {
-		t.Fatalf("GetRun error = %v", err)
-	}
-	if gotRun.Status != session.RunFailed || gotRun.Error != "provider failed" {
-		t.Fatalf("run after failure = %+v", gotRun)
+	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.parts) != 0 || len(store.events) != 0 || len(store.epochs) != 0 {
+		t.Fatalf("failed admission leaked state: sessions=%d runs=%d messages=%d parts=%d events=%d epochs=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.parts), len(store.events), len(store.epochs))
 	}
 }
 

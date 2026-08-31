@@ -27,6 +27,37 @@ func TestStreamingOrchestratorFailsProviderErrors(t *testing.T) {
 	}
 }
 
+func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	admitted, err := (admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}).admit(context.Background(), testRunAdmission())
+	if err != nil {
+		t.Fatalf("Admit error = %v", err)
+	}
+	failed := admitted.Run
+	failed.Status = session.RunFailed
+	failed.Error = "provider failed"
+	failed.FinishedAt = failed.CreatedAt.Add(time.Second)
+	if err := store.FinishRun(context.Background(), failed); err != nil {
+		t.Fatalf("FinishRun error = %v", err)
+	}
+	batch, err := store.ListMessages(context.Background(), admitted.Session.ID, session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	if len(batch.Messages) != 2 || batch.Messages[0].ID != admitted.UserMessage.ID || batch.Messages[1].ID != admitted.AssistantMessage.ID {
+		t.Fatalf("history after failure = %#v", batch.Messages)
+	}
+	gotRun, err := store.GetRun(context.Background(), admitted.Run.ID)
+	if err != nil {
+		t.Fatalf("GetRun error = %v", err)
+	}
+	if gotRun.Status != session.RunFailed || gotRun.Error != "provider failed" {
+		t.Fatalf("run after failure = %+v", gotRun)
+	}
+}
+
 func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 	t.Parallel()
 
@@ -137,9 +168,7 @@ func TestStreamingOrchestratorRollsBackIncompleteAssistantParts(t *testing.T) {
 	if result.Status != session.RunFailed || result.Error == nil {
 		t.Fatalf("result = %+v, want failed persistence", result)
 	}
-	if len(store.parts) != 0 {
-		t.Fatalf("parts = %#v, want transaction rollback", store.parts)
-	}
+	assertOnlyAdmittedUserPart(t, store.parts)
 	if toolCalls != 0 {
 		t.Fatalf("tool calls = %d, want 0", toolCalls)
 	}
@@ -164,9 +193,10 @@ func TestStreamingOrchestratorRollsBackWholeTurnWhenSecondToolCreationFails(t *t
 	if result.Status != session.RunFailed || result.Error == nil {
 		t.Fatalf("result = %+v, want failed persistence", result)
 	}
-	if len(store.parts) != 0 || len(store.toolCalls) != 0 || executions != 0 {
+	if len(store.toolCalls) != 0 || executions != 0 {
 		t.Fatalf("rolled back turn: parts=%#v calls=%#v executions=%d", store.parts, store.toolCalls, executions)
 	}
+	assertOnlyAdmittedUserPart(t, store.parts)
 	for _, event := range store.events {
 		if event.ToolTransition == session.ToolTransitionPending {
 			t.Fatalf("pending event survived rollback: %#v", event)
@@ -245,9 +275,24 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
 	}
 	for _, part := range store.parts {
+		if part.MessageID == "message-2" {
+			continue
+		}
 		switch part.Kind {
 		case session.PartText, session.PartReasoning, session.PartToolCall:
 			t.Fatalf("assistant part persisted despite malformed arguments: kind=%s payload=%s", part.Kind, part.Payload)
+		}
+	}
+}
+
+func assertOnlyAdmittedUserPart(t *testing.T, parts map[session.PartID]session.Part) {
+	t.Helper()
+	if len(parts) != 1 {
+		t.Fatalf("parts = %#v, want only admitted user part", parts)
+	}
+	for _, part := range parts {
+		if part.MessageID != "message-2" || part.Kind != session.PartText || string(part.Payload) != `{"text":"hello"}` {
+			t.Fatalf("admitted user part = %#v", part)
 		}
 	}
 }
