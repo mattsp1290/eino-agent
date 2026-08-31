@@ -27,6 +27,37 @@ func TestStreamingOrchestratorFailsProviderErrors(t *testing.T) {
 	}
 }
 
+func TestFailedExecutionDoesNotEraseAdmittedHistory(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	admitted, err := (admitter{Store: store, Clock: func() time.Time { return time.Unix(1, 0) }}).admit(context.Background(), testRunAdmission())
+	if err != nil {
+		t.Fatalf("Admit error = %v", err)
+	}
+	failed := admitted.Run
+	failed.Status = session.RunFailed
+	failed.Error = "provider failed"
+	failed.FinishedAt = failed.CreatedAt.Add(time.Second)
+	if err := store.FinishRun(context.Background(), failed); err != nil {
+		t.Fatalf("FinishRun error = %v", err)
+	}
+	batch, err := store.ListMessages(context.Background(), admitted.Session.ID, session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	if len(batch.Messages) != 2 || batch.Messages[0].ID != admitted.UserMessage.ID || batch.Messages[1].ID != admitted.AssistantMessage.ID {
+		t.Fatalf("history after failure = %#v", batch.Messages)
+	}
+	gotRun, err := store.GetRun(context.Background(), admitted.Run.ID)
+	if err != nil {
+		t.Fatalf("GetRun error = %v", err)
+	}
+	if gotRun.Status != session.RunFailed || gotRun.Error != "provider failed" {
+		t.Fatalf("run after failure = %+v", gotRun)
+	}
+}
+
 func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 	t.Parallel()
 
