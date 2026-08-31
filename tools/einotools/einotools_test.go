@@ -154,7 +154,7 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
 	handle, err := orchestrator.Start(ctx, runtime.Request{
 		SessionID: "catalog-runtime",
-		Input:     []*einoschema.Message{einoschema.UserMessage("read the fixture")},
+		Message:   runtime.UserMessage{Content: "read the fixture"},
 		Config: config.Snapshot{
 			Agent: config.Agent{Name: "agent", Model: selection}, Model: selection,
 			Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": root},

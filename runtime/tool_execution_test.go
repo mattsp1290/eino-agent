@@ -151,7 +151,7 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 		WithRunPlanProvider(staticRunPlanProvider{plan: plan}), WithEventSink(sink), WithOwnerID("owner-1"),
 		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
 	)
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-session", ParentID: "user-1", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolExecutionPanic) {
 		t.Fatalf("result = %+v", result)
 	}

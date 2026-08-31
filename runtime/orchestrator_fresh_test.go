@@ -19,6 +19,51 @@ import (
 	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
+func TestStreamingOrchestratorRejectsInvalidUserMessageBeforeDependencies(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]string{
+		"empty":         "",
+		"whitespace":    " \t\n",
+		"invalid UTF-8": string([]byte{0xff}),
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			orchestrator := mustConfiguredOrchestrator()
+			orchestrator.store = nil
+			orchestrator.model = nil
+			orchestrator.plans = nil
+			orchestrator.ids = nil
+			_, err := orchestrator.Start(context.Background(), Request{
+				SessionID: "session-invalid",
+				Message:   UserMessage{Content: content},
+				Config:    orchestratorConfig(),
+			})
+			if !errors.Is(err, ErrInvalidOrchestrator) {
+				t.Fatalf("Start error = %v, want ErrInvalidOrchestrator", err)
+			}
+		})
+	}
+}
+
+func TestStreamingOrchestratorPreservesAcceptedUserMessageBytes(t *testing.T) {
+	t.Parallel()
+
+	const content = "  héllo 世界\n"
+	var providerContent string
+	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		providerContent = request.Messages[len(request.Messages)-1].Content
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	}))
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "exact-content", Message: UserMessage{Content: content}, Config: orchestratorConfig()})
+	if result.Error != nil {
+		t.Fatal(result.Error)
+	}
+	if providerContent != content {
+		t.Fatalf("provider content = %q, want exact %q", providerContent, content)
+	}
+}
+
 func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
@@ -53,7 +98,7 @@ func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 		go func(orchestrator *StreamingOrchestrator) {
 			defer wait.Done()
 			<-ready
-			handle, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", ParentID: "user", Input: []*einoschema.Message{einoschema.UserMessage("hello")}, Config: orchestratorConfig()})
+			handle, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 			results <- startResult{handle: handle, err: err}
 		}(orchestrator)
 	}
@@ -90,8 +135,7 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	}))
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		ParentID:  "user-1",
-		Input:     []*einoschema.Message{einoschema.UserMessage("hello")},
+		Message:   UserMessage{Content: "hello"},
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {

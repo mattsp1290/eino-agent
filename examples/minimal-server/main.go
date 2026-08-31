@@ -195,7 +195,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 	}
 	handle, err := s.runtime.Start(context.WithoutCancel(r.Context()), runtime.Request{
 		SessionID: sessionID,
-		Input:     messages,
+		Message:   runtime.UserMessage{Content: messages[len(messages)-1].Content},
 		Config:    s.config,
 		Metadata:  map[string]string{"example": "minimal-server"},
 	})
@@ -290,6 +290,9 @@ func decodeRunMessages(r *http.Request) ([]*einoschema.Message, error) {
 		return nil, err
 	}
 	if len(payload.Messages) > 0 {
+		if payload.Messages[len(payload.Messages)-1] == nil {
+			return nil, fmt.Errorf("terminal message required")
+		}
 		return payload.Messages, nil
 	}
 	if strings.TrimSpace(payload.Message) == "" {

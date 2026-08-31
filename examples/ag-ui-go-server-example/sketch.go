@@ -60,9 +60,14 @@ func StartRequest(sessionID session.ID, input RunInput, snapshot config.Snapshot
 	if len(input.Resume) > 0 {
 		return runtime.Request{}, ErrAGUIResumeRequiresAppAdapter
 	}
+	messages := convert.ToEinoMessages(input.Messages)
+	var message runtime.UserMessage
+	if len(messages) > 0 && messages[len(messages)-1] != nil {
+		message.Content = messages[len(messages)-1].Content
+	}
 	return runtime.Request{
 		SessionID: sessionID,
-		Input:     convert.ToEinoMessages(input.Messages),
+		Message:   message,
 		Config:    snapshot,
 		Metadata: map[string]string{
 			"agui_thread_id": input.ThreadID,

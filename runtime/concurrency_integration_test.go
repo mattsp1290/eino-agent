@@ -66,7 +66,7 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 			sessionID := session.ID("concurrent-session-" + string(rune('a'+i)))
 			handle, err := orch.Start(ctx, Request{
 				SessionID: sessionID,
-				Input:     []*einoschema.Message{einoschema.UserMessage("hello")},
+				Message:   UserMessage{Content: "hello"},
 				Config:    orchestratorConfig(),
 			})
 			if err != nil {
@@ -123,7 +123,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	for i := range sessions {
 		handle, err := orch.Start(ctx, Request{
 			SessionID: session.ID("interrupt-session-" + string(rune('a'+i))),
-			Input:     []*einoschema.Message{einoschema.UserMessage("hello")},
+			Message:   UserMessage{Content: "hello"},
 			Config:    orchestratorConfig(),
 		})
 		if err != nil {

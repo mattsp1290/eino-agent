@@ -113,7 +113,7 @@ func TestNativeContextContributionReachesProviderBeforeHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle, err := orchestrator.Start(context.Background(), runtime.Request{
-		SessionID: "session-a", Input: []*einoschema.Message{einoschema.UserMessage("base-user")},
+		SessionID: "session-a", Message: runtime.UserMessage{Content: "base-user"},
 		Config: config.Snapshot{Agent: config.Agent{Name: "agent", Model: selection, Options: map[string]string{}}, Model: selection, Metadata: map[string]string{"workspace_root": t.TempDir()}},
 	})
 	if err != nil {
