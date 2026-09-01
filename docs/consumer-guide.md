@@ -11,7 +11,7 @@ For a runnable starting point, see `examples/minimal-server` and
 
 ## Installation
 
-The supported root pin is `github.com/mattsp1290/eino-agent@v0.1.3` and
+The supported root pin is `github.com/mattsp1290/eino-agent@v0.2.0` and
 requires Go 1.26.3. An unrelated module verified its complete graph through
 the standard public Go proxy and checksum database with no replacement,
 workspace, vendor tree, or checkout access.
