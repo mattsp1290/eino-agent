@@ -7,7 +7,7 @@ This sketch maps the current `ag-ui-go-server-example` shape to stable `eino-age
 | Current example responsibility | eino-agent API |
 | --- | --- |
 | Fiber route parses `RunAgentInput` and owns path/auth policy | Keep in the app; call `runtime.StreamingOrchestrator.Start` with a `runtime.Request` |
-| AG-UI messages to Eino messages | Use `eino-agui/convert.ToEinoMessages`, as shown by `examples/ag-ui-go-server-example/sketch.go` |
+| Current AG-UI submission | Validate the raw terminal message and copy only its plain-text user content into `runtime.Request.Message` |
 | SSE stream/reconnect boilerplate | `transport.SSEHandler` with `session.Store`, `stream.Tail`, route-owned session lookup, and `after` cursor parsing |
 | Local paused/history storage | `store/sqlite.Open` for durable sessions, runs, messages, parts, tool calls, epochs, and replayable events |
 | Client-defined AG-UI tools | `tools/agui.MountClientTools` plus `composition.Registry` and `agui.ClientToolSnapshot` |
@@ -23,12 +23,19 @@ Core flow:
 2. Build a `stream.Tail` for live fanout.
 3. Pass the `stream.Tail` through `runtime.WithEventSink` for live fanout, and pass the same tail to `transport.SSEHandler`.
 4. Build one `composition.Registry`, mount server tools into it, and install it with `runtime.WithRunPlanProvider`.
-5. For each AG-UI run request, close the prior session mount, convert messages, and publish client tools with `tools/agui.MountClientTools`.
+5. For each AG-UI run request, close the prior session mount, validate and extract only the raw terminal user text, and publish client tools with `tools/agui.MountClientTools`.
 6. Call `runtime.StreamingOrchestrator.Start`.
 7. Serve replay/reconnect through `transport.SSEHandler`.
 8. Serve interrupts through `transport.InterruptHandler`.
 
 `runtime.EventSink` is for live delivery and observation. The runtime commits replayable events through the run-fenced `session.ExecutionStore` before forwarding copies to the tail; consumers must not append those copies to durable storage again.
+
+AG-UI wire requests may contain earlier messages for protocol compatibility,
+but they are not runtime history input. The adapter requires the final raw
+`aguitypes.Message` to have the user role and string-like, nonblank, valid-UTF-8
+content. It rejects trailing assistant or tool messages, multimodal arrays,
+structured values, and unknown content forms. Runtime loads the prior durable
+conversation and combines it with only that validated terminal prompt.
 
 ## POST-SSE Route Shape
 
@@ -37,7 +44,7 @@ The current app's `/agentic`, `/agentic_chat`, `/tool_based_generative_ui`, and 
 1. parse `RunAgentInput` before `SendStreamWriter`;
 2. default AG-UI `threadId` and `runId` the same way the current app does;
 3. map `threadId` to `session.ID`;
-4. maintain the AG-UI `runId` as response identity and runtime metadata;
+4. maintain the AG-UI `runId` in the app's response/control mapping, not in runtime session metadata;
 5. assign a server-owned client-tool generation for that session;
 6. start the runtime outside the request body's parsing lifetime;
 7. stream replay plus live tail events for that session into the current `SendStreamWriter` until the admitted run emits a terminal event.

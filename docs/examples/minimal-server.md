@@ -16,6 +16,10 @@ curl -sS -X POST http://localhost:8080/sessions/minimal/runs \
   -d '{"message":"hello from curl"}'
 ```
 
+The request contains only the new user submission. Do not send a `messages`
+array or resend transcript history: the runtime persists this text during
+admission and loads prior messages from SQLite for every later run.
+
 Open or reconnect the AG-UI event stream, passing the returned `run_id`:
 
 ```bash
