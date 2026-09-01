@@ -13,7 +13,7 @@ tool settlement, and observability/redaction policy.
 
 - Module: `github.com/mattsp1290/eino-agent`
 - Go: `1.26.3`
-- Supported root release: `v0.1.3`
+- Supported root release: `v0.2.0`
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.8.13`
