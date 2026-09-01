@@ -12,7 +12,11 @@ import (
 	"testing"
 	"time"
 
+	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/session/history"
 )
 
 func TestMinimalServerStreamsAndReplaysAGUIEvents(t *testing.T) {
@@ -107,24 +111,123 @@ func TestMinimalServerRejectsControlRouteMethods(t *testing.T) {
 	}
 }
 
-func TestMinimalServerRejectsNullTerminalMessage(t *testing.T) {
+func TestMinimalServerRejectsInvalidRunMessage(t *testing.T) {
 	t.Parallel()
 
-	request := httptest.NewRequest(
-		http.MethodPost,
-		"/sessions/"+string(defaultSessionID)+"/runs",
-		strings.NewReader(`{"messages":[null]}`),
-	)
-	response := httptest.NewRecorder()
-
-	(&Server{}).ServeHTTP(response, request)
-
-	if response.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+	tests := map[string]string{
+		"blank":             `{"message":"  \n"}`,
+		"missing":           `{}`,
+		"caller transcript": `{"messages":[{"role":"user","content":"old"}]}`,
 	}
-	if !strings.Contains(response.Body.String(), "terminal message required") {
-		t.Fatalf("body = %q, want terminal message error", response.Body.String())
+	for name, body := range tests {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPost,
+				"/sessions/"+string(defaultSessionID)+"/runs",
+				strings.NewReader(body),
+			)
+			response := httptest.NewRecorder()
+
+			(&Server{}).ServeHTTP(response, request)
+
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
+			}
+		})
 	}
+}
+
+func TestMinimalServerSequentialRunsUseDurableHistory(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
+	if err != nil {
+		t.Fatalf("NewServer error = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	const sessionID session.ID = "sequential"
+	var secondRunID session.RunID
+	for _, prompt := range []string{"first-user", "second-user"} {
+		runID := startRun(t, httpServer.URL, sessionID, prompt)
+		waitForTerminalRun(t, server.store, runID, 2*time.Second)
+		secondRunID = runID
+	}
+
+	requests, err := server.store.ListModelRequests(context.Background(), secondRunID, session.ModelRequestCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListModelRequests error = %v", err)
+	}
+	if len(requests.Records) != 1 {
+		t.Fatalf("second-run model requests = %d, want 1", len(requests.Records))
+	}
+	var audited []runtime.AuditedMessage
+	if err := json.Unmarshal(requests.Records[0].Messages, &audited); err != nil {
+		t.Fatalf("decode audited messages: %v", err)
+	}
+	wantProvider := []struct {
+		role    einoschema.RoleType
+		content string
+	}{
+		{einoschema.User, "first-user"},
+		{einoschema.Assistant, `Minimal server received "first-user"`},
+		{einoschema.User, "second-user"},
+	}
+	if len(audited) != len(wantProvider) {
+		t.Fatalf("second-run provider history length = %d, want %d", len(audited), len(wantProvider))
+	}
+	for index := range wantProvider {
+		var message einoschema.Message
+		if err := json.Unmarshal(audited[index].Canonical, &message); err != nil {
+			t.Fatalf("decode provider message %d: %v", index, err)
+		}
+		if message.Role != wantProvider[index].role || message.Content != wantProvider[index].content {
+			t.Fatalf("provider history[%d] = (%s, %q), want (%s, %q)", index, message.Role, message.Content, wantProvider[index].role, wantProvider[index].content)
+		}
+	}
+
+	messages, err := runtime.LoadHistory(context.Background(), server.store, sessionID, history.Options{})
+	if err != nil {
+		t.Fatalf("LoadHistory error = %v", err)
+	}
+	want := []struct {
+		role    einoschema.RoleType
+		content string
+	}{
+		{einoschema.User, "first-user"},
+		{einoschema.Assistant, `Minimal server received "first-user"`},
+		{einoschema.User, "second-user"},
+		{einoschema.Assistant, `Minimal server received "second-user"`},
+	}
+	if len(messages) != len(want) {
+		t.Fatalf("history length = %d, want %d: %#v", len(messages), len(want), messages)
+	}
+	for index := range want {
+		if messages[index].Role != want[index].role || messages[index].Content != want[index].content {
+			t.Fatalf("history[%d] = (%s, %q), want (%s, %q)", index, messages[index].Role, messages[index].Content, want[index].role, want[index].content)
+		}
+	}
+}
+
+func waitForTerminalRun(t *testing.T, store session.Store, runID session.RunID, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		run, err := store.GetRun(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("GetRun(%s) error = %v", runID, err)
+		}
+		switch run.Status {
+		case session.RunCompleted:
+			return
+		case session.RunFailed, session.RunInterrupted:
+			t.Fatalf("run %s settled as %s", runID, run.Status)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("run %s did not settle within %s", runID, timeout)
 }
 
 func TestMinimalServerCloseInterruptsActiveRunsBeforeClosingStore(t *testing.T) {

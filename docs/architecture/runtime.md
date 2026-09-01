@@ -64,21 +64,24 @@ Import direction is part of the public contract:
 
 The runtime treats a run as durable before it is executable.
 
-1. Host code loads and validates a `config.Snapshot`.
-2. Runtime creates or locates a `session.Session`.
-3. Runtime admits a `session.Run` with selected agent, provider, model,
-   config/plugin/component snapshot metadata, parent message/run IDs, and
-   context epoch.
-4. Runtime acquires the implementation-defined per-session execution lock.
-5. Runtime emits internal `runtime.EventRunStarted`.
-6. Runtime builds a `runtime.TurnSnapshot`.
-7. Runtime resolves tools and provider model for that snapshot.
-8. Runtime streams the Eino provider call, persists replayable messages/parts,
-   emits live-only deltas, and settles tool calls.
-9. Runtime flushes save-point work: pending messages, tool results, context
+1. Host code loads a `config.Snapshot` and submits exactly one current
+   `runtime.UserMessage`.
+2. Runtime validates that text, resolves immutable run dependencies, and
+   creates or locates the `session.Session`.
+3. One store transaction acquires per-session run ownership, loads the prior
+   committed history, and admits the run, context epoch, current user message
+   and text part, assistant placeholder, and `run_started` event.
+4. Runtime builds a `runtime.TurnSnapshot` from prior durable history followed
+   by the current user text. The provider never receives a caller-owned
+   transcript.
+5. Runtime publishes the committed start event and resolves tools for the
+   frozen snapshot.
+6. Runtime streams the Eino provider call, appends assistant parts, emits
+   live-only deltas, and settles tool calls.
+7. Runtime flushes save-point work: follow-up messages, tool results, context
    epoch transitions, observability data, and hook results.
-10. Runtime finishes the run as completed, failed, or interrupted before
-    releasing the session lock.
+8. Runtime finishes the run as completed, failed, or interrupted before
+   releasing the session lock.
 
 This avoids conflating a live Eino stream with the durable conversation. A
 client can disconnect from AG-UI SSE without changing the authoritative run
@@ -100,6 +103,8 @@ same store-owned atomic admission boundary.
 Store implementations must provide these invariants:
 
 - an admitted run is visible before provider streaming begins;
+- the admitted user message/part and assistant placeholder are visible before
+  provider streaming begins;
 - `session.Store.AdmitRun` is the atomic per-session ownership operation;
 - only one nonterminal run owns a session unless a future branch design
   explicitly allows parallel ownership;
@@ -121,8 +126,8 @@ or to retry only when an explicit retry-safe contract allows it.
 ## Turn Snapshots and Context Epochs
 
 `runtime.TurnSnapshot` is internal state for one provider request. Runtime
-admission checks and deep-clones `config.Snapshot` and the complete supported
-Eino message graph before any durable write. It
+admission checks and deep-clones `config.Snapshot`, loads the committed message
+graph itself, and appends the validated current user text. It
 captures:
 
 - durable run/session/context epoch IDs;

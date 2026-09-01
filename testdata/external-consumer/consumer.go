@@ -13,7 +13,9 @@ var (
 	_ = composition.NewRegistry
 	_ = model.Provider{}
 	_ = fake.Provider{}
-	_ = runtime.Request{}
+	_ = runtime.Request{
+		Message: runtime.UserMessage{Content: "current user submission"},
+	}
 	_ *sqlite.Store
 	_ = stream.NewTail
 )

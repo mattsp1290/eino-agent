@@ -81,7 +81,7 @@ and an immutable `config.Snapshot`:
 ```go
 handle, err := orchestrator.Start(ctx, runtime.Request{
     SessionID: session.ID("tenant-123/thread-456"),
-    Input:     messages,
+    Message:   runtime.UserMessage{Content: submittedText},
     Config:    snapshot,
     Metadata:  map[string]string{"workspace_id": "workspace-1"},
 })
@@ -89,6 +89,32 @@ handle, err := orchestrator.Start(ctx, runtime.Request{
 
 The returned `runtime.Handle` is the live control surface for that admitted
 run. Use `Done()` for terminal status and `Interrupt()` for cancellation.
+
+`Message` is exactly one new user submission. Do not copy a client transcript
+into the request, preload provider messages, or append the submitted user or
+assistant records yourself. During admission, runtime loads the session's
+committed history, adds the current user text to the provider snapshot, and
+atomically persists the new user message/part and assistant placeholder. A
+second run for the same settled session therefore receives the first durable
+user/assistant pair followed by only its new user message. `LoadHistory` and
+AG-UI replay read that same durable transcript.
+
+The persistence outcome depends on where a run stops:
+
+- A synchronous admission failure commits none of that attempted run's
+  transcript records. If this was a later admission, the existing session and
+  earlier transcript remain unchanged.
+- A provider or pre-execution failure after successful admission retains the
+  admitted user text and an empty assistant placeholder, and finishes the run
+  as failed.
+- An interruption after admission retains the same pair and finishes the run
+  as interrupted.
+- Successful settlement retains the user text and the completed assistant
+  content.
+
+These records are runtime-owned. Event sinks, HTTP adapters, and application
+stores must not dual-write them; doing so creates duplicate replay history and
+bypasses the run fence.
 
 ## HTTP and AG-UI
 

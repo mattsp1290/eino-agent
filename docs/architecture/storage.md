@@ -49,6 +49,16 @@ a lease duration; the store clock stamps the absolute deadline.
 Required behavior:
 
 - The operation is atomic for one `SessionID`.
+- Fresh-run admission commits the run and fence, context epoch, current user
+  message and text part, assistant placeholder, and canonical `run_started`
+  event as one set. Creating a new session is part of that same transaction.
+- `Run.ParentMsgID` and the assistant placeholder's `ParentID` both name the
+  runtime-generated user message. No consumer-supplied message ID participates
+  in this relationship.
+- The current user message sorts strictly after all existing session messages;
+  its assistant placeholder sorts strictly after that user. Stores represent
+  this canonical order with UTC timestamps at nanosecond precision and use ID
+  only as the deterministic tie-breaker for equal timestamps.
 - Every pre-existing run ID returns `session.ErrConflict`, regardless of
   whether the submitted record is identical.
 - Exactly one nonterminal run may own a session.
@@ -56,6 +66,10 @@ Required behavior:
 - Terminal statuses are `RunInterrupted`, `RunFailed`, and `RunCompleted`.
 - After scoped `SettleRun` records terminal state and its durable event, the next
   run may be admitted.
+- Any error or panic before admission commits rolls back the entire new set. A
+  failed later admission leaves the already-committed session and transcript
+  unchanged. Failures or interruptions after admission retain the admitted
+  user and assistant placeholder.
 - `run_finished` is a reserved canonical event kind. Exactly one exists per run,
   and only `SettleRun` may commit it.
 - `ClaimToken` is mutation authority. `OwnerID` is diagnostic metadata.

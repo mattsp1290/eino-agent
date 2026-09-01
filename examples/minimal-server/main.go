@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -188,14 +189,14 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	messages, err := decodeRunMessages(r)
+	message, err := decodeRunMessage(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	handle, err := s.runtime.Start(context.WithoutCancel(r.Context()), runtime.Request{
 		SessionID: sessionID,
-		Message:   runtime.UserMessage{Content: messages[len(messages)-1].Content},
+		Message:   message,
 		Config:    s.config,
 		Metadata:  map[string]string{"example": "minimal-server"},
 	})
@@ -281,24 +282,25 @@ func minimalConfig() config.Snapshot {
 	}
 }
 
-func decodeRunMessages(r *http.Request) ([]*einoschema.Message, error) {
+func decodeRunMessage(r *http.Request) (runtime.UserMessage, error) {
 	var payload struct {
-		Message  string                `json:"message"`
-		Messages []*einoschema.Message `json:"messages"`
+		Message string `json:"message"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		return nil, err
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&payload); err != nil {
+		return runtime.UserMessage{}, err
 	}
-	if len(payload.Messages) > 0 {
-		if payload.Messages[len(payload.Messages)-1] == nil {
-			return nil, fmt.Errorf("terminal message required")
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = fmt.Errorf("exactly one JSON object required")
 		}
-		return payload.Messages, nil
+		return runtime.UserMessage{}, err
 	}
 	if strings.TrimSpace(payload.Message) == "" {
-		return nil, fmt.Errorf("message or messages required")
+		return runtime.UserMessage{}, fmt.Errorf("message required")
 	}
-	return []*einoschema.Message{einoschema.UserMessage(payload.Message)}, nil
+	return runtime.UserMessage{Content: payload.Message}, nil
 }
 
 func eventCursorFromRequest(r *http.Request) session.EventCursor {

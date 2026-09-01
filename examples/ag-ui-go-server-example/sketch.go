@@ -10,11 +10,13 @@ package agui_go_server_example
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
+	"unicode/utf8"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
-	"github.com/mattsp1290/eino-agui/convert"
 
 	agentagui "github.com/mattsp1290/eino-agent/agui"
 	"github.com/mattsp1290/eino-agent/composition"
@@ -60,10 +62,9 @@ func StartRequest(sessionID session.ID, input RunInput, snapshot config.Snapshot
 	if len(input.Resume) > 0 {
 		return runtime.Request{}, ErrAGUIResumeRequiresAppAdapter
 	}
-	messages := convert.ToEinoMessages(input.Messages)
-	var message runtime.UserMessage
-	if len(messages) > 0 && messages[len(messages)-1] != nil {
-		message.Content = messages[len(messages)-1].Content
+	message, err := terminalTextUserMessage(input.Messages)
+	if err != nil {
+		return runtime.Request{}, err
 	}
 	return runtime.Request{
 		SessionID: sessionID,
@@ -71,9 +72,29 @@ func StartRequest(sessionID session.ID, input RunInput, snapshot config.Snapshot
 		Config:    snapshot,
 		Metadata: map[string]string{
 			"agui_thread_id": input.ThreadID,
-			"agui_run_id":    input.RunID,
 		},
 	}, nil
+}
+
+func terminalTextUserMessage(messages []aguitypes.Message) (runtime.UserMessage, error) {
+	if len(messages) == 0 {
+		return runtime.UserMessage{}, fmt.Errorf("terminal AG-UI user message required")
+	}
+	terminal := messages[len(messages)-1]
+	if terminal.Role != aguitypes.RoleUser {
+		return runtime.UserMessage{}, fmt.Errorf("terminal AG-UI message must have user role")
+	}
+	content, ok := terminal.ContentString()
+	if !ok {
+		return runtime.UserMessage{}, fmt.Errorf("terminal AG-UI user message must contain plain text")
+	}
+	if !utf8.ValidString(content) {
+		return runtime.UserMessage{}, fmt.Errorf("terminal AG-UI user message must be valid UTF-8")
+	}
+	if strings.TrimSpace(content) == "" {
+		return runtime.UserMessage{}, fmt.Errorf("terminal AG-UI user message must not be blank")
+	}
+	return runtime.UserMessage{Content: content}, nil
 }
 
 // SessionIDFromThreadID preserves ag-ui-go-server-example's thread identity as
