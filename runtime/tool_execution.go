@@ -67,6 +67,10 @@ func (e *runExecution) terminalizeUnfinishedTools(ctx context.Context, snapshot 
 
 func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall, errText string) (session.ToolSettlement, error) {
 	completedAt := e.host.now()
+	messageAt, err := e.nextDurableMessageTime(ctx, run.SessionID, completedAt)
+	if err != nil {
+		return session.ToolSettlement{}, err
+	}
 	raw := cloneJSON(claimed.Output)
 	metadata := cloneStringMap(claimed.Metadata)
 	result := ToolResult{}
@@ -84,7 +88,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	}
 	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, Error: errText,
-		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt,
+		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,
 	})
 	if err != nil {
 		return session.ToolSettlement{}, err
@@ -107,18 +111,25 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	observedTool := e.host.startObservedToolCall(ctx, snapshot, tool, call)
 	outcome := e.executeClaimedToolPipeline(ctx, tool, call, prepareErr)
 	completedAt := e.host.now()
-	settlement, _, err := BuildToolSettlement(ToolSettlementInput{
+	failSettlement := func(err error) (settledTool, error) {
+		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
+		e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, session.ToolCallFailed, completedAt.Sub(claimed.StartedAt), err, nil)
+		return settledTool{}, err
+	}
+	messageAt, err := e.nextDurableMessageTime(ctx, snapshot.SessionID, completedAt)
+	if err != nil {
+		return failSettlement(err)
+	}
+	settlement, _, err := buildToolSettlement(ToolSettlementInput{
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
-	})
+	}, messageAt)
 	eventEnvelope := toolTransitionEnvelope(e.host, snapshot, completedAt)
 	if err == nil {
 		_, err = e.persistToolSettlement(ctx, claimed, settlement, eventEnvelope)
 	}
 	if err != nil {
-		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
-		e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, session.ToolCallFailed, completedAt.Sub(claimed.StartedAt), err, nil)
-		return settledTool{}, err
+		return failSettlement(err)
 	}
 	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: claimed.ID, ToolName: claimed.Name,

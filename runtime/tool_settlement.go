@@ -50,6 +50,10 @@ type ToolSettlementInput struct {
 // BuildToolSettlement builds the canonical terminal call, result message, and
 // result part envelope used by runtime execution.
 func BuildToolSettlement(input ToolSettlementInput) (session.ToolSettlement, ToolOutput, error) {
+	return buildToolSettlement(input, input.CompletedAt)
+}
+
+func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (session.ToolSettlement, ToolOutput, error) {
 	if err := validateSettlementInput(input); err != nil {
 		return session.ToolSettlement{}, ToolOutput{}, err
 	}
@@ -63,6 +67,7 @@ func BuildToolSettlement(input ToolSettlementInput) (session.ToolSettlement, Too
 		Metadata:    metadata,
 		ModelID:     input.ModelID,
 		CompletedAt: input.CompletedAt,
+		MessageAt:   messageAt,
 	})
 	return settlement, output, err
 }
@@ -75,6 +80,7 @@ type terminalToolEnvelopeInput struct {
 	Metadata    map[string]string
 	ModelID     string
 	CompletedAt time.Time
+	MessageAt   time.Time
 }
 
 func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSettlement, error) {
@@ -84,6 +90,9 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 	}
 	if input.CompletedAt.IsZero() || !session.TerminalToolCall(input.Status) {
 		return session.ToolSettlement{}, errors.New("tool settlement requires terminal status and completion time")
+	}
+	if input.MessageAt.IsZero() {
+		return session.ToolSettlement{}, errors.New("tool settlement requires durable message time")
 	}
 	settlement := session.ToolSettlement{
 		ID:          call.ID,
@@ -96,11 +105,11 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 		CompletedAt: input.CompletedAt.UTC(),
 		ResultMessage: session.Message{
 			ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID,
-			Role: session.RoleTool, ModelID: input.ModelID, CreatedAt: input.CompletedAt.UTC(), UpdatedAt: input.CompletedAt.UTC(),
+			Role: session.RoleTool, ModelID: input.ModelID, CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
 		},
 		ResultPart: session.Part{
 			ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID,
-			Kind: session.PartToolResult, Payload: cloneJSON(input.Output), CreatedAt: input.CompletedAt.UTC(), UpdatedAt: input.CompletedAt.UTC(),
+			Kind: session.PartToolResult, Payload: cloneJSON(input.Output), CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
 		},
 	}
 	return settlement, nil

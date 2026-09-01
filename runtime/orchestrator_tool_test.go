@@ -12,6 +12,7 @@ import (
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
+	einoobs "github.com/mattsp1290/eino-obs"
 
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
@@ -89,6 +90,49 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	if !strings.Contains(string(toolEvents[0].Payload), `"arguments":{"text":"hi"}`) {
 		t.Fatalf("tool event payload = %s", toolEvents[0].Payload)
 	}
+}
+
+func TestResumeOrderingFloorFailureBalancesToolObservations(t *testing.T) {
+	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
+	floorErr := errors.New("durable message floor unavailable")
+	toolRegistry := staticToolRegistry{tools: []Tool{{
+		Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: "ok"}, nil
+		}),
+	}}}
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(&listMessagesErrorStore{Store: store, err: floorErr}),
+		WithOwnerID("owner-1"),
+		WithObserver(observer),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
+	)
+	handle, err := orchestrator.Resume(context.Background(), run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunFailed || !errors.Is(result.Error, floorErr) {
+		t.Fatalf("result = %+v, want failed floor reconstruction", result)
+	}
+	toolSpans := observationsByKind(observer.Snapshot().Observations, "tool_call")
+	settled := observationsByKind(observer.Snapshot().Observations, "tool.settled")
+	if len(toolSpans) != 1 || toolSpans[0].Status != "error" || toolSpans[0].Error == nil {
+		t.Fatalf("tool observations = %#v, want one ended error span", toolSpans)
+	}
+	if len(settled) != 1 || settled[0].Status != "error" || settled[0].Error == nil {
+		t.Fatalf("settled observations = %#v, want one failed settlement", settled)
+	}
+}
+
+type listMessagesErrorStore struct {
+	session.Store
+	err error
+}
+
+func (s *listMessagesErrorStore) ListMessages(context.Context, session.ID, session.ReplayCursor) (session.ReplayBatch, error) {
+	return session.ReplayBatch{}, s.err
 }
 
 func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {

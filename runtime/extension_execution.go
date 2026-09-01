@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sync"
+	"time"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
@@ -16,6 +18,44 @@ type runExecution struct {
 	store  session.ExecutionStore
 	lease  *runLeaseHeartbeat
 	events *eventQueue
+
+	durableMessageMu          sync.Mutex
+	durableMessageFloor       time.Time
+	durableMessageInitialized bool
+}
+
+func (e *runExecution) seedDurableMessageFloor(at time.Time) {
+	if e == nil || at.IsZero() {
+		return
+	}
+	e.durableMessageMu.Lock()
+	defer e.durableMessageMu.Unlock()
+	at = at.UTC()
+	if !e.durableMessageInitialized || at.After(e.durableMessageFloor) {
+		e.durableMessageFloor = at
+	}
+	e.durableMessageInitialized = true
+}
+
+func (e *runExecution) nextDurableMessageTime(ctx context.Context, sessionID session.ID, observed time.Time) (time.Time, error) {
+	e.durableMessageMu.Lock()
+	defer e.durableMessageMu.Unlock()
+	if !e.durableMessageInitialized {
+		latest, err := latestAdmissionMessageTime(context.WithoutCancel(ctx), e.host.store, sessionID)
+		if err != nil {
+			return time.Time{}, err
+		}
+		e.durableMessageFloor = latest
+		e.durableMessageInitialized = true
+	}
+	observed = observed.UTC()
+	if !observed.After(e.durableMessageFloor) {
+		observed = e.durableMessageFloor.Add(time.Nanosecond)
+	}
+	// Allocation is monotonic per execution. Persistence failures may leave
+	// gaps and must never roll the floor backward.
+	e.durableMessageFloor = observed
+	return observed, nil
 }
 
 func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run) *runExecution {

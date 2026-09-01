@@ -40,7 +40,7 @@ go.work.sum
 .bin/
 
 # Transient agent planning artifacts
-/.agents/plans/
+.agents/plans/
 
 # Transient code-review artifacts
 /reviews/
