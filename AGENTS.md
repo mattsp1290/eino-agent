@@ -12,6 +12,13 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
+## Local Agent Plans
+
+`.agents/plans/` is intentionally gitignored local execution input. Preserve
+its contents unless the user explicitly requests local deletion, and never
+stage plan files. Treat a request to remove a plan from Git or a pull request
+as index-only removal; verify the local plan still exists afterward.
+
 ## Non-Interactive Shell Commands
 
 **ALWAYS use non-interactive flags** with file operations to avoid hanging on confirmation prompts.
