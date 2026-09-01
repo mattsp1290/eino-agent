@@ -1,6 +1,7 @@
 package agui_go_server_example
 
 import (
+	"encoding/json"
 	"testing"
 
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
@@ -8,6 +9,30 @@ import (
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/session"
 )
+
+func TestTerminalTextUserMessageAcceptsStringLikeContent(t *testing.T) {
+	t.Parallel()
+
+	text := "  terminal-user\n"
+	tests := map[string]any{
+		"string":          text,
+		"string pointer":  &text,
+		"bytes":           []byte(text),
+		"raw JSON string": json.RawMessage(`"  terminal-user\n"`),
+	}
+	for name, content := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			message, err := terminalTextUserMessage([]aguitypes.Message{{Role: aguitypes.RoleUser, Content: content}})
+			if err != nil {
+				t.Fatalf("terminalTextUserMessage error = %v", err)
+			}
+			if message.Content != text {
+				t.Fatalf("Content = %q, want %q", message.Content, text)
+			}
+		})
+	}
+}
 
 func TestStartRequestUsesOnlyTerminalPlainTextUserMessage(t *testing.T) {
 	t.Parallel()

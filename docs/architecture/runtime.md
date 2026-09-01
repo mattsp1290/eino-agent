@@ -66,11 +66,11 @@ The runtime treats a run as durable before it is executable.
 
 1. Host code loads a `config.Snapshot` and submits exactly one current
    `runtime.UserMessage`.
-2. Runtime validates that text, resolves immutable run dependencies, and
-   creates or locates the `session.Session`.
-3. One store transaction acquires per-session run ownership, loads the prior
-   committed history, and admits the run, context epoch, current user message
-   and text part, assistant placeholder, and `run_started` event.
+2. Runtime validates that text and resolves immutable run dependencies.
+3. One store transaction creates or locates the `session.Session`, acquires
+   per-session run ownership, loads the prior committed history, and admits the
+   run, context epoch, current user message and text part, assistant
+   placeholder, and `run_started` event.
 4. Runtime builds a `runtime.TurnSnapshot` from prior durable history followed
    by the current user text. The provider never receives a caller-owned
    transcript.

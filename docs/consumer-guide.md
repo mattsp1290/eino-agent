@@ -388,10 +388,11 @@ runtime does not advertise a separate scheduling contract.
 
 ## Configuration
 
-`config.Snapshot` and the complete mutable Eino message graph are checked and
-deep-cloned before any durable admission write. Config reloads, plugin changes,
-permission changes, and provider/model changes affect later runs only. They do
-not mutate an in-flight turn snapshot.
+`config.Snapshot` is checked and deep-cloned before admission. Runtime builds
+the provider message graph from committed durable history plus the one current
+`UserMessage`, then freezes that graph for the admitted turn. Config reloads,
+plugin changes, permission changes, and provider/model changes affect later
+runs only. They do not mutate an in-flight turn snapshot.
 
 Applications should validate:
 

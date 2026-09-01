@@ -118,6 +118,8 @@ func TestMinimalServerRejectsInvalidRunMessage(t *testing.T) {
 		"blank":             `{"message":"  \n"}`,
 		"missing":           `{}`,
 		"caller transcript": `{"messages":[{"role":"user","content":"old"}]}`,
+		"unknown field":     `{"message":"hello","extra":true}`,
+		"trailing value":    `{"message":"hello"}{}`,
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
