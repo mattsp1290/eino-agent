@@ -1,26 +1,26 @@
 package model
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/internal/providerstatewire"
 )
 
 const (
-	HardProviderStateMaxItems              = 64
-	HardProviderStateMaxItemBytes          = 10 * 1024 * 1024
-	HardProviderStateMaxMessageBytes       = 16 * 1024 * 1024
-	HardProviderStateMaxEnvelopeBytes      = 13_985_112
-	HardProviderStateMaxStoredMessageBytes = 22_632_024
-	MaxProviderStateCodecIDBytes           = 128
-	MaxProviderStateCompatibilityKeyBytes  = 256
-	MaxProviderStateExtraKeyBytes          = 256
-	MaxProviderStateProviderIDBytes        = 128
-	MaxProviderStateModelIDBytes           = 256
+	HardProviderStateMaxItems              = providerstatewire.MaxItems
+	HardProviderStateMaxItemBytes          = providerstatewire.MaxItemBytes
+	HardProviderStateMaxMessageBytes       = providerstatewire.MaxMessageBytes
+	HardProviderStateMaxEnvelopeBytes      = providerstatewire.MaxEnvelopeBytes
+	HardProviderStateMaxStoredMessageBytes = providerstatewire.MaxStoredMessageBytes
+	MaxProviderStateCodecIDBytes           = providerstatewire.MaxCodecIDBytes
+	MaxProviderStateCompatibilityKeyBytes  = providerstatewire.MaxCompatibilityBytes
+	MaxProviderStateExtraKeyBytes          = providerstatewire.MaxExtraKeyBytes
+	MaxProviderStateProviderIDBytes        = providerstatewire.MaxProviderIDBytes
+	MaxProviderStateModelIDBytes           = providerstatewire.MaxModelIDBytes
 )
 
 var (
@@ -74,7 +74,8 @@ type ProviderStateCapture struct {
 	ClaimedKeys []string
 }
 
-// ProviderStateCodec captures and restores one provider's private assistant state.
+// ProviderStateCodec captures and restores one provider's private assistant
+// state. Implementations must be safe for concurrent use by multiple runs.
 type ProviderStateCodec interface {
 	Contract() ProviderStateContract
 	OwnedExtraKeys() []string
@@ -87,7 +88,6 @@ type ProviderStateCodec interface {
 type ProviderStateStreamer interface {
 	Streamer
 	ProviderStateContract() ProviderStateContract
-	ProviderStateOwnedExtraKeys() []string
 	CaptureProviderState(*einoschema.Message) (ProviderStateCapture, error)
 }
 
@@ -100,7 +100,10 @@ func ValidateProviderStateContract(contract ProviderStateContract) error {
 		len(contract.CompatibilityKey) > MaxProviderStateCompatibilityKeyBytes {
 		return providerStateError(ErrProviderStateInvalid)
 	}
-	limits := contract.Limits
+	return validateProviderStateLimits(contract.Limits)
+}
+
+func validateProviderStateLimits(limits ProviderStateLimits) error {
 	if limits.MaxItems <= 0 || limits.MaxItems > HardProviderStateMaxItems ||
 		limits.MaxItemBytes <= 0 || limits.MaxItemBytes > HardProviderStateMaxItemBytes ||
 		limits.MaxMessageBytes <= 0 || limits.MaxMessageBytes > HardProviderStateMaxMessageBytes ||
@@ -123,6 +126,9 @@ func ValidateProviderStateIdentity(providerID, modelID string) error {
 
 // ValidateProviderStateItems validates and counts raw items without normalizing them.
 func ValidateProviderStateItems(items []ProviderStateItem, limits ProviderStateLimits) error {
+	if err := validateProviderStateLimits(limits); err != nil {
+		return err
+	}
 	if len(items) == 0 {
 		return providerStateError(ErrProviderStateInvalid)
 	}
@@ -168,10 +174,6 @@ func cloneProviderStateItems(src []ProviderStateItem) []ProviderStateItem {
 	return dst
 }
 
-func cloneProviderStateContract(contract ProviderStateContract) ProviderStateContract {
-	return contract
-}
-
 func providerStateError(kind error) error {
 	switch kind {
 	case ErrProviderStateTooLarge:
@@ -186,32 +188,9 @@ func providerStateError(kind error) error {
 }
 
 func isJSONObject(raw json.RawMessage) bool {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return false
-	}
-	if _, ok := value.(map[string]any); !ok || value == nil {
-		return false
-	}
-	return errors.Is(decoder.Decode(&struct{}{}), io.EOF)
+	return providerstatewire.IsJSONObject(raw)
 }
 
 func validASCIIToken(value string, max int) bool {
-	if value == "" || len(value) > max {
-		return false
-	}
-	for i := 0; i < len(value); i++ {
-		if !providerStateTokenByte(value[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func providerStateTokenByte(value byte) bool {
-	if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' {
-		return true
-	}
-	return bytes.ContainsRune([]byte("!#$%&'*+-.^_`|~:/@"), rune(value))
+	return providerstatewire.ValidASCIIToken(value, max)
 }

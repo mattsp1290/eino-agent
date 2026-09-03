@@ -264,7 +264,8 @@ type ReplayBatch struct {
 	Parts    []Part
 	// PartOwnerMessageIDs contains the store-authoritative owner column for
 	// each parallel Parts entry. Stores that cannot supply a separate owner may
-	// leave it empty, in which case callers fall back to Part.MessageID.
+	// leave it empty. Consumers must resolve the two valid shapes through
+	// ResolveReplayPartOwners.
 	PartOwnerMessageIDs []MessageID
 	Next                ReplayCursor
 }

@@ -3,6 +3,7 @@ package history
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"reflect"
 	"strings"
@@ -279,6 +280,45 @@ func TestLoadIgnoresLiveOnlyEvents(t *testing.T) {
 		t.Fatalf("Load error = %v", err)
 	}
 	assertMessage(t, projected[0], schema.Assistant, "settled")
+}
+
+func TestLoadBatchRejectsNonParallelPartOwnerMetadata(t *testing.T) {
+	t.Parallel()
+	parts := []session.Part{
+		part("first", "assistant", session.PartText, 0, `{"text":"one"}`),
+		part("second", "assistant", session.PartText, 1, `{"text":"two"}`),
+	}
+	for name, owners := range map[string][]session.MessageID{
+		"partial":  {"assistant"},
+		"overlong": {"assistant", "assistant", "assistant"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := historyStore{batch: session.ReplayBatch{
+				Messages:            []session.Message{message("assistant", session.RoleAssistant)},
+				Parts:               parts,
+				PartOwnerMessageIDs: owners,
+			}}
+			if _, err := LoadBatch(t.Context(), store, "session-1"); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("LoadBatch error = %v, want ErrConflict", err)
+			}
+		})
+	}
+}
+
+func TestProjectRejectsNonParallelPartOwnersWhenApplyingEpoch(t *testing.T) {
+	t.Parallel()
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("assistant", session.RoleAssistant)},
+		Parts: []session.Part{
+			part("first", "assistant", session.PartText, 0, `{"text":"one"}`),
+			part("second", "assistant", session.PartText, 1, `{"text":"two"}`),
+		},
+		PartOwnerMessageIDs: []session.MessageID{"assistant"},
+	}
+	_, err := Project(batch, Options{Epoch: &session.ContextEpoch{TailStartID: "assistant"}})
+	if !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("Project error = %v, want ErrConflict", err)
+	}
 }
 
 func TestProjectRejectsMalformedIncludedPayload(t *testing.T) {

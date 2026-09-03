@@ -64,6 +64,9 @@ func TestProviderStateContractValidation(t *testing.T) {
 			}
 		})
 	}
+	if err := ValidateProviderStateItems([]ProviderStateItem{{Data: json.RawMessage(`{"x":1}`)}}, ProviderStateLimits{}); !errors.Is(err, ErrProviderStateInvalid) {
+		t.Fatalf("invalid item limits error = %v", err)
+	}
 }
 
 func TestProviderStateIdentityAndRegistrationByteBoundaries(t *testing.T) {
@@ -101,10 +104,10 @@ func TestEinoJSONExtraStateCodecPreservesBytesAndRejectsShape(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw := []json.RawMessage{json.RawMessage(`{"encrypted":"SENTINEL", "n":1}`), json.RawMessage("{\n  \"n\": 2, \"encrypted\":\"other\"\n}")}
+	raw := []json.RawMessage{json.RawMessage(`{"encrypted":"SENTINEL", "n":1}`), json.RawMessage("{\n  \"n\": 2, \"encrypted\":\"other\"\n}"), json.RawMessage(`{"n":1e400}`)}
 	message := einoschema.AssistantMessage("done", nil)
 	message.Extra = map[string]any{"openaicodex:reasoning_items": raw}
-	stateful := &einoProviderStateStreamer{codec: codec, contract: codec.Contract(), owned: map[string]struct{}{"openaicodex:reasoning_items": {}}, ownedKeys: codec.OwnedExtraKeys()}
+	stateful := &einoProviderStateStreamer{codec: codec, contract: codec.Contract(), owned: map[string]struct{}{"openaicodex:reasoning_items": {}}}
 	capture, err := stateful.CaptureProviderState(message)
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +223,42 @@ func TestStateAwareEinoStreamerRejectsInvalidSidecarsWithoutDispatch(t *testing.
 			}
 		})
 	}
+	withoutState := Request{Identity: Identity{SessionID: "session", ProviderID: "bad provider", ModelID: "model"}, Messages: []*einoschema.Message{einoschema.UserMessage("new")}}
+	client.calls = 0
+	if _, err := streamer.StreamProvider(context.Background(), withoutState); !errors.Is(err, ErrProviderStateInvalid) || client.calls != 0 {
+		t.Fatalf("state-free invalid identity = calls %d error %v", client.calls, err)
+	}
+}
+
+func TestProviderStateCodecCannotMutateProviderNeutralMessageFields(t *testing.T) {
+	base, err := NewEinoJSONExtraStateCodec(EinoJSONExtraStateConfig{ExtraKey: "state", Contract: testProviderStateContract()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &providerStateRecordingModel{}
+	captureStreamer, err := NewEinoStreamerWithProviderState(client, &mutatingProviderStateCodec{ProviderStateCodec: base, mutateCapture: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := einoschema.AssistantMessage("original", nil)
+	message.Extra = map[string]any{"state": []json.RawMessage{json.RawMessage(`{"x":1}`)}}
+	if _, err := captureStreamer.CaptureProviderState(message); !errors.Is(err, ErrProviderStateInvalid) {
+		t.Fatalf("capture mutation error = %v", err)
+	}
+
+	restoreStreamer, err := NewEinoStreamerWithProviderState(client, &mutatingProviderStateCodec{ProviderStateCodec: base, mutateRestore: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{
+		Identity:      Identity{SessionID: "session", ProviderID: "provider", ModelID: "model"},
+		Messages:      []*einoschema.Message{einoschema.AssistantMessage("original", nil)},
+		ProviderState: []ProviderMessageState{{MessageIndex: 0, MessageID: "message", SourceSessionID: "session", SourceRunID: "run", ProviderID: "provider", SourceModelID: "model", CodecID: testProviderStateContract().CodecID, Version: 1, CompatibilityKey: "reasoning-v1", Items: []ProviderStateItem{{Data: json.RawMessage(`{"x":1}`)}}}},
+	}
+	client.calls = 0
+	if _, err := restoreStreamer.StreamProvider(context.Background(), request); !errors.Is(err, ErrProviderStateInvalid) || client.calls != 0 {
+		t.Fatalf("restore mutation = calls %d error %v", client.calls, err)
+	}
 }
 
 func TestProviderStateCodecPanicsAreContentFree(t *testing.T) {
@@ -256,6 +295,32 @@ type panicProviderStateCodec struct {
 	panicContract bool
 	panicCapture  bool
 	panicRestore  bool
+}
+
+type mutatingProviderStateCodec struct {
+	ProviderStateCodec
+	mutateCapture bool
+	mutateRestore bool
+}
+
+func (c *mutatingProviderStateCodec) CaptureAssistant(message *einoschema.Message) (ProviderStateCapture, error) {
+	capture, err := c.ProviderStateCodec.CaptureAssistant(message)
+	if c.mutateCapture {
+		message.Content = "mutated"
+		message.Role = einoschema.User
+	}
+	return capture, err
+}
+
+func (c *mutatingProviderStateCodec) RestoreAssistant(message *einoschema.Message, items []ProviderStateItem) error {
+	if err := c.ProviderStateCodec.RestoreAssistant(message, items); err != nil {
+		return err
+	}
+	if c.mutateRestore {
+		message.ReasoningContent = "mutated"
+		message.ToolCalls = []einoschema.ToolCall{{ID: "mutated"}}
+	}
+	return nil
 }
 
 func (c *panicProviderStateCodec) Contract() ProviderStateContract {
