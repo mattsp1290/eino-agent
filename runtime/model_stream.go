@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -19,6 +18,15 @@ type modelStreamResult struct {
 	usage         model.Usage
 	receivedDelta bool
 	err           error
+}
+
+const (
+	providerStreamPanicCode    = "provider_stream_panic"
+	providerStreamPanicMessage = "provider stream failed"
+)
+
+func newProviderStreamPanicError() error {
+	return model.Error{Code: providerStreamPanicCode, Message: providerStreamPanicMessage}
 }
 
 type modelStreamReader interface {
@@ -44,9 +52,9 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		observation: o.startObservedStream(ctx, snapshot, messageID, attempt),
 	}
 	defer func() {
-		if recovered := recover(); recovered != nil {
+		if recover() != nil {
 			result.message = nil
-			result.err = fmt.Errorf("provider stream panic: %v", recovered)
+			result.err = newProviderStreamPanicError()
 		}
 		if usage != nil {
 			*usage = addUsage(*usage, result.usage)
