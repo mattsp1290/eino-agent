@@ -23,6 +23,10 @@ func TestRulesSafetyGates(t *testing.T) {
 	if encrypted.Persist != DispositionOmit || encrypted.Replay != DispositionOmit || encrypted.LiveTail != DispositionOmit {
 		t.Fatalf("encrypted reasoning rule = %#v, want omit/omit/omit", encrypted)
 	}
+	providerState := rules[EventProviderState]
+	if providerState.Persist != DispositionOmit || providerState.Replay != DispositionOmit || providerState.LiveTail != DispositionOmit || providerState.SnapshotSafe {
+		t.Fatalf("provider state rule = %#v, want omit/omit/omit", providerState)
+	}
 }
 
 func TestRulesFamiliesAreUnique(t *testing.T) {
@@ -43,6 +47,7 @@ func TestRulesFamiliesAreUnique(t *testing.T) {
 		EventText,
 		EventReasoning,
 		EventEncryptedReasoning,
+		EventProviderState,
 		EventToolCall,
 		EventToolResult,
 		EventStateSnapshot,

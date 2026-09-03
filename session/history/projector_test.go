@@ -295,6 +295,30 @@ func TestProjectRejectsMalformedIncludedPayload(t *testing.T) {
 	}
 }
 
+func TestProjectWithSourcesOmitsProviderStateAndTracksExpansion(t *testing.T) {
+	t.Parallel()
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("assistant", session.RoleAssistant)},
+		Parts: []session.Part{
+			part("text", "assistant", session.PartText, 0, `{"text":"answer"}`),
+			part("private", "assistant", session.PartProviderState, 1, `not even valid JSON SENTINEL`),
+			part("tool", "assistant", session.PartToolResult, 2, `{"tool_call_id":"call","status":"completed","content":"result"}`),
+		},
+	}
+	projection, err := ProjectWithSources(batch, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(projection.Messages) != 2 || len(projection.SourceMessageIDs) != 2 || projection.SourceMessageIDs[0] != "assistant" || projection.SourceMessageIDs[1] != "assistant" {
+		t.Fatalf("projection = %#v", projection)
+	}
+	for _, message := range projection.Messages {
+		if len(message.Extra) != 0 || strings.Contains(message.Content, "SENTINEL") {
+			t.Fatalf("provider state leaked: %#v", message)
+		}
+	}
+}
+
 func message(id session.MessageID, role session.Role) session.Message {
 	now := time.Unix(1, 0)
 	return session.Message{

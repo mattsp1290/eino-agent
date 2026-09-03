@@ -236,10 +236,27 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
-	snapshot.Messages, err = materializeContextAssembly(assembled)
+	materialized, err := materializeContextAssemblyWithMapping(assembled)
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
+	snapshot.Messages = materialized.Messages
+	states, err := cloneRuntimeProviderState(snapshot.providerState)
+	if err != nil {
+		return TurnSnapshot{}, err
+	}
+	for index := range states {
+		baseIndex := states[index].MessageIndex
+		if baseIndex < 0 || baseIndex >= len(materialized.BaseToFinal) {
+			return TurnSnapshot{}, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		}
+		finalIndex := materialized.BaseToFinal[baseIndex]
+		if finalIndex < 0 || finalIndex >= len(snapshot.Messages) || snapshot.Messages[finalIndex] == nil || snapshot.Messages[finalIndex].Role != einoschema.Assistant {
+			return TurnSnapshot{}, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		}
+		states[index].MessageIndex = finalIndex
+	}
+	snapshot.providerState = states
 	if len(execution.plan.tools.capabilities) != 0 {
 		planned, err := execution.plan.ResolveTools(ctx, NewToolScopeContext(snapshot))
 		if err != nil {
@@ -273,6 +290,10 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
+		capturedState, err := captureAssistantProviderState(snapshot, currentMessageID, msg)
+		if err != nil {
+			return o.executionFailure(ctx, snapshot, currentMessageID, err)
+		}
 		normalizeToolCallIDs(msg, o.ids)
 		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, msg.ToolCalls)
 		if err != nil {
@@ -281,7 +302,7 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 		for index := range preparedCalls {
 			msg.ToolCalls[index] = preparedCalls[index].schemaCall
 		}
-		preparedCalls, err = o.persistAssistantTurn(ctx, execution, snapshot, currentMessageID, msg, preparedCalls)
+		preparedCalls, err = o.persistAssistantTurn(ctx, execution, snapshot, currentMessageID, msg, capturedState.payloads, preparedCalls)
 		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
@@ -290,6 +311,10 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 		}
 		if turn >= o.toolTurns() {
 			return o.executionFailure(ctx, snapshot, currentMessageID, model.Error{Code: "tool_turn_limit_exceeded", Message: "model exceeded tool turn limit", Cause: model.ErrProviderRejected})
+		}
+		if capturedState.state != nil {
+			capturedState.state.MessageIndex = len(messages)
+			snapshot.providerState = append(snapshot.providerState, *capturedState.state)
 		}
 		messages = append(messages, msg)
 		toolMessages, err := o.executePreparedTools(ctx, execution, snapshot, currentMessageID, preparedCalls)

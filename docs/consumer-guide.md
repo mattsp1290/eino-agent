@@ -90,6 +90,66 @@ handle, err := orchestrator.Start(ctx, runtime.Request{
 The returned `runtime.Handle` is the live control surface for that admitted
 run. Use `Done()` for terminal status and `Interrupt()` for cancellation.
 
+## Durable Provider-Private State
+
+Providers that require opaque assistant continuation objects can opt into the
+state-aware Eino boundary. Register one strict key and one immutable contract;
+the core runtime never parses the objects:
+
+```go
+codec, err := model.NewEinoJSONExtraStateCodec(model.EinoJSONExtraStateConfig{
+    ExtraKey: "openaicodex:reasoning_items",
+    Contract: model.ProviderStateContract{
+        CodecID: "github.com/mattsp1290/eino-providers/openaicodex/reasoning-items",
+        Version: 1,
+        CompatibilityKey: "openaicodex-responses-reasoning-v1",
+        Limits: model.ProviderStateLimits{
+            MaxItems: 32,
+            MaxItemBytes: 10 * 1024 * 1024,
+            MaxMessageBytes: 16 * 1024 * 1024,
+            MaxEnvelopeBytes: 13_985_112,
+            MaxStoredMessageBytes: 22_632_024,
+        },
+    },
+})
+if err != nil {
+    return err
+}
+streamer, err := model.NewEinoStreamerWithProviderState(einoModel, codec)
+if err != nil {
+    return err
+}
+```
+
+The registered `Extra` value must have dynamic type `[]json.RawMessage`, and
+each item must be exactly one non-null JSON object. Capture preserves its exact
+bytes; durable storage uses standard padded base64 so whitespace and property
+order survive SQLite close/reopen. Codec limits must be positive and cannot
+exceed the core ceilings shown above (with at most 64 items).
+
+Codecs are trusted in-process adapter code. Provider output and stored bytes
+are untrusted and fail closed on malformed JSON/envelopes, limits, ordering,
+ownership, provider, codec/version, or compatibility mismatch. A different
+model may consume earlier state only when the provider, codec/version, and
+compatibility key still match. Otherwise start a new session or create an
+explicit state-free active epoch; runtime never silently strips incompatible
+active state.
+
+Provider state follows the owning message's database and backup retention. It
+is retained but inactive when compaction summarizes that message, is never
+copied into summaries, and remains active for retained-tail messages. Raw
+`session.Store` access is an operator boundary. Hosts remain responsible for
+database encryption, access control, backups, expiry, and deletion because
+opaque or encrypted provider data is still sensitive.
+
+Consumers submit only the new user message as usual. They do not parse
+Responses items, restore `Extra`, merge history, or write a second history
+store. Runtime captures and atomically persists the assistant state, while the
+state-aware adapter privately restores it after ledger and extension handling.
+Ordinary history, AG-UI replay/live events, request ledgers, extensions, logs,
+traces, errors, and snapshots contain no provider-state bytes, base64, or
+content-derived digest.
+
 `Message` is exactly one new user submission. Do not copy a client transcript
 into the request, preload provider messages, or append the submitted user or
 assistant records yourself. During admission, runtime loads the session's

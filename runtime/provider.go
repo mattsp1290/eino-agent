@@ -19,10 +19,11 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		}
 	}
 	return model.Request{
-		Identity: modelIdentity(s.ContextIdentity(messageID, "", trace)),
-		Messages: messages,
-		Tools:    tools,
-		Options:  s.Config.Agent.Options,
+		Identity:      modelIdentity(s.ContextIdentity(messageID, "", trace)),
+		Messages:      messages,
+		ProviderState: s.providerState,
+		Tools:         tools,
+		Options:       s.Config.Agent.Options,
 	}
 }
 

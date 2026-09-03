@@ -49,6 +49,7 @@ const (
 	EventCustom             EventFamily = "custom"
 	EventError              EventFamily = "error"
 	EventEncryptedReasoning EventFamily = "encrypted_reasoning"
+	EventProviderState      EventFamily = "provider_state"
 )
 
 // Rule describes durability and replay behavior for one AG-UI event family.
@@ -105,7 +106,15 @@ func Rules() []Rule {
 			Replay:    DispositionOmit,
 			LiveTail:  DispositionOmit,
 			Redaction: session.RedactionContent,
-			Notes:     "Encrypted reasoning is never persisted, replayed, or included in snapshots.",
+			Notes:     "Encrypted reasoning is never persisted as an AG-UI event, replayed, or included in snapshots; a provider adapter may separately retain bounded opaque continuity state in a runtime-private provider_state part.",
+		},
+		{
+			Family:    EventProviderState,
+			Persist:   DispositionOmit,
+			Replay:    DispositionOmit,
+			LiveTail:  DispositionOmit,
+			Redaction: session.RedactionContent,
+			Notes:     "Provider-private continuity state is never an AG-UI event or snapshot field; runtime-owned provider_state parts are visible only at the durable-store operator boundary and matching provider adapter.",
 		},
 		{
 			Family:      EventToolCall,

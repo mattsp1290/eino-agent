@@ -24,6 +24,23 @@ shape that intentionally does not import `runtime`, `session`, or the
 `context` package. Runtime maps its richer turn identity into this provider
 shape in `runtime.ProviderRequest`.
 
+## Provider-Private Continuation State
+
+`model.ProviderStateCodec` is the public opt-in contract for bounded opaque
+assistant state. `model.NewEinoJSONExtraStateCodec` implements a strict single
+Eino `Extra` key whose value is `[]json.RawMessage`;
+`model.NewEinoStreamerWithProviderState` captures that key from completed
+assistant messages and restores it only onto a private request clone
+immediately before `ToolCallingChatModel.Stream`. The ordinary
+`model.NewEinoStreamer` rejects sidecars and remains state-free.
+
+`model.Request.ProviderState` is an owned sidecar indexed against the ordinary
+message slice. It never enters message JSON. Runtime and the final adapter both
+verify session/message/run ownership, provider identity, codec ID/version, and
+compatibility key. Exact compatibility-key equality is the only permission for
+a source model ID to differ from the current model ID. Capture and restore
+panics or errors collapse to fixed, content-free provider-state errors.
+
 ## Streaming Callbacks
 
 Every built adapter implements `model.Streamer`. Its optional observer callback

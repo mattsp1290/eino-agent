@@ -9,11 +9,19 @@ tool definitions, config loading, and deployment policy; `eino-agent` supplies
 runtime admission, durable session contracts, AG-UI replay/live-tail adapters,
 tool settlement, and observability/redaction policy.
 
+State-aware provider adapters can also retain bounded opaque assistant
+continuation state across tool loops and process restarts. The runtime stores
+that state atomically with the owning assistant turn and restores it only at
+the matching adapter boundary; ordinary history, AG-UI, ledgers, extensions,
+and observability remain provider-neutral.
+
 ## Module Baseline
 
 - Module: `github.com/mattsp1290/eino-agent`
 - Go: `1.26.3`
 - Supported root release: `v0.2.0`
+- Durable provider-state release candidate: `v0.3.0` (not supported until the
+  annotated tag and published no-replace consumer gate are verified)
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.8.13`

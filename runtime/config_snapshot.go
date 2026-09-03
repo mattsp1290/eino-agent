@@ -22,19 +22,34 @@ func FreezeTurnSnapshot(
 	systemPrompt string,
 	now time.Time,
 ) (TurnSnapshot, error) {
-	request, err := (model.Request{Messages: messages}).Clone()
+	return freezeTurnSnapshotWithProviderState(runID, sessionID, epochID, snapshot, resolved, messages, nil, systemPrompt, now)
+}
+
+func freezeTurnSnapshotWithProviderState(
+	runID session.RunID,
+	sessionID session.ID,
+	epochID session.EpochID,
+	snapshot config.Snapshot,
+	resolved model.Resolved,
+	messages []*einoschema.Message,
+	providerState []model.ProviderMessageState,
+	systemPrompt string,
+	now time.Time,
+) (TurnSnapshot, error) {
+	request, err := (model.Request{Messages: messages, ProviderState: providerState}).Clone()
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
 	return TurnSnapshot{
-		RunID:        runID,
-		SessionID:    sessionID,
-		EpochID:      epochID,
-		Config:       snapshot.Clone(),
-		Model:        cloneResolved(resolved),
-		Messages:     request.Messages,
-		SystemPrompt: systemPrompt,
-		CreatedAt:    now,
+		RunID:         runID,
+		SessionID:     sessionID,
+		EpochID:       epochID,
+		Config:        snapshot.Clone(),
+		Model:         cloneResolved(resolved),
+		Messages:      request.Messages,
+		providerState: request.ProviderState,
+		SystemPrompt:  systemPrompt,
+		CreatedAt:     now,
 	}, nil
 }
 

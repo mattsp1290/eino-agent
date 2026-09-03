@@ -95,14 +95,33 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 		placeholders[index] = "?"
 		partArgs[index] = message.ID
 	}
-	parts, err := listJSON[session.Part](ctx, s, `WITH page(id, created_at) AS (
+	rows, err := s.query(ctx, `WITH page(id, created_at) AS (
 		SELECT id, created_at FROM messages WHERE id IN (`+strings.Join(placeholders, ",")+`)
-	) SELECT p.record FROM page JOIN parts p ON p.message_id = page.id
+	) SELECT p.message_id, p.record FROM page JOIN parts p ON p.message_id = page.id
 	ORDER BY page.created_at, page.id, p.ordinal, p.id`, partArgs...)
 	if err != nil {
 		return session.ReplayBatch{}, err
 	}
-	return session.ReplayBatch{Messages: messages, Parts: parts, Next: next}, nil
+	defer func() { _ = rows.Close() }()
+	var parts []session.Part
+	var owners []session.MessageID
+	for rows.Next() {
+		var owner session.MessageID
+		var raw []byte
+		if err := rows.Scan(&owner, &raw); err != nil {
+			return session.ReplayBatch{}, err
+		}
+		var part session.Part
+		if err := json.Unmarshal(raw, &part); err != nil {
+			return session.ReplayBatch{}, session.ErrConflict
+		}
+		parts = append(parts, part)
+		owners = append(owners, owner)
+	}
+	if err := rows.Err(); err != nil {
+		return session.ReplayBatch{}, err
+	}
+	return session.ReplayBatch{Messages: messages, Parts: parts, PartOwnerMessageIDs: owners, Next: next}, nil
 }
 
 func (s *Store) GetMessage(ctx context.Context, id session.MessageID) (session.Message, error) {

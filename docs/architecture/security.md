@@ -124,7 +124,19 @@ orchestrator when durable reasoning storage is not allowed for that deployment.
 Live provider deltas may contain plain reasoning for clients that are authorized
 to see it, but observability defaults forbid both plain and encrypted reasoning
 content. Encrypted reasoning is modeled as an omitted AG-UI event family and
-must not be copied into observation attributes.
+never appears in replay or live snapshots. Separately, a registered provider
+codec may capture bounded opaque continuation objects into runtime-private
+`provider_state` parts. Those bytes are not reasoning events and are restored
+only at the matching provider boundary; they are absent from public history,
+AG-UI, request ledgers, extensions, logs, traces, errors, and snapshots.
+
+Codecs are trusted adapter code, while provider output and stored envelopes are
+structurally untrusted. Exact ownership/identity/version/compatibility and size
+checks fail closed with fixed errors. Base64 preserves bytes but does not
+encrypt them. Database encryption, access control, retention, backups, and
+deletion remain host responsibilities, and raw store access is an operator
+boundary. Provider-private bytes must not be copied into observation
+attributes.
 
 Evidence:
 

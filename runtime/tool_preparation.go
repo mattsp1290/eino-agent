@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -11,8 +12,8 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message, calls []preparedToolCall) ([]preparedToolCall, error) {
-	parts := make([]session.Part, 0, 2)
+func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message, providerStatePayloads []json.RawMessage, calls []preparedToolCall) ([]preparedToolCall, error) {
+	parts := make([]session.Part, 0, 2+len(providerStatePayloads))
 	ordinal := int64(0)
 	now := o.now()
 	if msg.Content != "" {
@@ -21,6 +22,10 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 	}
 	if msg.ReasoningContent != "" {
 		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: now, UpdatedAt: now})
+		ordinal++
+	}
+	for _, payload := range providerStatePayloads {
+		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartProviderState, Ordinal: ordinal, Payload: cloneJSON(payload), CreatedAt: now, UpdatedAt: now})
 		ordinal++
 	}
 	for index := range calls {

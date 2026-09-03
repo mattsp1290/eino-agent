@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +38,9 @@ func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	}
 	if frames[0]["messages"] == nil {
 		t.Fatalf("messages snapshot missing messages: %#v", frames[0])
+	}
+	if strings.Contains(string(sink.Bytes()), "AGUI_PROVIDER_STATE_SENTINEL") || strings.Contains(string(sink.Bytes()), "provider_state") {
+		t.Fatalf("provider state leaked to replay: %s", sink.Bytes())
 	}
 }
 
@@ -145,6 +149,9 @@ func replayStore(t *testing.T) session.Store {
 	}
 	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-text", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartText, Ordinal: 10, Payload: []byte(`{"text":"settled"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append part: %v", err)
+	}
+	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-provider-state", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartProviderState, Ordinal: 11, Payload: []byte(`{"data":"AGUI_PROVIDER_STATE_SENTINEL"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("append provider state: %v", err)
 	}
 	events := []session.EventRecord{
 		{ID: "evt-started", SessionID: "session-replay", RunID: "run-1", MessageID: "assistant-1", Kind: string(runtime.EventRunStarted), CreatedAt: now},

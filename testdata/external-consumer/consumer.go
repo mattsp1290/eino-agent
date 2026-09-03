@@ -18,4 +18,12 @@ var (
 	}
 	_ *sqlite.Store
 	_ = stream.NewTail
+	_ model.ProviderStateCodec
+	_ model.ProviderStateStreamer
+	_ = model.ProviderStateContract{
+		CodecID: "example.test/reasoning-items", Version: 1, CompatibilityKey: "reasoning-v1",
+		Limits: model.ProviderStateLimits{MaxItems: 1, MaxItemBytes: 1024, MaxMessageBytes: 1024, MaxEnvelopeBytes: 4096, MaxStoredMessageBytes: 4096},
+	}
+	_ = model.NewEinoJSONExtraStateCodec
+	_ = model.NewEinoStreamerWithProviderState
 )

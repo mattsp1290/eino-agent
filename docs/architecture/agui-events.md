@@ -49,6 +49,7 @@ and never replayed.
 | Text | Settled `session.Part{Kind: PartText}` on assistant message. | Replay as AG-UI assistant message content projected from durable parts. | Emit `TEXT_MESSAGE_*` deltas live. | Empty deltas. |
 | Plain reasoning | `session.Part{Kind: PartReasoning}` only when provider and host policy allow storage. | Replay as reasoning content only from durable reasoning parts. | Emit `REASONING_*` live while allowed. | Provider-private or policy-denied reasoning. |
 | Encrypted reasoning | Never persisted. | Never replayed. | Not emitted by `eino-agent`; scrub from snapshots. | All encrypted reasoning payloads. |
+| Provider-private state | Never persisted as an AG-UI event; runtime may retain a private `PartProviderState`. | Never replayed or decoded by AG-UI. | Never emitted. | All raw bytes, base64, digests, codec diagnostics, and source bindings. |
 | Tool calls | `session.ToolCall` plus one canonical `EventRecord` for each pending, running, and terminal phase; state and event commit atomically. | Replay call state from durable tool-call records, parts, and correlated phase events. | After commit, publish the exact persisted event best-effort when the bridge enables `eino-agui/stream.WithLiveToolCallEvents`. | Duplicate post-turn proposals when live tool calls were already emitted. |
 | Tool results | `PartToolResult` plus settled `session.ToolCall` output/error. | Replay bounded model-facing tool result from durable part. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
 | State snapshots | `PartState` only when host marks snapshot replay-safe. | Replay latest replay-safe snapshot or host-projected state. | Emit live snapshot when state changes. | Sensitive or non-replay-safe host state. |
@@ -128,6 +129,7 @@ Message snapshots and state snapshots must be scrubbed before persistence or
 replay:
 
 - encrypted reasoning is excluded;
+- provider-private state, its base64 representation, digests, and source bindings are excluded;
 - provider-private reasoning is excluded unless explicitly allowed;
 - plain reasoning is excluded unless `GateProviderReasoningStorage` is
   satisfied;

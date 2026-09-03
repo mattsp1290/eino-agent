@@ -62,15 +62,16 @@ type Orchestrator interface {
 
 // TurnSnapshot is the immutable state used for one provider request.
 type TurnSnapshot struct {
-	RunID        session.RunID
-	SessionID    session.ID
-	EpochID      session.EpochID
-	Config       config.Snapshot
-	Model        model.Resolved
-	Messages     []*einoschema.Message
-	Tools        []Tool
-	SystemPrompt string
-	CreatedAt    time.Time
+	RunID         session.RunID
+	SessionID     session.ID
+	EpochID       session.EpochID
+	Config        config.Snapshot
+	Model         model.Resolved
+	Messages      []*einoschema.Message
+	providerState []model.ProviderMessageState
+	Tools         []Tool
+	SystemPrompt  string
+	CreatedAt     time.Time
 }
 
 // Tool describes one runtime-materialized tool available to a turn.

@@ -20,6 +20,13 @@ dependency is published as module version `v0.1.0` through repository tag
 `wasmext/gen/v0.1.0` at commit
 `f8a2784061bb9df52ccb0db3a431c5100a99b798`.
 
+Durable provider-private state is being prepared as the `v0.3.0` release
+candidate. That version is not a supported pin until the exact clean candidate
+passes `make check`, the remote annotated tag peels to it, and a fresh
+published-mode consumer compiles the state-aware public API without a
+`replace`, workspace, or vendor tree. This paragraph will be replaced with the
+verified tag target and date after publication.
+
 The previously missing response artifacts now exist in this inspected local
 agent workspace. They are stored outside this repository under
 `~/.agents/projects/*/responses/`, so a clean clone on another machine may not

@@ -153,6 +153,9 @@ const (
 	PartCompaction PartKind = "compaction"
 	// PartState stores app-visible state snapshots or patches.
 	PartState PartKind = "state"
+	// PartProviderState stores provider-private continuity data. Public history
+	// projection and replay surfaces always omit this kind.
+	PartProviderState PartKind = "provider_state"
 )
 
 // Part is an ordered, replayable fragment of a message. Payload is structured
@@ -259,7 +262,11 @@ type ReplayCursor struct {
 type ReplayBatch struct {
 	Messages []Message
 	Parts    []Part
-	Next     ReplayCursor
+	// PartOwnerMessageIDs contains the store-authoritative owner column for
+	// each parallel Parts entry. Stores that cannot supply a separate owner may
+	// leave it empty, in which case callers fall back to Part.MessageID.
+	PartOwnerMessageIDs []MessageID
+	Next                ReplayCursor
 }
 
 // EventID identifies a durable runtime event record.

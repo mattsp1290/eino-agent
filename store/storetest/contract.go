@@ -346,6 +346,15 @@ func Run(t *testing.T, factory Factory) {
 		msg1 := appendMessage(t, ctx, execution, message("msg-z", s.ID, r.ID, session.RoleUser))
 		msg2 := appendMessage(t, ctx, execution, message("msg-a", s.ID, r.ID, session.RoleAssistant))
 		appendPart(t, ctx, execution, part("prt-z", msg2.ID, s.ID, r.ID, 20))
+		stateBytes := json.RawMessage("{\n \"z\":2, \"a\":\"exact\"\n}")
+		statePayload, err := session.EncodeProviderStatePayload(session.ProviderStateEnvelope{CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model", CompatibilityKey: "compat", ItemIndex: 0, Data: stateBytes})
+		if err != nil {
+			t.Fatalf("encode provider state: %v", err)
+		}
+		statePart := part("prt-state", msg2.ID, s.ID, r.ID, 25)
+		statePart.Kind = session.PartProviderState
+		statePart.Payload = statePayload
+		appendPart(t, ctx, execution, statePart)
 		appendPart(t, ctx, execution, part("prt-m", msg1.ID, s.ID, r.ID, 10))
 		appendPart(t, ctx, execution, part("prt-a", msg2.ID, s.ID, r.ID, 30))
 		batch, err := subject.Store.ListMessages(ctx, s.ID, session.ReplayCursor{Limit: 10})
@@ -355,8 +364,12 @@ func Run(t *testing.T, factory Factory) {
 		if got := ids(batch.Messages); got != "msg-z,msg-a" {
 			t.Fatalf("message order = %s, want msg-z,msg-a", got)
 		}
-		if got := partIDs(batch.Parts); got != "prt-m,prt-z,prt-a" {
-			t.Fatalf("part order = %s, want prt-m,prt-z,prt-a", got)
+		if got := partIDs(batch.Parts); got != "prt-m,prt-z,prt-state,prt-a" {
+			t.Fatalf("part order = %s, want prt-m,prt-z,prt-state,prt-a", got)
+		}
+		decodedState, err := session.DecodeProviderStatePayload(batch.Parts[2].Payload)
+		if err != nil || !reflect.DeepEqual(decodedState.Data, stateBytes) {
+			t.Fatalf("provider state round trip = %q, %v; want %q", decodedState.Data, err, stateBytes)
 		}
 		first, err := subject.Store.ListMessages(ctx, s.ID, session.ReplayCursor{Limit: 1})
 		if err != nil {
@@ -372,8 +385,8 @@ func Run(t *testing.T, factory Factory) {
 		if got := partIDs(first.Parts); got != "prt-m" {
 			t.Fatalf("first page parts = %s, want prt-m", got)
 		}
-		if got := partIDs(second.Parts); got != "prt-z,prt-a" {
-			t.Fatalf("second page parts = %s, want prt-z,prt-a", got)
+		if got := partIDs(second.Parts); got != "prt-z,prt-state,prt-a" {
+			t.Fatalf("second page parts = %s, want prt-z,prt-state,prt-a", got)
 		}
 		other := createSession(t, ctx, subject.Store, "session-replay-other")
 		if _, err := subject.Store.ListMessages(ctx, other.ID, session.ReplayCursor{AfterMessageID: msg1.ID, Limit: 1}); !errors.Is(err, session.ErrNotFound) {

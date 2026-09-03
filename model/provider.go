@@ -33,9 +33,12 @@ type StreamDelta struct {
 type Request struct {
 	Identity Identity
 	Messages []*einoschema.Message
-	System   string
-	Tools    []*einoschema.ToolInfo
-	Options  map[string]string
+	// ProviderState is a private sidecar restored only by a state-aware adapter.
+	// It is deliberately excluded from provider-neutral message serialization.
+	ProviderState []ProviderMessageState
+	System        string
+	Tools         []*einoschema.ToolInfo
+	Options       map[string]string
 	// IdempotencyKey is assigned by a ledger-enabled runtime. It is not part of
 	// the model-visible audited projection. Adapters whose provider transport
 	// accepts an idempotency key may read it directly.
@@ -74,6 +77,7 @@ func (r Request) Clone() (Request, error) {
 	if err != nil {
 		return Request{}, err
 	}
+	next.ProviderState = cloneProviderState(r.ProviderState)
 	next.Tools, err = cloneToolInfos(r.Tools)
 	if err != nil {
 		return Request{}, err

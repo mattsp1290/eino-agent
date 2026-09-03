@@ -366,8 +366,18 @@ func validateBoundedTurnMetadataInput(original, candidate BoundedTurnMetadata) e
 }
 
 func materializeContextAssembly(value contextAssembly) ([]*einoschema.Message, error) {
+	materialized, err := materializeContextAssemblyWithMapping(value)
+	return materialized.Messages, err
+}
+
+type materializedContext struct {
+	Messages    []*einoschema.Message
+	BaseToFinal []int
+}
+
+func materializeContextAssemblyWithMapping(value contextAssembly) (materializedContext, error) {
 	if err := validateContextAssembly(value); err != nil {
-		return nil, err
+		return materializedContext{}, err
 	}
 	contributions := append([]contextContribution(nil), value.Contributions...)
 	sort.Slice(contributions, func(i, j int) bool {
@@ -381,7 +391,7 @@ func materializeContextAssembly(value contextAssembly) ([]*einoschema.Message, e
 	for _, contribution := range contributions {
 		message, err := cloneMessageDeep(contribution.Message)
 		if err != nil {
-			return nil, err
+			return materializedContext{}, err
 		}
 		if message.Role == einoschema.System {
 			prelude = append(prelude, message)
@@ -391,11 +401,15 @@ func materializeContextAssembly(value contextAssembly) ([]*einoschema.Message, e
 	}
 	base, err := cloneProtectedMessages(value.Base)
 	if err != nil {
-		return nil, err
+		return materializedContext{}, err
 	}
 	messages := make([]*einoschema.Message, 0, len(prelude)+len(base)+len(suffix))
 	messages = append(messages, prelude...)
 	messages = append(messages, base...)
 	messages = append(messages, suffix...)
-	return messages, nil
+	mapping := make([]int, len(base))
+	for index := range base {
+		mapping[index] = len(prelude) + index
+	}
+	return materializedContext{Messages: messages, BaseToFinal: mapping}, nil
 }

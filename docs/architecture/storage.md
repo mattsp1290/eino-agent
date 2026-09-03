@@ -228,3 +228,28 @@ journaling for provider responses or tool execution.
 Every backend should run the contract suite in its own package and add
 backend-specific tests for ID generation, migrations, persistence across
 process restart, and database-level isolation.
+
+## Provider-State Parts
+
+`session.PartProviderState` stores one provider-private continuation item next
+to its owning assistant message without changing the SQLite schema. Its
+canonical payload contains `codec_id`, positive `version`, `provider_id`,
+`source_model_id`, `compatibility_key`, zero-based `item_index`, and
+`data_base64`. Standard padded base64 wraps the exact raw JSON object bytes;
+decode rejects unknown, duplicate, missing, reordered, non-canonical, or
+trailing fields and non-canonical base64.
+
+The outer part remains authoritative for message, session, run, ordinal, and
+timestamps. Stateful admission compares those embedded records with the store
+query's authoritative session and SQLite owner column before restore. Items
+must be contiguous and strictly ordered. The hard ceilings are 64 items, 10
+MiB per raw item, 16 MiB raw per message, 13,985,112 serialized bytes per
+envelope, and 22,632,024 serialized bytes per owning message; codecs may only
+tighten them.
+
+Assistant text, reasoning, provider-state parts, and tool-call proposals commit
+inside one existing run-fenced transaction. There is no new table, DDL version,
+or migration. Normal `history.Project`/`Load` never decode or return provider
+state. Raw store access can see it and is therefore an operator/security
+boundary subject to host encryption, authorization, retention, backup, and
+deletion policy.

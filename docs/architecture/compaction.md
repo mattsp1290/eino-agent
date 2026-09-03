@@ -22,3 +22,17 @@ operation as sequential store writes.
 
 This gives embedders a small durable boundary they can build on without adding
 automatic summarization or token-budget policy in the runtime yet.
+
+## Provider-Private State
+
+Compaction never copies `provider_state` parts into a summary. State attached
+to a summarized-away assistant remains stored for the same retention period as
+its owner but is not parsed or restored from the active epoch. A retained-tail
+assistant keeps its state active because its message and parts remain in the
+projected tail. Malformed inactive state does not break the active request;
+malformed active state fails before provider dispatch.
+
+Changing to an incompatible provider/model requires a new session or an
+explicit epoch whose active context contains no incompatible state-bearing
+message. Provider ID, codec ID/version, and compatibility key must match; state
+is never silently discarded or migrated.

@@ -39,6 +39,13 @@ func TestMaterializeContextAssemblyUsesSystemPreludeAndUserSuffix(t *testing.T) 
 	if contributions[0].Source != "user-b" || base[0].Content != "base-user" {
 		t.Fatal("materialization mutated input ordering or base history")
 	}
+	mapped, err := materializeContextAssemblyWithMapping(contextAssembly{Base: base, Contributions: contributions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(mapped.BaseToFinal, []int{2, 3, 4}) || mapped.Messages[mapped.BaseToFinal[1]].Role != einoschema.Assistant {
+		t.Fatalf("base-to-final mapping = %#v", mapped)
+	}
 }
 
 func TestContextContributionRejectsNonTextSystemOrUserMessages(t *testing.T) {

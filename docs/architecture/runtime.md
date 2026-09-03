@@ -83,6 +83,21 @@ The runtime treats a run as durable before it is executable.
 8. Runtime finishes the run as completed, failed, or interrupted before
    releasing the session lock.
 
+
+For a state-aware adapter, the completed assistant response is captured before
+tool preparation. Runtime removes only codec-owned top-level `Extra`, validates
+the raw objects, and appends one ordered `provider_state` part per object in the
+same run-fenced transaction as text, reasoning, and tool-call facts. A capture,
+validation, or append failure rolls back the entire assistant turn, fails the
+run, executes no tool, and sends no follow-up model request.
+
+Admission loads the active epoch through a source-aware but state-free history
+projection. It binds private parts to their durable assistant source IDs,
+cross-checks the authoritative session plus part/message/run/envelope identity,
+and carries immutable sidecars beside `TurnSnapshot.Messages`. Context sources
+receive only bounded metadata; after their system preludes and user suffixes
+are assembled, runtime rebinds sidecar indexes through an explicit
+base-to-final map. Ledgers and extensions therefore see only clean messages.
 This avoids conflating a live Eino stream with the durable conversation. A
 client can disconnect from AG-UI SSE without changing the authoritative run
 state.

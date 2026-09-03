@@ -23,12 +23,22 @@ type Options struct {
 // Project converts durable session messages and parts into provider messages.
 // It never reads runtime events, so live-only deltas are excluded by design.
 func Project(batch session.ReplayBatch, options Options) ([]*einoschema.Message, error) {
+	projection, err := ProjectWithSources(batch, options)
+	if err != nil {
+		return nil, err
+	}
+	return projection.Messages, nil
+}
+
+// ProjectWithSources projects state-free messages while retaining the durable
+// source ID for each output message.
+func ProjectWithSources(batch session.ReplayBatch, options Options) (Projection, error) {
 	batch = applyEpoch(batch, options.Epoch)
 	partsByMessage := map[session.MessageID][]session.Part{}
 	for _, part := range batch.Parts {
 		partsByMessage[part.MessageID] = append(partsByMessage[part.MessageID], part)
 	}
-	result := make([]*einoschema.Message, 0, len(batch.Messages))
+	result := Projection{Messages: make([]*einoschema.Message, 0, len(batch.Messages)), SourceMessageIDs: make([]session.MessageID, 0, len(batch.Messages))}
 	for _, message := range batch.Messages {
 		parts := partsByMessage[message.ID]
 		sort.SliceStable(parts, func(i, j int) bool {
@@ -36,31 +46,23 @@ func Project(batch session.ReplayBatch, options Options) ([]*einoschema.Message,
 		})
 		projected, err := projectMessage(message, parts, options)
 		if err != nil {
-			return nil, err
+			return Projection{}, err
 		}
-		result = append(result, projected...)
+		result.Messages = append(result.Messages, projected...)
+		for range projected {
+			result.SourceMessageIDs = append(result.SourceMessageIDs, message.ID)
+		}
 	}
 	return result, nil
 }
 
 // Load reads all replayable history for a session and projects it.
 func Load(ctx context.Context, store session.Store, sessionID session.ID, options Options) ([]*einoschema.Message, error) {
-	cursor := session.ReplayCursor{Limit: 100}
-	var messages []session.Message
-	var parts []session.Part
-	for {
-		batch, err := store.ListMessages(ctx, sessionID, cursor)
-		if err != nil {
-			return nil, err
-		}
-		messages = append(messages, batch.Messages...)
-		parts = append(parts, batch.Parts...)
-		if batch.Next == (session.ReplayCursor{}) {
-			break
-		}
-		cursor = batch.Next
+	batch, err := LoadBatch(ctx, store, sessionID)
+	if err != nil {
+		return nil, err
 	}
-	return Project(session.ReplayBatch{Messages: messages, Parts: parts}, options)
+	return Project(batch, options)
 }
 
 func projectMessage(message session.Message, parts []session.Part, options Options) ([]*einoschema.Message, error) {
@@ -146,13 +148,20 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) session.
 		}
 	}
 	parts := make([]session.Part, 0, len(batch.Parts))
-	for _, part := range batch.Parts {
-		if include[part.MessageID] {
+	owners := make([]session.MessageID, 0, len(batch.Parts))
+	for index, part := range batch.Parts {
+		owner := part.MessageID
+		if len(batch.PartOwnerMessageIDs) == len(batch.Parts) {
+			owner = batch.PartOwnerMessageIDs[index]
+		}
+		if include[owner] {
 			parts = append(parts, part)
+			owners = append(owners, owner)
 		}
 	}
 	batch.Messages = messages
 	batch.Parts = parts
+	batch.PartOwnerMessageIDs = owners
 	return batch
 }
 

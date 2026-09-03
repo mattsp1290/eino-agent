@@ -111,14 +111,14 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	historyMessages, err := LoadHistory(ctx, store, sessionRecord.ID, request.History)
+	historyMessages, providerState, err := loadProviderHistory(ctx, store, sessionRecord, request.History, request.Model)
 	if err != nil {
 		return admittedRun{}, err
 	}
 	providerMessages := make([]*einoschema.Message, 0, len(historyMessages)+1)
 	providerMessages = append(providerMessages, historyMessages...)
 	providerMessages = append(providerMessages, einoschema.UserMessage(request.UserMessage.Content))
-	snapshot, err := FreezeTurnSnapshot(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, request.Config.Agent.SystemPrompt, now)
+	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
 	}

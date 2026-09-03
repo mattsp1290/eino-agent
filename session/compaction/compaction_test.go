@@ -31,11 +31,13 @@ func TestBoundaryProjectsSummaryWithoutRawPromptLeak(t *testing.T) {
 	projected, err := history.Project(session.ReplayBatch{
 		Messages: []session.Message{
 			message("old", session.RoleUser, now),
+			message("old-assistant", session.RoleAssistant, now.Add(time.Nanosecond)),
 			boundary.Message,
 			message("tail", session.RoleUser, now.Add(time.Second)),
 		},
 		Parts: []session.Part{
 			part("old-part", "old", session.PartText, `{"text":"SECRET raw prompt"}`, now),
+			part("old-provider-state", "old-assistant", session.PartProviderState, `{"data":"SECRET provider state"}`, now.Add(time.Nanosecond)),
 			boundary.Part,
 			part("tail-part", "tail", session.PartText, `{"text":"Continue"}`, now.Add(time.Second)),
 		},
@@ -53,8 +55,8 @@ func TestBoundaryProjectsSummaryWithoutRawPromptLeak(t *testing.T) {
 		t.Fatalf("summary message = %#v", projected[0])
 	}
 	joined := projected[0].Content + projected[1].Content
-	if strings.Contains(joined, "SECRET raw prompt") {
-		t.Fatalf("projected compacted raw prompt: %q", joined)
+	if strings.Contains(joined, "SECRET raw prompt") || strings.Contains(joined, "SECRET provider state") {
+		t.Fatalf("projected compacted private content: %q", joined)
 	}
 }
 

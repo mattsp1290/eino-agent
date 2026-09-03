@@ -37,6 +37,7 @@ Default policy:
 - no attachment bytes, paths, URLs, or extracted media content;
 - no reasoning content;
 - no encrypted reasoning;
+- no provider-private state, base64 representation, content-derived digest, or raw codec/decoder error;
 - no compaction summary content;
 - no state snapshot payloads;
 - no AG-UI custom event payloads;
@@ -107,6 +108,7 @@ Never export these by default:
 - attachment bytes, attachment URLs, file paths, image/PDF/media contents;
 - reasoning text;
 - encrypted reasoning;
+- provider-private state bytes, base64, content-derived digests, and raw restore errors;
 - compaction summary text;
 - state snapshot payloads;
 - AG-UI custom event payloads;
@@ -136,6 +138,8 @@ prompt text, raw output text, raw tool payloads, attachments, reasoning,
 encrypted reasoning, secrets, or compaction summaries. `MaxSummaryBytes` must be
 positive and small enough for Datadog attribute limits before summaries are
 enabled.
+
+Provider-private state is never eligible for opt-in summaries.
 
 ## Tags and Attributes
 
