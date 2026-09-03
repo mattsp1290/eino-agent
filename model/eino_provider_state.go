@@ -28,11 +28,11 @@ func NewEinoJSONExtraStateCodec(config EinoJSONExtraStateConfig) (ProviderStateC
 	if err := ValidateProviderStateContract(config.Contract); err != nil {
 		return nil, err
 	}
-	return &einoJSONExtraStateCodec{extraKey: config.ExtraKey, contract: cloneProviderStateContract(config.Contract)}, nil
+	return &einoJSONExtraStateCodec{extraKey: config.ExtraKey, contract: config.Contract}, nil
 }
 
 func (c *einoJSONExtraStateCodec) Contract() ProviderStateContract {
-	return cloneProviderStateContract(c.contract)
+	return c.contract
 }
 
 func (c *einoJSONExtraStateCodec) OwnedExtraKeys() []string {
@@ -172,57 +172,50 @@ func requireProviderNeutralMessageUnchanged(before *einoschema.Message, current 
 	return nil
 }
 
-func validateOwnedKeys(keys []string) (map[string]struct{}, []string, error) {
+func validateOwnedKeys(keys []string) (map[string]struct{}, error) {
 	if len(keys) == 0 {
-		return nil, nil, providerStateError(ErrProviderStateInvalid)
+		return nil, providerStateError(ErrProviderStateInvalid)
 	}
 	owned := make(map[string]struct{}, len(keys))
-	copyKeys := make([]string, len(keys))
-	for i, key := range keys {
+	for _, key := range keys {
 		if key == "" || len(key) > MaxProviderStateExtraKeyBytes || !utf8.ValidString(key) {
-			return nil, nil, providerStateError(ErrProviderStateInvalid)
+			return nil, providerStateError(ErrProviderStateInvalid)
 		}
 		if _, duplicate := owned[key]; duplicate {
-			return nil, nil, providerStateError(ErrProviderStateInvalid)
+			return nil, providerStateError(ErrProviderStateInvalid)
 		}
 		owned[key] = struct{}{}
-		copyKeys[i] = key
 	}
-	return owned, copyKeys, nil
+	return owned, nil
 }
 
-func snapshotProviderStateCodec(codec ProviderStateCodec) (contract ProviderStateContract, owned map[string]struct{}, ownedKeys []string, err error) {
+func snapshotProviderStateCodec(codec ProviderStateCodec) (contract ProviderStateContract, owned map[string]struct{}, err error) {
 	defer func() {
 		if recover() != nil {
 			contract = ProviderStateContract{}
-			owned, ownedKeys = nil, nil
+			owned = nil
 			err = providerStateError(ErrProviderStateInvalid)
 		}
 	}()
 	contract = codec.Contract()
 	if err = ValidateProviderStateContract(contract); err != nil {
-		return ProviderStateContract{}, nil, nil, err
+		return ProviderStateContract{}, nil, err
 	}
-	owned, ownedKeys, err = validateOwnedKeys(codec.OwnedExtraKeys())
-	return contract, owned, ownedKeys, err
+	owned, err = validateOwnedKeys(codec.OwnedExtraKeys())
+	return contract, owned, err
 }
 
 func providerStateErrorFrom(err error) error {
 	switch {
 	case err == nil:
 		return nil
-	case errorsIs(err, ErrProviderStateTooLarge):
+	case errors.Is(err, ErrProviderStateTooLarge):
 		return providerStateError(ErrProviderStateTooLarge)
-	case errorsIs(err, ErrProviderStateMismatch):
+	case errors.Is(err, ErrProviderStateMismatch):
 		return providerStateError(ErrProviderStateMismatch)
-	case errorsIs(err, ErrProviderStateVersion):
+	case errors.Is(err, ErrProviderStateVersion):
 		return providerStateError(ErrProviderStateVersion)
 	default:
 		return providerStateError(ErrProviderStateInvalid)
 	}
-}
-
-// errorsIs is kept local so codec failures are always collapsed to fixed text.
-func errorsIs(err, target error) bool {
-	return errors.Is(err, target)
 }

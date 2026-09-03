@@ -209,10 +209,6 @@ func (s *panicRuntimeProviderStateStreamer) ProviderStateContract() model.Provid
 	return s.contract
 }
 
-func (s *panicRuntimeProviderStateStreamer) ProviderStateOwnedExtraKeys() []string {
-	return []string{providerStateExtraKey}
-}
-
 func (s *panicRuntimeProviderStateStreamer) CaptureProviderState(*einoschema.Message) (model.ProviderStateCapture, error) {
 	if s.panicCapture {
 		panic("STATE_SENTINEL")

@@ -305,6 +305,22 @@ func TestLoadBatchRejectsNonParallelPartOwnerMetadata(t *testing.T) {
 	}
 }
 
+func TestProjectRejectsNonParallelPartOwnersWhenApplyingEpoch(t *testing.T) {
+	t.Parallel()
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("assistant", session.RoleAssistant)},
+		Parts: []session.Part{
+			part("first", "assistant", session.PartText, 0, `{"text":"one"}`),
+			part("second", "assistant", session.PartText, 1, `{"text":"two"}`),
+		},
+		PartOwnerMessageIDs: []session.MessageID{"assistant"},
+	}
+	_, err := Project(batch, Options{Epoch: &session.ContextEpoch{TailStartID: "assistant"}})
+	if !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("Project error = %v, want ErrConflict", err)
+	}
+}
+
 func TestProjectRejectsMalformedIncludedPayload(t *testing.T) {
 	t.Parallel()
 

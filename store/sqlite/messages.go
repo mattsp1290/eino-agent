@@ -68,50 +68,19 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 	args := []any{sessionID}
 	where := "session_id = ?"
 	if cursor.AfterMessageID != "" {
-		var authoritativeID, authoritativeSessionID, authoritativeRunID, authoritativeRole, authoritativeCreatedAt string
-		var raw []byte
-		err := s.queryRow(ctx, `SELECT id, session_id, run_id, role, created_at, record FROM messages WHERE id = ? AND session_id = ?`, cursor.AfterMessageID, sessionID).
-			Scan(&authoritativeID, &authoritativeSessionID, &authoritativeRunID, &authoritativeRole, &authoritativeCreatedAt, &raw)
+		after, err := scanAuthoritativeMessage(s.queryRow(ctx, `SELECT id, session_id, run_id, role, created_at, record FROM messages WHERE id = ? AND session_id = ?`, cursor.AfterMessageID, sessionID))
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return session.ReplayBatch{}, session.ErrNotFound
 			}
 			return session.ReplayBatch{}, err
 		}
-		after, err := decodeAuthoritativeMessage(authoritativeID, authoritativeSessionID, authoritativeRunID, authoritativeRole, authoritativeCreatedAt, raw)
-		if err != nil {
-			return session.ReplayBatch{}, err
-		}
 		where += " AND (created_at > ? OR (created_at = ? AND id > ?))"
 		args = append(args, timeText(after.CreatedAt), timeText(after.CreatedAt), cursor.AfterMessageID)
 	}
 	args = append(args, limit+1)
-	messageRows, err := s.query(ctx, `SELECT id, session_id, run_id, role, created_at, record FROM messages WHERE `+where+` ORDER BY created_at, id LIMIT ?`, args...)
+	messages, messageIDs, err := s.loadReplayMessages(ctx, where, args...)
 	if err != nil {
-		return session.ReplayBatch{}, err
-	}
-	var messages []session.Message
-	var messageIDs []session.MessageID
-	for messageRows.Next() {
-		var authoritativeID, authoritativeSessionID, authoritativeRunID, authoritativeRole, authoritativeCreatedAt string
-		var raw []byte
-		if err := messageRows.Scan(&authoritativeID, &authoritativeSessionID, &authoritativeRunID, &authoritativeRole, &authoritativeCreatedAt, &raw); err != nil {
-			_ = messageRows.Close()
-			return session.ReplayBatch{}, err
-		}
-		message, err := decodeAuthoritativeMessage(authoritativeID, authoritativeSessionID, authoritativeRunID, authoritativeRole, authoritativeCreatedAt, raw)
-		if err != nil {
-			_ = messageRows.Close()
-			return session.ReplayBatch{}, err
-		}
-		messages = append(messages, message)
-		messageIDs = append(messageIDs, session.MessageID(authoritativeID))
-	}
-	if err := messageRows.Err(); err != nil {
-		_ = messageRows.Close()
-		return session.ReplayBatch{}, err
-	}
-	if err := messageRows.Close(); err != nil {
 		return session.ReplayBatch{}, err
 	}
 	next := session.ReplayCursor{}
@@ -123,18 +92,45 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 	if len(messages) == 0 {
 		return session.ReplayBatch{Messages: messages, Next: next}, nil
 	}
-	placeholders := make([]string, len(messages))
-	partArgs := make([]any, len(messages))
+	parts, owners, err := s.loadReplayParts(ctx, messageIDs)
+	if err != nil {
+		return session.ReplayBatch{}, err
+	}
+	return session.ReplayBatch{Messages: messages, Parts: parts, PartOwnerMessageIDs: owners, Next: next}, nil
+}
+
+func (s *Store) loadReplayMessages(ctx context.Context, where string, args ...any) ([]session.Message, []session.MessageID, error) {
+	rows, err := s.query(ctx, `SELECT id, session_id, run_id, role, created_at, record FROM messages WHERE `+where+` ORDER BY created_at, id LIMIT ?`, args...)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var messages []session.Message
+	var messageIDs []session.MessageID
+	for rows.Next() {
+		message, err := scanAuthoritativeMessage(rows)
+		if err != nil {
+			return nil, nil, err
+		}
+		messages = append(messages, message)
+		messageIDs = append(messageIDs, message.ID)
+	}
+	return messages, messageIDs, rows.Err()
+}
+
+func (s *Store) loadReplayParts(ctx context.Context, messageIDs []session.MessageID) ([]session.Part, []session.MessageID, error) {
+	placeholders := make([]string, len(messageIDs))
+	args := make([]any, len(messageIDs))
 	for index, messageID := range messageIDs {
 		placeholders[index] = "?"
-		partArgs[index] = messageID
+		args[index] = messageID
 	}
 	rows, err := s.query(ctx, `WITH page(id, created_at) AS (
 		SELECT id, created_at FROM messages WHERE id IN (`+strings.Join(placeholders, ",")+`)
 	) SELECT p.id, p.message_id, p.session_id, p.run_id, p.ordinal, p.record FROM page JOIN parts p ON p.message_id = page.id
-	ORDER BY page.created_at, page.id, p.ordinal, p.id`, partArgs...)
+	ORDER BY page.created_at, page.id, p.ordinal, p.id`, args...)
 	if err != nil {
-		return session.ReplayBatch{}, err
+		return nil, nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var parts []session.Part
@@ -142,24 +138,14 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 	stateCounts := make(map[session.MessageID]int)
 	stateBytes := make(map[session.MessageID]int)
 	for rows.Next() {
-		var authoritativeID, authoritativeMessageID, authoritativeSessionID, authoritativeRunID string
-		var authoritativeOrdinal int64
-		var raw []byte
-		if err := rows.Scan(&authoritativeID, &authoritativeMessageID, &authoritativeSessionID, &authoritativeRunID, &authoritativeOrdinal, &raw); err != nil {
-			return session.ReplayBatch{}, err
+		part, owner, err := scanAuthoritativePart(rows)
+		if err != nil {
+			return nil, nil, err
 		}
-		var part session.Part
-		if err := json.Unmarshal(raw, &part); err != nil ||
-			part.ID != session.PartID(authoritativeID) || part.MessageID != session.MessageID(authoritativeMessageID) ||
-			part.SessionID != session.ID(authoritativeSessionID) || part.RunID != session.RunID(authoritativeRunID) ||
-			part.Ordinal != authoritativeOrdinal {
-			return session.ReplayBatch{}, session.ErrConflict
-		}
-		owner := session.MessageID(authoritativeMessageID)
 		if part.Kind == session.PartProviderState {
 			if stateCounts[owner] >= session.ProviderStateHardMaxItems ||
 				len(part.Payload) > session.ProviderStateHardMaxStoredMessageBytes-stateBytes[owner] {
-				return session.ReplayBatch{}, session.ErrConflict
+				return nil, nil, session.ErrConflict
 			}
 			stateCounts[owner]++
 			stateBytes[owner] += len(part.Payload)
@@ -167,10 +153,16 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 		parts = append(parts, part)
 		owners = append(owners, owner)
 	}
-	if err := rows.Err(); err != nil {
-		return session.ReplayBatch{}, err
+	return parts, owners, rows.Err()
+}
+
+func scanAuthoritativeMessage(row rowScanner) (session.Message, error) {
+	var id, sessionID, runID, role, createdAt string
+	var raw []byte
+	if err := row.Scan(&id, &sessionID, &runID, &role, &createdAt, &raw); err != nil {
+		return session.Message{}, err
 	}
-	return session.ReplayBatch{Messages: messages, Parts: parts, PartOwnerMessageIDs: owners, Next: next}, nil
+	return decodeAuthoritativeMessage(id, sessionID, runID, role, createdAt, raw)
 }
 
 func decodeAuthoritativeMessage(id, sessionID, runID, role, createdAt string, raw []byte) (session.Message, error) {
@@ -182,6 +174,22 @@ func decodeAuthoritativeMessage(id, sessionID, runID, role, createdAt string, ra
 		return session.Message{}, session.ErrConflict
 	}
 	return message, nil
+}
+
+func scanAuthoritativePart(row rowScanner) (session.Part, session.MessageID, error) {
+	var id, messageID, sessionID, runID string
+	var ordinal int64
+	var raw []byte
+	if err := row.Scan(&id, &messageID, &sessionID, &runID, &ordinal, &raw); err != nil {
+		return session.Part{}, "", err
+	}
+	var part session.Part
+	if err := json.Unmarshal(raw, &part); err != nil ||
+		part.ID != session.PartID(id) || part.MessageID != session.MessageID(messageID) ||
+		part.SessionID != session.ID(sessionID) || part.RunID != session.RunID(runID) || part.Ordinal != ordinal {
+		return session.Part{}, "", session.ErrConflict
+	}
+	return part, session.MessageID(messageID), nil
 }
 
 func (s *Store) GetMessage(ctx context.Context, id session.MessageID) (session.Message, error) {

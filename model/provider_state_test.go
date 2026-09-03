@@ -107,7 +107,7 @@ func TestEinoJSONExtraStateCodecPreservesBytesAndRejectsShape(t *testing.T) {
 	raw := []json.RawMessage{json.RawMessage(`{"encrypted":"SENTINEL", "n":1}`), json.RawMessage("{\n  \"n\": 2, \"encrypted\":\"other\"\n}"), json.RawMessage(`{"n":1e400}`)}
 	message := einoschema.AssistantMessage("done", nil)
 	message.Extra = map[string]any{"openaicodex:reasoning_items": raw}
-	stateful := &einoProviderStateStreamer{codec: codec, contract: codec.Contract(), owned: map[string]struct{}{"openaicodex:reasoning_items": {}}, ownedKeys: codec.OwnedExtraKeys()}
+	stateful := &einoProviderStateStreamer{codec: codec, contract: codec.Contract(), owned: map[string]struct{}{"openaicodex:reasoning_items": {}}}
 	capture, err := stateful.CaptureProviderState(message)
 	if err != nil {
 		t.Fatal(err)

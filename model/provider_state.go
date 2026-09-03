@@ -88,7 +88,6 @@ type ProviderStateCodec interface {
 type ProviderStateStreamer interface {
 	Streamer
 	ProviderStateContract() ProviderStateContract
-	ProviderStateOwnedExtraKeys() []string
 	CaptureProviderState(*einoschema.Message) (ProviderStateCapture, error)
 }
 
@@ -173,10 +172,6 @@ func cloneProviderStateItems(src []ProviderStateItem) []ProviderStateItem {
 		dst[i].Data = append(json.RawMessage(nil), src[i].Data...)
 	}
 	return dst
-}
-
-func cloneProviderStateContract(contract ProviderStateContract) ProviderStateContract {
-	return contract
 }
 
 func providerStateError(kind error) error {

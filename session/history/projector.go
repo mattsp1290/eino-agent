@@ -33,7 +33,11 @@ func Project(batch session.ReplayBatch, options Options) ([]*einoschema.Message,
 // ProjectWithSources projects state-free messages while retaining the durable
 // source ID for each output message.
 func ProjectWithSources(batch session.ReplayBatch, options Options) (Projection, error) {
-	batch = applyEpoch(batch, options.Epoch)
+	var err error
+	batch, err = applyEpoch(batch, options.Epoch)
+	if err != nil {
+		return Projection{}, err
+	}
 	partsByMessage := map[session.MessageID][]session.Part{}
 	for _, part := range batch.Parts {
 		partsByMessage[part.MessageID] = append(partsByMessage[part.MessageID], part)
@@ -118,12 +122,16 @@ func projectToolResults(parts []session.Part) ([]*einoschema.Message, error) {
 	return result, nil
 }
 
-func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) session.ReplayBatch {
+func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session.ReplayBatch, error) {
 	if epoch == nil {
-		return batch
+		return batch, nil
 	}
 	if epoch.SummaryMessageID == "" && epoch.TailStartID == "" {
-		return batch
+		return batch, nil
+	}
+	partOwners, err := session.ResolveReplayPartOwners(batch.Parts, batch.PartOwnerMessageIDs)
+	if err != nil {
+		return session.ReplayBatch{}, err
 	}
 	include := map[session.MessageID]bool{}
 	byID := map[session.MessageID]session.Message{}
@@ -150,10 +158,7 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) session.
 	parts := make([]session.Part, 0, len(batch.Parts))
 	owners := make([]session.MessageID, 0, len(batch.Parts))
 	for index, part := range batch.Parts {
-		owner := part.MessageID
-		if len(batch.PartOwnerMessageIDs) == len(batch.Parts) {
-			owner = batch.PartOwnerMessageIDs[index]
-		}
+		owner := partOwners[index]
 		if include[owner] {
 			parts = append(parts, part)
 			owners = append(owners, owner)
@@ -162,7 +167,7 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) session.
 	batch.Messages = messages
 	batch.Parts = parts
 	batch.PartOwnerMessageIDs = owners
-	return batch
+	return batch, nil
 }
 
 func textContent(parts []session.Part, options Options) (string, error) {

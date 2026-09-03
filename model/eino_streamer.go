@@ -35,11 +35,10 @@ func (s *einoStreamer) StreamProvider(ctx context.Context, request Request) (*ei
 }
 
 type einoProviderStateStreamer struct {
-	client    einomodel.ToolCallingChatModel
-	codec     ProviderStateCodec
-	contract  ProviderStateContract
-	owned     map[string]struct{}
-	ownedKeys []string
+	client   einomodel.ToolCallingChatModel
+	codec    ProviderStateCodec
+	contract ProviderStateContract
+	owned    map[string]struct{}
 }
 
 // NewEinoStreamerWithProviderState adapts an Eino model with one immutable
@@ -48,19 +47,15 @@ func NewEinoStreamerWithProviderState(client einomodel.ToolCallingChatModel, cod
 	if client == nil || codec == nil {
 		return nil, providerStateError(ErrProviderStateInvalid)
 	}
-	contract, owned, ownedKeys, err := snapshotProviderStateCodec(codec)
+	contract, owned, err := snapshotProviderStateCodec(codec)
 	if err != nil {
 		return nil, err
 	}
-	return &einoProviderStateStreamer{client: client, codec: codec, contract: cloneProviderStateContract(contract), owned: owned, ownedKeys: ownedKeys}, nil
+	return &einoProviderStateStreamer{client: client, codec: codec, contract: contract, owned: owned}, nil
 }
 
 func (s *einoProviderStateStreamer) ProviderStateContract() ProviderStateContract {
-	return cloneProviderStateContract(s.contract)
-}
-
-func (s *einoProviderStateStreamer) ProviderStateOwnedExtraKeys() []string {
-	return append([]string(nil), s.ownedKeys...)
+	return s.contract
 }
 
 func (s *einoProviderStateStreamer) CaptureProviderState(message *einoschema.Message) (ProviderStateCapture, error) {
