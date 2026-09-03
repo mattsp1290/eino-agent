@@ -1,7 +1,7 @@
 # Dependency Status
 
 Date: 2026-06-27
-Last updated: 2026-08-31
+Last updated: 2026-09-02
 
 This note records the prerequisite state for `eino-agent` before runtime
 implementation starts. The exact pins below are the initial baseline. Do not
@@ -14,18 +14,16 @@ No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
 
-The supported root pin is `v0.2.0` at commit
-`71f4e85b0a9cd8c5ad9472313a12e8f3eeb89047`. Its generated-bindings
+The supported root pin is `v0.3.0` at commit
+`62b243dc99ff7b0d698507b428b474c1861e8712`. Its generated-bindings
 dependency is published as module version `v0.1.0` through repository tag
 `wasmext/gen/v0.1.0` at commit
 `f8a2784061bb9df52ccb0db3a431c5100a99b798`.
 
-Durable provider-private state is being prepared as the `v0.3.0` release
-candidate. That version is not a supported pin until the exact clean candidate
-passes `make check`, the remote annotated tag peels to it, and a fresh
-published-mode consumer compiles the state-aware public API without a
-`replace`, workspace, or vendor tree. This paragraph will be replaced with the
-verified tag target and date after publication.
+Durable provider-private state is supported by `v0.3.0`. On 2026-09-02, the
+exact clean tag target passed `make check`, the remote annotated tag peeled to
+that commit, and a fresh published-mode consumer compiled the state-aware
+public API without a `replace`, workspace, vendor tree, or checkout access.
 
 The previously missing response artifacts now exist in this inspected local
 agent workspace. They are stored outside this repository under
@@ -55,7 +53,7 @@ status.
 | `github.com/mattsp1290/eino-tools` | commit `63a3c99272c2359e24484698f2bd62e6fac849b6`, pseudo-version `v0.1.1-0.20260825160656-63a3c99272c2` | `~/git/eino-tools`, completed catalog commits `cc35e50` and `63a3c99`, and `.agents/requests/eino-agent-composition-tool-registration/` |
 | `github.com/mattsp1290/eino-obs` | commit `a9a6f8bb478b479c1e48ab353261a60c4a19195a` | `~/git/eino-obs`, `README.md`, root/exporter/fake/exporter/datadog packages |
 | `github.com/mattsp1290/ensemble` | commit `a709ad8ed2e9d8962b73b228859433cc6554ee2c` for current discovery only | `~/git/ensemble`, `eino-agui/docs/decisions/0002-ensemble-shared-surface.md` |
-| `github.com/mattsp1290/eino-agent` | version `v0.2.0`, commit `71f4e85b0a9cd8c5ad9472313a12e8f3eeb89047` | `make check` on the exact commit plus a fresh published-mode consumer using Go 1.26.3, `proxy.golang.org`, and `sum.golang.org`. |
+| `github.com/mattsp1290/eino-agent` | version `v0.3.0`, commit `62b243dc99ff7b0d698507b428b474c1861e8712` | `make check` on the exact clean commit plus a fresh published-mode consumer using Go 1.26.3, `proxy.golang.org`, and `sum.golang.org`, with no `replace`, workspace, vendor tree, or checkout access. |
 | `github.com/mattsp1290/eino-agent/wasmext/gen` | version `v0.1.0`, tag `wasmext/gen/v0.1.0`, commit `f8a2784061bb9df52ccb0db3a431c5100a99b798` | Fresh-cache standard-proxy download plus the local and published external-consumer gates; no consumer replacement is required. |
 
 Version floors and shared dependency pins:
@@ -96,15 +94,17 @@ replacement is ignored. Published mode adds no replacement and rejects
 nonstandard proxy, checksum, private-module, `GOFLAGS`, workspace, vendor, or
 checkout selection.
 
-Post-tag validation performed on 2026-08-31:
+Post-tag validation performed on 2026-09-02:
 
 - `make check` passed on exact commit
-  `71f4e85b0a9cd8c5ad9472313a12e8f3eeb89047`.
-- Remote annotated tag `v0.2.0` peeled to that exact commit.
-- `EINO_AGENT_CONSUMER_VERSION=v0.2.0 testdata/external-consumer/check.sh`
+  `62b243dc99ff7b0d698507b428b474c1861e8712`.
+- Remote annotated tag `v0.3.0` peeled to that exact commit.
+- `EINO_AGENT_CONSUMER_VERSION=v0.3.0 testdata/external-consumer/check.sh`
   passed from a fresh published-mode consumer with Go 1.26.3,
   `GOPROXY=https://proxy.golang.org,direct`, `GOSUMDB=sum.golang.org`, and
-  empty `GOFLAGS`, `GOPRIVATE`, `GONOSUMDB`, and `GONOPROXY`.
+  empty `GOFLAGS`, `GOPRIVATE`, `GONOSUMDB`, and `GONOPROXY`; it reported
+  `github.com/mattsp1290/eino-agent v0.3.0`, `replacement=false`, and
+  `external-consumer: published verification passed`.
 
 Validation performed locally on 2026-06-27:
 
