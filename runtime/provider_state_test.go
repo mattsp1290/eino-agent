@@ -148,6 +148,78 @@ func TestLoadProviderHistoryIgnoresMalformedInactiveCompactedState(t *testing.T)
 	}
 }
 
+func TestLoadProviderHistoryRejectsOwnerMismatchBeforeInactiveFiltering(t *testing.T) {
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	payload := providerStatePayloadForTest(t, session.ProviderStateEnvelope{
+		CodecID: runtimeProviderStateContract().CodecID, Version: 1, ProviderID: "fake", SourceModelID: "test",
+		CompatibilityKey: runtimeProviderStateContract().CompatibilityKey, ItemIndex: 0, Data: providerStateRawItems[0],
+	})
+	batch := session.ReplayBatch{
+		Messages: []session.Message{
+			{ID: "old", SessionID: "session", RunID: "old-run", Role: session.RoleAssistant, ModelID: "test", CreatedAt: now},
+			{ID: "tail", SessionID: "session", RunID: "tail-run", Role: session.RoleAssistant, ModelID: "test", CreatedAt: now.Add(time.Second)},
+			{ID: "summary", SessionID: "session", RunID: "summary-run", Role: session.RoleSystem, CreatedAt: now.Add(2 * time.Second)},
+		},
+		Parts: []session.Part{
+			{ID: "state", MessageID: "tail", SessionID: "session", RunID: "tail-run", Kind: session.PartProviderState, Payload: payload},
+			{ID: "summary-text", MessageID: "summary", SessionID: "session", RunID: "summary-run", Kind: session.PartCompaction, Payload: json.RawMessage(`{"text":"summary","epoch_id":"epoch","redacted":true}`)},
+		},
+		PartOwnerMessageIDs: []session.MessageID{"old", "summary"},
+	}
+	resolved := providerStateResolvedForTest(t)
+	_, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, resolved)
+	if !errors.Is(err, model.ErrProviderStateMismatch) {
+		t.Fatalf("error = %v, want provider-state mismatch", err)
+	}
+}
+
+func TestProviderStateStreamerCallbackPanicsAreContentFree(t *testing.T) {
+	fixture := newProviderStateLoadFixture(t)
+	contractPanic := &panicRuntimeProviderStateStreamer{panicContract: true}
+	resolved := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: contractPanic}
+	_, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}, fixture.sessionRecord, history.Options{}, resolved)
+	if !errors.Is(err, model.ErrProviderStateInvalid) || strings.Contains(err.Error(), "STATE_SENTINEL") {
+		t.Fatalf("contract panic error = %v", err)
+	}
+
+	capturePanic := &panicRuntimeProviderStateStreamer{contract: runtimeProviderStateContract(), panicCapture: true}
+	snapshot := TurnSnapshot{SessionID: "session", RunID: "run", Model: model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: capturePanic}}
+	message := einoschema.AssistantMessage("answer", nil)
+	message.Extra = map[string]any{providerStateExtraKey: []json.RawMessage{providerStateRawItems[0]}}
+	_, err = captureAssistantProviderState(snapshot, "assistant", message)
+	if !errors.Is(err, model.ErrProviderStateInvalid) || strings.Contains(err.Error(), "STATE_SENTINEL") {
+		t.Fatalf("capture panic error = %v", err)
+	}
+}
+
+type panicRuntimeProviderStateStreamer struct {
+	contract      model.ProviderStateContract
+	panicContract bool
+	panicCapture  bool
+}
+
+func (s *panicRuntimeProviderStateStreamer) StreamProvider(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+	return einoschema.StreamReaderFromArray([]model.StreamDelta{}), nil
+}
+
+func (s *panicRuntimeProviderStateStreamer) ProviderStateContract() model.ProviderStateContract {
+	if s.panicContract {
+		panic("STATE_SENTINEL")
+	}
+	return s.contract
+}
+
+func (s *panicRuntimeProviderStateStreamer) ProviderStateOwnedExtraKeys() []string {
+	return []string{providerStateExtraKey}
+}
+
+func (s *panicRuntimeProviderStateStreamer) CaptureProviderState(*einoschema.Message) (model.ProviderStateCapture, error) {
+	if s.panicCapture {
+		panic("STATE_SENTINEL")
+	}
+	return model.ProviderStateCapture{}, nil
+}
+
 func providerStateResolvedForTest(t *testing.T) model.Resolved {
 	t.Helper()
 	codec, err := model.NewEinoJSONExtraStateCodec(model.EinoJSONExtraStateConfig{ExtraKey: providerStateExtraKey, Contract: runtimeProviderStateContract()})

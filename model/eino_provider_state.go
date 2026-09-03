@@ -3,6 +3,7 @@ package model
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -91,6 +92,10 @@ func guardedCapture(codec ProviderStateCodec, owned map[string]struct{}, contrac
 	if message == nil || message.Role != einoschema.Assistant {
 		return ProviderStateCapture{}, providerStateError(ErrProviderStateInvalid)
 	}
+	neutralBefore, err := providerNeutralMessageClone(message)
+	if err != nil {
+		return ProviderStateCapture{}, providerStateError(ErrProviderStateInvalid)
+	}
 	keys := make([]string, 0, len(message.Extra))
 	for key := range message.Extra {
 		if _, ok := owned[key]; !ok {
@@ -101,6 +106,9 @@ func guardedCapture(codec ProviderStateCodec, owned map[string]struct{}, contrac
 	capture, err = codec.CaptureAssistant(message)
 	if err != nil {
 		return ProviderStateCapture{}, providerStateErrorFrom(err)
+	}
+	if err := requireProviderNeutralMessageUnchanged(neutralBefore, message); err != nil {
+		return ProviderStateCapture{}, err
 	}
 	claimed := make(map[string]struct{}, len(capture.ClaimedKeys))
 	for _, key := range capture.ClaimedKeys {
@@ -141,6 +149,27 @@ func guardedCapture(codec ProviderStateCodec, owned map[string]struct{}, contrac
 	capture.Items = cloneProviderStateItems(capture.Items)
 	capture.ClaimedKeys = append([]string(nil), capture.ClaimedKeys...)
 	return capture, nil
+}
+
+func providerNeutralMessageClone(message *einoschema.Message) (*einoschema.Message, error) {
+	if message == nil {
+		return nil, providerStateError(ErrProviderStateInvalid)
+	}
+	candidate := *message
+	candidate.Extra = nil
+	messages, err := cloneMessages([]*einoschema.Message{&candidate})
+	if err != nil || len(messages) != 1 || messages[0] == nil {
+		return nil, providerStateError(ErrProviderStateInvalid)
+	}
+	return messages[0], nil
+}
+
+func requireProviderNeutralMessageUnchanged(before *einoschema.Message, current *einoschema.Message) error {
+	after, err := providerNeutralMessageClone(current)
+	if err != nil || !reflect.DeepEqual(before, after) {
+		return providerStateError(ErrProviderStateInvalid)
+	}
+	return nil
 }
 
 func validateOwnedKeys(keys []string) (map[string]struct{}, []string, error) {

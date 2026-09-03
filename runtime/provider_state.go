@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -52,6 +53,9 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		if len(batch.PartOwnerMessageIDs) == len(batch.Parts) {
 			owner = batch.PartOwnerMessageIDs[index]
 		}
+		if part.MessageID != owner {
+			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		}
 		if active[owner] {
 			groups[owner] = append(groups[owner], ownedPart{part: part, owner: owner})
 		}
@@ -63,9 +67,9 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 	if !ok || streamer == nil {
 		return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 	}
-	contract := streamer.ProviderStateContract()
-	if err := model.ValidateProviderStateContract(contract); err != nil {
-		return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+	contract, err := safeProviderStateContract(streamer)
+	if err != nil {
+		return nil, nil, err
 	}
 	owners := make([]session.MessageID, 0, len(groups))
 	for owner := range groups {
@@ -160,14 +164,48 @@ func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.Mess
 		}
 		return capturedProviderState{}, nil
 	}
-	capture, err := streamer.CaptureProviderState(message)
+	if message == nil {
+		return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
+	}
+	contract, err := safeProviderStateContract(streamer)
 	if err != nil {
-		return capturedProviderState{}, collapseProviderStateError(err)
+		return capturedProviderState{}, err
+	}
+	owned, err := safeProviderStateOwnedKeys(streamer)
+	if err != nil {
+		return capturedProviderState{}, err
+	}
+	originalKeys := make(map[string]struct{}, len(message.Extra))
+	for key := range message.Extra {
+		if _, ok := owned[key]; !ok {
+			return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		originalKeys[key] = struct{}{}
+	}
+	capture, err := safeCaptureProviderState(streamer, message)
+	if err != nil {
+		return capturedProviderState{}, err
+	}
+	claimed := make(map[string]struct{}, len(capture.ClaimedKeys))
+	for _, key := range capture.ClaimedKeys {
+		if _, ok := originalKeys[key]; !ok {
+			return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		if _, duplicate := claimed[key]; duplicate {
+			return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		claimed[key] = struct{}{}
+	}
+	if len(message.Extra) != 0 || len(claimed) != len(originalKeys) ||
+		len(capture.Items) == 0 && len(capture.ClaimedKeys) != 0 || len(capture.Items) != 0 && len(claimed) == 0 {
+		return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
 	}
 	if len(capture.Items) == 0 {
 		return capturedProviderState{}, nil
 	}
-	contract := streamer.ProviderStateContract()
+	if err := model.ValidateProviderStateItems(capture.Items, contract.Limits); err != nil {
+		return capturedProviderState{}, collapseProviderStateError(err)
+	}
 	result := capturedProviderState{payloads: make([]json.RawMessage, len(capture.Items))}
 	storedBytes := 0
 	for index, item := range capture.Items {
@@ -197,6 +235,61 @@ func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.Mess
 	}
 	result.state = &cloned.ProviderState[0]
 	return result, nil
+}
+
+func safeProviderStateContract(streamer model.ProviderStateStreamer) (contract model.ProviderStateContract, err error) {
+	defer func() {
+		if recover() != nil {
+			contract = model.ProviderStateContract{}
+			err = runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+	}()
+	if streamer == nil {
+		return model.ProviderStateContract{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
+	}
+	contract = streamer.ProviderStateContract()
+	if err := model.ValidateProviderStateContract(contract); err != nil {
+		return model.ProviderStateContract{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
+	}
+	return contract, nil
+}
+
+func safeProviderStateOwnedKeys(streamer model.ProviderStateStreamer) (owned map[string]struct{}, err error) {
+	defer func() {
+		if recover() != nil {
+			owned = nil
+			err = runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+	}()
+	keys := streamer.ProviderStateOwnedExtraKeys()
+	if len(keys) == 0 {
+		return nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+	}
+	owned = make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if key == "" || len(key) > model.MaxProviderStateExtraKeyBytes || !utf8.ValidString(key) {
+			return nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		if _, duplicate := owned[key]; duplicate {
+			return nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		owned[key] = struct{}{}
+	}
+	return owned, nil
+}
+
+func safeCaptureProviderState(streamer model.ProviderStateStreamer, message *einoschema.Message) (capture model.ProviderStateCapture, err error) {
+	defer func() {
+		if recover() != nil {
+			capture = model.ProviderStateCapture{}
+			err = runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+	}()
+	capture, err = streamer.CaptureProviderState(message)
+	if err != nil {
+		return model.ProviderStateCapture{}, collapseProviderStateError(err)
+	}
+	return capture, nil
 }
 
 func cloneRuntimeProviderState(states []model.ProviderMessageState) ([]model.ProviderMessageState, error) {

@@ -90,6 +90,40 @@ func TestProviderStatePayloadSurvivesSQLiteCloseAndReopen(t *testing.T) {
 	}
 }
 
+func TestListMessagesRejectsProviderStateRowsAboveHardCount(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, filepath.Join(t.TempDir(), "provider-state-count.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: "state-session", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{ID: "state-run", SessionID: "state-session", ProviderID: "provider", ModelID: "model", OwnerID: "owner", ClaimToken: "claim", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	message := session.Message{ID: "state-message", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, ModelID: run.ModelID, CreatedAt: now, UpdatedAt: now}
+	if _, err := execution.AppendMessage(ctx, message); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index <= session.ProviderStateHardMaxItems; index++ {
+		part := session.Part{
+			ID: session.PartID(fmt.Sprintf("state-part-%03d", index)), MessageID: message.ID, SessionID: message.SessionID,
+			RunID: message.RunID, Kind: session.PartProviderState, Ordinal: int64(index), Payload: json.RawMessage(`{}`), CreatedAt: now, UpdatedAt: now,
+		}
+		if _, err := execution.AppendPart(ctx, part); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.ListMessages(ctx, message.SessionID, session.ReplayCursor{Limit: 10}); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("ListMessages error = %v, want ErrConflict", err)
+	}
+}
+
 func sqliteToolEvent(id session.EventID, at time.Time) session.ToolTransitionEvent {
 	return session.ToolTransitionEvent{ID: id, CreatedAt: at.UTC()}
 }

@@ -33,6 +33,24 @@ func TestProviderStatePayloadRoundTripPreservesRawBytes(t *testing.T) {
 	}
 }
 
+func TestProviderStatePayloadPreservesValidLargeExponent(t *testing.T) {
+	want := json.RawMessage(`{"n":1e400}`)
+	payload, err := EncodeProviderStatePayload(ProviderStateEnvelope{
+		CodecID: "example.test/reasoning", Version: 1, ProviderID: "provider", SourceModelID: "model",
+		CompatibilityKey: "reasoning-v1", ItemIndex: 0, Data: want,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeProviderStatePayload(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got.Data, want) {
+		t.Fatalf("decoded = %q, want %q", got.Data, want)
+	}
+}
+
 func TestProviderStatePayloadRejectsNonCanonicalAndMalformedInput(t *testing.T) {
 	valid, err := EncodeProviderStatePayload(ProviderStateEnvelope{CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model", CompatibilityKey: "compat", ItemIndex: 0, Data: json.RawMessage(`{"x":1}`)})
 	if err != nil {

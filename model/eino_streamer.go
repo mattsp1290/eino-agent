@@ -81,10 +81,8 @@ func (s *einoProviderStateStreamer) StreamProvider(ctx context.Context, request 
 	if err != nil {
 		return nil, err
 	}
-	if len(req.ProviderState) != 0 {
-		if err := ValidateProviderStateIdentity(string(req.Identity.ProviderID), string(req.Identity.ModelID)); err != nil {
-			return nil, err
-		}
+	if err := ValidateProviderStateIdentity(string(req.Identity.ProviderID), string(req.Identity.ModelID)); err != nil {
+		return nil, err
 	}
 	previousIndex := -1
 	for _, state := range req.ProviderState {
@@ -124,8 +122,15 @@ func restoreProviderState(codec ProviderStateCodec, owned map[string]struct{}, m
 			err = providerStateError(ErrProviderStateInvalid)
 		}
 	}()
+	neutralBefore, err := providerNeutralMessageClone(message)
+	if err != nil {
+		return providerStateError(ErrProviderStateInvalid)
+	}
 	if err := codec.RestoreAssistant(message, cloneProviderStateItems(items)); err != nil {
 		return providerStateErrorFrom(err)
+	}
+	if err := requireProviderNeutralMessageUnchanged(neutralBefore, message); err != nil {
+		return err
 	}
 	if len(message.Extra) == 0 {
 		return providerStateError(ErrProviderStateInvalid)

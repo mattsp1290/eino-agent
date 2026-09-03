@@ -7,18 +7,20 @@ import (
 	"errors"
 	"io"
 	"unicode/utf8"
+
+	"github.com/mattsp1290/eino-agent/internal/providerstatewire"
 )
 
 const (
-	ProviderStateHardMaxItems              = 64
-	ProviderStateHardMaxItemBytes          = 10 * 1024 * 1024
-	ProviderStateHardMaxMessageBytes       = 16 * 1024 * 1024
-	ProviderStateHardMaxEnvelopeBytes      = 13_985_112
-	ProviderStateHardMaxStoredMessageBytes = 22_632_024
-	ProviderStateMaxCodecIDBytes           = 128
-	ProviderStateMaxCompatibilityKeyBytes  = 256
-	ProviderStateMaxProviderIDBytes        = 128
-	ProviderStateMaxModelIDBytes           = 256
+	ProviderStateHardMaxItems              = providerstatewire.MaxItems
+	ProviderStateHardMaxItemBytes          = providerstatewire.MaxItemBytes
+	ProviderStateHardMaxMessageBytes       = providerstatewire.MaxMessageBytes
+	ProviderStateHardMaxEnvelopeBytes      = providerstatewire.MaxEnvelopeBytes
+	ProviderStateHardMaxStoredMessageBytes = providerstatewire.MaxStoredMessageBytes
+	ProviderStateMaxCodecIDBytes           = providerstatewire.MaxCodecIDBytes
+	ProviderStateMaxCompatibilityKeyBytes  = providerstatewire.MaxCompatibilityBytes
+	ProviderStateMaxProviderIDBytes        = providerstatewire.MaxProviderIDBytes
+	ProviderStateMaxModelIDBytes           = providerstatewire.MaxModelIDBytes
 )
 
 // ErrProviderStateInvalid reports malformed or non-canonical durable state.
@@ -113,32 +115,9 @@ func validateProviderStateEnvelope(envelope ProviderStateEnvelope) error {
 }
 
 func providerStateJSONObject(raw json.RawMessage) bool {
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	var value any
-	if err := decoder.Decode(&value); err != nil {
-		return false
-	}
-	if _, ok := value.(map[string]any); !ok || value == nil {
-		return false
-	}
-	return errors.Is(decoder.Decode(&struct{}{}), io.EOF)
+	return providerstatewire.IsJSONObject(raw)
 }
 
 func providerStateASCIIToken(value string, max int) bool {
-	if value == "" || len(value) > max {
-		return false
-	}
-	for i := range len(value) {
-		if !providerStateTokenByte(value[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func providerStateTokenByte(value byte) bool {
-	if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' {
-		return true
-	}
-	return bytes.ContainsRune([]byte("!#$%&'*+-.^_`|~:/@"), rune(value))
+	return providerstatewire.ValidASCIIToken(value, max)
 }

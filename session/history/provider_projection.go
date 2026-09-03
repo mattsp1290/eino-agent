@@ -28,12 +28,15 @@ func LoadBatch(ctx context.Context, store session.Store, sessionID session.ID) (
 		}
 		messages = append(messages, batch.Messages...)
 		parts = append(parts, batch.Parts...)
-		if len(batch.PartOwnerMessageIDs) == len(batch.Parts) {
+		switch {
+		case len(batch.PartOwnerMessageIDs) == len(batch.Parts):
 			partOwners = append(partOwners, batch.PartOwnerMessageIDs...)
-		} else {
+		case len(batch.PartOwnerMessageIDs) == 0:
 			for _, part := range batch.Parts {
 				partOwners = append(partOwners, part.MessageID)
 			}
+		default:
+			return session.ReplayBatch{}, session.ErrConflict
 		}
 		if batch.Next == (session.ReplayCursor{}) {
 			break

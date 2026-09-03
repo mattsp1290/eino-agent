@@ -183,6 +183,9 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 		{name: "part message id", mutate: func(t *testing.T, db *sql.DB, result Result) {
 			mutateSQLiteProviderStateParts(t, db, func(part *session.Part) { part.MessageID = "forged-message" })
 		}},
+		{name: "message id", mutate: func(t *testing.T, db *sql.DB, result Result) {
+			mutateSQLiteRecord[session.Message](t, db, "messages", string(result.MessageID), func(message *session.Message) { message.ID = "forged-message" })
+		}},
 		{name: "coherent embedded session", mutate: func(t *testing.T, db *sql.DB, result Result) {
 			mutateSQLiteRecord[session.Message](t, db, "messages", string(result.MessageID), func(message *session.Message) { message.SessionID = "forged-session" })
 			mutateSQLiteProviderStateParts(t, db, func(part *session.Part) { part.SessionID = "forged-session" })
@@ -222,7 +225,7 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 			secondClient := &runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("should not run", nil)}}
 			second := providerStateOrchestrator(t, store, ids, secondClient)
 			_, err = second.Start(ctx, Request{SessionID: "state-session", Message: UserMessage{Content: "second"}, Config: orchestratorConfig()})
-			if !errors.Is(err, model.ErrProviderStateMismatch) || clientCallCount(secondClient) != 0 || strings.Contains(err.Error(), "STATE_SENTINEL") {
+			if (!errors.Is(err, model.ErrProviderStateMismatch) && !errors.Is(err, session.ErrConflict)) || clientCallCount(secondClient) != 0 || strings.Contains(err.Error(), "STATE_SENTINEL") {
 				t.Fatalf("corrupt admission = calls %d error %v", clientCallCount(secondClient), err)
 			}
 		})
