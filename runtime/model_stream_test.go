@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -16,13 +15,14 @@ type testModelStreamReader struct {
 	chunks     []model.StreamDelta
 	index      int
 	panicAt    int
+	panicValue any
 	closePanic bool
 	closes     int
 }
 
 func (r *testModelStreamReader) Recv() (model.StreamDelta, error) {
 	if r.index == r.panicAt {
-		panic("receive panic")
+		panic(r.panicValue)
 	}
 	if r.index == len(r.chunks) {
 		return model.StreamDelta{}, io.EOF
@@ -35,22 +35,24 @@ func (r *testModelStreamReader) Recv() (model.StreamDelta, error) {
 func (r *testModelStreamReader) Close() {
 	r.closes++
 	if r.closePanic {
-		panic("close panic")
+		panic(r.panicValue)
 	}
 }
 
 func TestReceiveModelStreamPreservesPartialStateAcrossPanic(t *testing.T) {
+	const secret = "provider-secret-receive-value"
 	reader := &testModelStreamReader{
-		chunks:  []model.StreamDelta{{Message: einoschema.AssistantMessage("first", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 1}}},
-		panicAt: 1,
+		chunks:     []model.StreamDelta{{Message: einoschema.AssistantMessage("first", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 1}}},
+		panicAt:    1,
+		panicValue: secret,
 	}
 	var result modelStreamResult
 	var indexes []int64
 	func() {
 		defer func() {
-			if recovered := recover(); recovered != nil {
+			if recover() != nil {
 				result.message = nil
-				result.err = fmt.Errorf("provider stream panic: %v", recovered)
+				result.err = newProviderStreamPanicError()
 			}
 		}()
 		receiveModelStream(context.Background(), reader, &result, func(index int64, _ *einoschema.Message) {
@@ -60,7 +62,7 @@ func TestReceiveModelStreamPreservesPartialStateAcrossPanic(t *testing.T) {
 	if result.message != nil || !result.receivedDelta || result.usage != (model.Usage{InputTokens: 3, OutputTokens: 1}) {
 		t.Fatalf("result = %#v", result)
 	}
-	if result.err == nil || !strings.Contains(result.err.Error(), "provider stream panic: receive panic") {
+	if result.err == nil || result.err.Error() != providerStreamPanicMessage || strings.Contains(result.err.Error(), secret) {
 		t.Fatalf("error = %v", result.err)
 	}
 	if len(indexes) != 1 || indexes[0] != 0 || reader.closes != 1 {
@@ -69,17 +71,19 @@ func TestReceiveModelStreamPreservesPartialStateAcrossPanic(t *testing.T) {
 }
 
 func TestReceiveModelStreamClosePanicSupersedesSuccess(t *testing.T) {
+	const secret = "provider-secret-close-value"
 	reader := &testModelStreamReader{
 		chunks:     []model.StreamDelta{{Message: einoschema.AssistantMessage("done", nil), Usage: model.Usage{InputTokens: 4, OutputTokens: 2}}},
 		panicAt:    -1,
+		panicValue: secret,
 		closePanic: true,
 	}
 	var result modelStreamResult
 	func() {
 		defer func() {
-			if recovered := recover(); recovered != nil {
+			if recover() != nil {
 				result.message = nil
-				result.err = fmt.Errorf("provider stream panic: %v", recovered)
+				result.err = newProviderStreamPanicError()
 			}
 		}()
 		receiveModelStream(context.Background(), reader, &result, nil)
@@ -87,7 +91,7 @@ func TestReceiveModelStreamClosePanicSupersedesSuccess(t *testing.T) {
 	if result.message != nil || !result.receivedDelta || result.usage != (model.Usage{InputTokens: 4, OutputTokens: 2}) {
 		t.Fatalf("result = %#v", result)
 	}
-	if result.err == nil || !strings.Contains(result.err.Error(), "provider stream panic: close panic") || reader.closes != 1 {
+	if result.err == nil || result.err.Error() != providerStreamPanicMessage || strings.Contains(result.err.Error(), secret) || reader.closes != 1 {
 		t.Fatalf("error=%v closes=%d", result.err, reader.closes)
 	}
 }

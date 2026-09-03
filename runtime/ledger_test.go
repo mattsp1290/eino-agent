@@ -220,6 +220,7 @@ func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "partial-usage-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	cleanup()
 	want := session.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}
 	if result.Status != session.RunFailed || result.Error == nil || result.Usage != want || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d want usage=%#v", result, attempts, want)
@@ -316,6 +317,7 @@ func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.
 }
 
 func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
+	const secret = "provider-secret-invoke-value"
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -328,7 +330,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	defer cleanup()
 
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		panic("provider panic")
+		panic(secret)
 	})
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
@@ -336,11 +338,16 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	}
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
-	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: provider panic") {
+	cleanup()
+	if result.Status != session.RunFailed || result.Error == nil || result.Error.Error() != providerStreamPanicMessage || strings.Contains(result.Error.Error(), secret) {
 		t.Fatalf("result = %#v", result)
 	}
+	run, err := store.GetRun(context.Background(), result.RunID)
+	if err != nil || run.Error != providerStreamPanicMessage || strings.Contains(run.Error, secret) {
+		t.Fatalf("durable run = %#v, %v", run, err)
+	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
-	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed {
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed || batch.Records[0].ErrorCode != "operation_failed" {
 		t.Fatalf("records = %#v, %v", batch.Records, err)
 	}
 	if strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Error.Code == "" {
@@ -349,6 +356,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 }
 
 func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
+	const secret = "provider-secret-second-receive"
 	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -369,7 +377,7 @@ func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 		return einoschema.StreamReaderWithConvert(origin, func(delta model.StreamDelta) (model.StreamDelta, error) {
 			converted++
 			if converted == 2 {
-				panic("second receive")
+				panic(secret)
 			}
 			return delta, nil
 		}), nil
@@ -382,12 +390,17 @@ func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "receive-panic-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	cleanup()
 	wantUsage := session.Usage{InputTokens: 5, OutputTokens: 2}
-	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), "provider stream panic: second receive") || result.Usage != wantUsage || attempts != 1 {
+	if result.Status != session.RunFailed || result.Error == nil || result.Error.Error() != providerStreamPanicMessage || strings.Contains(result.Error.Error(), secret) || result.Usage != wantUsage || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d", result, attempts)
 	}
+	run, err := store.GetRun(context.Background(), result.RunID)
+	if err != nil || run.Error != providerStreamPanicMessage || strings.Contains(run.Error, secret) {
+		t.Fatalf("durable run=%#v error=%v", run, err)
+	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
-	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed {
+	if err != nil || len(batch.Records) != 1 || batch.Records[0].State != session.ModelRequestFailed || batch.Records[0].ErrorCode != "operation_failed" {
 		t.Fatalf("records=%#v error=%v", batch.Records, err)
 	}
 	if strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Usage != wantUsage || completed[0].Error.Code == "" {
@@ -420,6 +433,7 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 	}
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "dispatch-start-failure-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	cleanup()
 	if !errors.Is(result.Error, updateErr) || called || len(sequence) != 0 || len(completed) != 0 {
 		t.Fatalf("result=%#v adapter_called=%t sequence=%#v completed=%#v", result, called, sequence, completed)
 	}
@@ -448,6 +462,7 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 	}
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "lifecycle-success-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	cleanup()
 	if result.Error != nil || strings.Join(sequence, ",") != "requested,completed" || len(completed) != 1 || completed[0].Error.Code != "" {
 		t.Fatalf("result=%#v sequence=%#v completed=%#v", result, sequence, completed)
 	}
@@ -667,10 +682,13 @@ func modelLifecycleNoticePlan(t *testing.T, sequence *[]string, completed *[]Mod
 		_ = mount.Close(context.Background())
 		t.Fatal(err)
 	}
+	var once sync.Once
 	return newTestDispatchPlan(dispatch), func() {
-		if err := mount.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
+		once.Do(func() {
+			if err := mount.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
