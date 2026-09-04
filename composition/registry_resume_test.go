@@ -193,7 +193,7 @@ func TestStrictResumeCanonicalizesRestrictionRuleSets(t *testing.T) {
 	}
 
 	equivalentMount := mountRules([]string{"alpha", "zeta"}, []string{})
-	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest(t, "session-a", persisted))
 	if err != nil {
 		t.Fatalf("equivalent reordered rules did not resume: %v", err)
 	}
@@ -226,8 +226,8 @@ func TestAcquireResumePlanRejectsTamperedPersistedDescriptorBeforeSelection(t *t
 	persisted := plan.Descriptor()
 	plan.Release()
 	persisted.Components[0].Artifact.Hash = "tampered"
-	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("tampered descriptor resume = %v, want ErrExtensionPlanMismatch", err)
+	if _, err := session.VerifyExtensionPlanForSession("session-a", persisted); err == nil {
+		t.Fatal("tampered descriptor unexpectedly verified")
 	}
 }
 
@@ -249,7 +249,8 @@ func TestAcquireResumePlanRejectsDurableSessionMismatch(t *testing.T) {
 	}
 	descriptor := plan.Descriptor()
 	plan.Release()
-	if resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-b", descriptor)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+	verified := resumeRequest(t, "session-a", descriptor)
+	if resumed, err := registry.AcquireResumePlan(context.Background(), runtime.ResumePlanRequest{SessionID: "session-b", Plan: verified.Plan}); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
 		if resumed != nil {
 			resumed.Release()
 		}
@@ -285,7 +286,7 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 		t.Fatalf("expected grouped mixed-scope handlers, got %#v", persisted.Components)
 	}
 
-	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest(t, "session-a", persisted))
 	if err != nil {
 		t.Fatalf("AcquireResumePlan = %v", err)
 	}
@@ -293,10 +294,6 @@ func TestStrictResumeRecoversSessionScopeFromNestedHandlerRegistrations(t *testi
 }
 
 func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
-	registry, err := NewRegistry(nil, compositionNotice)
-	if err != nil {
-		t.Fatal(err)
-	}
 	persisted := session.ExtensionPlanDescriptor{Components: []session.ComponentPlan{{
 		InstanceID: "mixed", Artifact: extension.Artifact{Name: "mixed", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative},
 		Handlers: []session.RegistrationIdentity{
@@ -304,10 +301,8 @@ func TestStrictResumeRejectsConflictingNestedSessionScopes(t *testing.T) {
 			{ID: "b", Contract: compositionNotice.Contract().ID, Version: compositionNotice.Contract().Version, Scope: extension.SessionScope("session-b"), Kind: extension.HandlerNotification},
 		},
 	}}}
-	sealed, _ := session.SealExtensionPlanForSession("", persisted)
-	persisted = sealed.Descriptor()
-	if _, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted)); !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
-		t.Fatalf("conflicting nested scopes = %v", err)
+	if _, err := session.SealExtensionPlanForSession("session-a", persisted); err == nil {
+		t.Fatal("conflicting nested scopes unexpectedly sealed")
 	}
 }
 

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -43,6 +44,7 @@ const (
 	delegatedURLMaxBytes    = 64
 	delegatedSnippetMax     = 24
 	delegatedFailureClass   = "search backend unavailable"
+	delegatedURLCredential  = "SENTINEL_URL_CREDENTIAL"
 )
 
 var errDelegatedBackendUnavailable = errors.New(delegatedFailureClass)
@@ -74,6 +76,7 @@ func (fn delegatedSearchFunc) Search(ctx context.Context, query string) ([]deleg
 func TestDelegatedWebSearchUsesPublishedRuntimeContract(t *testing.T) {
 	t.Run("bounded durable execution and quiescent lifecycle", testDelegatedSearchExecution)
 	t.Run("layered malformed input", testDelegatedSearchValidation)
+	t.Run("permission denial and approval contain execution", testDelegatedSearchPermissionContainment)
 	t.Run("cancellation reaches host once", testDelegatedSearchCancellation)
 	t.Run("backend diagnostics stay private", testDelegatedSearchFailureRedaction)
 	t.Run("equivalent identity and strict drift", testDelegatedSearchPlanIdentity)
@@ -91,6 +94,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 	})
 	component := delegatedComponent("artifact-hash-v1", "config-hash-v1")
 	registry, mount := mountDelegatedSearchFixture(t, component, searcher)
+	t.Cleanup(func() { cleanupDelegatedMount(mount) })
 
 	frozen, err := registry.AcquireRunPlan(ctx, runtime.RunPlanRequest{SessionID: "delegated-success"})
 	if err != nil {
@@ -171,10 +175,17 @@ func testDelegatedSearchExecution(t *testing.T) {
 	if !bytes.Equal(output.Structured, encodedResult) {
 		t.Fatalf("structured copy = %s, content = %s", output.Structured, encodedResult)
 	}
+	exactMaximum, err := maximumDelegatedFixtureBytes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(encodedResult, exactMaximum) {
+		t.Fatalf("encoded result is not the escape-heavy exact-maximum fixture: got %d bytes, want %d", len(encodedResult), len(exactMaximum))
+	}
 	if output.InlineSize != 2*int64(len(encodedResult)) || output.OriginalSize != output.InlineSize {
 		t.Fatalf("output sizes = original %d inline %d encoded %d", output.OriginalSize, output.InlineSize, len(encodedResult))
 	}
-	worstCase, err := maximumDelegatedResultBytes()
+	worstCase, err := worstCaseDelegatedResultBytes()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,13 +200,17 @@ func testDelegatedSearchExecution(t *testing.T) {
 	if len(bounded.Results) != delegatedResultMax {
 		t.Fatalf("result count = %d", len(bounded.Results))
 	}
+	var envelopeKeys map[string]json.RawMessage
+	if err := json.Unmarshal(output.Structured, &envelopeKeys); err != nil || len(envelopeKeys) != 1 || envelopeKeys["results"] == nil {
+		t.Fatalf("result envelope fields = %s, err = %v", output.Structured, err)
+	}
 	for _, record := range bounded.Results {
 		if !utf8.ValidString(record.Title) || !utf8.ValidString(record.URL) || !utf8.ValidString(record.Snippet) ||
-			len(record.Title) > delegatedTitleMaxBytes || len(record.URL) > delegatedURLMaxBytes || len(record.Snippet) > delegatedSnippetMax {
-			t.Fatalf("unbounded record = %#v", record)
+			len(record.Title) != delegatedTitleMaxBytes || len(record.URL) != delegatedURLMaxBytes || len(record.Snippet) != delegatedSnippetMax {
+			t.Fatalf("record did not reach exact field bounds = %#v", record)
 		}
 		parsed, parseErr := url.Parse(record.URL)
-		if parseErr != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		if parseErr != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			t.Fatalf("invalid source URL %q: %v", record.URL, parseErr)
 		}
 		raw, marshalErr := json.Marshal(record)
@@ -207,7 +222,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 			t.Fatalf("record fields = %s, err = %v", raw, err)
 		}
 	}
-	for _, forbidden := range []string{"credential", "provider_name", "diagnostic", "generated_answer"} {
+	for _, forbidden := range []string{"credential", "provider_name", "diagnostic", "generated_answer", delegatedURLCredential} {
 		if strings.Contains(string(output.Structured), forbidden) {
 			t.Fatalf("result contains forbidden field %q: %s", forbidden, output.Structured)
 		}
@@ -234,12 +249,14 @@ func testDelegatedSearchExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer lifecyclePlan.Release()
 	mount.Deactivate()
 	laterPlan, err := registry.AcquireRunPlan(ctx, runtime.RunPlanRequest{SessionID: "delegated-lifecycle"})
 	if err != nil {
 		lifecyclePlan.Release()
 		t.Fatal(err)
 	}
+	defer laterPlan.Release()
 	laterTools, err := laterPlan.ResolveTools(ctx, runtime.ToolScopeContext{SessionID: "delegated-lifecycle"})
 	if err != nil || len(laterTools) != 0 {
 		t.Fatalf("post-deactivation tools = %#v, err = %v", laterTools, err)
@@ -302,6 +319,14 @@ func testDelegatedSearchValidation(t *testing.T) {
 	if err != nil || string(canonical) != `{"query":"ok"}` {
 		t.Fatalf("valid canonical input = %s, err = %v", canonical, err)
 	}
+	invalidBackendBytes := string(bytes.Repeat([]byte{0xff}, delegatedTitleMaxBytes))
+	boundedInvalid := boundDelegatedRecords([]delegatedSearchRecord{{
+		Title: invalidBackendBytes, URL: "https://example.test/result", Snippet: invalidBackendBytes,
+	}})
+	if len(boundedInvalid) != 1 || !utf8.ValidString(boundedInvalid[0].Title) || !utf8.ValidString(boundedInvalid[0].Snippet) ||
+		len(boundedInvalid[0].Title) > delegatedTitleMaxBytes || len(boundedInvalid[0].Snippet) > delegatedSnippetMax {
+		t.Fatalf("invalid backend UTF-8 escaped field bounds: %#v", boundedInvalid)
+	}
 	if backendCalls.Load() != 0 {
 		t.Fatalf("validation invoked backend %d times", backendCalls.Load())
 	}
@@ -316,7 +341,7 @@ func testDelegatedSearchCancellation(t *testing.T) {
 		calls.Add(1)
 		once.Do(func() { close(started) })
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return nil, errors.New("transport closed after cancellation")
 	})
 	registry, mount := mountDelegatedSearchFixture(t, delegatedComponent("artifact-cancel", "config-cancel"), searcher)
 	defer closeDelegatedMount(t, mount)
@@ -350,6 +375,51 @@ func testDelegatedSearchCancellation(t *testing.T) {
 	}
 	if calls.Load() != 1 {
 		t.Fatalf("canceled backend calls = %d, want 1", calls.Load())
+	}
+}
+
+func testDelegatedSearchPermissionContainment(t *testing.T) {
+	for _, action := range []permissions.Action{permissions.ActionDeny, permissions.ActionAsk} {
+		t.Run(string(action), func(t *testing.T) {
+			ctx := context.Background()
+			var backendCalls atomic.Int32
+			searcher := delegatedSearchFunc(func(context.Context, string) ([]delegatedSearchRecord, error) {
+				backendCalls.Add(1)
+				return maximumDelegatedFixtureRecords(), nil
+			})
+			registry, mount := mountDelegatedSearchFixture(t, delegatedComponent("artifact-permission-"+string(action), "config-permission-"+string(action)), searcher)
+			defer closeDelegatedMount(t, mount)
+			store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "permission.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = store.Close() }()
+			policy := &recordingDelegatedPolicy{action: action}
+			callID := session.ToolCallID("delegated-permission-" + string(action))
+			orchestrator := newDelegatedOrchestrator(t, store, registry, &delegatedSearchModel{callID: string(callID)}, policy, nil)
+			handle, err := orchestrator.Start(ctx, runtime.Request{
+				SessionID: session.ID("delegated-permission-" + string(action)),
+				Message:   runtime.UserMessage{Content: "policy containment"}, Config: delegatedRuntimeConfig(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := waitDelegatedResult(t, handle)
+			if result.Status != session.RunCompleted || result.Error != nil {
+				t.Fatalf("policy result = %+v", result)
+			}
+			call, err := store.GetToolCall(ctx, callID)
+			if err != nil || call.Status != session.ToolCallFailed {
+				t.Fatalf("policy durable call = %+v, err = %v", call, err)
+			}
+			requests := policy.snapshot()
+			if len(requests) != 1 || requests[0].Permission != delegatedPermissionName || requests[0].Pattern != delegatedPattern {
+				t.Fatalf("policy requests = %#v", requests)
+			}
+			if backendCalls.Load() != 0 {
+				t.Fatalf("%s policy invoked backend %d times", action, backendCalls.Load())
+			}
+		})
 	}
 }
 
@@ -446,13 +516,18 @@ func testDelegatedSearchPlanIdentity(t *testing.T) {
 	if equivalent.Descriptor().Fingerprint != persisted.Fingerprint {
 		t.Fatalf("equivalent fingerprints differ: %s != %s", equivalent.Descriptor().Fingerprint, persisted.Fingerprint)
 	}
-	equivalent.Release()
-	closeDelegatedMount(t, equivalentMount)
-
 	sealed, err := session.VerifyExtensionPlanForSession("identity-session", persisted)
 	if err != nil {
 		t.Fatal(err)
 	}
+	resumed, err := equivalentRegistry.AcquireResumePlan(ctx, runtime.ResumePlanRequest{SessionID: "identity-session", Plan: sealed})
+	if err != nil {
+		t.Fatalf("equivalent strict resume = %v", err)
+	}
+	resumed.Release()
+	equivalent.Release()
+	closeDelegatedMount(t, equivalentMount)
+
 	for _, test := range []struct {
 		name      string
 		component extension.Component
@@ -472,8 +547,95 @@ func testDelegatedSearchPlanIdentity(t *testing.T) {
 			}
 		})
 	}
+	assertDelegatedOrchestratorResumeRejectsDrift(t, persisted, searcher)
 	if backendCalls.Load() != 0 {
 		t.Fatalf("descriptor verification invoked backend %d times", backendCalls.Load())
+	}
+}
+
+func assertDelegatedOrchestratorResumeRejectsDrift(t *testing.T, persisted session.ExtensionPlanDescriptor, searcher delegatedSearchFixture) {
+	t.Helper()
+	ctx := context.Background()
+	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "resume-drift.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = store.Close() }()
+	now := time.Now().UTC()
+	if _, err := store.CreateSession(ctx, session.Session{ID: "identity-session", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{
+		ID: "identity-run", SessionID: "identity-session", OwnerID: "original-owner", ClaimToken: "original-claim",
+		Agent: "external-consumer", ProviderID: "fixture", ModelID: "scripted", Status: session.RunPending,
+		Config:        map[string]string{"workspace_id": "fixture-workspace", "workspace_root": os.TempDir()},
+		ExtensionPlan: persisted, CreatedAt: now,
+	}, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	assistant := session.Message{
+		ID: "identity-assistant", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant,
+		Agent: run.Agent, ModelID: run.ModelID, CreatedAt: now, UpdatedAt: now,
+	}
+	if _, err := execution.AppendMessage(ctx, assistant); err != nil {
+		t.Fatal(err)
+	}
+	input := json.RawMessage(`{"query":"bounded test"}`)
+	requestPartPayload, err := json.Marshal(struct {
+		ID        string          `json:"id"`
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}{ID: "identity-call", Name: delegatedToolName, Arguments: input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending := session.ToolCall{
+		ID: "identity-call", SessionID: run.SessionID, RunID: run.ID, MessageID: assistant.ID,
+		RequestPartID: "identity-request-part", ResultMessageID: "identity-result-message", ResultPartID: "identity-result-part",
+		Name: delegatedToolName, Pattern: delegatedPattern, Input: input, Status: session.ToolCallPending, RetrySafe: false,
+	}
+	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+		Call: pending,
+		RequestPart: session.Part{
+			ID: pending.RequestPartID, MessageID: pending.MessageID, SessionID: pending.SessionID, RunID: pending.RunID,
+			Kind: session.PartToolCall, Payload: requestPartPayload, CreatedAt: now, UpdatedAt: now,
+		},
+		Event: session.ToolTransitionEvent{ID: "identity-pending-event", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeRun, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeCall, err := store.GetToolCall(ctx, pending.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEvents, err := store.ListEvents(ctx, run.SessionID, session.EventCursor{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	driftedRegistry, driftedMount := mountDelegatedSearchFixture(t, delegatedComponent("artifact-identity-v1", "config-identity-resume-drift"), searcher)
+	defer closeDelegatedMount(t, driftedMount)
+	orchestrator := newDelegatedOrchestrator(t, store, driftedRegistry, &delegatedSearchModel{callID: "unused"}, permissions.StaticPolicy{}, nil)
+	handle, err := orchestrator.Resume(ctx, run.ID)
+	if handle != nil {
+		t.Fatal("strict resume mismatch returned a live handle")
+	}
+	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("orchestrator resume = %v, want ErrExtensionPlanMismatch", err)
+	}
+	afterRun, runErr := store.GetRun(ctx, run.ID)
+	afterCall, callErr := store.GetToolCall(ctx, pending.ID)
+	afterEvents, eventErr := store.ListEvents(ctx, run.SessionID, session.EventCursor{Limit: 100})
+	if runErr != nil || callErr != nil || eventErr != nil {
+		t.Fatalf("read durable state after resume: run=%v call=%v events=%v", runErr, callErr, eventErr)
+	}
+	if !reflect.DeepEqual(afterRun, beforeRun) || !reflect.DeepEqual(afterCall, beforeCall) || !reflect.DeepEqual(afterEvents, beforeEvents) {
+		t.Fatalf("resume mismatch mutated durable state:\nrun before=%+v\nrun after=%+v\ncall before=%+v\ncall after=%+v", beforeRun, afterRun, beforeCall, afterCall)
 	}
 }
 
@@ -500,7 +662,7 @@ func mountDelegatedSearchFixture(t *testing.T, component extension.Component, se
 }
 
 func delegatedSearchDefinition(searcher delegatedSearchFixture) (tools.Definition, error) {
-	worstCase, err := maximumDelegatedResultBytes()
+	worstCase, err := worstCaseDelegatedResultBytes()
 	if err != nil {
 		return tools.Definition{}, err
 	}
@@ -523,8 +685,8 @@ func delegatedSearchDefinition(searcher delegatedSearchFixture) (tools.Definitio
 			defer cancel()
 			records, err := searcher.Search(callCtx, execution.Input.Query)
 			if err != nil {
-				if callCtx.Err() != nil && errors.Is(err, callCtx.Err()) {
-					return delegatedSearchResult{}, callCtx.Err()
+				if contextErr := callCtx.Err(); contextErr != nil {
+					return delegatedSearchResult{}, contextErr
 				}
 				return delegatedSearchResult{}, errDelegatedBackendUnavailable
 			}
@@ -570,7 +732,7 @@ func boundDelegatedRecords(records []delegatedSearchRecord) []delegatedSearchRec
 		record.URL = delegatedUTF8Prefix(record.URL, delegatedURLMaxBytes)
 		record.Snippet = delegatedUTF8Prefix(record.Snippet, delegatedSnippetMax)
 		parsed, err := url.Parse(record.URL)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 			continue
 		}
 		bounded = append(bounded, record)
@@ -579,6 +741,10 @@ func boundDelegatedRecords(records []delegatedSearchRecord) []delegatedSearchRec
 }
 
 func delegatedUTF8Prefix(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	value = strings.ToValidUTF8(value, "")
 	if len(value) <= limit {
 		return value
 	}
@@ -588,7 +754,7 @@ func delegatedUTF8Prefix(value string, limit int) string {
 	return value[:limit]
 }
 
-func oversizedDelegatedRecords() []delegatedSearchRecord {
+func maximumDelegatedFixtureRecords() []delegatedSearchRecord {
 	urlPrefix := "https://example.test/"
 	longURL := urlPrefix + strings.Repeat("a", delegatedURLMaxBytes-len(urlPrefix)) + "overflow"
 	record := delegatedSearchRecord{
@@ -596,10 +762,26 @@ func oversizedDelegatedRecords() []delegatedSearchRecord {
 		URL:     longURL,
 		Snippet: strings.Repeat("\n\t\\\"", delegatedSnippetMax/4) + "overflow",
 	}
-	return []delegatedSearchRecord{record, record, record}
+	return []delegatedSearchRecord{record, record}
 }
 
-func maximumDelegatedResultBytes() (int64, error) {
+func oversizedDelegatedRecords() []delegatedSearchRecord {
+	maximum := maximumDelegatedFixtureRecords()
+	credentialBearing := delegatedSearchRecord{
+		Title: "drop", URL: "https://user:" + delegatedURLCredential + "@example.test/result", Snippet: "must not persist",
+	}
+	return append([]delegatedSearchRecord{credentialBearing}, append(maximum, maximum[0])...)
+}
+
+func maximumDelegatedFixtureBytes() ([]byte, error) {
+	return json.Marshal(delegatedSearchResult{Results: boundDelegatedRecords(maximumDelegatedFixtureRecords())})
+}
+
+// worstCaseDelegatedResultBytes is a conservative upper bound for every valid
+// result, including six-byte JSON escapes. A valid absolute HTTP(S) URL cannot
+// itself consist entirely of control bytes, so the executable exact-maximum
+// fixture has a separate shared constructor above.
+func worstCaseDelegatedResultBytes() (int64, error) {
 	baseline := delegatedSearchResult{Results: make([]delegatedSearchRecord, delegatedResultMax)}
 	raw, err := json.Marshal(baseline)
 	if err != nil {
@@ -736,13 +918,18 @@ func delegatedRuntimeConfig() config.Snapshot {
 type recordingDelegatedPolicy struct {
 	mu       sync.Mutex
 	requests []permissions.Request
+	action   permissions.Action
 }
 
 func (p *recordingDelegatedPolicy) Decide(_ context.Context, request permissions.Request) (permissions.Decision, error) {
 	p.mu.Lock()
 	p.requests = append(p.requests, request)
 	p.mu.Unlock()
-	return permissions.Decision{Action: permissions.ActionAllow}, nil
+	action := p.action
+	if action == "" {
+		action = permissions.ActionAllow
+	}
+	return permissions.Decision{Action: action, Reason: "fixture_policy", Message: "fixture policy decision"}, nil
 }
 
 func (p *recordingDelegatedPolicy) snapshot() []permissions.Request {
@@ -821,4 +1008,11 @@ func closeDelegatedMount(t *testing.T, mount *composition.Mount) {
 	if err := mount.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func cleanupDelegatedMount(mount *composition.Mount) {
+	mount.Deactivate()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = mount.Close(ctx)
 }

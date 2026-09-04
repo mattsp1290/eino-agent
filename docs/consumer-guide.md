@@ -311,10 +311,13 @@ if err != nil {
 }
 defer func() {
     mount.Deactivate()
-    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    _ = mount.Close(shutdownCtx)
-    _ = loader.Close(shutdownCtx)
+    closeWithin := func(closeFn func(context.Context) error) error {
+        shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+        defer cancel()
+        return closeFn(shutdownCtx)
+    }
+    _ = closeWithin(mount.Close)
+    _ = closeWithin(loader.Close)
 }()
 
 orchestrator, err := runtime.NewStreamingOrchestrator(

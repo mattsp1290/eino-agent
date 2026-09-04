@@ -9,14 +9,18 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func resumeRequest(sessionID session.ID, descriptor session.ExtensionPlanDescriptor) runtime.ResumePlanRequest {
-	plan, _ := session.VerifyExtensionPlanForSession(sessionID, descriptor)
+func resumeRequest(t *testing.T, sessionID session.ID, descriptor session.ExtensionPlanDescriptor) runtime.ResumePlanRequest {
+	t.Helper()
+	plan, err := session.VerifyExtensionPlanForSession(sessionID, descriptor)
+	if err != nil {
+		t.Fatalf("VerifyExtensionPlanForSession error = %v", err)
+	}
 	return runtime.ResumePlanRequest{SessionID: sessionID, Plan: plan}
 }
 
 func assertResumePlanDrift(t *testing.T, registry *Registry, sessionID session.ID, persisted session.ExtensionPlanDescriptor) {
 	t.Helper()
-	plan, err := registry.AcquireResumePlan(context.Background(), resumeRequest(sessionID, persisted))
+	plan, err := registry.AcquireResumePlan(context.Background(), resumeRequest(t, sessionID, persisted))
 	if plan != nil {
 		plan.Release()
 	}
