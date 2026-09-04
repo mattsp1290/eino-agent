@@ -72,6 +72,7 @@ fi
 
 mkdir -p -- "${consumer_dir}" "${module_cache}"
 cp -f -- "${script_dir}/consumer.go" "${consumer_dir}/consumer.go"
+cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"
 
 cd -- "${consumer_dir}"
 
@@ -82,7 +83,17 @@ if [[ "${mode}" == "published" ]]; then
 fi
 "${go_command[@]}" mod init example.com/eino-agent-external-consumer
 "${go_command[@]}" mod edit -go=1.26.3
-"${go_command[@]}" mod edit -require="${root_module}@${required_version}"
+selected_required_version="${required_version}"
+if [[ "${mode}" == "published" ]]; then
+	selected_required_version="$("${go_command[@]}" list -m -f '{{.Version}}' "${root_module}@${required_version}")"
+	if [[ -z "${selected_required_version}" ]]; then
+		printf 'external-consumer: root query %s did not resolve to a version\n' "${required_version}" >&2
+		exit 1
+	fi
+fi
+printf 'ROOT_MODULE_REQUESTED=%s@%s\n' "${root_module}" "${required_version}"
+printf 'ROOT_MODULE_SELECTED=%s@%s\n' "${root_module}" "${selected_required_version}"
+"${go_command[@]}" mod edit -require="${root_module}@${selected_required_version}"
 
 if [[ "${mode}" == "local" ]]; then
 	"${go_command[@]}" mod edit -replace="${root_module}=${repository_root}"
@@ -123,9 +134,9 @@ printf 'NESTED_MODULE=%s@%s replacement=false\n' "${nested_module}" "${nested_ve
 
 if [[ "${mode}" == "published" ]]; then
 	root_selection="$("${go_command[@]}" list -m -f '{{.Version}}|{{if .Replace}}{{.Replace.Path}}{{end}}' "${root_module}")"
-	if [[ "${root_selection}" != "${required_version}|" ]]; then
+	if [[ "${root_selection}" != "${selected_required_version}|" ]]; then
 		printf 'external-consumer: root selected %s, expected %s without replacement\n' \
-			"${root_selection}" "${required_version}|" >&2
+			"${root_selection}" "${selected_required_version}|" >&2
 		exit 1
 	fi
 	if grep -Eq '^[[:space:]]*replace[[:space:](]' go.mod; then

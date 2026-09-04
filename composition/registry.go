@@ -346,7 +346,17 @@ func (r *Registry) AcquireResumePlan(ctx context.Context, request runtime.Resume
 			toolIdentities[planToolIdentity{InstanceID: component.InstanceID, Scope: identity.Scope, RegistrationID: identity.RegistrationID, ToolName: identity.Name}] = true
 		}
 	}
-	return r.acquire(ctx, request.SessionID, instances, persistedToolSelector(toolIdentities))
+	plan, err := r.acquire(ctx, request.SessionID, instances, persistedToolSelector(toolIdentities))
+	if err != nil {
+		return nil, err
+	}
+	if plan == nil || plan.Descriptor().Fingerprint != request.Plan.Fingerprint() {
+		if plan != nil {
+			plan.Release()
+		}
+		return nil, runtime.ErrExtensionPlanMismatch
+	}
+	return plan, nil
 }
 
 func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances map[string]bool, selectTool planToolSelector) (*runtime.RunPlan, error) {

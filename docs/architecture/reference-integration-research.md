@@ -126,7 +126,7 @@ Hard contract for `eino-agent`:
   categories, truncation metadata, duplicate-key rejection, and `RawJSON`
   forward compatibility.
 
-What remains outside `eino-tools` and belongs to `eino-agent`:
+What remains outside `eino-tools`:
 
 - Session-bound tool registration/materialization.
 - Permission and approval policy.
@@ -134,7 +134,11 @@ What remains outside `eino-tools` and belongs to `eino-agent`:
 - Subagent/task orchestration.
 - Plan/todo/session state.
 - Skill loading.
-- Web search connector policy and schema.
+- Generic web-search composition, permission, retention, settlement, and
+  resume remain in `eino-agent`; the canonical schema, query semantics, result
+  records, and host-search adapter belong to `eino-agent-extensions` under the
+  [delegated ownership decision](web-search-extension-ownership.md). This
+  supersedes the original research recommendation.
 - LSP/diagnostics lifecycle and schema, unless a later optional package exists.
 - Datadog instrumentation wrappers.
 
@@ -308,8 +312,11 @@ Architecture and API work should:
 - Persist only durable events/snapshots needed for replay.
 - Use no-network/fake observability in tests.
 - Keep Datadog exporter setup opt-in and environment/config driven.
-- Keep web search, LSP/diagnostics, permissions, subagents, skills, and retained
-  output in the `eino-agent` runtime layer.
+- Keep generic web-search composition and runtime enforcement, along with
+  LSP/diagnostics, permissions, subagents, skills, and retained output, in the
+  `eino-agent` runtime layer. The canonical `web_search` schema and host adapter
+  remain delegated to `eino-agent-extensions` as described in the
+  [ownership decision](web-search-extension-ownership.md).
 
 Documentation and examples should:
 

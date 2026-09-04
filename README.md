@@ -125,6 +125,8 @@ the detailed rules.
 
 ## Integration Guides
 
+- `docs/architecture/web-search-extension-ownership.md`: delegated ownership
+  and public runtime seams for the `eino-agent-extensions` web-search adapter.
 - `docs/consumer-guide.md`: public API, storage, tool lifecycle, observability,
   configuration, and migration guidance.
 - `docs/integrations/datadog.md`: Datadog/eino-obs exporter wiring and safe

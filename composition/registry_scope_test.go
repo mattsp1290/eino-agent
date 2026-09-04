@@ -60,7 +60,7 @@ func TestAtomicScopedCompositionAndStrictResume(t *testing.T) {
 	}
 	planB.Release()
 
-	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest(t, "session-a", persisted))
 	if err != nil || resumed.Descriptor().Fingerprint != persisted.Fingerprint {
 		t.Fatalf("AcquireResumePlan = %#v, %v", resumed, err)
 	}
@@ -390,7 +390,7 @@ func TestResumePlanDoesNotLeaseLaterSameSessionMount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest("session-a", persisted))
+	resumed, err := registry.AcquireResumePlan(context.Background(), resumeRequest(t, "session-a", persisted))
 	if err != nil {
 		t.Fatal(err)
 	}

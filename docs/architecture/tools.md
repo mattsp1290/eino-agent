@@ -21,6 +21,12 @@ The `tools` package owns:
 - model-facing `schema.ToolInfo` assembly without reusing mutable containers.
 
 Concrete leaf behavior remains outside this package.
+In particular, `web_search` is a concrete native extension whose canonical
+model schema, semantic validation, result records, and host-search adapter
+belong to `eino-agent-extensions`. This repository supplies only the generic
+composition, validation, permission, retention, settlement, and resume
+mechanics described in the
+[`delegated web-search ownership decision`](web-search-extension-ownership.md).
 `tools/einotools.MountStandard` translates deterministic
 `eino-tools/catalog` definitions into `tools.Definition` values and mounts the
 complete set atomically through `composition.Registry`.
