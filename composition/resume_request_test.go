@@ -2,6 +2,7 @@ package composition
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -16,12 +17,11 @@ func resumeRequest(sessionID session.ID, descriptor session.ExtensionPlanDescrip
 func assertResumePlanDrift(t *testing.T, registry *Registry, sessionID session.ID, persisted session.ExtensionPlanDescriptor) {
 	t.Helper()
 	plan, err := registry.AcquireResumePlan(context.Background(), resumeRequest(sessionID, persisted))
-	if err != nil {
-		t.Fatalf("AcquireResumePlan error = %v", err)
+	if plan != nil {
+		plan.Release()
 	}
-	defer plan.Release()
-	if plan.Descriptor().Fingerprint == persisted.Fingerprint {
-		t.Fatalf("provider returned persisted fingerprint %s for drifted composition", persisted.Fingerprint)
+	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("AcquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
 

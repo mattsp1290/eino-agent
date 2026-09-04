@@ -152,8 +152,13 @@ Important downstream decisions:
   through one process-wide, ref-counted lock domain. Workspace tools share the
   canonical-root key; non-concurrent static tools share their catalog-ID key.
 - Independent workspace roots may run concurrently.
-- `web_search` is out of scope for `eino-tools`; `eino-agent` owns the
-  model-facing schema and runtime connector policy.
+- `web_search` is out of scope for `eino-tools`.
+  [`eino-agent-extensions` owns](architecture/web-search-extension-ownership.md)
+  the reusable model-facing schema, strict query semantics, bounded result
+  records, and host-search adapter. `eino-agent` owns the generic composition,
+  JSON-object validation, permission, durable execution, retention, and resume
+  seams. The embedding host owns provider credentials, network/backend policy,
+  freshness and rate limits, presentation, and backend lifecycle.
 - LSP/diagnostics are out of scope for `eino-tools` in this slice;
   `eino-agent` owns the model-facing schema unless a later optional package is
   created.

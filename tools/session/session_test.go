@@ -3,6 +3,7 @@ package sessiontools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -315,14 +316,12 @@ func TestSessionToolMountResumeRejectsIdentityDrift(t *testing.T) {
 			}
 			defer func() { _ = mount.Close(context.Background()) }()
 			resumed, err := registry.AcquireResumePlan(context.Background(), resumePlanRequest("session-a", descriptor))
-			if err != nil {
-				t.Fatalf("AcquireResumePlan error = %v", err)
-			}
-			if resumed.Descriptor().Fingerprint == descriptor.Fingerprint {
+			if resumed != nil {
 				resumed.Release()
-				t.Fatal("drifted session tool composition retained persisted fingerprint")
 			}
-			resumed.Release()
+			if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+				t.Fatalf("AcquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
+			}
 		})
 	}
 }

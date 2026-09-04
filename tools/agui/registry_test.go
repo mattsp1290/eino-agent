@@ -120,12 +120,11 @@ func aguiResumePlanRequest(sessionID session.ID, descriptor session.ExtensionPla
 func assertAGUIResumePlanDrift(t *testing.T, registry *composition.Registry, persisted session.ExtensionPlanDescriptor) {
 	t.Helper()
 	plan, err := registry.AcquireResumePlan(context.Background(), aguiResumePlanRequest("session-a", persisted))
-	if err != nil {
-		t.Fatalf("AcquireResumePlan error = %v", err)
+	if plan != nil {
+		plan.Release()
 	}
-	defer plan.Release()
-	if plan.Descriptor().Fingerprint == persisted.Fingerprint {
-		t.Fatal("drifted AG-UI composition retained persisted fingerprint")
+	if !errors.Is(err, runtime.ErrExtensionPlanMismatch) {
+		t.Fatalf("AcquireResumePlan error = %v, want ErrExtensionPlanMismatch", err)
 	}
 }
 

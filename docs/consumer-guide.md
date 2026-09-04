@@ -278,7 +278,6 @@ Mount native and Wasm-backed tool definitions through the same
 
 ```go
 loader := wasmext.NewLoader()
-defer loader.Close(ctx)
 wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
     Name:           "review_tool",
     Path:           "extensions/review-tool.wasm",
@@ -288,7 +287,10 @@ wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
 if err != nil {
     return err
 }
-plans := composition.NewRegistry(nil)
+plans, err := composition.NewRegistry(nil)
+if err != nil {
+    return err
+}
 component := extension.Component{
     InstanceID: "review-tool-v1",
     Artifact: extension.Artifact{
@@ -307,7 +309,13 @@ mount, err := plans.Mount(ctx, component, composition.InstallerFunc(
 if err != nil {
     return err
 }
-defer mount.Close(ctx)
+defer func() {
+    mount.Deactivate()
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = mount.Close(shutdownCtx)
+    _ = loader.Close(shutdownCtx)
+}()
 
 orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithStore(store),
@@ -334,7 +342,9 @@ Set `ModuleConfig.Observer` when guest log lines should be exported through an
 `einoobs.Observer`; `wasmext` attaches the configured module name and verified
 digest and enforces a 4 KiB-or-tighter message bound.
 
-`tools.Definition` requires `Decode`, `Encode`, and `Execute`.
+`tools.Definition` requires `Name` and `Execute`. `Normalize` and `Pattern` are
+optional callbacks; typed adapters can supply them without changing the
+JSON-native runtime contract.
 `composition.Registry.Mount` validates and freezes definitions under a stable
 component identity; deactivation stops future plan acquisition while acquired
 plans retain their leases. `config.Snapshot.Tools` controls per-run
@@ -349,7 +359,10 @@ Mount the standard `eino-tools` catalog through the same composition registry
 used by every other executable component:
 
 ```go
-plans := composition.NewRegistry(reporter)
+plans, err := composition.NewRegistry(reporter)
+if err != nil {
+    return err
+}
 component := extension.Component{
     InstanceID: "standard-coding-tools",
     Artifact: extension.Artifact{
@@ -373,7 +386,12 @@ standardMount, err := einotools.MountStandard(ctx, plans, component, einotools.O
 if err != nil {
     return err
 }
-defer standardMount.Close(context.Background())
+defer func() {
+    standardMount.Deactivate()
+    shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = standardMount.Close(shutdownCtx)
+}()
 
 orchestrator, err := runtime.NewStreamingOrchestrator(
     runtime.WithRunPlanProvider(plans),
@@ -415,6 +433,49 @@ Runtime-controlled tools use this lifecycle:
 6. Best-effort publish the exact already-committed phase events to live and
    extension sinks; publication failure never reverses durable state.
 7. Emit observability from the committed result.
+
+### Delegated web-search extension
+
+The canonical `web_search` contract is deliberately not defined in this
+repository. It belongs to `eino-agent-extensions`; see the
+[`delegated web-search ownership decision`](architecture/web-search-extension-ownership.md)
+and its
+[`fresh-module runtime proof`](../testdata/external-consumer/delegated_web_search_fixture_test.go).
+The integration uses these public target seams:
+
+- Define the JSON-native boundary with `tools.Definition`, a raw
+  `tools.InputNormalizer`, `tools.TypedPermissionPattern`, and
+  `tools.TypedExecutor`. Ordinary `tools.TypedNormalizer` is suitable only if
+  the input type itself implements equivalently strict unmarshalling.
+- Publish it with `composition.Registry.Mount` and
+  `composition.ToolRegistration`; freeze execution with `AcquireRunPlan`, and
+  recover with `AcquireResumePlan`.
+- Identify native ownership through `extension.Component`,
+  `extension.Artifact`, `extension.SourceNative`, and a global or exact-session
+  scope.
+- Pass the registry through `runtime.WithRunPlanProvider`. Execution receives
+  `runtime.ToolCall`, bounded `runtime.ToolContext`, and the executor's
+  `context.Context`; `runtime.RetentionPolicy` enforces the extension's
+  calculated output budget.
+- For strict resume, capture the fingerprinted `runtime.RunPlan.Descriptor`,
+  call `runtime.RunPlan.Release`, verify the persisted
+  `session.ExtensionPlanDescriptor` with
+  `session.VerifyExtensionPlanForSession`, and pass the resulting
+  `session.SealedExtensionPlan` in `runtime.ResumePlanRequest`. Mismatch is
+  `runtime.ErrExtensionPlanMismatch`, and every returned plan must be
+  released. `session.SealExtensionPlanForSession` is separately reserved for
+  newly reconstructed fingerprintless descriptors, not plan descriptors.
+- Apply host policy through `permissions.Policy` or
+  `permissions.StaticPolicy`.
+- Shut down by calling `composition.Mount.Deactivate`, then `Close` with a new
+  finite context. Deactivation removes the tool from future plans while
+  already acquired plans retain their lease until `runtime.RunPlan.Release`.
+
+The extension fixes the tool name and registration ID at `web_search`, the
+permission at `network.web.search`, and the non-sensitive constant permission
+pattern at `web_search`. The host supplies and rotates honest component
+artifact identity, owns credentials and backend lifecycle, and never places
+secrets in configuration hashes or model input.
 
 Tool-call state transitions publish runtime/AG-UI events only after the matching
 pending, running, or terminal event is durably committed and when the bridge
