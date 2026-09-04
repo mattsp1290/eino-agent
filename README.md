@@ -19,8 +19,8 @@ and observability remain provider-neutral.
 
 - Module: `github.com/mattsp1290/eino-agent`
 - Go: `1.26.3`
-- Supported root release: `v0.3.0` at commit
-  `62b243dc99ff7b0d698507b428b474c1861e8712`, verified on 2026-09-02 with
+- Supported root release: `v0.3.3` at commit
+  `36fe8d8a046b4dd193e97b8f49a580a71bf07bbc`, verified on 2026-09-04 with
   `make check` and a fresh published consumer using no `replace`, workspace,
   vendor tree, or checkout access
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`

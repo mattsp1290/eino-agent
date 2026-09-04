@@ -11,13 +11,13 @@ For a runnable starting point, see `examples/minimal-server` and
 
 ## Installation
 
-The supported root pin is `github.com/mattsp1290/eino-agent@v0.3.0` at commit
-`62b243dc99ff7b0d698507b428b474c1861e8712` and requires Go 1.26.3. On
-2026-09-02, that exact clean commit passed `make check`; its remote annotated
+The supported root pin is `github.com/mattsp1290/eino-agent@v0.3.3` at commit
+`36fe8d8a046b4dd193e97b8f49a580a71bf07bbc` and requires Go 1.26.3. On
+2026-09-04, that exact clean commit passed `make check`; its remote annotated
 tag peeled to the same commit; and an unrelated module verified its complete
-graph and state-aware public API through the standard public Go proxy and
-checksum database with no `replace`, workspace, vendor tree, or checkout
-access.
+graph, state-aware public API, and delegated web-search runtime contract
+through the standard public Go proxy and checksum database with no `replace`,
+workspace, vendor tree, or checkout access.
 
 The release depends on the separately published generated-bindings
 module `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, whose repository
