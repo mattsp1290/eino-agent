@@ -12,12 +12,15 @@ bd close <id>         # Complete work
 bd dolt push          # Push beads data to remote
 ```
 
-## Local Agent Plans
+## Local Agent Artifacts
 
-`.agents/plans/` is intentionally gitignored local execution input. Preserve
-its contents unless the user explicitly requests local deletion, and never
-stage plan files. Treat a request to remove a plan from Git or a pull request
-as index-only removal; verify the local plan still exists afterward.
+`.agents/plans/`, `.agents/reviews/`, and `reviews/` are intentionally
+gitignored local agent artifacts. Never stage or commit files in these
+directories, including with `git add -f`. Preserve their contents unless the
+user explicitly requests local deletion. Treat a request to remove these
+artifacts from Git or a pull request as index-only removal; verify the local
+files still exist afterward. Before committing, verify that
+`git ls-files -- .agents/plans .agents/reviews reviews` returns no paths.
 
 ## Non-Interactive Shell Commands
 
