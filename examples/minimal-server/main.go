@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -23,8 +24,8 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/store/sqlite"
-	"github.com/mattsp1290/eino-agent/stream"
 	"github.com/mattsp1290/eino-agent/transport"
+	"github.com/mattsp1290/eino-agent/watch"
 )
 
 const (
@@ -58,17 +59,18 @@ func main() {
 // Server is a small embeddable HTTP surface around the runtime and AG-UI
 // transport adapters.
 type Server struct {
-	store   *sqlite.Store
-	tail    *stream.Tail
-	runtime *runtime.StreamingOrchestrator
-	config  config.Snapshot
+	store    *sqlite.Store
+	observer *watch.Service
+	mount    *composition.Mount
+	runtime  *runtime.StreamingOrchestrator
+	config   config.Snapshot
 
 	mu      sync.Mutex
 	handles map[session.RunID]activeHandle
 }
 
 // NewServer opens local durable storage and wires the runtime to AG-UI SSE
-// replay/live-tail handlers.
+// session state-watch handlers.
 func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	if dbPath == "" {
 		dbPath = "minimal-server.db"
@@ -77,36 +79,51 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	ids := &sequenceIDs{}
-	tail := stream.NewTail(64)
-	sink := eventSink{tail: tail}
+	ids := &sequenceIDs{prefix: rand.Text()}
+	observer, err := watch.NewService(store, watch.Options{
+		Snapshot:     session.ObservationLimits{MaxMessages: 50, MaxTools: 100, MaxParts: 200, MaxSnapshotBytes: 1 << 20, MaxTextBytes: 128 << 10},
+		PollInterval: 50 * time.Millisecond, ReadTimeout: time.Second, MaxSubscriptions: 64, MaxWatchedSessions: 32, MaxLiveRuns: 32, MaxLiveTextBytes: 1 << 20, PendingUpdates: 64,
+	})
+	if err != nil {
+		_ = store.Close()
+		return nil, err
+	}
 	snapshot := minimalConfig()
 	plans, err := composition.NewRegistry(nil)
 	if err != nil {
-		tail.Close()
+		_ = observer.Close(ctx)
+		_ = store.Close()
+		return nil, err
+	}
+	mount, err := mountScriptedTool(ctx, plans)
+	if err != nil {
+		_ = observer.Close(ctx)
 		_ = store.Close()
 		return nil, err
 	}
 	orchestrator, err := runtime.NewStreamingOrchestrator(
 		runtime.WithStore(store),
 		runtime.WithModelResolver(scriptedResolver{}),
-		runtime.WithEventSink(sink),
+		runtime.WithSessionObserver(observer),
 		runtime.WithIDGenerator(ids),
 		runtime.WithRunPlanProvider(plans),
 		runtime.WithOwnerID("minimal-server"),
 		runtime.WithQueueSize(16),
 	)
 	if err != nil {
-		tail.Close()
+		mount.Deactivate()
+		_ = mount.Close(ctx)
+		_ = observer.Close(ctx)
 		_ = store.Close()
 		return nil, err
 	}
 	return &Server{
-		store:   store,
-		tail:    tail,
-		config:  snapshot,
-		handles: map[session.RunID]activeHandle{},
-		runtime: orchestrator,
+		store:    store,
+		observer: observer,
+		mount:    mount,
+		config:   snapshot,
+		handles:  map[session.RunID]activeHandle{},
+		runtime:  orchestrator,
 	}, nil
 }
 
@@ -128,11 +145,21 @@ func (s *Server) Close() error {
 		select {
 		case <-handle.done:
 		case <-deadline:
-			log.Printf("timed out waiting for run %s to stop during close", handle.handle.RunID())
+			return fmt.Errorf("timed out waiting for run %s to stop during close", handle.handle.RunID())
 		}
 	}
-	if s.tail != nil {
-		s.tail.Close()
+	cleanupCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if s.mount != nil {
+		s.mount.Deactivate()
+		if err := s.mount.Close(cleanupCtx); err != nil {
+			return err
+		}
+	}
+	if s.observer != nil {
+		if err := s.observer.Close(cleanupCtx); err != nil {
+			return err
+		}
 	}
 	if s.store != nil {
 		return s.store.Close()
@@ -165,17 +192,10 @@ func (s *Server) serveSession(w http.ResponseWriter, r *http.Request) {
 			methodNotAllowed(w, http.MethodGet)
 			return
 		}
-		transport.SSEHandler(transport.SSEConfig{
-			Store:   s.store,
-			Tail:    s.tail,
+		transport.SessionWatchHandler(transport.SessionWatchConfig{
+			Service: s.observer, WriteTimeout: time.Second,
+			Auth:    func(ctx context.Context, _ *http.Request) (context.Context, error) { return ctx, nil },
 			Session: func(*http.Request) (session.ID, error) { return sessionID, nil },
-			Cursor:  eventCursorFromRequest,
-			ThreadID: func(_ *http.Request, id session.ID) string {
-				return string(id)
-			},
-			RunID: func(r *http.Request) string {
-				return r.URL.Query().Get("run_id")
-			},
 		}).ServeHTTP(w, r)
 	case "runs":
 		s.startRun(w, r, sessionID)
@@ -303,20 +323,6 @@ func decodeRunMessage(r *http.Request) (runtime.UserMessage, error) {
 	return runtime.UserMessage{Content: payload.Message}, nil
 }
 
-func eventCursorFromRequest(r *http.Request) session.EventCursor {
-	cursor := session.EventCursor{Limit: 100}
-	query := r.URL.Query()
-	if after := query.Get("after"); after != "" {
-		cursor.AfterEventID = session.EventID(after)
-	}
-	if limit := query.Get("limit"); limit != "" {
-		if parsed, err := strconv.Atoi(limit); err == nil && parsed > 0 {
-			cursor.Limit = parsed
-		}
-	}
-	return cursor
-}
-
 func parseSessionRoute(path string) (session.ID, string, bool) {
 	parts := strings.Split(strings.Trim(strings.TrimPrefix(path, "/sessions/"), "/"), "/")
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
@@ -372,6 +378,11 @@ func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Reques
 			einoschema.AssistantMessage("Minimal server received ", nil),
 			einoschema.AssistantMessage(lastUserText(request.Messages), nil),
 		}
+		if !currentTurnHasTool(request.Messages) {
+			chunks = []*einoschema.Message{einoschema.AssistantMessage("Checking input. ", nil), einoschema.AssistantMessage("", []einoschema.ToolCall{{
+				ID: rand.Text(), Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"safe scripted input"}`},
+			}})}
+		}
 		for _, chunk := range chunks {
 			select {
 			case <-ctx.Done():
@@ -405,24 +416,17 @@ func lastUserText(messages []*einoschema.Message) string {
 	return "the request"
 }
 
-type eventSink struct {
-	tail *stream.Tail
-}
-
-func (s eventSink) Emit(ctx context.Context, event session.EventRecord) {
-	s.tail.Emit(ctx, event)
-}
-
 type sequenceIDs struct {
-	mu sync.Mutex
-	n  int
+	prefix string
+	mu     sync.Mutex
+	n      int
 }
 
 func (s *sequenceIDs) next(prefix string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.n++
-	return prefix + "-" + strconv.Itoa(s.n)
+	return s.prefix + "-" + prefix + "-" + strconv.Itoa(s.n)
 }
 
 func (s *sequenceIDs) NewRunID() session.RunID         { return session.RunID(s.next("run")) }

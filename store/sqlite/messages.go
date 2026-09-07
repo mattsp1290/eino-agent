@@ -24,12 +24,16 @@ func (s *Store) appendMessage(ctx context.Context, record session.Message) (sess
 	if err != nil {
 		return session.Message{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO messages(id, session_id, run_id, role, record, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		record.ID, record.SessionID, record.RunID, record.Role, raw, timeText(record.CreatedAt))
+	_, err = s.exec(ctx, `INSERT INTO messages(id, session_id, run_id, role, finalized, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.SessionID, record.RunID, record.Role, record.Role != session.RoleAssistant, raw, timeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 
 func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Part, error) {
+	text, valid := observationText(record)
+	if err := s.validatePartOwner(ctx, record); err != nil {
+		return session.Part{}, err
+	}
 	var existing session.Part
 	if err := s.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{record.ID}, &existing); err == nil {
 		if !sameRecord(existing, record) {
@@ -43,17 +47,21 @@ func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Pa
 	if err != nil {
 		return session.Part{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO parts(id, message_id, session_id, run_id, ordinal, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.MessageID, record.SessionID, record.RunID, record.Ordinal, raw, timeText(record.CreatedAt))
+	_, err = s.exec(ctx, `INSERT INTO parts(id, message_id, session_id, run_id, ordinal, kind, display_text, text_valid, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.MessageID, record.SessionID, record.RunID, record.Ordinal, record.Kind, text, valid, raw, timeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 
 func (s *Store) updatePart(ctx context.Context, record session.Part) error {
+	text, valid := observationText(record)
+	if err := s.validatePartOwner(ctx, record); err != nil {
+		return err
+	}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	result, err := s.exec(ctx, `UPDATE parts SET ordinal = ?, record = ? WHERE id = ?`, record.Ordinal, raw, record.ID)
+	result, err := s.exec(ctx, `UPDATE parts SET ordinal = ?, kind = ?, display_text = ?, text_valid = ?, record = ? WHERE id = ? AND session_id = ? AND run_id = ? AND message_id = ?`, record.Ordinal, record.Kind, text, valid, raw, record.ID, record.SessionID, record.RunID, record.MessageID)
 	if err != nil {
 		return mapErr(err)
 	}

@@ -19,7 +19,7 @@ import (
 	"github.com/mattsp1290/eino-agent/session/history"
 )
 
-func TestMinimalServerStreamsAndReplaysAGUIEvents(t *testing.T) {
+func TestMinimalServerWatchesAndReconnectsAGUIState(t *testing.T) {
 	t.Parallel()
 
 	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
@@ -32,8 +32,8 @@ func TestMinimalServerStreamsAndReplaysAGUIEvents(t *testing.T) {
 
 	runID := startRun(t, httpServer.URL, defaultSessionID, "hello")
 	eventsURL := httpServer.URL + "/sessions/" + string(defaultSessionID) + "/events?run_id=" + string(runID)
-	live := readSSEUntil(t, eventsURL, "RUN_FINISHED", 2*time.Second)
-	for _, want := range []string{"RUN_STARTED", "TEXT_MESSAGE_CONTENT", "RUN_FINISHED"} {
+	live := readSSEUntil(t, eventsURL, `"Status":"completed","ProviderID"`, 2*time.Second)
+	for _, want := range []string{"MESSAGES_SNAPSHOT", "STATE_SNAPSHOT", `"Status":"completed","ProviderID"`} {
 		if !strings.Contains(live, want) {
 			t.Fatalf("live SSE missing %s:\n%s", want, live)
 		}
@@ -42,8 +42,8 @@ func TestMinimalServerStreamsAndReplaysAGUIEvents(t *testing.T) {
 		t.Fatalf("live SSE missing run id %s:\n%s", runID, live)
 	}
 
-	replay := readSSEUntil(t, eventsURL, "RUN_FINISHED", 2*time.Second)
-	for _, want := range []string{"MESSAGES_SNAPSHOT", "RUN_STARTED", "RUN_FINISHED", "Minimal server received"} {
+	replay := readSSEUntil(t, eventsURL, `"Status":"completed","ProviderID"`, 2*time.Second)
+	for _, want := range []string{"MESSAGES_SNAPSHOT", "STATE_SNAPSHOT", `"Status":"completed","ProviderID"`, "Minimal server received"} {
 		if !strings.Contains(replay, want) {
 			t.Fatalf("replay SSE missing %s:\n%s", want, replay)
 		}
@@ -162,31 +162,24 @@ func TestMinimalServerSequentialRunsUseDurableHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListModelRequests error = %v", err)
 	}
-	if len(requests.Records) != 1 {
-		t.Fatalf("second-run model requests = %d, want 1", len(requests.Records))
+	if len(requests.Records) != 2 {
+		t.Fatalf("second-run model requests = %d, want 2", len(requests.Records))
 	}
 	var audited []runtime.AuditedMessage
 	if err := json.Unmarshal(requests.Records[0].Messages, &audited); err != nil {
 		t.Fatalf("decode audited messages: %v", err)
 	}
-	wantProvider := []struct {
-		role    einoschema.RoleType
-		content string
-	}{
-		{einoschema.User, "first-user"},
-		{einoschema.Assistant, `Minimal server received "first-user"`},
-		{einoschema.User, "second-user"},
+	wantRoles := []einoschema.RoleType{einoschema.User, einoschema.Assistant, einoschema.Tool, einoschema.Assistant, einoschema.User}
+	if len(audited) != len(wantRoles) {
+		t.Fatalf("provider history length=%d", len(audited))
 	}
-	if len(audited) != len(wantProvider) {
-		t.Fatalf("second-run provider history length = %d, want %d", len(audited), len(wantProvider))
-	}
-	for index := range wantProvider {
+	for i, a := range audited {
 		var message einoschema.Message
-		if err := json.Unmarshal(audited[index].Canonical, &message); err != nil {
-			t.Fatalf("decode provider message %d: %v", index, err)
+		if err := json.Unmarshal(a.Canonical, &message); err != nil {
+			t.Fatal(err)
 		}
-		if message.Role != wantProvider[index].role || message.Content != wantProvider[index].content {
-			t.Fatalf("provider history[%d] = (%s, %q), want (%s, %q)", index, message.Role, message.Content, wantProvider[index].role, wantProvider[index].content)
+		if message.Role != wantRoles[i] {
+			t.Fatalf("message %d role=%s", i, message.Role)
 		}
 	}
 
@@ -194,23 +187,20 @@ func TestMinimalServerSequentialRunsUseDurableHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadHistory error = %v", err)
 	}
-	want := []struct {
-		role    einoschema.RoleType
-		content string
-	}{
-		{einoschema.User, "first-user"},
-		{einoschema.Assistant, `Minimal server received "first-user"`},
-		{einoschema.User, "second-user"},
-		{einoschema.Assistant, `Minimal server received "second-user"`},
+	if len(messages) != 8 {
+		t.Fatalf("history length=%d", len(messages))
 	}
-	if len(messages) != len(want) {
-		t.Fatalf("history length = %d, want %d: %#v", len(messages), len(want), messages)
+	if messages[3].Content != `Minimal server received "first-user"` || messages[7].Content != `Minimal server received "second-user"` {
+		t.Fatalf("wrong final messages: %#v", messages)
 	}
-	for index := range want {
-		if messages[index].Role != want[index].role || messages[index].Content != want[index].content {
-			t.Fatalf("history[%d] = (%s, %q), want (%s, %q)", index, messages[index].Role, messages[index].Content, want[index].role, want[index].content)
-		}
+	snap, err := server.store.ReadObservationSnapshot(context.Background(), sessionID, session.ObservationLimits{MaxMessages: 50, MaxTools: 100, MaxParts: 200, MaxSnapshotBytes: 1 << 20, MaxTextBytes: 128 << 10})
+	if err != nil {
+		t.Fatal(err)
 	}
+	if len(snap.Messages) != 6 || len(snap.Tools) != 2 {
+		t.Fatalf("watch projection: %#v", snap)
+	}
+
 }
 
 func waitForTerminalRun(t *testing.T, store session.Store, runID session.RunID, timeout time.Duration) {

@@ -416,6 +416,7 @@ type admissionStore struct {
 	sessions          map[session.ID]session.Session
 	runs              map[session.RunID]session.Run
 	messages          map[session.MessageID]session.Message
+	finalized         map[session.MessageID]bool
 	parts             map[session.PartID]session.Part
 	events            map[session.EventID]session.EventRecord
 	toolCalls         map[session.ToolCallID]session.ToolCall
@@ -439,6 +440,7 @@ func newAdmissionStore() *admissionStore {
 		sessions:      map[session.ID]session.Session{},
 		runs:          map[session.RunID]session.Run{},
 		messages:      map[session.MessageID]session.Message{},
+		finalized:     map[session.MessageID]bool{},
 		parts:         map[session.PartID]session.Part{},
 		events:        map[session.EventID]session.EventRecord{},
 		toolCalls:     map[session.ToolCallID]session.ToolCall{},
@@ -455,6 +457,7 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.sessions = tx.sessions
 	s.runs = tx.runs
 	s.messages = tx.messages
+	s.finalized = tx.finalized
 	s.parts = tx.parts
 	s.events = tx.events
 	s.toolCalls = tx.toolCalls
@@ -468,6 +471,7 @@ func (s *admissionStore) clone() *admissionStore {
 		sessions:          cloneMap(s.sessions),
 		runs:              cloneMap(s.runs),
 		messages:          cloneMap(s.messages),
+		finalized:         cloneMap(s.finalized),
 		parts:             cloneMap(s.parts),
 		events:            cloneMap(s.events),
 		toolCalls:         cloneMap(s.toolCalls),
@@ -833,6 +837,7 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 	s.sessions = tx.sessions
 	s.runs = tx.runs
 	s.messages = tx.messages
+	s.finalized = tx.finalized
 	s.parts = tx.parts
 	s.events = tx.events
 	s.toolCalls = tx.toolCalls
@@ -997,3 +1002,12 @@ func (s *admissionStore) ListModelRequests(_ context.Context, runID session.RunI
 }
 
 var _ session.ExecutionStore = (*fakeExecutionStore)(nil)
+
+func (s *fakeExecutionStore) FinalizeAssistantMessage(_ context.Context, id session.MessageID) error {
+	m, ok := s.messages[id]
+	if !ok || !s.valid() || m.RunID != s.fence.RunID || m.SessionID != s.runs[s.fence.RunID].SessionID || m.Role != session.RoleAssistant {
+		return session.ErrConflict
+	}
+	s.finalized[id] = true
+	return nil
+}

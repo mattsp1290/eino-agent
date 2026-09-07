@@ -20,6 +20,7 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
+	"github.com/mattsp1290/eino-agent/watch"
 )
 
 var (
@@ -40,6 +41,7 @@ type IDGenerator interface {
 
 // StreamingOrchestrator executes admitted runs against Eino model streams.
 type StreamingOrchestrator struct {
+	sessionObserver         *watch.Service
 	configured              bool
 	store                   session.Store
 	model                   model.Resolver

@@ -27,6 +27,7 @@ type Factory func(testing.TB) Subject
 // Run executes the durable store contract suite against a store implementation.
 func Run(t *testing.T, factory Factory) {
 	t.Helper()
+	observationContract(t, factory)
 
 	t.Run("atomic run ownership", func(t *testing.T) {
 		subject := setup(t, factory)

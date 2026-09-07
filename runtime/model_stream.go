@@ -11,6 +11,7 @@ import (
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/watch"
 )
 
 type modelStreamResult struct {
@@ -35,6 +36,7 @@ type modelStreamReader interface {
 }
 
 type modelStreamAttempt struct {
+	live        watch.LiveIdentity
 	execution   *runExecution
 	snapshot    TurnSnapshot
 	messageID   session.MessageID
@@ -59,6 +61,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		if usage != nil {
 			*usage = addUsage(*usage, result.usage)
 		}
+		o.sessionObserver.FinishAttempt(state.live)
 		state.finalize(ctx, o, &result)
 	}()
 	request := snapshot.ProviderRequest(messageID, o.trace, messages)
@@ -77,6 +80,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	if result.err != nil {
 		return result
 	}
+	state.live = o.sessionObserver.BeginAttempt(watch.LiveIdentity{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, RequestID: state.record.ID, Attempt: attempt, Step: step})
 	request.IdempotencyKey = string(state.record.ID)
 	result.err = updateModelRequest(ctx, execution.store, &state.record, session.ModelRequestDispatchStarted, nil, o.now())
 	if result.err != nil {
@@ -110,6 +114,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 }
 
 func (a *modelStreamAttempt) observeDelta(ctx context.Context, host *StreamingOrchestrator, index int64, message *einoschema.Message) {
+	host.sessionObserver.AppendText(a.live, message.Content)
 	host.observeStreamChunk(a.observation, index)
 	a.execution.eventSink().Emit(ctx, session.EventRecord{
 		Kind: EventMessageDelta, SessionID: a.snapshot.SessionID, RunID: a.snapshot.RunID,

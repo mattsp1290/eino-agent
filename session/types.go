@@ -375,6 +375,7 @@ type ExecutionStore interface {
 	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
 	SettleRun(ctx context.Context, request SettleRunRequest) (RunSettlementResult, error)
 	AppendMessage(ctx context.Context, message Message) (Message, error)
+	FinalizeAssistantMessage(ctx context.Context, id MessageID) error
 	AppendPart(ctx context.Context, part Part) (Part, error)
 	UpdatePart(ctx context.Context, part Part) error
 	AppendEvent(ctx context.Context, event EventRecord) (EventRecord, error)

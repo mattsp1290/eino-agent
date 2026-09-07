@@ -23,8 +23,8 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 	if err != nil {
 		return session.ToolCall{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO tool_calls(id, session_id, run_id, message_id, status, claimed_by, claim_token, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.SessionID, record.RunID, record.MessageID, record.Status, record.ClaimedBy, record.ClaimToken, raw)
+	_, err = s.exec(ctx, `INSERT INTO tool_calls(id, session_id, run_id, message_id, status, claimed_by, claim_token, name, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		record.ID, record.SessionID, record.RunID, record.MessageID, record.Status, record.ClaimedBy, record.ClaimToken, record.Name, raw)
 	return record, mapErr(err)
 }
 
