@@ -57,7 +57,7 @@ func (b *WatchBridge) Apply(u watch.Update) error {
 		}
 		b.snapshot = u.Snapshot.Clone()
 		for id, overlay := range b.overlays {
-			if !watch.Eligible(b.snapshot, overlay.Live.Identity) {
+			if !watchOverlayEligible(b.snapshot, overlay) {
 				delete(b.overlays, id)
 			}
 		}
@@ -69,7 +69,7 @@ func (b *WatchBridge) Apply(u watch.Update) error {
 		if !utf8.ValidString(u.Live.Text) {
 			return watch.ErrResyncRequired
 		}
-		if watch.Eligible(b.snapshot, id) {
+		if watchOverlayEligible(b.snapshot, u) {
 			previous, exists := b.overlays[id.MessageID]
 			if !exists || u.Live.PublicationVersion > previous.Live.PublicationVersion {
 				b.overlays[id.MessageID] = u
@@ -97,7 +97,33 @@ func (b *WatchBridge) render() error {
 		}
 		messages = append(messages, types.Message{ID: string(m.ID), Role: types.Role(m.Role), Content: text})
 	}
+	if runNotice, ok := b.overlays[""]; ok {
+		state.Live = append(state.Live, WatchLiveState{Identity: runNotice.Live.Identity, Available: false, PublicationVersion: runNotice.Live.PublicationVersion})
+	}
 	b.emit.MessagesSnapshot(messages)
 	b.emit.StateSnapshot(state)
 	return errors.Join(b.emit.Err(), b.emit.EncErr())
+}
+
+// A run-qualified unavailable notice can precede a visible placeholder. It
+// communicates availability in state without inventing a conversation message.
+func watchOverlayEligible(snapshot session.ObservationSnapshot, u watch.Update) bool {
+	id := u.Live.Identity
+	if u.Kind != watch.LiveUnavailable || id.MessageID != "" {
+		return watch.Eligible(snapshot, id)
+	}
+	if id.SessionID != snapshot.Watermark.SessionID {
+		return false
+	}
+	for _, message := range snapshot.Messages {
+		if message.RunID == id.RunID && !message.Finalized {
+			return false
+		}
+	}
+	for _, run := range snapshot.Runs {
+		if run.ID == id.RunID && !run.Terminal() {
+			return true
+		}
+	}
+	return false
 }

@@ -222,6 +222,7 @@ func (o *StreamingOrchestrator) runFresh(ctx context.Context, execution *runExec
 		return
 	}
 	run = started
+	o.sessionObserver.Hint(run.SessionID)
 	extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
 	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot)
 	if err != nil {

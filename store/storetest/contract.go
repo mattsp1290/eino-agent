@@ -28,6 +28,7 @@ type Factory func(testing.TB) Subject
 func Run(t *testing.T, factory Factory) {
 	t.Helper()
 	observationContract(t, factory)
+	boundedObservationContract(t, factory)
 
 	t.Run("atomic run ownership", func(t *testing.T) {
 		subject := setup(t, factory)

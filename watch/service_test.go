@@ -2,8 +2,10 @@ package watch
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -99,6 +101,9 @@ func TestWatchAdmissionPollingAndFinalization(t *testing.T) {
 		t.Fatal(final)
 	}
 	s.AppendText(id, "delayed")
+	if notice := next(t, sub); notice.Kind != LiveUnavailable || notice.Live.Identity.MessageID != "" {
+		t.Fatal(notice)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 	if _, err = sub.Next(ctx); !errors.Is(err, context.DeadlineExceeded) {
@@ -159,6 +164,9 @@ func TestCacheBeforeVisibilityAndWindowEviction(t *testing.T) {
 	}
 	durable(t, sub, func(v session.ObservationSnapshot) bool { return v.Messages[0].ID == "z" })
 	s.AppendText(id, "delayed")
+	if notice := next(t, sub); notice.Kind != LiveUnavailable || notice.Live.Identity.MessageID != "" {
+		t.Fatal(notice)
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
 	defer cancel()
 	if _, err = sub.Next(ctx); !errors.Is(err, context.DeadlineExceeded) {
@@ -299,5 +307,336 @@ func TestNextCancellationBusyAndDetachedCopies(t *testing.T) {
 	sub.Close()
 	if _, err = sub.Next(t.Context()); !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
+	}
+}
+
+type pausedInitialReader struct {
+	*sqlite.Store
+	snapshots                                                    atomic.Int32
+	revisions                                                    atomic.Int32
+	initialRead, releaseInitial, workerSnapshot, workerRechecked chan struct{}
+}
+
+func (r *pausedInitialReader) ReadObservationSnapshot(ctx context.Context, id session.ID, l session.ObservationLimits) (session.ObservationSnapshot, error) {
+	n := r.snapshots.Add(1)
+	snapshot, err := r.Store.ReadObservationSnapshot(ctx, id, l)
+	switch n {
+	case 1:
+		close(r.initialRead)
+		select {
+		case <-r.releaseInitial:
+		case <-ctx.Done():
+			return session.ObservationSnapshot{}, ctx.Err()
+		}
+	case 2:
+		close(r.workerSnapshot)
+	}
+	return snapshot, err
+}
+func (r *pausedInitialReader) ReadObservationRevision(ctx context.Context, id session.ID) (session.ObservationWatermark, error) {
+	if r.revisions.Add(1) == 2 {
+		close(r.workerRechecked)
+	}
+	return r.Store.ReadObservationRevision(ctx, id)
+}
+func TestInitialReadCannotLoseNewerWorkerSnapshot(t *testing.T) {
+	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "initial-race.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	reader := &pausedInitialReader{Store: st, initialRead: make(chan struct{}), releaseInitial: make(chan struct{}), workerSnapshot: make(chan struct{}), workerRechecked: make(chan struct{})}
+	options := testOptions()
+	options.PollInterval = time.Hour
+	service, err := NewService(reader, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close(context.Background()) }()
+	attached := make(chan *Subscription, 1)
+	failed := make(chan error, 1)
+	go func() {
+		sub, err := service.Watch(t.Context(), "s")
+		if err != nil {
+			failed <- err
+			return
+		}
+		attached <- sub
+	}()
+	<-reader.initialRead
+	if _, err = st.CreateSession(t.Context(), session.Session{ID: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	service.Hint("s")
+	<-reader.workerSnapshot
+	service.Hint("s")
+	<-reader.workerRechecked
+	// The worker has accepted the new revision while the subscriber still has
+	// only its earlier committed read. Releasing that read must not strand it.
+	close(reader.releaseInitial)
+	var sub *Subscription
+	select {
+	case sub = <-attached:
+	case err = <-failed:
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if sub.Initial().Exists {
+		t.Fatal("barrier failed to hold old initial state")
+	}
+	service.Hint("s")
+	u := next(t, sub)
+	if u.Kind != Durable || !u.Snapshot.Exists {
+		t.Fatal(u)
+	}
+}
+
+type pausedResnapshotReader struct {
+	*sqlite.Store
+	reads             atomic.Int32
+	captured, release chan struct{}
+}
+
+func (r *pausedResnapshotReader) ReadObservationSnapshot(ctx context.Context, id session.ID, l session.ObservationLimits) (session.ObservationSnapshot, error) {
+	n := r.reads.Add(1)
+	snap, err := r.Store.ReadObservationSnapshot(ctx, id, l)
+	if n == 2 {
+		close(r.captured)
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return session.ObservationSnapshot{}, ctx.Err()
+		}
+	}
+	return snap, err
+}
+func TestResnapshotAcceptsConcurrentNewerPoll(t *testing.T) {
+	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "resnapshot-race.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.Close() }()
+	reader := &pausedResnapshotReader{Store: st, captured: make(chan struct{}), release: make(chan struct{})}
+	options := testOptions()
+	options.PollInterval = time.Hour
+	service, err := NewService(reader, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close(context.Background()) }()
+	sub, err := service.Watch(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	done := make(chan error, 1)
+	result := make(chan session.ObservationSnapshot, 1)
+	go func() { snap, err := sub.Resnapshot(t.Context()); result <- snap; done <- err }()
+	<-reader.captured
+	if _, err = st.CreateSession(t.Context(), session.Session{ID: "s"}); err != nil {
+		t.Fatal(err)
+	}
+	service.Hint("s")
+	// A notification is sent under the publication mutex only after the newer
+	// snapshot has been accepted. Next stays serialized behind Resnapshot.
+	select {
+	case <-sub.notify:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not publish")
+	}
+	close(reader.release)
+	if err = <-done; err != nil {
+		t.Fatal(err)
+	}
+	snap := <-result
+	if !snap.Exists || snap.Watermark.Revision == 0 {
+		t.Fatal(snap)
+	}
+	if _, err = sub.Resnapshot(t.Context()); err != nil {
+		t.Fatal("healthy forward read terminated subscription", err)
+	}
+}
+
+func TestSlowAndFastSubscribersConvergeIndependently(t *testing.T) {
+	service, st := setup(t, testOptions())
+	admit(t, st, "s", "r", "m")
+	slow, err := service.Watch(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer slow.Close()
+	fast, err := service.Watch(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fast.Close()
+	id := service.BeginAttempt(LiveIdentity{SessionID: "s", RunID: "r", MessageID: "m", RequestID: "req"})
+	for range 50 {
+		service.AppendText(id, "x")
+		u := next(t, fast)
+		if u.Kind != Live {
+			t.Fatal(u)
+		}
+	}
+	u := next(t, slow)
+	if u.Kind != Live || len(u.Live.Text) != 50 {
+		t.Fatal("slow consumer lost full replacement", u)
+	}
+	if _, err := fast.Resnapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if u := next(t, fast); u.Kind != Live || len(u.Live.Text) != 50 {
+		t.Fatal(u)
+	}
+}
+
+type noncooperativeReader struct{ entered, release chan struct{} }
+
+func (r *noncooperativeReader) ReadObservationRevision(context.Context, session.ID) (session.ObservationWatermark, error) {
+	return session.ObservationWatermark{}, errors.New("PRIVATE_ERROR")
+}
+func (r *noncooperativeReader) ReadObservationSnapshot(context.Context, session.ID, session.ObservationLimits) (session.ObservationSnapshot, error) {
+	close(r.entered)
+	<-r.release
+	return session.ObservationSnapshot{}, errors.New("PRIVATE_ERROR")
+}
+func TestServiceCloseTimeoutCanBeRetried(t *testing.T) {
+	reader := &noncooperativeReader{entered: make(chan struct{}), release: make(chan struct{})}
+	options := testOptions()
+	options.PollInterval = time.Hour
+	service, err := NewService(reader, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := service.Watch(t.Context(), "s"); done <- err }()
+	<-reader.entered
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err = service.Close(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	close(reader.release)
+	if err = <-done; !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if err = service.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type failingRevisionReader struct {
+	*sqlite.Store
+	fail atomic.Bool
+}
+
+func (r *failingRevisionReader) ReadObservationRevision(ctx context.Context, id session.ID) (session.ObservationWatermark, error) {
+	if r.fail.Load() {
+		return session.ObservationWatermark{}, errors.New("PRIVATE_DATABASE_ERROR")
+	}
+	return r.Store.ReadObservationRevision(ctx, id)
+}
+func TestReadFailureTerminatesWithoutRawError(t *testing.T) {
+	_, st := setup(t, testOptions())
+	reader := &failingRevisionReader{Store: st}
+	service, err := NewService(reader, testOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = service.Close(context.Background()) }()
+	sub, err := service.Watch(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader.fail.Store(true)
+	service.Hint("s")
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if _, err = sub.Next(ctx); !errors.Is(err, session.ErrObservationStore) {
+		t.Fatal(err)
+	}
+	if _, err = sub.Resnapshot(ctx); !errors.Is(err, session.ErrObservationStore) {
+		t.Fatal(err)
+	}
+}
+func TestServiceCapacityAndOptions(t *testing.T) {
+	service, st := setup(t, testOptions())
+	for _, options := range []Options{{}, func() Options { o := testOptions(); o.PendingUpdates = 0; return o }(), func() Options { o := testOptions(); o.Snapshot.MaxMessages = -1; return o }()} {
+		if _, err := NewService(st, options); !errors.Is(err, ErrOptions) {
+			t.Fatal(err)
+		}
+	}
+	var nilStore *sqlite.Store
+	if _, err := NewService(nilStore, testOptions()); !errors.Is(err, ErrOptions) {
+		t.Fatal(err)
+	}
+	if _, err := service.Watch(t.Context(), ""); !errors.Is(err, ErrOptions) {
+		t.Fatal(err)
+	}
+	service.options.MaxSubscriptions = 1
+	sub, err := service.Watch(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = service.Watch(t.Context(), "s"); !errors.Is(err, ErrCapacity) {
+		t.Fatal(err)
+	}
+	sub.Close()
+	again, err := service.Watch(t.Context(), "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	again.Close()
+}
+
+func TestStoreIncarnationAndRevisionRegressionRequireReattach(t *testing.T) {
+	for _, change := range []string{"incarnation", "revision"} {
+		t.Run(change, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "watermark.db")
+			st, err := sqlite.Open(t.Context(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = st.Close() }()
+			admit(t, st, "s", "r", "m")
+			service, err := NewService(st, testOptions())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = service.Close(context.Background()) }()
+			sub, err := service.Watch(t.Context(), "s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sub.Close()
+			raw, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = raw.Close() }()
+			raw.SetMaxOpenConns(1)
+			if _, err = raw.ExecContext(t.Context(), "PRAGMA busy_timeout=5000"); err != nil {
+				t.Fatal(err)
+			}
+			query := "UPDATE observation_store SET incarnation = 'recreated'"
+			if change == "revision" {
+				query = "UPDATE observation_revisions SET revision = 1 WHERE session_id = 's'"
+			}
+			if _, err = raw.ExecContext(t.Context(), query); err != nil {
+				t.Fatal(err)
+			}
+			service.Hint("s")
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+			for {
+				_, err = sub.Next(ctx)
+				if err != nil {
+					break
+				}
+			}
+			if !errors.Is(err, ErrResyncRequired) {
+				t.Fatal(err)
+			}
+		})
 	}
 }

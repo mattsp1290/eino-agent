@@ -22,7 +22,6 @@ type Subscription struct {
 	initial, snapshot session.ObservationSnapshot
 	pending           []Update
 	sequence          uint64
-	generation        uint64
 	err               error
 }
 
@@ -75,6 +74,7 @@ func (sub *Subscription) Resnapshot(ctx context.Context) (session.ObservationSna
 		s.mu.Unlock()
 		return session.ObservationSnapshot{}, err
 	}
+	baseline := sub.snapshot.Watermark
 	s.workers.Add(1)
 	defer s.workers.Done()
 	s.mu.Unlock()
@@ -91,11 +91,13 @@ func (sub *Subscription) Resnapshot(ctx context.Context) (session.ObservationSna
 		s.terminateLocked(sub, safeReadError(err))
 		return session.ObservationSnapshot{}, sub.err
 	}
-	if !validSnapshot(snap, sub.group.id) || snap.Watermark.StoreID != sub.snapshot.Watermark.StoreID || snap.Watermark.Revision < sub.snapshot.Watermark.Revision {
+	if !validSnapshot(snap, sub.group.id) || snap.Watermark.StoreID != baseline.StoreID || snap.Watermark.Revision < baseline.Revision {
 		s.terminateLocked(sub, ErrResyncRequired)
 		return session.ObservationSnapshot{}, sub.err
 	}
-	sub.generation++
+	if sub.snapshot.Watermark.Revision > snap.Watermark.Revision {
+		snap = sub.snapshot.Clone()
+	}
 	sub.pending = nil
 	sub.snapshot = snap.Clone()
 	s.seedLocked(sub)

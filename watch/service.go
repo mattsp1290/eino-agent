@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"reflect"
 	"sync"
 	"time"
@@ -39,8 +40,11 @@ func NewService(reader session.ObservationReader, options Options) (*Service, er
 		return nil, ErrOptions
 	}
 	v := reflect.ValueOf(reader)
-	if (v.Kind() == reflect.Pointer || v.Kind() == reflect.Interface) && v.IsNil() {
-		return nil, ErrOptions
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Map, reflect.Pointer, reflect.Interface, reflect.Slice:
+		if v.IsNil() {
+			return nil, ErrOptions
+		}
 	}
 	var bytes [16]byte
 	if _, err := rand.Read(bytes[:]); err != nil {
@@ -110,8 +114,10 @@ func validSnapshot(s session.ObservationSnapshot, id session.ID) bool {
 	return s.Watermark.StoreID != "" && s.Watermark.SessionID == id && s.Watermark.Revision >= 0 && ((s.Exists && s.Watermark.Revision > 0) || (!s.Exists && s.Watermark.Revision == 0 && len(s.Messages) == 0 && len(s.Runs) == 0 && len(s.Tools) == 0))
 }
 func safeReadError(err error) error {
-	if err == session.ErrObservationTooLarge || err == session.ErrObservationInvalid {
-		return err
+	for _, safe := range []error{session.ErrObservationTooLarge, session.ErrObservationInvalid} {
+		if errors.Is(err, safe) {
+			return safe
+		}
 	}
 	return session.ErrObservationStore
 }
@@ -152,7 +158,17 @@ func (s *Service) poll(g *watchedSession) {
 		ctx, cancel := context.WithTimeout(g.ctx, s.options.ReadTimeout)
 		revision, err := s.reader.ReadObservationRevision(ctx, g.id)
 		var snap session.ObservationSnapshot
+		s.mu.Lock()
 		need := err == nil && (g.watermark.StoreID == "" || revision != g.watermark)
+		if err == nil {
+			for sub := range g.subs {
+				if sub.ready && sub.snapshot.Watermark != revision {
+					need = true
+					break
+				}
+			}
+		}
+		s.mu.Unlock()
 		if need {
 			snap, err = s.reader.ReadObservationSnapshot(ctx, g.id, s.options.Snapshot)
 		}

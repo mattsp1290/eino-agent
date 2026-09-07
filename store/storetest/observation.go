@@ -2,7 +2,10 @@ package storetest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +98,52 @@ func observationContract(t *testing.T, factory Factory) {
 		detached.Messages[0].Text = "mutated"
 		if read().Messages[0].Text == "mutated" {
 			t.Fatal("aliased snapshot")
+		}
+	})
+}
+
+func boundedObservationContract(t *testing.T, factory Factory) {
+	t.Run("bounded allowlisted observation", func(t *testing.T) {
+		subject := setup(t, factory)
+		reader, ok := subject.Store.(session.ObservationReader)
+		if !ok {
+			t.Fatal("missing ObservationReader")
+		}
+		ctx := context.Background()
+		createSession(t, ctx, subject.Store, "bounded")
+		r, err := subject.Store.AdmitRun(ctx, run("bounded-run", "bounded", "owner"), time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ex := executionFor(subject.Store, r)
+		for i, role := range []session.Role{session.RoleUser, session.RoleAssistant, session.RoleSystem} {
+			m := session.Message{ID: session.MessageID(fmt.Sprintf("m%d", i)), SessionID: r.SessionID, RunID: r.ID, Role: role, CreatedAt: time.Unix(int64(i), 0)}
+			appendMessage(t, ctx, ex, m)
+			text := "visible"
+			if role == session.RoleSystem {
+				text = "PRIVATE_SYSTEM"
+			}
+			raw, _ := json.Marshal(map[string]string{"text": text})
+			appendPart(t, ctx, ex, session.Part{ID: session.PartID(fmt.Sprintf("p%d", i)), SessionID: r.SessionID, RunID: r.ID, MessageID: m.ID, Kind: session.PartText, Payload: raw})
+		}
+		appendPart(t, ctx, ex, session.Part{ID: "reasoning", SessionID: r.SessionID, RunID: r.ID, MessageID: "m1", Kind: session.PartReasoning, Payload: []byte(`{"text":"PRIVATE_REASONING"}`)})
+		limits := session.ObservationLimits{MaxMessages: 1, MaxTools: 1, MaxParts: 1, MaxSnapshotBytes: 64000, MaxTextBytes: 7}
+		snapshot, err := reader.ReadObservationSnapshot(ctx, r.SessionID, limits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := json.Marshal(snapshot)
+		if strings.Contains(string(raw), "PRIVATE") || len(snapshot.Messages) != 1 || snapshot.Messages[0].ID != "m1" || snapshot.Messages[0].Text != "visible" || !snapshot.OmittedOlderMessages {
+			t.Fatal(snapshot)
+		}
+		limits.MaxTextBytes = 6
+		if _, err = reader.ReadObservationSnapshot(ctx, r.SessionID, limits); !errors.Is(err, session.ErrObservationTooLarge) {
+			t.Fatal(err)
+		}
+		limits.MaxTextBytes = 7
+		appendPart(t, ctx, ex, session.Part{ID: "empty", SessionID: r.SessionID, RunID: r.ID, MessageID: "m1", Kind: session.PartText, Payload: []byte(`{"text":""}`)})
+		if _, err = reader.ReadObservationSnapshot(ctx, r.SessionID, limits); !errors.Is(err, session.ErrObservationTooLarge) {
+			t.Fatal("empty part escaped cumulative count", err)
 		}
 	})
 }

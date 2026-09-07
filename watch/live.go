@@ -107,11 +107,13 @@ func (s *Service) seedSessionLocked(id session.ID) {
 	}
 }
 func (s *Service) seedLocked(sub *Subscription) {
+	represented := make(map[session.RunID]bool)
 	for _, m := range sub.snapshot.Messages {
 		id := LiveIdentity{ServiceID: s.incarnation, SessionID: sub.group.id, RunID: m.RunID, MessageID: m.ID}
 		if !Eligible(sub.snapshot, id) {
 			continue
 		}
+		represented[m.RunID] = true
 		u := Update{Kind: LiveUnavailable, Live: LiveText{Identity: id, PublicationVersion: s.version}}
 		if entry := s.live[runKey{id.SessionID, id.RunID}]; entry != nil && entry.value.Identity.MessageID == m.ID {
 			u.Live = entry.value
@@ -120,5 +122,13 @@ func (s *Service) seedLocked(sub *Subscription) {
 			}
 		}
 		s.enqueueLocked(sub, u)
+	}
+	for _, run := range sub.snapshot.Runs {
+		if !run.Terminal() && !represented[run.ID] {
+			s.enqueueLocked(sub, Update{Kind: LiveUnavailable, Live: LiveText{
+				Identity:           LiveIdentity{ServiceID: s.incarnation, SessionID: sub.group.id, RunID: run.ID},
+				PublicationVersion: s.version,
+			}})
+		}
 	}
 }

@@ -662,7 +662,9 @@ text onto finalized text. The AG-UI WatchBridge implements these rules.
 The live cache retains current text without subscribers. MaxLiveRuns bounds
 entries and MaxLiveTextBytes bounds total retained text. Missing capacity or
 text overflow produces explicit unavailability instead of a false complete
-prefix. Attempt completion and run release clear retained text. Service
+prefix. An unavailable notice with an empty MessageID qualifies the active run
+when no eligible placeholder is visible; it never creates a message. Attempt
+completion and run release clear retained text. Service
 recreation cannot restore lost transient prefixes. This is same-process live
 observation; separate SQLite connections provide committed read isolation,
 not distributed token delivery.

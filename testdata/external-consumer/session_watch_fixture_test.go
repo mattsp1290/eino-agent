@@ -1,9 +1,12 @@
 package consumer
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -21,6 +24,7 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/store/sqlite"
 	"github.com/mattsp1290/eino-agent/tools"
+	"github.com/mattsp1290/eino-agent/transport"
 	"github.com/mattsp1290/eino-agent/watch"
 )
 
@@ -159,6 +163,12 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = service.Close(context.Background()) }()
+	httpServer := httptest.NewServer(transport.SessionWatchHandler(transport.SessionWatchConfig{
+		Service: service, WriteTimeout: time.Second,
+		Auth:    func(ctx context.Context, _ *http.Request) (context.Context, error) { return ctx, nil },
+		Session: func(*http.Request) (session.ID, error) { return "watch-session", nil },
+	}))
+	defer httpServer.Close()
 	script := &watchScript{partial: make(chan struct{}), release: make(chan struct{}), toolStarted: make(chan struct{}), toolRelease: make(chan struct{})}
 	registry, mount := mountWatchTool(t, script)
 	defer func() { mount.Deactivate(); _ = mount.Close(context.Background()) }()
@@ -198,6 +208,10 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	live := watchRead(t, second, func(u watch.Update) bool { return u.Kind == watch.Live && u.Live.Text == "paused prefix" })
+	httpLive := watchHTTPMessages(t, httpServer.URL, "paused prefix")
+	if httpLive[len(httpLive)-1].ID != string(live.Live.Identity.MessageID) {
+		t.Fatal("HTTP changed live durable message identity")
+	}
 	if _, err = second.Resnapshot(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -232,6 +246,10 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	final := watchTerminal(t, second, handle.RunID())
 	if final.Messages[len(final.Messages)-1].Text != "durable final" || !final.Messages[len(final.Messages)-1].Finalized || len(final.Tools) != 1 || final.Tools[0].Status != session.ToolCallCompleted || script.toolCalls.Load() != 1 {
 		t.Fatal(final)
+	}
+	httpFinal := watchHTTPMessages(t, httpServer.URL, "durable final")
+	if httpFinal[1].ID != httpLive[1].ID {
+		t.Fatal("HTTP reconnect changed durable identity")
 	}
 	second.Close()
 	// Observe interruption through the same public runtime while its native sink
@@ -436,4 +454,52 @@ func TestPublicWatchStrictResumeDoesNotDuplicateTool(t *testing.T) {
 	if script.toolCalls.Load() != 1 {
 		t.Fatal("duplicate tool on terminal resume")
 	}
+}
+
+type watchHTTPMessage struct{ ID, Role, Content string }
+
+func watchHTTPMessages(t *testing.T, url, content string) []watchHTTPMessage {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Last-Event-ID", "ignored-historical-cursor")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		t.Fatal(response.Status)
+	}
+	scanner := bufio.NewScanner(response.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.Contains(line, "PRIVATE_") {
+			t.Fatal("private data crossed HTTP observation")
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		var frame struct {
+			Type     string
+			Messages []watchHTTPMessage
+		}
+		if err = json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Type != "MESSAGES_SNAPSHOT" {
+			continue
+		}
+		for _, m := range frame.Messages {
+			if m.Content == content {
+				return frame.Messages
+			}
+		}
+	}
+	t.Fatal("HTTP did not deliver current text", scanner.Err())
+	return nil
 }

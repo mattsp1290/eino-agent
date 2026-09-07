@@ -65,7 +65,9 @@ type LiveText struct {
 }
 
 // Update is a closed union: Durable carries Snapshot; Live and LiveUnavailable
-// carry Live. Unavailable removes any older overlay for that qualified message.
+// carry Live. Unavailable removes any older overlay for its qualified message;
+// an empty MessageID marks an active run without an eligible visible placeholder
+// and communicates availability without creating a conversation message.
 // Only Durable advances a store watermark.
 type Update struct {
 	Kind             Kind

@@ -111,7 +111,7 @@ func (s *Store) observationMessages(ctx context.Context, out *session.Observatio
 		}
 		m.ID = session.MessageID(id.String)
 		m.RunID = session.RunID(run.String)
-		if id.String == "" || run.String == "" || !utf8.ValidString(id.String+run.String) {
+		if id.String == "" || run.String == "" || !observationStringsValid(id.String, run.String) {
 			err = session.ErrObservationInvalid
 			break
 		}
@@ -211,7 +211,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		if !r.Terminal() {
 			r.LeaseUntil = time.UnixMicro(lease).UTC()
 		}
-		if !utf8.ValidString(string(id) + r.ProviderID + r.ModelID) {
+		if !observationStringsValid(string(id), r.ProviderID, r.ModelID) {
 			return session.ErrObservationInvalid
 		}
 		if err = b.record(len(id) + len(r.ProviderID) + len(r.ModelID) + len(r.Status)); err != nil {
@@ -247,7 +247,7 @@ func (s *Store) observationTools(ctx context.Context, out *session.ObservationSn
 		t.ID = session.ToolCallID(tid.String)
 		t.MessageID = session.MessageID(mid.String)
 		t.Name = name.String
-		if !utf8.ValidString(tid.String+mid.String+name.String) || tid.String == "" || mid.String == "" || name.String == "" {
+		if !observationStringsValid(tid.String, mid.String, name.String) || tid.String == "" || mid.String == "" || name.String == "" {
 			return session.ErrObservationInvalid
 		}
 		if !session.TerminalToolCall(t.Status) && t.Status != session.ToolCallPending && t.Status != session.ToolCallRunning {
@@ -262,3 +262,12 @@ func (s *Store) observationTools(ctx context.Context, out *session.ObservationSn
 }
 
 var _ session.ObservationReader = (*Store)(nil)
+
+func observationStringsValid(values ...string) bool {
+	for _, value := range values {
+		if !utf8.ValidString(value) {
+			return false
+		}
+	}
+	return true
+}
