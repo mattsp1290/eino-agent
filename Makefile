@@ -104,6 +104,8 @@ POSTGRES_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresBa
 POSTGRES_REQUIRED_SUITES := $(POSTGRES_SUITE) $(addprefix $(POSTGRES_SUITE)/,catalog constraints revisions pending_reopen large_indexes)
 POSTGRES_SCHEMA_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresSchemaVerification
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_SCHEMA_SUITE) $(addprefix $(POSTGRES_SCHEMA_SUITE)/,reference states rejection readonly)
+POSTGRES_MIGRATION_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresMigration
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_MIGRATION_SUITE) $(addprefix $(POSTGRES_MIGRATION_SUITE)/,lifecycle rejection rollback host_context concurrent canceled_waiter physical_cleanup)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'

@@ -272,9 +272,9 @@ checks and the required CI job use the same reference from
 
 Testcontainers core and its PostgreSQL module are pinned to `v0.42.0`.
 The fixture uses pgx `v5.10.0`, matching the resolved requirement of the
-planned `gorm.io/driver/postgres v1.6.2` adapter. GORM and the public PostgreSQL
-store/migration APIs are added in later slices; this baseline proof does not
-advertise a usable PostgreSQL Store yet. Normal tests require no Docker;
+planned `gorm.io/driver/postgres v1.6.2` adapter. GORM and public PostgreSQL
+store construction follow separately; `postgres.Migrate(ctx, db)` now explicitly
+initializes or validates the schema on a host-owned pgx pool. Normal tests require no Docker;
 `make postgres-test` and `make postgres-race` fail on unavailable Docker,
 startup errors, skipped PostgreSQL tests, or a missing required suite.
 
@@ -284,7 +284,8 @@ and PostgreSQL's [database locale rules](https://www.postgresql.org/docs/17/sql-
 The private PostgreSQL schema verifier compares stable catalog structure with
 `store/postgres/schema_fingerprints.json`. These two fingerprints come from the
 reviewed baseline SQL and the history-table DDL in Goose `v3.27.3`; the latter
-is reproduced in the integration fixture until the migration entry point lands.
+is reproduced independently in the catalog fixture and also verified through
+the production migration entry point.
 Catalog OIDs, owners, ACLs, sequence positions and application data are excluded.
 History rows and the store incarnation are validated separately. Catalog reads
 use a read-only transaction with a [local search path](https://www.postgresql.org/docs/17/sql-set.html),
@@ -295,5 +296,26 @@ edges involving store tables are rejected even when the other table is outside p
 After reviewing a deliberate baseline or catalog-query change, regenerate with
 `go test -tags=postgres_integration -run '^TestPostgresSchemaVerification/reference$' ./store/postgres -args -update-postgres-schema`.
 Run it twice and require no second diff, then run the normal required PostgreSQL
-targets. Ordinary tests never update the reference. These private checks add no
-public construction or migration API; guarded Goose dispatch remains a later slice.
+targets. Ordinary tests never update the reference.
+
+Goose is pinned to `v3.27.3`. Each migration builds an instance-scoped Provider
+with embedded SQL, disabled global registration, and history table
+`public.eino_agent_goose_version`. Only `ApplyVersion(ctx, 1, true)` is used:
+its validating session locker runs before history initialization. Empty and
+precisely validated version-0 databases can initialize; complete version-1
+schemas validate without changes. Other states are rejected before writes.
+
+The pinned connection temporarily uses a canonical search path and identifier
+quoting for Goose's catalog queries and DDL, then restores the host's settings.
+Acquisition is bounded to 60 seconds, detached unlock/restore to 5 seconds, and
+physical cleanup to a fresh 5 seconds. An uncertain unlock discards the physical
+pgx connection before returning the SQL wrapper. This also works with a host's
+`stdlib.OpenDBFromPool(pool)` bridge: closing only that wrapper connection would
+release its still-locked session into pgxpool. The host owns both wrapper and
+native pool shutdown. Migration never calls `Provider.Close` or closes the pool.
+Cleanup failures remain errors even when Goose reports an already-applied baseline.
+Cancellation closes the captured transport before exposing `Done` to Goose:
+pgx otherwise maps some already-canceled calls to `driver.ErrBadConn`, releasing
+a live session through the bridge before a later `Raw` cleanup can reach it.
+The cancellation guard is disarmed before returning a healthy connection to its
+host, and detached cleanup uses its own bounded guard.

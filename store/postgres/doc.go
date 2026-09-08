@@ -1,4 +1,3 @@
-// Package postgres reserves the PostgreSQL SQL-store backend namespace.
-// The fresh baseline and private read-only schema verifier have integration coverage; public
-// store construction and migration entry points are added in subsequent slices.
+// Package postgres provides explicit schema migration for a dedicated PostgreSQL
+// database using a borrowed pgx-backed pool. Store construction follows separately.
 package postgres
