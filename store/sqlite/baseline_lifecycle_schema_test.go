@@ -90,7 +90,7 @@ func identityBytes(size int, state uint32) []byte {
 func TestBaselineLargeIdentityIndexes(t *testing.T) {
 	db := openBaseline(t)
 	tables := []string{"sessions", "runs", "context_epochs", "messages", "parts", "tool_calls", "model_requests", "events"}
-	for n, size := range []int{1024, 1025} {
+	for n, size := range []int{baselineIdentityBytes, baselineOversizeIdentityBytes} {
 		key := n + 1
 		ids := make(map[string]string)
 		for i, table := range tables {

@@ -15,7 +15,14 @@ import (
 //go:embed migrations/00001_initial.sql
 var baselineSQL []byte
 
-const baselineTime = "0000-01-01T00:00:00.000000000Z"
+const (
+	baselineTime                  = "0000-01-01T00:00:00.000000000Z"
+	baselineIdentityBytes         = 1024
+	baselineOversizeIdentityBytes = baselineIdentityBytes + 1
+	baselineTimestampBytes        = len(baselineTime)
+	baselineRowIDBytes            = 8
+	baselineMaxIndexValueBytes    = 2*baselineOversizeIdentityBytes + baselineTimestampBytes + baselineRowIDBytes
+)
 
 func openBaseline(t *testing.T) *sql.DB {
 	t.Helper()
@@ -92,25 +99,25 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 				cols := baselineStrings(t, db, `SELECT name FROM pragma_index_xinfo(?) WHERE cid>=0 ORDER BY seqno`, name)
 				got = append(got, name+":"+strings.Join(cols, ","))
 				// Include all stored columns, even auxiliary index payload. The largest
-				// fixture key is workspace + public ID + fixed time + rowid = 2086
-				// value bytes. SQLite has no PostgreSQL btree tuple ceiling; the latter
+				// fixture key has two one-byte-over identities, a fixed time, and
+				// a rowid; its value-byte bound is derived above. SQLite has no PostgreSQL btree tuple ceiling; the latter
 				// needs its own physical-size proof in the PostgreSQL slice.
-				valueBytes := 8 // implicit rowid
+				valueBytes := baselineRowIDBytes // implicit rowid
 				for _, col := range cols {
 					switch col {
 					case "id", "session_id", "workspace_id":
-						valueBytes += 1024
+						valueBytes += baselineOversizeIdentityBytes
 					case "created_at":
-						valueBytes += 30
+						valueBytes += baselineTimestampBytes
 					case "status", "role", "kind", "tool_transition":
 						valueBytes += 14
 					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "ordinal", "attempt", "step", "finalized", "text_valid":
-						valueBytes += 8
+						valueBytes += baselineRowIDBytes
 					default:
 						t.Fatalf("%s indexes private or unbounded projection %s", name, col)
 					}
 				}
-				if valueBytes > 2086 {
+				if valueBytes > baselineMaxIndexValueBytes {
 					t.Fatalf("%s key values exceed fixture bound: %d", name, valueBytes)
 				}
 			}
