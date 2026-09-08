@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/pressly/goose/v3"
 	"go.uber.org/multierr"
 	_ "modernc.org/sqlite"
@@ -58,5 +60,24 @@ func TestMigrateRejectsWrongDriverAndClosedPool(t *testing.T) {
 	}
 	if err := Migrate(t.Context(), db); err == nil {
 		t.Fatal("accepted a closed pool")
+	}
+}
+
+func TestMigrateDoesNotEchoConnectionString(t *testing.T) {
+	// Invalid timeout is parsed lazily by pgx, before any network connection.
+	db, err := sql.Open("pgx", "host=dsn-host-marker dbname=dsn-db-marker user=dsn-user-marker connect_timeout=invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	err = Migrate(t.Context(), db)
+	var parseErr *pgconn.ParseConfigError
+	if !errors.As(err, &parseErr) {
+		t.Fatal("migration did not preserve the underlying configuration error")
+	}
+	for _, marker := range []string{"dsn-host-marker", "dsn-db-marker", "dsn-user-marker", "connect_timeout"} {
+		if strings.Contains(err.Error(), marker) {
+			t.Fatal("public migration error echoed connection-string fields")
+		}
 	}
 }

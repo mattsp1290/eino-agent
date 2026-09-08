@@ -30,8 +30,18 @@ func Migrate(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	return migrate(ctx, db, files, locker)
+	if err := migrate(ctx, db, files, locker); err != nil {
+		return migrationError{cause: err}
+	}
+	return nil
 }
+
+// Driver errors may contain connection strings. Keep public formatting safe
+// while preserving the complete cause for errors.Is and errors.As.
+type migrationError struct{ cause error }
+
+func (migrationError) Error() string   { return "postgres migration failed" }
+func (e migrationError) Unwrap() error { return e.cause }
 
 // Test fixtures may supply an equivalent failing baseline or locker; every path
 // still uses the production validation and physical-connection cleanup adapter.
