@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 const maxModelRequestRecordBytes = 4 << 20
@@ -31,7 +32,7 @@ func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequ
 	if len(raw) > maxModelRequestRecordBytes {
 		return session.ModelRequestRecord{}, session.ErrModelRequestTooLarge
 	}
-	_, err = s.exec(ctx, `INSERT INTO model_requests(id, run_id, state, attempt, step, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, record.ID, record.RunID, record.State, record.Attempt, record.Step, raw, timeText(record.CreatedAt))
+	_, err = s.exec(ctx, `INSERT INTO model_requests(id, run_id, state, attempt, step, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, record.ID, record.RunID, record.State, record.Attempt, record.Step, raw, sqlstore.TimeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 
@@ -92,7 +93,7 @@ func (s *Store) ListModelRequests(ctx context.Context, runID session.RunID, curs
 			return session.ModelRequestBatch{}, err
 		}
 		where += " AND (created_at > ? OR (created_at = ? AND id > ?))"
-		args = append(args, timeText(after.CreatedAt), timeText(after.CreatedAt), cursor.AfterID)
+		args = append(args, sqlstore.TimeText(after.CreatedAt), sqlstore.TimeText(after.CreatedAt), cursor.AfterID)
 	}
 	args = append(args, limit+1)
 	records, err := listJSON[session.ModelRequestRecord](ctx, s, `SELECT record FROM model_requests WHERE `+where+` ORDER BY created_at, id LIMIT ?`, args...)

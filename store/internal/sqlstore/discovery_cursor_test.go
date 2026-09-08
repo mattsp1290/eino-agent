@@ -1,4 +1,4 @@
-package sqlite
+package sqlstore
 
 import (
 	"encoding/base64"
@@ -15,12 +15,12 @@ func TestDiscoveryCursorRoundTripAndMaximum(t *testing.T) {
 	store := strings.Repeat("a", 32)
 	for _, identity := range []string{"ordinary", strings.Repeat("\x00", 1024), strings.Repeat("é", 512), strings.Repeat("界", 341) + "x"} {
 		for _, at := range []time.Time{{}, time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC), time.Date(9999, 12, 31, 23, 59, 59, 999999999, time.UTC), time.Date(2026, 9, 8, 1, 2, 3, 123456789, time.FixedZone("offset", 3600))} {
-			encoded := encodeDiscoveryCursor(store, identity, session.SessionSummary{ID: session.ID(identity), CreatedAt: at})
+			encoded := EncodeDiscoveryCursor(store, identity, session.SessionSummary{ID: session.ID(identity), CreatedAt: at})
 			if len(encoded) > 8192 {
 				t.Fatal("maximum legal cursor exceeds query bound", len(encoded))
 			}
-			c, err := decodeDiscoveryCursor(encoded, identity)
-			if err != nil || c.storeID != store || c.id != session.ID(identity) || !c.createdAt.Equal(at) {
+			c, err := DecodeDiscoveryCursor(encoded, identity)
+			if err != nil || c.StoreID != store || c.ID != session.ID(identity) || !c.CreatedAt.Equal(at) {
 				t.Fatal(c, err)
 			}
 		}
@@ -30,13 +30,13 @@ func TestDiscoveryCursorRoundTripAndMaximum(t *testing.T) {
 func TestDiscoveryCursorCanonicalEncoding(t *testing.T) {
 	const wire = `{"version":1,"store":"YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE","workspace":"QQ","id":"aWQ","created":""}`
 	want := base64.RawURLEncoding.EncodeToString([]byte(wire))
-	got := encodeDiscoveryCursor(strings.Repeat("a", 32), "A", session.SessionSummary{ID: "id"})
+	got := EncodeDiscoveryCursor(strings.Repeat("a", 32), "A", session.SessionSummary{ID: "id"})
 	if got != want {
 		t.Fatal("canonical encoding changed")
 	}
 }
 func TestDiscoveryCursorRejectsNoncanonical(t *testing.T) {
-	valid := encodeDiscoveryCursor(strings.Repeat("a", 32), "A", session.SessionSummary{ID: "id"})
+	valid := EncodeDiscoveryCursor(strings.Repeat("a", 32), "A", session.SessionSummary{ID: "id"})
 	raw, _ := base64.RawURLEncoding.DecodeString(valid)
 	var fields map[string]any
 	if err := json.Unmarshal(raw, &fields); err != nil {
@@ -72,7 +72,7 @@ func TestDiscoveryCursorRejectsNoncanonical(t *testing.T) {
 		cases = append(cases, encode(b))
 	}
 	for i, bad := range cases {
-		if _, err := decodeDiscoveryCursor(bad, "A"); !errors.Is(err, session.ErrDiscoveryCursor) {
+		if _, err := DecodeDiscoveryCursor(bad, "A"); !errors.Is(err, session.ErrDiscoveryCursor) {
 			t.Fatal(i, err)
 		}
 	}
