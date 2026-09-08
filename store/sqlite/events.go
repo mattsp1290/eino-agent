@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 func (s *Store) appendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
@@ -29,7 +30,7 @@ func (s *Store) appendEvent(ctx context.Context, record session.EventRecord) (se
 		transition = record.ToolTransition
 	}
 	_, err = s.exec(ctx, `INSERT INTO events(id, session_id, run_id, kind, tool_call_id, tool_transition, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.SessionID, record.RunID, record.Kind, toolCallID, transition, raw, timeText(record.CreatedAt))
+		record.ID, record.SessionID, record.RunID, record.Kind, toolCallID, transition, raw, sqlstore.TimeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 
@@ -46,7 +47,7 @@ func (s *Store) ListEvents(ctx context.Context, sessionID session.ID, cursor ses
 			return session.EventBatch{}, err
 		}
 		where += " AND (created_at > ? OR (created_at = ? AND id > ?))"
-		args = append(args, timeText(after.CreatedAt), timeText(after.CreatedAt), cursor.AfterEventID)
+		args = append(args, sqlstore.TimeText(after.CreatedAt), sqlstore.TimeText(after.CreatedAt), cursor.AfterEventID)
 	}
 	args = append(args, limit+1)
 	events, err := listJSON[session.EventRecord](ctx, s, `SELECT record FROM events WHERE `+where+` ORDER BY created_at, id LIMIT ?`, args...)

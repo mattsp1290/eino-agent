@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 func (s *Store) appendMessage(ctx context.Context, record session.Message) (session.Message, error) {
@@ -25,7 +26,7 @@ func (s *Store) appendMessage(ctx context.Context, record session.Message) (sess
 		return session.Message{}, err
 	}
 	_, err = s.exec(ctx, `INSERT INTO messages(id, session_id, run_id, role, finalized, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.SessionID, record.RunID, record.Role, record.Role != session.RoleAssistant, raw, timeText(record.CreatedAt))
+		record.ID, record.SessionID, record.RunID, record.Role, record.Role != session.RoleAssistant, raw, sqlstore.TimeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 
@@ -48,7 +49,7 @@ func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Pa
 		return session.Part{}, err
 	}
 	_, err = s.exec(ctx, `INSERT INTO parts(id, message_id, session_id, run_id, ordinal, kind, display_text, text_valid, record, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		record.ID, record.MessageID, record.SessionID, record.RunID, record.Ordinal, record.Kind, text, valid, raw, timeText(record.CreatedAt))
+		record.ID, record.MessageID, record.SessionID, record.RunID, record.Ordinal, record.Kind, text, valid, raw, sqlstore.TimeText(record.CreatedAt))
 	return record, mapErr(err)
 }
 
@@ -84,7 +85,7 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 			return session.ReplayBatch{}, err
 		}
 		where += " AND (created_at > ? OR (created_at = ? AND id > ?))"
-		args = append(args, timeText(after.CreatedAt), timeText(after.CreatedAt), cursor.AfterMessageID)
+		args = append(args, sqlstore.TimeText(after.CreatedAt), sqlstore.TimeText(after.CreatedAt), cursor.AfterMessageID)
 	}
 	args = append(args, limit+1)
 	messages, messageIDs, err := s.loadReplayMessages(ctx, where, args...)
@@ -178,7 +179,7 @@ func decodeAuthoritativeMessage(id, sessionID, runID, role, createdAt string, ra
 	if err := json.Unmarshal(raw, &message); err != nil ||
 		message.ID != session.MessageID(id) || message.SessionID != session.ID(sessionID) ||
 		message.RunID != session.RunID(runID) || message.Role != session.Role(role) ||
-		timeText(message.CreatedAt) != createdAt {
+		sqlstore.TimeText(message.CreatedAt) != createdAt {
 		return session.Message{}, session.ErrConflict
 	}
 	return message, nil

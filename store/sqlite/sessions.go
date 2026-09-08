@@ -8,6 +8,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 func (s *Store) CreateSession(ctx context.Context, record session.Session) (session.Session, error) {
@@ -27,7 +28,7 @@ func (s *Store) CreateSession(ctx context.Context, record session.Session) (sess
 	if err != nil {
 		return session.Session{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO sessions(id, record, workspace_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, record.ID, raw, record.WorkspaceID, record.Title, timeText(record.CreatedAt), timeText(record.UpdatedAt))
+	_, err = s.exec(ctx, `INSERT INTO sessions(id, record, workspace_id, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, record.ID, raw, record.WorkspaceID, record.Title, sqlstore.TimeText(record.CreatedAt), sqlstore.TimeText(record.UpdatedAt))
 	return record, mapErr(err)
 }
 
@@ -45,7 +46,7 @@ func (s *Store) UpdateSession(ctx context.Context, record session.Session) error
 	if err != nil {
 		return err
 	}
-	result, err := s.exec(ctx, `UPDATE sessions SET record = ?, workspace_id = ?, title = ?, created_at = ?, updated_at = ? WHERE id = ?`, raw, record.WorkspaceID, record.Title, timeText(record.CreatedAt), timeText(record.UpdatedAt), record.ID)
+	result, err := s.exec(ctx, `UPDATE sessions SET record = ?, workspace_id = ?, title = ?, created_at = ?, updated_at = ? WHERE id = ?`, raw, record.WorkspaceID, record.Title, sqlstore.TimeText(record.CreatedAt), sqlstore.TimeText(record.UpdatedAt), record.ID)
 	if err != nil {
 		return mapErr(err)
 	}

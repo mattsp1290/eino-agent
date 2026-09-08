@@ -6,6 +6,7 @@ import (
 	"errors"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpoch) (session.ContextEpoch, error) {
@@ -22,7 +23,7 @@ func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpo
 	if err != nil {
 		return session.ContextEpoch{}, err
 	}
-	_, err = s.exec(ctx, `INSERT INTO context_epochs(id, session_id, record, closed_at) VALUES (?, ?, ?, ?)`, record.ID, record.SessionID, raw, timeText(record.ClosedAt))
+	_, err = s.exec(ctx, `INSERT INTO context_epochs(id, session_id, record, closed_at) VALUES (?, ?, ?, ?)`, record.ID, record.SessionID, raw, sqlstore.TimeText(record.ClosedAt))
 	if constraintFailed(err) {
 		var reread session.ContextEpoch
 		if getErr := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &reread); getErr == nil && sameRecord(reread, record) {
@@ -37,7 +38,7 @@ func (s *Store) finishContextEpoch(ctx context.Context, record session.ContextEp
 	if err != nil {
 		return err
 	}
-	result, err := s.exec(ctx, `UPDATE context_epochs SET record = ?, closed_at = ? WHERE id = ?`, raw, timeText(record.ClosedAt), record.ID)
+	result, err := s.exec(ctx, `UPDATE context_epochs SET record = ?, closed_at = ? WHERE id = ?`, raw, sqlstore.TimeText(record.ClosedAt), record.ID)
 	if err != nil {
 		return mapErr(err)
 	}

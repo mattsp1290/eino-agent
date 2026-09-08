@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration time.Duration) (session.Run, error) {
@@ -27,7 +28,7 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration 
 	leaseMicros := durationMicros(leaseDuration)
 	_, err = s.exec(ctx, `INSERT INTO runs(id, session_id, status, owner_id, claim_token, provider_id, model_id, lease_until, record, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER) + ?, ?, ?)`,
-		record.ID, record.SessionID, record.Status, record.OwnerID, record.ClaimToken, record.ProviderID, record.ModelID, leaseMicros, raw, timeText(record.CreatedAt))
+		record.ID, record.SessionID, record.Status, record.OwnerID, record.ClaimToken, record.ProviderID, record.ModelID, leaseMicros, raw, sqlstore.TimeText(record.CreatedAt))
 	if constraintFailed(err) {
 		if active, activeErr := s.ActiveRun(ctx, record.SessionID); activeErr == nil && active.ID != record.ID {
 			return session.Run{}, session.ErrSessionBusy

@@ -149,10 +149,3 @@ func constraintFailed(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "constraint failed") || strings.Contains(msg, "constraint failed:")
 }
-
-func timeText(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return t.UTC().Format("2006-01-02T15:04:05.000000000Z")
-}

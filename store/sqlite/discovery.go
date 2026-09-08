@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 var _ session.SessionDiscoveryReader = (*Store)(nil)
@@ -23,10 +24,10 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 	if s == nil || s.db == nil || s.tx != nil {
 		return zero, session.ErrDiscoveryReader
 	}
-	var cursor discoveryPosition
+	var cursor sqlstore.DiscoveryPosition
 	if q.Cursor != "" {
 		var err error
-		cursor, err = decodeDiscoveryCursor(q.Cursor, q.WorkspaceID)
+		cursor, err = sqlstore.DecodeDiscoveryCursor(q.Cursor, q.WorkspaceID)
 		if err != nil {
 			return zero, err
 		}
@@ -43,10 +44,10 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 			}
 			return err
 		}
-		if !incarnation.Valid || !validDiscoveryIncarnation(incarnation.String) {
+		if !incarnation.Valid || !sqlstore.ValidDiscoveryIncarnation(incarnation.String) {
 			return session.ErrDiscoveryInvalid
 		}
-		if q.Cursor != "" && cursor.storeID != incarnation.String {
+		if q.Cursor != "" && cursor.StoreID != incarnation.String {
 			return session.ErrDiscoveryCursor
 		}
 		var err error
@@ -68,10 +69,10 @@ func discoverySQL(continuation bool) string {
 	return query + " ORDER BY created_at DESC, id DESC LIMIT ?"
 }
 
-func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQuery, cursor discoveryPosition, incarnation string) (session.SessionDiscoveryPage, error) {
+func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQuery, cursor sqlstore.DiscoveryPosition, incarnation string) (session.SessionDiscoveryPage, error) {
 	args := []any{session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxTitleBytes, 30, 30, q.WorkspaceID}
 	if q.Cursor != "" {
-		args = append(args, timeText(cursor.createdAt), cursor.id)
+		args = append(args, sqlstore.TimeText(cursor.CreatedAt), cursor.ID)
 	}
 	args = append(args, q.Limit+1)
 	rows, err := s.query(ctx, discoverySQL(q.Cursor != ""), args...)
@@ -82,7 +83,7 @@ func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQue
 	page := session.SessionDiscoveryPage{Sessions: make([]session.SessionSummary, 0, q.Limit)}
 	for rows.Next() {
 		if len(page.Sessions) == q.Limit {
-			page.NextCursor = encodeDiscoveryCursor(incarnation, q.WorkspaceID, page.Sessions[len(page.Sessions)-1])
+			page.NextCursor = sqlstore.EncodeDiscoveryCursor(incarnation, q.WorkspaceID, page.Sessions[len(page.Sessions)-1])
 			break
 		}
 		summary, err := scanDiscoverySummary(rows, q.WorkspaceID)
@@ -112,11 +113,11 @@ func scanDiscoverySummary(row rowScanner, workspace string) (session.SessionSumm
 		return summary, session.ErrDiscoveryInvalid
 	}
 	var err error
-	summary.CreatedAt, err = discoveryTime(created.String)
+	summary.CreatedAt, err = sqlstore.DiscoveryTime(created.String)
 	if err != nil {
 		return summary, err
 	}
-	summary.UpdatedAt, err = discoveryTime(updated.String)
+	summary.UpdatedAt, err = sqlstore.DiscoveryTime(updated.String)
 	if err != nil {
 		return summary, err
 	}
