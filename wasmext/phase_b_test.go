@@ -18,7 +18,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
 
@@ -73,11 +72,11 @@ func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
-	store, err := sqlitestore.Open(context.Background(), t.TempDir()+"/wasm-context.db")
+	store, storePool, err := openTestSQLite(context.Background(), t.TempDir()+"/wasm-context.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var messages []string
 	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		for _, message := range request.Messages {

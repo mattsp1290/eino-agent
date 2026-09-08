@@ -55,6 +55,20 @@ incompatible with earlier databases; see the
 | `permissions` | Tool permission policy primitives. | Product-specific approval UI and enforcement defaults. |
 | `obs` | Redaction/correlation policy definitions for Datadog/eino-obs. | Exporter configuration and any opt-in content summaries. |
 
+SQLite storage uses a host-owned modernc `*sql.DB`. Call `sqlite.Migrate`
+explicitly with writers stopped, then `sqlite.New` on the same pool. New only
+validates; neither operation closes or configures the pool. Set foreign-key and
+busy-timeout options in the URI so they apply to every connection. Construct file
+URIs with `net/url` to preserve special characters in paths. Reopen an initialized
+file with a fresh host pool and New; migration is unnecessary on that path.
+
+Private `:memory:` databases require one retained connection from migration
+through use. For `file:name?mode=memory&cache=shared`, retain a keeper connection
+until all stores finish. Do not set connection lifetimes or idle timeouts that
+close the final memory connection. Closing the last connection loses that database.
+Only the fresh Goose baseline is supported; legacy schemas are rejected without
+repair or import. The host owns shutdown and any disposable database cleanup.
+
 ## Minimal Embed
 
 A typical server wires these pieces once at startup through
@@ -66,10 +80,17 @@ request `SessionID`. EventSink, permissions policy, owner ID override, queue
 sizing, and lease tuning are optional.
 
 ```go
-store, err := sqlite.Open(ctx, "agent.db")
-if err != nil {
-    return err
-}
+// sql is database/sql; url is net/url. The SQLite package registers modernc.
+uri := url.URL{Scheme: "file", Path: "agent.db",
+    RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"}
+pool, err := sql.Open("sqlite", uri.String())
+if err != nil { return err }
+pool.SetMaxOpenConns(1)
+pool.SetMaxIdleConns(1)
+defer pool.Close() // the host retains this pool until shutdown
+if err := sqlite.Migrate(ctx, pool); err != nil { return err }
+store, err := sqlite.New(ctx, pool)
+if err != nil { return err }
 tail := stream.NewTail(128)
 ids := newIDGenerator()
 

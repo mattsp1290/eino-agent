@@ -22,14 +22,14 @@ import (
 func TestStoreContract(t *testing.T) {
 	factory := func(t testing.TB) storetest.Subject {
 		t.Helper()
-		st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+		st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 		if err != nil {
 			t.Fatalf("open sqlite store: %v", err)
 		}
 		return storetest.Subject{
 			Store: st,
 			Cleanup: func() {
-				_ = st.Close()
+				_ = st.db.Close()
 			},
 		}
 	}
@@ -75,12 +75,12 @@ func sqliteRunSettlementRequest(run session.Run, id session.EventID) session.Set
 }
 
 func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	defer func() {
-		_ = st.Close()
+		_ = st.db.Close()
 	}()
 
 	ctx := context.Background()
@@ -137,7 +137,7 @@ func TestConcurrentToolClaimHasSingleOwner(t *testing.T) {
 
 func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing.T) {
 	st, execution, call := setupClaimedToolCall(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	now := time.Now().UTC()
 	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
@@ -175,7 +175,7 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 
 func TestToolTransitionEventIdentityAndGenericBypass(t *testing.T) {
 	st, execution, call := setupClaimedToolCall(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 
 	claimReplay := session.ClaimToolCallRequest{
@@ -233,7 +233,7 @@ func TestToolTransitionEventIdentityAndGenericBypass(t *testing.T) {
 func TestToolTransitionEventFailureRollsBackCreateAndClaim(t *testing.T) {
 	t.Run("create", func(t *testing.T) {
 		st, execution, call, now := setupToolTransitionTest(t)
-		defer func() { _ = st.Close() }()
+		defer func() { _ = st.db.Close() }()
 		if _, err := st.db.ExecContext(context.Background(), `CREATE TRIGGER fail_tool_event BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'forced event failure'); END`); err != nil {
 			t.Fatal(err)
 		}
@@ -247,7 +247,7 @@ func TestToolTransitionEventFailureRollsBackCreateAndClaim(t *testing.T) {
 
 	t.Run("claim", func(t *testing.T) {
 		st, execution, call, now := setupToolTransitionTest(t)
-		defer func() { _ = st.Close() }()
+		defer func() { _ = st.db.Close() }()
 		ctx := context.Background()
 		if _, err := execution.CreateToolCall(ctx, sqliteCreateRequest(call, "event-create-ok", now)); err != nil {
 			t.Fatal(err)
@@ -282,7 +282,7 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 	for _, table := range []string{"messages", "parts"} {
 		t.Run(table, func(t *testing.T) {
 			st, execution, call := setupClaimedToolCall(t)
-			defer func() { _ = st.Close() }()
+			defer func() { _ = st.db.Close() }()
 			ctx := context.Background()
 			now := time.Now().UTC()
 			output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
@@ -309,8 +309,8 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 			if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
 				t.Fatalf("result message survived rollback: %v", err)
 			}
-			var part session.Part
-			if err := st.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{call.ResultPartID}, &part); !errors.Is(err, session.ErrNotFound) {
+			var part []byte
+			if err := st.db.QueryRowContext(ctx, "SELECT record FROM parts WHERE id = ?", []byte(call.ResultPartID)).Scan(&part); !errors.Is(err, sql.ErrNoRows) {
 				t.Fatalf("result part survived rollback: %v", err)
 			}
 			if _, err := st.db.ExecContext(ctx, `DROP TRIGGER fail_settlement`); err != nil {
@@ -344,7 +344,7 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
 			st, execution, call := setupClaimedToolCall(t)
-			defer func() { _ = st.Close() }()
+			defer func() { _ = st.db.Close() }()
 			ctx := context.Background()
 			call, err := st.GetToolCall(ctx, call.ID)
 			if err != nil {
@@ -368,8 +368,8 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 			if _, err := st.GetMessage(ctx, call.ResultMessageID); !errors.Is(err, session.ErrNotFound) {
 				t.Fatalf("reserved message error = %v, want ErrNotFound", err)
 			}
-			var part session.Part
-			if err := st.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{call.ResultPartID}, &part); !errors.Is(err, session.ErrNotFound) {
+			var part []byte
+			if err := st.db.QueryRowContext(ctx, "SELECT record FROM parts WHERE id = ?", []byte(call.ResultPartID)).Scan(&part); !errors.Is(err, sql.ErrNoRows) {
 				t.Fatalf("reserved part error = %v, want ErrNotFound", err)
 			}
 		})
@@ -378,7 +378,7 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 
 func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	st, execution, call := setupClaimedToolCall(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	stale := session.ToolSettlement{
 		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: json.RawMessage(`{"content":"stale"}`),
@@ -393,7 +393,7 @@ func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.exec(ctx, `UPDATE tool_calls SET claimed_by = ?, claim_token = ?, record = ? WHERE id = ?`, current.ClaimedBy, current.ClaimToken, raw, current.ID); err != nil {
+	if _, err := st.db.ExecContext(ctx, `UPDATE tool_calls SET claimed_by = ?, claim_token = ?, record = ? WHERE id = ?`, []byte(current.ClaimedBy), []byte(current.ClaimToken), raw, []byte(current.ID)); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(stale, "event-settle")); !errors.Is(err, session.ErrConflict) {
@@ -405,12 +405,12 @@ func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 }
 
 func TestSettleRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	defer func() {
-		_ = st.Close()
+		_ = st.db.Close()
 	}()
 
 	ctx := context.Background()
@@ -454,11 +454,11 @@ func TestSettleRunIsIdempotentAndRejectsOverwrite(t *testing.T) {
 }
 
 func TestListMessagesDoesNotDecodePartsOutsideCurrentPage(t *testing.T) {
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if _, err := st.CreateSession(ctx, session.Session{ID: "session-page", CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -478,7 +478,7 @@ func TestListMessagesDoesNotDecodePartsOutsideCurrentPage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := st.exec(ctx, `UPDATE parts SET record = ? WHERE id = ?`, []byte(`{malformed`), "part-message-two"); err != nil {
+	if _, err := st.db.ExecContext(ctx, `UPDATE parts SET record = ? WHERE id = ?`, []byte(`{malformed`), []byte("part-message-two")); err != nil {
 		t.Fatal(err)
 	}
 	first, err := st.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 1})
@@ -493,11 +493,11 @@ func TestListMessagesDoesNotDecodePartsOutsideCurrentPage(t *testing.T) {
 func TestListMessagesOrdersNanosecondsBeforeLexicalIDs(t *testing.T) {
 	t.Parallel()
 
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	userAt := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
 	assistantAt := userAt.Add(time.Nanosecond)
@@ -545,11 +545,11 @@ func TestListMessagesOrdersNanosecondsBeforeLexicalIDs(t *testing.T) {
 }
 
 func TestSettleRunRollsBackTerminalStateWhenEventInsertFails(t *testing.T) {
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if _, err := st.CreateSession(ctx, session.Session{ID: "run-rollback-session", CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -559,7 +559,7 @@ func TestSettleRunRollsBackTerminalStateWhenEventInsertFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_run_finished BEFORE INSERT ON events WHEN NEW.kind = 'run_finished' BEGIN SELECT RAISE(ABORT, 'forced run event failure'); END`); err != nil {
+	if _, err := st.db.ExecContext(ctx, `CREATE TRIGGER fail_run_finished BEFORE INSERT ON events WHEN NEW.kind = x'72756e5f66696e6973686564' BEGIN SELECT RAISE(ABORT, 'forced run event failure'); END`); err != nil {
 		t.Fatal(err)
 	}
 	request := session.SettleRunRequest{
@@ -582,11 +582,11 @@ func TestSettleRunRollsBackTerminalStateWhenEventInsertFails(t *testing.T) {
 func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	now := time.Now().UTC()
 	if _, err := st.CreateSession(ctx, session.Session{ID: "claim-session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
@@ -705,7 +705,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 func TestCreateToolCallDuplicateRequiresFullRecordMatch(t *testing.T) {
 	st, execution, call := setupClaimedToolCall(t)
 	defer func() {
-		_ = st.Close()
+		_ = st.db.Close()
 	}()
 
 	ctx := context.Background()
@@ -716,7 +716,7 @@ func TestCreateToolCallDuplicateRequiresFullRecordMatch(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsIncompleteNonemptyDatabase(t *testing.T) {
+func TestNewRejectsIncompleteNonemptyDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -726,17 +726,17 @@ func TestOpenRejectsIncompleteNonemptyDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = db.Close()
-	store, err := Open(context.Background(), path)
+	store, err := reopenSQLiteFixture(context.Background(), path)
 	if err == nil {
-		_ = store.Close()
-		t.Fatal("Open succeeded for incomplete schema")
+		_ = store.db.Close()
+		t.Fatal("New succeeded for incomplete schema")
 	}
 	if !errors.Is(err, session.ErrConflict) {
-		t.Fatalf("Open err = %v, want ErrConflict", err)
+		t.Fatalf("New err = %v, want ErrConflict", err)
 	}
 }
 
-func TestOpenRejectsSchemaDrift(t *testing.T) {
+func TestNewRejectsSchemaDrift(t *testing.T) {
 	for _, test := range []struct {
 		name   string
 		mutate string
@@ -747,11 +747,11 @@ func TestOpenRejectsSchemaDrift(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "store.db")
-			store, err := Open(context.Background(), path)
+			store, err := openSQLiteFixture(context.Background(), path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := store.Close(); err != nil {
+			if err := store.db.Close(); err != nil {
 				t.Fatal(err)
 			}
 			db, err := sql.Open("sqlite", path)
@@ -764,35 +764,35 @@ func TestOpenRejectsSchemaDrift(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err = Open(context.Background(), path)
+			store, err = reopenSQLiteFixture(context.Background(), path)
 			if err == nil {
-				_ = store.Close()
-				t.Fatal("Open succeeded for drifted current-version schema")
+				_ = store.db.Close()
+				t.Fatal("New succeeded for drifted current-version schema")
 			}
 			if !errors.Is(err, session.ErrConflict) {
-				t.Fatalf("Open err = %v, want ErrConflict", err)
+				t.Fatalf("New err = %v, want ErrConflict", err)
 			}
 		})
 	}
 }
 
-func TestOpenRejectsExactDDLDrift(t *testing.T) {
+func TestNewRejectsExactDDLDrift(t *testing.T) {
 	tests := map[string][2]string{
 		"column affinity":   {"record BLOB NOT NULL", "record TEXT NOT NULL"},
 		"nullability":       {"updated_at TEXT NOT NULL", "updated_at TEXT"},
-		"foreign key":       {"FOREIGN KEY(session_id) REFERENCES sessions(id)", "CHECK (length(session_id) > 0)"},
+		"foreign key":       {"session_key INTEGER NOT NULL REFERENCES sessions(row_key)", "session_key INTEGER NOT NULL CHECK (session_key > 0)"},
 		"partial predicate": {"WHERE status IN ('pending', 'running')", "WHERE status = 'running'"},
 		"check constraint":  {"updated_at TEXT NOT NULL", "updated_at TEXT NOT NULL CHECK (updated_at <> '')"},
-		"collation":         {"id TEXT PRIMARY KEY", "id TEXT COLLATE NOCASE PRIMARY KEY"},
-		"generated column":  {"updated_at TEXT NOT NULL\n);", "updated_at TEXT NOT NULL,\n  normalized_id TEXT GENERATED ALWAYS AS (lower(id)) VIRTUAL\n);"},
+		"collation":         {"created_at TEXT NOT NULL COLLATE BINARY", "created_at TEXT NOT NULL COLLATE NOCASE"},
+		"generated column":  {"updated_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(updated_at) = 'text')", "updated_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(updated_at) = 'text'), normalized_id BLOB GENERATED ALWAYS AS (id) VIRTUAL"},
 		"strict table":      {");\nCREATE INDEX sessions_workspace_created_idx", ") STRICT;\nCREATE INDEX sessions_workspace_created_idx"},
 		"without rowid":     {");\nCREATE INDEX sessions_workspace_created_idx", ") WITHOUT ROWID;\nCREATE INDEX sessions_workspace_created_idx"},
-		"deferrable key":    {"FOREIGN KEY(session_id) REFERENCES sessions(id)", "FOREIGN KEY(session_id) REFERENCES sessions(id) DEFERRABLE INITIALLY DEFERRED"},
+		"deferrable key":    {"REFERENCES sessions(row_key)", "REFERENCES sessions(row_key) DEFERRABLE INITIALLY DEFERRED"},
 	}
 	for name, replacement := range tests {
 		t.Run(name, func(t *testing.T) {
-			definition := strings.Replace(currentSchema, replacement[0], replacement[1], 1)
-			if definition == currentSchema {
+			definition := strings.Replace(string(baselineSQL), replacement[0], replacement[1], 1)
+			if definition == string(baselineSQL) {
 				t.Fatal("test mutation did not change schema")
 			}
 			path := filepath.Join(t.TempDir(), "store.db")
@@ -800,40 +800,54 @@ func TestOpenRejectsExactDDLDrift(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			prepareMigrationSchema(t, db, migrationSchemaBootstrap)
 			if _, err := db.Exec(definition); err != nil {
 				_ = db.Close()
 				t.Fatalf("seed drifted schema: %v", err)
 			}
+			execBaseline(t, db, "INSERT INTO eino_agent_goose_version(version_id,is_applied) VALUES(1,1)")
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err := Open(context.Background(), path)
+			store, err := reopenSQLiteFixture(context.Background(), path)
 			if err == nil {
-				_ = store.Close()
-				t.Fatal("Open succeeded for drifted schema")
+				_ = store.db.Close()
+				t.Fatal("New succeeded for drifted schema")
 			}
 			if !errors.Is(err, session.ErrConflict) {
-				t.Fatalf("Open err = %v, want ErrConflict", err)
+				t.Fatalf("New err = %v, want ErrConflict", err)
 			}
 		})
 	}
 }
 
-func TestConcurrentOpenInitializesCurrentSchema(t *testing.T) {
+func TestInitializedDatabaseSupportsConcurrentNew(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "store.db")
+	initialized, err := openSQLiteFixture(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := initialized.ReadObservationRevision(t.Context(), "absent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initialized.db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	const openers = 8
 	start := make(chan struct{})
 	results := make(chan error, openers)
-	var storesMu sync.Mutex
-	var stores []*Store
 	for range openers {
 		go func() {
 			<-start
-			store, err := Open(context.Background(), path)
+			store, err := reopenSQLiteFixture(t.Context(), path)
 			if err == nil {
-				storesMu.Lock()
-				stores = append(stores, store)
-				storesMu.Unlock()
+				var after session.ObservationWatermark
+				after, err = store.ReadObservationRevision(t.Context(), "absent")
+				if err == nil && after != before {
+					err = errors.New("store identity changed during New")
+				}
+				err = errors.Join(err, store.db.Close())
 			}
 			results <- err
 		}()
@@ -841,20 +855,17 @@ func TestConcurrentOpenInitializesCurrentSchema(t *testing.T) {
 	close(start)
 	for range openers {
 		if err := <-results; err != nil {
-			t.Errorf("concurrent Open: %v", err)
+			t.Errorf("concurrent New: %v", err)
 		}
-	}
-	for _, store := range stores {
-		_ = store.Close()
 	}
 }
 
 func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
-	store, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = store.db.Close() }()
 	ctx := context.Background()
 	now := time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC)
 	if _, err := store.CreateSession(ctx, session.Session{ID: "ledger-session", CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -902,24 +913,24 @@ func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
 
 func setupToolTransitionTest(t testing.TB) (*Store, session.ExecutionStore, session.ToolCall, time.Time) {
 	t.Helper()
-	st, err := Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	st, err := openSQLiteFixture(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	ctx := context.Background()
 	now := time.Now().UTC()
 	if _, err := st.CreateSession(ctx, session.Session{ID: "session-tool", CreatedAt: now, UpdatedAt: now}); err != nil {
-		_ = st.Close()
+		_ = st.db.Close()
 		t.Fatalf("create session: %v", err)
 	}
 	run, err := st.AdmitRun(ctx, session.Run{ID: "run-tool", SessionID: "session-tool", OwnerID: "owner", ClaimToken: "claim-tool-run", Status: session.RunPending, CreatedAt: now}, time.Minute)
 	if err != nil {
-		_ = st.Close()
+		_ = st.db.Close()
 		t.Fatalf("admit run: %v", err)
 	}
 	execution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-tool", SessionID: "session-tool", RunID: "run-tool", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
-		_ = st.Close()
+		_ = st.db.Close()
 		t.Fatalf("append message: %v", err)
 	}
 	call := session.ToolCall{ID: "call-tool", SessionID: "session-tool", RunID: "run-tool", MessageID: "msg-tool", ResultMessageID: "result-tool", ResultPartID: "part-tool", Name: "tool", Pattern: "resource/one", Input: []byte(`{"ok":true}`), Status: session.ToolCallPending}
@@ -931,7 +942,7 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ExecutionStore, session
 	st, execution, call, now := setupToolTransitionTest(t)
 	ctx := context.Background()
 	if _, err := execution.CreateToolCall(ctx, sqliteCreateRequest(call, "event-create-tool", now)); err != nil {
-		_ = st.Close()
+		_ = st.db.Close()
 		t.Fatalf("create tool call: %v", err)
 	}
 	call.ClaimedBy = "worker"
@@ -939,11 +950,11 @@ func setupClaimedToolCall(t testing.TB) (*Store, session.ExecutionStore, session
 	startedAt := now.Add(time.Microsecond)
 	claimed, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, StartedAt: startedAt, LeaseDuration: time.Minute, Event: sqliteToolEvent("event-claim-tool", startedAt)})
 	if err != nil {
-		_ = st.Close()
+		_ = st.db.Close()
 		t.Fatalf("claim tool call: %v", err)
 	}
 	if claimed.Call.Pattern != "resource/one" {
-		_ = st.Close()
+		_ = st.db.Close()
 		t.Fatalf("claimed pattern = %q", claimed.Call.Pattern)
 	}
 	return st, execution, claimed.Call

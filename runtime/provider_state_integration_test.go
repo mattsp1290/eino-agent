@@ -23,7 +23,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 const providerStateExtraKey = "openaicodex:reasoning_items"
@@ -53,11 +52,11 @@ func runDurableProviderStateJourney(t *testing.T, reopen bool) {
 	t.Helper()
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "state.db")
-	store, err := sqlitestore.Open(ctx, dbPath)
+	store, storePool, err := openTestSQLite(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	ids := &sequenceIDs{}
 	firstClient := &runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("first answer")}}
 	first := providerStateOrchestrator(t, store, ids, firstClient)
@@ -94,10 +93,10 @@ func runDurableProviderStateJourney(t *testing.T, reopen bool) {
 	assertProviderStateAbsent(t, public)
 
 	if reopen {
-		if err := store.Close(); err != nil {
+		if err := storePool.Close(); err != nil {
 			t.Fatal(err)
 		}
-		store, err = sqlitestore.Open(ctx, dbPath)
+		store, storePool, err = reopenTestSQLite(ctx, dbPath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -142,11 +141,11 @@ func runDurableProviderStateJourney(t *testing.T, reopen bool) {
 
 func TestActiveProviderStateWithoutCodecRollsBackAdmission(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	ids := &sequenceIDs{}
 	firstClient := &runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("answer")}}
 	first := providerStateOrchestrator(t, store, ids, firstClient)
@@ -195,7 +194,7 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 		t.Run(test.name, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "corrupt.db")
-			store, err := sqlitestore.Open(ctx, path)
+			store, storePool, err := openTestSQLite(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -206,7 +205,7 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 			if firstResult.Error != nil {
 				t.Fatal(firstResult.Error)
 			}
-			if err := store.Close(); err != nil {
+			if err := storePool.Close(); err != nil {
 				t.Fatal(err)
 			}
 			db, err := sql.Open("sqlite", path)
@@ -217,11 +216,11 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			store, err = sqlitestore.Open(ctx, path)
+			store, storePool, err = reopenTestSQLite(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = store.Close() }()
+			defer func() { _ = storePool.Close() }()
 			secondClient := &runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("should not run", nil)}}
 			second := providerStateOrchestrator(t, store, ids, secondClient)
 			_, err = second.Start(ctx, Request{SessionID: "state-session", Message: UserMessage{Content: "second"}, Config: orchestratorConfig()})
@@ -533,7 +532,7 @@ func mutateSQLiteProviderStateParts(t *testing.T, db *sql.DB, mutate func(*sessi
 		t.Fatal(err)
 	}
 	for _, value := range updates {
-		if _, err := db.Exec(`UPDATE parts SET record = ? WHERE id = ?`, value.raw, value.id); err != nil {
+		if _, err := db.Exec(`UPDATE parts SET record = ? WHERE id = ?`, value.raw, []byte(value.id)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -542,7 +541,7 @@ func mutateSQLiteProviderStateParts(t *testing.T, db *sql.DB, mutate func(*sessi
 func mutateSQLiteRecord[T any](t *testing.T, db *sql.DB, table, id string, mutate func(*T)) {
 	t.Helper()
 	var raw []byte
-	if err := db.QueryRow(`SELECT record FROM `+table+` WHERE id = ?`, id).Scan(&raw); err != nil {
+	if err := db.QueryRow(`SELECT record FROM `+table+` WHERE id = ?`, []byte(id)).Scan(&raw); err != nil {
 		t.Fatal(err)
 	}
 	var record T
@@ -554,7 +553,7 @@ func mutateSQLiteRecord[T any](t *testing.T, db *sql.DB, table, id string, mutat
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE `+table+` SET record = ? WHERE id = ?`, raw, id); err != nil {
+	if _, err := db.Exec(`UPDATE `+table+` SET record = ? WHERE id = ?`, raw, []byte(id)); err != nil {
 		t.Fatal(err)
 	}
 }

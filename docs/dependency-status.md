@@ -330,8 +330,9 @@ in `store/sqlite/schema_fingerprints.json`. Analysis statistics and sequence
 positions are excluded; history rows and store identity are checked separately.
 Inspection uses a deferred read transaction, including with a host's immediate
 transaction configuration, and preserves the borrowed connection and pool.
-The existing public SQLite lifecycle still uses its legacy initializer until
-the separate store cutover.
+The SQLite public lifecycle uses explicit `Migrate` and read-only `New` over a
+host-owned pool. Shared GORM persistence uses `gorm.io/gorm v1.31.2` and the
+official SQLite dialect `v1.6.0` with the supplied modernc connection.
 
 After reviewing a baseline or catalog-query change, regenerate with
 `go test -run '^TestMigrationSchemaReference$' ./store/sqlite -args -update-sqlite-schema`.

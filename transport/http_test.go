@@ -11,7 +11,6 @@ import (
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestSSEHandlerAppliesAuthAndReplayCursor(t *testing.T) {
@@ -214,11 +213,11 @@ func TestResumeHandlerRejectsNonPost(t *testing.T) {
 func replayStore(t *testing.T) session.Store {
 	t.Helper()
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, t.TempDir()+"/store.db")
+	store, storePool, err := openTestSQLite(ctx, t.TempDir()+"/store.db")
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
-	t.Cleanup(func() { _ = store.Close() })
+	t.Cleanup(func() { _ = storePool.Close() })
 	now := time.Date(2026, 6, 28, 16, 0, 0, 0, time.UTC)
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-http", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)

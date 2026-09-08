@@ -72,6 +72,7 @@ fi
 
 mkdir -p -- "${consumer_dir}" "${module_cache}"
 cp -f -- "${script_dir}/consumer.go" "${consumer_dir}/consumer.go"
+cp -f -- "${script_dir}/sqlite_pool_test.go" "${consumer_dir}/sqlite_pool_test.go"
 cp -f -- "${script_dir}/session_discovery_fixture_test.go" "${consumer_dir}/session_discovery_fixture_test.go"
 cp -f -- "${script_dir}/session_watch_fixture_test.go" "${consumer_dir}/session_watch_fixture_test.go"
 cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"

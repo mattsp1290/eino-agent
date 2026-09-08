@@ -9,7 +9,7 @@ This sketch maps the current `ag-ui-go-server-example` shape to stable `eino-age
 | Fiber route parses `RunAgentInput` and owns path/auth policy | Keep in the app; call `runtime.StreamingOrchestrator.Start` with a `runtime.Request` |
 | Current AG-UI submission | Validate the raw terminal message and copy only its plain-text user content into `runtime.Request.Message` |
 | SSE stream/reconnect boilerplate | `transport.SSEHandler` with `session.Store`, `stream.Tail`, route-owned session lookup, and `after` cursor parsing |
-| Local paused/history storage | `store/sqlite.Open` for durable sessions, runs, messages, parts, tool calls, epochs, and replayable events |
+| Local paused/history storage | `store/sqlite.Migrate` followed by `store/sqlite.New` for durable sessions, runs, messages, parts, tool calls, epochs, and replayable events |
 | Client-defined AG-UI tools | `tools/agui.MountClientTools` plus `composition.Registry` and `agui.ClientToolSnapshot` |
 | Interrupt route | `transport.InterruptHandler` and an app-owned active-handle lookup |
 
@@ -19,7 +19,7 @@ The buildable package in `examples/ag-ui-go-server-example` intentionally uses `
 
 Core flow:
 
-1. Open local storage with `store/sqlite.Open`.
+1. Open and retain a host-owned modernc pool, then initialize and construct storage with `store/sqlite.Migrate` followed by `store/sqlite.New`.
 2. Build a `stream.Tail` for live fanout.
 3. Pass the `stream.Tail` through `runtime.WithEventSink` for live fanout, and pass the same tail to `transport.SSEHandler`.
 4. Build one `composition.Registry`, mount server tools into it, and install it with `runtime.WithRunPlanProvider`.
@@ -83,7 +83,7 @@ those entries explicitly to durable runtime settlement before accepting them.
 ## Stable APIs Used
 
 - `runtime.StreamingOrchestrator`, `runtime.Request`, `runtime.Handle`
-- `session.Store` and `store/sqlite.Open`
+- `session.Store` and `store/sqlite.Migrate` followed by `store/sqlite.New`
 - `stream.Tail`
 - `transport.SSEHandler`, `transport.InterruptHandler`
 - `agui.ClientToolSnapshot`, `agui.ClientToolDispatcher`

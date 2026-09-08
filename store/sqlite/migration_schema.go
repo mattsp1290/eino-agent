@@ -16,6 +16,11 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+type schemaReader interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 type migrationSchemaState uint8
 
 const (
@@ -52,6 +57,10 @@ LIMIT 2`
 // read-only option prevents modernc's _txlock=immediate setting from turning
 // this preflight into a writer transaction.
 func inspectMigrationSchema(ctx context.Context, conn *sql.Conn) (state migrationSchemaState, err error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	defer func() { err = errors.Join(err, ctx.Err()) }()
 	if conn == nil {
 		return 0, fmt.Errorf("%w: nil sqlite connection", session.ErrConflict)
 	}

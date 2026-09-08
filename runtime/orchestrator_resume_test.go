@@ -215,12 +215,12 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	defer func() {
-		_ = store.Close()
+		_ = storePool.Close()
 	}()
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume", CreatedAt: now, UpdatedAt: now}); err != nil {
@@ -376,11 +376,11 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	t.Parallel()
 	const leaseDuration = time.Second
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	defer func() {
@@ -482,12 +482,12 @@ func TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool(t *testing.T) {
 func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStatus) (*sqlitestore.Store, session.Run) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = store.Close()
+		_ = storePool.Close()
 	})
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume", CreatedAt: now, UpdatedAt: now}); err != nil {

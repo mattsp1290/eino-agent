@@ -20,7 +20,7 @@ func observationLimits() session.ObservationLimits {
 }
 func TestObservationLimitsPrivacyAndIndex(t *testing.T) {
 	st, ex, _, now := setupToolTransitionTest(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	l := observationLimits()
 	appendPart := func(id string, kind session.PartKind, payload string) {
@@ -58,10 +58,10 @@ func TestObservationLimitsPrivacyAndIndex(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, query := range []string{
-		"EXPLAIN QUERY PLAN SELECT id FROM messages WHERE session_id = 'session-tool' AND role IN ('user','assistant') ORDER BY created_at DESC,id DESC LIMIT 2",
-		"EXPLAIN QUERY PLAN SELECT id FROM parts WHERE session_id = 'session-tool' AND message_id = 'msg-tool' AND kind = 'text' ORDER BY ordinal,id LIMIT 2",
+		"EXPLAIN QUERY PLAN SELECT id FROM messages WHERE session_key = (SELECT row_key FROM sessions WHERE id = x'73657373696f6e2d746f6f6c') AND role IN ('user','assistant') ORDER BY created_at DESC,id DESC LIMIT 2",
+		"EXPLAIN QUERY PLAN SELECT id FROM parts WHERE session_key = (SELECT row_key FROM sessions WHERE id = x'73657373696f6e2d746f6f6c') AND message_key = (SELECT row_key FROM messages WHERE id = x'6d73672d746f6f6c') AND kind = 'text' ORDER BY ordinal,id LIMIT 2",
 	} {
-		rows, err := st.query(ctx, query)
+		rows, err := st.db.QueryContext(ctx, query)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -82,7 +82,7 @@ func TestObservationLimitsPrivacyAndIndex(t *testing.T) {
 }
 func TestObservationRootReaderAndOverflow(t *testing.T) {
 	st, ex, _, _ := setupToolTransitionTest(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	if err := st.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
 		r := tx.(session.ObservationReader)
@@ -104,21 +104,21 @@ func TestObservationRootReaderAndOverflow(t *testing.T) {
 	if _, err := st.ReadObservationSnapshot(ctx, "session-tool", observationLimits()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.exec(ctx, "UPDATE observation_revisions SET revision = ? WHERE session_id = ?", int64(math.MaxInt64), "session-tool"); err != nil {
+	if _, err := st.db.ExecContext(ctx, "UPDATE observation_revisions SET revision = ? WHERE session_id = ?", int64(math.MaxInt64), []byte("session-tool")); err != nil {
 		t.Fatal(err)
 	}
 	if err := ex.FinalizeAssistantMessage(ctx, "msg-tool"); err == nil {
 		t.Fatal("revision overflow accepted")
 	}
 	var finalized bool
-	if err := st.queryRow(ctx, "SELECT finalized FROM messages WHERE id = 'msg-tool'").Scan(&finalized); err != nil || finalized {
+	if err := st.db.QueryRowContext(ctx, "SELECT finalized FROM messages WHERE id = x'6d73672d746f6f6c'").Scan(&finalized); err != nil || finalized {
 		t.Fatal(err, finalized)
 	}
 }
 func TestObservationReopenAndRecreation(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "store.db")
-	st, err := Open(ctx, path)
+	st, err := openSQLiteFixture(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,8 +126,8 @@ func TestObservationReopenAndRecreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = st.Close()
-	st, err = Open(ctx, path)
+	_ = st.db.Close()
+	st, err = reopenSQLiteFixture(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,15 +135,15 @@ func TestObservationReopenAndRecreation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = st.Close()
+	_ = st.db.Close()
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal(before, after)
 	}
-	st, err = Open(ctx, filepath.Join(t.TempDir(), "new.db"))
+	st, err = openSQLiteFixture(ctx, filepath.Join(t.TempDir(), "new.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	recreated, err := st.ReadObservationSnapshot(ctx, "absent", observationLimits())
 	if err != nil {
 		t.Fatal(err)
@@ -157,12 +157,12 @@ func TestObservationConcurrentCommittedSnapshot(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), "store.db")
-			writer, err := Open(ctx, path)
+			writer, err := openSQLiteFixture(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = writer.Close() }()
-			if _, err = writer.exec(ctx, "PRAGMA journal_mode="+mode); err != nil {
+			defer func() { _ = writer.db.Close() }()
+			if _, err = writer.db.ExecContext(ctx, "PRAGMA journal_mode="+mode); err != nil {
 				t.Fatal(err)
 			}
 			_, err = writer.CreateSession(ctx, session.Session{ID: "s"})
@@ -178,11 +178,11 @@ func TestObservationConcurrentCommittedSnapshot(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			reader, err := Open(ctx, path)
+			reader, err := openSQLiteFixture(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = reader.Close() }()
+			defer func() { _ = reader.db.Close() }()
 			ready, commit := make(chan struct{}), make(chan struct{})
 			done := make(chan error, 1)
 			go func() {
@@ -223,7 +223,7 @@ func TestObservationConcurrentCommittedSnapshot(t *testing.T) {
 
 func TestObservationWindowCumulativeLimitsAndExcludedPopulations(t *testing.T) {
 	st, ex, _, now := setupToolTransitionTest(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := t.Context()
 	limit := observationLimits()
 	limit.MaxMessages = 2
@@ -287,24 +287,36 @@ func TestObservationWindowCumulativeLimitsAndExcludedPopulations(t *testing.T) {
 }
 func TestObservationForeignOwnershipAndScalarUTF8(t *testing.T) {
 	st, ex, _, _ := setupToolTransitionTest(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := t.Context()
 	if _, err := ex.AppendPart(ctx, session.Part{ID: "p", MessageID: "msg-tool", SessionID: "session-tool", RunID: "run-tool", Kind: session.PartText, Payload: []byte(`{"text":"safe"}`)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.exec(ctx, "UPDATE parts SET run_id = 'foreign' WHERE id = 'p'"); err != nil {
+	if _, err := st.CreateSession(ctx, session.Session{ID: "foreign-session"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.AdmitRun(ctx, session.Run{ID: "foreign-run", SessionID: "foreign-session", Status: session.RunRunning, ClaimToken: "foreign-token"}, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE parts SET run_key = (SELECT row_key FROM runs WHERE id = ?) WHERE id = ?", []byte("foreign-run"), []byte("p")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.ReadObservationSnapshot(ctx, "session-tool", observationLimits()); !errors.Is(err, session.ErrObservationInvalid) {
 		t.Fatal(err)
 	}
-	if observationStringsValid("\xc3", "\xa9") {
-		t.Fatal("individually malformed fields accepted")
+	if _, err := st.db.ExecContext(ctx, "UPDATE parts SET run_key = (SELECT row_key FROM runs WHERE id = ?) WHERE id = ?", []byte("run-tool"), []byte("p")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.ExecContext(ctx, "UPDATE runs SET provider_id=?, model_id=? WHERE id=?", []byte{0xc3}, []byte{0xa9}, []byte("run-tool")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.ReadObservationSnapshot(ctx, "session-tool", observationLimits()); !errors.Is(err, session.ErrObservationInvalid) {
+		t.Fatal("individually malformed fields accepted", err)
 	}
 }
 func TestObservationAssistantToolFinalizationAtomic(t *testing.T) {
 	st, ex, call, now := setupToolTransitionTest(t)
-	defer func() { _ = st.Close() }()
+	defer func() { _ = st.db.Close() }()
 	ctx := t.Context()
 	call.RequestPartID = "request"
 	request := session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolCall, Payload: []byte(`{"id":"call-tool","name":"tool","arguments":{"ok":true}}`)}, Event: session.ToolTransitionEvent{ID: "pending", CreatedAt: now}}

@@ -31,7 +31,6 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 	agenttools "github.com/mattsp1290/eino-agent/tools"
 )
 
@@ -129,11 +128,11 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
 
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "runtime.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "runtime.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 
 	wantOrder := []string{"file_read", "file_write", "file_edit", "file_list", "glob", "search", "apply_patch", "shell", "url_fetch", "user_interact"}
 	streamer := &catalogRuntimeStreamer{wantOrder: wantOrder}

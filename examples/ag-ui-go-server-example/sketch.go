@@ -9,9 +9,11 @@ package agui_go_server_example
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"unicode/utf8"
@@ -168,8 +170,24 @@ func InterruptHandler(lookup func(context.Context, *http.Request) (transport.Int
 	return transport.InterruptHandler(nil, lookup)
 }
 
-// OpenLocalStore uses eino-agent's SQLite store for local durable sessions,
-// messages, parts, runs, tool calls, context epochs, and replayable events.
-func OpenLocalStore(ctx context.Context, path string) (*sqlitestore.Store, error) {
-	return sqlitestore.Open(ctx, path)
+// OpenLocalStore opens a host-owned pool and explicitly initializes its store.
+// The application retains and closes the returned pool at shutdown.
+func OpenLocalStore(ctx context.Context, path string) (*sqlitestore.Store, *sql.DB, error) {
+	uri := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"}
+	pool, err := sql.Open("sqlite", uri.String())
+	if err != nil {
+		return nil, nil, err
+	}
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	if err := sqlitestore.Migrate(ctx, pool); err != nil {
+		_ = pool.Close()
+		return nil, nil, err
+	}
+	store, err := sqlitestore.New(ctx, pool)
+	if err != nil {
+		_ = pool.Close()
+		return nil, nil, err
+	}
+	return store, pool, nil
 }

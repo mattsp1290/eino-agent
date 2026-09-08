@@ -34,11 +34,11 @@ func TestOperationAdmissionCancellation(t *testing.T) {
 	for _, operation := range []string{"Next", "Resnapshot"} {
 		for _, terminate := range []string{"deadline", "close"} {
 			t.Run(operation+"/"+terminate, func(t *testing.T) {
-				store, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "admission.db"))
+				store, storePool, err := openTestSQLite(t.Context(), filepath.Join(t.TempDir(), "admission.db"))
 				if err != nil {
 					t.Fatal(err)
 				}
-				defer func() { _ = store.Close() }()
+				defer func() { _ = storePool.Close() }()
 				reader := &operationAdmissionReader{Store: store, entered: make(chan struct{}), release: make(chan struct{})}
 				options := testOptions()
 				options.PollInterval = time.Hour

@@ -20,7 +20,7 @@ import (
 
 func watchFixture(t *testing.T) (*watch.Service, *sqlite.Store, SessionWatchConfig) {
 	t.Helper()
-	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "watch.db"))
+	st, stPool, err := openTestSQLite(t.Context(), filepath.Join(t.TempDir(), "watch.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,7 +28,7 @@ func watchFixture(t *testing.T) (*watch.Service, *sqlite.Store, SessionWatchConf
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()); _ = st.Close() })
+	t.Cleanup(func() { _ = s.Close(context.Background()); _ = stPool.Close() })
 	return s, st, SessionWatchConfig{Service: s, Auth: func(ctx context.Context, _ *http.Request) (context.Context, error) { return ctx, nil }, Session: func(*http.Request) (session.ID, error) { return "s", nil }, WriteTimeout: 100 * time.Millisecond}
 }
 func TestSessionWatchHTTPFreshReconnectAndAuth(t *testing.T) {

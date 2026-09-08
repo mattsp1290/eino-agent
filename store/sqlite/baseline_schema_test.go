@@ -10,10 +10,13 @@ import (
 	"testing"
 )
 
-// This source is inactive until the production initializer switches to Goose.
+// The explicit baseline is shared by production migration and schema proofs.
 //
 //go:embed migrations/00001_initial.sql
 var baselineSQL []byte
+
+//go:embed testdata/legacy_schema.sql
+var currentSchema string
 
 const (
 	baselineTime                  = "0000-01-01T00:00:00.000000000Z"

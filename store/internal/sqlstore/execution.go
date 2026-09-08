@@ -1,11 +1,13 @@
-package sqlite
+package sqlstore
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"gorm.io/gorm"
+
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 type executionStore struct {
@@ -29,114 +31,120 @@ func (e *executionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	})
 }
 
+// withFence is an operation boundary as well as the authorization check. The
+// dialect lock is acquired before reading the run and held until fn returns.
 func (e *executionStore) withFence(ctx context.Context, fn func(*Store, session.Run) error) error {
 	return e.withFenceState(ctx, false, fn)
 }
 
 func (e *executionStore) withFenceState(ctx context.Context, allowTerminal bool, fn func(*Store, session.Run) error) error {
-	if e == nil || e.store == nil || e.fence.RunID == "" || e.fence.ClaimToken == "" {
+	if e == nil || e.store == nil || fn == nil || e.fence.RunID == "" || e.fence.ClaimToken == "" {
 		return session.ErrConflict
 	}
-	if e.store.tx != nil {
-		run, err := loadRunFence(ctx, e.store, e.fence, allowTerminal)
+	return e.store.atomic(ctx, func(st *Store) error {
+		run, err := loadRunFence(ctx, st, e.fence, allowTerminal)
 		if err != nil {
 			return err
 		}
-		return fn(e.store, run)
-	}
-	return e.store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
-		store, ok := tx.(*Store)
-		if !ok {
-			return session.ErrConflict
-		}
-		run, err := loadRunFence(ctx, store, e.fence, allowTerminal)
-		if err != nil {
-			return err
-		}
-		return fn(store, run)
+		return fn(st, run)
 	})
 }
 
 func loadRunFence(ctx context.Context, store *Store, fence session.RunFence, allowTerminal bool) (session.Run, error) {
-	query := `SELECT record, status, owner_id, claim_token, lease_until FROM runs WHERE id = ? AND claim_token = ?`
-	args := []any{fence.RunID, fence.ClaimToken}
+	db := store.dialect.LockRun(store.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key").Where("runs.id = ? AND runs.claim_token = ?", []byte(fence.RunID), []byte(fence.ClaimToken)))
 	if !allowTerminal {
-		query += ` AND status IN (?, ?)`
-		args = append(args, session.RunPending, session.RunRunning)
+		db = db.Where("runs.status IN ?", []string{string(session.RunPending), string(session.RunRunning)})
 	}
-	run, err := store.getRun(ctx, query, args...)
-	if err != nil {
-		return session.Run{}, session.ErrConflict
+	var row runRow
+	if err := db.Take(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return session.Run{}, session.ErrConflict
+		}
+		return session.Run{}, err
 	}
-	return run, nil
+	return decodeRunRow(row)
 }
 
 func (e *executionStore) StartRun(ctx context.Context, startedAt time.Time) (session.Run, error) {
-	var started session.Run
+	if startedAt.IsZero() {
+		return session.Run{}, session.ErrConflict
+	}
+	var result session.Run
 	err := e.withFence(ctx, func(store *Store, current session.Run) error {
 		current.Status = session.RunRunning
-		current.StartedAt = startedAt
+		current.StartedAt = startedAt.UTC()
 		if err := store.writeRun(ctx, current); err != nil {
 			return err
 		}
 		var err error
-		started, err = store.GetRun(ctx, e.fence.RunID)
+		result, err = store.getRun(ctx, e.fence.RunID)
 		return err
 	})
-	return started, err
+	return result, err
 }
 
 func (e *executionStore) RenewRunLease(ctx context.Context, leaseDuration time.Duration) (session.Run, error) {
 	if leaseDuration <= 0 {
 		return session.Run{}, session.ErrConflict
 	}
-	var renewed session.Run
+	var result session.Run
 	err := e.withFence(ctx, func(store *Store, _ session.Run) error {
-		result, err := store.exec(ctx, `UPDATE runs SET lease_until = CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER) + ? WHERE id = ? AND claim_token = ? AND status IN (?, ?)`, durationMicros(leaseDuration), e.fence.RunID, e.fence.ClaimToken, session.RunPending, session.RunRunning)
-		if err != nil {
-			return mapErr(err)
+		if err := renewRunLease(ctx, store, e.fence, leaseDuration); err != nil {
+			return err
 		}
-		if err := rowsAffected(result); err != nil {
-			return session.ErrConflict
-		}
-		renewed, err = store.GetRun(ctx, e.fence.RunID)
+		var err error
+		result, err = store.getRun(ctx, e.fence.RunID)
 		return err
 	})
-	return renewed, err
+	return result, err
+}
+
+func renewRunLease(ctx context.Context, store *Store, fence session.RunFence, leaseDuration time.Duration) error {
+	db := store.dbFor(ctx).Table("runs").Where("id = ? AND claim_token = ? AND status IN ?", []byte(fence.RunID), []byte(fence.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+		"lease_until": gorm.Expr(store.dialect.ClockSQL()+" + ?", durationMicros(leaseDuration)),
+	})
+	if err := db.Error; err != nil {
+		return store.mapErr(err)
+	}
+	if db.RowsAffected == 0 {
+		return session.ErrConflict
+	}
+	return nil
 }
 
 func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
-	if !request.Settlement.FinishedAt.IsZero() {
-		request.Settlement.FinishedAt = request.Settlement.FinishedAt.UTC()
-	}
-	if request.Event.ID == "" {
+	if request.Event.ID == "" || request.Settlement.FinishedAt.IsZero() {
 		return session.RunSettlementResult{}, session.ErrConflict
 	}
-	var committed session.RunSettlementResult
+	var result session.RunSettlementResult
 	err := e.withFenceState(ctx, true, func(store *Store, current session.Run) error {
-		var unfinished int
-		if err := store.queryRow(ctx, `SELECT COUNT(*) FROM tool_calls WHERE run_id = ? AND status IN (?, ?)`, current.ID, session.ToolCallPending, session.ToolCallRunning).Scan(&unfinished); err != nil {
-			return mapErr(err)
+		var count int64
+		runKey, err := store.key(ctx, "runs", string(current.ID))
+		if err != nil {
+			return err
 		}
-		if unfinished != 0 {
+		if err := store.dbFor(ctx).Table("tool_calls").Where("run_key = ? AND status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Count(&count).Error; err != nil {
+			return store.mapErr(err)
+		}
+		if count != 0 {
 			return session.ErrConflict
 		}
 		if current.Terminal() {
-			if current.Status != request.Settlement.Status || !current.FinishedAt.Equal(request.Settlement.FinishedAt) || current.Error != request.Settlement.Error {
+			if current.Status != request.Settlement.Status || !current.FinishedAt.Equal(request.Settlement.FinishedAt.UTC()) || current.Error != request.Settlement.Error {
 				return session.ErrConflict
 			}
 			expected, err := session.RunSettlementRecord(current, request.Event)
 			if err != nil {
 				return err
 			}
-			var existing session.EventRecord
-			if err := store.getJSON(ctx, `SELECT record FROM events WHERE run_id = ? AND kind = ?`, []any{current.ID, session.RunSettlementEventKind}, &existing); err != nil {
+			existing, err := store.eventByRunFinished(ctx, runKey, expected.Kind)
+			if err != nil || !SameRecord(existing, expected) {
+				if err != nil {
+					return session.ErrConflict
+				}
 				return session.ErrConflict
 			}
-			if !sqlstore.SameRecord(existing, expected) {
-				return session.ErrConflict
-			}
-			committed = session.RunSettlementResult{Run: current, Event: existing}
+			result = session.RunSettlementResult{Run: current, Event: existing}
 			return nil
 		}
 		canonicalRun, err := session.ApplyRunSettlement(current, request.Settlement)
@@ -150,14 +158,14 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 		if err := store.writeRun(ctx, canonicalRun); err != nil {
 			return err
 		}
-		canonicalEvent, err = store.appendEvent(ctx, canonicalEvent)
+		canonicalEvent, err = store.appendCanonicalEvent(ctx, canonicalEvent)
 		if err != nil {
 			return err
 		}
-		committed = session.RunSettlementResult{Run: canonicalRun, Event: canonicalEvent}
+		result = session.RunSettlementResult{Run: canonicalRun, Event: canonicalEvent}
 		return nil
 	})
-	return committed, err
+	return result, err
 }
 
 func (e *executionStore) AppendMessage(ctx context.Context, record session.Message) (session.Message, error) {
@@ -176,11 +184,29 @@ func (e *executionStore) AppendMessage(ctx context.Context, record session.Messa
 	return result, err
 }
 
+func (e *executionStore) FinalizeAssistantMessage(ctx context.Context, id session.MessageID) error {
+	return e.withFence(ctx, func(store *Store, run session.Run) error {
+		sessionKey, err := store.key(ctx, "sessions", string(run.SessionID))
+		if err != nil {
+			return err
+		}
+		runKey, err := store.key(ctx, "runs", string(run.ID))
+		if err != nil {
+			return err
+		}
+		db := store.dbFor(ctx).Table("messages").Where("id = ? AND session_key = ? AND run_key = ? AND role = ?", []byte(id), sessionKey, runKey, string(session.RoleAssistant)).Updates(map[string]any{"finalized": 1})
+		if err := db.Error; err != nil {
+			return store.mapErr(err)
+		}
+		if db.RowsAffected == 0 {
+			return session.ErrNotFound
+		}
+		return nil
+	})
+}
+
 func (e *executionStore) AppendPart(ctx context.Context, record session.Part) (session.Part, error) {
-	if record.Kind == session.PartToolCall || record.Kind == session.PartToolResult {
-		return session.Part{}, session.ErrConflict
-	}
-	if record.RunID != e.fence.RunID {
+	if record.Kind == session.PartToolCall || record.Kind == session.PartToolResult || record.RunID != e.fence.RunID {
 		return session.Part{}, session.ErrConflict
 	}
 	var result session.Part
@@ -224,38 +250,37 @@ func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRe
 }
 
 func (e *executionStore) CreateToolCall(ctx context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
-	record := request.Call
-	if record.RunID != e.fence.RunID {
+	call := request.Call
+	if call.RunID != e.fence.RunID {
 		return session.ToolTransitionResult{}, session.ErrConflict
 	}
 	var result session.ToolTransitionResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
-		part := request.RequestPart
-		if record.SessionID != run.SessionID || !sqlstore.ValidToolRequestEnvelope(record, part) {
+		if call.SessionID != run.SessionID || !ValidToolRequestEnvelope(call, request.RequestPart) {
 			return session.ErrConflict
 		}
-		event, err := session.ToolTransitionRecord(record, request.Event)
+		event, err := session.ToolTransitionRecord(call, request.Event)
 		if err != nil || event.ToolTransition != session.ToolTransitionPending {
 			return session.ErrConflict
 		}
-		if _, err = store.appendPart(ctx, part); err != nil {
+		if _, err := store.appendPart(ctx, request.RequestPart); err != nil {
 			return err
 		}
-		result.Call, err = store.createToolCall(ctx, record)
+		result.Call, err = store.createToolCall(ctx, call)
 		if err != nil {
 			return err
 		}
-		result.Event, err = store.appendEvent(ctx, event)
+		result.Event, err = store.appendCanonicalEvent(ctx, event)
 		if err != nil {
 			return err
 		}
-		result.Call, err = store.GetToolCall(ctx, record.ID)
+		result.Call, err = store.GetToolCall(ctx, call.ID)
 		return err
 	})
 	if err != nil {
 		return session.ToolTransitionResult{}, err
 	}
-	return result, err
+	return result, nil
 }
 
 func (e *executionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
@@ -265,7 +290,13 @@ func (e *executionStore) ClaimToolCall(ctx context.Context, request session.Clai
 	var result session.ToolTransitionResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
 		current, err := store.GetToolCall(ctx, request.ID)
-		if err != nil || current.RunID != e.fence.RunID || current.SessionID != run.SessionID {
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				return session.ErrConflict
+			}
+			return err
+		}
+		if current.RunID != e.fence.RunID || current.SessionID != run.SessionID {
 			return session.ErrConflict
 		}
 		candidate := current
@@ -282,44 +313,48 @@ func (e *executionStore) ClaimToolCall(ctx context.Context, request session.Clai
 			if !session.SameToolTransitionState(current, candidate) {
 				return session.ErrConflict
 			}
-			canonicalEvent, err := store.appendEvent(ctx, event)
-			if err != nil {
-				return err
-			}
-			result = session.ToolTransitionResult{Call: current, Event: canonicalEvent}
-			return nil
+			result = session.ToolTransitionResult{Call: current}
+			result.Event, err = store.appendCanonicalEvent(ctx, event)
+			return err
 		}
 		if current.Status != session.ToolCallPending || current.ClaimedBy != "" || current.ClaimToken != "" {
 			return session.ErrConflict
 		}
-		runLease, err := (&executionStore{store: store, fence: e.fence}).RenewRunLease(ctx, request.LeaseDuration)
+		if err := renewRunLease(ctx, store, e.fence, request.LeaseDuration); err != nil {
+			return err
+		}
+		var leasedRun session.Run
+		leasedRun, err = store.getRun(ctx, e.fence.RunID)
 		if err != nil {
 			return err
 		}
-		candidate.LeaseUntil = runLease.LeaseUntil
+		candidate.LeaseUntil = leasedRun.LeaseUntil
 		result.Call, err = store.claimToolCall(ctx, candidate)
 		if err != nil {
 			return err
 		}
-		result.Event, err = store.appendEvent(ctx, event)
+		result.Event, err = store.appendCanonicalEvent(ctx, event)
 		if err != nil {
 			return err
 		}
-		result.Call, err = store.GetToolCall(ctx, candidate.ID)
+		result.Call, err = store.GetToolCall(ctx, request.ID)
 		return err
 	})
 	if err != nil {
 		return session.ToolTransitionResult{}, err
 	}
-	return result, err
+	return result, nil
 }
 
 func (e *executionStore) SettleToolCall(ctx context.Context, request session.SettleToolCallRequest) (session.ToolTransitionResult, error) {
-	settlement := request.Settlement
 	var result session.ToolTransitionResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
+		settlement := request.Settlement
 		call, err := store.GetToolCall(ctx, settlement.ID)
 		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				return session.ErrConflict
+			}
 			return err
 		}
 		if call.RunID != e.fence.RunID || call.SessionID != run.SessionID {
@@ -336,8 +371,7 @@ func (e *executionStore) SettleToolCall(ctx context.Context, request session.Set
 		if err := store.settleToolCall(ctx, settlement); err != nil {
 			return err
 		}
-		result.Call = settled
-		result.Event, err = store.appendEvent(ctx, event)
+		result.Event, err = store.appendCanonicalEvent(ctx, event)
 		if err != nil {
 			return err
 		}

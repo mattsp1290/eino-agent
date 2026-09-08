@@ -15,7 +15,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
@@ -89,11 +88,11 @@ func TestScopedMountConcurrentPlansAndQuiescentUnmount(t *testing.T) {
 }
 
 func TestNativeContextContributionReachesProviderBeforeHistory(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), t.TempDir()+"/native-context.db")
+	store, storePool, err := openTestSQLite(context.Background(), t.TempDir()+"/native-context.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	registry, err := composition.NewRegistry(nil)
 	if err != nil {
 		t.Fatal(err)

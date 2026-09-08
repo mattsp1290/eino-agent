@@ -27,7 +27,6 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 	"github.com/mattsp1290/eino-agent/tools"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
 )
@@ -724,11 +723,11 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var modelTurns atomic.Int64
 	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		if modelTurns.Add(1) == 1 {

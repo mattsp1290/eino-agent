@@ -93,11 +93,11 @@ func TestFinalToolContextPreservesPlanOrderAndIsIsolated(t *testing.T) {
 }
 
 func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), t.TempDir()+"/store.db")
+	store, storePool, err := openTestSQLite(context.Background(), t.TempDir()+"/store.db")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		panic("executor secret")
 	})}}}
@@ -265,8 +265,12 @@ func TestPendingResumeToolPanicPublishesClaimAndSettlement(t *testing.T) {
 		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
 	)
 	done := make(chan Result, 1)
-	orchestrator.executeResume(context.Background(), newRunExecution(orchestrator, plan, run), run, done)
+	execution := newRunExecution(orchestrator, plan, run)
+	orchestrator.executeResume(context.Background(), execution, run, done)
 	result := <-done
+	if err := execution.events.flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolExecutionPanic) {
 		t.Fatalf("result = %+v", result)
 	}

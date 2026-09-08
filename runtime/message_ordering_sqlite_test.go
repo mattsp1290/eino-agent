@@ -11,7 +11,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
@@ -19,14 +18,14 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "store.db")
-	store, err := sqlitestore.Open(ctx, dbPath)
+	store, storePool, err := openTestSQLite(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	closed := false
 	defer func() {
 		if !closed {
-			_ = store.Close()
+			_ = storePool.Close()
 		}
 	}()
 	frozenAt := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
@@ -62,16 +61,16 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 	if result := <-handle.Done(); result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	if err := store.Close(); err != nil {
+	if err := storePool.Close(); err != nil {
 		t.Fatal(err)
 	}
 	closed = true
 
-	reopened, err := sqlitestore.Open(ctx, dbPath)
+	reopened, reopenedPool, err := reopenTestSQLite(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = reopened.Close() }()
+	defer func() { _ = reopenedPool.Close() }()
 
 	var rawMessages []session.Message
 	var rawParts []session.Part

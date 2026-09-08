@@ -1,4 +1,4 @@
-package sqlite
+package sqlstore
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 var _ session.SessionDiscoveryReader = (*Store)(nil)
@@ -21,13 +20,13 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 	if err := q.Validate(); err != nil {
 		return zero, err
 	}
-	if s == nil || s.db == nil || s.tx != nil {
+	if s == nil || s.db == nil || s.pool == nil || s.tx != nil {
 		return zero, session.ErrDiscoveryReader
 	}
-	var cursor sqlstore.DiscoveryPosition
+	var cursor DiscoveryPosition
 	if q.Cursor != "" {
 		var err error
-		cursor, err = sqlstore.DecodeDiscoveryCursor(q.Cursor, q.WorkspaceID)
+		cursor, err = DecodeDiscoveryCursor(q.Cursor, q.WorkspaceID)
 		if err != nil {
 			return zero, err
 		}
@@ -36,15 +35,15 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 		q.Limit = session.DiscoveryDefaultLimit
 	}
 	var page session.SessionDiscoveryPage
-	err := s.discoveryTx(ctx, func(tx *Store) error {
+	err := s.read(ctx, func(tx *Store) error {
 		var incarnation sql.NullString
-		if err := tx.queryRow(ctx, "SELECT "+boundedColumn("incarnation")+" FROM observation_store WHERE singleton = 1", 32).Scan(&incarnation); err != nil {
+		if err := tx.queryRow(ctx, "SELECT "+tx.boundedColumn("incarnation")+" FROM observation_store WHERE singleton = 1", 32).Scan(&incarnation); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return session.ErrDiscoveryInvalid
 			}
 			return err
 		}
-		if !incarnation.Valid || !sqlstore.ValidDiscoveryIncarnation(incarnation.String) {
+		if !incarnation.Valid || !ValidDiscoveryIncarnation(incarnation.String) {
 			return session.ErrDiscoveryInvalid
 		}
 		if q.Cursor != "" && cursor.StoreID != incarnation.String {
@@ -61,21 +60,21 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 }
 
 // Separate first/continuation statements preserve the composite tuple seek.
-func discoverySQL(continuation bool) string {
-	query := "SELECT " + boundedColumn("id") + ", " + boundedColumn("workspace_id") + ", " + boundedColumn("title") + ", " + boundedColumn("created_at") + ", " + boundedColumn("updated_at") + ", (typeof(id) != 'text' OR typeof(workspace_id) != 'text' OR typeof(title) != 'text' OR typeof(created_at) != 'text' OR typeof(updated_at) != 'text') FROM sessions INDEXED BY sessions_workspace_created_idx WHERE workspace_id = ?"
+func (s *Store) discoverySQL(continuation bool) string {
+	query := "SELECT " + s.boundedColumn("id") + ", " + s.boundedColumn("workspace_id") + ", " + s.boundedColumn("title") + ", " + s.boundedColumn("created_at") + ", " + s.boundedColumn("updated_at") + ", (" + s.dialect.InvalidScalar("id", true) + " OR " + s.dialect.InvalidScalar("workspace_id", true) + " OR " + s.dialect.InvalidScalar("title", true) + " OR " + s.dialect.InvalidScalar("created_at", false) + " OR " + s.dialect.InvalidScalar("updated_at", false) + ") FROM sessions" + s.dialect.IndexHint("sessions_workspace_created_idx") + " WHERE workspace_id = ?"
 	if continuation {
 		query += " AND (created_at, id) < (?, ?)"
 	}
 	return query + " ORDER BY created_at DESC, id DESC LIMIT ?"
 }
 
-func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQuery, cursor sqlstore.DiscoveryPosition, incarnation string) (session.SessionDiscoveryPage, error) {
-	args := []any{session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxTitleBytes, 30, 30, q.WorkspaceID}
+func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQuery, cursor DiscoveryPosition, incarnation string) (session.SessionDiscoveryPage, error) {
+	args := []any{session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxTitleBytes, 30, 30, []byte(q.WorkspaceID)}
 	if q.Cursor != "" {
-		args = append(args, sqlstore.TimeText(cursor.CreatedAt), cursor.ID)
+		args = append(args, TimeText(cursor.CreatedAt), []byte(cursor.ID))
 	}
 	args = append(args, q.Limit+1)
-	rows, err := s.query(ctx, discoverySQL(q.Cursor != ""), args...)
+	rows, err := s.query(ctx, s.discoverySQL(q.Cursor != ""), args...)
 	if err != nil {
 		return session.SessionDiscoveryPage{}, err
 	}
@@ -83,7 +82,7 @@ func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQue
 	page := session.SessionDiscoveryPage{Sessions: make([]session.SessionSummary, 0, q.Limit)}
 	for rows.Next() {
 		if len(page.Sessions) == q.Limit {
-			page.NextCursor = sqlstore.EncodeDiscoveryCursor(incarnation, q.WorkspaceID, page.Sessions[len(page.Sessions)-1])
+			page.NextCursor = EncodeDiscoveryCursor(incarnation, q.WorkspaceID, page.Sessions[len(page.Sessions)-1])
 			break
 		}
 		summary, err := scanDiscoverySummary(rows, q.WorkspaceID)
@@ -113,11 +112,11 @@ func scanDiscoverySummary(row rowScanner, workspace string) (session.SessionSumm
 		return summary, session.ErrDiscoveryInvalid
 	}
 	var err error
-	summary.CreatedAt, err = sqlstore.DiscoveryTime(created.String)
+	summary.CreatedAt, err = DiscoveryTime(created.String)
 	if err != nil {
 		return summary, err
 	}
-	summary.UpdatedAt, err = sqlstore.DiscoveryTime(updated.String)
+	summary.UpdatedAt, err = DiscoveryTime(updated.String)
 	if err != nil {
 		return summary, err
 	}

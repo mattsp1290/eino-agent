@@ -15,7 +15,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
@@ -23,14 +22,14 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 
 	ctx := context.Background()
 	dbPath := filepath.Join(t.TempDir(), "store.db")
-	store, err := sqlitestore.Open(ctx, dbPath)
+	store, storePool, err := openTestSQLite(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	closed := false
 	defer func() {
 		if !closed {
-			_ = store.Close()
+			_ = storePool.Close()
 		}
 	}()
 	frozenAt := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
@@ -93,16 +92,16 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	if err != nil || !reflect.DeepEqual(storedSession, originalSession) {
 		t.Fatalf("session after identity drift = %#v, %v; want %#v", storedSession, err, originalSession)
 	}
-	if err := store.Close(); err != nil {
+	if err := storePool.Close(); err != nil {
 		t.Fatal(err)
 	}
 	closed = true
 
-	reopened, err := sqlitestore.Open(ctx, dbPath)
+	reopened, reopenedPool, err := reopenTestSQLite(ctx, dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = reopened.Close() }()
+	defer func() { _ = reopenedPool.Close() }()
 	providerHistory, err := LoadHistory(ctx, reopened, sessionID, history.Options{IncludeReasoning: false})
 	if err != nil {
 		t.Fatal(err)
@@ -145,11 +144,11 @@ func TestAdmissionSQLiteRollsBackAfterUserPartWrite(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
 	firstRequest := testRunAdmission()
 	first, err := (admitter{Store: store, Clock: func() time.Time { return now }}).admit(ctx, firstRequest)

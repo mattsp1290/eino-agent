@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
+
 	modernsqlite "modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 )
@@ -15,8 +17,8 @@ import (
 // SQLite's busy handler can sleep through a canceled Go context. Pin the
 // connection and temporarily disable that handler, retrying whole read views
 // in Go instead. Other store operations retain their original busy timeout.
-func (s *Store) discoveryTx(ctx context.Context, read func(*Store) error) (err error) {
-	conn, err := s.db.Conn(ctx)
+func (sqliteDialect) Read(ctx context.Context, pool *sql.DB, read func(sqlstore.SQLReader) error) (err error) {
+	conn, err := pool.Conn(ctx)
 	if err != nil {
 		return err
 	}
@@ -27,7 +29,9 @@ func (s *Store) discoveryTx(ctx context.Context, read func(*Store) error) (err e
 	}
 	// Restore even if cancellation races the statement that disables the handler.
 	defer func() {
-		_, restoreErr := conn.ExecContext(context.WithoutCancel(ctx), "PRAGMA busy_timeout="+strconv.Itoa(timeout))
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, restoreErr := conn.ExecContext(cleanup, "PRAGMA busy_timeout="+strconv.Itoa(timeout))
 		if restoreErr != nil {
 			// A connection with unknown settings must not return to the pool.
 			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
@@ -42,21 +46,34 @@ func (s *Store) discoveryTx(ctx context.Context, read func(*Store) error) (err e
 	})
 }
 
-func discoveryReadAttempt(ctx context.Context, conn *sql.Conn, read func(*Store) error) (err error) {
+func discoveryReadAttempt(ctx context.Context, conn *sql.Conn, read func(sqlstore.SQLReader) error) (err error) {
 	// Own rollback explicitly. database/sql's cancellation rollback can discard
 	// the pinned connection before its original busy handler is restored.
-	tx, err := conn.BeginTx(context.WithoutCancel(ctx), nil)
+	// ReadOnly forces modernc to use deferred BEGIN even if the host selected
+	// _txlock=immediate. The busy handler stays disabled through tx cleanup.
+	tx, err := conn.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
-	defer func() { _ = tx.Rollback() }()
-	if err = read(&Store{tx: tx}); err != nil {
+	defer func() {
+		rollbackErr := tx.Rollback()
+		if rollbackErr != nil && !errors.Is(rollbackErr, sql.ErrTxDone) {
+			_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+			err = errors.Join(err, rollbackErr)
+		}
+	}()
+	if err = read(tx); err != nil {
 		return err
 	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		// A failed driver commit may also have failed its implicit rollback.
+		// Discard rather than reuse a connection with unknown transaction state.
+		_ = conn.Raw(func(any) error { return driver.ErrBadConn })
+	}
+	return err
 }
 
 func retryDiscoveryRead(ctx context.Context, timeout time.Duration, read func() error) error {

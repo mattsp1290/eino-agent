@@ -18,7 +18,6 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
-	"github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 type discoveryModel struct {
@@ -135,11 +134,11 @@ func TestPublicSessionDiscoveryReopenAndIndependentContinuation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "discovery.db")
-	st, err := sqlite.Open(ctx, path)
+	st, stPool, err := openTestSQLite(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = stPool.Close() }()
 	initialModel := &discoveryModel{}
 	orchestrator := discoveryRuntime(t, st, initialModel)
 	at := time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)
@@ -175,14 +174,14 @@ func TestPublicSessionDiscoveryReopenAndIndependentContinuation(t *testing.T) {
 		t.Fatal("completed sessions disappeared")
 	}
 	bBefore := discoveryHistory(t, ctx, st, "b1")
-	if err = st.Close(); err != nil {
+	if err = stPool.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := sqlite.Open(ctx, path)
+	reopened, reopenedPool, err := reopenTestSQLite(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = reopened.Close() }()
+	defer func() { _ = reopenedPool.Close() }()
 	freshModel := &discoveryModel{}
 	freshRuntime := discoveryRuntime(t, reopened, freshModel)
 	rediscovered := discoveredIDs(t, ctx, reopened)

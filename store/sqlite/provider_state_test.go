@@ -16,7 +16,7 @@ import (
 func TestProviderStatePayloadSurvivesSQLiteCloseAndReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "provider-state.db")
-	store, err := Open(ctx, path)
+	store, err := openSQLiteFixture(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,14 +43,14 @@ func TestProviderStatePayloadSurvivesSQLiteCloseAndReopen(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.Close(); err != nil {
+	if err := store.db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	store, err = Open(ctx, path)
+	store, err = reopenSQLiteFixture(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = store.db.Close() }()
 	batch, err := store.ListMessages(ctx, "state-session", session.ReplayCursor{Limit: 10})
 	if err != nil || len(batch.Parts) != 2 || len(batch.PartOwnerMessageIDs) != 2 {
 		t.Fatalf("batch = %#v, %v", batch, err)
@@ -68,11 +68,11 @@ func TestProviderStatePayloadSurvivesSQLiteCloseAndReopen(t *testing.T) {
 
 func TestListMessagesRejectsProviderStateRowsAboveHardCount(t *testing.T) {
 	ctx := context.Background()
-	store, err := Open(ctx, filepath.Join(t.TempDir(), "provider-state-count.db"))
+	store, err := openSQLiteFixture(ctx, filepath.Join(t.TempDir(), "provider-state-count.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = store.db.Close() }()
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
 	if _, err := store.CreateSession(ctx, session.Session{ID: "state-session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)
