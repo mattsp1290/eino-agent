@@ -2,7 +2,6 @@ package watch
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 
 	"github.com/mattsp1290/eino-agent/session"
@@ -15,7 +14,7 @@ type Subscription struct {
 	cancel    context.CancelFunc
 	stop      func() bool
 	notify    chan struct{}
-	operation sync.Mutex
+	operation chan struct{}
 	reading   atomic.Bool
 	// Below protected by service.mu.
 	ready             bool
@@ -30,19 +29,49 @@ func (sub *Subscription) Initial() session.ObservationSnapshot {
 	defer sub.service.mu.Unlock()
 	return sub.initial.Clone()
 }
+
+// Admission must remain cancelable while another operation is reading the
+// store. The gate still serializes snapshot replacement with update delivery.
+func (sub *Subscription) acquireOperation(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-sub.ctx.Done():
+		sub.service.mu.Lock()
+		defer sub.service.mu.Unlock()
+		if sub.err != nil {
+			return sub.err
+		}
+		return ErrClosed
+	case sub.operation <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			sub.releaseOperation()
+			return err
+		}
+		return nil
+	}
+}
+
+func (sub *Subscription) releaseOperation() { <-sub.operation }
+
 func (sub *Subscription) Next(ctx context.Context) (Update, error) {
 	if !sub.reading.CompareAndSwap(false, true) {
 		return Update{}, ErrBusy
 	}
 	defer sub.reading.Store(false)
 	for {
-		sub.operation.Lock()
+		if err := sub.acquireOperation(ctx); err != nil {
+			return Update{}, err
+		}
 		s := sub.service
 		s.mu.Lock()
 		if sub.err != nil {
 			err := sub.err
 			s.mu.Unlock()
-			sub.operation.Unlock()
+			sub.releaseOperation()
 			return Update{}, err
 		}
 		if len(sub.pending) > 0 {
@@ -52,11 +81,11 @@ func (sub *Subscription) Next(ctx context.Context) (Update, error) {
 			sub.sequence++
 			u.DeliverySequence = sub.sequence
 			s.mu.Unlock()
-			sub.operation.Unlock()
+			sub.releaseOperation()
 			return u.clone(), nil
 		}
 		s.mu.Unlock()
-		sub.operation.Unlock()
+		sub.releaseOperation()
 		select {
 		case <-ctx.Done():
 			return Update{}, ctx.Err()
@@ -65,8 +94,10 @@ func (sub *Subscription) Next(ctx context.Context) (Update, error) {
 	}
 }
 func (sub *Subscription) Resnapshot(ctx context.Context) (session.ObservationSnapshot, error) {
-	sub.operation.Lock()
-	defer sub.operation.Unlock()
+	if err := sub.acquireOperation(ctx); err != nil {
+		return session.ObservationSnapshot{}, err
+	}
+	defer sub.releaseOperation()
 	s := sub.service
 	s.mu.Lock()
 	if sub.err != nil {

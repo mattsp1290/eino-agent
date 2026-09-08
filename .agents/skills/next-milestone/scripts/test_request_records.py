@@ -195,6 +195,7 @@ Synthetic public paths only.
             text=True,
             capture_output=True,
             check=False,
+            timeout=5,
         )
         return completed.returncode, json.loads(completed.stdout), completed.stderr
 
@@ -627,6 +628,89 @@ Synthetic public paths only.
         self.assertEqual((recovered_code, recovered["status"]), (0, "complete"))
         self.assertEqual(len(recovered["reused"]), 1)
         self.assertEqual(len(recovered["created"]), 1)
+
+    def test_same_set_reuse_rejects_mismatched_milestones_before_writing(self) -> None:
+        for second_mode in ("create", "reuse"):
+            with self.subTest(second_mode=second_mode):
+                request_set = f"{DATE}-mismatch-{second_mode}"
+                filename = f"{DATE}-mismatch-{second_mode}.md"
+                names = [f"{target}/{filename}" for target in sorted(self.targets)]
+                members = []
+                before = {}
+                for index, target in enumerate(sorted(self.targets)):
+                    body = self.body(target, filename, request_set, names)
+                    if index == 1:
+                        body = body.replace(
+                            "**Selected milestone:** Durable tool execution",
+                            "**Selected milestone:** Different milestone",
+                        )
+                    mode = "reuse" if index == 0 else second_mode
+                    destination = self.destination(target, filename)
+                    if mode == "reuse":
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.write_text(body)
+                        before[destination] = destination.read_bytes()
+                    members.append(self.member(
+                        target, filename, body, mode=mode,
+                        expected_sha256=hashlib.sha256(body.encode()).hexdigest()
+                        if mode == "reuse" else None,
+                    ))
+                result, code = rr.create_set(
+                    self.projects, self.create_manifest(request_set, members), "mismatch"
+                )
+                self.assertEqual((code, result["status"]), (2, "blocked"))
+                self.assertIn("inconsistent_request_set", {e["code"] for e in result["errors"]})
+                self.assertEqual(result["created"], [])
+                for destination, content in before.items():
+                    self.assertEqual(destination.read_bytes(), content)
+                if second_mode == "create":
+                    self.assertFalse(self.destination("eino-tools", filename).exists())
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_inspect_rejects_unwritten_fifo_without_blocking(self) -> None:
+        destination = self.destination("eino-tools", f"{DATE}-fifo.md")
+        destination.parent.mkdir(parents=True)
+        os.mkfifo(destination)
+        code, result, stderr = self.run_cli(
+            "inspect", "--projects-root", str(self.projects), "--consumer", "eino-agent"
+        )
+        self.assertEqual((code, result["status"]), (2, "blocked"))
+        self.assertIn("unsafe_path", {e["code"] for e in result["errors"]})
+        self.assertEqual(stderr, "")
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "requires FIFO support")
+    def test_read_rejects_validated_file_replaced_by_fifo(self) -> None:
+        destination = self.destination("eino-tools", f"{DATE}-swapped.md")
+        destination.parent.mkdir(parents=True)
+        destination.write_text("PRIVATE CONTENT MUST NOT APPEAR")
+        probe = """
+import os, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import request_records as rr
+path = Path(sys.argv[2])
+rr.require_real_file(path)
+path.unlink()
+os.mkfifo(path)
+fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    try:
+        rr.read_bytes_at(fd, path.name, path)
+    except rr.ContractError as exc:
+        print(exc.code)
+    else:
+        raise AssertionError("accepted FIFO")
+finally:
+    os.close(fd)
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(SCRIPT.parent), str(destination)],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), "unsafe_path")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
 
     def test_create_write_failure_removes_incomplete_leaf(self) -> None:
         request_set = f"{DATE}-write-failure"

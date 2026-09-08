@@ -52,7 +52,7 @@ func SessionWatchHandler(c SessionWatchConfig) http.Handler {
 			return
 		}
 		controller := http.NewResponseController(w)
-		if err = controller.SetWriteDeadline(time.Now().Add(c.WriteTimeout)); err != nil {
+		if err = controller.SetWriteDeadline(time.Time{}); err != nil {
 			http.Error(w, "watch writer requires deadlines", http.StatusInternalServerError)
 			return
 		}
@@ -107,11 +107,14 @@ type deadlineWriter struct {
 	timeout    time.Duration
 }
 
-func (w *deadlineWriter) Write(p []byte) (int, error) {
+func (w *deadlineWriter) Write(p []byte) (n int, err error) {
 	if err := w.controller.SetWriteDeadline(time.Now().Add(w.timeout)); err != nil {
 		return 0, err
 	}
-	n, err := w.writer.Write(p)
+	// HTTP/2 deadlines arm stream-reset timers. Clear only after synchronous
+	// I/O ends so healthy idle streams stay open and blocked writes stay bounded.
+	defer func() { err = errors.Join(err, w.controller.SetWriteDeadline(time.Time{})) }()
+	n, err = w.writer.Write(p)
 	if err != nil {
 		return n, err
 	}

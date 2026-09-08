@@ -78,7 +78,7 @@ func (s *Service) Watch(ctx context.Context, id session.ID) (*Subscription, erro
 		go s.poll(group)
 	}
 	lifetime, cancel := context.WithCancel(ctx)
-	sub := &Subscription{service: s, group: group, ctx: lifetime, cancel: cancel, notify: make(chan struct{}, 1)}
+	sub := &Subscription{service: s, group: group, ctx: lifetime, cancel: cancel, notify: make(chan struct{}, 1), operation: make(chan struct{}, 1)}
 	s.subscriptions[sub] = true
 	group.subs[sub] = true
 	sub.stop = context.AfterFunc(lifetime, func() { sub.Close() })

@@ -570,7 +570,7 @@ def pin_project_directory(
 
 
 def read_bytes_at(directory_fd: int, filename: str, display_path: Path) -> bytes:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -1263,6 +1263,7 @@ def create_set(
                         "reused record identity does not match",
                     )
                 if existing_record.metadata["Request set"] == request_set:
+                    selected_milestones.add(existing_record.metadata["Selected milestone"])
                     if existing_record.members != expected_members:
                         raise ContractError(
                             "inconsistent_request_set",
@@ -1278,7 +1279,7 @@ def create_set(
             raise ContractError(
                 "inconsistent_request_set",
                 manifest_path,
-                "new request-set members name different selected milestones",
+                "request-set members name different selected milestones",
             )
     except ContractError as exc:
         result["status"] = "blocked"
@@ -1374,7 +1375,7 @@ def create_set(
 def snapshot_at(
     directory_fd: int, filename: str, display_path: Path
 ) -> tuple[bytes, tuple[int, int, int, int, int, int]]:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
