@@ -280,3 +280,18 @@ startup errors, skipped PostgreSQL tests, or a missing required suite.
 
 The fixture follows the [Testcontainers PostgreSQL wait strategy](https://golang.testcontainers.org/modules/postgres/)
 and PostgreSQL's [database locale rules](https://www.postgresql.org/docs/17/sql-createdatabase.html).
+
+The private PostgreSQL schema verifier compares stable catalog structure with
+`store/postgres/schema_fingerprints.json`. These two fingerprints come from the
+reviewed baseline SQL and the history-table DDL in Goose `v3.27.3`; the latter
+is reproduced in the integration fixture until the migration entry point lands.
+Catalog OIDs, owners, ACLs, sequence positions and application data are excluded.
+History rows and the store incarnation are validated separately. Catalog reads
+use a read-only transaction with a [local search path](https://www.postgresql.org/docs/17/sql-set.html),
+preserving host settings.
+
+After reviewing a deliberate baseline or catalog-query change, regenerate with
+`go test -tags=postgres_integration -run '^TestPostgresSchemaVerification/reference$' ./store/postgres -args -update-postgres-schema`.
+Run it twice and require no second diff, then run the normal required PostgreSQL
+targets. Ordinary tests never update the reference. These private checks add no
+public construction or migration API; guarded Goose dispatch remains a later slice.
