@@ -173,7 +173,7 @@ func InterruptHandler(lookup func(context.Context, *http.Request) (transport.Int
 // OpenLocalStore opens a host-owned pool and explicitly initializes its store.
 // The application retains and closes the returned pool at shutdown.
 func OpenLocalStore(ctx context.Context, path string) (*sqlitestore.Store, *sql.DB, error) {
-	uri := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"}
+	uri := url.URL{Scheme: "file", Path: path, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", OmitHost: true}
 	pool, err := sql.Open("sqlite", uri.String())
 	if err != nil {
 		return nil, nil, err

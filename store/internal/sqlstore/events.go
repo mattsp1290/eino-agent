@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/mattsp1290/eino-agent/session"
@@ -42,20 +43,21 @@ func (s *Store) insertEvent(ctx context.Context, record session.EventRecord, can
 	if err != nil {
 		return session.EventRecord{}, relationError(err)
 	}
-	var toolKey any
+	var toolKey int64
 	if record.ToolTransition != "" {
-		toolKeyValue, keyErr := s.key(ctx, "tool_calls", string(record.ToolCallID))
+		var keyErr error
+		toolKey, keyErr = s.key(ctx, "tool_calls", string(record.ToolCallID))
 		if keyErr != nil {
 			return session.EventRecord{}, relationError(keyErr)
 		}
-		toolKey = toolKeyValue
 	}
 	row := map[string]any{
 		"id": []byte(record.ID), "session_key": sessionKey, "run_key": runKey,
-		"tool_key": toolKey, "kind": []byte(record.Kind), "record": raw,
+		"kind": []byte(record.Kind), "record": raw,
 		"created_at": TimeText(record.CreatedAt),
 	}
 	if record.ToolTransition != "" {
+		row["tool_key"] = toolKey
 		row["tool_transition"] = string(record.ToolTransition)
 	}
 	db := s.dbFor(ctx).Table("events").Clauses(clause.OnConflict{DoNothing: true}).Create(row)
@@ -78,7 +80,7 @@ func (s *Store) insertEvent(ctx context.Context, record session.EventRecord, can
 		return session.EventRecord{}, readErr
 	}
 	if record.ToolTransition != "" {
-		if existing, readErr = s.eventByToolTransition(ctx, toolKeyValueFromAny(toolKey), record.ToolTransition); readErr == nil {
+		if existing, readErr = s.eventByToolTransition(ctx, toolKey, record.ToolTransition); readErr == nil {
 			if SameRecord(existing, record) {
 				return existing, nil
 			}
@@ -99,20 +101,13 @@ func (s *Store) insertEvent(ctx context.Context, record session.EventRecord, can
 	return session.EventRecord{}, session.ErrConflict
 }
 
-func toolKeyValueFromAny(value any) int64 {
-	if key, ok := value.(int64); ok {
-		return key
-	}
-	return 0
-}
-
-func (s *Store) eventSelect() string {
-	return "events.row_key, events.id, events.session_key, events.run_key, sessions.id AS session_id, runs.id AS run_id, events.tool_key, tool_calls.id AS tool_call_id, tool_calls.session_key AS tool_session_key, tool_calls.run_key AS tool_run_key, events.kind, events.tool_transition, events.record, events.created_at"
+func (s *Store) eventQuery(ctx context.Context) *gorm.DB {
+	return s.dbFor(ctx).Table("events").Select("events.row_key, events.id, events.session_key, events.run_key, sessions.id AS session_id, runs.id AS run_id, events.tool_key, tool_calls.id AS tool_call_id, tool_calls.session_key AS tool_session_key, tool_calls.run_key AS tool_run_key, events.kind, events.tool_transition, events.record, events.created_at").Joins("JOIN sessions ON sessions.row_key = events.session_key").Joins("JOIN runs ON runs.row_key = events.run_key").Joins("LEFT JOIN tool_calls ON tool_calls.row_key = events.tool_key")
 }
 
 func (s *Store) eventByID(ctx context.Context, id session.EventID) (session.EventRecord, error) {
 	var row eventRow
-	err := s.dbFor(ctx).Table("events").Select(s.eventSelect()).Joins("JOIN sessions ON sessions.row_key = events.session_key").Joins("JOIN runs ON runs.row_key = events.run_key").Joins("LEFT JOIN tool_calls ON tool_calls.row_key = events.tool_key").Where("events.id = ?", []byte(id)).Take(&row).Error
+	err := s.eventQuery(ctx).Where("events.id = ?", []byte(id)).Take(&row).Error
 	if err != nil {
 		return session.EventRecord{}, translateReadError(err)
 	}
@@ -121,7 +116,7 @@ func (s *Store) eventByID(ctx context.Context, id session.EventID) (session.Even
 
 func (s *Store) eventByToolTransition(ctx context.Context, toolKey int64, transition session.ToolTransitionPhase) (session.EventRecord, error) {
 	var row eventRow
-	err := s.dbFor(ctx).Table("events").Select(s.eventSelect()).Joins("JOIN sessions ON sessions.row_key = events.session_key").Joins("JOIN runs ON runs.row_key = events.run_key").Joins("LEFT JOIN tool_calls ON tool_calls.row_key = events.tool_key").Where("events.tool_key = ? AND events.tool_transition = ?", toolKey, string(transition)).Take(&row).Error
+	err := s.eventQuery(ctx).Where("events.tool_key = ? AND events.tool_transition = ?", toolKey, string(transition)).Take(&row).Error
 	if err != nil {
 		return session.EventRecord{}, translateReadError(err)
 	}
@@ -130,7 +125,7 @@ func (s *Store) eventByToolTransition(ctx context.Context, toolKey int64, transi
 
 func (s *Store) eventByRunFinished(ctx context.Context, runKey int64, kind string) (session.EventRecord, error) {
 	var row eventRow
-	err := s.dbFor(ctx).Table("events").Select(s.eventSelect()).Joins("JOIN sessions ON sessions.row_key = events.session_key").Joins("JOIN runs ON runs.row_key = events.run_key").Joins("LEFT JOIN tool_calls ON tool_calls.row_key = events.tool_key").Where("events.run_key = ? AND events.kind = ?", runKey, []byte(kind)).Take(&row).Error
+	err := s.eventQuery(ctx).Where("events.run_key = ? AND events.kind = ?", runKey, []byte(kind)).Take(&row).Error
 	if err != nil {
 		return session.EventRecord{}, translateReadError(err)
 	}
@@ -146,7 +141,7 @@ func (s *Store) ListEvents(ctx context.Context, sessionID session.ID, cursor ses
 	if err != nil {
 		return session.EventBatch{}, err
 	}
-	query := s.dbFor(ctx).Table("events").Select(s.eventSelect()).Joins("JOIN sessions ON sessions.row_key = events.session_key").Joins("JOIN runs ON runs.row_key = events.run_key").Joins("LEFT JOIN tool_calls ON tool_calls.row_key = events.tool_key").Where("events.session_key = ?", sessionKey)
+	query := s.eventQuery(ctx).Where("events.session_key = ?", sessionKey)
 	if cursor.AfterEventID != "" {
 		after, err := s.eventByID(ctx, cursor.AfterEventID)
 		if err != nil {

@@ -51,7 +51,7 @@ func (e *executionStore) withFenceState(ctx context.Context, allowTerminal bool,
 }
 
 func loadRunFence(ctx context.Context, store *Store, fence session.RunFence, allowTerminal bool) (session.Run, error) {
-	db := store.dialect.LockRun(store.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key").Where("runs.id = ? AND runs.claim_token = ?", []byte(fence.RunID), []byte(fence.ClaimToken)))
+	db := store.dialect.LockRun(store.runQuery(ctx).Where("runs.id = ? AND runs.claim_token = ?", []byte(fence.RunID), []byte(fence.ClaimToken)))
 	if !allowTerminal {
 		db = db.Where("runs.status IN ?", []string{string(session.RunPending), string(session.RunRunning)})
 	}

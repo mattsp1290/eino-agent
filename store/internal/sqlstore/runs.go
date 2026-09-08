@@ -18,7 +18,8 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration 
 	}
 	var result session.Run
 	err := s.atomic(ctx, func(st *Store) error {
-		if _, err := st.key(ctx, "sessions", string(record.SessionID)); err != nil {
+		sessionKey, err := st.key(ctx, "sessions", string(record.SessionID))
+		if err != nil {
 			return relationError(err)
 		}
 		active, err := st.activeRun(ctx, record.SessionID)
@@ -31,10 +32,6 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration 
 		raw, err := json.Marshal(record)
 		if err != nil {
 			return err
-		}
-		sessionKey, err := st.key(ctx, "sessions", string(record.SessionID))
-		if err != nil {
-			return relationError(err)
 		}
 		db := st.dbFor(ctx).Table("runs").Clauses(clause.OnConflict{DoNothing: true})
 		row := map[string]any{
@@ -75,13 +72,17 @@ func (s *Store) ActiveRun(ctx context.Context, sessionID session.ID) (session.Ru
 	return s.activeRun(ctx, sessionID)
 }
 
+func (s *Store) runQuery(ctx context.Context) *gorm.DB {
+	return s.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key")
+}
+
 func (s *Store) activeRun(ctx context.Context, sessionID session.ID) (session.Run, error) {
 	var row runRow
 	sessionKey, err := s.key(ctx, "sessions", string(sessionID))
 	if err != nil {
 		return session.Run{}, err
 	}
-	db := s.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key").Where("runs.session_key = ? AND runs.status IN ?", sessionKey, []string{string(session.RunPending), string(session.RunRunning)}).Order("runs.created_at, runs.id").Limit(1)
+	db := s.runQuery(ctx).Where("runs.session_key = ? AND runs.status IN ?", sessionKey, []string{string(session.RunPending), string(session.RunRunning)}).Order("runs.created_at, runs.id").Limit(1)
 	if err := db.Take(&row).Error; err != nil {
 		return session.Run{}, translateReadError(err)
 	}
@@ -90,7 +91,7 @@ func (s *Store) activeRun(ctx context.Context, sessionID session.ID) (session.Ru
 
 func (s *Store) getRun(ctx context.Context, id session.RunID) (session.Run, error) {
 	var row runRow
-	db := s.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key").Where("runs.id = ?", []byte(id)).Limit(1)
+	db := s.runQuery(ctx).Where("runs.id = ?", []byte(id)).Limit(1)
 	if err := db.Take(&row).Error; err != nil {
 		return session.Run{}, translateReadError(err)
 	}
@@ -99,7 +100,7 @@ func (s *Store) getRun(ctx context.Context, id session.RunID) (session.Run, erro
 
 func (s *Store) ListUnfinishedRuns(ctx context.Context) ([]session.Run, error) {
 	var rows []runRow
-	err := s.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key").Where("runs.status IN ?", []string{string(session.RunPending), string(session.RunRunning)}).Order("runs.created_at, runs.id").Find(&rows).Error
+	err := s.runQuery(ctx).Where("runs.status IN ?", []string{string(session.RunPending), string(session.RunRunning)}).Order("runs.created_at, runs.id").Find(&rows).Error
 	if err != nil {
 		return nil, translateReadError(err)
 	}
@@ -185,7 +186,7 @@ func (s *Store) writeRun(ctx context.Context, record session.Run) error {
 		if getErr != nil {
 			return getErr
 		}
-		if latest.Terminal() && sameRun(latest, record) {
+		if latest.Terminal() && SameRecord(latest, record) {
 			return nil
 		}
 		return session.ErrConflict

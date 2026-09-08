@@ -10,7 +10,7 @@ import (
 )
 
 func openTestSQLite(ctx context.Context, path string) (*sqlite.Store, *sql.DB, error) {
-	uri := url.URL{Scheme: "file", Path: path}
+	uri := url.URL{Scheme: "file", Path: path, OmitHost: true}
 	if strings.HasPrefix(path, "file:") {
 		parsed, err := url.Parse(path)
 		if err != nil {

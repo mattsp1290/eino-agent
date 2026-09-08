@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
 	"github.com/mattsp1290/eino-agent/session"
@@ -78,13 +79,13 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 	return record, nil
 }
 
-func (s *Store) toolCallSelect() string {
-	return "tool_calls.row_key, tool_calls.id, tool_calls.session_key, tool_calls.run_key, sessions.id AS session_id, runs.id AS run_id, tool_calls.request_message_key, tool_calls.request_part_key, reqm.id AS request_message_id, reqm.session_key AS request_message_session_key, reqm.run_key AS request_message_run_key, reqp.id AS request_part_id, reqp.message_key AS request_part_message_key, reqp.session_key AS request_part_session_key, reqp.run_key AS request_part_run_key, tool_calls.result_message_id, tool_calls.result_part_id, tool_calls.status, tool_calls.name, tool_calls.claimed_by, tool_calls.claim_token, tool_calls.record"
+func (s *Store) toolCallQuery(ctx context.Context) *gorm.DB {
+	return s.dbFor(ctx).Table("tool_calls").Select("tool_calls.row_key, tool_calls.id, tool_calls.session_key, tool_calls.run_key, sessions.id AS session_id, runs.id AS run_id, tool_calls.request_message_key, tool_calls.request_part_key, reqm.id AS request_message_id, reqm.session_key AS request_message_session_key, reqm.run_key AS request_message_run_key, reqp.id AS request_part_id, reqp.message_key AS request_part_message_key, reqp.session_key AS request_part_session_key, reqp.run_key AS request_part_run_key, tool_calls.result_message_id, tool_calls.result_part_id, tool_calls.status, tool_calls.name, tool_calls.claimed_by, tool_calls.claim_token, tool_calls.record").Joins("JOIN sessions ON sessions.row_key = tool_calls.session_key").Joins("JOIN runs ON runs.row_key = tool_calls.run_key").Joins("JOIN messages AS reqm ON reqm.row_key = tool_calls.request_message_key").Joins("JOIN parts AS reqp ON reqp.row_key = tool_calls.request_part_key")
 }
 
 func (s *Store) GetToolCall(ctx context.Context, id session.ToolCallID) (session.ToolCall, error) {
 	var row toolCallRow
-	err := s.dbFor(ctx).Table("tool_calls").Select(s.toolCallSelect()).Joins("JOIN sessions ON sessions.row_key = tool_calls.session_key").Joins("JOIN runs ON runs.row_key = tool_calls.run_key").Joins("JOIN messages AS reqm ON reqm.row_key = tool_calls.request_message_key").Joins("JOIN parts AS reqp ON reqp.row_key = tool_calls.request_part_key").Where("tool_calls.id = ?", []byte(id)).Take(&row).Error
+	err := s.toolCallQuery(ctx).Where("tool_calls.id = ?", []byte(id)).Take(&row).Error
 	if err != nil {
 		return session.ToolCall{}, translateReadError(err)
 	}
@@ -104,7 +105,7 @@ func (s *Store) ListUnfinishedToolCalls(ctx context.Context, runID session.RunID
 		return nil, err
 	}
 	var rows []toolCallRow
-	err = s.dbFor(ctx).Table("tool_calls").Select(s.toolCallSelect()).Joins("JOIN sessions ON sessions.row_key = tool_calls.session_key").Joins("JOIN runs ON runs.row_key = tool_calls.run_key").Joins("JOIN messages AS reqm ON reqm.row_key = tool_calls.request_message_key").Joins("JOIN parts AS reqp ON reqp.row_key = tool_calls.request_part_key").Where("tool_calls.run_key = ? AND tool_calls.status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Order("tool_calls.id").Find(&rows).Error
+	err = s.toolCallQuery(ctx).Where("tool_calls.run_key = ? AND tool_calls.status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Order("tool_calls.id").Find(&rows).Error
 	if err != nil {
 		return nil, s.mapErr(err)
 	}
@@ -226,7 +227,6 @@ func (s *Store) settleToolCall(ctx context.Context, settlement session.ToolSettl
 		if !SameRecord(call, settled) {
 			return session.ErrConflict
 		}
-		return nil
 	}
 	if _, err := s.appendMessage(ctx, settlement.ResultMessage); err != nil {
 		return err

@@ -16,8 +16,7 @@ func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpo
 		return session.ContextEpoch{}, err
 	}
 	db := s.dbFor(ctx)
-	row, readErr := s.contextEpochRowByID(ctx, string(record.ID))
-	if readErr == nil {
+	validateExisting := func(row contextEpochRow) (session.ContextEpoch, error) {
 		var existing session.ContextEpoch
 		if err := decodeStoredRecord(row.Record, &existing); err != nil {
 			return session.ContextEpoch{}, err
@@ -29,6 +28,10 @@ func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpo
 			return session.ContextEpoch{}, session.ErrConflict
 		}
 		return existing, nil
+	}
+	row, readErr := s.contextEpochRowByID(ctx, string(record.ID))
+	if readErr == nil {
+		return validateExisting(row)
 	} else if !errors.Is(readErr, session.ErrNotFound) {
 		return session.ContextEpoch{}, readErr
 	}
@@ -50,17 +53,7 @@ func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpo
 	if err != nil {
 		return session.ContextEpoch{}, err
 	}
-	var existing session.ContextEpoch
-	if err := decodeStoredRecord(row.Record, &existing); err != nil {
-		return session.ContextEpoch{}, err
-	}
-	if !contextEpochRowMatches(row, existing) || row.SessionKey != sessionKey {
-		return session.ContextEpoch{}, session.ErrConflict
-	}
-	if !SameRecord(existing, record) {
-		return session.ContextEpoch{}, session.ErrConflict
-	}
-	return existing, nil
+	return validateExisting(row)
 }
 
 func contextEpochRowMatches(row contextEpochRow, record session.ContextEpoch) bool {

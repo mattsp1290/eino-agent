@@ -19,17 +19,24 @@ func (s *Store) CreateSession(ctx context.Context, record session.Session) (sess
 	var result session.Session
 	err := s.atomic(ctx, func(store *Store) error {
 		db := store.dbFor(ctx)
-		row, readErr := store.sessionRowByID(ctx, string(record.ID))
-		if readErr == nil {
+		validateExisting := func(row sessionRow) (session.Session, error) {
 			var existing session.Session
 			if err := decodeStoredRecord(row.Record, &existing); err != nil {
-				return err
+				return session.Session{}, err
 			}
 			if !sessionRowMatches(row, existing) || string(existing.ID) != string(record.ID) {
-				return session.ErrConflict
+				return session.Session{}, session.ErrConflict
 			}
 			if !SameRecord(existing, record) {
-				return session.ErrConflict
+				return session.Session{}, session.ErrConflict
+			}
+			return existing, nil
+		}
+		row, readErr := store.sessionRowByID(ctx, string(record.ID))
+		if readErr == nil {
+			existing, err := validateExisting(row)
+			if err != nil {
+				return err
 			}
 			result = existing
 			return nil
@@ -53,15 +60,9 @@ func (s *Store) CreateSession(ctx context.Context, record session.Session) (sess
 			if err != nil {
 				return err
 			}
-			var existing session.Session
-			if err := decodeStoredRecord(row.Record, &existing); err != nil {
+			existing, err := validateExisting(row)
+			if err != nil {
 				return err
-			}
-			if !sessionRowMatches(row, existing) || string(existing.ID) != string(record.ID) {
-				return session.ErrConflict
-			}
-			if !SameRecord(existing, record) {
-				return session.ErrConflict
 			}
 			result = existing
 			return nil

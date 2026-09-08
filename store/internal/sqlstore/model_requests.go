@@ -22,19 +22,22 @@ func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequ
 		return session.ModelRequestRecord{}, err
 	}
 	db := s.dbFor(ctx)
-	row, readErr := s.modelRequestRowByID(ctx, string(record.ID))
-	if readErr == nil {
-		var existing session.ModelRequestRecord
-		if err := decodeModelRequest(row, &existing); err != nil {
+	validateExisting := func(row modelRequestRow) (session.ModelRequestRecord, error) {
+		existing, err := modelRequestRecordFromRow(row, string(record.ID))
+		if err != nil {
 			return session.ModelRequestRecord{}, err
 		}
-		if !modelRequestRowMatches(row, existing) || row.SessionKey != sessionKey || row.RunKey != runKey {
+		if row.SessionKey != sessionKey || row.RunKey != runKey {
 			return session.ModelRequestRecord{}, session.ErrConflict
 		}
 		if !SameRecord(existing, record) {
 			return session.ModelRequestRecord{}, session.ErrConflict
 		}
 		return existing, nil
+	}
+	row, readErr := s.modelRequestRowByID(ctx, string(record.ID))
+	if readErr == nil {
+		return validateExisting(row)
 	} else if !errors.Is(readErr, session.ErrNotFound) {
 		return session.ModelRequestRecord{}, readErr
 	}
@@ -59,19 +62,12 @@ func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequ
 	}
 	row, err = s.modelRequestRowByID(ctx, string(record.ID))
 	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
+			return session.ModelRequestRecord{}, session.ErrConflict
+		}
 		return session.ModelRequestRecord{}, err
 	}
-	var existing session.ModelRequestRecord
-	if err := decodeModelRequest(row, &existing); err != nil {
-		return session.ModelRequestRecord{}, err
-	}
-	if !modelRequestRowMatches(row, existing) || row.SessionKey != sessionKey || row.RunKey != runKey {
-		return session.ModelRequestRecord{}, session.ErrConflict
-	}
-	if !SameRecord(existing, record) {
-		return session.ModelRequestRecord{}, session.ErrConflict
-	}
-	return existing, nil
+	return validateExisting(row)
 }
 
 func (s *Store) updateModelRequest(ctx context.Context, record session.ModelRequestRecord) error {
@@ -86,12 +82,9 @@ func (s *Store) updateModelRequest(ctx context.Context, record session.ModelRequ
 	if row.SessionKey != sessionKey || row.RunKey != runKey {
 		return session.ErrConflict
 	}
-	current, err := s.GetModelRequest(ctx, record.ID)
+	current, err := modelRequestRecordFromRow(row, string(record.ID))
 	if err != nil {
 		return err
-	}
-	if !modelRequestRowMatches(row, current) {
-		return session.ErrConflict
 	}
 	if !SameModelRequestIdentity(current, record) {
 		return session.ErrConflict
@@ -126,11 +119,15 @@ func (s *Store) GetModelRequest(ctx context.Context, id session.ModelRequestID) 
 	if err != nil {
 		return session.ModelRequestRecord{}, err
 	}
+	return modelRequestRecordFromRow(row, string(id))
+}
+
+func modelRequestRecordFromRow(row modelRequestRow, id string) (session.ModelRequestRecord, error) {
 	var record session.ModelRequestRecord
 	if err := decodeModelRequest(row, &record); err != nil {
 		return session.ModelRequestRecord{}, err
 	}
-	if !modelRequestRowMatches(row, record) || string(record.ID) != string(id) {
+	if !modelRequestRowMatches(row, record) || string(record.ID) != id {
 		return session.ModelRequestRecord{}, session.ErrConflict
 	}
 	return record, nil

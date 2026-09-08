@@ -78,7 +78,7 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	if dbPath == "" {
 		dbPath = "minimal-server.db"
 	}
-	uri := url.URL{Scheme: "file", Path: dbPath, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"}
+	uri := url.URL{Scheme: "file", Path: dbPath, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", OmitHost: true}
 	pool, err := sql.Open("sqlite", uri.String())
 	if err != nil {
 		return nil, err

@@ -81,7 +81,7 @@ sizing, and lease tuning are optional.
 
 ```go
 // sql is database/sql; url is net/url. The SQLite package registers modernc.
-uri := url.URL{Scheme: "file", Path: "agent.db",
+uri := url.URL{Scheme: "file", Path: "agent.db", OmitHost: true,
     RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)"}
 pool, err := sql.Open("sqlite", uri.String())
 if err != nil { return err }

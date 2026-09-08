@@ -14,7 +14,7 @@ func reopenSQLiteFixture(ctx context.Context, path string) (*Store, error) {
 	return sqliteFixturePool(ctx, path, false)
 }
 func sqliteFixturePool(ctx context.Context, path string, initialize bool) (*Store, error) {
-	uri := url.URL{Scheme: "file", Path: path}
+	uri := url.URL{Scheme: "file", Path: path, OmitHost: true}
 	if strings.HasPrefix(path, "file:") {
 		parsed, err := url.Parse(path)
 		if err != nil {

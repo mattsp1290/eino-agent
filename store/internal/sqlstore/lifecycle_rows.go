@@ -118,8 +118,6 @@ func decodeEventRow(row eventRow) (session.EventRecord, error) {
 	return value, nil
 }
 
-func sameRun(left, right session.Run) bool { return SameRecord(left, right) }
-
 func relationError(err error) error {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
