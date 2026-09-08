@@ -85,7 +85,7 @@ race:
 	$(GO_TEST) -race ./...
 
 windows-compile:
-	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO_TEST) -exec=true ./tools/einotools
+	GOOS=windows GOARCH=amd64 CGO_ENABLED=0 $(GO_TEST) -exec=true ./tools/einotools ./session ./watch
 
 mod-tidy-check:
 	go mod tidy -diff

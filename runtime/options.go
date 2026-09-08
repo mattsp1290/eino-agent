@@ -13,6 +13,7 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
+	"github.com/mattsp1290/eino-agent/watch"
 )
 
 // Option configures a StreamingOrchestrator. Options are applied in order.
@@ -202,4 +203,9 @@ func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator
 		apply(o, value)
 		return nil
 	}
+}
+
+// WithSessionObserver attaches the bounded same-process state-watch tap.
+func WithSessionObserver(value *watch.Service) Option {
+	return interfaceOption("SessionObserver", value, func(o *StreamingOrchestrator, value *watch.Service) { o.sessionObserver = value })
 }

@@ -52,7 +52,8 @@ It wires:
 - `store/sqlite` as the durable transactional `session.Store`;
 - `runtime.StreamingOrchestrator` for run admission and interruption;
 - `stream.Tail` for live AG-UI deltas;
-- `transport.SSEHandler` for replay plus live tail;
+- `transport.SessionWatchHandler` for coherent bounded session state and current live text;
+- `transport.SSEHandler` for the separate historical event replay/live-tail API;
 - a scripted Eino model resolver so the example runs without provider secrets.
 
 Core route shape:
@@ -117,7 +118,7 @@ make lint
 Replayable conversation state is stored as sessions, runs, messages, ordered
 parts, tool calls, context epochs, and selected event records. Live AG-UI SSE
 frames and model deltas are transport output, not the replay source of truth.
-Reconnects reconstruct snapshots from durable messages/parts and then attach to
+The historical reconnect API reconstructs messages/parts and attaches to
 the active live tail.
 
 See `docs/architecture/agui-events.md` and `docs/architecture/storage.md` for
@@ -134,3 +135,19 @@ the detailed rules.
 - `docs/integrations/ag-ui-go-server-example.md`: AG-UI server migration sketch.
 - `docs/integrations/ensemble.md`: future ensemble adapter options and
   non-parity caveat.
+
+
+## Session snapshot and watch (unreleased)
+
+The current checkout adds `session.ObservationReader`, `watch.Service`, and
+`runtime.WithSessionObserver`. A watch starts with a transaction-consistent
+bounded message window, then delivers coalesced durable replacements and
+separately identified transient text. It works before admission and during a
+run. Detaching or closing observation leaves execution ownership with the host.
+
+See [the consumer guide](docs/consumer-guide.md#session-state-observation) for
+construction, limits, overflow recovery, and cleanup. The minimal server's
+existing events route now emits current AG-UI message/state snapshots. These
+APIs are candidate-checkout functionality, not part of the published v0.3.3 pin.
+Old development databases require explicit recreation for the new schema;
+opening an old schema fails without deleting or migrating it.

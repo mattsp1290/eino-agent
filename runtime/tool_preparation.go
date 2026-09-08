@@ -60,11 +60,12 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 			}
 			created[index] = result
 		}
-		return nil
+		return store.FinalizeAssistantMessage(ctx, messageID)
 	})
 	if err != nil {
 		return nil, err
 	}
+	o.sessionObserver.Hint(snapshot.SessionID)
 	for index := range calls {
 		calls[index].record = created[index].Call
 		calls[index].call.ResultMessageID = created[index].Call.ResultMessageID

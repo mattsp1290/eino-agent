@@ -92,6 +92,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
 	run = started
+	o.sessionObserver.Hint(run.SessionID)
 	calls, err := o.store.ListUnfinishedToolCalls(ctx, run.ID)
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}

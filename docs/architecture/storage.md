@@ -226,7 +226,7 @@ journaling for provider responses or tool execution.
 
 
 Every backend should run the contract suite in its own package and add
-backend-specific tests for ID generation, migrations, persistence across
+backend-specific tests for ID generation, schema validation, persistence across
 process restart, and database-level isolation.
 
 ## Provider-State Parts
@@ -253,3 +253,45 @@ or migration. Normal `history.Project`/`Load` never decode or return provider
 state. Raw store access can see it and is therefore an operator/security
 boundary subject to host encryption, authorization, retention, backup, and
 deletion policy.
+
+
+## Observation revisions, projection and schema
+
+ObservationReader is a substantive public read capability, separate from
+history/event pagination. SQLite reads its watermark, existence flag, recent
+eligible messages, allowed text parts, related runs/tools and active run in one
+transaction. Root-only observation methods reject a transaction-scoped Store;
+uncommitted caller transactions cannot publish observations. Transactions
+release before subscriber delivery.
+
+The canonical schema contains observation_store (one random persistent
+incarnation), observation_revisions, message finalized flags, safe projection
+columns, message/part/tool indexes, and revision triggers for session/run/
+message/part/tool inserts, updates and deletes. All mutation paths, including
+claims, leases and raw SQL inside WithinTx, tick the authoritative owning
+session revision transactionally. Revision overflow fails the mutation through
+an integer/range constraint. Rollback undoes revision ticks. Extra ticks and
+nonconsecutive revisions are valid; model-request audit changes do not export
+their records.
+
+Part kind, parsed display text and text validity are populated on writes.
+Snapshots select only these safe columns and bounded run/tool identity fields,
+never arbitrary record JSON. The partial message index skips excluded roles;
+the part index selects only text kinds for included messages. Bounded selected
+records do not imply constant database page access independent of index depth.
+Malformed included text, invalid ownership/status or excessive included
+records fail without returning payload contents.
+
+User/tool messages finalize on append. Assistant placeholders begin
+unfinalized. Fenced FinalizeAssistantMessage validates session/run ownership
+and assistant role; runtime invokes it in the same transaction as assistant
+text/private-state parts and pending tools. This includes empty and tool-only
+completions. Failed placeholders may remain unfinalized; a terminal run
+invalidates their transient presentation. Storetest.Run requires the public
+revision/finalization contract, including rollback and stale-fence rejection.
+
+The new schema deliberately has no migration, compatibility reader, silent
+reset or legacy cursor conversion. Existing development stores fail schema
+verification and must be explicitly recreated by their owner. Never delete a
+database automatically. A binary rollback requires its matching database
+schema. Schema verification checks every table, index and trigger definition.

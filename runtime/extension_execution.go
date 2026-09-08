@@ -13,11 +13,13 @@ import (
 // runExecution owns the frozen extension plan for one fresh or resumed run.
 // Request contexts carry cancellation and request values, never plan identity.
 type runExecution struct {
-	host   *StreamingOrchestrator
-	plan   *RunPlan
-	store  session.ExecutionStore
-	lease  *runLeaseHeartbeat
-	events *eventQueue
+	sessionID session.ID
+	runID     session.RunID
+	host      *StreamingOrchestrator
+	plan      *RunPlan
+	store     session.ExecutionStore
+	lease     *runLeaseHeartbeat
+	events    *eventQueue
 
 	durableMessageMu          sync.Mutex
 	durableMessageFloor       time.Time
@@ -66,7 +68,8 @@ func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run
 	if store == nil {
 		panic(fmt.Sprintf("nil run execution store for run %q", run.ID))
 	}
-	return &runExecution{host: host, plan: plan, store: store, events: newEventQueue(host.queueSize, host.events)}
+	host.sessionObserver.Hint(run.SessionID)
+	return &runExecution{sessionID: run.SessionID, runID: run.ID, host: host, plan: plan, store: store, events: newEventQueue(host.queueSize, host.events)}
 }
 
 func (e *runExecution) dispatch() *extension.Plan {
@@ -78,6 +81,7 @@ func (e *runExecution) dispatch() *extension.Plan {
 
 func (e *runExecution) release() {
 	if e != nil {
+		e.host.sessionObserver.ReleaseRun(e.sessionID, e.runID)
 		e.events.close()
 		if e.plan != nil {
 			e.plan.release()
@@ -103,5 +107,6 @@ func (e *runExecution) publishPersistedWithNotificationContext(infrastructureCtx
 	if e == nil {
 		return
 	}
+	e.host.sessionObserver.Hint(record.SessionID)
 	runEventSink{infrastructure: e.events, plan: e.dispatch()}.publishPersisted(infrastructureCtx, notificationCtx, record)
 }

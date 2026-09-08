@@ -35,8 +35,8 @@ records, then converted through `eino-agui/convert` and emitted through
 `eino-agui/emitter` where needed.
 
 Live tail may emit deltas immediately. Durable storage persists settled facts.
-When a client reconnects, it receives replayed durable state plus a live tail
-from the active run, not a best-effort resend of prior transport writes.
+The historical reconnect path combines paged durable replay with a live tail.
+That handoff is not a transaction-consistent state snapshot.
 
 Encrypted reasoning is never persisted, never included in message snapshots,
 and never replayed.
@@ -163,3 +163,24 @@ AG-UI bridge implementations must:
 - avoid storing raw SSE frames as replay source data;
 - exclude encrypted reasoning from all snapshots and replay projections;
 - use durable cursor boundaries from `session.Store` for replay and live tail.
+
+
+## Typed session watch adapter
+
+agui.WatchBridge consumes watch.Subscription updates through the existing
+eino-agui emitter. It constructs public AG-UI Message values with durable IDs;
+the conversion helper that generates IDs is not used. Initial emits the
+durable baseline, then Apply consumes increasing DeliverySequence updates.
+Durable updates replace the bounded message window. Live updates replace
+text for a matching visible unfinalized message in a nonterminal run.
+Unavailable notices and publication versions suppress delayed replacements.
+Finalization, terminal run state and absence from a newer window purge overlays
+without retaining retired-message tombstones.
+
+MESSAGES_SNAPSHOT contains only user/assistant display text. STATE_SNAPSHOT
+contains the exported WatchState shape: watermark, existence/omission flags,
+allowlisted run/tool views and qualified live availability. It contains no
+tool arguments/results, arbitrary error text, configuration or reasoning.
+This current-state API coalesces revisions and does not promise every
+RUN_STARTED or TOOL_CALL event. The historical classification table above
+describes the separate event/replay policy, not the watch allowlist.

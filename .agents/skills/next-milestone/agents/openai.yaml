@@ -1,0 +1,4 @@
+interface:
+  display_name: "Next Eino Agent Milestone"
+  short_description: "Choose the next embeddability increment"
+  default_prompt: "Use $implementation-plan $next-milestone to research and plan the next eino-agent embeddability or runtime-customization milestone."

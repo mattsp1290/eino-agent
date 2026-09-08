@@ -34,6 +34,7 @@ internal dependency.
 | `store/storetest` | Contract tests for custom stores. | Backend-specific persistence and isolation tests. |
 | `transport` | HTTP adapters for AG-UI SSE replay/live tail, interrupt, resume, and message decoding. | Route layout, middleware, auth, request validation, cursor persistence. |
 | `agui` | Durability/replay policy for AG-UI event families and client-tool classification. | Product decisions for conditional reasoning/state/custom-event replay. |
+| `watch` | Coherent bounded durable session windows and same-process transient text. | Exact authorized session, finite capacities, polling/read deadlines, reconnect policy. |
 | `stream` | Bounded live event tails for active sessions. | Capacity choice and reconnect/resync UX. |
 | `model` | Provider/model catalog and resolver contracts. | Concrete provider clients and credentials. |
 | `config` | Immutable run configuration snapshots and validation lifecycle. | Config loading, plugin ordering, secrets source, reload trigger. |
@@ -599,3 +600,108 @@ writes for every provider attempt. Set a retention policy for those records,
 and allowlist only non-secret option keys. See the
 [`extension point catalog`](architecture/extension-points.md) and the
 [`native extension example`](../examples/native-extension).
+
+
+## Session state observation
+
+This is an unreleased checkout API; the published pin above does not include it.
+Construct one observation service for the store and share it with all observed
+orchestrators in this process:
+
+```go
+observer, err := watch.NewService(store, watch.Options{
+    Snapshot: session.ObservationLimits{
+        MaxMessages: 50, MaxTools: 100, MaxParts: 200,
+        MaxSnapshotBytes: 1 << 20, MaxTextBytes: 128 << 10,
+    },
+    PollInterval: 50 * time.Millisecond, ReadTimeout: time.Second,
+    MaxSubscriptions: 64, MaxWatchedSessions: 32, MaxLiveRuns: 32,
+    MaxLiveTextBytes: 1 << 20, PendingUpdates: 64,
+})
+if err != nil { return err }
+// Include runtime.WithSessionObserver(observer) in orchestrator construction.
+sub, err := observer.Watch(ctx, authorizedSessionID)
+if err != nil { return err }
+defer sub.Close()
+initial := sub.Initial() // detached committed snapshot, including Exists=false
+_ = initial
+for {
+    update, err := sub.Next(ctx)
+    if err != nil { return err }
+    // Durable replaces the whole message/run/tool window.
+    // Live replaces transient text for its exact attempt identity.
+    // LiveUnavailable removes the qualified transient overlay.
+    _ = update
+}
+```
+
+The values above illustrate finite host choices. Every option must be positive.
+MaxMessages selects the most recent eligible user/assistant messages;
+OmittedOlderMessages marks older omitted history. MaxTools and MaxParts bound
+the whole snapshot, including empty text parts. MaxTextBytes bounds cumulative
+display text. MaxSnapshotBytes charges a conservative encoded budget: 256
+bytes per record plus six times each included string's UTF-8 length. Oversized
+included content returns `session.ErrObservationTooLarge` with no partial view.
+SQL selects at most each configured row limit plus one and does not load
+excluded provider, reasoning, system, or tool-result payloads.
+
+A durable watermark combines a persistent random store incarnation, exact
+SessionID, and nonnegative signed 64-bit revision. Only committed mutations
+advance it. Timestamps, opaque IDs, and model-attempt sequences do not order
+revisions. Durable replacements may skip intermediate transactions; this is a
+state watch, not an audit changefeed. A store incarnation change or revision
+regression requires a fresh watch.
+
+Live updates carry service incarnation, session/run/message/model-request
+identity, attempt/step, attempt sequence, and publication version. They never
+advance a durable watermark. Replace a matching unfinalized visible message's
+overlay; purge overlays when their message or run leaves the snapshot, the
+message finalizes, or the run becomes terminal. Do not concatenate transient
+text onto finalized text. The AG-UI WatchBridge implements these rules.
+
+The live cache retains current text without subscribers. MaxLiveRuns bounds
+entries and MaxLiveTextBytes bounds total retained text. Missing capacity or
+text overflow produces explicit unavailability instead of a false complete
+prefix. An unavailable notice with an empty MessageID qualifies the active run
+when no eligible placeholder is visible; it never creates a message. Attempt
+completion and run release clear retained text. Service
+recreation cannot restore lost transient prefixes. This is same-process live
+observation; separate SQLite connections provide committed read isolation,
+not distributed token delivery.
+
+One poll worker is shared per watched session and stops after its last
+subscription detaches. PollInterval checks durable revisions even without
+runtime hints or EventSink delivery. ReadTimeout bounds each store operation;
+custom readers must honor context cancellation and return committed detached
+snapshots. A read failure terminates observation with a content-free error.
+
+PendingUpdates bounds coalesced updates. Overflow discards pending data,
+detaches that subscription, and exposes `watch.ErrResyncRequired` outside the
+queue even if no later publication occurs. Call Watch again for recovery.
+`Resnapshot` is only for a live subscription: it discards obsolete queued work,
+reads fresh durable state and reseeds current live text even while a provider
+is paused. A failed resnapshot ends the subscription. Concurrent Next calls
+return ErrBusy; canceling a Next context cancels that wait only. Canceling the
+Watch lifetime or calling Close detaches. Initial and returned updates own
+their slices.
+
+The allowlist includes user/assistant display text, durable IDs, finalized
+flags, safe run status/provider/model/active-lease fields, and tool identity,
+name and status. It excludes raw errors, claim tokens, system instructions,
+configuration, metadata, reasoning, private provider state, tool arguments and
+tool results. Display text itself can contain sensitive user content. Hosts
+must authorize the exact session and escape text appropriately.
+
+Host shutdown remains explicit: stop admitting requests, interrupt and await
+owned handles, deactivate and close mounts with bounded contexts, close any
+Wasm loaders, close subscriptions/service and any legacy tail, then close the
+store after all users drain. Service.Close(ctx) owns only observation and can
+be called again after a timeout. StreamingOrchestrator has no public Close.
+
+The external-consumer fixture exercises SQLite, mounted native tools, real
+scripted streaming, blocked sinks, detach, overflow recovery, interruption,
+strict fenced tool resume, reopen and cleanup without credentials. The local
+gate proves the candidate checkout with independently resolved dependencies;
+a release and published-pin verification remain separate authorized actions.
+`make windows-compile` checks pure-Go session/watch and tools/einotools;
+transitive Wasm dependencies still limit the broader runtime platform surface.
