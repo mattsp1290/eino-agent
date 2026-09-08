@@ -56,12 +56,12 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 		"observation_revisions": {"sqlite_autoindex_observation_revisions_1:session_id"},
 		"sessions":              {"sqlite_autoindex_sessions_1:id", "sessions_workspace_created_idx:workspace_id,created_at,id"},
 		"runs":                  {"sqlite_autoindex_runs_1:id", "runs_session_status_idx:session_key,status", "runs_session_active_unique_idx:session_key"},
-		"messages":              {"sqlite_autoindex_messages_1:id", "messages_replay_idx:session_key,created_at,id", "messages_observation_idx:session_key,created_at,id,run_key,role,finalized"},
-		"parts":                 {"sqlite_autoindex_parts_1:id", "parts_replay_idx:session_key,message_key,ordinal,id", "parts_observation_idx:session_key,message_key,kind,ordinal,id,run_key,text_valid"},
-		"tool_calls":            {"sqlite_autoindex_tool_calls_1:id", "tools_unfinished_idx:run_key,status", "tools_observation_idx:session_key,run_key,id"},
+		"messages":              {"messages_run_key_idx:run_key", "sqlite_autoindex_messages_1:id", "messages_replay_idx:session_key,created_at,id", "messages_observation_idx:session_key,created_at,id,run_key,role,finalized"},
+		"parts":                 {"parts_message_key_idx:message_key", "parts_run_key_idx:run_key", "sqlite_autoindex_parts_1:id", "parts_replay_idx:session_key,message_key,ordinal,id", "parts_observation_idx:session_key,message_key,kind,ordinal,id,run_key,text_valid"},
+		"tool_calls":            {"tool_calls_request_message_key_idx:request_message_key", "tool_calls_request_part_key_idx:request_part_key", "sqlite_autoindex_tool_calls_1:id", "tools_unfinished_idx:run_key,status", "tools_observation_idx:session_key,run_key,id"},
 		"context_epochs":        {"sqlite_autoindex_context_epochs_1:id", "context_epochs_session_created_idx:session_key,created_at,id"},
-		"model_requests":        {"sqlite_autoindex_model_requests_1:id", "model_requests_run_attempt_step_idx:run_key,attempt,step", "model_requests_run_created_idx:run_key,created_at,id"},
-		"events":                {"sqlite_autoindex_events_1:id", "events_replay_idx:session_key,created_at,id", "events_tool_transition_unique_idx:tool_key,tool_transition", "events_run_finished_unique_idx:run_key,kind"},
+		"model_requests":        {"model_requests_session_key_idx:session_key", "sqlite_autoindex_model_requests_1:id", "model_requests_run_attempt_step_idx:run_key,attempt,step", "model_requests_run_created_idx:run_key,created_at,id"},
+		"events":                {"events_run_key_idx:run_key", "events_tool_key_idx:tool_key", "sqlite_autoindex_events_1:id", "events_replay_idx:session_key,created_at,id", "events_tool_transition_unique_idx:tool_key,tool_transition", "events_run_finished_unique_idx:run_key,kind"},
 	}
 	var wantTables []string
 	for table := range indexes {
@@ -104,7 +104,7 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 						valueBytes += 30
 					case "status", "role", "kind", "tool_transition":
 						valueBytes += 14
-					case "session_key", "run_key", "message_key", "tool_key", "ordinal", "attempt", "step", "finalized", "text_valid":
+					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "ordinal", "attempt", "step", "finalized", "text_valid":
 						valueBytes += 8
 					default:
 						t.Fatalf("%s indexes private or unbounded projection %s", name, col)
@@ -143,6 +143,37 @@ func expectBaselineError(t *testing.T, db *sql.DB, fragment, query string, args 
 	}
 }
 
+func assertBaselineIndexedLookup(t *testing.T, db *sql.DB, table, column string) {
+	t.Helper()
+	rows, err := db.Query("EXPLAIN QUERY PLAN SELECT rowid FROM "+table+" WHERE "+column+"=?", 999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := rows.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	count := 0
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasPrefix(detail, "SEARCH ") {
+			t.Errorf("%s.%s foreign-key lookup scans: %s", table, column, detail)
+		}
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("%s.%s lookup produced %d plan steps, want one index search", table, column, count)
+	}
+}
+
 func TestBaselineSchemaForeignKeys(t *testing.T) {
 	db := openBaseline(t)
 	populateBaseline(t, db)
@@ -164,6 +195,7 @@ func TestBaselineSchemaForeignKeys(t *testing.T) {
 			if got := baselineStrings(t, db, `SELECT type FROM pragma_table_info(?) WHERE name=?`, table, col); !reflect.DeepEqual(got, []string{"INTEGER"}) {
 				t.Fatalf("%s.%s type: %v", table, col, got)
 			}
+			assertBaselineIndexedLookup(t, db, table, col)
 			expectBaselineError(t, db, "FOREIGN KEY constraint failed", "UPDATE "+table+" SET "+col+"=999")
 			if col != "tool_key" {
 				expectBaselineError(t, db, "NOT NULL constraint failed", "UPDATE "+table+" SET "+col+"=NULL")

@@ -50,6 +50,7 @@ CREATE TABLE messages (
   created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text')
 );
 CREATE INDEX messages_replay_idx ON messages(session_key, created_at, id);
+CREATE INDEX messages_run_key_idx ON messages(run_key);
 
 CREATE TABLE parts (
   row_key INTEGER PRIMARY KEY,
@@ -65,6 +66,8 @@ CREATE TABLE parts (
   created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text')
 );
 CREATE INDEX parts_replay_idx ON parts(session_key, message_key, ordinal, id);
+CREATE INDEX parts_message_key_idx ON parts(message_key);
+CREATE INDEX parts_run_key_idx ON parts(run_key);
 
 CREATE TABLE tool_calls (
   row_key INTEGER PRIMARY KEY,
@@ -82,6 +85,8 @@ CREATE TABLE tool_calls (
   record BLOB NOT NULL CHECK (typeof(record) = 'blob')
 );
 CREATE INDEX tools_unfinished_idx ON tool_calls(run_key, status);
+CREATE INDEX tool_calls_request_message_key_idx ON tool_calls(request_message_key);
+CREATE INDEX tool_calls_request_part_key_idx ON tool_calls(request_part_key);
 
 CREATE TABLE context_epochs (
   row_key INTEGER PRIMARY KEY,
@@ -107,6 +112,7 @@ CREATE TABLE model_requests (
 );
 CREATE UNIQUE INDEX model_requests_run_attempt_step_idx ON model_requests(run_key, attempt, step);
 CREATE INDEX model_requests_run_created_idx ON model_requests(run_key, created_at, id);
+CREATE INDEX model_requests_session_key_idx ON model_requests(session_key);
 
 CREATE TABLE events (
   row_key INTEGER PRIMARY KEY,
@@ -121,6 +127,8 @@ CREATE TABLE events (
   CHECK ((tool_key IS NULL) = (tool_transition IS NULL))
 );
 CREATE INDEX events_replay_idx ON events(session_key, created_at, id);
+CREATE INDEX events_run_key_idx ON events(run_key);
+CREATE INDEX events_tool_key_idx ON events(tool_key);
 CREATE UNIQUE INDEX events_tool_transition_unique_idx ON events(tool_key, tool_transition) WHERE tool_transition IS NOT NULL;
 CREATE UNIQUE INDEX events_run_finished_unique_idx ON events(run_key, kind) WHERE kind = X'72756e5f66696e6973686564';
 CREATE INDEX messages_observation_idx ON messages(session_key, created_at, id, run_key, role, finalized) WHERE role IN ('user', 'assistant');
