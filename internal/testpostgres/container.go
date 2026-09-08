@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -129,6 +130,23 @@ func (d *Database) Open(t *testing.T) *sql.DB {
 	t.Helper()
 
 	return openPool(t, d.dsn)
+}
+
+// OpenPGX opens an independent native pool for testing the database/sql bridge.
+// Cleanup stays host-owned and runs after wrappers registered by the caller.
+func (d *Database) OpenPGX(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), operationTimeout)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, d.dsn)
+	if err != nil {
+		t.Fatal("postgres fixture: native pool open failed")
+	}
+	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatal("postgres fixture: native pool ping failed")
+	}
+	return pool
 }
 
 func openPool(t *testing.T, dsn string) *sql.DB {
