@@ -12,7 +12,7 @@ import (
 func (s *Store) appendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
 	var existing session.EventRecord
 	if err := s.getJSON(ctx, "SELECT record FROM events WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.EventRecord{}, session.ErrConflict
 		}
 		return existing, nil

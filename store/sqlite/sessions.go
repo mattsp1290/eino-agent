@@ -17,7 +17,7 @@ func (s *Store) CreateSession(ctx context.Context, record session.Session) (sess
 	}
 	var existing session.Session
 	if err := s.getJSON(ctx, "SELECT record FROM sessions WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.Session{}, session.ErrConflict
 		}
 		return existing, nil

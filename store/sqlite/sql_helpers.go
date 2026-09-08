@@ -1,7 +1,6 @@
 package sqlite
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -12,12 +11,6 @@ import (
 
 	"github.com/mattsp1290/eino-agent/session"
 )
-
-func sameRecord[T any](left, right T) bool {
-	leftRaw, leftErr := json.Marshal(left)
-	rightRaw, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftRaw, rightRaw)
-}
 
 func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
 	if s.tx != nil {

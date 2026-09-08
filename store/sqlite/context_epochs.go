@@ -12,7 +12,7 @@ import (
 func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpoch) (session.ContextEpoch, error) {
 	var existing session.ContextEpoch
 	if err := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.ContextEpoch{}, session.ErrConflict
 		}
 		return existing, nil
@@ -26,7 +26,7 @@ func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpo
 	_, err = s.exec(ctx, `INSERT INTO context_epochs(id, session_id, record, closed_at) VALUES (?, ?, ?, ?)`, record.ID, record.SessionID, raw, sqlstore.TimeText(record.ClosedAt))
 	if constraintFailed(err) {
 		var reread session.ContextEpoch
-		if getErr := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &reread); getErr == nil && sameRecord(reread, record) {
+		if getErr := s.getJSON(ctx, "SELECT record FROM context_epochs WHERE id = ?", []any{record.ID}, &reread); getErr == nil && sqlstore.SameRecord(reread, record) {
 			return reread, nil
 		}
 	}

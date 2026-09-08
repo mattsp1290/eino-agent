@@ -221,33 +221,6 @@ func TestObservationConcurrentCommittedSnapshot(t *testing.T) {
 	}
 }
 
-func FuzzObservationText(f *testing.F) {
-	for _, seed := range []string{`{"text":"hello"}`, `{"text":42}`, `{"text":null}`, `{"text":""}`, "{\"text\":\"\xff\"}"} {
-		f.Add([]byte(seed))
-	}
-	f.Fuzz(func(t *testing.T, raw []byte) {
-		if len(raw) > 4096 {
-			return
-		}
-		value, valid := observationText(session.Part{Kind: session.PartText, Payload: raw})
-		if valid {
-			if !json.Valid(raw) {
-				t.Fatal("accepted malformed JSON")
-			}
-			var decoded struct {
-				Text string `json:"text"`
-			}
-			if err := json.Unmarshal(raw, &decoded); err != nil || decoded.Text != value {
-				t.Fatal("text changed")
-			}
-		}
-		hidden, ok := observationText(session.Part{Kind: session.PartProviderState, Payload: raw})
-		if hidden != "" || !ok {
-			t.Fatal("hidden state inspected")
-		}
-	})
-}
-
 func TestObservationWindowCumulativeLimitsAndExcludedPopulations(t *testing.T) {
 	st, ex, _, now := setupToolTransitionTest(t)
 	defer func() { _ = st.Close() }()

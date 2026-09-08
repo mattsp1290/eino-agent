@@ -96,7 +96,7 @@ func (s *Store) writeRun(ctx context.Context, record session.Run) error {
 		return err
 	}
 	if current.Terminal() {
-		if sameRecord(current, record) {
+		if sqlstore.SameRecord(current, record) {
 			return nil
 		}
 		return session.ErrConflict
@@ -115,7 +115,7 @@ func (s *Store) writeRun(ctx context.Context, record session.Run) error {
 		if getErr != nil {
 			return getErr
 		}
-		if latest.Terminal() && sameRecord(latest, record) {
+		if latest.Terminal() && sqlstore.SameRecord(latest, record) {
 			return nil
 		}
 		return session.ErrConflict

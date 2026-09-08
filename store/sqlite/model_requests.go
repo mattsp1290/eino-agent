@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"time"
 
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
@@ -18,7 +17,7 @@ func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequ
 	}
 	var existing session.ModelRequestRecord
 	if err := s.getJSON(ctx, "SELECT record FROM model_requests WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.ModelRequestRecord{}, session.ErrConflict
 		}
 		return existing, nil
@@ -41,11 +40,11 @@ func (s *Store) updateModelRequest(ctx context.Context, record session.ModelRequ
 	if err != nil {
 		return err
 	}
-	if !sameModelRequestIdentity(current, record) {
+	if !sqlstore.SameModelRequestIdentity(current, record) {
 		return session.ErrConflict
 	}
 	if current.State == record.State {
-		if sameRecord(current, record) {
+		if sqlstore.SameRecord(current, record) {
 			return nil
 		}
 		return session.ErrConflict
@@ -65,13 +64,6 @@ func (s *Store) updateModelRequest(ctx context.Context, record session.ModelRequ
 		return mapErr(err)
 	}
 	return rowsAffected(result)
-}
-
-func sameModelRequestIdentity(left, right session.ModelRequestRecord) bool {
-	left.State, right.State = "", ""
-	left.ErrorCode, right.ErrorCode = "", ""
-	left.UpdatedAt, right.UpdatedAt = time.Time{}, time.Time{}
-	return sameRecord(left, right)
 }
 
 func (s *Store) GetModelRequest(ctx context.Context, id session.ModelRequestID) (session.ModelRequestRecord, error) {
