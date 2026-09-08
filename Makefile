@@ -98,3 +98,13 @@ external-consumer-check:
 
 lint: $(GOLANGCI_LINT)
 	$(GOLANGCI_LINT) run ./...
+
+# Keep Docker tests opt-in locally and required in the dedicated CI job.
+POSTGRES_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresBaseline
+POSTGRES_REQUIRED_SUITES := $(POSTGRES_SUITE) $(addprefix $(POSTGRES_SUITE)/,catalog constraints revisions pending_reopen large_indexes)
+.PHONY: postgres-test postgres-race
+postgres-test:
+	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'
+
+postgres-race:
+	bash -o pipefail -c 'go test -json -race -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'

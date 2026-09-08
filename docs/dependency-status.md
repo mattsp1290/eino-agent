@@ -261,3 +261,22 @@ The [consumer flow](consumer-guide.md#workspace-conversation-discovery) and
 normative. The companion durable-conversation-renaming request remains unresolved.
 The downstream consumer owns verifying/adopting both pins before its TUI plan;
 this publication does not claim downstream adoption.
+
+## PostgreSQL baseline test pins
+
+The PostgreSQL schema proof uses `postgres:17.9-bookworm` at multi-platform
+image digest `sha256:47f917f7409eacd22fc5dfb1dee634e1b55cf0c01d1a7eb701be2227a03e0641`,
+resolved from the official Docker image index on 2026-09-08. Local tagged
+checks and the required CI job use the same reference from
+`internal/testpostgres/container.go`, with a non-C `en_US.utf8` database locale.
+
+Testcontainers core and its PostgreSQL module are pinned to `v0.42.0`.
+The fixture uses pgx `v5.10.0`, matching the resolved requirement of the
+planned `gorm.io/driver/postgres v1.6.2` adapter. GORM and the public PostgreSQL
+store/migration APIs are added in later slices; this baseline proof does not
+advertise a usable PostgreSQL Store yet. Normal tests require no Docker;
+`make postgres-test` and `make postgres-race` fail on unavailable Docker,
+startup errors, skipped PostgreSQL tests, or a missing required suite.
+
+The fixture follows the [Testcontainers PostgreSQL wait strategy](https://golang.testcontainers.org/modules/postgres/)
+and PostgreSQL's [database locale rules](https://www.postgresql.org/docs/17/sql-createdatabase.html).

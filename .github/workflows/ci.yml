@@ -52,3 +52,22 @@ jobs:
 
       - name: Lint
         run: make lint
+
+  postgres:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.26.3
+          cache: true
+      - name: Vet PostgreSQL integration code
+        run: go vet -tags=postgres_integration ./internal/testpostgres ./store/postgres ./runtime
+      - name: Lint PostgreSQL integration code
+        run: |
+          make tools
+          .bin/golangci-lint run --build-tags=postgres_integration ./...
+      - name: PostgreSQL tests (required, zero skips)
+        run: make postgres-test
+      - name: PostgreSQL race tests (required, zero skips)
+        run: make postgres-race
