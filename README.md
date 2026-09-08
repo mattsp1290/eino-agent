@@ -23,6 +23,9 @@ and observability remain provider-neutral.
   `36fe8d8a046b4dd193e97b8f49a580a71bf07bbc`, verified on 2026-09-04 with
   `make check` and a fresh published consumer using no `replace`, workspace,
   vendor tree, or checkout access
+- Verified workspace-discovery pin: `v0.3.4-0.20260908144805-034b315a5175` at
+  commit `034b315a517520d18010c0bd9429ef404a2df73d`, verified on 2026-09-08
+  with `make check` and a fresh published consumer (no replacement)
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.8.13`
@@ -137,7 +140,7 @@ the detailed rules.
   non-parity caveat.
 
 
-## Session snapshot and watch (unreleased)
+## Session snapshot and watch
 
 The current checkout adds `session.ObservationReader`, `watch.Service`, and
 `runtime.WithSessionObserver`. A watch starts with a transaction-consistent
@@ -148,7 +151,8 @@ run. Detaching or closing observation leaves execution ownership with the host.
 See [the consumer guide](docs/consumer-guide.md#session-state-observation) for
 construction, limits, overflow recovery, and cleanup. The minimal server's
 existing events route now emits current AG-UI message/state snapshots. These
-APIs are candidate-checkout functionality, not part of the published v0.3.3 pin.
+APIs are included in the verified workspace-discovery pin above; they are not
+part of the earlier v0.3.3 release.
 Old development databases require explicit recreation for the new schema;
 opening an old schema fails without deleting or migrating it.
 
@@ -161,3 +165,8 @@ conversation. See the [consumer flow](docs/consumer-guide.md#workspace-conversat
 and [storage contract](docs/architecture/storage.md#workspace-session-discovery)
 for bounds, concurrency, errors and the intentionally incompatible SQLite schema.
 Safe durable renaming remains a separate capability request.
+
+Verified implementation: [`034b315a5175`](https://github.com/mattsp1290/eino-agent/commit/034b315a517520d18010c0bd9429ef404a2df73d),
+Go module version `v0.3.4-0.20260908144805-034b315a5175`. The fresh
+published fixture verifies discovery and independent runtime continuation after
+reopen. See [dependency evidence](docs/dependency-status.md#workspace-discovery-publication).

@@ -1,7 +1,7 @@
 # Dependency Status
 
 Date: 2026-06-27
-Last updated: 2026-09-04
+Last updated: 2026-09-08
 
 This note records the prerequisite state for `eino-agent` before runtime
 implementation starts. The exact pins below are the initial baseline. Do not
@@ -206,3 +206,58 @@ Ongoing constraints for runtime implementation:
 
 No code-level blocker remains for the initial runtime architecture and module
 setup beads.
+
+## Workspace discovery publication
+
+On 2026-09-08, workspace-scoped durable discovery was published at full commit
+`034b315a517520d18010c0bd9429ef404a2df73d`, resolving through the public Go proxy
+to `v0.3.4-0.20260908144805-034b315a5175`. This is the verified source
+for discovery and the included session-watch APIs; the earlier v0.3.3 evidence
+above remains the historical tagged baseline. A later documentation-only commit
+records this proof and is not the source claimed to have passed the published gate.
+
+The implementation tree passed `make check`: formatting, vet, all tests, full
+race tests, module tidy, lint (0 issues), Windows compilation, WIT regeneration
+and the fresh local external consumer. Targeted session/store/runtime tests and
+store/runtime race tests also passed. No runtime production signatures or
+admission identity rules changed.
+
+The exact remote branch commit matched `034b315a517520d18010c0bd9429ef404a2df73d`.
+The following clean published gate passed, using a new consumer module and fresh
+module cache, proxy-only dependency downloads, checksum verification, no replace,
+no workspace and no vendor directory:
+
+```sh
+env GOTOOLCHAIN=go1.26.3 GOWORK=off \
+  GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
+  GOFLAGS= GOPRIVATE= GONOSUMDB= GONOPROXY= \
+  EINO_AGENT_CONSUMER_VERSION=034b315a517520d18010c0bd9429ef404a2df73d \
+  testdata/external-consumer/check.sh
+```
+
+Observed results: `ROOT_MODULE_SELECTED=github.com/mattsp1290/eino-agent@v0.3.4-0.20260908144805-034b315a5175`,
+`all modules verified`, passing consumer tests/build, and
+`external-consumer: published verification passed`. A separate proxy-only
+`go list -m -json` returned `Origin.Hash=034b315a517520d18010c0bd9429ef404a2df73d`.
+The generated module remains `wasmext/gen@v0.1.0` without a replacement.
+
+`TestPublicSessionDiscoveryReopenAndIndependentContinuation` creates two empty A
+conversations and one B conversation, pages A, completes distinct histories,
+reopens SQLite, rediscovers both A IDs and checks exact independent provider
+requests and histories. It also proves discovery causes no provider calls or
+run/lease/revision changes. The published fixture includes all discovery source
+and tests. SQLite's `TestDiscovery*`, `TestOpenRejectsPreDiscoverySchemaWithoutMutation`,
+and opt-in `storetest.RunDiscovery` cover bounds, cursor integrity, committed
+connections, ordering, cancellation, privacy and schema rejection.
+
+SQLite is the built-in supported discovery backend. Other Store implementations
+must explicitly implement SessionDiscoveryReader and run RunDiscovery. The new
+schema rejects old databases without alteration; owners preserve desired data
+and choose a separate/recreated current-schema database. Rollback requires the
+matching earlier binary/database. There is no migration or automatic deletion.
+
+The [consumer flow](consumer-guide.md#workspace-conversation-discovery) and
+[storage contract](architecture/storage.md#workspace-session-discovery) are
+normative. The companion durable-conversation-renaming request remains unresolved.
+The downstream consumer owns verifying/adopting both pins before its TUI plan;
+this publication does not claim downstream adoption.

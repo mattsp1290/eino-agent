@@ -24,6 +24,19 @@ module `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, whose repository
 tag is `wasmext/gen/v0.1.0`. Consumers must not add a workaround for that
 internal dependency.
 
+For workspace discovery and session watch, use the newer verified commit
+`034b315a517520d18010c0bd9429ef404a2df73d` (module version
+`v0.3.4-0.20260908144805-034b315a5175`):
+
+```sh
+go get github.com/mattsp1290/eino-agent@034b315a517520d18010c0bd9429ef404a2df73d
+```
+
+This pin passed `make check` and the fresh published-mode discovery/reopen,
+watch and delegated-search fixtures on 2026-09-08. Its SQLite schema is
+incompatible with earlier databases; see the
+[discovery contract](architecture/storage.md#workspace-session-discovery).
+
 ## Package Surface
 
 | Package | Use it for | You still provide |
