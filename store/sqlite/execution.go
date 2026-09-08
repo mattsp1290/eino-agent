@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 type executionStore struct {
@@ -132,7 +133,7 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 			if err := store.getJSON(ctx, `SELECT record FROM events WHERE run_id = ? AND kind = ?`, []any{current.ID, session.RunSettlementEventKind}, &existing); err != nil {
 				return session.ErrConflict
 			}
-			if !sameRecord(existing, expected) {
+			if !sqlstore.SameRecord(existing, expected) {
 				return session.ErrConflict
 			}
 			committed = session.RunSettlementResult{Run: current, Event: existing}
@@ -230,7 +231,7 @@ func (e *executionStore) CreateToolCall(ctx context.Context, request session.Cre
 	var result session.ToolTransitionResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
 		part := request.RequestPart
-		if record.SessionID != run.SessionID || !validToolRequestEnvelope(record, part) {
+		if record.SessionID != run.SessionID || !sqlstore.ValidToolRequestEnvelope(record, part) {
 			return session.ErrConflict
 		}
 		event, err := session.ToolTransitionRecord(record, request.Event)

@@ -14,7 +14,7 @@ import (
 func (s *Store) appendMessage(ctx context.Context, record session.Message) (session.Message, error) {
 	var existing session.Message
 	if err := s.getJSON(ctx, "SELECT record FROM messages WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.Message{}, session.ErrConflict
 		}
 		return existing, nil
@@ -31,13 +31,13 @@ func (s *Store) appendMessage(ctx context.Context, record session.Message) (sess
 }
 
 func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Part, error) {
-	text, valid := observationText(record)
+	text, valid := sqlstore.ObservationText(record)
 	if err := s.validatePartOwner(ctx, record); err != nil {
 		return session.Part{}, err
 	}
 	var existing session.Part
 	if err := s.getJSON(ctx, "SELECT record FROM parts WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.Part{}, session.ErrConflict
 		}
 		return existing, nil
@@ -54,7 +54,7 @@ func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Pa
 }
 
 func (s *Store) updatePart(ctx context.Context, record session.Part) error {
-	text, valid := observationText(record)
+	text, valid := sqlstore.ObservationText(record)
 	if err := s.validatePartOwner(ctx, record); err != nil {
 		return err
 	}
@@ -147,10 +147,17 @@ func (s *Store) loadReplayParts(ctx context.Context, messageIDs []session.Messag
 	stateCounts := make(map[session.MessageID]int)
 	stateBytes := make(map[session.MessageID]int)
 	for rows.Next() {
-		part, owner, err := scanAuthoritativePart(rows)
+		var id, messageID, sessionID, runID string
+		var ordinal int64
+		var raw []byte
+		if err := rows.Scan(&id, &messageID, &sessionID, &runID, &ordinal, &raw); err != nil {
+			return nil, nil, err
+		}
+		part, err := sqlstore.DecodeAuthoritativePart(id, messageID, sessionID, runID, ordinal, raw)
 		if err != nil {
 			return nil, nil, err
 		}
+		owner := part.MessageID
 		if part.Kind == session.PartProviderState {
 			if stateCounts[owner] >= session.ProviderStateHardMaxItems ||
 				len(part.Payload) > session.ProviderStateHardMaxStoredMessageBytes-stateBytes[owner] {
@@ -171,34 +178,7 @@ func scanAuthoritativeMessage(row rowScanner) (session.Message, error) {
 	if err := row.Scan(&id, &sessionID, &runID, &role, &createdAt, &raw); err != nil {
 		return session.Message{}, err
 	}
-	return decodeAuthoritativeMessage(id, sessionID, runID, role, createdAt, raw)
-}
-
-func decodeAuthoritativeMessage(id, sessionID, runID, role, createdAt string, raw []byte) (session.Message, error) {
-	var message session.Message
-	if err := json.Unmarshal(raw, &message); err != nil ||
-		message.ID != session.MessageID(id) || message.SessionID != session.ID(sessionID) ||
-		message.RunID != session.RunID(runID) || message.Role != session.Role(role) ||
-		sqlstore.TimeText(message.CreatedAt) != createdAt {
-		return session.Message{}, session.ErrConflict
-	}
-	return message, nil
-}
-
-func scanAuthoritativePart(row rowScanner) (session.Part, session.MessageID, error) {
-	var id, messageID, sessionID, runID string
-	var ordinal int64
-	var raw []byte
-	if err := row.Scan(&id, &messageID, &sessionID, &runID, &ordinal, &raw); err != nil {
-		return session.Part{}, "", err
-	}
-	var part session.Part
-	if err := json.Unmarshal(raw, &part); err != nil ||
-		part.ID != session.PartID(id) || part.MessageID != session.MessageID(messageID) ||
-		part.SessionID != session.ID(sessionID) || part.RunID != session.RunID(runID) || part.Ordinal != ordinal {
-		return session.Part{}, "", session.ErrConflict
-	}
-	return part, session.MessageID(messageID), nil
+	return sqlstore.DecodeAuthoritativeMessage(id, sessionID, runID, role, createdAt, raw)
 }
 
 func (s *Store) GetMessage(ctx context.Context, id session.MessageID) (session.Message, error) {

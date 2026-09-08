@@ -5,14 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/mattsp1290/eino-agent/internal/jsonequal"
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (session.ToolCall, error) {
 	var existing session.ToolCall
 	if err := s.getJSON(ctx, "SELECT record FROM tool_calls WHERE id = ?", []any{record.ID}, &existing); err == nil {
-		if !sameRecord(existing, record) {
+		if !sqlstore.SameRecord(existing, record) {
 			return session.ToolCall{}, session.ErrConflict
 		}
 		return existing, nil
@@ -26,22 +26,6 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 	_, err = s.exec(ctx, `INSERT INTO tool_calls(id, session_id, run_id, message_id, status, claimed_by, claim_token, name, record) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		record.ID, record.SessionID, record.RunID, record.MessageID, record.Status, record.ClaimedBy, record.ClaimToken, record.Name, raw)
 	return record, mapErr(err)
-}
-
-func validToolRequestEnvelope(call session.ToolCall, part session.Part) bool {
-	if call.RequestPartID == "" || part.ID != call.RequestPartID || part.MessageID != call.MessageID ||
-		part.SessionID != call.SessionID || part.RunID != call.RunID || part.Kind != session.PartToolCall {
-		return false
-	}
-	var payload struct {
-		ID        session.ToolCallID `json:"id"`
-		Name      string             `json:"name"`
-		Arguments json.RawMessage    `json:"arguments"`
-	}
-	if err := json.Unmarshal(part.Payload, &payload); err != nil {
-		return false
-	}
-	return payload.ID == call.ID && payload.Name == call.Name && jsonequal.Equal(payload.Arguments, call.Input)
 }
 
 func (s *Store) GetToolCall(ctx context.Context, id session.ToolCallID) (session.ToolCall, error) {
@@ -97,7 +81,7 @@ func (s *Store) finishToolCall(ctx context.Context, record session.ToolCall) err
 		return session.ErrConflict
 	}
 	if session.TerminalToolCall(current.Status) {
-		if sameRecord(current, record) {
+		if sqlstore.SameRecord(current, record) {
 			return nil
 		}
 		return session.ErrConflict
@@ -119,7 +103,7 @@ func (s *Store) finishToolCall(ctx context.Context, record session.ToolCall) err
 		if getErr != nil {
 			return getErr
 		}
-		if session.TerminalToolCall(latest.Status) && sameRecord(latest, record) {
+		if session.TerminalToolCall(latest.Status) && sqlstore.SameRecord(latest, record) {
 			return nil
 		}
 		return session.ErrConflict
@@ -143,7 +127,7 @@ func (s *Store) settleToolCall(ctx context.Context, settlement session.ToolSettl
 	if err != nil {
 		return err
 	}
-	if !validToolResultEnvelope(call, settlement) {
+	if !sqlstore.ValidToolResultEnvelope(call, settlement) {
 		return session.ErrConflict
 	}
 	settled, err := settlement.Apply(call)
@@ -160,13 +144,4 @@ func (s *Store) settleToolCall(ctx context.Context, settlement session.ToolSettl
 		return err
 	}
 	return nil
-}
-
-func validToolResultEnvelope(call session.ToolCall, settlement session.ToolSettlement) bool {
-	message := settlement.ResultMessage
-	part := settlement.ResultPart
-	return call.ResultMessageID != "" && call.ResultPartID != "" &&
-		message.ID == call.ResultMessageID && message.SessionID == call.SessionID && message.RunID == call.RunID && message.ParentID == call.MessageID && message.Role == session.RoleTool &&
-		part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && part.SessionID == call.SessionID && part.RunID == call.RunID && part.Kind == session.PartToolResult &&
-		jsonequal.Equal(part.Payload, settlement.Output)
 }
