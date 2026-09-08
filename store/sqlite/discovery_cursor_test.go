@@ -20,10 +20,19 @@ func TestDiscoveryCursorRoundTripAndMaximum(t *testing.T) {
 				t.Fatal("maximum legal cursor exceeds query bound", len(encoded))
 			}
 			c, err := decodeDiscoveryCursor(encoded, identity)
-			if err != nil || c.Store != store || c.Workspace != identity || c.ID != identity || c.Created != timeText(at) {
+			if err != nil || c.storeID != store || c.id != session.ID(identity) || !c.createdAt.Equal(at) {
 				t.Fatal(c, err)
 			}
 		}
+	}
+}
+
+func TestDiscoveryCursorCanonicalEncoding(t *testing.T) {
+	const wire = `{"version":1,"store":"YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE","workspace":"QQ","id":"aWQ","created":""}`
+	want := base64.RawURLEncoding.EncodeToString([]byte(wire))
+	got := encodeDiscoveryCursor(strings.Repeat("a", 32), "A", session.SessionSummary{ID: "id"})
+	if got != want {
+		t.Fatal("canonical encoding changed")
 	}
 }
 func TestDiscoveryCursorRejectsNoncanonical(t *testing.T) {

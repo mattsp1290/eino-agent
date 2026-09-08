@@ -13,7 +13,7 @@ import (
 const discoveryTimeLayout = "2006-01-02T15:04:05.000000000Z"
 
 // Identity fields use inner base64 to bound JSON expansion even for control bytes.
-type discoveryCursor struct {
+type discoveryCursorEnvelope struct {
 	Version   int    `json:"version"`
 	Store     string `json:"store"`
 	Workspace string `json:"workspace"`
@@ -21,15 +21,26 @@ type discoveryCursor struct {
 	Created   string `json:"created"`
 }
 
+// A position has one meaning: validated identifiers and a UTC creation time.
+// Wire version and workspace binding are checked before constructing it.
+type discoveryPosition struct {
+	storeID   string
+	id        session.ID
+	createdAt time.Time
+}
+
 func encodeDiscoveryCursor(store, workspace string, last session.SessionSummary) string {
 	enc := base64.RawURLEncoding.EncodeToString
-	raw, _ := json.Marshal(discoveryCursor{1, enc([]byte(store)), enc([]byte(workspace)), enc([]byte(last.ID)), timeText(last.CreatedAt)})
+	raw, _ := json.Marshal(discoveryCursorEnvelope{
+		Version: 1, Store: enc([]byte(store)), Workspace: enc([]byte(workspace)),
+		ID: enc([]byte(last.ID)), Created: timeText(last.CreatedAt),
+	})
 	return enc(raw)
 }
 
-func decodeDiscoveryCursor(value, workspace string) (discoveryCursor, error) {
-	var c discoveryCursor
-	invalid := func() (discoveryCursor, error) { return discoveryCursor{}, session.ErrDiscoveryCursor }
+func decodeDiscoveryCursor(value, workspace string) (discoveryPosition, error) {
+	var c discoveryCursorEnvelope
+	invalid := func() (discoveryPosition, error) { return discoveryPosition{}, session.ErrDiscoveryCursor }
 	if len(value) > session.DiscoveryMaxCursorBytes {
 		return invalid()
 	}
@@ -48,8 +59,7 @@ func decodeDiscoveryCursor(value, workspace string) (discoveryCursor, error) {
 	if encodeDiscoveryCursor(string(store), string(ws), session.SessionSummary{ID: session.ID(id), CreatedAt: created}) != value {
 		return invalid()
 	}
-	c.Store, c.Workspace, c.ID = string(store), string(ws), string(id)
-	return c, nil
+	return discoveryPosition{storeID: string(store), id: session.ID(id), createdAt: created}, nil
 }
 
 func validDiscoveryIncarnation(value string) bool {

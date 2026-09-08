@@ -20,6 +20,23 @@ func RunDiscovery(t *testing.T, factory Factory) {
 	t.Run("discovery errors", func(t *testing.T) { discoveryErrors(t, factory) })
 	t.Run("discovery between page writes", func(t *testing.T) { discoveryWrites(t, factory) })
 	t.Run("discovery bounded private read only", func(t *testing.T) { discoveryPrivate(t, factory) })
+	t.Run("discovery oversized summaries", func(t *testing.T) { discoverySizeLimits(t, factory) })
+}
+
+func discoverySizeLimits(t *testing.T, factory Factory) {
+	st, reader := discoverySubject(t, factory)
+	for _, tc := range []struct {
+		workspace string
+		id        session.ID
+		title     string
+	}{
+		{"size-title", "oversized-title", strings.Repeat("t", session.DiscoveryMaxTitleBytes+1)},
+		{"size-id", session.ID(strings.Repeat("i", session.DiscoveryMaxIdentityBytes+1)), "small"},
+	} {
+		discoveryCreate(t, st, session.Session{ID: tc.id, WorkspaceID: tc.workspace, Title: tc.title})
+		p, err := reader.ListSessions(t.Context(), session.SessionDiscoveryQuery{WorkspaceID: tc.workspace})
+		discoveryErrorPage(t, p, err, session.ErrDiscoveryTooLarge)
+	}
 }
 
 func discoverySubject(t *testing.T, factory Factory) (session.Store, session.SessionDiscoveryReader) {

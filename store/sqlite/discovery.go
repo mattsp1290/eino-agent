@@ -23,7 +23,7 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 	if s == nil || s.db == nil || s.tx != nil {
 		return zero, session.ErrDiscoveryReader
 	}
-	var cursor discoveryCursor
+	var cursor discoveryPosition
 	if q.Cursor != "" {
 		var err error
 		cursor, err = decodeDiscoveryCursor(q.Cursor, q.WorkspaceID)
@@ -46,7 +46,7 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 		if !incarnation.Valid || !validDiscoveryIncarnation(incarnation.String) {
 			return session.ErrDiscoveryInvalid
 		}
-		if q.Cursor != "" && cursor.Store != incarnation.String {
+		if q.Cursor != "" && cursor.storeID != incarnation.String {
 			return session.ErrDiscoveryCursor
 		}
 		var err error
@@ -68,10 +68,10 @@ func discoverySQL(continuation bool) string {
 	return query + " ORDER BY created_at DESC, id DESC LIMIT ?"
 }
 
-func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQuery, cursor discoveryCursor, incarnation string) (session.SessionDiscoveryPage, error) {
+func (s *Store) discoveryPage(ctx context.Context, q session.SessionDiscoveryQuery, cursor discoveryPosition, incarnation string) (session.SessionDiscoveryPage, error) {
 	args := []any{session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxIdentityBytes, session.DiscoveryMaxTitleBytes, 30, 30, q.WorkspaceID}
 	if q.Cursor != "" {
-		args = append(args, cursor.Created, cursor.ID)
+		args = append(args, timeText(cursor.createdAt), cursor.id)
 	}
 	args = append(args, q.Limit+1)
 	rows, err := s.query(ctx, discoverySQL(q.Cursor != ""), args...)
