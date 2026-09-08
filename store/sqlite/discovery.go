@@ -35,8 +35,7 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 		q.Limit = session.DiscoveryDefaultLimit
 	}
 	var page session.SessionDiscoveryPage
-	err := s.WithinTx(ctx, func(ctx context.Context, st session.Store) error {
-		tx := st.(*Store)
+	err := s.discoveryTx(ctx, func(tx *Store) error {
 		var incarnation sql.NullString
 		if err := tx.queryRow(ctx, "SELECT "+boundedColumn("incarnation")+" FROM observation_store WHERE singleton = 1", 32).Scan(&incarnation); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {

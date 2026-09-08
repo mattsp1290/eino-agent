@@ -617,7 +617,9 @@ and allowlist only non-secret option keys. See the
 
 ## Session state observation
 
-This is an unreleased checkout API; the published pin above does not include it.
+Session observation is included in the verified
+`v0.3.4-0.20260908144805-034b315a5175` pin described under Installation;
+it is not included in the earlier `v0.3.3` release.
 Construct one observation service for the store and share it with all observed
 orchestrators in this process:
 
@@ -714,8 +716,9 @@ be called again after a timeout. StreamingOrchestrator has no public Close.
 The external-consumer fixture exercises SQLite, mounted native tools, real
 scripted streaming, blocked sinks, detach, overflow recovery, interruption,
 strict fenced tool resume, reopen and cleanup without credentials. The local
-gate proves the candidate checkout with independently resolved dependencies;
-a release and published-pin verification remain separate authorized actions.
+gate checks the current checkout with independently resolved dependencies.
+The verified discovery/watch pin also passed the published-mode fixture;
+see [publication evidence](dependency-status.md#workspace-discovery-publication).
 `make windows-compile` checks pure-Go session/watch and tools/einotools;
 transitive Wasm dependencies still limit the broader runtime platform surface.
 
