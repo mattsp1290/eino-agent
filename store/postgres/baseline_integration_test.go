@@ -85,17 +85,73 @@ func assertStrings(t *testing.T, got, want []string) {
 	}
 }
 
-var pgIndexes = map[string][]string{
-	"observation_store":     {"observation_store_pkey:singleton"},
-	"observation_revisions": {"observation_revisions_pkey:session_id"},
-	"sessions":              {"sessions_pkey:row_key", "sessions_id_key:id", "sessions_workspace_created_idx:workspace_id,created_at,id"},
-	"runs":                  {"runs_pkey:row_key", "runs_id_key:id", "runs_session_status_idx:session_key,status", "runs_session_active_unique_idx:session_key"},
-	"messages":              {"messages_pkey:row_key", "messages_id_key:id", "messages_replay_idx:session_key,created_at,id", "messages_observation_idx:session_key,created_at,id,run_key,role,finalized", "messages_run_key_idx:run_key"},
-	"parts":                 {"parts_pkey:row_key", "parts_id_key:id", "parts_replay_idx:session_key,message_key,ordinal,id", "parts_observation_idx:session_key,message_key,kind,ordinal,id,run_key,text_valid", "parts_message_key_idx:message_key", "parts_run_key_idx:run_key"},
-	"tool_calls":            {"tool_calls_pkey:row_key", "tool_calls_id_key:id", "tools_unfinished_idx:run_key,status", "tools_observation_idx:session_key,run_key,id", "tool_calls_request_message_key_idx:request_message_key", "tool_calls_request_part_key_idx:request_part_key"},
-	"context_epochs":        {"context_epochs_pkey:row_key", "context_epochs_id_key:id", "context_epochs_session_created_idx:session_key,created_at,id"},
-	"model_requests":        {"model_requests_pkey:row_key", "model_requests_id_key:id", "model_requests_run_attempt_step_idx:run_key,attempt,step", "model_requests_run_created_idx:run_key,created_at,id", "model_requests_session_key_idx:session_key"},
-	"events":                {"events_pkey:row_key", "events_id_key:id", "events_replay_idx:session_key,created_at,id", "events_tool_transition_unique_idx:tool_key,tool_transition", "events_run_finished_unique_idx:run_key,kind", "events_run_key_idx:run_key", "events_tool_key_idx:tool_key"},
+type pgIndex struct {
+	name, columns   string
+	unique, partial bool
+}
+
+var pgIndexes = map[string][]pgIndex{
+	"observation_store": {
+		{name: "observation_store_pkey", columns: "singleton", unique: true},
+	},
+	"observation_revisions": {
+		{name: "observation_revisions_pkey", columns: "session_id", unique: true},
+	},
+	"sessions": {
+		{name: "sessions_pkey", columns: "row_key", unique: true},
+		{name: "sessions_id_key", columns: "id", unique: true},
+		{name: "sessions_workspace_created_idx", columns: "workspace_id,created_at,id"},
+	},
+	"runs": {
+		{name: "runs_pkey", columns: "row_key", unique: true},
+		{name: "runs_id_key", columns: "id", unique: true},
+		{name: "runs_session_status_idx", columns: "session_key,status"},
+		{name: "runs_session_active_unique_idx", columns: "session_key", unique: true, partial: true},
+	},
+	"messages": {
+		{name: "messages_pkey", columns: "row_key", unique: true},
+		{name: "messages_id_key", columns: "id", unique: true},
+		{name: "messages_replay_idx", columns: "session_key,created_at,id"},
+		{name: "messages_observation_idx", columns: "session_key,created_at,id,run_key,role,finalized", partial: true},
+		{name: "messages_run_key_idx", columns: "run_key"},
+	},
+	"parts": {
+		{name: "parts_pkey", columns: "row_key", unique: true},
+		{name: "parts_id_key", columns: "id", unique: true},
+		{name: "parts_replay_idx", columns: "session_key,message_key,ordinal,id"},
+		{name: "parts_observation_idx", columns: "session_key,message_key,kind,ordinal,id,run_key,text_valid"},
+		{name: "parts_message_key_idx", columns: "message_key"},
+		{name: "parts_run_key_idx", columns: "run_key"},
+	},
+	"tool_calls": {
+		{name: "tool_calls_pkey", columns: "row_key", unique: true},
+		{name: "tool_calls_id_key", columns: "id", unique: true},
+		{name: "tools_unfinished_idx", columns: "run_key,status"},
+		{name: "tools_observation_idx", columns: "session_key,run_key,id"},
+		{name: "tool_calls_request_message_key_idx", columns: "request_message_key"},
+		{name: "tool_calls_request_part_key_idx", columns: "request_part_key"},
+	},
+	"context_epochs": {
+		{name: "context_epochs_pkey", columns: "row_key", unique: true},
+		{name: "context_epochs_id_key", columns: "id", unique: true},
+		{name: "context_epochs_session_created_idx", columns: "session_key,created_at,id"},
+	},
+	"model_requests": {
+		{name: "model_requests_pkey", columns: "row_key", unique: true},
+		{name: "model_requests_id_key", columns: "id", unique: true},
+		{name: "model_requests_run_attempt_step_idx", columns: "run_key,attempt,step", unique: true},
+		{name: "model_requests_run_created_idx", columns: "run_key,created_at,id"},
+		{name: "model_requests_session_key_idx", columns: "session_key"},
+	},
+	"events": {
+		{name: "events_pkey", columns: "row_key", unique: true},
+		{name: "events_id_key", columns: "id", unique: true},
+		{name: "events_replay_idx", columns: "session_key,created_at,id"},
+		{name: "events_tool_transition_unique_idx", columns: "tool_key,tool_transition", unique: true, partial: true},
+		{name: "events_run_finished_unique_idx", columns: "run_key,kind", unique: true, partial: true},
+		{name: "events_run_key_idx", columns: "run_key"},
+		{name: "events_tool_key_idx", columns: "tool_key"},
+	},
 }
 var pgOwners = map[string][]string{
 	"runs": {"session_key:sessions"}, "messages": {"run_key:runs", "session_key:sessions"},
@@ -121,7 +177,10 @@ func testCatalog(t *testing.T, server *testpostgres.Server) {
    CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum,ord)
    LEFT JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
    WHERE i.indrelid=$1::regclass GROUP BY ic.relname ORDER BY ic.relname`, "public."+table)
-		want := append([]string(nil), expected...)
+		want := make([]string, 0, len(expected))
+		for _, index := range expected {
+			want = append(want, index.name+":"+index.columns)
+		}
 		sort.Strings(want)
 		assertStrings(t, got, want)
 		pk := "row_key:bigint"
@@ -132,11 +191,8 @@ func testCatalog(t *testing.T, server *testpostgres.Server) {
 			pk = "session_id:bytea"
 		}
 		assertStrings(t, queryStrings(t, db, `SELECT a.attname || ':' || pg_catalog.format_type(a.atttypid,a.atttypmod) FROM pg_catalog.pg_index i JOIN pg_catalog.pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=i.indkey[0] WHERE i.indrelid=$1::regclass AND i.indisprimary`, "public."+table), []string{pk})
-		for _, entry := range expected {
-			name := strings.Split(entry, ":")[0]
-			unique := strings.HasSuffix(name, "_pkey") || strings.HasSuffix(name, "_id_key") || name == "model_requests_run_attempt_step_idx" || strings.Contains(name, "_unique_idx")
-			partial := strings.Contains(name, "_unique_idx") || name == "messages_observation_idx"
-			assertStrings(t, queryStrings(t, db, `SELECT indisunique::text || ':' || (indpred IS NOT NULL)::text FROM pg_catalog.pg_index WHERE indexrelid=$1::regclass`, "public."+name), []string{strconv.FormatBool(unique) + ":" + strconv.FormatBool(partial)})
+		for _, index := range expected {
+			assertStrings(t, queryStrings(t, db, `SELECT indisunique::text || ':' || (indpred IS NOT NULL)::text FROM pg_catalog.pg_index WHERE indexrelid=$1::regclass`, "public."+index.name), []string{strconv.FormatBool(index.unique) + ":" + strconv.FormatBool(index.partial)})
 		}
 	}
 	// Every time projection uses C; bytea does not use a text collation.

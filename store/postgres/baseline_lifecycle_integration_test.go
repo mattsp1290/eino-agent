@@ -144,20 +144,19 @@ func assertPGIndexFootprints(t *testing.T, db *sql.DB) {
 		t.Fatal(err)
 	}
 	for table, indexes := range pgIndexes {
-		for _, entry := range indexes {
-			name, columns, _ := strings.Cut(entry, ":")
+		for _, index := range indexes {
 			// Actual inserts above exercise every index with incompressible values.
 			// Composite record sizes include headers and provide a diagnostic check
 			// below one third of a database page; they are not exact btree tuple sizes.
-			size, err := strconv.Atoi(queryStrings(t, db, "SELECT coalesce(max(pg_column_size(ROW("+columns+"))),0)::text FROM public."+table)[0])
+			size, err := strconv.Atoi(queryStrings(t, db, "SELECT coalesce(max(pg_column_size(ROW("+index.columns+"))),0)::text FROM public."+table)[0])
 			if err != nil {
 				t.Fatal(err)
 			}
 			if size == 0 || size*3 >= blockSize {
-				t.Fatalf("%s record footprint %d versus page %d", name, size, blockSize)
+				t.Fatalf("%s record footprint %d versus page %d", index.name, size, blockSize)
 			}
-			if got := queryStrings(t, db, `SELECT (pg_relation_size($1::regclass)>0)::text`, "public."+name); !reflect.DeepEqual(got, []string{"true"}) {
-				t.Fatalf("%s has no physical index pages", name)
+			if got := queryStrings(t, db, `SELECT (pg_relation_size($1::regclass)>0)::text`, "public."+index.name); !reflect.DeepEqual(got, []string{"true"}) {
+				t.Fatalf("%s has no physical index pages", index.name)
 			}
 		}
 	}
