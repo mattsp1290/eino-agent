@@ -36,12 +36,12 @@ func DecodeAuthoritativeMessage(id, sessionID, runID, role, createdAt string, ra
 }
 
 // DecodeAuthoritativePart decodes a part and verifies its indexed fields.
-func DecodeAuthoritativePart(id, messageID, sessionID, runID string, ordinal int64, raw []byte) (session.Part, session.MessageID, error) {
+func DecodeAuthoritativePart(id, messageID, sessionID, runID string, ordinal int64, raw []byte) (session.Part, error) {
 	var part session.Part
 	if err := json.Unmarshal(raw, &part); err != nil ||
 		part.ID != session.PartID(id) || part.MessageID != session.MessageID(messageID) ||
 		part.SessionID != session.ID(sessionID) || part.RunID != session.RunID(runID) || part.Ordinal != ordinal {
-		return session.Part{}, "", session.ErrConflict
+		return session.Part{}, session.ErrConflict
 	}
-	return part, session.MessageID(messageID), nil
+	return part, nil
 }

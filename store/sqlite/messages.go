@@ -153,10 +153,11 @@ func (s *Store) loadReplayParts(ctx context.Context, messageIDs []session.Messag
 		if err := rows.Scan(&id, &messageID, &sessionID, &runID, &ordinal, &raw); err != nil {
 			return nil, nil, err
 		}
-		part, owner, err := sqlstore.DecodeAuthoritativePart(id, messageID, sessionID, runID, ordinal, raw)
+		part, err := sqlstore.DecodeAuthoritativePart(id, messageID, sessionID, runID, ordinal, raw)
 		if err != nil {
 			return nil, nil, err
 		}
+		owner := part.MessageID
 		if part.Kind == session.PartProviderState {
 			if stateCounts[owner] >= session.ProviderStateHardMaxItems ||
 				len(part.Payload) > session.ProviderStateHardMaxStoredMessageBytes-stateBytes[owner] {
