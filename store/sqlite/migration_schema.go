@@ -30,6 +30,24 @@ const (
 //go:embed schema_fingerprints.json
 var migrationSchemaFingerprints []byte
 
+const migrationHistoryQuery = `
+SELECT CASE WHEN typeof(id) = 'integer' THEN id END,
+       CASE WHEN typeof(version_id) = 'integer' THEN version_id END,
+       CASE WHEN typeof(is_applied) = 'integer' THEN is_applied END,
+       CASE WHEN typeof(tstamp) = 'text' AND length(CAST(tstamp AS BLOB)) = 19 THEN tstamp END,
+       typeof(id), typeof(version_id), typeof(is_applied), typeof(tstamp)
+FROM main.eino_agent_goose_version
+ORDER BY id
+LIMIT 3`
+
+const migrationIncarnationQuery = `
+SELECT CASE WHEN typeof(singleton) = 'integer' AND singleton = 1 THEN singleton END,
+       CASE WHEN typeof(incarnation) = 'text' AND length(CAST(incarnation AS BLOB)) = 32 THEN incarnation END,
+       typeof(singleton), typeof(incarnation)
+FROM main.observation_store
+ORDER BY rowid
+LIMIT 2`
+
 // inspectMigrationSchema only reads a pinned connection. In particular, the
 // read-only option prevents modernc's _txlock=immediate setting from turning
 // this preflight into a writer transaction.
@@ -159,15 +177,7 @@ func migrationSchemaFingerprint(catalog map[string]string) string {
 }
 
 func validateMigrationHistory(ctx context.Context, tx *sql.Tx, state migrationSchemaState) (err error) {
-	rows, err := tx.QueryContext(ctx, `
-SELECT CASE WHEN typeof(id) = 'integer' THEN id END,
-       CASE WHEN typeof(version_id) = 'integer' THEN version_id END,
-       CASE WHEN typeof(is_applied) = 'integer' THEN is_applied END,
-       CASE WHEN typeof(tstamp) = 'text' AND length(tstamp) = 19 THEN tstamp END,
-       typeof(id), typeof(version_id), typeof(is_applied), typeof(tstamp)
-FROM main.eino_agent_goose_version
-ORDER BY id
-LIMIT 3`)
+	rows, err := tx.QueryContext(ctx, migrationHistoryQuery)
 	if err != nil {
 		return err
 	}
@@ -227,13 +237,7 @@ func validateMigrationIncarnation(ctx context.Context, tx *sql.Tx) error {
 	var singleton sql.NullInt64
 	var incarnation sql.NullString
 	var singletonType, incarnationType string
-	rows, err := tx.QueryContext(ctx, `
-SELECT CASE WHEN typeof(singleton) = 'integer' AND singleton = 1 THEN singleton END,
-       CASE WHEN typeof(incarnation) = 'text' AND length(incarnation) = 32 THEN incarnation END,
-       typeof(singleton), typeof(incarnation)
-FROM main.observation_store
-ORDER BY rowid
-LIMIT 2`)
+	rows, err := tx.QueryContext(ctx, migrationIncarnationQuery)
 	if err != nil {
 		return err
 	}

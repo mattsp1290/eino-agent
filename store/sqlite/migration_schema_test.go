@@ -103,6 +103,7 @@ func TestMigrationSchemaRejection(t *testing.T) {
 		{"timestamp_blob", migrationSchemaBootstrap, "UPDATE eino_agent_goose_version SET tstamp=x'31'"},
 		{"timestamp_null", migrationSchemaBootstrap, "UPDATE eino_agent_goose_version SET tstamp=NULL"},
 		{"timestamp_invalid", migrationSchemaBootstrap, "UPDATE eino_agent_goose_version SET tstamp='invalid'"},
+		{"timestamp_nul_suffix", migrationSchemaBootstrap, "UPDATE eino_agent_goose_version SET tstamp='0000-01-01 00:00:00' || char(0) || printf('%1000000s', 'x')"},
 		{"partial", migrationSchemaBootstrap, "CREATE TABLE sessions(id BLOB)"},
 		{"missing_current_row", migrationSchemaCurrent, "DELETE FROM eino_agent_goose_version WHERE version_id=1"},
 		{"extra_history", migrationSchemaCurrent, "INSERT INTO eino_agent_goose_version(version_id,is_applied) VALUES(1,1)"},
@@ -119,6 +120,7 @@ func TestMigrationSchemaRejection(t *testing.T) {
 		{"missing_identity", migrationSchemaCurrent, "DELETE FROM observation_store"},
 		{"invalid_identity", migrationSchemaCurrent, "PRAGMA ignore_check_constraints=ON; UPDATE observation_store SET incarnation='not-valid'"},
 		{"identity_blob", migrationSchemaCurrent, "PRAGMA ignore_check_constraints=ON; UPDATE observation_store SET incarnation=zeroblob(1000000)"},
+		{"identity_nul_suffix", migrationSchemaCurrent, "PRAGMA ignore_check_constraints=ON; UPDATE observation_store SET incarnation='0123456789abcdef0123456789abcdef' || char(0) || printf('%1000000s', 'x')"},
 		{"extra_identity", migrationSchemaCurrent, "PRAGMA ignore_check_constraints=ON; INSERT INTO observation_store VALUES(2,lower(hex(randomblob(16))))"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -141,6 +143,37 @@ func TestMigrationSchemaRejection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMigrationSchemaProjectionBounds(t *testing.T) {
+	t.Run("timestamp", func(t *testing.T) {
+		db := migrationSchemaDB(t, migrationSchemaBootstrap)
+		execBaseline(t, db, "UPDATE eino_agent_goose_version SET tstamp='0000-01-01 00:00:00' || char(0) || printf('%1000000s', 'x')")
+		var id, version, applied sql.NullInt64
+		var timestamp sql.NullString
+		var idType, versionType, appliedType, timeType string
+		if err := db.QueryRowContext(t.Context(), migrationHistoryQuery).Scan(
+			&id, &version, &applied, &timestamp, &idType, &versionType, &appliedType, &timeType); err != nil {
+			t.Fatal(err)
+		}
+		if timestamp.Valid {
+			t.Fatal("malformed timestamp was materialized by SQL projection")
+		}
+	})
+	t.Run("incarnation", func(t *testing.T) {
+		db := migrationSchemaDB(t, migrationSchemaCurrent)
+		execBaseline(t, db, "PRAGMA ignore_check_constraints=ON; UPDATE observation_store SET incarnation='0123456789abcdef0123456789abcdef' || char(0) || printf('%1000000s', 'x')")
+		var singleton sql.NullInt64
+		var incarnation sql.NullString
+		var singletonType, incarnationType string
+		if err := db.QueryRowContext(t.Context(), migrationIncarnationQuery).Scan(
+			&singleton, &incarnation, &singletonType, &incarnationType); err != nil {
+			t.Fatal(err)
+		}
+		if incarnation.Valid {
+			t.Fatal("malformed incarnation was materialized by SQL projection")
+		}
+	})
 }
 
 func TestMigrationSchemaReadOnly(t *testing.T) {
