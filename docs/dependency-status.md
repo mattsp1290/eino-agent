@@ -319,3 +319,22 @@ pgx otherwise maps some already-canceled calls to `driver.ErrBadConn`, releasing
 a live session through the bridge before a later `Raw` cleanup can reach it.
 The cancellation guard is disarmed before returning a healthy connection to its
 host, and detached cleanup uses its own bounded guard.
+
+## SQLite schema reference
+
+Goose `v3.27.3` resolves modernc SQLite to `v1.54.0`; this dependency change
+was approved on 2026-09-08. The private SQLite verifier recognizes empty,
+exact Goose version-0 bootstrap, and complete version-1 databases. It compares
+`main.sqlite_schema`, including implicit indexes, with the reviewed fingerprints
+in `store/sqlite/schema_fingerprints.json`. Analysis statistics and sequence
+positions are excluded; history rows and store identity are checked separately.
+Inspection uses a deferred read transaction, including with a host's immediate
+transaction configuration, and preserves the borrowed connection and pool.
+The existing public SQLite lifecycle still uses its legacy initializer until
+the separate store cutover.
+
+After reviewing a baseline or catalog-query change, regenerate with
+`go test -run '^TestMigrationSchemaReference$' ./store/sqlite -args -update-sqlite-schema`.
+Run it twice and require no second diff, then run the normal SQLite tests.
+The fixture applies the pinned Goose history DDL and embedded baseline to fresh
+temporary databases. Ordinary tests compare the reference without updating it.
