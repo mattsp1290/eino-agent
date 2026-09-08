@@ -86,6 +86,8 @@ func testSchemaRejection(t *testing.T, server *testpostgres.Server) {
 		{"foreign_function", schemaEmpty, `CREATE FUNCTION public.foreign_app() RETURNS integer LANGUAGE sql AS 'SELECT 1'`},
 		{"foreign_type", schemaEmpty, `CREATE TYPE public.foreign_app AS ENUM('foreign')`},
 		{"foreign_sequence", schemaEmpty, `CREATE SEQUENCE public.foreign_app`},
+		{"external_inheriting_child", schemaCurrent, `CREATE SCHEMA foreign_app; CREATE TABLE foreign_app.child () INHERITS (public.sessions)`},
+		{"external_inherited_parent", schemaCurrent, `CREATE SCHEMA foreign_app; CREATE TABLE foreign_app.parent (); ALTER TABLE public.sessions INHERIT foreign_app.parent`},
 		{"baseline_without_history", schemaEmpty, schemaBaselineSQL},
 		{"history_without_row", schemaBootstrap, `DELETE FROM public.eino_agent_goose_version`},
 		{"malformed_history", schemaBootstrap, `ALTER TABLE public.eino_agent_goose_version ALTER COLUMN is_applied DROP NOT NULL`},
@@ -172,6 +174,31 @@ func testSchemaReadOnly(t *testing.T, server *testpostgres.Server) {
 	if _, err := inspectSchema(ctx, conn); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled verification: %v", err)
 	}
+	for _, test := range []struct{ name, setup, quoted string }{
+		{"quoted_identifiers", `SET quote_all_identifiers=on`, "on"},
+		{"temporary_type", `CREATE TEMP TABLE bytea(shadow integer)`, "off"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			db := server.Database(t).Open(t)
+			prepareSchema(t, db, schemaCurrent)
+			conn := schemaConn(t, db)
+			if _, err := conn.ExecContext(t.Context(), `SET search_path=public,pg_catalog; `+test.setup); err != nil {
+				t.Fatal(err)
+			}
+			if state, err := inspectSchema(t.Context(), conn); err != nil || state != schemaCurrent {
+				t.Fatalf("host deparser context: %d, %v", state, err)
+			}
+			for _, setting := range []struct{ query, want string }{
+				{`SHOW search_path`, "public, pg_catalog"},
+				{`SHOW quote_all_identifiers`, test.quoted},
+			} {
+				var got string
+				if err := conn.QueryRowContext(t.Context(), setting.query).Scan(&got); err != nil || got != setting.want {
+					t.Fatalf("host setting changed: %q, %v", got, err)
+				}
+			}
+		})
+	}
 }
 
 func prepareSchema(t *testing.T, db *sql.DB, state schemaState) {
@@ -215,7 +242,7 @@ func schemaCatalog(t *testing.T, db *sql.DB) map[string]string {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.ExecContext(t.Context(), `SET LOCAL search_path=pg_catalog`); err != nil {
+	if _, err := tx.ExecContext(t.Context(), schemaCatalogSettings); err != nil {
 		t.Fatal(err)
 	}
 	objects, err := readSchemaCatalog(t.Context(), tx)

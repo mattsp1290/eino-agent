@@ -288,7 +288,9 @@ is reproduced in the integration fixture until the migration entry point lands.
 Catalog OIDs, owners, ACLs, sequence positions and application data are excluded.
 History rows and the store incarnation are validated separately. Catalog reads
 use a read-only transaction with a [local search path](https://www.postgresql.org/docs/17/sql-set.html),
-preserving host settings.
+preserving host settings. The local path puts `pg_catalog` ahead of `pg_temp`,
+and identifier quoting is normalized only within that transaction. Inheritance
+edges involving store tables are rejected even when the other table is outside public.
 
 After reviewing a deliberate baseline or catalog-query change, regenerate with
 `go test -tags=postgres_integration -run '^TestPostgresSchemaVerification/reference$' ./store/postgres -args -update-postgres-schema`.

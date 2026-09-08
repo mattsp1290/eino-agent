@@ -29,6 +29,9 @@ const (
 //go:embed schema_fingerprints.json
 var schemaFingerprints []byte
 
+const schemaCatalogSettings = `SET LOCAL search_path = pg_catalog, pg_temp;
+SET LOCAL quote_all_identifiers = off`
+
 // inspectSchema uses the caller's pinned connection so a later migration locker
 // can retain its session lock across verification and migration dispatch.
 func inspectSchema(ctx context.Context, conn *sql.Conn) (state schemaState, err error) {
@@ -44,9 +47,9 @@ func inspectSchema(ctx context.Context, conn *sql.Conn) (state schemaState, err 
 			err = errors.Join(err, rollbackErr)
 		}
 	}()
-	// Catalog deparsers otherwise vary with the host's search_path. SET LOCAL is
-	// confined to this read-only transaction and cannot reconfigure the pool.
-	if _, err = tx.ExecContext(ctx, `SET LOCAL search_path = pg_catalog`); err != nil {
+	// Deparsers otherwise vary with host quoting and temporary type visibility.
+	// SET LOCAL is confined to this transaction and cannot reconfigure the pool.
+	if _, err = tx.ExecContext(ctx, schemaCatalogSettings); err != nil {
 		return 0, err
 	}
 	objects, err := readSchemaCatalog(ctx, tx)

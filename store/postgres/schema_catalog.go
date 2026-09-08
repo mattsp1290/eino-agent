@@ -31,6 +31,15 @@ FROM pg_catalog.pg_class AS c
 JOIN pg_catalog.pg_namespace AS n ON n.oid=c.relnamespace
 WHERE n.nspname='public' AND c.relkind NOT IN ('i','I','S')
 ORDER BY c.relname`,
+		`SELECT 'inheritance:' || cn.nspname || '.' || c.relname || ':' || pn.nspname || '.' || p.relname,
+ json_build_object('sequence',i.inhseqno,'detachPending',i.inhdetachpending)::text
+FROM pg_catalog.pg_inherits AS i
+JOIN pg_catalog.pg_class AS c ON c.oid=i.inhrelid
+JOIN pg_catalog.pg_namespace AS cn ON cn.oid=c.relnamespace
+JOIN pg_catalog.pg_class AS p ON p.oid=i.inhparent
+JOIN pg_catalog.pg_namespace AS pn ON pn.oid=p.relnamespace
+WHERE cn.nspname='public' OR pn.nspname='public'
+ORDER BY cn.nspname,c.relname,pn.nspname,p.relname`,
 		`SELECT 'column:public.' || c.relname || '.' || a.attname,
  json_build_object('attnum',a.attnum,'name',a.attname,
    'type',pg_catalog.format_type(a.atttypid,a.atttypmod),'typmod',a.atttypmod,
