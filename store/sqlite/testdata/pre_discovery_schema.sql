@@ -5,12 +5,8 @@ CREATE TABLE observation_revisions (session_id TEXT PRIMARY KEY, revision INTEGE
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   record BLOB NOT NULL,
-  workspace_id TEXT NOT NULL,
-  title TEXT NOT NULL,
-  created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
-CREATE INDEX sessions_workspace_created_idx ON sessions(workspace_id COLLATE BINARY, created_at COLLATE BINARY, id COLLATE BINARY);
 
 CREATE TABLE IF NOT EXISTS runs (
   id TEXT PRIMARY KEY,

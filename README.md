@@ -151,3 +151,13 @@ existing events route now emits current AG-UI message/state snapshots. These
 APIs are candidate-checkout functionality, not part of the published v0.3.3 pin.
 Old development databases require explicit recreation for the new schema;
 opening an old schema fails without deleting or migrating it.
+
+## Workspace session discovery
+
+`session.SessionDiscoveryReader` lists bounded durable summaries for one explicit
+workspace, including empty and completed conversations. Built-in SQLite provides
+indexed creation-time/ID pagination; hosts authorize each workspace and selected
+conversation. See the [consumer flow](docs/consumer-guide.md#workspace-conversation-discovery)
+and [storage contract](docs/architecture/storage.md#workspace-session-discovery)
+for bounds, concurrency, errors and the intentionally incompatible SQLite schema.
+Safe durable renaming remains a separate capability request.
