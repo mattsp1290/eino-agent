@@ -295,3 +295,105 @@ reset or legacy cursor conversion. Existing development stores fail schema
 verification and must be explicitly recreated by their owner. Never delete a
 database automatically. A binary rollback requires its matching database
 schema. Schema verification checks every table, index and trigger definition.
+
+## Workspace session discovery
+
+`session.SessionDiscoveryReader` is a separate optional capability with
+`ListSessions(ctx, session.SessionDiscoveryQuery) (session.SessionDiscoveryPage, error)`.
+It enumerates durable conversation metadata, including empty, pending, running
+and completed conversations. It performs no admission, recovery, claims, lease
+renewal, event publication or provider calls. Store and ExecutionStore method
+sets are unchanged.
+
+| Backend | Discovery support |
+| --- | --- |
+| Built-in `store/sqlite.Store` | Supported through a root store reader |
+| Other `session.Store` implementations | Must explicitly implement `SessionDiscoveryReader` and pass `storetest.RunDiscovery(t, factory)` |
+
+`storetest.RunDiscovery` is opt-in and separate from `storetest.Run`. Test doubles
+are not supported production backends. Hosts report unavailable discovery when
+the capability is absent; there is no private scan fallback.
+
+The workspace is an exact selector, **not authorization**. Authorize it on every
+page and separately authorize subsequent known-ID history/runtime access.
+WorkspaceID is nonempty valid UTF-8, at most 1024 bytes. No trimming, case folding,
+path normalization or wildcard interpretation occurs. Unknown valid workspaces
+return an empty page. An empty stored workspace is allowed but cannot be listed.
+
+Limit zero defaults to 50; 1–100 is accepted, other values fail without clamping.
+Cursor is empty initially and otherwise at most 8192 bytes. Each detached summary
+contains exactly `id`, `workspace_id`, `title`, `created_at`, `updated_at` as JSON
+keys. ID and workspace are at most 1024 UTF-8 bytes each; title at most 16384.
+Titles may be empty and are intentionally visible stored text. Host escaping is
+required. Metadata, directories, parent IDs, transcripts, tool data, model
+requests, provider state and claims are excluded.
+
+Order is CreatedAt descending then ID descending using bytewise UTF-8 comparison
+(SQLite BINARY). UpdatedAt is stored metadata time, not last-message activity;
+ordinary runtime messages currently do not advance it. Times return in UTC with
+nanosecond precision. Zero time is encoded as an empty key and sorts last, even
+behind nonzero year 0000. Nonzero UTC years must lie within 0000–9999. No UnixNano
+conversion limits this range.
+
+NextCursor is nonempty only when a lookahead row exists and identifies the last
+returned tuple. Full final pages, short final pages and empty pages have an empty
+cursor. An empty cursor restarts listing; Limit may change between pages. SQLite
+cursors bind version 1, durable database incarnation, exact workspace and creation
+key/ID. Canonical JSON wrapped in raw URL-safe base64 uses inner base64 for
+identity fields to bound expansion. Malformed, oversized, noncanonical,
+unknown-version, duplicate/unknown/missing-field, cross-workspace and cross-store
+cursors fail. Cursors survive closing/reopening the same database; recreation
+invalidates them. They are unsigned pagination state, neither secrets nor
+tamper-proof credentials. Well-formed changed tuples select another range only
+inside the independently authorized workspace; the anchor need not still exist.
+
+Each call reads one committed view and releases its transaction and connection
+before returning. No pagination snapshot or server-side cursor persists. For
+unchanged workspace/creation/ID keys, returned records never repeat. Concurrent
+inserts ahead require refresh; backdated inserts behind may appear later.
+Title-only updates do not reorder rows; unread titles reflect their page's view,
+while returned titles may be stale until refresh. Trusted UpdateSession can
+change workspace or creation keys; concurrent traversal may then miss/repeat
+records and must restart. This capability adds no move or rename workflow.
+
+Context errors take priority at method entry, followed by query validation and
+store work. Cancellation during a failed database operation prefers `ctx.Err()`.
+Every error returns the zero page and a content-free class supporting errors.Is:
+
+| Error | Meaning |
+| --- | --- |
+| `ErrDiscoveryQuery` | Invalid workspace or limit |
+| `ErrDiscoveryCursor` | Invalid, excessive or mismatched cursor |
+| `ErrDiscoveryTooLarge` | Included identity/title exceeds its ceiling; no truncation or partial page |
+| `ErrDiscoveryInvalid` | Invalid durable UTF-8, identity, timestamp or incarnation projection |
+| `ErrDiscoveryReader` | Nil or transaction-scoped reader |
+| `ErrDiscoveryStore` | Closed store or other database failure |
+| `context.Canceled`, `context.DeadlineExceeded` | Context cancellation or deadline |
+
+Never invoke discovery on a WithinTx child or call the root reader while holding
+that same store's sole connection in a transaction. These reads do not expose
+uncommitted changes. The next page's lookahead title is not validated, so an
+oversized next title does not prevent the current page from completing.
+
+SQLite stores workspace_id, title and created_at beside id/updated_at and the
+owning session JSON, maintaining them in the same CreateSession/UpdateSession
+statement. Both writers reject invalid summary UTF-8 and unrepresentable UTC
+years with content-free `session.ErrConflict`; they permit empty and oversized
+stored strings. They do not invent timestamps. Existing observation triggers
+remain atomic with those writes. No discovery read decodes session JSON.
+
+`sessions_workspace_created_idx(workspace_id COLLATE BINARY, created_at COLLATE
+BINARY, id COLLATE BINARY)` serves two query variants: first-page workspace seek
+and continuation workspace plus `(created_at, id) < (?, ?)` seek. SQL byte guards
+bound each selected scalar before driver materialization. At most Limit+1 index
+entries are read, with no offsets, counts, per-session lookups or sorting of the
+whole catalog. Cost includes index depth and SQLite's internal scalar page access;
+it is not constant time independent of store size.
+
+The schema deliberately changes incompatibly. Open rejects the complete previous
+schema without changing its data or structure; there is no migration, dual reader
+or feature flag. Before switching binaries, preserve any desired development
+database and explicitly select a separate/recreated current-schema database.
+Never delete databases automatically. Rollback requires the old binary and its
+matching preserved database; the old binary cannot open this new schema. Cursor
+versions and incarnations are not translated.

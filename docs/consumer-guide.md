@@ -24,6 +24,19 @@ module `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, whose repository
 tag is `wasmext/gen/v0.1.0`. Consumers must not add a workaround for that
 internal dependency.
 
+For workspace discovery and session watch, use the newer verified commit
+`034b315a517520d18010c0bd9429ef404a2df73d` (module version
+`v0.3.4-0.20260908144805-034b315a5175`):
+
+```sh
+go get github.com/mattsp1290/eino-agent@034b315a517520d18010c0bd9429ef404a2df73d
+```
+
+This pin passed `make check` and the fresh published-mode discovery/reopen,
+watch and delegated-search fixtures on 2026-09-08. Its SQLite schema is
+incompatible with earlier databases; see the
+[discovery contract](architecture/storage.md#workspace-session-discovery).
+
 ## Package Surface
 
 | Package | Use it for | You still provide |
@@ -604,7 +617,9 @@ and allowlist only non-secret option keys. See the
 
 ## Session state observation
 
-This is an unreleased checkout API; the published pin above does not include it.
+Session observation is included in the verified
+`v0.3.4-0.20260908144805-034b315a5175` pin described under Installation;
+it is not included in the earlier `v0.3.3` release.
 Construct one observation service for the store and share it with all observed
 orchestrators in this process:
 
@@ -701,7 +716,73 @@ be called again after a timeout. StreamingOrchestrator has no public Close.
 The external-consumer fixture exercises SQLite, mounted native tools, real
 scripted streaming, blocked sinks, detach, overflow recovery, interruption,
 strict fenced tool resume, reopen and cleanup without credentials. The local
-gate proves the candidate checkout with independently resolved dependencies;
-a release and published-pin verification remain separate authorized actions.
+gate checks the current checkout with independently resolved dependencies.
+The verified discovery/watch pin also passed the published-mode fixture;
+see [publication evidence](dependency-status.md#workspace-discovery-publication).
 `make windows-compile` checks pure-Go session/watch and tools/einotools;
 transitive Wasm dependencies still limit the broader runtime platform surface.
+
+## Workspace conversation discovery
+
+Allocate conversation IDs independently of workspace IDs. Built-in SQLite
+implements the optional `session.SessionDiscoveryReader`; another Store must
+opt in explicitly. If unavailable, return a host-level unavailable-discovery
+error rather than querying backend internals. SQLite and the reusable
+`storetest.RunDiscovery` contract cover empty and completed conversations.
+
+After authorizing the workspace, the public create/list/select flow is:
+
+```go
+// st is a session.Store. Allocate a new conversation ID in host code.
+now := time.Now().UTC()
+_, err := st.CreateSession(ctx, session.Session{
+    ID: conversationID, WorkspaceID: authorizedWorkspace,
+    Title: string(conversationID), CreatedAt: now, UpdatedAt: now,
+})
+if err != nil { return err }
+reader, ok := st.(session.SessionDiscoveryReader)
+if !ok { return errors.New("session discovery unavailable") }
+page, err := reader.ListSessions(ctx, session.SessionDiscoveryQuery{
+    WorkspaceID: authorizedWorkspace, Limit: 50,
+})
+if err != nil { return err }
+// Show page.Sessions; select and authorize one returned ID for history/Start.
+// For another page, supply the same workspace and page.NextCursor.
+// Stop when NextCursor is empty. An empty cursor starts a refresh.
+```
+
+Continue the chosen ID with the existing `orchestrator.Start` flow, supplying
+matching `Config.Metadata["workspace_id"]`. To pre-create sessions compatible
+with current runtime admission, initially use Title=ID, empty ParentID and
+Directory, nil session/request Metadata, and omit `workspace_root`. Reopening
+the same database and rediscovering either ID preserves independent histories.
+The executable public journey is
+`testdata/external-consumer/session_discovery_fixture_test.go`.
+
+Discovery reads the current stored title, including empty or edited titles. Safe
+arbitrary title mutation and admission after renaming remain the separate request
+at `~/.agents/projects/eino-agent/requests/2026-09-08-durable-conversation-renaming.md`.
+This feature does not resolve that request or the full TUI milestone.
+
+Workspace selectors are exact UTF-8 strings (1–1024 bytes), with no wildcard or
+normalization. They carry no authorization. Hosts authorize every page and every
+selected conversation. Limit defaults to 50, maximum 100; cursors are bounded to
+8192 bytes and bind database/workspace. Summaries expose only ID, workspace,
+current title and creation/update timestamps. ID/workspace have 1024-byte ceilings,
+title 16384; an oversized included record fails the entire page. Titles can contain
+user text requiring host sanitization.
+
+Ordering is creation time descending, then bytewise ID descending, with zero
+times last. UpdatedAt is metadata time, not message activity. Refresh to see new
+rows ahead of the cursor or changed titles already displayed. Inserts behind may
+appear later; changing workspace/creation keys during traversal requires restart.
+Each page is a committed view with no retained snapshot. List outside store
+transactions and handle context cancellation and the stable `ErrDiscovery*`
+classes described in the [storage contract](architecture/storage.md#workspace-session-discovery).
+
+Hosts own canonicalization, authorization, numbering, excerpts, title fallback,
+selection/preferences, launch and active-turn switching policy. SQLite's new
+projection schema intentionally rejects older databases without modification.
+Preserve desired data and explicitly choose a current-schema database before
+switching; rollback pairs the prior binary with its prior database. There is no
+automatic deletion or migration.

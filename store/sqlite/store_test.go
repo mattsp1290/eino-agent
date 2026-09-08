@@ -35,6 +35,7 @@ func TestStoreContract(t *testing.T) {
 	}
 
 	storetest.Run(t, factory)
+	storetest.RunDiscovery(t, factory)
 }
 
 func sqliteToolEvent(id session.EventID, at time.Time) session.ToolTransitionEvent {
@@ -784,8 +785,8 @@ func TestOpenRejectsExactDDLDrift(t *testing.T) {
 		"check constraint":  {"updated_at TEXT NOT NULL", "updated_at TEXT NOT NULL CHECK (updated_at <> '')"},
 		"collation":         {"id TEXT PRIMARY KEY", "id TEXT COLLATE NOCASE PRIMARY KEY"},
 		"generated column":  {"updated_at TEXT NOT NULL\n);", "updated_at TEXT NOT NULL,\n  normalized_id TEXT GENERATED ALWAYS AS (lower(id)) VIRTUAL\n);"},
-		"strict table":      {");\n\nCREATE TABLE IF NOT EXISTS runs", ") STRICT;\n\nCREATE TABLE IF NOT EXISTS runs"},
-		"without rowid":     {");\n\nCREATE TABLE IF NOT EXISTS runs", ") WITHOUT ROWID;\n\nCREATE TABLE IF NOT EXISTS runs"},
+		"strict table":      {");\nCREATE INDEX sessions_workspace_created_idx", ") STRICT;\nCREATE INDEX sessions_workspace_created_idx"},
+		"without rowid":     {");\nCREATE INDEX sessions_workspace_created_idx", ") WITHOUT ROWID;\nCREATE INDEX sessions_workspace_created_idx"},
 		"deferrable key":    {"FOREIGN KEY(session_id) REFERENCES sessions(id)", "FOREIGN KEY(session_id) REFERENCES sessions(id) DEFERRABLE INITIALLY DEFERRED"},
 	}
 	for name, replacement := range tests {
