@@ -85,69 +85,43 @@ func testReplayEventsModels(t *testing.T, server *testpostgres.Server) {
 	f := newReplayFixture(t, server)
 	run := f.seed(t, "replay-session", "replay-run")
 	base := f.now.Truncate(time.Second)
-	eventItems := []replayItem{{id: "event-z\x00", at: base.Add(2 * time.Nanosecond)}, {id: "event-é", at: base.Add(2 * time.Nanosecond)}, {id: "event-a\x00", at: base.Add(2 * time.Nanosecond)}, {id: "event-\x00", at: base.Add(2 * time.Nanosecond)}, {id: "event-adjacent", at: base.Add(time.Nanosecond)}}
-	modelItems := []replayItem{{id: "model-z\x00", at: base.Add(2 * time.Nanosecond)}, {id: "model-é", at: base.Add(2 * time.Nanosecond)}, {id: "model-a\x00", at: base.Add(2 * time.Nanosecond)}, {id: "model-\x00", at: base.Add(2 * time.Nanosecond)}, {id: "model-adjacent", at: base.Add(time.Nanosecond)}}
+	items := []replayItem{{id: "z\x00", at: base.Add(2 * time.Nanosecond)}, {id: "é", at: base.Add(2 * time.Nanosecond)}, {id: "a\x00", at: base.Add(2 * time.Nanosecond)}, {id: "\x00", at: base.Add(2 * time.Nanosecond)}, {id: "adjacent", at: base.Add(time.Nanosecond)}}
 	wantEvents := []session.EventID{"event-adjacent", "event-\x00", "event-a\x00", "event-z\x00", "event-é"}
 	wantModels := []session.ModelRequestID{"model-adjacent", "model-\x00", "model-a\x00", "model-z\x00", "model-é"}
 	execution := f.store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-	for _, index := range []int{3, 0, 4, 2, 1} {
-		item := eventItems[index]
-		if _, err := execution.AppendEvent(f.ctx, session.EventRecord{ID: session.EventID(item.id), SessionID: run.SessionID, RunID: run.ID, Kind: "replay_order", Payload: json.RawMessage(`{"ok":true}`), CreatedAt: item.at}); err != nil {
+	for index, order := range []int{3, 0, 4, 2, 1} {
+		item := items[order]
+		if _, err := execution.AppendEvent(f.ctx, session.EventRecord{ID: session.EventID("event-" + item.id), SessionID: run.SessionID, RunID: run.ID, Kind: "replay_order", Payload: json.RawMessage(`{"ok":true}`), CreatedAt: item.at}); err != nil {
 			t.Fatalf("append replay event: %v", err)
 		}
-	}
-	for index, order := range []int{3, 0, 4, 2, 1} {
-		item := modelItems[order]
-		record := session.ModelRequestRecord{ID: session.ModelRequestID(item.id), SessionID: run.SessionID, RunID: run.ID, AssistantMessageID: session.MessageID("assistant-" + item.id), Attempt: index, State: session.ModelRequestPrepared, Messages: json.RawMessage(`{"messages":[]}`), CreatedAt: item.at, UpdatedAt: item.at}
+		record := session.ModelRequestRecord{ID: session.ModelRequestID("model-" + item.id), SessionID: run.SessionID, RunID: run.ID, AssistantMessageID: session.MessageID("assistant-" + item.id), Attempt: index, State: session.ModelRequestPrepared, Messages: json.RawMessage(`{"messages":[]}`), CreatedAt: item.at, UpdatedAt: item.at}
 		if _, err := execution.CreateModelRequest(f.ctx, record); err != nil {
 			t.Fatalf("append replay model request: %v", err)
 		}
 	}
-	firstEvent, err := f.store.ListEvents(f.ctx, run.SessionID, session.EventCursor{Limit: 2})
-	if err != nil {
-		t.Fatalf("first replay event page: %v", err)
+	eventCursor := session.EventCursor{}
+	modelCursor := session.ModelRequestCursor{}
+	for pageIndex, page := range []struct{ limit, start, end int }{{2, 0, 2}, {1, 2, 3}, {0, 3, 5}} {
+		if pageIndex == 1 {
+			f.reopen(t)
+		}
+		eventCursor.Limit = page.limit
+		eventPage, err := f.store.ListEvents(f.ctx, run.SessionID, eventCursor)
+		if err != nil {
+			t.Fatalf("replay event page %d: %v", pageIndex, err)
+		}
+		assertReplayEventPage(t, eventPage, wantEvents[page.start:page.end])
+		eventCursor = eventPage.Next
+		modelCursor.Limit = page.limit
+		modelPage, err := f.store.ListModelRequests(f.ctx, run.ID, modelCursor)
+		if err != nil {
+			t.Fatalf("replay model page %d: %v", pageIndex, err)
+		}
+		assertReplayModelPage(t, modelPage, wantModels[page.start:page.end])
+		modelCursor = modelPage.Next
 	}
-	assertReplayEventPage(t, firstEvent, wantEvents[:2])
-	f.reopen(t)
-	eventCursor := firstEvent.Next
-	eventCursor.Limit = 1
-	secondEvent, err := f.store.ListEvents(f.ctx, run.SessionID, eventCursor)
-	if err != nil {
-		t.Fatalf("second replay event page after reopen: %v", err)
-	}
-	assertReplayEventPage(t, secondEvent, wantEvents[2:3])
-	eventCursor = secondEvent.Next
-	eventCursor.Limit = 0
-	thirdEvent, err := f.store.ListEvents(f.ctx, run.SessionID, eventCursor)
-	if err != nil {
-		t.Fatalf("final replay event page: %v", err)
-	}
-	assertReplayEventPage(t, thirdEvent, wantEvents[3:])
-	if thirdEvent.Next != (session.EventCursor{}) {
-		t.Fatal("final replay event page returned a nonzero cursor")
-	}
-	firstModel, err := f.store.ListModelRequests(f.ctx, run.ID, session.ModelRequestCursor{Limit: 2})
-	if err != nil {
-		t.Fatalf("first replay model page: %v", err)
-	}
-	assertReplayModelPage(t, firstModel, wantModels[:2])
-	f.reopen(t)
-	modelCursor := firstModel.Next
-	modelCursor.Limit = 1
-	secondModel, err := f.store.ListModelRequests(f.ctx, run.ID, modelCursor)
-	if err != nil {
-		t.Fatalf("second replay model page after reopen: %v", err)
-	}
-	assertReplayModelPage(t, secondModel, wantModels[2:3])
-	modelCursor = secondModel.Next
-	modelCursor.Limit = 0
-	thirdModel, err := f.store.ListModelRequests(f.ctx, run.ID, modelCursor)
-	if err != nil {
-		t.Fatalf("final replay model page: %v", err)
-	}
-	assertReplayModelPage(t, thirdModel, wantModels[3:])
-	if thirdModel.Next != (session.ModelRequestCursor{}) {
-		t.Fatal("final replay model page returned a nonzero cursor")
+	if eventCursor != (session.EventCursor{}) || modelCursor != (session.ModelRequestCursor{}) {
+		t.Fatal("final replay pages returned nonzero cursors")
 	}
 	other := f.seed(t, "other-session", "other-run")
 	if _, err := f.store.ListEvents(f.ctx, other.SessionID, session.EventCursor{AfterEventID: wantEvents[0], Limit: 1}); !errors.Is(err, session.ErrConflict) {

@@ -140,7 +140,8 @@ func testReplayProviderItemBound(t *testing.T, server *testpostgres.Server) {
 }
 
 func testReplayProviderByteBound(t *testing.T, server *testpostgres.Server) {
-	f := newReplayFixture(t, server)
+	// Encoding and persisting three large envelopes is slower under the race detector.
+	f := newReplayFixtureWithTimeout(t, server, 90*time.Second)
 	sessionID := session.ID("bytes-session")
 	run := f.seed(t, sessionID, "bytes-run")
 	execution, message := replayMessageGraph(t, f, run, "bytes-message")

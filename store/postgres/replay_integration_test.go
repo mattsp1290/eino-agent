@@ -32,9 +32,14 @@ type replayFixture struct {
 
 func newReplayFixture(t *testing.T, server *testpostgres.Server) *replayFixture {
 	t.Helper()
+	return newReplayFixtureWithTimeout(t, server, 30*time.Second)
+}
+
+func newReplayFixtureWithTimeout(t *testing.T, server *testpostgres.Server, timeout time.Duration) *replayFixture {
+	t.Helper()
 	database := server.Database(t)
 	db, store := migratePostgresDatabase(t, database)
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), timeout)
 	t.Cleanup(cancel)
 	return &replayFixture{ctx: ctx, database: database, db: db, store: store, now: time.Now().UTC()}
 }
