@@ -30,7 +30,6 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/store/sqlite"
 	"github.com/mattsp1290/eino-agent/tools"
 )
 
@@ -110,11 +109,11 @@ func testDelegatedSearchExecution(t *testing.T) {
 	}
 	frozen.Release()
 
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "consumer.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "consumer.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 
 	modelFixture := &delegatedSearchModel{callID: "delegated-success-call"}
 	policy := &recordingDelegatedPolicy{}
@@ -345,11 +344,11 @@ func testDelegatedSearchCancellation(t *testing.T) {
 	})
 	registry, mount := mountDelegatedSearchFixture(t, delegatedComponent("artifact-cancel", "config-cancel"), searcher)
 	defer closeDelegatedMount(t, mount)
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "cancel.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "cancel.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	modelFixture := &delegatedSearchModel{callID: "delegated-cancel-call"}
 	orchestrator := newDelegatedOrchestrator(t, store, registry, modelFixture, permissions.StaticPolicy{}, nil)
 	runCtx, cancel := context.WithCancel(ctx)
@@ -389,11 +388,11 @@ func testDelegatedSearchPermissionContainment(t *testing.T) {
 			})
 			registry, mount := mountDelegatedSearchFixture(t, delegatedComponent("artifact-permission-"+string(action), "config-permission-"+string(action)), searcher)
 			defer closeDelegatedMount(t, mount)
-			store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "permission.db"))
+			store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "permission.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = store.Close() }()
+			defer func() { _ = storePool.Close() }()
 			policy := &recordingDelegatedPolicy{action: action}
 			callID := session.ToolCallID("delegated-permission-" + string(action))
 			orchestrator := newDelegatedOrchestrator(t, store, registry, &delegatedSearchModel{callID: string(callID)}, policy, nil)
@@ -433,11 +432,11 @@ func testDelegatedSearchFailureRedaction(t *testing.T) {
 	})
 	registry, mount := mountDelegatedSearchFixture(t, delegatedComponent("artifact-failure", "config-failure"), searcher)
 	defer closeDelegatedMount(t, mount)
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "failure.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "failure.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	events := &recordingDelegatedEvents{}
 	modelFixture := &delegatedSearchModel{callID: "delegated-failure-call"}
 	orchestrator := newDelegatedOrchestrator(t, store, registry, modelFixture, permissions.StaticPolicy{}, events)
@@ -556,11 +555,11 @@ func testDelegatedSearchPlanIdentity(t *testing.T) {
 func assertDelegatedOrchestratorResumeRejectsDrift(t *testing.T, persisted session.ExtensionPlanDescriptor, searcher delegatedSearchFixture) {
 	t.Helper()
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "resume-drift.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "resume-drift.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	now := time.Now().UTC()
 	if _, err := store.CreateSession(ctx, session.Session{ID: "identity-session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)

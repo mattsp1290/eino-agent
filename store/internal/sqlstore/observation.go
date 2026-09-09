@@ -1,4 +1,4 @@
-package sqlite
+package sqlstore
 
 import (
 	"context"
@@ -25,18 +25,21 @@ func observationError(err error) error {
 }
 
 func (s *Store) observationTx(ctx context.Context, id session.ID, fn func(*Store) error) error {
-	if s == nil || s.tx != nil || s.db == nil || id == "" {
+	if s == nil || s.tx != nil || s.db == nil || s.pool == nil || id == "" {
 		return session.ErrObservationReader
 	}
-	return observationError(s.WithinTx(ctx, func(ctx context.Context, st session.Store) error {
-		return fn(st.(*Store))
-	}))
+	return observationError(s.read(ctx, fn))
 }
 
 func (s *Store) revision(ctx context.Context, id session.ID) (session.ObservationWatermark, bool, error) {
 	w := session.ObservationWatermark{SessionID: id}
 	var exists bool
-	err := s.queryRow(ctx, `SELECT incarnation, COALESCE((SELECT revision FROM observation_revisions WHERE session_id = ?), 0), EXISTS(SELECT 1 FROM sessions WHERE id = ?) FROM observation_store WHERE singleton = 1`, id, id).Scan(&w.StoreID, &w.Revision, &exists)
+	var incarnation sql.NullString
+	err := s.queryRow(ctx, "SELECT "+s.boundedColumn("incarnation")+", COALESCE((SELECT revision FROM observation_revisions WHERE session_id = ?), 0), EXISTS(SELECT 1 FROM sessions WHERE id = ?) FROM observation_store WHERE singleton = 1", 32, []byte(id), []byte(id)).Scan(&incarnation, &w.Revision, &exists)
+	if err == nil && (!incarnation.Valid || !ValidDiscoveryIncarnation(incarnation.String)) {
+		err = session.ErrObservationInvalid
+	}
+	w.StoreID = incarnation.String
 	if err == nil && (!exists && w.Revision != 0 || exists && w.Revision <= 0) {
 		err = session.ErrObservationInvalid
 	}
@@ -52,6 +55,8 @@ func (s *Store) ReadObservationSnapshot(ctx context.Context, id session.ID, limi
 	}
 	var result session.ObservationSnapshot
 	err := s.observationTx(ctx, id, func(tx *Store) error {
+		// BUSY retries restart the complete snapshot on a fresh read view.
+		result = session.ObservationSnapshot{}
 		var err error
 		result.Watermark, result.Exists, err = tx.revision(ctx, id)
 		if err != nil {
@@ -87,11 +92,11 @@ func (b *observationBudget) record(n int) error {
 
 // Bound each selected scalar at SQL's boundary before the driver materializes
 // it. Record JSON (including private metadata) is never selected.
-func boundedColumn(column string) string {
-	return "CASE WHEN length(CAST(" + column + " AS BLOB)) <= ? THEN " + column + " ELSE NULL END"
+func (s *Store) boundedColumn(column string) string {
+	return "CASE WHEN " + s.dialect.ByteLength(column) + " <= ? THEN " + column + " ELSE NULL END"
 }
 func (s *Store) observationMessages(ctx context.Context, out *session.ObservationSnapshot, l session.ObservationLimits, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+boundedColumn("id")+", "+boundedColumn("run_id")+", role, finalized FROM messages INDEXED BY messages_observation_idx WHERE session_id = ? AND role IN ('user', 'assistant') ORDER BY created_at DESC, id DESC LIMIT ?", b.bytes/6, b.bytes/6, out.Watermark.SessionID, l.MaxMessages+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("m.id")+", "+s.boundedColumn("r.id")+", m.role, m.finalized, COALESCE(r.session_key = m.session_key, FALSE) FROM messages AS m"+s.dialect.IndexHint("messages_observation_idx")+" LEFT JOIN runs AS r ON r.row_key = m.run_key WHERE m.session_key = (SELECT row_key FROM sessions WHERE id = ?) AND m.role IN ('user', 'assistant') ORDER BY m.created_at DESC, m.id DESC LIMIT ?", b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), l.MaxMessages+1)
 	if err != nil {
 		return err
 	}
@@ -102,7 +107,12 @@ func (s *Store) observationMessages(ctx context.Context, out *session.Observatio
 		}
 		var id, run sql.NullString
 		var m session.ObservationMessage
-		if err = rows.Scan(&id, &run, &m.Role, &m.Finalized); err != nil {
+		var owner bool
+		if err = rows.Scan(&id, &run, &m.Role, &m.Finalized, &owner); err != nil {
+			break
+		}
+		if !owner {
+			err = session.ErrObservationInvalid
 			break
 		}
 		if !id.Valid || !run.Valid {
@@ -135,7 +145,7 @@ func (s *Store) observationMessages(ctx context.Context, out *session.Observatio
 	return nil
 }
 func (s *Store) observationParts(ctx context.Context, id session.ID, m *session.ObservationMessage, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+boundedColumn("display_text")+", text_valid, run_id = ? FROM parts INDEXED BY parts_observation_idx WHERE session_id = ? AND message_id = ? AND kind = 'text' ORDER BY ordinal,id LIMIT ?", min(b.text, b.bytes/6), m.RunID, id, m.ID, b.parts+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("display_text")+", text_valid, COALESCE(run_key = (SELECT row_key FROM runs WHERE id = ?), FALSE) FROM parts"+s.dialect.IndexHint("parts_observation_idx")+" WHERE session_key = (SELECT row_key FROM sessions WHERE id = ?) AND message_key = (SELECT row_key FROM messages WHERE id = ?) AND kind = 'text' ORDER BY ordinal,id LIMIT ?", min(b.text, b.bytes/6), []byte(m.RunID), []byte(id), []byte(m.ID), b.parts+1)
 	if err != nil {
 		return err
 	}
@@ -175,7 +185,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		ids[m.RunID] = true
 	}
 	var active sql.NullString
-	if err := s.queryRow(ctx, "SELECT "+boundedColumn("id")+" FROM runs WHERE session_id = ? AND status IN ('pending','running') LIMIT 1", b.bytes/6, out.Watermark.SessionID).Scan(&active); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.queryRow(ctx, "SELECT "+s.boundedColumn("id")+" FROM runs WHERE session_key = (SELECT row_key FROM sessions WHERE id = ?) AND status IN ('pending','running') LIMIT 1", b.bytes/6, []byte(out.Watermark.SessionID)).Scan(&active); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	} else if err == nil {
 		if !active.Valid {
@@ -192,7 +202,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		r := session.ObservationRun{ID: id}
 		var provider, model, status sql.NullString
 		var lease int64
-		err := s.queryRow(ctx, "SELECT "+boundedColumn("status")+", "+boundedColumn("provider_id")+", "+boundedColumn("model_id")+", lease_until FROM runs WHERE id = ? AND session_id = ?", b.bytes/6, b.bytes/6, b.bytes/6, id, out.Watermark.SessionID).Scan(&status, &provider, &model, &lease)
+		err := s.queryRow(ctx, "SELECT "+s.boundedColumn("status")+", "+s.boundedColumn("provider_id")+", "+s.boundedColumn("model_id")+", lease_until FROM runs WHERE id = ? AND session_key = (SELECT row_key FROM sessions WHERE id = ?)", b.bytes/6, b.bytes/6, b.bytes/6, []byte(id), []byte(out.Watermark.SessionID)).Scan(&status, &provider, &model, &lease)
 		if errors.Is(err, sql.ErrNoRows) {
 			return session.ErrObservationInvalid
 		}
@@ -211,7 +221,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		if !r.Terminal() {
 			r.LeaseUntil = time.UnixMicro(lease).UTC()
 		}
-		if !observationStringsValid(string(id), r.ProviderID, r.ModelID) {
+		if id == "" || !observationStringsValid(string(id), r.ProviderID, r.ModelID) {
 			return session.ErrObservationInvalid
 		}
 		if err = b.record(len(id) + len(r.ProviderID) + len(r.ModelID) + len(r.Status)); err != nil {
@@ -226,7 +236,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 	return nil
 }
 func (s *Store) observationTools(ctx context.Context, out *session.ObservationSnapshot, id session.RunID, l session.ObservationLimits, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+boundedColumn("id")+", "+boundedColumn("message_id")+", "+boundedColumn("name")+", "+boundedColumn("status")+" FROM tool_calls INDEXED BY tools_observation_idx WHERE session_id = ? AND run_id = ? ORDER BY id LIMIT ?", b.bytes/6, b.bytes/6, b.bytes/6, b.bytes/6, out.Watermark.SessionID, id, l.MaxTools-len(out.Tools)+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("t.id")+", "+s.boundedColumn("m.id")+", "+s.boundedColumn("t.name")+", "+s.boundedColumn("t.status")+", COALESCE(m.session_key = t.session_key AND m.run_key = t.run_key, FALSE) FROM tool_calls AS t"+s.dialect.IndexHint("tools_observation_idx")+" LEFT JOIN messages AS m ON m.row_key = t.request_message_key WHERE t.session_key = (SELECT row_key FROM sessions WHERE id = ?) AND t.run_key = (SELECT row_key FROM runs WHERE id = ?) ORDER BY t.id LIMIT ?", b.bytes/6, b.bytes/6, b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), []byte(id), l.MaxTools-len(out.Tools)+1)
 	if err != nil {
 		return err
 	}
@@ -237,8 +247,12 @@ func (s *Store) observationTools(ctx context.Context, out *session.ObservationSn
 		}
 		var tid, mid, name, status sql.NullString
 		t := session.ObservationTool{RunID: id}
-		if err = rows.Scan(&tid, &mid, &name, &status); err != nil {
+		var owner bool
+		if err = rows.Scan(&tid, &mid, &name, &status, &owner); err != nil {
 			return err
+		}
+		if !owner {
+			return session.ErrObservationInvalid
 		}
 		if !tid.Valid || !mid.Valid || !name.Valid || !status.Valid {
 			return session.ErrObservationTooLarge

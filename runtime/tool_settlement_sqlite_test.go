@@ -7,16 +7,15 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	now := time.Now().UTC()
 	if _, err := store.CreateSession(ctx, session.Session{ID: "session", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatal(err)

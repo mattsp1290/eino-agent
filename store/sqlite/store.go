@@ -3,103 +3,101 @@ package sqlite
 import (
 	"context"
 	"database/sql"
-	_ "embed"
+	"fmt"
 
-	_ "modernc.org/sqlite"
+	gormsqlite "gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+	modernsqlite "modernc.org/sqlite"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
-//go:embed schema.sql
-var currentSchema string
-
-// Store persists sessions in SQLite.
+// Store persists sessions using a host-owned modernc SQLite pool.
 type Store struct {
+	*sqlstore.Store
 	db *sql.DB
-	tx *sql.Tx
 }
 
-// Open opens a current SQLite store or atomically initializes an empty one.
-func Open(ctx context.Context, path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
+// New verifies an initialized database and borrows it without changing schema
+// or pool settings. The host must first call Migrate, and owns pool shutdown.
+func New(ctx context.Context, db *sql.DB) (*Store, error) {
+	if err := validatePool(ctx, db); err != nil {
+		return nil, sqliteLifecycleError{err}
 	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.ExecContext(ctx, `PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;`); err != nil {
-		_ = db.Close()
-		return nil, err
+	state, err := inspectPool(ctx, db)
+	if err != nil {
+		return nil, sqliteLifecycleError{err}
+	}
+	if state != migrationSchemaCurrent {
+		return nil, fmt.Errorf("%w: sqlite schema is not initialized", session.ErrConflict)
+	}
+	orm, err := gorm.Open(gormsqlite.New(gormsqlite.Config{DriverName: "sqlite", Conn: db}), &gorm.Config{
+		DisableAutomaticPing: true,
+		Logger:               logger.Discard,
+	})
+	if err != nil {
+		return nil, sqliteLifecycleError{err}
+	}
+	return &Store{Store: sqlstore.New(orm, db, sqliteDialect{}), db: db}, nil
+}
+
+func validatePool(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("%w: nil sqlite pool", session.ErrConflict)
+	}
+	if _, ok := db.Driver().(*modernsqlite.Driver); !ok {
+		return fmt.Errorf("%w: unsupported sqlite driver", session.ErrConflict)
 	}
 	conn, err := db.Conn(ctx)
 	if err != nil {
-		_ = db.Close()
-		return nil, err
+		return err
 	}
 	defer func() { _ = conn.Close() }()
-	if err := initializeOrVerify(ctx, conn); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return &Store{db: db}, nil
-}
-
-func initializeOrVerify(ctx context.Context, conn *sql.Conn) (err error) {
-	if _, err = conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+	var enabled int
+	if err := conn.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&enabled); err != nil {
 		return err
 	}
-	defer func() {
-		if err != nil {
-			_, _ = conn.ExecContext(context.WithoutCancel(ctx), `ROLLBACK`)
-		}
-	}()
-	empty, err := emptySchema(ctx, conn)
+	if enabled != 1 {
+		return fmt.Errorf("%w: sqlite foreign keys must be enabled by the host", session.ErrConflict)
+	}
+	return nil
+}
+
+func inspectPool(ctx context.Context, db *sql.DB) (migrationSchemaState, error) {
+	conn, err := db.Conn(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	if empty {
-		if _, err = conn.ExecContext(ctx, currentSchema); err != nil {
-			return err
-		}
-	}
-	if err = verifySchema(ctx, conn); err != nil {
-		return err
-	}
-	_, err = conn.ExecContext(ctx, `COMMIT`)
-	return err
+	defer func() { _ = conn.Close() }()
+	return inspectMigrationSchema(ctx, conn)
 }
 
-// Close closes the underlying database.
-func (s *Store) Close() error {
-	if s == nil || s.db == nil {
-		return nil
-	}
-	return s.db.Close()
-}
+// Lifecycle errors retain classification without exposing host connection text.
+type sqliteLifecycleError struct{ err error }
 
-// WithinTx executes fn inside a SQLite transaction.
-func (s *Store) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) (err error) {
-	if s == nil || fn == nil {
-		return session.ErrConflict
+func (e sqliteLifecycleError) Error() string { return "sqlite store initialization failed" }
+func (e sqliteLifecycleError) Unwrap() error { return e.err }
+
+func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuery) (session.SessionDiscoveryPage, error) {
+	var store *sqlstore.Store
+	if s != nil {
+		store = s.Store
 	}
-	if s.tx != nil {
-		return fn(ctx, s)
+	return store.ListSessions(ctx, q)
+}
+func (s *Store) ReadObservationRevision(ctx context.Context, id session.ID) (session.ObservationWatermark, error) {
+	var store *sqlstore.Store
+	if s != nil {
+		store = s.Store
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	return store.ReadObservationRevision(ctx, id)
+}
+func (s *Store) ReadObservationSnapshot(ctx context.Context, id session.ID, limits session.ObservationLimits) (session.ObservationSnapshot, error) {
+	var store *sqlstore.Store
+	if s != nil {
+		store = s.Store
 	}
-	child := &Store{db: s.db, tx: tx}
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			_ = tx.Rollback()
-			panic(recovered)
-		}
-		if err != nil {
-			_ = tx.Rollback()
-			return
-		}
-		err = tx.Commit()
-	}()
-	err = fn(ctx, child)
-	return err
+	return store.ReadObservationSnapshot(ctx, id, limits)
 }

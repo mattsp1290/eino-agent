@@ -154,9 +154,6 @@ func TestStreamingOrchestratorRecordsResume(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store, run := resumeStoreWithTool(t, "dead-owner", session.ToolCallPending)
-	defer func() {
-		_ = store.Close()
-	}()
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil })}}}
 	orch := mustConfiguredOrchestrator(

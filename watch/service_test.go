@@ -18,7 +18,7 @@ func testOptions() Options {
 }
 func setup(t *testing.T, o Options) (*Service, *sqlite.Store) {
 	t.Helper()
-	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "store.db"))
+	st, stPool, err := openTestSQLite(t.Context(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -32,7 +32,7 @@ func setup(t *testing.T, o Options) (*Service, *sqlite.Store) {
 		if err := s.Close(ctx); err != nil {
 			t.Error(err)
 		}
-		_ = st.Close()
+		_ = stPool.Close()
 	})
 	return s, st
 }
@@ -340,11 +340,11 @@ func (r *pausedInitialReader) ReadObservationRevision(ctx context.Context, id se
 	return r.Store.ReadObservationRevision(ctx, id)
 }
 func TestInitialReadCannotLoseNewerWorkerSnapshot(t *testing.T) {
-	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "initial-race.db"))
+	st, stPool, err := openTestSQLite(t.Context(), filepath.Join(t.TempDir(), "initial-race.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = stPool.Close() }()
 	reader := &pausedInitialReader{Store: st, initialRead: make(chan struct{}), releaseInitial: make(chan struct{}), workerSnapshot: make(chan struct{}), workerRechecked: make(chan struct{})}
 	options := testOptions()
 	options.PollInterval = time.Hour
@@ -411,11 +411,11 @@ func (r *pausedResnapshotReader) ReadObservationSnapshot(ctx context.Context, id
 	return snap, err
 }
 func TestResnapshotAcceptsConcurrentNewerPoll(t *testing.T) {
-	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "resnapshot-race.db"))
+	st, stPool, err := openTestSQLite(t.Context(), filepath.Join(t.TempDir(), "resnapshot-race.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = stPool.Close() }()
 	reader := &pausedResnapshotReader{Store: st, captured: make(chan struct{}), release: make(chan struct{})}
 	options := testOptions()
 	options.PollInterval = time.Hour
@@ -593,11 +593,11 @@ func TestStoreIncarnationAndRevisionRegressionRequireReattach(t *testing.T) {
 	for _, change := range []string{"incarnation", "revision"} {
 		t.Run(change, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "watermark.db")
-			st, err := sqlite.Open(t.Context(), path)
+			st, stPool, err := openTestSQLite(t.Context(), path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = st.Close() }()
+			defer func() { _ = stPool.Close() }()
 			admit(t, st, "s", "r", "m")
 			service, err := NewService(st, testOptions())
 			if err != nil {
@@ -618,9 +618,9 @@ func TestStoreIncarnationAndRevisionRegressionRequireReattach(t *testing.T) {
 			if _, err = raw.ExecContext(t.Context(), "PRAGMA busy_timeout=5000"); err != nil {
 				t.Fatal(err)
 			}
-			query := "UPDATE observation_store SET incarnation = 'recreated'"
+			query := "UPDATE observation_store SET incarnation = lower(hex(randomblob(16)))"
 			if change == "revision" {
-				query = "UPDATE observation_revisions SET revision = 1 WHERE session_id = 's'"
+				query = "UPDATE observation_revisions SET revision = 1 WHERE session_id = CAST('s' AS BLOB)"
 			}
 			if _, err = raw.ExecContext(t.Context(), query); err != nil {
 				t.Fatal(err)

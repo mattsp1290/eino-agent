@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ type watermarkConnector struct {
 	path              string
 	captured, release chan struct{}
 	once              sync.Once
+	armed             atomic.Bool
+	capture           func(string, []driver.NamedValue)
 }
 
 func (c *watermarkConnector) Connect(context.Context) (driver.Conn, error) {
@@ -37,12 +40,19 @@ type watermarkConn struct {
 	connector *watermarkConnector
 }
 
+func (c *watermarkConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	return c.Conn.(driver.ConnBeginTx).BeginTx(ctx, opts)
+}
+
 func (c *watermarkConn) QueryContext(ctx context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	if c.connector.capture != nil {
+		c.connector.capture(q, args)
+	}
 	rows, err := c.Conn.(driver.QueryerContext).QueryContext(ctx, q, args)
 	if err != nil {
 		return nil, err
 	}
-	if strings.Contains(q, "SELECT incarnation") {
+	if c.connector.armed.Load() && strings.Contains(q, "FROM observation_store WHERE singleton = 1") {
 		return &watermarkRows{Rows: rows, after: func() {
 			c.connector.once.Do(func() {
 				close(c.connector.captured)
@@ -69,12 +79,12 @@ func TestObservationCommitBetweenWatermarkAndFields(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			path := filepath.Join(t.TempDir(), "isolation.db")
-			writer, err := Open(ctx, path)
+			writer, err := openSQLiteFixture(ctx, path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = writer.Close() }()
-			if _, err = writer.exec(ctx, "PRAGMA journal_mode="+mode); err != nil {
+			defer func() { _ = writer.db.Close() }()
+			if _, err = writer.db.ExecContext(ctx, "PRAGMA journal_mode="+mode); err != nil {
 				t.Fatal(err)
 			}
 			if _, err = writer.CreateSession(ctx, session.Session{ID: "s"}); err != nil {
@@ -88,10 +98,15 @@ func TestObservationCommitBetweenWatermarkAndFields(t *testing.T) {
 			if _, err = ex.AppendMessage(ctx, session.Message{ID: "m", SessionID: "s", RunID: "r", Role: session.RoleAssistant}); err != nil {
 				t.Fatal(err)
 			}
-			connector := &watermarkConnector{path: path, captured: make(chan struct{}), release: make(chan struct{})}
-			reader := &Store{db: sql.OpenDB(connector)}
-			reader.db.SetMaxOpenConns(1)
-			defer func() { _ = reader.Close() }()
+			connector := &watermarkConnector{path: path + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", captured: make(chan struct{}), release: make(chan struct{})}
+			pool := sql.OpenDB(connector)
+			pool.SetMaxOpenConns(1)
+			defer func() { _ = pool.Close() }()
+			reader, err := New(ctx, pool)
+			if err != nil {
+				t.Fatal(err)
+			}
+			connector.armed.Store(true)
 			snapshots := make(chan session.ObservationSnapshot, 1)
 			readErrors := make(chan error, 1)
 			go func() {

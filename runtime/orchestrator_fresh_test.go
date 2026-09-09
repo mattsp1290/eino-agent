@@ -16,7 +16,6 @@ import (
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestStreamingOrchestratorRejectsInvalidUserMessageBeforeDependencies(t *testing.T) {
@@ -108,11 +107,11 @@ func TestPreExecutionRejectionRetainsAdmittedPair(t *testing.T) {
 }
 
 func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var dispatches atomic.Int32
 	newOrchestrator := func(sink *blockingSink) *StreamingOrchestrator {
 		return mustConfiguredOrchestrator(

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -60,6 +62,7 @@ func main() {
 // transport adapters.
 type Server struct {
 	store    *sqlite.Store
+	pool     *sql.DB
 	observer *watch.Service
 	mount    *composition.Mount
 	runtime  *runtime.StreamingOrchestrator
@@ -75,8 +78,20 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 	if dbPath == "" {
 		dbPath = "minimal-server.db"
 	}
-	store, err := sqlite.Open(ctx, dbPath)
+	uri := url.URL{Scheme: "file", Path: dbPath, RawQuery: "_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)", OmitHost: true}
+	pool, err := sql.Open("sqlite", uri.String())
 	if err != nil {
+		return nil, err
+	}
+	pool.SetMaxOpenConns(1)
+	pool.SetMaxIdleConns(1)
+	if err = sqlite.Migrate(ctx, pool); err != nil {
+		_ = pool.Close()
+		return nil, err
+	}
+	store, err := sqlite.New(ctx, pool)
+	if err != nil {
+		_ = pool.Close()
 		return nil, err
 	}
 	ids := &sequenceIDs{prefix: rand.Text()}
@@ -85,20 +100,20 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 		PollInterval: 50 * time.Millisecond, ReadTimeout: time.Second, MaxSubscriptions: 64, MaxWatchedSessions: 32, MaxLiveRuns: 32, MaxLiveTextBytes: 1 << 20, PendingUpdates: 64,
 	})
 	if err != nil {
-		_ = store.Close()
+		_ = pool.Close()
 		return nil, err
 	}
 	snapshot := minimalConfig()
 	plans, err := composition.NewRegistry(nil)
 	if err != nil {
 		_ = observer.Close(ctx)
-		_ = store.Close()
+		_ = pool.Close()
 		return nil, err
 	}
 	mount, err := mountScriptedTool(ctx, plans)
 	if err != nil {
 		_ = observer.Close(ctx)
-		_ = store.Close()
+		_ = pool.Close()
 		return nil, err
 	}
 	orchestrator, err := runtime.NewStreamingOrchestrator(
@@ -114,11 +129,12 @@ func NewServer(ctx context.Context, dbPath string) (*Server, error) {
 		mount.Deactivate()
 		_ = mount.Close(ctx)
 		_ = observer.Close(ctx)
-		_ = store.Close()
+		_ = pool.Close()
 		return nil, err
 	}
 	return &Server{
 		store:    store,
+		pool:     pool,
 		observer: observer,
 		mount:    mount,
 		config:   snapshot,
@@ -161,8 +177,8 @@ func (s *Server) Close() error {
 			return err
 		}
 	}
-	if s.store != nil {
-		return s.store.Close()
+	if s.pool != nil {
+		return s.pool.Close()
 	}
 	return nil
 }

@@ -22,7 +22,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/store/sqlite"
 	"github.com/mattsp1290/eino-agent/tools"
 	"github.com/mattsp1290/eino-agent/transport"
 	"github.com/mattsp1290/eino-agent/watch"
@@ -153,11 +152,11 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	path := filepath.Join(t.TempDir(), "watch.db")
-	store, err := sqlite.Open(ctx, path)
+	store, storePool, err := openTestSQLite(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	service, err := watch.NewService(store, consumerWatchOptions())
 	if err != nil {
 		t.Fatal(err)
@@ -289,14 +288,14 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	if err = service.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.Close(); err != nil {
+	if err = storePool.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := sqlite.Open(ctx, path)
+	reopened, reopenedPool, err := reopenTestSQLite(ctx, path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = reopened.Close() }()
+	defer func() { _ = reopenedPool.Close() }()
 	persisted, err := reopened.ReadObservationSnapshot(ctx, "watch-session", consumerWatchOptions().Snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -319,11 +318,11 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	}
 }
 func TestPublicWatchOverflowAndReattach(t *testing.T) {
-	st, err := sqlite.Open(t.Context(), filepath.Join(t.TempDir(), "overflow.db"))
+	st, stPool, err := openTestSQLite(t.Context(), filepath.Join(t.TempDir(), "overflow.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = stPool.Close() }()
 	options := consumerWatchOptions()
 	options.PendingUpdates = 1
 	service, err := watch.NewService(st, options)
@@ -375,11 +374,11 @@ func TestPublicWatchOverflowAndReattach(t *testing.T) {
 func TestPublicWatchStrictResumeDoesNotDuplicateTool(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	st, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "resume.db"))
+	st, stPool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "resume.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = st.Close() }()
+	defer func() { _ = stPool.Close() }()
 	script := &watchScript{toolStarted: make(chan struct{}), toolRelease: make(chan struct{})}
 	close(script.toolRelease)
 	registry, mount := mountWatchTool(t, script)

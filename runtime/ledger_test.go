@@ -16,15 +16,14 @@ import (
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var submitted model.Request
 	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		var cloneErr error
@@ -75,11 +74,11 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 }
 
 func TestModelRequestLedgerPersistsAndSetsIdempotencyKeyByDefault(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var submitted model.Request
 	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		submitted = request
@@ -100,11 +99,11 @@ func TestModelRequestLedgerPersistsAndSetsIdempotencyKeyByDefault(t *testing.T) 
 }
 
 func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var mu sync.Mutex
 	calls := 0
 	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.Message, error) {
@@ -131,11 +130,11 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 }
 
 func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	providerCalls := 0
 	toolExecutions := 0
 	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.Message, error) {
@@ -193,11 +192,11 @@ func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
 }
 
 func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var sequence []string
 	var completed []ModelCompletedNotice
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
@@ -244,11 +243,11 @@ func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
 }
 
 func TestLedgerCancellationAfterDispatchSettlesFailed(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	started := make(chan struct{})
 	streamer := deltaStreamerFunc(func(ctx context.Context, _ model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 		reader, writer := einoschema.Pipe[model.StreamDelta](1)
@@ -286,11 +285,11 @@ func TestLedgerCancellationAfterDispatchSettlesFailed(t *testing.T) {
 }
 
 func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	updateErr := errors.New("terminal ledger update failed")
 	failingStore := &terminalUpdateFailingStore{Store: store, err: updateErr}
 	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
@@ -318,11 +317,11 @@ func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.
 
 func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	const secret = "provider-secret-invoke-value"
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 
 	var sequence []string
 	var completed []ModelCompletedNotice
@@ -357,11 +356,11 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 
 func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 	const secret = "provider-secret-second-receive"
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var sequence []string
 	var completed []ModelCompletedNotice
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
@@ -409,11 +408,11 @@ func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 }
 
 func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	updateErr := errors.New("dispatch start update failed")
 	failingStore := &dispatchStartFailingStore{Store: store, err: updateErr}
 	var sequence []string
@@ -444,11 +443,11 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 }
 
 func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var sequence []string
 	var completed []ModelCompletedNotice
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
@@ -469,11 +468,11 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 }
 
 func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var calls int
 	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
 		calls++
@@ -527,11 +526,11 @@ func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+			store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = store.Close() }()
+			defer func() { _ = storePool.Close() }()
 			calls := 0
 			streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 				calls++
@@ -571,11 +570,11 @@ func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
 }
 
 func TestLedgerAuditFailureAfterAdmissionSettlesRunWithoutDispatch(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	called := false
 	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
 		called = true
@@ -737,11 +736,11 @@ func TestLedgerUsesExecutionScopedWriterCapability(t *testing.T) {
 }
 
 func TestLedgerPassesDurableRecordIDThroughRequest(t *testing.T) {
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	streamer := &recordingRequestStreamer{}
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {

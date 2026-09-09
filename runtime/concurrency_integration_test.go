@@ -14,19 +14,18 @@ import (
 
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	defer func() {
-		_ = store.Close()
+		_ = storePool.Close()
 	}()
 	var executions atomic.Int64
 	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
@@ -99,12 +98,12 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
 	defer func() {
-		_ = store.Close()
+		_ = storePool.Close()
 	}()
 	started := make(chan struct{}, 16)
 	orch := mustConfiguredOrchestrator(

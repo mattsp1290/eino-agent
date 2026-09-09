@@ -17,7 +17,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
-	sqlitestore "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
@@ -468,11 +467,11 @@ func TestToolOutputUsesProtectedDisposition(t *testing.T) {
 func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	store, err := sqlitestore.Open(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatalf("open sqlite store: %v", err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var executedCall ToolCall
 	toolRegistry := staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -515,11 +514,11 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 
 func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransform(t *testing.T) {
 	ctx := context.Background()
-	store, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "store.db"))
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = store.Close() }()
+	defer func() { _ = storePool.Close() }()
 	var notices []ToolSettledNotice
 	var executed atomic.Bool
 	toolRegistry := staticToolRegistry{tools: []Tool{{

@@ -15,7 +15,6 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/store/sqlite"
 	"github.com/mattsp1290/eino-agent/watch"
 )
 
@@ -24,11 +23,11 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 		t.Run(mode, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
-			st, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "watch.db"))
+			st, stPool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "watch.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer func() { _ = st.Close() }()
+			defer func() { _ = stPool.Close() }()
 			options := watch.Options{Snapshot: session.ObservationLimits{MaxMessages: 20, MaxTools: 20, MaxParts: 40, MaxSnapshotBytes: 64000, MaxTextBytes: 1000}, PollInterval: time.Millisecond, ReadTimeout: time.Second, MaxSubscriptions: 10, MaxWatchedSessions: 10, MaxLiveRuns: 10, MaxLiveTextBytes: 1000, PendingUpdates: 20}
 			service, err := watch.NewService(st, options)
 			if err != nil {

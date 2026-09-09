@@ -16,11 +16,11 @@ import (
 
 func discoveryStore(t *testing.T, path string) *Store {
 	t.Helper()
-	s, err := Open(t.Context(), path)
+	s, err := openSQLiteFixture(t.Context(), path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close() })
+	t.Cleanup(func() { _ = s.db.Close() })
 	return s
 }
 func putDiscovery(t *testing.T, s session.Store, record session.Session) {
@@ -37,8 +37,11 @@ func listDiscovery(t *testing.T, s *Store, q session.SessionDiscoveryQuery) sess
 	}
 	return p
 }
-func requireDiscoveryError(t *testing.T, s *Store, ctx context.Context, q session.SessionDiscoveryQuery, want error) {
+func requireDiscoveryError(t *testing.T, s session.SessionDiscoveryReader, ctx context.Context, q session.SessionDiscoveryQuery, want error) {
 	t.Helper()
+	if s == nil {
+		s = (*Store)(nil)
+	}
 	p, err := s.ListSessions(ctx, q)
 	if err != want || !reflect.DeepEqual(p, session.SessionDiscoveryPage{}) {
 		t.Fatalf("page=%+v err=%v want=%v", p, err, want)
@@ -66,7 +69,7 @@ func TestDiscoveryProjectionWritesAndReopen(t *testing.T) {
 		if _, err := tx.CreateSession(ctx, session.Session{ID: "rollback", WorkspaceID: "A"}); err != nil {
 			return err
 		}
-		requireDiscoveryError(t, tx.(*Store), ctx, session.SessionDiscoveryQuery{WorkspaceID: "A"}, session.ErrDiscoveryReader)
+		requireDiscoveryError(t, tx.(session.SessionDiscoveryReader), ctx, session.SessionDiscoveryQuery{WorkspaceID: "A"}, session.ErrDiscoveryReader)
 		return rollback
 	})
 	if !errors.Is(err, rollback) {
@@ -82,10 +85,14 @@ func TestDiscoveryProjectionWritesAndReopen(t *testing.T) {
 	if err = s.UpdateSession(t.Context(), record); err != nil {
 		t.Fatal(err)
 	}
-	if err = s.Close(); err != nil {
+	if err = s.db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	s = discoveryStore(t, path)
+	s, err = reopenSQLiteFixture(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.db.Close() })
 	next := listDiscovery(t, s, session.SessionDiscoveryQuery{WorkspaceID: "A", Cursor: first.NextCursor})
 	if len(next.Sessions) != 1 || next.Sessions[0].ID != "a" || next.NextCursor != "" {
 		t.Fatal(next)
@@ -129,18 +136,20 @@ func TestDiscoveryOversizeLookaheadAndCorruption(t *testing.T) {
 		value     any
 		want      error
 	}{
-		{"large title", "UPDATE sessions SET title = ? WHERE id='a'", strings.Repeat("t", 16385), session.ErrDiscoveryTooLarge},
-		{"invalid utf8", "UPDATE sessions SET title = ? WHERE id='a'", string([]byte{255}), session.ErrDiscoveryInvalid},
-		{"blob scalar", "UPDATE sessions SET title = ? WHERE id='a'", []byte("blob"), session.ErrDiscoveryInvalid},
-		{"timestamp", "UPDATE sessions SET updated_at = ? WHERE id='a'", "PRIVATE_BAD_TIME", session.ErrDiscoveryInvalid},
-		{"long timestamp", "UPDATE sessions SET updated_at = ? WHERE id='a'", strings.Repeat("x", 31), session.ErrDiscoveryInvalid},
-		{"empty identity", "UPDATE sessions SET id = ? WHERE id='a'", "", session.ErrDiscoveryInvalid},
-		{"null identity", "UPDATE sessions SET id = ? WHERE id='a'", nil, session.ErrDiscoveryInvalid},
+		{"large title", "UPDATE sessions SET title = ? WHERE id=x'61'", []byte(strings.Repeat("t", 16385)), session.ErrDiscoveryTooLarge},
+		{"invalid utf8", "UPDATE sessions SET title = ? WHERE id=x'61'", []byte{255}, session.ErrDiscoveryInvalid},
+		{"text scalar", "UPDATE sessions SET title = ? WHERE id=x'61'", "text", session.ErrDiscoveryInvalid},
+		{"timestamp", "UPDATE sessions SET updated_at = ? WHERE id=x'61'", "PRIVATE_BAD_TIME", session.ErrDiscoveryInvalid},
+		{"long timestamp", "UPDATE sessions SET updated_at = ? WHERE id=x'61'", strings.Repeat("x", 31), session.ErrDiscoveryInvalid},
+		{"empty identity", "UPDATE sessions SET id = ? WHERE id=x'61'", []byte{}, session.ErrDiscoveryInvalid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := discoveryStore(t, filepath.Join(t.TempDir(), "store.db"))
 			for _, id := range []session.ID{"a", "z"} {
 				putDiscovery(t, s, session.Session{ID: id, WorkspaceID: "A"})
+			}
+			if _, err := s.db.Exec("PRAGMA ignore_check_constraints=ON"); err != nil {
+				t.Fatal(err)
 			}
 			if _, err := s.db.Exec(tc.sql, tc.value); err != nil {
 				t.Fatal(err)
@@ -149,10 +158,7 @@ func TestDiscoveryOversizeLookaheadAndCorruption(t *testing.T) {
 			if len(first.Sessions) != 1 || first.Sessions[0].ID != "z" || first.NextCursor == "" {
 				t.Fatal(first)
 			}
-			// NULL keys cannot participate in a tuple seek, but must fail a full page.
-			if tc.name != "null identity" {
-				requireDiscoveryError(t, s, t.Context(), session.SessionDiscoveryQuery{WorkspaceID: "A", Cursor: first.NextCursor}, tc.want)
-			}
+			requireDiscoveryError(t, s, t.Context(), session.SessionDiscoveryQuery{WorkspaceID: "A", Cursor: first.NextCursor}, tc.want)
 			requireDiscoveryError(t, s, t.Context(), session.SessionDiscoveryQuery{WorkspaceID: "A"}, tc.want)
 		})
 	}
@@ -173,6 +179,9 @@ func TestDiscoveryReaderFailuresAndCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	listDiscovery(t, s, q) // Cancellation released the waiting read, not a leaked tx.
+	if _, err = s.db.Exec("PRAGMA ignore_check_constraints=ON"); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = s.db.Exec("UPDATE observation_store SET incarnation = ?", strings.Repeat("x", 10000)); err != nil {
 		t.Fatal(err)
 	}
@@ -181,7 +190,7 @@ func TestDiscoveryReaderFailuresAndCancellation(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireDiscoveryError(t, s, t.Context(), q, session.ErrDiscoveryInvalid)
-	if err = s.Close(); err != nil {
+	if err = s.db.Close(); err != nil {
 		t.Fatal(err)
 	}
 	requireDiscoveryError(t, s, t.Context(), q, session.ErrDiscoveryStore)
@@ -190,7 +199,7 @@ func TestDiscoveryReaderFailuresAndCancellation(t *testing.T) {
 //go:embed testdata/pre_discovery_schema.sql
 var preDiscoverySchema string
 
-func TestOpenRejectsPreDiscoverySchemaWithoutMutation(t *testing.T) {
+func TestMigrateRejectsPreDiscoverySchemaWithoutMutation(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -203,18 +212,18 @@ func TestOpenRejectsPreDiscoverySchemaWithoutMutation(t *testing.T) {
 	if _, err = db.Exec(`INSERT INTO sessions(id,record,updated_at) VALUES ('preserved','private record','')`); err != nil {
 		t.Fatal(err)
 	}
-	before, err := readSchemaObjects(t.Context(), db)
+	before, err := migrationSchemaCatalog(t.Context(), db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := Open(t.Context(), path)
+	s, err := openSQLiteFixture(t.Context(), path)
 	if s != nil {
-		_ = s.Close()
+		_ = s.db.Close()
 	}
 	if !errors.Is(err, session.ErrConflict) {
 		t.Fatal(err)
 	}
-	after, err := readSchemaObjects(t.Context(), db)
+	after, err := migrationSchemaCatalog(t.Context(), db)
 	if err != nil || !reflect.DeepEqual(before, after) {
 		t.Fatal("schema modified", err)
 	}
@@ -238,5 +247,17 @@ func TestDiscoveryMaximumScalarsProduceUsablePages(t *testing.T) {
 	next := listDiscovery(t, s, session.SessionDiscoveryQuery{WorkspaceID: ws, Limit: 1, Cursor: first.NextCursor})
 	if next.NextCursor != "" || len(next.Sessions) != 1 || next.Sessions[0].ID == first.Sessions[0].ID || next.Sessions[0].Title != title {
 		t.Fatal("maximum scalar continuation failed")
+	}
+}
+
+func TestDiscoveryNullIdentityRejectedBeforeRead(t *testing.T) {
+	s := discoveryStore(t, filepath.Join(t.TempDir(), "store.db"))
+	putDiscovery(t, s, session.Session{ID: "a", WorkspaceID: "A"})
+	before := listDiscovery(t, s, session.SessionDiscoveryQuery{WorkspaceID: "A"})
+	if _, err := s.db.Exec("UPDATE sessions SET id=NULL WHERE id=?", []byte("a")); err == nil {
+		t.Fatal("NULL public identity accepted")
+	}
+	if after := listDiscovery(t, s, session.SessionDiscoveryQuery{WorkspaceID: "A"}); !reflect.DeepEqual(before, after) {
+		t.Fatal("rejected NULL identity changed discovery", before, after)
 	}
 }
