@@ -374,9 +374,12 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 }
 
 func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
-	t.Parallel()
-	const leaseDuration = time.Second
-	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+	// Keep real-time lease renewal out of the parallel SQLite workload. This
+	// lease gives each heartbeat two seconds to finish its database transaction.
+	const leaseDuration = 6 * time.Second
+	testCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	store, storePool, err := openTestSQLite(testCtx, filepath.Join(t.TempDir(), "store.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,18 +409,22 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 		WithOwnerID("owner-a"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
-	handle, err := owner.Start(context.Background(), Request{SessionID: "heartbeat-session", Message: UserMessage{Content: "wait"}, Config: orchestratorConfig()})
+	handle, err := owner.Start(testCtx, Request{SessionID: "heartbeat-session", Message: UserMessage{Content: "wait"}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-entered
-	initial, err := store.GetRun(context.Background(), handle.RunID())
+	select {
+	case <-entered:
+	case <-testCtx.Done():
+		t.Fatalf("stream did not start: %v", testCtx.Err())
+	}
+	initial, err := store.GetRun(testCtx, handle.RunID())
 	if err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(2*leaseDuration + time.Second)
 	for {
-		current, getErr := store.GetRun(context.Background(), handle.RunID())
+		current, getErr := store.GetRun(testCtx, handle.RunID())
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
@@ -428,17 +435,26 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 		if now.After(deadline) {
 			t.Fatalf("heartbeat did not renew initial lease %s; current lease %s", initial.LeaseUntil, current.LeaseUntil)
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-time.After(50 * time.Millisecond):
+		case <-testCtx.Done():
+			t.Fatalf("heartbeat lease observation canceled: %v", testCtx.Err())
+		}
 	}
 	resumer := mustConfiguredOrchestrator(
 		WithStore(store), WithRunPlanProvider(provider), WithOwnerID("owner-b"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
-	if _, err := resumer.Resume(context.Background(), handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
+	if _, err := resumer.Resume(testCtx, handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
 		t.Fatalf("Resume error = %v, want ErrSessionBusy", err)
 	}
 	close(release)
-	result := <-handle.Done()
+	var result Result
+	select {
+	case result = <-handle.Done():
+	case <-testCtx.Done():
+		t.Fatalf("run did not complete after release: %v", testCtx.Err())
+	}
 	if result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
