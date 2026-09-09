@@ -110,6 +110,12 @@ POSTGRES_STORE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPost
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_STORE_SUITE) $(addprefix $(POSTGRES_STORE_SUITE)/,contract discovery)
 POSTGRES_LIFECYCLE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresStoreLifecycle
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_LIFECYCLE_SUITE) $(addprefix $(POSTGRES_LIFECYCLE_SUITE)/,readonly_constructor empty_schema nil_closed_canceled reopen_incarnation host_pool_settings transaction_visibility commit_rollback_tag)
+POSTGRES_FENCING_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresFencing
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_FENCING_SUITE) $(addprefix $(POSTGRES_FENCING_SUITE)/,admission reclaim live_clock stale_methods delayed_writer run_settlement tool_settlement tool_transitions)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_FENCING_SUITE)/stale_methods/,StartRun RenewRunLease SettleRun AppendMessage FinalizeAssistantMessage AppendPart UpdatePart AppendEvent CreateToolCall ClaimToolCall SettleToolCall StartContextEpoch FinishContextEpoch CreateModelRequest UpdateModelRequest)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_FENCING_SUITE)/run_settlement/,identical contradictory)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_FENCING_SUITE)/tool_settlement/,identical contradictory)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_FENCING_SUITE)/tool_transitions/,pending/identical pending/contradictory running/identical running/contradictory)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'
