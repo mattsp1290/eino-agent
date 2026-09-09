@@ -32,7 +32,7 @@ func (s *Store) CreateSession(ctx context.Context, record session.Session) (sess
 			}
 			return existing, nil
 		}
-		row, readErr := store.sessionRowByID(ctx, string(record.ID))
+		row, readErr := store.lockSessionByID(ctx, string(record.ID))
 		if readErr == nil {
 			existing, err := validateExisting(row)
 			if err != nil {
@@ -56,7 +56,7 @@ func (s *Store) CreateSession(ctx context.Context, record session.Session) (sess
 			return err
 		}
 		if created.RowsAffected == 0 {
-			row, err := store.sessionRowByID(ctx, string(record.ID))
+			row, err := store.lockSessionByID(ctx, string(record.ID))
 			if err != nil {
 				return err
 			}
@@ -103,7 +103,11 @@ func (s *Store) UpdateSession(ctx context.Context, record session.Session) error
 		return err
 	}
 	return s.atomic(ctx, func(store *Store) error {
-		db := store.dbFor(ctx).Table(store.tableName("sessions")).Where("id = ?", publicID(record.ID)).Updates(map[string]any{
+		rowKey, err := store.lockSessionKeyByID(ctx, string(record.ID))
+		if err != nil {
+			return err
+		}
+		db := store.dbFor(ctx).Table(store.tableName("sessions")).Where("row_key = ?", rowKey).Updates(map[string]any{
 			"record": raw, "workspace_id": []byte(record.WorkspaceID), "title": []byte(record.Title),
 			"created_at": TimeText(record.CreatedAt), "updated_at": TimeText(record.UpdatedAt),
 		})

@@ -87,7 +87,7 @@ func (d queryDialect) Read(ctx context.Context, db *sql.DB, fn func(SQLReader) e
 }
 
 func (queryDialect) ClockSQL() string                  { return "CURRENT_TIMESTAMP" }
-func (queryDialect) LockRun(db *gorm.DB) *gorm.DB      { return db }
+func (queryDialect) LockRows(db *gorm.DB) *gorm.DB     { return db }
 func (queryDialect) MapError(err error) error          { return err }
 func (queryDialect) IndexHint(string) string           { return "" }
 func (queryDialect) ByteLength(column string) string   { return "length(CAST(" + column + " AS BLOB))" }

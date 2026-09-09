@@ -68,6 +68,14 @@ func rowsAffected(result *gorm.DB) error {
 
 func durationMicros(duration time.Duration) int64 { return max(1, duration.Microseconds()) }
 
+// Both schemas represent boolean projections as checked integer flags.
+func flagValue(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
 type rowScanner interface{ Scan(...any) error }
 
 // tableName applies the controlled backend naming strategy to fixed internal names.

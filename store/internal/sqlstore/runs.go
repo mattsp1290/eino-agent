@@ -18,7 +18,14 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration 
 	}
 	var result session.Run
 	err := s.atomic(ctx, func(st *Store) error {
-		sessionKey, err := st.key(ctx, "sessions", string(record.SessionID))
+		// A repeated run ID is arbitrated before taking the session lock. This
+		// preserves duplicate-ID precedence when callers race admission.
+		if _, err := st.getRun(ctx, record.ID); err == nil {
+			return session.ErrConflict
+		} else if !errors.Is(err, session.ErrNotFound) {
+			return err
+		}
+		sessionKey, err := st.lockSessionKeyByID(ctx, string(record.SessionID))
 		if err != nil {
 			return relationError(err)
 		}
@@ -46,10 +53,8 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration 
 			return st.mapErr(err)
 		}
 		if created.RowsAffected == 0 {
-			if current, getErr := st.getRun(ctx, record.ID); getErr == nil {
-				if current.ID == record.ID {
-					return session.ErrConflict
-				}
+			if _, getErr := st.getRun(ctx, record.ID); getErr == nil {
+				return session.ErrConflict
 			} else if !errors.Is(getErr, session.ErrNotFound) {
 				return getErr
 			}
@@ -121,11 +126,15 @@ func (s *Store) ClaimRun(ctx context.Context, claim session.RunClaim) (session.R
 	}
 	var result session.Run
 	err := s.atomic(ctx, func(st *Store) error {
-		current, err := st.getRun(ctx, claim.RunID)
+		row, err := st.lockRun(ctx, claim.RunID)
 		if err != nil {
 			if errors.Is(err, session.ErrNotFound) {
 				return session.ErrConflict
 			}
+			return err
+		}
+		current, err := decodeRunRow(row)
+		if err != nil {
 			return err
 		}
 		candidate := current
@@ -137,8 +146,8 @@ func (s *Store) ClaimRun(ctx context.Context, claim session.RunClaim) (session.R
 			return err
 		}
 		// The conditional update is evaluated against the database clock. The
-		// prior read is informational only; it is never used to authorize claim.
-		db := st.dbFor(ctx).Table(st.tableName("runs")).Where("id = ? AND status IN ? AND lease_until <= "+st.dialect.ClockSQL(), []byte(claim.RunID), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+		// row locks retain ownership; expiry still uses the live database clock.
+		db := st.dbFor(ctx).Table(st.tableName("runs")).Where("row_key = ? AND status IN ? AND lease_until <= "+st.dialect.ClockSQL(), row.RowKey, []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
 			"status": string(session.RunRunning), "owner_id": []byte(claim.OwnerID), "claim_token": []byte(claim.ClaimToken), "record": raw,
 			"lease_until": gorm.Expr(st.dialect.ClockSQL()+" + ?", durationMicros(claim.LeaseDuration)),
 		})

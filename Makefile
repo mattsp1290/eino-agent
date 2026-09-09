@@ -106,6 +106,10 @@ POSTGRES_SCHEMA_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPos
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_SCHEMA_SUITE) $(addprefix $(POSTGRES_SCHEMA_SUITE)/,reference states rejection readonly)
 POSTGRES_MIGRATION_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresMigration
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_MIGRATION_SUITE) $(addprefix $(POSTGRES_MIGRATION_SUITE)/,lifecycle rejection rollback host_context concurrent canceled_waiter physical_cleanup)
+POSTGRES_STORE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresStore
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_STORE_SUITE) $(addprefix $(POSTGRES_STORE_SUITE)/,contract discovery)
+POSTGRES_LIFECYCLE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresStoreLifecycle
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_LIFECYCLE_SUITE) $(addprefix $(POSTGRES_LIFECYCLE_SUITE)/,readonly_constructor empty_schema nil_closed_canceled reopen_incarnation host_pool_settings transaction_visibility commit_rollback_tag)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'
