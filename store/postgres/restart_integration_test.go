@@ -147,7 +147,11 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 		t.Fatal("durable records changed across restart")
 	}
 	assertRestartNoReservedOutputs(t, ctx, db, call)
-	waitRestartLeaseExpiry(t, ctx, db, runID)
+	waitRace(t, ctx, func() (bool, error) {
+		var expired bool
+		err := db.QueryRowContext(ctx, `SELECT lease_until <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint FROM public.runs WHERE id=$1`, []byte(runID)).Scan(&expired)
+		return expired, err
+	})
 	claimed, err := store.ClaimRun(ctx, session.RunClaim{RunID: runID, OwnerID: "new-owner", ClaimToken: "new-fence", LeaseDuration: time.Minute})
 	if err != nil {
 		t.Fatalf("claim expired run: %v", err)
@@ -282,24 +286,4 @@ func restartPostmasterTime(t *testing.T, ctx context.Context, db *sql.DB) time.T
 		t.Fatalf("read postmaster start time: %v", err)
 	}
 	return value
-}
-
-func waitRestartLeaseExpiry(t *testing.T, ctx context.Context, db *sql.DB, runID session.RunID) {
-	t.Helper()
-	ticker := time.NewTicker(5 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		var expired bool
-		if err := db.QueryRowContext(ctx, `SELECT lease_until <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint FROM public.runs WHERE id=$1`, []byte(runID)).Scan(&expired); err != nil {
-			t.Fatalf("poll run lease: %v", err)
-		}
-		if expired {
-			return
-		}
-		select {
-		case <-ctx.Done():
-			t.Fatalf("run lease did not expire: %v", ctx.Err())
-		case <-ticker.C:
-		}
-	}
 }
