@@ -119,6 +119,9 @@ POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_FENCING_SUITE)/tool_transitio
 POSTGRES_TRANSACTION_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresTransactions
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_TRANSACTION_SUITE) $(addprefix $(POSTGRES_TRANSACTION_SUITE)/store/,commit error panic cancel nested_caught)
 POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_TRANSACTION_SUITE)/execution/,commit error panic cancel nested_caught)
+POSTGRES_ATOMICITY_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresAtomicity
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_ATOMICITY_SUITE) $(addprefix $(POSTGRES_ATOMICITY_SUITE)/mutation/,event result_part model_request revision)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_ATOMICITY_SUITE)/cleanup/,terminated_backend_poison rollback_cleanup release_cleanup)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'

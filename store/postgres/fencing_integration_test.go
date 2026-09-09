@@ -134,11 +134,23 @@ func waitRace(t *testing.T, ctx context.Context, predicate func() (bool, error))
 // ErrConflict alone cannot prove that an earlier statement was rolled back.
 func (f *raceFixture) snapshot(t *testing.T) string {
 	t.Helper()
+	return f.snapshotExcludingEvent(t, "")
+}
+
+// Exclude only a separately verified event committed by an outer transaction.
+func (f *raceFixture) snapshotExcludingEvent(t *testing.T, excluded session.EventID) string {
+	t.Helper()
 	var result strings.Builder
 	for _, table := range []string{"observation_store", "observation_revisions", "sessions", "runs", "messages", "parts", "tool_calls", "context_epochs", "model_requests", "events"} {
 		var rows string
-		query := "SELECT COALESCE(jsonb_agg(r ORDER BY r::text), '[]'::jsonb)::text FROM (SELECT to_jsonb(t) AS r FROM public." + table + " t) rows"
-		if err := f.observer.QueryRowContext(f.ctx, query).Scan(&rows); err != nil {
+		query := "SELECT COALESCE(jsonb_agg(r ORDER BY r::text), '[]'::jsonb)::text FROM (SELECT to_jsonb(t) AS r FROM public." + table + " t"
+		var args []any
+		if table == "events" && excluded != "" {
+			query += " WHERE t.id <> $1"
+			args = append(args, []byte(excluded))
+		}
+		query += ") rows"
+		if err := f.observer.QueryRowContext(f.ctx, query, args...).Scan(&rows); err != nil {
 			t.Fatal(err)
 		}
 		result.WriteString(table + ":" + rows + "\n")
