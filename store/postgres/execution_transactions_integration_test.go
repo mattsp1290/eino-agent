@@ -37,14 +37,7 @@ func testExecutionTransactions(t *testing.T, server *testpostgres.Server) {
 						return err
 					}
 					assertExecutionUncommitted(t, f, before)
-					if outcome == "cancel" {
-						err := finishTransaction(outcome, cancel)
-						if !errors.Is(callbackCtx.Err(), context.Canceled) {
-							return errors.New("transaction callback context did not observe cancellation")
-						}
-						return err
-					}
-					return finishTransaction(outcome, cancel)
+					return finishTransaction(t, callbackCtx, outcome, cancel)
 				})
 			})
 			if calls != 1 {
@@ -83,7 +76,7 @@ func testExecutionTransactions(t *testing.T, server *testpostgres.Server) {
 						return err
 					}
 					assertExecutionUncommitted(t, f, before)
-					return finishTransaction("error", nil)
+					return errTransactionAbort
 				})
 				if !errors.Is(err, errTransactionAbort) {
 					return fmt.Errorf("nested callback lost error: %v", err)
@@ -95,7 +88,7 @@ func testExecutionTransactions(t *testing.T, server *testpostgres.Server) {
 					return err
 				}
 				assertExecutionUncommitted(t, f, before)
-				return finishTransaction("commit", nil)
+				return nil
 			})
 		})
 		if outerCalls != 1 || nestedCalls != 1 {

@@ -21,7 +21,8 @@ func TestPostgresTransactions(t *testing.T) {
 	t.Run("execution", func(t *testing.T) { testExecutionTransactions(t, server) })
 }
 
-func finishTransaction(outcome string, cancel context.CancelFunc) error {
+func finishTransaction(t *testing.T, ctx context.Context, outcome string, cancel context.CancelFunc) error {
+	t.Helper()
 	switch outcome {
 	case "commit":
 		return nil
@@ -31,6 +32,9 @@ func finishTransaction(outcome string, cancel context.CancelFunc) error {
 		panic(errTransactionPanic)
 	case "cancel":
 		cancel()
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			t.Error("transaction callback context did not observe cancellation")
+		}
 		return nil
 	default:
 		panic("unknown transaction outcome: " + outcome)

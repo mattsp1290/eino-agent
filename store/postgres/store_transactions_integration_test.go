@@ -30,7 +30,7 @@ func testStoreTransactions(t *testing.T, server *testpostgres.Server) {
 						return err
 					}
 					assertStoreUncommitted(t, f, baseline, outcome+"-session")
-					return finishTransaction(outcome, cancel)
+					return finishTransaction(t, ctx, outcome, cancel)
 				})
 			})
 			if calls != 1 {
@@ -134,7 +134,7 @@ func testStoreNestedCaught(t *testing.T, server *testpostgres.Server) {
 				return err
 			}
 			assertStoreUncommitted(t, f, baseline, "nested-success")
-			return finishTransaction("commit", nil)
+			return nil
 		})
 	})
 	if outerCalls != 1 || nestedCalls != 1 {
