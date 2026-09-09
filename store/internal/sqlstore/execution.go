@@ -100,7 +100,7 @@ func (e *executionStore) RenewRunLease(ctx context.Context, leaseDuration time.D
 }
 
 func renewRunLease(ctx context.Context, store *Store, fence session.RunFence, leaseDuration time.Duration) error {
-	db := store.dbFor(ctx).Table("runs").Where("id = ? AND claim_token = ? AND status IN ?", []byte(fence.RunID), []byte(fence.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+	db := store.dbFor(ctx).Table(store.tableName("runs")).Where("id = ? AND claim_token = ? AND status IN ?", []byte(fence.RunID), []byte(fence.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
 		"lease_until": gorm.Expr(store.dialect.ClockSQL()+" + ?", durationMicros(leaseDuration)),
 	})
 	if err := db.Error; err != nil {
@@ -123,7 +123,7 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 		if err != nil {
 			return err
 		}
-		if err := store.dbFor(ctx).Table("tool_calls").Where("run_key = ? AND status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Count(&count).Error; err != nil {
+		if err := store.dbFor(ctx).Table(store.tableName("tool_calls")).Where("run_key = ? AND status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Count(&count).Error; err != nil {
 			return store.mapErr(err)
 		}
 		if count != 0 {
@@ -194,7 +194,7 @@ func (e *executionStore) FinalizeAssistantMessage(ctx context.Context, id sessio
 		if err != nil {
 			return err
 		}
-		db := store.dbFor(ctx).Table("messages").Where("id = ? AND session_key = ? AND run_key = ? AND role = ?", []byte(id), sessionKey, runKey, string(session.RoleAssistant)).Updates(map[string]any{"finalized": 1})
+		db := store.dbFor(ctx).Table(store.tableName("messages")).Where("id = ? AND session_key = ? AND run_key = ? AND role = ?", []byte(id), sessionKey, runKey, string(session.RoleAssistant)).Updates(map[string]any{"finalized": 1})
 		if err := db.Error; err != nil {
 			return store.mapErr(err)
 		}

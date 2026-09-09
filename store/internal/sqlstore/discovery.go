@@ -37,7 +37,7 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 	var page session.SessionDiscoveryPage
 	err := s.read(ctx, func(tx *Store) error {
 		var incarnation sql.NullString
-		if err := tx.queryRow(ctx, "SELECT "+tx.boundedColumn("incarnation")+" FROM observation_store WHERE singleton = 1", 32).Scan(&incarnation); err != nil {
+		if err := tx.queryRow(ctx, "SELECT "+tx.boundedColumn("incarnation")+" FROM "+tx.tableName("observation_store")+" WHERE singleton = 1", 32).Scan(&incarnation); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return session.ErrDiscoveryInvalid
 			}
@@ -61,7 +61,7 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 
 // Separate first/continuation statements preserve the composite tuple seek.
 func (s *Store) discoverySQL(continuation bool) string {
-	query := "SELECT " + s.boundedColumn("id") + ", " + s.boundedColumn("workspace_id") + ", " + s.boundedColumn("title") + ", " + s.boundedColumn("created_at") + ", " + s.boundedColumn("updated_at") + ", (" + s.dialect.InvalidScalar("id", true) + " OR " + s.dialect.InvalidScalar("workspace_id", true) + " OR " + s.dialect.InvalidScalar("title", true) + " OR " + s.dialect.InvalidScalar("created_at", false) + " OR " + s.dialect.InvalidScalar("updated_at", false) + ") FROM sessions" + s.dialect.IndexHint("sessions_workspace_created_idx") + " WHERE workspace_id = ?"
+	query := "SELECT " + s.boundedColumn("id") + ", " + s.boundedColumn("workspace_id") + ", " + s.boundedColumn("title") + ", " + s.boundedColumn("created_at") + ", " + s.boundedColumn("updated_at") + ", (" + s.dialect.InvalidScalar("id", true) + " OR " + s.dialect.InvalidScalar("workspace_id", true) + " OR " + s.dialect.InvalidScalar("title", true) + " OR " + s.dialect.InvalidScalar("created_at", false) + " OR " + s.dialect.InvalidScalar("updated_at", false) + ") FROM " + s.tableName("sessions") + s.dialect.IndexHint("sessions_workspace_created_idx") + " WHERE workspace_id = ?"
 	if continuation {
 		query += " AND (created_at, id) < (?, ?)"
 	}

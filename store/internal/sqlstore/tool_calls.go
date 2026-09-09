@@ -38,25 +38,25 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 	// Relation keys are checked together so a valid ID from another run cannot
 	// be smuggled into the owning row.
 	var count int64
-	if err := s.dbFor(ctx).Table("runs").Where("row_key = ? AND session_key = ?", runKey, sessionKey).Count(&count).Error; err != nil || count != 1 {
+	if err := s.dbFor(ctx).Table(s.tableName("runs")).Where("row_key = ? AND session_key = ?", runKey, sessionKey).Count(&count).Error; err != nil || count != 1 {
 		if err != nil {
 			return session.ToolCall{}, s.mapErr(err)
 		}
 		return session.ToolCall{}, session.ErrConflict
 	}
-	if err := s.dbFor(ctx).Table("messages").Where("row_key = ? AND session_key = ? AND run_key = ?", messageKey, sessionKey, runKey).Count(&count).Error; err != nil || count != 1 {
+	if err := s.dbFor(ctx).Table(s.tableName("messages")).Where("row_key = ? AND session_key = ? AND run_key = ?", messageKey, sessionKey, runKey).Count(&count).Error; err != nil || count != 1 {
 		if err != nil {
 			return session.ToolCall{}, s.mapErr(err)
 		}
 		return session.ToolCall{}, session.ErrConflict
 	}
-	if err := s.dbFor(ctx).Table("parts").Where("row_key = ? AND message_key = ? AND session_key = ? AND run_key = ? AND kind = ?", partKey, messageKey, sessionKey, runKey, string(session.PartToolCall)).Count(&count).Error; err != nil || count != 1 {
+	if err := s.dbFor(ctx).Table(s.tableName("parts")).Where("row_key = ? AND message_key = ? AND session_key = ? AND run_key = ? AND kind = ?", partKey, messageKey, sessionKey, runKey, string(session.PartToolCall)).Count(&count).Error; err != nil || count != 1 {
 		if err != nil {
 			return session.ToolCall{}, s.mapErr(err)
 		}
 		return session.ToolCall{}, session.ErrConflict
 	}
-	db := s.dbFor(ctx).Table("tool_calls").Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
+	db := s.dbFor(ctx).Table(s.tableName("tool_calls")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": []byte(record.ID), "session_key": sessionKey, "run_key": runKey,
 		"request_message_key": messageKey, "request_part_key": partKey,
 		"result_message_id": []byte(record.ResultMessageID), "result_part_id": []byte(record.ResultPartID),
@@ -80,7 +80,7 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 }
 
 func (s *Store) toolCallQuery(ctx context.Context) *gorm.DB {
-	return s.dbFor(ctx).Table("tool_calls").Select("tool_calls.row_key, tool_calls.id, tool_calls.session_key, tool_calls.run_key, sessions.id AS session_id, runs.id AS run_id, tool_calls.request_message_key, tool_calls.request_part_key, reqm.id AS request_message_id, reqm.session_key AS request_message_session_key, reqm.run_key AS request_message_run_key, reqp.id AS request_part_id, reqp.message_key AS request_part_message_key, reqp.session_key AS request_part_session_key, reqp.run_key AS request_part_run_key, tool_calls.result_message_id, tool_calls.result_part_id, tool_calls.status, tool_calls.name, tool_calls.claimed_by, tool_calls.claim_token, tool_calls.record").Joins("JOIN sessions ON sessions.row_key = tool_calls.session_key").Joins("JOIN runs ON runs.row_key = tool_calls.run_key").Joins("JOIN messages AS reqm ON reqm.row_key = tool_calls.request_message_key").Joins("JOIN parts AS reqp ON reqp.row_key = tool_calls.request_part_key")
+	return s.dbFor(ctx).Table(s.tableName("tool_calls")).Select("tool_calls.row_key, tool_calls.id, tool_calls.session_key, tool_calls.run_key, sessions.id AS session_id, runs.id AS run_id, tool_calls.request_message_key, tool_calls.request_part_key, reqm.id AS request_message_id, reqm.session_key AS request_message_session_key, reqm.run_key AS request_message_run_key, reqp.id AS request_part_id, reqp.message_key AS request_part_message_key, reqp.session_key AS request_part_session_key, reqp.run_key AS request_part_run_key, tool_calls.result_message_id, tool_calls.result_part_id, tool_calls.status, tool_calls.name, tool_calls.claimed_by, tool_calls.claim_token, tool_calls.record").Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = tool_calls.session_key").Joins("JOIN " + s.tableName("runs") + " ON runs.row_key = tool_calls.run_key").Joins("JOIN " + s.tableName("messages") + " AS reqm ON reqm.row_key = tool_calls.request_message_key").Joins("JOIN " + s.tableName("parts") + " AS reqp ON reqp.row_key = tool_calls.request_part_key")
 }
 
 func (s *Store) GetToolCall(ctx context.Context, id session.ToolCallID) (session.ToolCall, error) {
@@ -145,7 +145,7 @@ func (s *Store) claimToolCall(ctx context.Context, record session.ToolCall) (ses
 	if err != nil {
 		return session.ToolCall{}, err
 	}
-	db := s.dbFor(ctx).Table("tool_calls").Where("row_key = ? AND status = ? AND claimed_by = ? AND claim_token = ?", toolKey, string(session.ToolCallPending), []byte{}, []byte{}).Updates(map[string]any{
+	db := s.dbFor(ctx).Table(s.tableName("tool_calls")).Where("row_key = ? AND status = ? AND claimed_by = ? AND claim_token = ?", toolKey, string(session.ToolCallPending), []byte{}, []byte{}).Updates(map[string]any{
 		"status": string(record.Status), "claimed_by": []byte(record.ClaimedBy), "claim_token": []byte(record.ClaimToken), "record": raw,
 	})
 	if err := db.Error; err != nil {
@@ -189,7 +189,7 @@ func (s *Store) finishToolCall(ctx context.Context, record session.ToolCall) err
 	if err != nil {
 		return err
 	}
-	db := s.dbFor(ctx).Table("tool_calls").Where("row_key = ? AND claimed_by = ? AND claim_token = ? AND status IN ?", toolKey, []byte(record.ClaimedBy), []byte(record.ClaimToken), []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Updates(map[string]any{
+	db := s.dbFor(ctx).Table(s.tableName("tool_calls")).Where("row_key = ? AND claimed_by = ? AND claim_token = ? AND status IN ?", toolKey, []byte(record.ClaimedBy), []byte(record.ClaimToken), []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Updates(map[string]any{
 		"status": string(record.Status), "claimed_by": []byte(record.ClaimedBy), "claim_token": []byte(record.ClaimToken), "record": raw,
 	})
 	if err := db.Error; err != nil {

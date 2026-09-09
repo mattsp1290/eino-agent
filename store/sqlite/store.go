@@ -8,6 +8,7 @@ import (
 	gormsqlite "gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
+	"gorm.io/gorm/schema"
 	modernsqlite "modernc.org/sqlite"
 
 	"github.com/mattsp1290/eino-agent/session"
@@ -35,6 +36,7 @@ func New(ctx context.Context, db *sql.DB) (*Store, error) {
 	}
 	orm, err := gorm.Open(gormsqlite.New(gormsqlite.Config{DriverName: "sqlite", Conn: db}), &gorm.Config{
 		DisableAutomaticPing: true,
+		NamingStrategy:       schema.NamingStrategy{SingularTable: true},
 		Logger:               logger.Discard,
 	})
 	if err != nil {

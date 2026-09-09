@@ -101,7 +101,7 @@ func decodeStoredRecord(raw []byte, dst any) error {
 
 func (s *Store) sessionRowByID(ctx context.Context, id string) (sessionRow, error) {
 	var row sessionRow
-	err := s.dbFor(ctx).Table("sessions").Select("row_key, id, record, workspace_id, title, created_at, updated_at").Where("id = ?", []byte(id)).Take(&row).Error
+	err := s.dbFor(ctx).Table(s.tableName("sessions")).Select("row_key, id, record, workspace_id, title, created_at, updated_at").Where("id = ?", []byte(id)).Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return sessionRow{}, session.ErrNotFound
 	}
@@ -110,7 +110,7 @@ func (s *Store) sessionRowByID(ctx context.Context, id string) (sessionRow, erro
 
 func (s *Store) messageRowByID(ctx context.Context, id string) (messageRow, error) {
 	var row messageRow
-	err := s.dbFor(ctx).Table("messages").Select("row_key, id, session_key, run_key, role, finalized, record, created_at").Where("id = ?", []byte(id)).Take(&row).Error
+	err := s.dbFor(ctx).Table(s.tableName("messages")).Select("row_key, id, session_key, run_key, role, finalized, record, created_at").Where("id = ?", []byte(id)).Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return messageRow{}, session.ErrNotFound
 	}
@@ -119,7 +119,7 @@ func (s *Store) messageRowByID(ctx context.Context, id string) (messageRow, erro
 
 func (s *Store) partRowByID(ctx context.Context, id string) (partRow, error) {
 	var row partRow
-	err := s.dbFor(ctx).Table("parts").Select("row_key, id, message_key, session_key, run_key, ordinal, kind, display_text, text_valid, record, created_at").Where("id = ?", []byte(id)).Take(&row).Error
+	err := s.dbFor(ctx).Table(s.tableName("parts")).Select("row_key, id, message_key, session_key, run_key, ordinal, kind, display_text, text_valid, record, created_at").Where("id = ?", []byte(id)).Take(&row).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return partRow{}, session.ErrNotFound
 	}
@@ -145,9 +145,9 @@ func (s *Store) modelRequestRowByID(ctx context.Context, id string) (modelReques
 }
 
 func (s *Store) contextEpochQuery(ctx context.Context) *gorm.DB {
-	return s.dbFor(ctx).Table("context_epochs").Select("context_epochs.*, sessions.id AS session_id").Joins("JOIN sessions ON sessions.row_key = context_epochs.session_key")
+	return s.dbFor(ctx).Table(s.tableName("context_epochs")).Select("context_epochs.*, sessions.id AS session_id").Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = context_epochs.session_key")
 }
 func (s *Store) modelRequestQuery(ctx context.Context) *gorm.DB {
 	size := s.dialect.ByteLength("model_requests.record")
-	return s.dbFor(ctx).Table("model_requests").Select("model_requests.row_key, model_requests.id, model_requests.session_key, model_requests.run_key, model_requests.assistant_message_id, model_requests.state, model_requests.attempt, model_requests.step, model_requests.created_at, sessions.id AS session_id, runs.id AS run_id, "+size+" AS record_bytes, CASE WHEN "+size+" <= ? THEN model_requests.record END AS record", maxModelRequestRecordBytes).Joins("JOIN sessions ON sessions.row_key = model_requests.session_key").Joins("JOIN runs ON runs.row_key = model_requests.run_key AND runs.session_key = model_requests.session_key")
+	return s.dbFor(ctx).Table(s.tableName("model_requests")).Select("model_requests.row_key, model_requests.id, model_requests.session_key, model_requests.run_key, model_requests.assistant_message_id, model_requests.state, model_requests.attempt, model_requests.step, model_requests.created_at, sessions.id AS session_id, runs.id AS run_id, "+size+" AS record_bytes, CASE WHEN "+size+" <= ? THEN model_requests.record END AS record", maxModelRequestRecordBytes).Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = model_requests.session_key").Joins("JOIN " + s.tableName("runs") + " ON runs.row_key = model_requests.run_key AND runs.session_key = model_requests.session_key")
 }

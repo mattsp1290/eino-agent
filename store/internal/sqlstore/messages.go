@@ -22,7 +22,7 @@ func (s *Store) appendMessage(ctx context.Context, record session.Message) (sess
 	}
 	db := s.dbFor(ctx)
 	var ownerCount int64
-	if err := db.Table("runs").Where("row_key = ? AND session_key = ?", runKey, sessionKey).Count(&ownerCount).Error; err != nil {
+	if err := db.Table(s.tableName("runs")).Where("row_key = ? AND session_key = ?", runKey, sessionKey).Count(&ownerCount).Error; err != nil {
 		return session.Message{}, s.mapErr(err)
 	}
 	if ownerCount != 1 {
@@ -51,7 +51,7 @@ func (s *Store) appendMessage(ctx context.Context, record session.Message) (sess
 	if err != nil {
 		return session.Message{}, err
 	}
-	created := db.Table("messages").Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
+	created := db.Table(s.tableName("messages")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "session_key": sessionKey, "run_key": runKey,
 		"role": string(record.Role), "finalized": record.Role != session.RoleAssistant,
 		"record": raw, "created_at": TimeText(record.CreatedAt),
@@ -99,7 +99,7 @@ func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Pa
 	if err != nil {
 		return session.Part{}, err
 	}
-	created := db.Table("parts").Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
+	created := db.Table(s.tableName("parts")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "message_key": messageKey, "session_key": sessionKey,
 		"run_key": runKey, "ordinal": record.Ordinal, "kind": string(record.Kind),
 		"display_text": []byte(text), "text_valid": valid, "record": raw,
@@ -128,7 +128,7 @@ func (s *Store) updatePart(ctx context.Context, record session.Part) error {
 	if err != nil {
 		return err
 	}
-	db := s.dbFor(ctx).Table("parts").Where("id = ? AND session_key = ? AND run_key = ? AND message_key = ?",
+	db := s.dbFor(ctx).Table(s.tableName("parts")).Where("id = ? AND session_key = ? AND run_key = ? AND message_key = ?",
 		publicID(record.ID), sessionKey, runKey, messageKey).Updates(map[string]any{
 		"ordinal": record.Ordinal, "kind": string(record.Kind), "display_text": []byte(text),
 		"text_valid": valid, "record": raw, "created_at": TimeText(record.CreatedAt),
@@ -151,7 +151,7 @@ func (s *Store) validatedPartOwnerKeys(ctx context.Context, record session.Part)
 		SessionKey int64 `gorm:"column:session_key"`
 		RunKey     int64 `gorm:"column:run_key"`
 	}
-	result := s.dbFor(ctx).Table("messages").Select("session_key, run_key").Where("row_key = ?", messageKey).Take(&owner)
+	result := s.dbFor(ctx).Table(s.tableName("messages")).Select("session_key, run_key").Where("row_key = ?", messageKey).Take(&owner)
 	if result.Error != nil {
 		mapped := s.mapErr(result.Error)
 		if errors.Is(mapped, session.ErrNotFound) {
@@ -203,7 +203,7 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 	args := []any{sessionKey}
 	if cursor.AfterMessageID != "" {
 		var after messageRow
-		result := s.dbFor(ctx).Table("messages AS m").Select("m.id, m.session_key, m.run_key, m.role, m.finalized, m.record, m.created_at").Where("m.id = ? AND m.session_key = ?", publicID(cursor.AfterMessageID), sessionKey).Take(&after)
+		result := s.dbFor(ctx).Table(s.tableName("messages")+" AS m").Select("m.id, m.session_key, m.run_key, m.role, m.finalized, m.record, m.created_at").Where("m.id = ? AND m.session_key = ?", publicID(cursor.AfterMessageID), sessionKey).Take(&after)
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return session.ReplayBatch{}, session.ErrNotFound
 		}
@@ -233,10 +233,10 @@ func (s *Store) ListMessages(ctx context.Context, sessionID session.ID, cursor s
 }
 
 func (s *Store) replayMessageQuery(ctx context.Context) *gorm.DB {
-	return s.dbFor(ctx).Table("messages AS m").
+	return s.dbFor(ctx).Table(s.tableName("messages") + " AS m").
 		Select("m.id, s.id AS session_id, r.id AS run_id, m.role, m.record, m.created_at").
-		Joins("JOIN sessions AS s ON s.row_key = m.session_key").
-		Joins("JOIN runs AS r ON r.row_key = m.run_key")
+		Joins("JOIN " + s.tableName("sessions") + " AS s ON s.row_key = m.session_key").
+		Joins("JOIN " + s.tableName("runs") + " AS r ON r.row_key = m.run_key")
 }
 
 func (s *Store) loadReplayMessages(ctx context.Context, limit int, where string, args ...any) ([]session.Message, []session.MessageID, error) {
@@ -271,7 +271,7 @@ func (s *Store) loadReplayParts(ctx context.Context, messageIDs []session.Messag
 		keys[i] = key
 	}
 	var rows []replayPartRow
-	db := s.dbFor(ctx).Table("parts AS p").Select("p.id, m.id AS message_id, s.id AS session_id, r.id AS run_id, p.ordinal, p.record").Joins("JOIN messages AS m ON m.row_key = p.message_key").Joins("JOIN sessions AS s ON s.row_key = p.session_key").Joins("JOIN runs AS r ON r.row_key = p.run_key").Where("p.message_key IN ?", keys).Order("m.created_at, m.id, p.ordinal, p.id")
+	db := s.dbFor(ctx).Table(s.tableName("parts")+" AS p").Select("p.id, m.id AS message_id, s.id AS session_id, r.id AS run_id, p.ordinal, p.record").Joins("JOIN "+s.tableName("messages")+" AS m ON m.row_key = p.message_key").Joins("JOIN "+s.tableName("sessions")+" AS s ON s.row_key = p.session_key").Joins("JOIN "+s.tableName("runs")+" AS r ON r.row_key = p.run_key").Where("p.message_key IN ?", keys).Order("m.created_at, m.id, p.ordinal, p.id")
 	if err := s.mapErr(db.Find(&rows).Error); err != nil {
 		return nil, nil, err
 	}
