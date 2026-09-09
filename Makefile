@@ -133,6 +133,8 @@ POSTGRES_REQUIRED_SUITES += $(POSTGRES_REPLAY_SUITE) $(addprefix $(POSTGRES_REPL
 POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_REPLAY_SUITE)/private_bounds/,items bytes owner)
 POSTGRES_RUNTIME_SUITE := github.com/mattsp1290/eino-agent/runtime:TestPostgresRuntime
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_RUNTIME_SUITE) $(addprefix $(POSTGRES_RUNTIME_SUITE)/,admission admission_rollback pending_resume optional_references)
+POSTGRES_RESTART_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresRestart
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_RESTART_SUITE) $(addprefix $(POSTGRES_RESTART_SUITE)/,host container)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'

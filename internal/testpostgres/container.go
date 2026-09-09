@@ -31,14 +31,16 @@ const (
 // Server owns one PostgreSQL container and the admin pool used to provision
 // disposable databases within it.
 type Server struct {
-	admin    *sql.DB
-	adminDSN string
+	admin     *sql.DB
+	adminDSN  string
+	container *postgres.PostgresContainer
 }
 
 // Database is a fresh database owned by a Server. Its connection string is
 // private so fixtures cannot accidentally expose credentials in test output.
 type Database struct {
-	dsn string
+	server *Server
+	name   string
 }
 
 // Start starts a PostgreSQL 17 container and registers all cleanup needed for
@@ -89,12 +91,64 @@ func Start(t *testing.T) *Server {
 		t.Fatalf("postgres fixture: connection endpoint lookup failed")
 	}
 
-	admin := openPool(t, adminDSN)
-
-	return &Server{
-		admin:    admin,
-		adminDSN: adminDSN,
+	server := &Server{
+		adminDSN:  adminDSN,
+		container: container,
 	}
+	// The current admin pool belongs to the server's test, so replacement
+	// pools outlive child database cleanup after a restart.
+	t.Cleanup(func() {
+		if server.admin != nil {
+			if err := server.admin.Close(); err != nil {
+				t.Error("postgres fixture: admin pool cleanup failed")
+			}
+		}
+	})
+	server.openAdmin(t)
+	return server
+}
+
+// Restart stops and starts the same container, retaining its data directory.
+// Callers must close all database pools first and must not run other cases on
+// this server concurrently. Existing Database handles resolve the new endpoint.
+func (s *Server) Restart(t *testing.T) {
+	t.Helper()
+	if err := s.admin.Close(); err != nil {
+		t.Fatal("postgres fixture: close admin before restart failed")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), startupTimeout)
+	defer cancel()
+	// A zero grace period exercises recovery across an abrupt container stop.
+	grace := time.Duration(0)
+	if err := s.container.Stop(ctx, &grace); err != nil {
+		t.Fatal("postgres fixture: container stop failed")
+	}
+	if err := s.container.Start(ctx); err != nil {
+		t.Fatal("postgres fixture: container restart failed")
+	}
+	dsn, err := s.container.ConnectionString(ctx, "sslmode=disable")
+	if err != nil {
+		t.Fatal("postgres fixture: restarted endpoint lookup failed")
+	}
+	s.adminDSN = dsn
+	// Startup logs survive a restart, so require a fresh successful SQL query
+	// before opening the replacement admin pool.
+	ready := wait.ForSQL("5432/tcp", "pgx", func(string, string) string { return dsn }).WithStartupTimeout(startupTimeout)
+	if err := ready.WaitUntilReady(ctx, s.container); err != nil {
+		t.Fatal("postgres fixture: restarted database readiness failed")
+	}
+	s.openAdmin(t)
+}
+
+func (s *Server) openAdmin(t *testing.T) {
+	t.Helper()
+	pool, err := sql.Open("pgx", s.adminDSN)
+	if err != nil {
+		t.Fatal("postgres fixture: admin pool open failed")
+	}
+	// Assign before ping so the server cleanup owns even a partially opened pool.
+	s.admin = pool
+	pingPool(t, pool)
 }
 
 // Database creates and owns a fresh database for one test case. The database
@@ -112,8 +166,8 @@ func (s *Server) Database(t *testing.T) *Database {
 	}
 
 	// Open pools are registered after this cleanup and therefore close before
-	// the database is dropped. Register it before parsing the private DSN so a
-	// later setup failure still removes the acquired database.
+	// the database is dropped. Register cleanup before returning the handle so
+	// a later setup failure still removes the acquired database.
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 		defer cancel()
@@ -122,12 +176,17 @@ func (s *Server) Database(t *testing.T) *Database {
 		}
 	})
 
-	parsed, err := url.Parse(s.adminDSN)
+	return &Database{server: s, name: name}
+}
+
+func (d *Database) connectionString(t *testing.T) string {
+	t.Helper()
+	parsed, err := url.Parse(d.server.adminDSN)
 	if err != nil {
 		t.Fatalf("postgres fixture: database connection setup failed")
 	}
-	parsed.Path = "/" + name
-	return &Database{dsn: parsed.String()}
+	parsed.Path = "/" + d.name
+	return parsed.String()
 }
 
 // Open opens an independent pgx database/sql pool for this database. Each
@@ -135,7 +194,7 @@ func (s *Server) Database(t *testing.T) *Database {
 func (d *Database) Open(t *testing.T) *sql.DB {
 	t.Helper()
 
-	return openPool(t, d.dsn)
+	return openPool(t, d.connectionString(t))
 }
 
 // OpenPGX opens an independent native pool for testing the database/sql bridge.
@@ -144,7 +203,7 @@ func (d *Database) OpenPGX(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), operationTimeout)
 	defer cancel()
-	pool, err := pgxpool.New(ctx, d.dsn)
+	pool, err := pgxpool.New(ctx, d.connectionString(t))
 	if err != nil {
 		t.Fatal("postgres fixture: native pool open failed")
 	}
@@ -167,11 +226,16 @@ func openPool(t *testing.T, dsn string) *sql.DB {
 		}
 	})
 
+	pingPool(t, db)
+	return db
+}
+
+func pingPool(t *testing.T, db *sql.DB) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), operationTimeout)
-	err = db.PingContext(ctx)
+	err := db.PingContext(ctx)
 	cancel()
 	if err != nil {
 		t.Fatalf("postgres fixture: pool ping failed")
 	}
-	return db
 }
