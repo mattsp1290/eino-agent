@@ -17,6 +17,7 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
@@ -57,7 +58,12 @@ func Start(t *testing.T) *Server {
 		testcontainers.WithEnv(map[string]string{
 			"POSTGRES_INITDB_ARGS": "--locale=en_US.utf8 --encoding=UTF8",
 		}),
-		postgres.BasicWaitStrategies(),
+		// Preserve the module's two readiness checks, using this fixture's
+		// startup budget instead of the strategies' one-minute defaults.
+		testcontainers.WithAdditionalWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(startupTimeout),
+			wait.ForListeningPort("5432/tcp").WithStartupTimeout(startupTimeout),
+		),
 	)
 
 	// postgres.Run may return a usable container together with an error during

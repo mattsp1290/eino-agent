@@ -246,14 +246,13 @@ func testDelayedWriter(t *testing.T, server *testpostgres.Server) {
 			}
 		})
 	}()
-	waitRace(t, f.ctx, func() (bool, error) {
-		select {
-		case <-locked:
-			return true, nil
-		default:
-			return false, nil
-		}
-	})
+	select {
+	case <-locked:
+	case err := <-writerResult:
+		t.Fatalf("writer completed before acquiring its lock: %v", err)
+	case <-workerCtx.Done():
+		t.Fatal(workerCtx.Err())
+	}
 	reclaimResult := make(chan error, 1)
 	workers.Add(1)
 	go func() {

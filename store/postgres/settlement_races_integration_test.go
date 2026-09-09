@@ -220,7 +220,8 @@ func testToolTransitionRace(t *testing.T, server *testpostgres.Server) {
 				conflict := mode == "contradictory"
 				create := pendingToolRequest(f.now, "pending")
 				creates := []session.CreateToolCallRequest{create, create}
-				claim := session.ClaimToolCallRequest{ID: "tool", ClaimedBy: "worker", ClaimToken: "tool-old", StartedAt: f.now.Add(time.Second), LeaseDuration: time.Minute, Event: session.ToolTransitionEvent{ID: "running", CreatedAt: f.now.Add(time.Second)}}
+				claimAt := f.now.Add(2 * time.Second)
+				claim := session.ClaimToolCallRequest{ID: "tool", ClaimedBy: "worker", ClaimToken: "tool-old", StartedAt: claimAt, LeaseDuration: time.Minute, Event: session.ToolTransitionEvent{ID: "running", CreatedAt: claimAt}}
 				claims := []session.ClaimToolCallRequest{claim, claim}
 				if conflict {
 					creates[1].Call.Name = "other"
