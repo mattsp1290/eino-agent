@@ -33,7 +33,7 @@ func (s *Store) AdmitRun(ctx context.Context, record session.Run, leaseDuration 
 		if err != nil {
 			return err
 		}
-		db := st.dbFor(ctx).Table("runs").Clauses(clause.OnConflict{DoNothing: true})
+		db := st.dbFor(ctx).Table(st.tableName("runs")).Clauses(clause.OnConflict{DoNothing: true})
 		row := map[string]any{
 			"id": []byte(record.ID), "session_key": sessionKey, "status": string(record.Status),
 			"provider_id": []byte(record.ProviderID), "model_id": []byte(record.ModelID),
@@ -73,7 +73,7 @@ func (s *Store) ActiveRun(ctx context.Context, sessionID session.ID) (session.Ru
 }
 
 func (s *Store) runQuery(ctx context.Context) *gorm.DB {
-	return s.dbFor(ctx).Table("runs").Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN sessions ON sessions.row_key = runs.session_key")
+	return s.dbFor(ctx).Table(s.tableName("runs")).Select("runs.row_key, runs.id, runs.session_key, sessions.id AS session_id, runs.status, runs.provider_id, runs.model_id, runs.owner_id, runs.claim_token, runs.lease_until, runs.record, runs.created_at").Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = runs.session_key")
 }
 
 func (s *Store) activeRun(ctx context.Context, sessionID session.ID) (session.Run, error) {
@@ -138,7 +138,7 @@ func (s *Store) ClaimRun(ctx context.Context, claim session.RunClaim) (session.R
 		}
 		// The conditional update is evaluated against the database clock. The
 		// prior read is informational only; it is never used to authorize claim.
-		db := st.dbFor(ctx).Table("runs").Where("id = ? AND status IN ? AND lease_until <= "+st.dialect.ClockSQL(), []byte(claim.RunID), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+		db := st.dbFor(ctx).Table(st.tableName("runs")).Where("id = ? AND status IN ? AND lease_until <= "+st.dialect.ClockSQL(), []byte(claim.RunID), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
 			"status": string(session.RunRunning), "owner_id": []byte(claim.OwnerID), "claim_token": []byte(claim.ClaimToken), "record": raw,
 			"lease_until": gorm.Expr(st.dialect.ClockSQL()+" + ?", durationMicros(claim.LeaseDuration)),
 		})
@@ -174,7 +174,7 @@ func (s *Store) writeRun(ctx context.Context, record session.Run) error {
 	if err != nil {
 		return err
 	}
-	db := s.dbFor(ctx).Table("runs").Where("id = ? AND claim_token = ? AND status IN ?", []byte(record.ID), []byte(record.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+	db := s.dbFor(ctx).Table(s.tableName("runs")).Where("id = ? AND claim_token = ? AND status IN ?", []byte(record.ID), []byte(record.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
 		"status": string(record.Status), "owner_id": []byte(record.OwnerID), "claim_token": []byte(record.ClaimToken),
 		"provider_id": []byte(record.ProviderID), "model_id": []byte(record.ModelID), "record": raw,
 	})

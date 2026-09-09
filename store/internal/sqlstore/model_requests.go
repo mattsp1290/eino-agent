@@ -48,7 +48,7 @@ func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequ
 	if len(raw) > maxModelRequestRecordBytes {
 		return session.ModelRequestRecord{}, session.ErrModelRequestTooLarge
 	}
-	created := db.Table("model_requests").Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
+	created := db.Table(s.tableName("model_requests")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "session_key": sessionKey, "run_key": runKey,
 		"assistant_message_id": publicID(record.AssistantMessageID), "state": string(record.State),
 		"attempt": record.Attempt, "step": record.Step, "record": raw,
@@ -105,7 +105,7 @@ func (s *Store) updateModelRequest(ctx context.Context, record session.ModelRequ
 	if len(raw) > maxModelRequestRecordBytes {
 		return session.ErrModelRequestTooLarge
 	}
-	db := s.dbFor(ctx).Table("model_requests").Where("id = ? AND state = ?", publicID(record.ID), string(current.State)).Updates(map[string]any{
+	db := s.dbFor(ctx).Table(s.tableName("model_requests")).Where("id = ? AND state = ?", publicID(record.ID), string(current.State)).Updates(map[string]any{
 		"state": string(record.State), "record": raw,
 	})
 	if err := s.mapErr(db.Error); err != nil {
@@ -194,7 +194,7 @@ func (s *Store) modelRequestOwnerKeys(ctx context.Context, sessionID session.ID,
 	var owner struct {
 		SessionKey int64 `gorm:"column:session_key"`
 	}
-	result := s.dbFor(ctx).Table("runs").Select("session_key").Where("row_key = ?", runKey).Take(&owner)
+	result := s.dbFor(ctx).Table(s.tableName("runs")).Select("session_key").Where("row_key = ?", runKey).Take(&owner)
 	if errors.Is(result.Error, gorm.ErrRecordNotFound) || result.Error != nil {
 		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
 			return 0, 0, session.ErrNotFound

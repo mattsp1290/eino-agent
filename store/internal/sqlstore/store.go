@@ -52,7 +52,7 @@ func (s *Store) mapErr(err error) error {
 
 func (s *Store) key(ctx context.Context, table, id string) (int64, error) {
 	var row struct{ RowKey int64 }
-	err := s.dbFor(ctx).Table(table).Select("row_key").Where("id = ?", []byte(id)).Take(&row).Error
+	err := s.dbFor(ctx).Table(s.tableName(table)).Select("row_key").Where("id = ?", []byte(id)).Take(&row).Error
 	return row.RowKey, s.mapErr(err)
 }
 
@@ -70,12 +70,16 @@ func durationMicros(duration time.Duration) int64 { return max(1, duration.Micro
 
 type rowScanner interface{ Scan(...any) error }
 
+// tableName applies the controlled backend naming strategy to fixed internal names.
+// Adapters use SingularTable so singleton names such as observation_store stay exact.
+func (s *Store) tableName(name string) string { return s.db.NamingStrategy.TableName(name) }
+
 func (s *Store) query(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return s.dbFor(ctx).Statement.ConnPool.QueryContext(ctx, query, args...)
+	return s.dbFor(ctx).Raw(query, args...).Rows()
 }
 
 func (s *Store) queryRow(ctx context.Context, query string, args ...any) *sql.Row {
-	return s.dbFor(ctx).Statement.ConnPool.QueryRowContext(ctx, query, args...)
+	return s.dbFor(ctx).Raw(query, args...).Row()
 }
 
 func (s *Store) read(ctx context.Context, read func(*Store) error) error {

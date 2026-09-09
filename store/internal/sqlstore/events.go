@@ -60,7 +60,7 @@ func (s *Store) insertEvent(ctx context.Context, record session.EventRecord, can
 		row["tool_key"] = toolKey
 		row["tool_transition"] = string(record.ToolTransition)
 	}
-	db := s.dbFor(ctx).Table("events").Clauses(clause.OnConflict{DoNothing: true}).Create(row)
+	db := s.dbFor(ctx).Table(s.tableName("events")).Clauses(clause.OnConflict{DoNothing: true}).Create(row)
 	if err := db.Error; err != nil {
 		return session.EventRecord{}, s.mapErr(err)
 	}
@@ -102,7 +102,7 @@ func (s *Store) insertEvent(ctx context.Context, record session.EventRecord, can
 }
 
 func (s *Store) eventQuery(ctx context.Context) *gorm.DB {
-	return s.dbFor(ctx).Table("events").Select("events.row_key, events.id, events.session_key, events.run_key, sessions.id AS session_id, runs.id AS run_id, events.tool_key, tool_calls.id AS tool_call_id, tool_calls.session_key AS tool_session_key, tool_calls.run_key AS tool_run_key, events.kind, events.tool_transition, events.record, events.created_at").Joins("JOIN sessions ON sessions.row_key = events.session_key").Joins("JOIN runs ON runs.row_key = events.run_key").Joins("LEFT JOIN tool_calls ON tool_calls.row_key = events.tool_key")
+	return s.dbFor(ctx).Table(s.tableName("events")).Select("events.row_key, events.id, events.session_key, events.run_key, sessions.id AS session_id, runs.id AS run_id, events.tool_key, tool_calls.id AS tool_call_id, tool_calls.session_key AS tool_session_key, tool_calls.run_key AS tool_run_key, events.kind, events.tool_transition, events.record, events.created_at").Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = events.session_key").Joins("JOIN " + s.tableName("runs") + " ON runs.row_key = events.run_key").Joins("LEFT JOIN " + s.tableName("tool_calls") + " ON tool_calls.row_key = events.tool_key")
 }
 
 func (s *Store) eventByID(ctx context.Context, id session.EventID) (session.EventRecord, error) {

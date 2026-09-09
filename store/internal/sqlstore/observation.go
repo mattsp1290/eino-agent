@@ -35,7 +35,7 @@ func (s *Store) revision(ctx context.Context, id session.ID) (session.Observatio
 	w := session.ObservationWatermark{SessionID: id}
 	var exists bool
 	var incarnation sql.NullString
-	err := s.queryRow(ctx, "SELECT "+s.boundedColumn("incarnation")+", COALESCE((SELECT revision FROM observation_revisions WHERE session_id = ?), 0), EXISTS(SELECT 1 FROM sessions WHERE id = ?) FROM observation_store WHERE singleton = 1", 32, []byte(id), []byte(id)).Scan(&incarnation, &w.Revision, &exists)
+	err := s.queryRow(ctx, "SELECT "+s.boundedColumn("incarnation")+", COALESCE((SELECT revision FROM "+s.tableName("observation_revisions")+" WHERE session_id = ?), 0), EXISTS(SELECT 1 FROM "+s.tableName("sessions")+" WHERE id = ?) FROM "+s.tableName("observation_store")+" WHERE singleton = 1", 32, []byte(id), []byte(id)).Scan(&incarnation, &w.Revision, &exists)
 	if err == nil && (!incarnation.Valid || !ValidDiscoveryIncarnation(incarnation.String)) {
 		err = session.ErrObservationInvalid
 	}
@@ -96,7 +96,7 @@ func (s *Store) boundedColumn(column string) string {
 	return "CASE WHEN " + s.dialect.ByteLength(column) + " <= ? THEN " + column + " ELSE NULL END"
 }
 func (s *Store) observationMessages(ctx context.Context, out *session.ObservationSnapshot, l session.ObservationLimits, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("m.id")+", "+s.boundedColumn("r.id")+", m.role, m.finalized, COALESCE(r.session_key = m.session_key, FALSE) FROM messages AS m"+s.dialect.IndexHint("messages_observation_idx")+" LEFT JOIN runs AS r ON r.row_key = m.run_key WHERE m.session_key = (SELECT row_key FROM sessions WHERE id = ?) AND m.role IN ('user', 'assistant') ORDER BY m.created_at DESC, m.id DESC LIMIT ?", b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), l.MaxMessages+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("m.id")+", "+s.boundedColumn("r.id")+", m.role, m.finalized, COALESCE(r.session_key = m.session_key, FALSE) FROM "+s.tableName("messages")+" AS m"+s.dialect.IndexHint("messages_observation_idx")+" LEFT JOIN "+s.tableName("runs")+" AS r ON r.row_key = m.run_key WHERE m.session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND m.role IN ('user', 'assistant') ORDER BY m.created_at DESC, m.id DESC LIMIT ?", b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), l.MaxMessages+1)
 	if err != nil {
 		return err
 	}
@@ -145,7 +145,7 @@ func (s *Store) observationMessages(ctx context.Context, out *session.Observatio
 	return nil
 }
 func (s *Store) observationParts(ctx context.Context, id session.ID, m *session.ObservationMessage, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("display_text")+", text_valid, COALESCE(run_key = (SELECT row_key FROM runs WHERE id = ?), FALSE) FROM parts"+s.dialect.IndexHint("parts_observation_idx")+" WHERE session_key = (SELECT row_key FROM sessions WHERE id = ?) AND message_key = (SELECT row_key FROM messages WHERE id = ?) AND kind = 'text' ORDER BY ordinal,id LIMIT ?", min(b.text, b.bytes/6), []byte(m.RunID), []byte(id), []byte(m.ID), b.parts+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("display_text")+", text_valid, COALESCE(run_key = (SELECT row_key FROM "+s.tableName("runs")+" WHERE id = ?), FALSE) FROM "+s.tableName("parts")+""+s.dialect.IndexHint("parts_observation_idx")+" WHERE session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND message_key = (SELECT row_key FROM "+s.tableName("messages")+" WHERE id = ?) AND kind = 'text' ORDER BY ordinal,id LIMIT ?", min(b.text, b.bytes/6), []byte(m.RunID), []byte(id), []byte(m.ID), b.parts+1)
 	if err != nil {
 		return err
 	}
@@ -185,7 +185,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		ids[m.RunID] = true
 	}
 	var active sql.NullString
-	if err := s.queryRow(ctx, "SELECT "+s.boundedColumn("id")+" FROM runs WHERE session_key = (SELECT row_key FROM sessions WHERE id = ?) AND status IN ('pending','running') LIMIT 1", b.bytes/6, []byte(out.Watermark.SessionID)).Scan(&active); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.queryRow(ctx, "SELECT "+s.boundedColumn("id")+" FROM "+s.tableName("runs")+" WHERE session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND status IN ('pending','running') LIMIT 1", b.bytes/6, []byte(out.Watermark.SessionID)).Scan(&active); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	} else if err == nil {
 		if !active.Valid {
@@ -202,7 +202,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		r := session.ObservationRun{ID: id}
 		var provider, model, status sql.NullString
 		var lease int64
-		err := s.queryRow(ctx, "SELECT "+s.boundedColumn("status")+", "+s.boundedColumn("provider_id")+", "+s.boundedColumn("model_id")+", lease_until FROM runs WHERE id = ? AND session_key = (SELECT row_key FROM sessions WHERE id = ?)", b.bytes/6, b.bytes/6, b.bytes/6, []byte(id), []byte(out.Watermark.SessionID)).Scan(&status, &provider, &model, &lease)
+		err := s.queryRow(ctx, "SELECT "+s.boundedColumn("status")+", "+s.boundedColumn("provider_id")+", "+s.boundedColumn("model_id")+", lease_until FROM "+s.tableName("runs")+" WHERE id = ? AND session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?)", b.bytes/6, b.bytes/6, b.bytes/6, []byte(id), []byte(out.Watermark.SessionID)).Scan(&status, &provider, &model, &lease)
 		if errors.Is(err, sql.ErrNoRows) {
 			return session.ErrObservationInvalid
 		}
@@ -236,7 +236,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 	return nil
 }
 func (s *Store) observationTools(ctx context.Context, out *session.ObservationSnapshot, id session.RunID, l session.ObservationLimits, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("t.id")+", "+s.boundedColumn("m.id")+", "+s.boundedColumn("t.name")+", "+s.boundedColumn("t.status")+", COALESCE(m.session_key = t.session_key AND m.run_key = t.run_key, FALSE) FROM tool_calls AS t"+s.dialect.IndexHint("tools_observation_idx")+" LEFT JOIN messages AS m ON m.row_key = t.request_message_key WHERE t.session_key = (SELECT row_key FROM sessions WHERE id = ?) AND t.run_key = (SELECT row_key FROM runs WHERE id = ?) ORDER BY t.id LIMIT ?", b.bytes/6, b.bytes/6, b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), []byte(id), l.MaxTools-len(out.Tools)+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("t.id")+", "+s.boundedColumn("m.id")+", "+s.boundedColumn("t.name")+", "+s.boundedColumn("t.status")+", COALESCE(m.session_key = t.session_key AND m.run_key = t.run_key, FALSE) FROM "+s.tableName("tool_calls")+" AS t"+s.dialect.IndexHint("tools_observation_idx")+" LEFT JOIN "+s.tableName("messages")+" AS m ON m.row_key = t.request_message_key WHERE t.session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND t.run_key = (SELECT row_key FROM "+s.tableName("runs")+" WHERE id = ?) ORDER BY t.id LIMIT ?", b.bytes/6, b.bytes/6, b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), []byte(id), l.MaxTools-len(out.Tools)+1)
 	if err != nil {
 		return err
 	}

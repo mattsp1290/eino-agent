@@ -39,7 +39,7 @@ func (s *Store) startContextEpoch(ctx context.Context, record session.ContextEpo
 	if err != nil {
 		return session.ContextEpoch{}, err
 	}
-	created := db.Table("context_epochs").Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
+	created := db.Table(s.tableName("context_epochs")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "session_key": sessionKey, "record": raw,
 		"created_at": TimeText(record.CreatedAt), "closed_at": TimeText(record.ClosedAt),
 	})
@@ -69,7 +69,7 @@ func (s *Store) finishContextEpoch(ctx context.Context, record session.ContextEp
 	if err != nil {
 		return err
 	}
-	db := s.dbFor(ctx).Table("context_epochs").Where("id = ? AND session_key = ?", publicID(record.ID), sessionKey).Updates(map[string]any{
+	db := s.dbFor(ctx).Table(s.tableName("context_epochs")).Where("id = ? AND session_key = ?", publicID(record.ID), sessionKey).Updates(map[string]any{
 		"record": raw, "closed_at": TimeText(record.ClosedAt), "created_at": TimeText(record.CreatedAt),
 	})
 	if err := s.mapErr(db.Error); err != nil {
