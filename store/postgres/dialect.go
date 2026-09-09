@@ -6,7 +6,9 @@ import (
 	"errors"
 	"sync"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
@@ -56,21 +58,11 @@ func (postgresDialect) Read(ctx context.Context, pool *sql.DB, read func(sqlstor
 	if err != nil {
 		return err
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
-			err = errors.Join(err, tx.Rollback(cleanup))
-			cancel()
-		}
-		err = errors.Join(err, tx.Close())
-	}()
+	defer func() { err = errors.Join(err, tx.Close()) }()
 	if err = read(tx); err != nil {
 		return err
 	}
-	err = tx.Commit(ctx)
-	committed = err == nil
-	return err
+	return tx.Commit(ctx)
 }
 
 func beginTransaction(ctx context.Context, pool *sql.DB, statement string) (*postgresTransaction, error) {
@@ -104,13 +96,31 @@ func (t *postgresTransaction) Commit(ctx context.Context) error {
 	if !t.active {
 		return sql.ErrTxDone
 	}
-	_, err := t.ExecContext(ctx, "COMMIT")
+	tag, err := commitPGX(ctx, t.Conn)
 	t.active = false
 	if err != nil {
 		t.closed = true
 		return errors.Join(err, ctx.Err(), discardAndClose(t.Conn))
 	}
+	if tag.String() == "ROLLBACK" {
+		return pgx.ErrTxCommitRollback
+	}
 	return nil
+}
+
+// commitPGX preserves PostgreSQL's COMMIT command tag. database/sql's
+// ExecContext exposes only RowsAffected, losing the ROLLBACK tag PostgreSQL
+// returns when a transaction was already aborted by an earlier statement.
+func commitPGX(ctx context.Context, conn *sql.Conn) (tag pgconn.CommandTag, err error) {
+	err = conn.Raw(func(raw any) error {
+		stdlibConn, ok := raw.(*stdlib.Conn)
+		if !ok || stdlibConn.Conn() == nil {
+			return errors.New("postgres transaction requires the pgx stdlib driver")
+		}
+		tag, err = stdlibConn.Conn().Exec(ctx, "COMMIT")
+		return err
+	})
+	return tag, errors.Join(err, ctx.Err())
 }
 
 func (t *postgresTransaction) Rollback(ctx context.Context) error {

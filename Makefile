@@ -109,7 +109,7 @@ POSTGRES_REQUIRED_SUITES += $(POSTGRES_MIGRATION_SUITE) $(addprefix $(POSTGRES_M
 POSTGRES_STORE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresStore
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_STORE_SUITE) $(addprefix $(POSTGRES_STORE_SUITE)/,contract discovery)
 POSTGRES_LIFECYCLE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresStoreLifecycle
-POSTGRES_REQUIRED_SUITES += $(POSTGRES_LIFECYCLE_SUITE) $(addprefix $(POSTGRES_LIFECYCLE_SUITE)/,readonly_constructor empty_schema nil_closed_canceled reopen_incarnation host_pool_settings transaction_visibility)
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_LIFECYCLE_SUITE) $(addprefix $(POSTGRES_LIFECYCLE_SUITE)/,readonly_constructor empty_schema nil_closed_canceled reopen_incarnation host_pool_settings transaction_visibility commit_rollback_tag)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'

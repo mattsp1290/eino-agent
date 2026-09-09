@@ -21,6 +21,7 @@ func TestPostgresStoreLifecycle(t *testing.T) {
 	t.Run("reopen_incarnation", func(t *testing.T) { testReopenIncarnation(t, server) })
 	t.Run("host_pool_settings", func(t *testing.T) { testHostStateUnchanged(t, server) })
 	t.Run("transaction_visibility", func(t *testing.T) { testTransactionVisibility(t, server) })
+	t.Run("commit_rollback_tag", func(t *testing.T) { testCommitRollbackTag(t, server) })
 }
 
 func publicCatalogMarker(t *testing.T, db *sql.DB) string {
