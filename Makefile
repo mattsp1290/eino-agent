@@ -122,6 +122,9 @@ POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_TRANSACTION_SUITE)/execution/
 POSTGRES_ATOMICITY_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresAtomicity
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_ATOMICITY_SUITE) $(addprefix $(POSTGRES_ATOMICITY_SUITE)/mutation/,event result_part model_request revision)
 POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_ATOMICITY_SUITE)/cleanup/,terminated_backend_poison rollback_cleanup release_cleanup)
+POSTGRES_REPLAY_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresReplay
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_REPLAY_SUITE) $(addprefix $(POSTGRES_REPLAY_SUITE)/,messages_parts events_models provider_bytes private_bounds canonical_time)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_REPLAY_SUITE)/private_bounds/,items bytes owner)
 .PHONY: postgres-test postgres-race
 postgres-test:
 	bash -o pipefail -c 'go test -json -tags=postgres_integration -count=1 -timeout=15m ./store/postgres ./runtime | python3 -u internal/testpostgres/check_output.py $(POSTGRES_REQUIRED_SUITES)'
