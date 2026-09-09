@@ -40,10 +40,9 @@ func testEventAtomicity(t *testing.T, server *testpostgres.Server) {
 	installAtomicityTrigger(t, f, "events", "events_atomicity_fault", "NEW.id = "+byteaLiteral(string(target)), "event mutation fault")
 	request := session.SettleRunRequest{Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: f.now.Add(time.Minute)}, Event: session.RunSettlementEvent{ID: target}}
 	fence := session.RunFence{RunID: "run", ClaimToken: "old"}
-	runAtomicityCase(t, f, baseline, fence, func(ctx context.Context, ex session.ExecutionStore) error {
+	runAtomicityCase(t, f, baseline, fence, "event mutation fault", func(ctx context.Context, ex session.ExecutionStore) error {
 		_, err := ex.SettleRun(ctx, request)
-		assertInjectedError(t, err, "event mutation fault")
-		return nil
+		return err
 	})
 	removeAtomicityTrigger(t, f, "events", "events_atomicity_fault")
 	if _, err := f.stores[0].Execution(fence).SettleRun(f.ctx, request); err != nil {
@@ -65,10 +64,9 @@ func testResultPartAtomicity(t *testing.T, server *testpostgres.Server) {
 	installAtomicityTrigger(t, f, "parts", "parts_atomicity_fault", "NEW.id = "+byteaLiteral(string(resultPart)), "result part mutation fault")
 	request := toolSettlement(call, f.now.Add(time.Minute), session.ToolCallCompleted, json.RawMessage(`{"ok":true}`), "", "atomicity-failed-terminal")
 	fence := session.RunFence{RunID: "run", ClaimToken: "old"}
-	runAtomicityCase(t, f, baseline, fence, func(ctx context.Context, ex session.ExecutionStore) error {
+	runAtomicityCase(t, f, baseline, fence, "result part mutation fault", func(ctx context.Context, ex session.ExecutionStore) error {
 		_, err := ex.SettleToolCall(ctx, request)
-		assertInjectedError(t, err, "result part mutation fault")
-		return nil
+		return err
 	})
 	removeAtomicityTrigger(t, f, "parts", "parts_atomicity_fault")
 	if _, err := f.stores[0].Execution(fence).SettleToolCall(f.ctx, request); err != nil {
@@ -91,10 +89,9 @@ func testModelRequestAtomicity(t *testing.T, server *testpostgres.Server) {
 	record := fencingModelRequest(run, "atomicity-model-request", f.now, session.ModelRequestPrepared)
 	installAtomicityTrigger(t, f, "model_requests", "model_requests_atomicity_fault", "NEW.id = "+byteaLiteral(string(record.ID)), "model request mutation fault")
 	fence := session.RunFence{RunID: "run", ClaimToken: "old"}
-	runAtomicityCase(t, f, baseline, fence, func(ctx context.Context, ex session.ExecutionStore) error {
+	runAtomicityCase(t, f, baseline, fence, "model request mutation fault", func(ctx context.Context, ex session.ExecutionStore) error {
 		_, err := ex.CreateModelRequest(ctx, record)
-		assertInjectedError(t, err, "model request mutation fault")
-		return nil
+		return err
 	})
 	removeAtomicityTrigger(t, f, "model_requests", "model_requests_atomicity_fault")
 	if _, err := f.stores[0].Execution(fence).CreateModelRequest(f.ctx, record); err != nil {
@@ -113,10 +110,9 @@ func testRevisionAtomicity(t *testing.T, server *testpostgres.Server) {
 	message := session.Message{ID: "atomicity-revision-message", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: f.now, UpdatedAt: f.now}
 	installAtomicityTrigger(t, f, "observation_revisions", "revisions_atomicity_fault", "NEW.session_id = "+byteaLiteral(string(run.SessionID)), "revision mutation fault")
 	fence := session.RunFence{RunID: "run", ClaimToken: "old"}
-	runAtomicityCase(t, f, baseline, fence, func(ctx context.Context, ex session.ExecutionStore) error {
+	runAtomicityCase(t, f, baseline, fence, "revision mutation fault", func(ctx context.Context, ex session.ExecutionStore) error {
 		_, err := ex.AppendMessage(ctx, message)
-		assertInjectedError(t, err, "revision mutation fault")
-		return nil
+		return err
 	})
 	removeAtomicityTrigger(t, f, "observation_revisions", "revisions_atomicity_fault")
 	if _, err := f.stores[0].Execution(fence).AppendMessage(f.ctx, message); err != nil {
@@ -128,12 +124,10 @@ func testRevisionAtomicity(t *testing.T, server *testpostgres.Server) {
 	}
 }
 
-func runAtomicityCase(t *testing.T, f *raceFixture, baseline string, fence session.RunFence, failed func(context.Context, session.ExecutionStore) error) {
+func runAtomicityCase(t *testing.T, f *raceFixture, baseline string, fence session.RunFence, message string, operation func(context.Context, session.ExecutionStore) error) {
 	t.Helper()
 	err := f.stores[0].WithinTx(f.ctx, func(ctx context.Context, tx session.Store) error {
-		if err := failed(ctx, tx.Execution(fence)); err != nil {
-			return err
-		}
+		assertInjectedError(t, operation(ctx, tx.Execution(fence)), message)
 		if got := f.snapshot(t); got != baseline {
 			t.Fatal("failed mutation changed observer-visible state before outer commit")
 		}
