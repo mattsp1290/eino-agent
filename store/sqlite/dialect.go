@@ -32,7 +32,7 @@ func (sqliteDialect) InvalidScalar(column string, binary bool) string {
 func (sqliteDialect) ClockSQL() string {
 	return "CAST((julianday('now') - 2440587.5) * 86400000000 AS INTEGER)"
 }
-func (sqliteDialect) LockRun(db *gorm.DB) *gorm.DB { return db }
+func (sqliteDialect) LockRows(db *gorm.DB) *gorm.DB { return db }
 func (sqliteDialect) MapError(err error) error {
 	var sqliteErr *modernsqlite.Error
 	if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == sqlite3.SQLITE_CONSTRAINT {

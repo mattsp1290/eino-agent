@@ -53,7 +53,7 @@ func (s *Store) appendMessage(ctx context.Context, record session.Message) (sess
 	}
 	created := db.Table(s.tableName("messages")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "session_key": sessionKey, "run_key": runKey,
-		"role": string(record.Role), "finalized": record.Role != session.RoleAssistant,
+		"role": string(record.Role), "finalized": flagValue(record.Role != session.RoleAssistant),
 		"record": raw, "created_at": TimeText(record.CreatedAt),
 	})
 	if err := s.mapErr(created.Error); err != nil {
@@ -102,7 +102,7 @@ func (s *Store) appendPart(ctx context.Context, record session.Part) (session.Pa
 	created := db.Table(s.tableName("parts")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "message_key": messageKey, "session_key": sessionKey,
 		"run_key": runKey, "ordinal": record.Ordinal, "kind": string(record.Kind),
-		"display_text": []byte(text), "text_valid": valid, "record": raw,
+		"display_text": []byte(text), "text_valid": flagValue(valid), "record": raw,
 		"created_at": TimeText(record.CreatedAt),
 	})
 	if err := s.mapErr(created.Error); err != nil {
@@ -131,7 +131,7 @@ func (s *Store) updatePart(ctx context.Context, record session.Part) error {
 	db := s.dbFor(ctx).Table(s.tableName("parts")).Where("id = ? AND session_key = ? AND run_key = ? AND message_key = ?",
 		publicID(record.ID), sessionKey, runKey, messageKey).Updates(map[string]any{
 		"ordinal": record.Ordinal, "kind": string(record.Kind), "display_text": []byte(text),
-		"text_valid": valid, "record": raw, "created_at": TimeText(record.CreatedAt),
+		"text_valid": flagValue(valid), "record": raw, "created_at": TimeText(record.CreatedAt),
 	})
 	if err := s.mapErr(db.Error); err != nil {
 		return err

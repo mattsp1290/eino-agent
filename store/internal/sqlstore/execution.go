@@ -51,18 +51,21 @@ func (e *executionStore) withFenceState(ctx context.Context, allowTerminal bool,
 }
 
 func loadRunFence(ctx context.Context, store *Store, fence session.RunFence, allowTerminal bool) (session.Run, error) {
-	db := store.dialect.LockRun(store.runQuery(ctx).Where("runs.id = ? AND runs.claim_token = ?", []byte(fence.RunID), []byte(fence.ClaimToken)))
-	if !allowTerminal {
-		db = db.Where("runs.status IN ?", []string{string(session.RunPending), string(session.RunRunning)})
-	}
-	var row runRow
-	if err := db.Take(&row).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
+	row, err := store.lockRun(ctx, fence.RunID)
+	if err != nil {
+		if errors.Is(err, session.ErrNotFound) {
 			return session.Run{}, session.ErrConflict
 		}
 		return session.Run{}, err
 	}
-	return decodeRunRow(row)
+	run, err := decodeRunRow(row)
+	if err != nil {
+		return session.Run{}, err
+	}
+	if run.ClaimToken != fence.ClaimToken || (!allowTerminal && run.Status != session.RunPending && run.Status != session.RunRunning) {
+		return session.Run{}, session.ErrConflict
+	}
+	return run, nil
 }
 
 func (e *executionStore) StartRun(ctx context.Context, startedAt time.Time) (session.Run, error) {

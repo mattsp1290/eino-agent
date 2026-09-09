@@ -22,7 +22,9 @@ type Dialect interface {
 	Begin(context.Context, *sql.DB) (Transaction, error)
 	Read(context.Context, *sql.DB, func(SQLReader) error) error
 	ClockSQL() string
-	LockRun(*gorm.DB) *gorm.DB
+	// LockRows locks rows from the query's current table. Joined queries must
+	// not accidentally lock the joined relation as well.
+	LockRows(*gorm.DB) *gorm.DB
 	MapError(error) error
 	IndexHint(string) string
 	ByteLength(string) string

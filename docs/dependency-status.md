@@ -272,9 +272,9 @@ checks and the required CI job use the same reference from
 
 Testcontainers core and its PostgreSQL module are pinned to `v0.42.0`.
 The fixture uses pgx `v5.10.0`, matching the resolved requirement of the
-planned `gorm.io/driver/postgres v1.6.2` adapter. GORM and public PostgreSQL
-store construction follow separately; `postgres.Migrate(ctx, db)` now explicitly
-initializes or validates the schema on a host-owned pgx pool. Normal tests require no Docker;
+`gorm.io/driver/postgres v1.6.2` adapter. `postgres.Migrate(ctx, db)` explicitly
+initializes or validates the schema, and `postgres.New(ctx, db)` verifies and
+borrows the initialized host-owned pgx pool for shared GORM persistence. Normal tests require no Docker;
 `make postgres-test` and `make postgres-race` fail on unavailable Docker,
 startup errors, skipped PostgreSQL tests, or a missing required suite.
 
