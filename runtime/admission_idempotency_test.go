@@ -1,0 +1,90 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"sync/atomic"
+	"testing"
+
+	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/session"
+)
+
+type countingResolver struct {
+	calls atomic.Int32
+}
+
+func (r *countingResolver) Resolve(_ context.Context, selection model.Selection, _ model.Runtime) (model.Resolved, error) {
+	r.calls.Add(1)
+	return model.Resolved{
+		Provider: model.Provider{ID: selection.ProviderID},
+		Model:    model.Descriptor{ID: selection.ModelID, ProviderID: selection.ProviderID},
+		Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		}),
+	}, nil
+}
+
+func TestKeyedAdmissionReturnsReceiptWithoutSecondResolution(t *testing.T) {
+	store := newAdmissionStore()
+	resolver := &countingResolver{}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolver), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	request := Request{SessionID: "keyed", AdmissionKey: "event-42", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	first, err := orch.Start(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Disposition != AdmissionNew || first.Handle == nil || first.Receipt.Key != request.AdmissionKey {
+		t.Fatalf("first = %#v", first)
+	}
+	<-first.Handle.Done()
+
+	duplicate, err := orch.Start(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if duplicate.Disposition != AdmissionExisting || duplicate.Handle != nil || duplicate.Receipt != first.Receipt {
+		t.Fatalf("duplicate = %#v, first = %#v", duplicate, first)
+	}
+	if got := resolver.calls.Load(); got != 1 {
+		t.Fatalf("resolver calls = %d, want 1", got)
+	}
+	lookup, err := orch.LookupAdmission(context.Background(), request.SessionID, request.AdmissionKey)
+	if err != nil || lookup.Receipt != first.Receipt || lookup.RunStatus != session.RunCompleted {
+		t.Fatalf("lookup = %#v, %v", lookup, err)
+	}
+}
+
+func TestKeyedAdmissionConflictDoesNotExposePayload(t *testing.T) {
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	}))
+	request := Request{SessionID: "keyed-conflict", AdmissionKey: "event-43", Message: UserMessage{Content: "first private prompt"}, Config: keyedAdmissionConfig(t)}
+	first, err := orch.Start(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-first.Handle.Done()
+	request.Message.Content = "second private prompt"
+	_, err = orch.Start(context.Background(), request)
+	if !errors.Is(err, session.ErrAdmissionConflict) {
+		t.Fatalf("error = %v", err)
+	}
+	if got := err.Error(); got != "admission conflict" {
+		t.Fatalf("conflict text = %q", got)
+	}
+}
+
+func keyedAdmissionConfig(t *testing.T) config.Snapshot {
+	t.Helper()
+	result := orchestratorConfig()
+	result.Metadata["workspace_root"] = t.TempDir()
+	return result
+}

@@ -25,9 +25,12 @@ type UserMessage struct {
 // current submission; runtime loads prior durable history itself.
 type Request struct {
 	SessionID session.ID
-	Message   UserMessage
-	Config    config.Snapshot
-	Metadata  map[string]string
+	// AdmissionKey makes a nonempty submission durable and idempotent within
+	// SessionID. It is an identifier, not an authorization token.
+	AdmissionKey string
+	Message      UserMessage
+	Config       config.Snapshot
+	Metadata     map[string]string
 }
 
 // Handle describes an admitted run and its live control surface.
@@ -55,7 +58,8 @@ type Result struct {
 // Orchestrator owns run admission, locking, streaming, interruption, and
 // cleanup. Store, model, tool, AG-UI, and observability details are injected.
 type Orchestrator interface {
-	Start(ctx context.Context, request Request) (Handle, error)
+	Start(ctx context.Context, request Request) (AdmissionResult, error)
+	LookupAdmission(ctx context.Context, sessionID session.ID, key string) (session.AdmissionRecord, error)
 	Resume(ctx context.Context, runID session.RunID) (Handle, error)
 	Status(ctx context.Context, sessionID session.ID) (session.Run, error)
 }

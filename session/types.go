@@ -347,6 +347,14 @@ type EventBatch struct {
 type Store interface {
 	ModelRequestReader
 	WithinTx(ctx context.Context, fn func(context.Context, Store) error) error
+	// LookupAdmission performs a fresh committed root-store read. Absence is
+	// ErrNotFound, including for a nonexistent session.
+	LookupAdmission(ctx context.Context, sessionID ID, key string) (AdmissionRecord, error)
+	// GetAdmission is a transaction-only receipt read used after session lock.
+	GetAdmission(ctx context.Context, sessionID ID, key string) (AdmissionRecord, error)
+	// LockAdmissionSession creates a missing candidate and locks/returns the
+	// authoritative session without comparing caller-generated timestamps.
+	LockAdmissionSession(ctx context.Context, candidate Session) (Session, error)
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSession(ctx context.Context, id ID) (Session, error)
 	UpdateSession(ctx context.Context, session Session) error
@@ -384,6 +392,9 @@ type ExecutionStore interface {
 	SettleToolCall(ctx context.Context, request SettleToolCallRequest) (ToolTransitionResult, error)
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
+	// RecordAdmission inserts the immutable receipt in the same fenced
+	// transaction as its run graph.
+	RecordAdmission(ctx context.Context, record AdmissionRecord) error
 	ModelRequestWriter
 }
 

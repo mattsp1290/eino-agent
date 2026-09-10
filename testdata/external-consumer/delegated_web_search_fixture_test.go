@@ -131,7 +131,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := orchestrator.Start(ctx, runtime.Request{
+	admission, err := orchestrator.Start(ctx, runtime.Request{
 		SessionID: "delegated-success",
 		Message:   runtime.UserMessage{Content: "search once"},
 		Config:    delegatedRuntimeConfig(),
@@ -139,7 +139,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := waitDelegatedResult(t, handle)
+	result := waitDelegatedResult(t, admission.Handle)
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("run result = %+v", result)
 	}
@@ -352,7 +352,7 @@ func testDelegatedSearchCancellation(t *testing.T) {
 	modelFixture := &delegatedSearchModel{callID: "delegated-cancel-call"}
 	orchestrator := newDelegatedOrchestrator(t, store, registry, modelFixture, permissions.StaticPolicy{}, nil)
 	runCtx, cancel := context.WithCancel(ctx)
-	handle, err := orchestrator.Start(runCtx, runtime.Request{SessionID: "delegated-cancel", Message: runtime.UserMessage{Content: "cancel search"}, Config: delegatedRuntimeConfig()})
+	admission, err := orchestrator.Start(runCtx, runtime.Request{SessionID: "delegated-cancel", Message: runtime.UserMessage{Content: "cancel search"}, Config: delegatedRuntimeConfig()})
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -364,7 +364,7 @@ func testDelegatedSearchCancellation(t *testing.T) {
 		t.Fatal("backend did not start")
 	}
 	cancel()
-	result := waitDelegatedResult(t, handle)
+	result := waitDelegatedResult(t, admission.Handle)
 	if result.Status != session.RunInterrupted || !result.Interrupted {
 		t.Fatalf("canceled result = %+v", result)
 	}
@@ -396,14 +396,14 @@ func testDelegatedSearchPermissionContainment(t *testing.T) {
 			policy := &recordingDelegatedPolicy{action: action}
 			callID := session.ToolCallID("delegated-permission-" + string(action))
 			orchestrator := newDelegatedOrchestrator(t, store, registry, &delegatedSearchModel{callID: string(callID)}, policy, nil)
-			handle, err := orchestrator.Start(ctx, runtime.Request{
+			admission, err := orchestrator.Start(ctx, runtime.Request{
 				SessionID: session.ID("delegated-permission-" + string(action)),
 				Message:   runtime.UserMessage{Content: "policy containment"}, Config: delegatedRuntimeConfig(),
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			result := waitDelegatedResult(t, handle)
+			result := waitDelegatedResult(t, admission.Handle)
 			if result.Status != session.RunCompleted || result.Error != nil {
 				t.Fatalf("policy result = %+v", result)
 			}
@@ -440,11 +440,11 @@ func testDelegatedSearchFailureRedaction(t *testing.T) {
 	events := &recordingDelegatedEvents{}
 	modelFixture := &delegatedSearchModel{callID: "delegated-failure-call"}
 	orchestrator := newDelegatedOrchestrator(t, store, registry, modelFixture, permissions.StaticPolicy{}, events)
-	handle, err := orchestrator.Start(ctx, runtime.Request{SessionID: "delegated-failure", Message: runtime.UserMessage{Content: "fail search"}, Config: delegatedRuntimeConfig()})
+	admission, err := orchestrator.Start(ctx, runtime.Request{SessionID: "delegated-failure", Message: runtime.UserMessage{Content: "fail search"}, Config: delegatedRuntimeConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := waitDelegatedResult(t, handle)
+	result := waitDelegatedResult(t, admission.Handle)
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("failure-handling result = %+v, calls = %d", result, calls.Load())
 	}

@@ -187,6 +187,54 @@ func (e *executionStore) AppendMessage(ctx context.Context, record session.Messa
 	return result, err
 }
 
+// RecordAdmission persists an immutable receipt only after the complete graph
+// has been created under the current run fence.
+func (e *executionStore) RecordAdmission(ctx context.Context, record session.AdmissionRecord) error {
+	if err := session.ValidateAdmissionRecord(record); err != nil {
+		return err
+	}
+	return e.withFence(ctx, func(store *Store, run session.Run) error {
+		r := record.Receipt
+		if r.SessionID != run.SessionID || r.RunID != run.ID || run.Status != session.RunPending {
+			return session.ErrAdmissionInvalid
+		}
+		sessionKey, err := store.key(ctx, "sessions", string(r.SessionID))
+		if err != nil {
+			return err
+		}
+		runKey, err := store.key(ctx, "runs", string(r.RunID))
+		if err != nil {
+			return err
+		}
+		user, err := store.messageRowByID(ctx, string(r.UserMessageID))
+		if err != nil {
+			return err
+		}
+		assistant, err := store.messageRowByID(ctx, string(r.AssistantMessageID))
+		if err != nil {
+			return err
+		}
+		if user.SessionKey != sessionKey || user.RunKey != runKey || user.Role != string(session.RoleUser) || assistant.SessionKey != sessionKey || assistant.RunKey != runKey || assistant.Role != string(session.RoleAssistant) {
+			return session.ErrAdmissionInvalid
+		}
+		created := store.dbFor(ctx).Table(store.tableName("admission_receipts")).Create(map[string]any{
+			"session_key": sessionKey, "admission_key": []byte(r.Key), "run_key": runKey,
+			"user_message_key": user.RowKey, "assistant_message_key": assistant.RowKey,
+			"fingerprint_version": record.FingerprintVersion, "fingerprint": record.Fingerprint[:], "created_at": TimeText(r.CreatedAt),
+		})
+		if err := store.mapErr(created.Error); err != nil {
+			if errors.Is(err, session.ErrConflict) {
+				return session.AdmissionConflictError{}
+			}
+			return err
+		}
+		if created.RowsAffected != 1 {
+			return session.AdmissionConflictError{}
+		}
+		return nil
+	})
+}
+
 func (e *executionStore) FinalizeAssistantMessage(ctx context.Context, id session.MessageID) error {
 	return e.withFence(ctx, func(store *Store, run session.Run) error {
 		sessionKey, err := store.key(ctx, "sessions", string(run.SessionID))

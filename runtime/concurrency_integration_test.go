@@ -63,7 +63,7 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			sessionID := session.ID("concurrent-session-" + string(rune('a'+i)))
-			handle, err := orch.Start(ctx, Request{
+			admission, err := orch.Start(ctx, Request{
 				SessionID: sessionID,
 				Message:   UserMessage{Content: "hello"},
 				Config:    orchestratorConfig(),
@@ -72,7 +72,7 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 				errs <- err
 				return
 			}
-			result := <-handle.Done()
+			result := <-admission.Handle.Done()
 			if result.Error != nil || result.Status != session.RunCompleted {
 				errs <- fmt.Errorf("session %s result = %+v", sessionID, result)
 				return
@@ -120,7 +120,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	const sessions = 8
 	handles := make([]Handle, 0, sessions)
 	for i := range sessions {
-		handle, err := orch.Start(ctx, Request{
+		admission, err := orch.Start(ctx, Request{
 			SessionID: session.ID("interrupt-session-" + string(rune('a'+i))),
 			Message:   UserMessage{Content: "hello"},
 			Config:    orchestratorConfig(),
@@ -128,7 +128,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start %d: %v", i, err)
 		}
-		handles = append(handles, handle)
+		handles = append(handles, admission.Handle)
 	}
 	for range sessions {
 		select {

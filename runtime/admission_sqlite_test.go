@@ -54,11 +54,11 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	prompts := []string{"first prompt", "  héllo 世界\n"}
 	var originalSession session.Session
 	for index, prompt := range prompts {
-		handle, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: UserMessage{Content: prompt}, Config: orchestratorConfig(), Metadata: metadata})
+		admission, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: UserMessage{Content: prompt}, Config: orchestratorConfig(), Metadata: metadata})
 		if err != nil {
 			t.Fatalf("Start %d: %v", index+1, err)
 		}
-		result := <-handle.Done()
+		result := <-admission.Handle.Done()
 		if result.Error != nil || result.Status != session.RunCompleted {
 			t.Fatalf("run %d result = %+v", index+1, result)
 		}

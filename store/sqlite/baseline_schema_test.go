@@ -67,6 +67,7 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 		"sessions":              {"sqlite_autoindex_sessions_1:id", "sessions_workspace_created_idx:workspace_id,created_at,id"},
 		"runs":                  {"sqlite_autoindex_runs_1:id", "runs_session_status_idx:session_key,status", "runs_session_active_unique_idx:session_key"},
 		"messages":              {"messages_run_key_idx:run_key", "sqlite_autoindex_messages_1:id", "messages_replay_idx:session_key,created_at,id", "messages_observation_idx:session_key,created_at,id,run_key,role,finalized"},
+		"admission_receipts":    {"admission_receipts_assistant_message_key_idx:assistant_message_key", "admission_receipts_run_key_idx:run_key", "admission_receipts_user_message_key_idx:user_message_key", "sqlite_autoindex_admission_receipts_1:run_key", "sqlite_autoindex_admission_receipts_2:session_key,admission_key"},
 		"parts":                 {"parts_message_key_idx:message_key", "parts_run_key_idx:run_key", "sqlite_autoindex_parts_1:id", "parts_replay_idx:session_key,message_key,ordinal,id", "parts_observation_idx:session_key,message_key,kind,ordinal,id,run_key,text_valid"},
 		"tool_calls":            {"tool_calls_request_message_key_idx:request_message_key", "tool_calls_request_part_key_idx:request_part_key", "sqlite_autoindex_tool_calls_1:id", "tools_unfinished_idx:run_key,status", "tools_observation_idx:session_key,run_key,id"},
 		"context_epochs":        {"sqlite_autoindex_context_epochs_1:id", "context_epochs_session_created_idx:session_key,created_at,id"},
@@ -110,11 +111,13 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 					switch col {
 					case "id", "session_id", "workspace_id":
 						valueBytes += baselineOversizeIdentityBytes
+					case "admission_key":
+						valueBytes += 256
 					case "created_at":
 						valueBytes += baselineTimestampBytes
 					case "status", "role", "kind", "tool_transition":
 						valueBytes += 14
-					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "ordinal", "attempt", "step", "finalized", "text_valid":
+					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "user_message_key", "assistant_message_key", "ordinal", "attempt", "step", "finalized", "text_valid":
 						valueBytes += baselineRowIDBytes
 					default:
 						t.Fatalf("%s indexes private or unbounded projection %s", name, col)

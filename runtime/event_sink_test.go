@@ -99,7 +99,7 @@ func TestBlockedInfrastructureSinkCannotBlockAdmissionOrHandleDone(t *testing.T)
 		once.Do(func() { close(started) })
 		<-release
 	})), WithQueueSize(2))
-	handle, err := orch.Start(context.Background(), Request{
+	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "blocked-sink-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig(),
 	})
 	if err != nil {
@@ -107,7 +107,7 @@ func TestBlockedInfrastructureSinkCannotBlockAdmissionOrHandleDone(t *testing.T)
 	}
 	<-started
 	select {
-	case result := <-handle.Done():
+	case result := <-admission.Handle.Done():
 		if result.Status != session.RunCompleted {
 			t.Fatalf("result = %+v", result)
 		}

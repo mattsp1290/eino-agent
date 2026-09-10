@@ -63,13 +63,29 @@ type StreamingOrchestrator struct {
 }
 
 // Start admits and asynchronously executes one streaming turn.
-func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Handle, error) {
+func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (AdmissionResult, error) {
+	request = frozenRequest(request)
 	if err := o.validate(request); err != nil {
-		return nil, err
+		return AdmissionResult{}, err
+	}
+	var fingerprint [32]byte
+	if request.AdmissionKey != "" {
+		var err error
+		if err = validateKeyedWorkspace(request); err != nil {
+			return AdmissionResult{}, err
+		}
+		if fingerprint, err = fingerprintAdmission(request); err != nil {
+			return AdmissionResult{}, err
+		}
+		if existing, found, err := o.lookupExistingAdmission(ctx, request.SessionID, request.AdmissionKey, fingerprint); err != nil {
+			return AdmissionResult{}, err
+		} else if found {
+			return existing, nil
+		}
 	}
 	plan, err := o.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
 	if err != nil {
-		return nil, err
+		return AdmissionResult{}, err
 	}
 	ownershipTransferred := false
 	defer func() {
@@ -82,10 +98,15 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		Options:   cloneStringMap(request.Config.Agent.Options),
 	})
 	if err != nil {
-		return nil, err
+		if existing, found, lookupErr := o.recheckAdmission(ctx, request, fingerprint); lookupErr != nil {
+			return AdmissionResult{}, lookupErr
+		} else if found {
+			return existing, nil
+		}
+		return AdmissionResult{}, err
 	}
 	if err := model.ValidateResolved(request.Config.Model, resolved); err != nil {
-		return nil, err
+		return AdmissionResult{}, err
 	}
 	ids := admissionIDs{
 		SessionID:          request.SessionID,
@@ -108,9 +129,19 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		LeaseDuration: o.lease(),
 		Metadata:      request.Metadata,
 		ExtensionPlan: plan.Descriptor(),
+		AdmissionKey:  request.AdmissionKey,
+		Fingerprint:   fingerprint,
 	})
 	if err != nil {
-		return nil, err
+		if existing, found, lookupErr := o.recheckAdmission(ctx, request, fingerprint); lookupErr != nil {
+			return AdmissionResult{}, lookupErr
+		} else if found {
+			return existing, nil
+		}
+		return AdmissionResult{}, err
+	}
+	if admitted.Existing {
+		return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionExisting}, nil
 	}
 	execution := newRunExecution(o, plan, admitted.Run)
 	execution.seedDurableMessageFloor(admitted.AssistantMessage.CreatedAt)
@@ -130,7 +161,14 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	}
 	ownershipTransferred = true
 	go o.execute(runCtx, execution, admitted, handle.done)
-	return handle, nil
+	return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionNew, Handle: handle}, nil
+}
+
+func (o *StreamingOrchestrator) recheckAdmission(ctx context.Context, request Request, fingerprint [32]byte) (AdmissionResult, bool, error) {
+	if request.AdmissionKey == "" {
+		return AdmissionResult{}, false, nil
+	}
+	return o.lookupExistingAdmission(context.WithoutCancel(ctx), request.SessionID, request.AdmissionKey, fingerprint)
 }
 
 // Status returns the current active run for a session.

@@ -40,14 +40,14 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 		t.Fatal(err)
 	}
 	const sessionID session.ID = "postgres-admission-success"
-	handle, err := orchestrator.Start(f.ctx, Request{
+	admission, err := orchestrator.Start(f.ctx, Request{
 		SessionID: sessionID, Message: UserMessage{Content: "postgres question"},
 		Config: orchestratorConfig(), Metadata: map[string]string{"source": "postgres"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitPostgresRuntime(t, f.ctx, handle)
+	result := awaitPostgresRuntime(t, f.ctx, admission.Handle)
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("result=%+v model calls=%d", result, calls.Load())
 	}
@@ -99,14 +99,14 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 	assertPostgresAdmissionCountsZero(t, f)
 	removeProbe()
 
-	handle, err := orchestrator.Start(f.ctx, Request{
+	admission, err := orchestrator.Start(f.ctx, Request{
 		SessionID: "postgres-admission-rollback", Message: UserMessage{Content: "retry question"},
 		Config: orchestratorConfig(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitPostgresRuntime(t, f.ctx, handle)
+	result := awaitPostgresRuntime(t, f.ctx, admission.Handle)
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("retry result=%+v model calls=%d", result, calls.Load())
 	}

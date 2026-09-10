@@ -762,7 +762,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := orch.Start(ctx, runtime.Request{
+	admission, err := orch.Start(ctx, runtime.Request{
 		SessionID: "wasm-session",
 		Message:   runtime.UserMessage{Content: "run the Wasm tool"},
 		Config: config.Snapshot{
@@ -773,7 +773,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Handle.Done()
 	if result.Status != session.RunCompleted || result.Error != nil || modelTurns.Load() != 2 {
 		t.Fatalf("result = %+v, model turns = %d", result, modelTurns.Load())
 	}

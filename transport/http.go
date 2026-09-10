@@ -29,7 +29,8 @@ type SessionFunc func(*http.Request) (session.ID, error)
 
 // Runtime is the runtime surface used by embeddable HTTP handlers.
 type Runtime interface {
-	Start(context.Context, runtime.Request) (runtime.Handle, error)
+	Start(context.Context, runtime.Request) (runtime.AdmissionResult, error)
+	LookupAdmission(context.Context, session.ID, string) (session.AdmissionRecord, error)
 	Resume(context.Context, session.RunID) (runtime.Handle, error)
 }
 

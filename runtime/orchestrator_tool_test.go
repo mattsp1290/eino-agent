@@ -495,11 +495,11 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
 		WithOwnerID("owner-1"),
 	)
-	handle, err := orch.Start(ctx, Request{SessionID: "session-cancel", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	admission, err := orch.Start(ctx, Request{SessionID: "session-cancel", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	<-handle.Done()
+	<-admission.Handle.Done()
 	call, err := store.GetToolCall(context.Background(), "call-cancel")
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
@@ -548,11 +548,11 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 		})),
 		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }), WithOwnerID("owner-1"),
 	)
-	handle, err := orchestrator.Start(ctx, Request{SessionID: "session-denied", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	admission, err := orchestrator.Start(ctx, Request{SessionID: "session-denied", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Handle.Done()
 	if result.Error != nil || result.Status != session.RunCompleted || executed.Load() {
 		t.Fatalf("run result = %+v", result)
 	}
@@ -600,7 +600,7 @@ func TestStreamingOrchestratorFailsWhenToolLoopExceedsLimit(t *testing.T) {
 
 func startAndWait(t *testing.T, orch *StreamingOrchestrator) Result {
 	t.Helper()
-	handle, err := orch.Start(context.Background(), Request{
+	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		Message:   UserMessage{Content: "hello"},
 		Config:    orchestratorConfig(),
@@ -608,5 +608,5 @@ func startAndWait(t *testing.T, orch *StreamingOrchestrator) Result {
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	return <-handle.Done()
+	return <-admission.Handle.Done()
 }

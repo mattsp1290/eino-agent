@@ -151,7 +151,7 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 		t.Fatal(err)
 	}
 	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
-	handle, err := orchestrator.Start(ctx, runtime.Request{
+	admission, err := orchestrator.Start(ctx, runtime.Request{
 		SessionID: "catalog-runtime",
 		Message:   runtime.UserMessage{Content: "read the fixture"},
 		Config: config.Snapshot{
@@ -162,7 +162,7 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Handle.Done()
 	if result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("runtime result = %+v", result)
 	}

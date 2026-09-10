@@ -409,7 +409,7 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 		WithOwnerID("owner-a"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
-	handle, err := owner.Start(testCtx, Request{SessionID: "heartbeat-session", Message: UserMessage{Content: "wait"}, Config: orchestratorConfig()})
+	admission, err := owner.Start(testCtx, Request{SessionID: "heartbeat-session", Message: UserMessage{Content: "wait"}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,13 +418,13 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 	case <-testCtx.Done():
 		t.Fatalf("stream did not start: %v", testCtx.Err())
 	}
-	initial, err := store.GetRun(testCtx, handle.RunID())
+	initial, err := store.GetRun(testCtx, admission.Handle.RunID())
 	if err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2*leaseDuration + time.Second)
 	for {
-		current, getErr := store.GetRun(testCtx, handle.RunID())
+		current, getErr := store.GetRun(testCtx, admission.Handle.RunID())
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
@@ -445,13 +445,13 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 		WithStore(store), WithRunPlanProvider(provider), WithOwnerID("owner-b"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
-	if _, err := resumer.Resume(testCtx, handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
+	if _, err := resumer.Resume(testCtx, admission.Handle.RunID()); !errors.Is(err, session.ErrSessionBusy) {
 		t.Fatalf("Resume error = %v, want ErrSessionBusy", err)
 	}
 	close(release)
 	var result Result
 	select {
-	case result = <-handle.Done():
+	case result = <-admission.Handle.Done():
 	case <-testCtx.Done():
 		t.Fatalf("run did not complete after release: %v", testCtx.Err())
 	}

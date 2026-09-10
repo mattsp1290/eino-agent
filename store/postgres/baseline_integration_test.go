@@ -115,6 +115,14 @@ var pgIndexes = map[string][]pgIndex{
 		{name: "messages_observation_idx", columns: "session_key,created_at,id,run_key,role,finalized", partial: true},
 		{name: "messages_run_key_idx", columns: "run_key"},
 	},
+	"admission_receipts": {
+		{name: "admission_receipts_pkey", columns: "row_key", unique: true},
+		{name: "admission_receipts_run_key_key", columns: "run_key", unique: true},
+		{name: "admission_receipts_session_key_admission_key_key", columns: "session_key,admission_key", unique: true},
+		{name: "admission_receipts_run_key_idx", columns: "run_key"},
+		{name: "admission_receipts_user_message_key_idx", columns: "user_message_key"},
+		{name: "admission_receipts_assistant_message_key_idx", columns: "assistant_message_key"},
+	},
 	"parts": {
 		{name: "parts_pkey", columns: "row_key", unique: true},
 		{name: "parts_id_key", columns: "id", unique: true},
@@ -155,9 +163,10 @@ var pgIndexes = map[string][]pgIndex{
 }
 var pgOwners = map[string][]string{
 	"runs": {"session_key:sessions"}, "messages": {"run_key:runs", "session_key:sessions"},
-	"parts":          {"message_key:messages", "run_key:runs", "session_key:sessions"},
-	"tool_calls":     {"request_message_key:messages", "request_part_key:parts", "run_key:runs", "session_key:sessions"},
-	"context_epochs": {"session_key:sessions"}, "model_requests": {"run_key:runs", "session_key:sessions"},
+	"admission_receipts": {"assistant_message_key:messages", "run_key:runs", "session_key:sessions", "user_message_key:messages"},
+	"parts":              {"message_key:messages", "run_key:runs", "session_key:sessions"},
+	"tool_calls":         {"request_message_key:messages", "request_part_key:parts", "run_key:runs", "session_key:sessions"},
+	"context_epochs":     {"session_key:sessions"}, "model_requests": {"run_key:runs", "session_key:sessions"},
 	"events": {"run_key:runs", "session_key:sessions", "tool_key:tool_calls"},
 }
 
@@ -209,6 +218,7 @@ func populatePG(t *testing.T, db *sql.DB) {
 	insertPGRun(t, db, 3, "r1", 1, "pending")
 	mustExec(t, db, `INSERT INTO public.context_epochs(row_key,id,session_key,record,created_at,closed_at) VALUES(7,'epoch',1,'{}',$1,'')`, pgTime)
 	insertPGMessage(t, db, 4, "m1", 1, 3, "assistant")
+	insertPGAdmissionReceipt(t, db, 1, 3, 4, 4)
 	insertPGPart(t, db, 5, "p1", 4, 1, 3, 0, "tool_call")
 	insertPGTool(t, db, 6, "t1", 1, 3, 4, 5, "pending")
 	insertPGModelRequest(t, db, "q1", 1, 3, "future-assistant", 0, 0)
@@ -306,6 +316,12 @@ func insertPGMessage(t *testing.T, db *sql.DB, key int, id string, sessionKey, r
 	t.Helper()
 	mustExec(t, db, `INSERT INTO public.messages(row_key,id,session_key,run_key,role,finalized,record,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, key, []byte(id), sessionKey, runKey, role, 0, []byte("{}"), pgTime)
 }
+
+func insertPGAdmissionReceipt(t *testing.T, db *sql.DB, sessionKey, runKey, userMessageKey, assistantMessageKey int) {
+	t.Helper()
+	mustExec(t, db, `INSERT INTO public.admission_receipts(session_key,admission_key,run_key,user_message_key,assistant_message_key,fingerprint_version,fingerprint,created_at) VALUES($1,$2,$3,$4,$5,1,$6,$7)`, sessionKey, []byte("admission"), runKey, userMessageKey, assistantMessageKey, make([]byte, 32), pgTime)
+}
+
 func insertPGPart(t *testing.T, db *sql.DB, key int, id string, messageKey, sessionKey, runKey, ordinal int, kind string) {
 	t.Helper()
 	mustExec(t, db, `INSERT INTO public.parts(row_key,id,message_key,session_key,run_key,ordinal,kind,display_text,text_valid,record,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`, key, []byte(id), messageKey, sessionKey, runKey, ordinal, kind, []byte{}, 0, []byte("{}"), pgTime)
