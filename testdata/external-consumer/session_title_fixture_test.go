@@ -198,6 +198,136 @@ func TestPublicExecutorOnlySessionTitleWriter(t *testing.T) {
 	}
 }
 
+type publicExecutionTitleWriter struct {
+	store       session.ExecutionStore
+	sessionID   session.ID
+	workspaceID string
+}
+
+func (w publicExecutionTitleWriter) SetTitle(ctx context.Context, title string) (session.SessionTitleResult, error) {
+	return w.store.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: w.sessionID, WorkspaceID: w.workspaceID, Title: title})
+}
+
+func TestPublicSessionTitleWriterRebindsOnPendingToolResume(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	st, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "resume-title.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+	now := time.Now().UTC()
+	if _, err := st.CreateSession(ctx, session.Session{ID: "resume-title", WorkspaceID: "A", Title: "initial", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	const claimSentinel = "CLAIM_SENTINEL_DO_NOT_LEAK"
+	const rejectedTitle = "REJECTED_TITLE_SENTINEL"
+	var stale runtime.SessionTitleWriter
+	var resumed runtime.SessionTitleWriter
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity, err := composition.NewToolSourceIdentity(strings.Repeat("c", 64), strings.Repeat("d", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount, err := registry.Mount(ctx, extension.Component{InstanceID: "resume-title-tool", Artifact: extension.Artifact{Name: "resume-title-tool", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}, composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+		return registrar.Tool(composition.ToolRegistration{ID: "rename", Scope: extension.GlobalScope(), SourceIdentity: identity, Definition: tools.Definition{
+			Name: "rename_session", AllowSessionTitle: true,
+			Execute: func(ctx context.Context, execution tools.Execution) (json.RawMessage, error) {
+				resumed = execution.Call.SessionTitle
+				if resumed == nil {
+					return nil, errors.New("missing resumed writer")
+				}
+				if _, err := stale.SetTitle(context.Background(), rejectedTitle); !errors.Is(err, session.ErrConflict) || strings.Contains(err.Error(), claimSentinel) || strings.Contains(err.Error(), rejectedTitle) {
+					return nil, errors.New("stale writer did not return a private conflict")
+				}
+				if _, err := resumed.SetTitle(ctx, "resumed title"); err != nil {
+					return nil, err
+				}
+				return json.RawMessage(`{"renamed":true}`), nil
+			},
+		}})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	runtimeConfig := config.Snapshot{Agent: config.Agent{Name: "consumer"}, Metadata: map[string]string{"workspace_id": "A"}}
+	plan, err := registry.AcquireRunPlan(ctx, runtime.RunPlanRequest{SessionID: "resume-title", Config: runtimeConfig})
+	if err != nil {
+		t.Fatal(err)
+	}
+	descriptor := plan.Descriptor()
+	plan.Release()
+	run, err := st.AdmitRun(ctx, session.Run{
+		ID: "resume-title-run", SessionID: "resume-title", OwnerID: "old-owner", ClaimToken: claimSentinel,
+		Status: session.RunRunning, Agent: runtimeConfig.Agent.Name, ProviderID: "discovery", ModelID: "deterministic",
+		Config: runtimeConfig.Metadata, ExtensionPlan: descriptor, CreatedAt: now,
+	}, time.Nanosecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldExecution := st.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	stale = publicExecutionTitleWriter{store: oldExecution, sessionID: run.SessionID, workspaceID: "A"}
+	assistant := session.Message{ID: "resume-title-assistant", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, Agent: run.Agent, ModelID: run.ModelID, CreatedAt: now, UpdatedAt: now}
+	if _, err := oldExecution.AppendMessage(ctx, assistant); err != nil {
+		t.Fatal(err)
+	}
+	call := session.ToolCall{
+		ID: "resume-title-call", SessionID: run.SessionID, RunID: run.ID, MessageID: assistant.ID,
+		RequestPartID: "resume-title-request", ResultMessageID: "resume-title-result-message", ResultPartID: "resume-title-result-part",
+		Name: "rename_session", Pattern: "rename_session", Input: json.RawMessage(`{"title":"resumed title"}`), Status: session.ToolCallPending,
+	}
+	payload, err := json.Marshal(map[string]any{"id": call.ID, "name": call.Name, "arguments": call.Input})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldExecution.CreateToolCall(ctx, session.CreateToolCallRequest{
+		Call:        call,
+		RequestPart: session.Part{ID: call.RequestPartID, MessageID: assistant.ID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartToolCall, Payload: payload, CreatedAt: now, UpdatedAt: now},
+		Event:       session.ToolTransitionEvent{ID: "resume-title-pending", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldExecution.FinalizeAssistantMessage(ctx, assistant.ID); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	orchestrator, err := runtime.NewStreamingOrchestrator(
+		runtime.WithStore(st), runtime.WithIDGenerator(discoveryIDs{}), runtime.WithModelResolver(discoveryResolver{&discoveryModel{}}),
+		runtime.WithRunPlanProvider(registry), runtime.WithOwnerID("new-owner"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, err := orchestrator.Resume(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.Error != nil || result.Status != session.RunInterrupted || resumed == nil {
+		t.Fatalf("resume result = %#v", result)
+	}
+	got, err := st.GetSession(ctx, run.SessionID)
+	if err != nil || got.Title != "resumed title" {
+		t.Fatalf("resumed session = %#v, error = %v", got, err)
+	}
+	settled, err := st.GetToolCall(ctx, call.ID)
+	if err != nil || settled.Status != session.ToolCallCompleted {
+		t.Fatalf("settled tool = %#v, error = %v", settled, err)
+	}
+	public, _ := json.Marshal(settled)
+	if strings.Contains(string(public), claimSentinel) || strings.Contains(string(public), rejectedTitle) {
+		t.Fatalf("tool result leaked private sentinel: %s", public)
+	}
+	if _, err := resumed.SetTitle(context.Background(), "terminal"); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("settled writer error = %v", err)
+	}
+}
+
 const titleStateKey = "consumer:title_state"
 
 var titleStateSentinel = json.RawMessage(`{"continuation":"TITLE_STATE_SENTINEL"}`)

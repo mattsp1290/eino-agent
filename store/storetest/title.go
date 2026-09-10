@@ -3,7 +3,6 @@ package storetest
 import (
 	"context"
 	"errors"
-	"sync"
 	"testing"
 	"time"
 
@@ -96,28 +95,37 @@ func titleContract(t *testing.T, factory Factory) {
 			t.Fatalf("rollback title = %q", got.Title)
 		}
 
-		start := make(chan struct{})
-		var wg sync.WaitGroup
-		errs := make(chan error, 2)
-		for _, title := range []string{"alpha", "beta"} {
-			wg.Add(1)
-			go func(title string) {
-				defer wg.Done()
-				<-start
-				_, err := subject.Store.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: record.ID, Title: title})
-				errs <- err
-			}(title)
+		locked := make(chan struct{})
+		release := make(chan struct{})
+		firstDone := make(chan error, 1)
+		go func() {
+			firstDone <- subject.Store.WithinTx(ctx, func(ctx context.Context, tx session.Store) error {
+				if _, err := tx.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: record.ID, Title: "alpha"}); err != nil {
+					return err
+				}
+				close(locked)
+				<-release
+				return nil
+			})
+		}()
+		<-locked
+		secondStarted := make(chan struct{})
+		secondDone := make(chan error, 1)
+		go func() {
+			close(secondStarted)
+			_, err := subject.Store.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: record.ID, Title: "beta"})
+			secondDone <- err
+		}()
+		<-secondStarted
+		close(release)
+		if err := <-firstDone; err != nil {
+			t.Fatal(err)
 		}
-		close(start)
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			if err != nil {
-				t.Fatal(err)
-			}
+		if err := <-secondDone; err != nil {
+			t.Fatal(err)
 		}
 		got, err := subject.Store.GetSession(ctx, record.ID)
-		if err != nil || got.Title != "alpha" && got.Title != "beta" {
+		if err != nil || got.Title != "beta" {
 			t.Fatalf("serialized title = %q, error = %v", got.Title, err)
 		}
 	})

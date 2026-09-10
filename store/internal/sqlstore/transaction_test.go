@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	gormsqlite "gorm.io/driver/sqlite"
 	"gorm.io/gorm"
@@ -17,12 +18,49 @@ import (
 
 var errCleanupInjected = errors.New("injected savepoint cleanup failure")
 
+func TestSessionTitleCleanupFailureIsStoreError(t *testing.T) {
+	pool, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+	pool.SetMaxOpenConns(1)
+	if _, err := pool.Exec("CREATE TABLE sessions(row_key INTEGER PRIMARY KEY,id BLOB UNIQUE,record BLOB,workspace_id BLOB,title BLOB,created_at TEXT,updated_at TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	orm, err := gorm.Open(gormsqlite.New(gormsqlite.Config{Conn: pool, DriverName: "sqlite"}), &gorm.Config{DisableAutomaticPing: true, Logger: logger.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := New(orm, pool, cleanupDialect{failPrefix: "RELEASE SAVEPOINT"})
+	now := time.Now().UTC()
+	if _, err := st.CreateSession(t.Context(), session.Session{ID: "title", WorkspaceID: "right", Title: "old", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	err = st.WithinTx(t.Context(), func(ctx context.Context, tx session.Store) error {
+		result, err := tx.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: "title", WorkspaceID: "wrong", Title: "rejected"})
+		if result != (session.SessionTitleResult{}) || err != session.ErrSessionTitleStore {
+			t.Fatalf("result = %#v, error = %v", result, err)
+		}
+		return nil
+	})
+	if !errors.Is(err, errCleanupInjected) {
+		t.Fatalf("outer transaction error = %v", err)
+	}
+}
+
 type cleanupDialect struct {
 	Dialect
 	failPrefix string
 }
 
-func (d cleanupDialect) MapError(err error) error { return err }
+func (d cleanupDialect) MapError(err error) error {
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return session.ErrNotFound
+	}
+	return err
+}
+func (d cleanupDialect) LockRows(db *gorm.DB) *gorm.DB { return db }
 func (d cleanupDialect) Begin(ctx context.Context, db *sql.DB) (Transaction, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {

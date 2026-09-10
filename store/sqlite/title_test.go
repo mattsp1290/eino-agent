@@ -115,3 +115,57 @@ func TestSessionTitleErrorPrivacyAndPrecedence(t *testing.T) {
 		t.Fatalf("corrupt result=%#v error=%v", result, err)
 	}
 }
+
+func TestSessionTitleBlockedWriterHonorsCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "blocked-title.db")
+	st, err := openSQLiteFixture(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = st.db.Close() }()
+	other, err := reopenSQLiteFixture(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = other.db.Close() }()
+	now := time.Now().UTC()
+	if _, err := st.CreateSession(t.Context(), session.Session{ID: "blocked", Title: "initial", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := st.ReadObservationRevision(t.Context(), "blocked")
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- st.WithinTx(t.Context(), func(ctx context.Context, tx session.Store) error {
+			if _, err := tx.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: "blocked", Title: "committed"}); err != nil {
+				return err
+			}
+			close(locked)
+			<-release
+			return nil
+		})
+	}()
+	<-locked
+	waitCtx, cancel := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancel()
+	result, waitErr := other.SetSessionTitle(waitCtx, session.SessionTitleRequest{SessionID: "blocked", Title: "canceled"})
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if result != (session.SessionTitleResult{}) || !errors.Is(waitErr, context.DeadlineExceeded) {
+		t.Fatalf("blocked result = %#v, error = %v", result, waitErr)
+	}
+	got, err := other.GetSession(t.Context(), "blocked")
+	if err != nil || got.Title != "committed" {
+		t.Fatalf("session = %#v, error = %v", got, err)
+	}
+	after, err := other.ReadObservationRevision(t.Context(), "blocked")
+	if err != nil || after.Revision <= before.Revision {
+		t.Fatalf("revision before=%#v after=%#v error=%v", before, after, err)
+	}
+}

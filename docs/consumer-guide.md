@@ -867,8 +867,8 @@ writer or claim token. Lease expiry alone does not revoke it, but claim takeover
 or terminal settlement does. The executable public journey is
 `testdata/external-consumer/session_title_fixture_test.go`.
 
-Workspace selectors are exact UTF-8 strings (1–1024 bytes), with no wildcard or
-normalization. They carry no authorization. Hosts authorize every page and every
+Discovery workspace selectors are exact UTF-8 strings (1–1024 bytes), with no
+wildcard or normalization. They carry no authorization. Hosts authorize every page and every
 selected conversation. Limit defaults to 50, maximum 100; cursors are bounded to
 8192 bytes and bind database/workspace. Summaries expose only ID, workspace,
 current title and creation/update timestamps. ID/workspace have 1024-byte ceilings,

@@ -115,11 +115,35 @@ func titleError(err error, manual bool) error {
 		return context.DeadlineExceeded
 	case errors.Is(err, session.ErrSessionTitleInvalid):
 		return session.ErrSessionTitleInvalid
-	case errors.Is(err, session.ErrConflict):
+	case errorTreeOnly(err, session.ErrConflict):
 		return session.ErrConflict
-	case manual && errors.Is(err, session.ErrNotFound):
+	case manual && errorTreeOnly(err, session.ErrNotFound):
 		return session.ErrNotFound
 	default:
 		return session.ErrSessionTitleStore
 	}
+}
+
+// errorTreeOnly accepts ordinary wrapping and joins containing solely target.
+// A joined cleanup or driver failure must be reported as a storage failure.
+func errorTreeOnly(err, target error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if child != nil && !errorTreeOnly(child, target) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return errorTreeOnly(wrapped.Unwrap(), target)
+	}
+	return err == target
 }
