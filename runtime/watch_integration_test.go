@@ -83,7 +83,7 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer observer.Close()
-			handle, err := orchestrator.Start(ctx, Request{SessionID: "watched", Message: UserMessage{Content: "user"}, Config: orchestratorConfig()})
+			handle, err := orchestrator.Start(ctx, Request{SessionID: "watched", Message: TextUserMessage("user"), Config: orchestratorConfig()})
 			if err != nil {
 				t.Fatal(err)
 			}

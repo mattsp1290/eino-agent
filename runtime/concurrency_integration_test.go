@@ -65,7 +65,7 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 			sessionID := session.ID("concurrent-session-" + string(rune('a'+i)))
 			handle, err := orch.Start(ctx, Request{
 				SessionID: sessionID,
-				Message:   UserMessage{Content: "hello"},
+				Message:   TextUserMessage("hello"),
 				Config:    orchestratorConfig(),
 			})
 			if err != nil {
@@ -122,7 +122,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	for i := range sessions {
 		handle, err := orch.Start(ctx, Request{
 			SessionID: session.ID("interrupt-session-" + string(rune('a'+i))),
-			Message:   UserMessage{Content: "hello"},
+			Message:   TextUserMessage("hello"),
 			Config:    orchestratorConfig(),
 		})
 		if err != nil {
@@ -139,7 +139,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	}
 	if _, err := orch.Start(ctx, Request{
 		SessionID: "interrupt-session-a",
-		Message:   UserMessage{Content: "stale contender"},
+		Message:   TextUserMessage("stale contender"),
 		Config:    orchestratorConfig(),
 	}); !errors.Is(err, session.ErrSessionBusy) {
 		t.Fatalf("contending Start error = %v, want ErrSessionBusy", err)
@@ -182,8 +182,12 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 			t.Fatalf("active run err = %v, want ErrNotFound", err)
 		}
 		batch, err := store.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 10})
-		if err != nil || len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant || len(batch.Parts) != 1 || string(batch.Parts[0].Payload) != `{"text":"hello"}` {
+		if err != nil || len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant || len(batch.Parts) != 1 {
 			t.Fatalf("interrupted history = %#v, %v; want admitted user/assistant pair", batch, err)
+		}
+		decodedUserContent, err := session.DecodeContentParts(session.RoleUser, batch.Parts, session.DefaultContentLimits())
+		if err != nil || len(decodedUserContent.Blocks) != 1 || decodedUserContent.Blocks[0].Text == nil || decodedUserContent.Blocks[0].Text.Text != "hello" {
+			t.Fatalf("interrupted user content = %#v, %v; want admitted \"hello\" text", decodedUserContent, err)
 		}
 	}
 }

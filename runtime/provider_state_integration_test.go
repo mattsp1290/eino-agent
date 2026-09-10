@@ -60,7 +60,7 @@ func runDurableProviderStateJourney(t *testing.T, reopen bool) {
 	ids := &sequenceIDs{}
 	firstClient := &runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("first answer")}}
 	first := providerStateOrchestrator(t, store, ids, firstClient)
-	firstResult := startAndWaitRequest(t, first, Request{SessionID: "state-session", Message: UserMessage{Content: "first question"}, Config: orchestratorConfig()})
+	firstResult := startAndWaitRequest(t, first, Request{SessionID: "state-session", Message: TextUserMessage("first question"), Config: orchestratorConfig()})
 	if firstResult.Status != session.RunCompleted || firstResult.Error != nil {
 		t.Fatalf("first result = %+v", firstResult)
 	}
@@ -104,7 +104,7 @@ func runDurableProviderStateJourney(t *testing.T, reopen bool) {
 	secondClient := &runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("second answer", nil)}}
 	second := providerStateOrchestrator(t, store, ids, secondClient)
 	second.plans = staticRunPlanProvider{plan: newTestDispatchPlan(providerStateContextDispatch(t))}
-	secondResult := startAndWaitRequest(t, second, Request{SessionID: "state-session", Message: UserMessage{Content: "second question"}, Config: orchestratorConfig()})
+	secondResult := startAndWaitRequest(t, second, Request{SessionID: "state-session", Message: TextUserMessage("second question"), Config: orchestratorConfig()})
 	if secondResult.Status != session.RunCompleted || secondResult.Error != nil {
 		t.Fatalf("second result = %+v", secondResult)
 	}
@@ -149,7 +149,7 @@ func TestActiveProviderStateWithoutCodecRollsBackAdmission(t *testing.T) {
 	ids := &sequenceIDs{}
 	firstClient := &runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("answer")}}
 	first := providerStateOrchestrator(t, store, ids, firstClient)
-	result := startAndWaitRequest(t, first, Request{SessionID: "state-session", Message: UserMessage{Content: "first"}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, first, Request{SessionID: "state-session", Message: TextUserMessage("first"), Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatal(result.Error)
 	}
@@ -164,7 +164,7 @@ func TestActiveProviderStateWithoutCodecRollsBackAdmission(t *testing.T) {
 			return []*einoschema.Message{einoschema.AssistantMessage("bad", nil)}, nil
 		})}), WithIDGenerator(ids), WithRunPlanProvider(emptyTestRunPlanProvider()),
 	)
-	_, err = ordinary.Start(ctx, Request{SessionID: "state-session", Message: UserMessage{Content: "second"}, Config: orchestratorConfig()})
+	_, err = ordinary.Start(ctx, Request{SessionID: "state-session", Message: TextUserMessage("second"), Config: orchestratorConfig()})
 	if !errors.Is(err, model.ErrProviderStateMismatch) || calls != 0 || strings.Contains(err.Error(), "STATE_SENTINEL") {
 		t.Fatalf("start = calls %d error %v", calls, err)
 	}
@@ -201,7 +201,7 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 			ids := &sequenceIDs{}
 			firstClient := &runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("answer")}}
 			first := providerStateOrchestrator(t, store, ids, firstClient)
-			firstResult := startAndWaitRequest(t, first, Request{SessionID: "state-session", Message: UserMessage{Content: "first"}, Config: orchestratorConfig()})
+			firstResult := startAndWaitRequest(t, first, Request{SessionID: "state-session", Message: TextUserMessage("first"), Config: orchestratorConfig()})
 			if firstResult.Error != nil {
 				t.Fatal(firstResult.Error)
 			}
@@ -223,7 +223,7 @@ func TestSQLiteEmbeddedProviderStateOwnershipCorruptionRollsBackAdmission(t *tes
 			defer func() { _ = storePool.Close() }()
 			secondClient := &runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("should not run", nil)}}
 			second := providerStateOrchestrator(t, store, ids, secondClient)
-			_, err = second.Start(ctx, Request{SessionID: "state-session", Message: UserMessage{Content: "second"}, Config: orchestratorConfig()})
+			_, err = second.Start(ctx, Request{SessionID: "state-session", Message: TextUserMessage("second"), Config: orchestratorConfig()})
 			if (!errors.Is(err, model.ErrProviderStateMismatch) && !errors.Is(err, session.ErrConflict)) || clientCallCount(secondClient) != 0 || strings.Contains(err.Error(), "STATE_SENTINEL") {
 				t.Fatalf("corrupt admission = calls %d error %v", clientCallCount(secondClient), err)
 			}
@@ -252,7 +252,7 @@ func TestProviderStateContinuesWithinToolLoop(t *testing.T) {
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(ids),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlanWithDispatch(tools, providerStateContextDispatch(t))}),
 	)
-	result := startAndWaitRequest(t, orch, Request{SessionID: "tool-state", Message: UserMessage{Content: "go"}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orch, Request{SessionID: "tool-state", Message: TextUserMessage("go"), Config: orchestratorConfig()})
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("result = %+v", result)
 	}
@@ -286,7 +286,7 @@ func TestProviderStateCaptureAndPersistenceFailuresLeaveNoAssistantParts(t *test
 			store.appendPartErrAt = test.failPartAt
 			client := &runtimeProviderStateModel{responses: []*einoschema.Message{test.response}}
 			orch := providerStateOrchestrator(t, store, &sequenceIDs{}, client)
-			result := startAndWaitRequest(t, orch, Request{SessionID: "capture-failure", Message: UserMessage{Content: "go"}, Config: orchestratorConfig()})
+			result := startAndWaitRequest(t, orch, Request{SessionID: "capture-failure", Message: TextUserMessage("go"), Config: orchestratorConfig()})
 			if result.Status != session.RunFailed || result.Error == nil || clientCallCount(client) != 1 || strings.Contains(result.Error.Error(), "STATE_SENTINEL") {
 				t.Fatalf("result = %+v calls=%d", result, clientCallCount(client))
 			}
@@ -294,7 +294,7 @@ func TestProviderStateCaptureAndPersistenceFailuresLeaveNoAssistantParts(t *test
 				t.Fatalf("error = %v, want %v", result.Error, test.wantErrKind)
 			}
 			for _, part := range store.parts {
-				if part.Kind != session.PartText || part.MessageID == result.MessageID {
+				if part.Kind != session.PartUserInputText || part.MessageID == result.MessageID {
 					t.Fatalf("assistant turn partially persisted: %#v", store.parts)
 				}
 			}
@@ -319,7 +319,7 @@ func TestProviderStateRetriesUseIndependentRestoreCopiesAndCaptureOnce(t *testin
 		ids := &sequenceIDs{}
 		firstClient := &runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("answer")}}
 		first := providerStateOrchestrator(t, store, ids, firstClient)
-		if result := startAndWaitRequest(t, first, Request{SessionID: "retry-state", Message: UserMessage{Content: "first"}, Config: orchestratorConfig()}); result.Error != nil {
+		if result := startAndWaitRequest(t, first, Request{SessionID: "retry-state", Message: TextUserMessage("first"), Config: orchestratorConfig()}); result.Error != nil {
 			t.Fatal(result.Error)
 		}
 		secondClient := &runtimeProviderStateModel{
@@ -329,7 +329,7 @@ func TestProviderStateRetriesUseIndependentRestoreCopiesAndCaptureOnce(t *testin
 		}
 		second := providerStateOrchestrator(t, store, ids, secondClient)
 		second.attemptsValue = 2
-		result := startAndWaitRequest(t, second, Request{SessionID: "retry-state", Message: UserMessage{Content: "second"}, Config: orchestratorConfig()})
+		result := startAndWaitRequest(t, second, Request{SessionID: "retry-state", Message: TextUserMessage("second"), Config: orchestratorConfig()})
 		if result.Error != nil {
 			t.Fatal(result.Error)
 		}
@@ -364,7 +364,7 @@ func TestProviderStateRetriesUseIndependentRestoreCopiesAndCaptureOnce(t *testin
 			t.Fatal(err)
 		}
 		orch := mustConfiguredOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()), WithAttempts(2))
-		result := startAndWaitRequest(t, orch, Request{SessionID: "capture-once", Message: UserMessage{Content: "go"}, Config: orchestratorConfig()})
+		result := startAndWaitRequest(t, orch, Request{SessionID: "capture-once", Message: TextUserMessage("go"), Config: orchestratorConfig()})
 		if result.Error != nil || codec.captures.Load() != 1 || clientCallCount(client) != 2 {
 			t.Fatalf("result=%+v captures=%d calls=%d", result, codec.captures.Load(), clientCallCount(client))
 		}

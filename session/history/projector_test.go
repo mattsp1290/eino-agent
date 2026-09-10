@@ -449,6 +449,184 @@ func requireGoldenEqual[T any](t *testing.T, got, want T) {
 	t.Fatalf("golden mismatch\n--- got ---\n%s\n--- want ---\n%s", gotJSON, wantJSON)
 }
 
+func TestProjectRichTextAndFunctionToolCall(t *testing.T) {
+	t.Parallel()
+
+	content := session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "part one "}},
+			{ID: "b2", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "part two"}},
+			{ID: "b3", Kind: session.BlockKindFunctionToolCall, FunctionCall: &session.FunctionCallBlock{CallID: "call-1", Name: "lookup", Arguments: `{"q":"x"}`}},
+		},
+	}
+	parts := encodeRichParts(t, content, "assistant-1", "rp")
+	projected, err := Project(session.ReplayBatch{
+		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
+		Parts:    parts,
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if len(projected) != 1 {
+		t.Fatalf("projected len = %d, want 1", len(projected))
+	}
+	if projected[0].Content != "part one part two" {
+		t.Fatalf("content = %q", projected[0].Content)
+	}
+	if len(projected[0].ToolCalls) != 1 || projected[0].ToolCalls[0].ID != "call-1" || projected[0].ToolCalls[0].Function.Name != "lookup" || projected[0].ToolCalls[0].Function.Arguments != `{"q":"x"}` {
+		t.Fatalf("tool calls = %#v", projected[0].ToolCalls)
+	}
+}
+
+func TestProjectUserInputTextConcatenation(t *testing.T) {
+	t.Parallel()
+
+	content := session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "hello "}},
+			{ID: "b2", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "world"}},
+		},
+	}
+	parts := encodeRichParts(t, content, "user-1", "up")
+	projected, err := Project(session.ReplayBatch{
+		Messages: []session.Message{message("user-1", session.RoleUser)},
+		Parts:    parts,
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	assertMessage(t, projected[0], schema.User, "hello world")
+}
+
+func TestProjectReasoningEnvelopeGoesToReasoningContent(t *testing.T) {
+	t.Parallel()
+
+	content := session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindReasoning, Reasoning: &session.ReasoningBlock{Text: "thinking"}},
+			{ID: "b2", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "answer"}},
+		},
+	}
+	parts := encodeRichParts(t, content, "assistant-1", "rp")
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
+		Parts:    parts,
+	}
+
+	projected, err := Project(batch, Options{})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if projected[0].ReasoningContent != "" {
+		t.Fatalf("reasoning content with defaults = %q, want empty", projected[0].ReasoningContent)
+	}
+	if projected[0].Content != "answer" {
+		t.Fatalf("content with defaults = %q", projected[0].Content)
+	}
+
+	projected, err = Project(batch, Options{IncludeReasoning: true})
+	if err != nil {
+		t.Fatalf("Project with IncludeReasoning error = %v", err)
+	}
+	if projected[0].ReasoningContent != "thinking" {
+		t.Fatalf("reasoning content = %q, want %q", projected[0].ReasoningContent, "thinking")
+	}
+	if projected[0].Content != "answer" {
+		t.Fatalf("content = %q, want reasoning kept out of Content", projected[0].Content)
+	}
+}
+
+func TestProjectLegacyReasoningStillAppendsToContent(t *testing.T) {
+	t.Parallel()
+
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
+		Parts: []session.Part{
+			part("reasoning", "assistant-1", session.PartReasoning, 10, `{"text":"legacy reasoning"}`),
+		},
+	}
+	projected, err := Project(batch, Options{IncludeReasoning: true})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if projected[0].Content != "legacy reasoning" || projected[0].ReasoningContent != "" {
+		t.Fatalf("legacy reasoning projection = %#v", projected[0])
+	}
+}
+
+func TestProjectFunctionToolResultJoinsTextParts(t *testing.T) {
+	t.Parallel()
+
+	content := session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindFunctionToolResult, FunctionResult: &session.FunctionResultBlock{
+				CallID: "call-1", Name: "lookup",
+				Content: []session.ResultContent{{Type: session.ResultContentText, Text: "part one "}, {Type: session.ResultContentText, Text: "part two"}},
+			}},
+		},
+	}
+	parts := encodeRichParts(t, content, "tool-1", "tp")
+	projected, err := Project(session.ReplayBatch{
+		Messages: []session.Message{message("tool-1", session.RoleTool)},
+		Parts:    parts,
+	}, Options{})
+	if err != nil {
+		t.Fatalf("Project error = %v", err)
+	}
+	if len(projected) != 1 {
+		t.Fatalf("projected len = %d, want 1", len(projected))
+	}
+	assertMessage(t, projected[0], schema.Tool, "part one part two")
+	if projected[0].ToolCallID != "call-1" {
+		t.Fatalf("tool call id = %q", projected[0].ToolCallID)
+	}
+}
+
+func TestProjectFunctionToolResultNonTextRejected(t *testing.T) {
+	t.Parallel()
+
+	content := session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindFunctionToolResult, FunctionResult: &session.FunctionResultBlock{
+				CallID: "call-1", Name: "lookup",
+				Content: []session.ResultContent{{Type: session.ResultContentImage, Media: &session.MediaBlock{URL: "https://example.com/x.png"}}},
+			}},
+		},
+	}
+	parts := encodeRichParts(t, content, "tool-1", "tp")
+	_, err := Project(session.ReplayBatch{
+		Messages: []session.Message{message("tool-1", session.RoleTool)},
+		Parts:    parts,
+	}, Options{})
+	if !errors.Is(err, ErrClassicUnsupported) {
+		t.Fatalf("Project error = %v, want ErrClassicUnsupported", err)
+	}
+}
+
+func TestProjectUnsupportedRichKindRejected(t *testing.T) {
+	t.Parallel()
+
+	content := session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindServerToolCall, ServerCall: &session.ServerCallBlock{Name: "search"}},
+		},
+	}
+	parts := encodeRichParts(t, content, "assistant-1", "rp")
+	_, err := Project(session.ReplayBatch{
+		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
+		Parts:    parts,
+	}, Options{})
+	if !errors.Is(err, ErrClassicUnsupported) {
+		t.Fatalf("Project error = %v, want ErrClassicUnsupported", err)
+	}
+}
+
 type historyStore struct {
 	session.Store
 	batch  session.ReplayBatch

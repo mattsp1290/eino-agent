@@ -495,7 +495,7 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
 		WithOwnerID("owner-1"),
 	)
-	handle, err := orch.Start(ctx, Request{SessionID: "session-cancel", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	handle, err := orch.Start(ctx, Request{SessionID: "session-cancel", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
@@ -548,7 +548,7 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 		})),
 		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }), WithOwnerID("owner-1"),
 	)
-	handle, err := orchestrator.Start(ctx, Request{SessionID: "session-denied", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	handle, err := orchestrator.Start(ctx, Request{SessionID: "session-denied", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,7 +602,7 @@ func startAndWait(t *testing.T, orch *StreamingOrchestrator) Result {
 	t.Helper()
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "hello"},
+		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {

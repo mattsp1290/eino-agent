@@ -145,7 +145,7 @@ func (s *Store) observationMessages(ctx context.Context, out *session.Observatio
 	return nil
 }
 func (s *Store) observationParts(ctx context.Context, id session.ID, m *session.ObservationMessage, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("display_text")+", text_valid, COALESCE(run_key = (SELECT row_key FROM "+s.tableName("runs")+" WHERE id = ?), FALSE) FROM "+s.tableName("parts")+""+s.dialect.IndexHint("parts_observation_idx")+" WHERE session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND message_key = (SELECT row_key FROM "+s.tableName("messages")+" WHERE id = ?) AND kind = 'text' ORDER BY ordinal,id LIMIT ?", min(b.text, b.bytes/6), []byte(m.RunID), []byte(id), []byte(m.ID), b.parts+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("display_text")+", text_valid, COALESCE(run_key = (SELECT row_key FROM "+s.tableName("runs")+" WHERE id = ?), FALSE) FROM "+s.tableName("parts")+""+s.dialect.IndexHint("parts_observation_idx")+" WHERE session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND message_key = (SELECT row_key FROM "+s.tableName("messages")+" WHERE id = ?) AND kind IN ('text','user_input_text','assistant_gen_text') ORDER BY ordinal,id LIMIT ?", min(b.text, b.bytes/6), []byte(m.RunID), []byte(id), []byte(m.ID), b.parts+1)
 	if err != nil {
 		return err
 	}

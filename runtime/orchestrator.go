@@ -8,7 +8,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	einoobs "github.com/mattsp1290/eino-obs"
@@ -60,10 +59,15 @@ type StreamingOrchestrator struct {
 	observer                *einoobs.Observer
 	modelRequestSafeOptions []string
 	modelRequestMaxBytes    int
+	contentLimits           session.ContentLimits
 }
 
 // Start admits and asynchronously executes one streaming turn.
 func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Handle, error) {
+	if err := o.validateConfigured(); err != nil {
+		return nil, err
+	}
+	request.Message.Blocks = assignContentBlockIDs(request.Message.Blocks, o.ids)
 	if err := o.validate(request); err != nil {
 		return nil, err
 	}
@@ -91,7 +95,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		SessionID:          request.SessionID,
 		RunID:              o.ids.NewRunID(),
 		UserMessageID:      o.ids.NewMessageID(),
-		UserPartID:         o.ids.NewPartID(),
+		UserPartIDs:        partIDsFromBlocks(request.Message.Blocks),
 		AssistantMessageID: o.ids.NewMessageID(),
 		ContextEpochID:     o.ids.NewEpochID(),
 		EventID:            o.ids.NewEventID(),
@@ -108,6 +112,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		LeaseDuration: o.lease(),
 		Metadata:      request.Metadata,
 		ExtensionPlan: plan.Descriptor(),
+		ContentLimits: o.contentLimits,
 	})
 	if err != nil {
 		return nil, err
@@ -497,13 +502,71 @@ func (o *StreamingOrchestrator) validate(request Request) error {
 	if request.SessionID == "" {
 		return fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
 	}
-	if !utf8.ValidString(request.Message.Content) {
-		return fmt.Errorf("%w: message content must be valid UTF-8", ErrInvalidOrchestrator)
+	if len(request.Message.Blocks) == 0 {
+		return fmt.Errorf("%w: message blocks required", ErrInvalidOrchestrator)
 	}
-	if strings.TrimSpace(request.Message.Content) == "" {
-		return fmt.Errorf("%w: message content required", ErrInvalidOrchestrator)
+	content := session.Content{Role: session.RoleUser, Blocks: request.Message.Blocks}
+	if err := content.Validate(o.contentLimits); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidOrchestrator, err)
+	}
+	if !hasNonEmptyTextOrMediaBlock(request.Message.Blocks) {
+		return fmt.Errorf("%w: message requires non-empty text or media content", ErrInvalidOrchestrator)
 	}
 	return nil
+}
+
+// assignContentBlockIDs returns a copy of blocks with a fresh durable block
+// ID assigned to every block whose ID is empty. It never mutates the
+// caller's slice or its elements. ids may be nil, in which case blocks with
+// empty IDs are left unassigned (validate then rejects them).
+func assignContentBlockIDs(blocks []session.ContentBlock, ids IDGenerator) []session.ContentBlock {
+	if len(blocks) == 0 {
+		return blocks
+	}
+	out := make([]session.ContentBlock, len(blocks))
+	copy(out, blocks)
+	if ids == nil {
+		return out
+	}
+	for i := range out {
+		if out[i].ID == "" {
+			out[i].ID = string(ids.NewPartID())
+		}
+	}
+	return out
+}
+
+// partIDsFromBlocks derives the durable Part ID used to store each user
+// content block from the block's own durable identity (assignContentBlockIDs
+// has already filled every block's ID by the time Start calls this). Reusing
+// the block ID as the Part ID avoids minting a second identifier per block.
+func partIDsFromBlocks(blocks []session.ContentBlock) []session.PartID {
+	if len(blocks) == 0 {
+		return nil
+	}
+	out := make([]session.PartID, len(blocks))
+	for i, block := range blocks {
+		out[i] = session.PartID(block.ID)
+	}
+	return out
+}
+
+// hasNonEmptyTextOrMediaBlock reports whether blocks contains at least one
+// non-blank user_input_text block or one media block (image/audio/video/
+// file). A submission with only blank text is rejected, matching prior
+// plain-text behavior.
+func hasNonEmptyTextOrMediaBlock(blocks []session.ContentBlock) bool {
+	for _, b := range blocks {
+		switch b.Kind {
+		case session.BlockKindUserInputText:
+			if b.Text != nil && strings.TrimSpace(b.Text.Text) != "" {
+				return true
+			}
+		case session.BlockKindUserInputImage, session.BlockKindUserInputAudio, session.BlockKindUserInputVideo, session.BlockKindUserInputFile:
+			return true
+		}
+	}
+	return false
 }
 
 func (o *StreamingOrchestrator) validateConfigured() error {

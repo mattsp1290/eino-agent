@@ -14,7 +14,7 @@ var (
 	_ = model.Provider{}
 	_ = fake.Provider{}
 	_ = runtime.Request{
-		Message: runtime.UserMessage{Content: "current user submission"},
+		Message: runtime.TextUserMessage("current user submission"),
 	}
 	_ *sqlite.Store
 	_ = stream.NewTail

@@ -61,7 +61,7 @@ func discoveryRuntime(t *testing.T, st session.Store, m *discoveryModel) *runtim
 func discoveryTurn(t *testing.T, ctx context.Context, o *runtime.StreamingOrchestrator, id session.ID, workspace, prompt string) session.RunID {
 	t.Helper()
 	selection := model.Selection{ProviderID: "discovery", ModelID: "deterministic"}
-	handle, err := o.Start(ctx, runtime.Request{SessionID: id, Message: runtime.UserMessage{Content: prompt}, Config: config.Snapshot{Agent: config.Agent{Name: "discovery-consumer", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": workspace}}})
+	handle, err := o.Start(ctx, runtime.Request{SessionID: id, Message: runtime.TextUserMessage(prompt), Config: config.Snapshot{Agent: config.Agent{Name: "discovery-consumer", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": workspace}}})
 	if err != nil {
 		t.Fatal(err)
 	}

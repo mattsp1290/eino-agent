@@ -187,7 +187,7 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	config := delegatedRuntimeConfig()
 	config.Agent.SystemPrompt = "PRIVATE_SYSTEM"
 	config.Metadata["secret"] = "PRIVATE_METADATA"
-	handle, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.UserMessage{Content: "new submission"}, Config: config})
+	handle, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.TextUserMessage("new submission"), Config: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	// remains blocked. Done and durable settlement cannot wait for that sink.
 	script.cancelStarted = make(chan struct{})
 	script.cancelRun.Store(true)
-	interrupted, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.UserMessage{Content: "interrupt next"}, Config: config})
+	interrupted, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.TextUserMessage("interrupt next"), Config: config})
 	if err != nil {
 		t.Fatal(err)
 	}

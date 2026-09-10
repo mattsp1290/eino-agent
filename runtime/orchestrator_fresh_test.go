@@ -35,7 +35,7 @@ func TestStreamingOrchestratorRejectsInvalidUserMessageBeforeDependencies(t *tes
 			orchestrator.ids = nil
 			_, err := orchestrator.Start(context.Background(), Request{
 				SessionID: "session-invalid",
-				Message:   UserMessage{Content: content},
+				Message:   TextUserMessage(content),
 				Config:    orchestratorConfig(),
 			})
 			if !errors.Is(err, ErrInvalidOrchestrator) {
@@ -54,7 +54,7 @@ func TestStreamingOrchestratorPreservesAcceptedUserMessageBytes(t *testing.T) {
 		providerContent = request.Messages[len(request.Messages)-1].Content
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	}))
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "exact-content", Message: UserMessage{Content: content}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "exact-content", Message: TextUserMessage(content), Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatal(result.Error)
 	}
@@ -140,7 +140,7 @@ func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 		go func(orchestrator *StreamingOrchestrator) {
 			defer wait.Done()
 			<-ready
-			handle, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+			handle, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 			results <- startResult{handle: handle, err: err}
 		}(orchestrator)
 	}
@@ -177,7 +177,7 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	}))
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "hello"},
+		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
@@ -194,19 +194,24 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	if run.Status != session.RunCompleted {
 		t.Fatalf("run status = %s", run.Status)
 	}
-	var textParts []session.Part
+	var textParts, userInputTextParts []session.Part
 	for _, part := range store.parts {
-		if part.Kind == session.PartText {
+		switch part.Kind {
+		case session.PartText:
 			textParts = append(textParts, part)
+		case session.PartUserInputText:
+			userInputTextParts = append(userInputTextParts, part)
 		}
 	}
-	if len(textParts) != 2 {
-		t.Fatalf("text parts = %#v", textParts)
+	if len(textParts) != 1 || textParts[0].MessageID != result.MessageID || string(textParts[0].Payload) != `{"text":"hello"}` {
+		t.Fatalf("assistant text part = %#v, want settled assistant text \"hello\"", textParts)
 	}
-	for _, part := range textParts {
-		if string(part.Payload) != `{"text":"hello"}` || part.MessageID != "message-2" && part.MessageID != result.MessageID {
-			t.Fatalf("text part = %#v, want admitted user or settled assistant", part)
-		}
+	if len(userInputTextParts) != 1 {
+		t.Fatalf("user input text parts = %#v", userInputTextParts)
+	}
+	decoded, err := session.DecodeContentParts(session.RoleUser, userInputTextParts, session.DefaultContentLimits())
+	if err != nil || len(decoded.Blocks) != 1 || decoded.Blocks[0].Text == nil || decoded.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("decoded user input text = %#v, error = %v", decoded, err)
 	}
 }
 

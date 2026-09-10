@@ -52,7 +52,7 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 		t.Fatal(err)
 	}
 	handle, err := orchestrator.Start(f.ctx, Request{
-		SessionID: sessionID, Message: UserMessage{Content: "postgres question"},
+		SessionID: sessionID, Message: TextUserMessage("postgres question"),
 		Config: orchestratorConfig(), Metadata: map[string]string{"source": "postgres"},
 	})
 	if err != nil {
@@ -100,7 +100,7 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 		t.Fatal(err)
 	}
 	_, err = orchestrator.Start(f.ctx, Request{
-		SessionID: "postgres-admission-rollback", Message: UserMessage{Content: "failed question"},
+		SessionID: "postgres-admission-rollback", Message: TextUserMessage("failed question"),
 		Config: orchestratorConfig(),
 	})
 	var pgErr *pgconn.PgError
@@ -114,7 +114,7 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 	removeProbe()
 
 	handle, err := orchestrator.Start(f.ctx, Request{
-		SessionID: "postgres-admission-rollback", Message: UserMessage{Content: "retry question"},
+		SessionID: "postgres-admission-rollback", Message: TextUserMessage("retry question"),
 		Config: orchestratorConfig(),
 	})
 	if err != nil {
@@ -178,7 +178,7 @@ func installRuntimeAdmissionRollbackTrigger(t *testing.T, f *postgresRuntimeFixt
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM public.context_epochs WHERE id = convert_to('epoch-1', 'UTF8')) OR
      NOT EXISTS (SELECT 1 FROM public.messages WHERE id = convert_to('z-user-1', 'UTF8') AND role = 'user') OR
-     NOT EXISTS (SELECT 1 FROM public.parts WHERE id = convert_to('part-1', 'UTF8') AND kind = 'text') OR
+     NOT EXISTS (SELECT 1 FROM public.parts WHERE id = convert_to('part-1', 'UTF8') AND kind = 'user_input_text') OR
      NOT EXISTS (SELECT 1 FROM public.messages WHERE id = convert_to('a-assistant-1', 'UTF8') AND role = 'assistant') THEN
     RAISE EXCEPTION 'runtime admission order witness missing' USING ERRCODE = 'P0001';
   END IF;

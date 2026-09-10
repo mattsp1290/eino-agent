@@ -1110,10 +1110,10 @@ func DecodeContentParts(role Role, parts []Part, limits ContentLimits) (Content,
 	recognizedBlocks := 0
 	cumulative := 0
 	for _, part := range parts {
-		switch {
-		case part.Kind == PartProviderState:
+		switch part.Kind {
+		case PartProviderState:
 			continue
-		case part.Kind == PartResponseMeta:
+		case PartResponseMeta:
 			if len(part.Payload) > limits.MaxBlockBytes {
 				return Content{}, ErrContentTooLarge
 			}

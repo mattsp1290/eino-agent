@@ -95,7 +95,7 @@ func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle, err := orchestrator.Start(context.Background(), runtime.Request{
-		SessionID: "session-a", Message: runtime.UserMessage{Content: "base-user"},
+		SessionID: "session-a", Message: runtime.TextUserMessage("base-user"),
 		Config: config.Snapshot{Agent: config.Agent{Name: "agent", Model: selection, Options: map[string]string{}}, Model: selection, Metadata: map[string]string{"workspace_root": t.TempDir()}},
 	})
 	if err != nil {

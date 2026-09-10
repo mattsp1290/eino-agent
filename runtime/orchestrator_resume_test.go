@@ -427,7 +427,7 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 		WithOwnerID("owner-a"), WithLease(leaseDuration),
 		WithClock(func() time.Time { return time.Date(2040, 1, 1, 0, 0, 0, 0, time.UTC) }),
 	)
-	handle, err := owner.Start(testCtx, Request{SessionID: "heartbeat-session", Message: UserMessage{Content: "wait"}, Config: orchestratorConfig()})
+	handle, err := owner.Start(testCtx, Request{SessionID: "heartbeat-session", Message: TextUserMessage("wait"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}

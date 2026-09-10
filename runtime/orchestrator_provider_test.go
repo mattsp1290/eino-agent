@@ -70,7 +70,7 @@ func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 	}))
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "hello"},
+		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
@@ -109,7 +109,7 @@ func TestStreamingOrchestratorCompletesWithBlockedInfrastructureSink(t *testing.
 	orch.queueSize = 1
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "hello"},
+		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
@@ -275,7 +275,7 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
 	}
 	for _, part := range store.parts {
-		if part.MessageID == "message-2" {
+		if part.MessageID == "message-3" {
 			continue
 		}
 		switch part.Kind {
@@ -291,8 +291,12 @@ func assertOnlyAdmittedUserPart(t *testing.T, parts map[session.PartID]session.P
 		t.Fatalf("parts = %#v, want only admitted user part", parts)
 	}
 	for _, part := range parts {
-		if part.MessageID != "message-2" || part.Kind != session.PartText || string(part.Payload) != `{"text":"hello"}` {
+		if part.MessageID != "message-3" || part.Kind != session.PartUserInputText {
 			t.Fatalf("admitted user part = %#v", part)
+		}
+		decoded, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.DefaultContentLimits())
+		if err != nil || len(decoded.Blocks) != 1 || decoded.Blocks[0].Text == nil || decoded.Blocks[0].Text.Text != "hello" {
+			t.Fatalf("admitted user part decoded = %#v, error = %v", decoded, err)
 		}
 	}
 }
@@ -474,7 +478,7 @@ func TestStartRejectsInvalidResolvedModelBeforeHistoryReads(t *testing.T) {
 		}, nil
 	})
 	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithModelResolver(resolver))
-	_, err := orchestrator.Start(context.Background(), Request{SessionID: "session-1", Config: orchestratorConfig(), Message: UserMessage{Content: "hello"}})
+	_, err := orchestrator.Start(context.Background(), Request{SessionID: "session-1", Config: orchestratorConfig(), Message: TextUserMessage("hello")})
 	if !errors.Is(err, model.ErrInvalidResolution) {
 		t.Fatalf("Start error = %v, want ErrInvalidResolution", err)
 	}

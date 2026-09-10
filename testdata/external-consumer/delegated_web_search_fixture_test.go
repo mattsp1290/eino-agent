@@ -133,7 +133,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 	}
 	handle, err := orchestrator.Start(ctx, runtime.Request{
 		SessionID: "delegated-success",
-		Message:   runtime.UserMessage{Content: "search once"},
+		Message:   runtime.TextUserMessage("search once"),
 		Config:    delegatedRuntimeConfig(),
 	})
 	if err != nil {
@@ -352,7 +352,7 @@ func testDelegatedSearchCancellation(t *testing.T) {
 	modelFixture := &delegatedSearchModel{callID: "delegated-cancel-call"}
 	orchestrator := newDelegatedOrchestrator(t, store, registry, modelFixture, permissions.StaticPolicy{}, nil)
 	runCtx, cancel := context.WithCancel(ctx)
-	handle, err := orchestrator.Start(runCtx, runtime.Request{SessionID: "delegated-cancel", Message: runtime.UserMessage{Content: "cancel search"}, Config: delegatedRuntimeConfig()})
+	handle, err := orchestrator.Start(runCtx, runtime.Request{SessionID: "delegated-cancel", Message: runtime.TextUserMessage("cancel search"), Config: delegatedRuntimeConfig()})
 	if err != nil {
 		cancel()
 		t.Fatal(err)
@@ -398,7 +398,7 @@ func testDelegatedSearchPermissionContainment(t *testing.T) {
 			orchestrator := newDelegatedOrchestrator(t, store, registry, &delegatedSearchModel{callID: string(callID)}, policy, nil)
 			handle, err := orchestrator.Start(ctx, runtime.Request{
 				SessionID: session.ID("delegated-permission-" + string(action)),
-				Message:   runtime.UserMessage{Content: "policy containment"}, Config: delegatedRuntimeConfig(),
+				Message:   runtime.TextUserMessage("policy containment"), Config: delegatedRuntimeConfig(),
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -440,7 +440,7 @@ func testDelegatedSearchFailureRedaction(t *testing.T) {
 	events := &recordingDelegatedEvents{}
 	modelFixture := &delegatedSearchModel{callID: "delegated-failure-call"}
 	orchestrator := newDelegatedOrchestrator(t, store, registry, modelFixture, permissions.StaticPolicy{}, events)
-	handle, err := orchestrator.Start(ctx, runtime.Request{SessionID: "delegated-failure", Message: runtime.UserMessage{Content: "fail search"}, Config: delegatedRuntimeConfig()})
+	handle, err := orchestrator.Start(ctx, runtime.Request{SessionID: "delegated-failure", Message: runtime.TextUserMessage("fail search"), Config: delegatedRuntimeConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -15,9 +15,23 @@ import (
 // UserMessage is the one current user submission admitted by Start.
 //
 // Runtime owns its durable message and part identities. Callers must not copy
-// transcript history into this value.
+// transcript history into this value. Block IDs may be left empty: Start
+// assigns any missing block ID from the orchestrator's IDGenerator before
+// validating and admitting the message.
 type UserMessage struct {
-	Content string
+	Blocks []session.ContentBlock
+}
+
+// TextUserMessage builds a UserMessage carrying a single user_input_text
+// block with the given text. The block's durable ID is left empty; Start
+// fills it in during admission.
+func TextUserMessage(text string) UserMessage {
+	return UserMessage{
+		Blocks: []session.ContentBlock{{
+			Kind: session.BlockKindUserInputText,
+			Text: &session.TextBlock{Text: text},
+		}},
+	}
 }
 
 // Request admits a user-visible run. Implementations persist the run before

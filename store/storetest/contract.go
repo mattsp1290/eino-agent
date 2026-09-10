@@ -30,6 +30,7 @@ func Run(t *testing.T, factory Factory) {
 	titleContract(t, factory)
 	observationContract(t, factory)
 	boundedObservationContract(t, factory)
+	contentContract(t, factory)
 
 	t.Run("atomic run ownership", func(t *testing.T) {
 		subject := setup(t, factory)

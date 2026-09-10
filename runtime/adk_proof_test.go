@@ -321,7 +321,8 @@ func newADKProof(t testing.TB, dbPath string, options adkProofOptions) *adkProof
 	if prompt == "" {
 		prompt = "prove the boundary"
 	}
-	request := Request{SessionID: sessionID, Message: UserMessage{Content: prompt}, Config: orchestratorConfig()}
+	request := Request{SessionID: sessionID, Message: TextUserMessage(prompt), Config: orchestratorConfig()}
+	request.Message.Blocks = assignContentBlockIDs(request.Message.Blocks, proof.host.ids)
 	plan, err := proof.host.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
 	if err != nil {
 		t.Fatal(err)
@@ -332,12 +333,12 @@ func newADKProof(t testing.TB, dbPath string, options adkProofOptions) *adkProof
 	}
 	ids := admissionIDs{
 		SessionID: request.SessionID, RunID: proof.host.ids.NewRunID(), UserMessageID: proof.host.ids.NewMessageID(),
-		UserPartID: proof.host.ids.NewPartID(), AssistantMessageID: proof.host.ids.NewMessageID(),
+		UserPartIDs: partIDsFromBlocks(request.Message.Blocks), AssistantMessageID: proof.host.ids.NewMessageID(),
 		ContextEpochID: proof.host.ids.NewEpochID(), EventID: proof.host.ids.NewEventID(), RunClaimToken: string(proof.host.ids.NewEventID()),
 	}
 	admitted, err := proof.host.admitter().admit(ctx, admissionRequest{
 		IDs: ids, UserMessage: request.Message, History: proof.host.history, Config: request.Config, Model: resolved,
-		OwnerID: proof.host.ownerID(), LeaseDuration: proof.host.lease(), ExtensionPlan: plan.Descriptor(),
+		OwnerID: proof.host.ownerID(), LeaseDuration: proof.host.lease(), ExtensionPlan: plan.Descriptor(), ContentLimits: proof.host.contentLimits,
 	})
 	if err != nil {
 		t.Fatal(err)

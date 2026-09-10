@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -12,6 +13,13 @@ import (
 
 	"github.com/mattsp1290/eino-agent/session"
 )
+
+// ErrClassicUnsupported reports that a durable part uses one of the new
+// BlockKind-backed content kinds that the classic *schema.Message projection
+// cannot represent (anything other than reasoning, user_input_text,
+// assistant_gen_text, function_tool_call, and function_tool_result). Classic
+// callers fail loudly instead of silently flattening rich content.
+var ErrClassicUnsupported = errors.New("session history: classic projection does not support this content block kind")
 
 // Options controls durable history projection.
 type Options struct {
@@ -76,29 +84,82 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 			Role: role(message.Role),
 			Name: message.Agent,
 		}
-		content, err := textContent(parts, options)
-		if err != nil {
-			return nil, err
-		}
-		projected.Content = content
-		result := []*einoschema.Message{projected}
+		var toolResultParts []session.Part
 		for _, part := range parts {
-			if part.Kind != session.PartToolCall {
-				if part.Kind == session.PartToolResult {
-					toolMessages, err := projectToolResults([]session.Part{part})
+			switch part.Kind {
+			case session.PartToolCall:
+				toolCall, err := decodeToolCall(part.Payload)
+				if err != nil {
+					return nil, err
+				}
+				projected.ToolCalls = append(projected.ToolCalls, toolCall)
+			case session.PartToolResult, session.PartFunctionToolResult:
+				toolResultParts = append(toolResultParts, part)
+			case session.PartText:
+				text, err := partText(part)
+				if err != nil {
+					return nil, err
+				}
+				projected.Content += text
+			case session.PartReasoning:
+				if !options.IncludeReasoning {
+					continue
+				}
+				if hasContentSchemaField(part.Payload) {
+					text, err := classicReasoningEnvelopeText(part)
 					if err != nil {
 						return nil, err
 					}
-					result = append(result, toolMessages...)
+					projected.ReasoningContent += text
+				} else {
+					text, err := partText(part)
+					if err != nil {
+						return nil, err
+					}
+					projected.Content += text
 				}
-				continue
+			case session.PartState:
+				if !options.IncludeState {
+					continue
+				}
+				text, err := partText(part)
+				if err != nil {
+					return nil, err
+				}
+				projected.Content += text
+			case session.PartCompaction:
+				text, err := partText(part)
+				if err != nil {
+					return nil, err
+				}
+				projected.Content += text
+			case session.PartFile, session.PartStep, session.PartProviderState, session.PartResponseMeta:
+				// ignored by classic projection
+			case session.PartUserInputText, session.PartAssistantGenText:
+				text, err := classicTextEnvelopeText(part)
+				if err != nil {
+					return nil, err
+				}
+				projected.Content += text
+			case session.PartFunctionToolCall:
+				toolCall, err := classicFunctionToolCallEnvelope(part)
+				if err != nil {
+					return nil, err
+				}
+				projected.ToolCalls = append(projected.ToolCalls, toolCall)
+			default:
+				if _, ok := session.BlockKindForPart(part.Kind); ok {
+					return nil, fmt.Errorf("part %s: %w: kind %q", part.ID, ErrClassicUnsupported, part.Kind)
+				}
+				return nil, fmt.Errorf("part %s: unsupported part kind %q", part.ID, part.Kind)
 			}
-			toolCall, err := decodeToolCall(part.Payload)
-			if err != nil {
-				return nil, err
-			}
-			projected.ToolCalls = append(projected.ToolCalls, toolCall)
 		}
+		result := []*einoschema.Message{projected}
+		toolMessages, err := projectToolResults(toolResultParts)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, toolMessages...)
 		return result, nil
 	case session.RoleTool:
 		return projectToolResults(parts)
@@ -110,16 +171,125 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 func projectToolResults(parts []session.Part) ([]*einoschema.Message, error) {
 	result := []*einoschema.Message{}
 	for _, part := range parts {
-		if part.Kind != session.PartToolResult {
-			continue
+		switch part.Kind {
+		case session.PartToolResult:
+			toolCallID, content, err := decodeToolResult(part.Payload)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, einoschema.ToolMessage(content, toolCallID))
+		case session.PartFunctionToolResult:
+			toolCallID, content, err := classicFunctionToolResultEnvelope(part)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, einoschema.ToolMessage(content, toolCallID))
 		}
-		toolCallID, content, err := decodeToolResult(part.Payload)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, einoschema.ToolMessage(content, toolCallID))
 	}
 	return result, nil
+}
+
+// hasContentSchemaField reports whether raw carries the durable content
+// envelope's top-level "schema" field. PartReasoning is the one PartKind
+// shared between the legacy free-text payload ({"text": "..."}) and the new
+// BlockKindReasoning envelope, so callers use this probe to tell them apart
+// before decoding.
+func hasContentSchemaField(raw json.RawMessage) bool {
+	var probe struct {
+		Schema *int `json:"schema"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	return probe.Schema != nil
+}
+
+// decodeSingleBlock decodes one durable content-block Part payload through
+// session.DecodeContentParts by presenting it as a synthetic single-part,
+// single-block Content of decodeRole. decodeRole only needs to be a role that
+// permits kind; it need not match the durable message's actual role, since
+// classic projection tolerates rich content on any message role.
+func decodeSingleBlock(part session.Part, kind session.BlockKind, decodeRole session.Role) (session.ContentBlock, error) {
+	synthetic := part
+	synthetic.Ordinal = 0
+	content, err := session.DecodeContentParts(decodeRole, []session.Part{synthetic}, session.DefaultContentLimits())
+	if err != nil {
+		return session.ContentBlock{}, fmt.Errorf("part %s payload: %w", part.ID, err)
+	}
+	if len(content.Blocks) != 1 || content.Blocks[0].Kind != kind {
+		return session.ContentBlock{}, fmt.Errorf("part %s: unexpected decoded block", part.ID)
+	}
+	return content.Blocks[0], nil
+}
+
+func classicTextEnvelopeText(part session.Part) (string, error) {
+	var kind session.BlockKind
+	var decodeRole session.Role
+	switch part.Kind {
+	case session.PartUserInputText:
+		kind, decodeRole = session.BlockKindUserInputText, session.RoleUser
+	case session.PartAssistantGenText:
+		kind, decodeRole = session.BlockKindAssistantGenText, session.RoleAssistant
+	default:
+		return "", fmt.Errorf("part %s: unsupported text kind %q", part.ID, part.Kind)
+	}
+	block, err := decodeSingleBlock(part, kind, decodeRole)
+	if err != nil {
+		return "", err
+	}
+	if block.Text == nil {
+		return "", fmt.Errorf("part %s: text block missing payload", part.ID)
+	}
+	return block.Text.Text, nil
+}
+
+func classicReasoningEnvelopeText(part session.Part) (string, error) {
+	block, err := decodeSingleBlock(part, session.BlockKindReasoning, session.RoleAssistant)
+	if err != nil {
+		return "", err
+	}
+	if block.Reasoning == nil {
+		return "", fmt.Errorf("part %s: reasoning block missing payload", part.ID)
+	}
+	return block.Reasoning.Text, nil
+}
+
+func classicFunctionToolCallEnvelope(part session.Part) (einoschema.ToolCall, error) {
+	block, err := decodeSingleBlock(part, session.BlockKindFunctionToolCall, session.RoleAssistant)
+	if err != nil {
+		return einoschema.ToolCall{}, err
+	}
+	if block.FunctionCall == nil {
+		return einoschema.ToolCall{}, fmt.Errorf("part %s: function_tool_call block missing payload", part.ID)
+	}
+	fc := block.FunctionCall
+	return einoschema.ToolCall{
+		ID:   fc.CallID,
+		Type: "function",
+		Function: einoschema.FunctionCall{
+			Name:      fc.Name,
+			Arguments: fc.Arguments,
+		},
+	}, nil
+}
+
+func classicFunctionToolResultEnvelope(part session.Part) (string, string, error) {
+	block, err := decodeSingleBlock(part, session.BlockKindFunctionToolResult, session.RoleUser)
+	if err != nil {
+		return "", "", err
+	}
+	if block.FunctionResult == nil {
+		return "", "", fmt.Errorf("part %s: function_tool_result block missing payload", part.ID)
+	}
+	fr := block.FunctionResult
+	var content string
+	for _, item := range fr.Content {
+		if item.Type != session.ResultContentText {
+			return "", "", fmt.Errorf("part %s: %w: non-text function tool result content %q", part.ID, ErrClassicUnsupported, item.Type)
+		}
+		content += item.Text
+	}
+	return fr.CallID, content, nil
 }
 
 func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session.ReplayBatch, error) {
@@ -168,43 +338,6 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 	batch.Parts = parts
 	batch.PartOwnerMessageIDs = owners
 	return batch, nil
-}
-
-func textContent(parts []session.Part, options Options) (string, error) {
-	content := ""
-	for _, part := range parts {
-		switch part.Kind {
-		case session.PartText:
-			text, err := partText(part)
-			if err != nil {
-				return "", err
-			}
-			content += text
-		case session.PartReasoning:
-			if options.IncludeReasoning {
-				text, err := partText(part)
-				if err != nil {
-					return "", err
-				}
-				content += text
-			}
-		case session.PartState:
-			if options.IncludeState {
-				text, err := partText(part)
-				if err != nil {
-					return "", err
-				}
-				content += text
-			}
-		case session.PartCompaction:
-			text, err := partText(part)
-			if err != nil {
-				return "", err
-			}
-			content += text
-		}
-	}
-	return content, nil
 }
 
 func partText(part session.Part) (string, error) {

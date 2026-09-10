@@ -764,7 +764,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 	handle, err := orch.Start(ctx, runtime.Request{
 		SessionID: "wasm-session",
-		Message:   runtime.UserMessage{Content: "run the Wasm tool"},
+		Message:   runtime.TextUserMessage("run the Wasm tool"),
 		Config: config.Snapshot{
 			Agent: config.Agent{Name: "agent", Model: selection}, Model: selection,
 			Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": t.TempDir()},

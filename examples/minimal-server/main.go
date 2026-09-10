@@ -336,7 +336,7 @@ func decodeRunMessage(r *http.Request) (runtime.UserMessage, error) {
 	if strings.TrimSpace(payload.Message) == "" {
 		return runtime.UserMessage{}, fmt.Errorf("message required")
 	}
-	return runtime.UserMessage{Content: payload.Message}, nil
+	return runtime.TextUserMessage(payload.Message), nil
 }
 
 func parseSessionRoute(path string) (session.ID, string, bool) {

@@ -30,6 +30,7 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		queueSize:            64,
 		leaseValue:           time.Minute,
 		modelRequestMaxBytes: defaultModelRequestMaxBytes,
+		contentLimits:        session.DefaultContentLimits(),
 	}
 	for index, option := range opts {
 		if option == nil {
@@ -193,6 +194,18 @@ func WithHistory(value history.Options) Option {
 // zero-value observer behavior.
 func WithObserver(value *einoobs.Observer) Option {
 	return func(o *StreamingOrchestrator) error { o.observer = value; return nil }
+}
+
+// WithContentLimits overrides the durable content bounds enforced on
+// admission. Defaults to session.DefaultContentLimits().
+func WithContentLimits(value session.ContentLimits) Option {
+	return func(o *StreamingOrchestrator) error {
+		if err := value.Validate(); err != nil {
+			return fmt.Errorf("%w: ContentLimits: %v", ErrInvalidOrchestrator, err)
+		}
+		o.contentLimits = value
+		return nil
+	}
 }
 
 func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator, int)) Option {

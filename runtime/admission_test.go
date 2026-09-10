@@ -28,7 +28,7 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
-	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.UserMessage.ID != "user-1" || admitted.UserPart.ID != "user-part-1" || admitted.AssistantMessage.ID != "assistant-1" {
+	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.UserMessage.ID != "user-1" || len(admitted.UserParts) != 1 || admitted.UserParts[0].ID != "user-part-1" || admitted.AssistantMessage.ID != "assistant-1" {
 		t.Fatalf("admitted identity = %+v", admitted)
 	}
 	if admitted.Run.ParentMsgID != admitted.UserMessage.ID || admitted.AssistantMessage.ParentID != admitted.UserMessage.ID {
@@ -50,8 +50,12 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant {
 		t.Fatalf("messages = %#v", batch.Messages)
 	}
-	if len(batch.Parts) != 1 || batch.Parts[0].SessionID != admitted.Session.ID || batch.Parts[0].RunID != admitted.Run.ID || batch.Parts[0].MessageID != admitted.UserMessage.ID || batch.Parts[0].Ordinal != 0 || string(batch.Parts[0].Payload) != `{"text":"hello"}` {
+	if len(batch.Parts) != 1 || batch.Parts[0].SessionID != admitted.Session.ID || batch.Parts[0].RunID != admitted.Run.ID || batch.Parts[0].MessageID != admitted.UserMessage.ID || batch.Parts[0].Ordinal != 0 || batch.Parts[0].Kind != session.PartUserInputText {
 		t.Fatalf("parts = %#v", batch.Parts)
+	}
+	decodedUserContent, err := session.DecodeContentParts(session.RoleUser, batch.Parts, session.DefaultContentLimits())
+	if err != nil || len(decodedUserContent.Blocks) != 1 || decodedUserContent.Blocks[0].Text == nil || decodedUserContent.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("decoded user content = %#v, error = %v", decodedUserContent, err)
 	}
 	if !admitted.AssistantMessage.CreatedAt.Equal(admitted.UserMessage.CreatedAt.Add(time.Nanosecond)) {
 		t.Fatalf("message times = user %s assistant %s", admitted.UserMessage.CreatedAt, admitted.AssistantMessage.CreatedAt)
@@ -74,15 +78,16 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[0])
 	}
 	request.Config.Agent.Options["temperature"] = "changed"
-	request.UserMessage.Content = "changed"
+	request.UserMessage.Blocks[0].Text.Text = "changed"
 	if admitted.Snapshot.Config.Agent.Options["temperature"] != "0.2" {
 		t.Fatalf("snapshot config mutated: %#v", admitted.Snapshot.Config.Agent.Options)
 	}
 	if admitted.Snapshot.Messages[0].Content != "hello" {
 		t.Fatalf("snapshot messages mutated: %#v", admitted.Snapshot.Messages[0])
 	}
-	if string(admitted.UserPart.Payload) != `{"text":"hello"}` {
-		t.Fatalf("persisted user part mutated: %s", admitted.UserPart.Payload)
+	persistedUserContent, err := session.DecodeContentParts(session.RoleUser, []session.Part{admitted.UserParts[0]}, session.DefaultContentLimits())
+	if err != nil || persistedUserContent.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("persisted user part mutated: %#v, error = %v", persistedUserContent, err)
 	}
 }
 
@@ -118,7 +123,7 @@ func TestAdmitRejectsCollidingGeneratedIDsBeforeStoreUse(t *testing.T) {
 
 	store := newAdmissionStore()
 	request := testRunAdmission()
-	request.IDs.UserPartID = session.PartID(request.IDs.UserMessageID)
+	request.IDs.UserPartIDs[0] = session.PartID(request.IDs.UserMessageID)
 	_, err := (admitter{Store: store}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
@@ -264,14 +269,14 @@ func TestAdmitRejectsEveryRepeatedRunID(t *testing.T) {
 		"session":           func(r *admissionRequest) { r.IDs.SessionID = "other-session" },
 		"epoch":             func(r *admissionRequest) { r.IDs.ContextEpochID = "other-epoch" },
 		"user message id":   func(r *admissionRequest) { r.IDs.UserMessageID = "other-user" },
-		"user part id":      func(r *admissionRequest) { r.IDs.UserPartID = "other-part" },
+		"user part id":      func(r *admissionRequest) { r.IDs.UserPartIDs = []session.PartID{"other-part"} },
 		"assistant message": func(r *admissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
 		"config":            func(r *admissionRequest) { r.Config.Agent.Mode = "other-mode" },
 		"model": func(r *admissionRequest) {
 			r.Config.Model.ModelID = "other-model"
 			r.Model.Model.ID = "other-model"
 		},
-		"message": func(r *admissionRequest) { r.UserMessage.Content = "other-input" },
+		"message": func(r *admissionRequest) { r.UserMessage.Blocks[0].Text.Text = "other-input" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -347,13 +352,13 @@ func testRunAdmission() admissionRequest {
 			SessionID:          "session-1",
 			RunID:              "run-1",
 			UserMessageID:      "user-1",
-			UserPartID:         "user-part-1",
+			UserPartIDs:        []session.PartID{"user-part-1"},
 			AssistantMessageID: "assistant-1",
 			ContextEpochID:     "epoch-1",
 			EventID:            "event-1",
 			RunClaimToken:      "claim-run-1",
 		},
-		UserMessage: UserMessage{Content: "hello"},
+		UserMessage: testUserMessage("hello"),
 		Config: config.Snapshot{
 			Agent: config.Agent{
 				Name:         "default",
@@ -376,7 +381,20 @@ func testRunAdmission() admissionRequest {
 		LeaseDuration: time.Minute,
 		Metadata:      map[string]string{"request": "admission"},
 		ExtensionPlan: emptyTestPlanDescriptor(),
+		ContentLimits: session.DefaultContentLimits(),
 	}
+}
+
+// testUserMessage builds a UserMessage with a fixed, pre-assigned block ID so
+// admission-level tests (which construct admissionRequest directly, bypassing
+// StreamingOrchestrator.Start's block-ID assignment) can exercise
+// session.EncodeContentParts deterministically.
+func testUserMessage(text string) UserMessage {
+	return UserMessage{Blocks: []session.ContentBlock{{
+		ID:   "user-block-1",
+		Kind: session.BlockKindUserInputText,
+		Text: &session.TextBlock{Text: text},
+	}}}
 }
 
 type capturingSink struct {

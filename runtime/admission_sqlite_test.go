@@ -54,7 +54,7 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	prompts := []string{"first prompt", "  héllo 世界\n"}
 	var originalSession session.Session
 	for index, prompt := range prompts {
-		handle, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: UserMessage{Content: prompt}, Config: orchestratorConfig(), Metadata: metadata})
+		handle, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage(prompt), Config: orchestratorConfig(), Metadata: metadata})
 		if err != nil {
 			t.Fatalf("Start %d: %v", index+1, err)
 		}
@@ -84,7 +84,7 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	}
 	if _, err := orchestrator.Start(ctx, Request{
 		SessionID: sessionID,
-		Message:   UserMessage{Content: "identity drift"},
+		Message:   TextUserMessage("identity drift"),
 		Config:    orchestratorConfig(),
 		Metadata:  map[string]string{"source": "changed"},
 	}); !errors.Is(err, session.ErrConflict) {
@@ -187,12 +187,12 @@ func TestAdmissionSQLiteRollsBackAfterUserPartWrite(t *testing.T) {
 	secondRequest := testRunAdmission()
 	secondRequest.IDs.RunID = "run-2"
 	secondRequest.IDs.UserMessageID = "user-2"
-	secondRequest.IDs.UserPartID = "user-part-2"
+	secondRequest.IDs.UserPartIDs = []session.PartID{"user-part-2"}
 	secondRequest.IDs.AssistantMessageID = "assistant-2"
 	secondRequest.IDs.ContextEpochID = "epoch-2"
 	secondRequest.IDs.EventID = "event-2"
 	secondRequest.IDs.RunClaimToken = "claim-run-2"
-	secondRequest.UserMessage.Content = "second prompt"
+	secondRequest.UserMessage.Blocks[0].Text.Text = "second prompt"
 	_, err = (admitter{Store: &failingAdmissionStore{Store: store}, Clock: func() time.Time { return now }}).admit(ctx, secondRequest)
 	if !errors.Is(err, errInjectedSecondAdmissionMessage) {
 		t.Fatalf("Admit error = %v, want injected second-message failure", err)

@@ -125,7 +125,7 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 	orch.observer = observer
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "SECRET prompt"},
+		Message:   TextUserMessage("SECRET prompt"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {

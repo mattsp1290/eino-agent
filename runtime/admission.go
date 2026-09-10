@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
+	"strings"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -23,7 +24,7 @@ type admissionIDs struct {
 	SessionID          session.ID
 	RunID              session.RunID
 	UserMessageID      session.MessageID
-	UserPartID         session.PartID
+	UserPartIDs        []session.PartID
 	AssistantMessageID session.MessageID
 	ContextEpochID     session.EpochID
 	EventID            session.EventID
@@ -40,13 +41,14 @@ type admissionRequest struct {
 	LeaseDuration time.Duration
 	Metadata      map[string]string
 	ExtensionPlan session.ExtensionPlanDescriptor
+	ContentLimits session.ContentLimits
 }
 
 type admittedRun struct {
 	Session          session.Session
 	Run              session.Run
 	UserMessage      session.Message
-	UserPart         session.Part
+	UserParts        []session.Part
 	AssistantMessage session.Message
 	Event            session.EventRecord
 	Snapshot         TurnSnapshot
@@ -117,7 +119,7 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	}
 	providerMessages := make([]*einoschema.Message, 0, len(historyMessages)+1)
 	providerMessages = append(providerMessages, historyMessages...)
-	providerMessages = append(providerMessages, einoschema.UserMessage(request.UserMessage.Content))
+	providerMessages = append(providerMessages, einoschema.UserMessage(joinedUserInputText(request.UserMessage.Blocks)))
 	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
@@ -139,9 +141,17 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	userPart, err := executionStore.AppendPart(ctx, admissionUserPart(request, sessionRecord.ID, runRecord.ID, userMessage.ID, userAt))
+	userParts, err := admissionUserParts(request, sessionRecord.ID, runRecord.ID, userMessage.ID, userAt)
 	if err != nil {
-		return admittedRun{}, err
+		return admittedRun{}, fmt.Errorf("%w: encode user content: %v", ErrInvalidAdmission, err)
+	}
+	persistedUserParts := make([]session.Part, 0, len(userParts))
+	for _, p := range userParts {
+		persisted, err := executionStore.AppendPart(ctx, p)
+		if err != nil {
+			return admittedRun{}, err
+		}
+		persistedUserParts = append(persistedUserParts, persisted)
 	}
 	assistantMessage, err := executionStore.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, assistantAt))
 	if err != nil {
@@ -152,7 +162,7 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	return buildAdmission(sessionRecord, runRecord, userMessage, userPart, assistantMessage, committedEvent, snapshot, now), nil
+	return buildAdmission(sessionRecord, runRecord, userMessage, persistedUserParts, assistantMessage, committedEvent, snapshot, now), nil
 }
 
 func getOrCreateAdmissionSession(ctx context.Context, store session.Store, request admissionRequest, now time.Time) (session.Session, error) {
@@ -199,7 +209,7 @@ func latestAdmissionMessageTime(ctx context.Context, store session.Store, sessio
 	}
 }
 
-func buildAdmission(sessionRecord session.Session, runRecord session.Run, userMessage session.Message, userPart session.Part, assistantMessage session.Message, event session.EventRecord, snapshot TurnSnapshot, now time.Time) admittedRun {
+func buildAdmission(sessionRecord session.Session, runRecord session.Run, userMessage session.Message, userParts []session.Part, assistantMessage session.Message, event session.EventRecord, snapshot TurnSnapshot, now time.Time) admittedRun {
 	snapshot.RunID = runRecord.ID
 	snapshot.SessionID = sessionRecord.ID
 	snapshot.EpochID = runRecord.ContextEpoch
@@ -208,7 +218,7 @@ func buildAdmission(sessionRecord session.Session, runRecord session.Run, userMe
 		Session:          sessionRecord,
 		Run:              runRecord,
 		UserMessage:      userMessage,
-		UserPart:         userPart,
+		UserParts:        userParts,
 		AssistantMessage: assistantMessage,
 		Event:            event,
 		Snapshot:         snapshot,
@@ -265,8 +275,8 @@ func validateAdmissionIdentity(ids admissionIDs) error {
 		return fmt.Errorf("%w: run id required", ErrInvalidAdmission)
 	case ids.UserMessageID == "":
 		return fmt.Errorf("%w: user message id required", ErrInvalidAdmission)
-	case ids.UserPartID == "":
-		return fmt.Errorf("%w: user part id required", ErrInvalidAdmission)
+	case len(ids.UserPartIDs) == 0:
+		return fmt.Errorf("%w: user part ids required", ErrInvalidAdmission)
 	case ids.AssistantMessageID == "":
 		return fmt.Errorf("%w: assistant message id required", ErrInvalidAdmission)
 	case ids.ContextEpochID == "":
@@ -279,11 +289,16 @@ func validateAdmissionIdentity(ids admissionIDs) error {
 	generated := []string{
 		string(ids.RunID),
 		string(ids.UserMessageID),
-		string(ids.UserPartID),
 		string(ids.AssistantMessageID),
 		string(ids.ContextEpochID),
 		string(ids.EventID),
 		ids.RunClaimToken,
+	}
+	for _, id := range ids.UserPartIDs {
+		if id == "" {
+			return fmt.Errorf("%w: user part ids required", ErrInvalidAdmission)
+		}
+		generated = append(generated, string(id))
 	}
 	seen := make(map[string]struct{}, len(generated))
 	for _, id := range generated {
@@ -337,20 +352,32 @@ func admissionUserMessage(request admissionRequest, sessionID session.ID, runID 
 	}
 }
 
-func admissionUserPart(request admissionRequest, sessionID session.ID, runID session.RunID, messageID session.MessageID, now time.Time) session.Part {
-	return session.Part{
-		ID:        request.IDs.UserPartID,
-		MessageID: messageID,
-		SessionID: sessionID,
-		RunID:     runID,
-		Kind:      session.PartText,
-		Ordinal:   0,
-		Payload: mustJSON(struct {
-			Text string `json:"text"`
-		}{Text: request.UserMessage.Content}),
-		CreatedAt: now,
-		UpdatedAt: now,
+// admissionUserParts encodes the current user submission's content blocks
+// into one durable Part per block (plus an optional response_meta part, never
+// applicable to a user-role submission), using the pre-generated PartIDs
+// assigned to this admission.
+func admissionUserParts(request admissionRequest, sessionID session.ID, runID session.RunID, messageID session.MessageID, now time.Time) ([]session.Part, error) {
+	content := session.Content{Role: session.RoleUser, Blocks: request.UserMessage.Blocks}
+	index := 0
+	ids := request.IDs.UserPartIDs
+	next := func() session.PartID {
+		id := ids[index]
+		index++
+		return id
 	}
+	return session.EncodeContentParts(content, next, messageID, sessionID, runID, now, request.ContentLimits)
+}
+
+// joinedUserInputText concatenates every user_input_text block's text, in
+// order. It is empty for a media-only submission.
+func joinedUserInputText(blocks []session.ContentBlock) string {
+	var sb strings.Builder
+	for _, block := range blocks {
+		if block.Kind == session.BlockKindUserInputText && block.Text != nil {
+			sb.WriteString(block.Text.Text)
+		}
+	}
+	return sb.String()
 }
 
 func admissionAssistantMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time) session.Message {

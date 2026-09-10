@@ -131,7 +131,7 @@ func TestADKBoundaryFreshRunInterceptsEveryModelAndToolCall(t *testing.T) {
 			for _, part := range batch.Parts {
 				kinds[part.Kind]++
 			}
-			if kinds[session.PartText] != 3 || kinds[session.PartToolCall] != 1 || kinds[session.PartToolResult] != 1 {
+			if kinds[session.PartText] != 2 || kinds[session.PartUserInputText] != 1 || kinds[session.PartToolCall] != 1 || kinds[session.PartToolResult] != 1 {
 				t.Fatalf("durable parts = %v", kinds)
 			}
 		})
