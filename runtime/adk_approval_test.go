@@ -1,12 +1,16 @@
 package runtime
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/cloudwego/eino/adk"
+	einomodel "github.com/cloudwego/eino/components/model"
+	"github.com/cloudwego/eino/compose"
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/session"
@@ -19,8 +23,12 @@ import (
 
 func TestADKApprovalPausesBeforeSiblingFunctionCallsAndResumesOnce(t *testing.T) {
 	t.Parallel()
-	for _, decision := range []string{"approve", "deny"} {
-		t.Run(decision, func(t *testing.T) {
+	for _, variant := range []struct {
+		decision  string
+		streaming bool
+	}{{"approve", false}, {"deny", false}, {"approve", true}} {
+		decision, streaming := variant.decision, variant.streaming
+		t.Run(decision+map[bool]string{false: "-generate", true: "-stream"}[streaming], func(t *testing.T) {
 			t.Parallel()
 			trace := &adkTrace{}
 			dbPath := filepath.Join(t.TempDir(), "proof.db")
@@ -34,7 +42,7 @@ func TestADKApprovalPausesBeforeSiblingFunctionCallsAndResumesOnce(t *testing.T)
 			}}
 			ledger := first.ledgerModel(scripted)
 			ledger.approval = &adkApprovalBinding{}
-			runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: first.newAgent(t, ledger), CheckPointStore: checkpoints})
+			runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: first.newAgent(t, ledger), CheckPointStore: checkpoints, EnableStreaming: streaming})
 			drained := drainADKEvents(t, trace, runner.Run(first.ctx, first.userInput(), adk.WithCheckPointID("approval")))
 			if len(drained.errs) != 0 || len(drained.interrupts) != 1 {
 				t.Fatalf("errors=%v interrupts=%d\n%s", drained.errs, len(drained.interrupts), strings.Join(trace.list(), "\n"))
@@ -77,7 +85,7 @@ func TestADKApprovalPausesBeforeSiblingFunctionCallsAndResumesOnce(t *testing.T)
 			continued := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{agenticAssistant(agenticText("continued after " + decision))}}
 			ledger2 := second.ledgerModel(continued)
 			ledger2.approval = &adkApprovalBinding{}
-			runner2 := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: second.newAgent(t, ledger2), CheckPointStore: checkpoints})
+			runner2 := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: second.newAgent(t, ledger2), CheckPointStore: checkpoints, EnableStreaming: streaming})
 			targets := &adk.ResumeParams{Targets: map[string]any{interruptID: decision}}
 			iter, err = runner2.ResumeWithParams(second.ctx, "approval", targets)
 			if err != nil {
@@ -128,7 +136,8 @@ func TestADKApprovalPausesBeforeSiblingFunctionCallsAndResumesOnce(t *testing.T)
 			if len(records) != 1 || records[0].Status != "decided" || records[0].Decision != decision {
 				t.Fatalf("approval records after decision = %+v", records)
 			}
-			assertTraceOrder(t, trace, "process.restart", "checkpoint.get approval", "approval.decided", "adapter.generate.begin", "provider.call 1", "adapter.commit")
+			kind := map[bool]string{false: "generate", true: "stream"}[streaming]
+			assertTraceOrder(t, trace, "process.restart", "checkpoint.get approval", "approval.decided", "adapter."+kind+".begin", "provider.call 1", "adapter.commit")
 
 			// A duplicate decision for the same paused request cannot dispatch.
 			iter, err = runner2.ResumeWithParams(second.ctx, "approval", targets)
@@ -146,32 +155,80 @@ func TestADKApprovalPausesBeforeSiblingFunctionCallsAndResumesOnce(t *testing.T)
 	}
 }
 
+// interruptGuard refuses to retry or fail over a model-boundary interrupt.
+// Upstream retry and failover only recognize graph-level interrupt errors
+// (compose.ExtractInterruptInfo), not a StatefulInterrupt signal returned by
+// the model itself, so the host-provided decision must guard it.
+func interruptGuard(err error) bool {
+	_, ok := compose.IsInterruptRerunError(err)
+	return ok
+}
+
 func TestADKApprovalOnlyResponseStillPauses(t *testing.T) {
 	t.Parallel()
-	trace := &adkTrace{}
-	checkpoints := newADKMemoryCheckpoints(trace)
-	proof := newADKProof(t, filepath.Join(t.TempDir(), "proof.db"), adkProofOptions{trace: trace})
-	defer proof.close()
-	scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{
-		agenticAssistant(schema.NewContentBlock(&schema.MCPToolApprovalRequest{ID: "apr-only", Name: "remote_read", ServerLabel: "srv"})),
-		agenticAssistant(agenticText("finished")),
-	}}
-	ledger := proof.ledgerModel(scripted)
-	ledger.approval = &adkApprovalBinding{}
-	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: proof.newAgent(t, ledger), CheckPointStore: checkpoints})
-	drained := drainADKEvents(t, trace, runner.Run(proof.ctx, proof.userInput(), adk.WithCheckPointID("approval-only")))
-	if len(drained.errs) != 0 || len(drained.interrupts) != 1 {
-		t.Fatalf("approval-only response did not pause: errs=%v interrupts=%d\n%s", drained.errs, len(drained.interrupts), strings.Join(trace.list(), "\n"))
-	}
-	if len(drained.outputs) != 0 {
-		t.Fatalf("approval-only response must not complete the agent normally: %d outputs", len(drained.outputs))
-	}
-	iter, err := runner.ResumeWithParams(proof.ctx, "approval-only", &adk.ResumeParams{Targets: map[string]any{drained.interrupts[0].ID: "approve"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumed := drainADKEvents(t, trace, iter)
-	if len(resumed.errs) != 0 || assistantText(resumed.outputs[len(resumed.outputs)-1]) != "finished" || len(proof.modelRequests()) != 2 {
-		t.Fatalf("resume = errs %v outputs %d ledger %d", resumed.errs, len(resumed.outputs), len(proof.modelRequests()))
+	for _, variant := range []string{"plain", "retry", "failover", "unguarded-retry"} {
+		t.Run(variant, func(t *testing.T) {
+			t.Parallel()
+			trace := &adkTrace{}
+			checkpoints := newADKMemoryCheckpoints(trace)
+			proof := newADKProof(t, filepath.Join(t.TempDir(), "proof.db"), adkProofOptions{trace: trace})
+			defer proof.close()
+			scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{
+				agenticAssistant(schema.NewContentBlock(&schema.MCPToolApprovalRequest{ID: "apr-only", Name: "remote_read", ServerLabel: "srv"})),
+				agenticAssistant(agenticText("finished")),
+			}}
+			ledger := proof.ledgerModel(scripted)
+			ledger.approval = &adkApprovalBinding{}
+			config := &adk.TypedChatModelAgentConfig[*schema.AgenticMessage]{Name: "proof", Model: ledger}
+			switch variant {
+			case "retry":
+				config.ModelRetryConfig = &adk.TypedModelRetryConfig[*schema.AgenticMessage]{MaxRetries: 2, ShouldRetry: func(_ context.Context, retryCtx *adk.TypedRetryContext[*schema.AgenticMessage]) *adk.TypedRetryDecision[*schema.AgenticMessage] {
+					return &adk.TypedRetryDecision[*schema.AgenticMessage]{Retry: retryCtx.Err != nil && !interruptGuard(retryCtx.Err)}
+				}}
+			case "failover":
+				config.ModelFailoverConfig = &adk.ModelFailoverConfig[*schema.AgenticMessage]{
+					MaxRetries: 1,
+					ShouldFailover: func(_ context.Context, _ *schema.AgenticMessage, err error) bool {
+						return err != nil && !interruptGuard(err)
+					},
+					GetFailoverModel: func(context.Context, *adk.FailoverContext[*schema.AgenticMessage]) (einomodel.BaseModel[*schema.AgenticMessage], []*schema.AgenticMessage, error) {
+						return nil, nil, errors.New("failover must not be consulted for an interrupt")
+					},
+				}
+			case "unguarded-retry":
+				// Documented hazard: the deprecated IsRetryAble path retries the
+				// pause as if it were a failure, re-dispatching the request.
+				config.ModelRetryConfig = &adk.TypedModelRetryConfig[*schema.AgenticMessage]{MaxRetries: 1, IsRetryAble: func(context.Context, error) bool { return true }, BackoffFunc: func(context.Context, int) time.Duration { return 0 }}
+			}
+			agent, err := adk.NewTypedChatModelAgent[*schema.AgenticMessage](proof.ctx, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: agent, CheckPointStore: checkpoints})
+			drained := drainADKEvents(t, trace, runner.Run(proof.ctx, proof.userInput(), adk.WithCheckPointID("approval-only")))
+			if variant == "unguarded-retry" {
+				if len(drained.interrupts) != 0 || len(proof.modelRequests()) != 2 || scripted.calls.Load() != 2 {
+					t.Fatalf("unguarded retry hazard changed: interrupts=%d ledger=%d calls=%d", len(drained.interrupts), len(proof.modelRequests()), scripted.calls.Load())
+				}
+				return
+			}
+			if len(drained.errs) != 0 || len(drained.interrupts) != 1 {
+				t.Fatalf("approval-only response did not pause: errs=%v interrupts=%d\n%s", drained.errs, len(drained.interrupts), strings.Join(trace.list(), "\n"))
+			}
+			if len(drained.outputs) != 0 {
+				t.Fatalf("approval-only response must not complete the agent normally: %d outputs", len(drained.outputs))
+			}
+			if len(proof.modelRequests()) != 1 || len(proof.approvalRecords()) != 1 || scripted.calls.Load() != 1 {
+				t.Fatalf("wrapper duplicated the pause: ledger=%d approvals=%d calls=%d", len(proof.modelRequests()), len(proof.approvalRecords()), scripted.calls.Load())
+			}
+			iter, err := runner.ResumeWithParams(proof.ctx, "approval-only", &adk.ResumeParams{Targets: map[string]any{drained.interrupts[0].ID: "approve"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			resumed := drainADKEvents(t, trace, iter)
+			if len(resumed.errs) != 0 || assistantText(resumed.outputs[len(resumed.outputs)-1]) != "finished" || len(proof.modelRequests()) != 2 {
+				t.Fatalf("resume = errs %v outputs %d ledger %d", resumed.errs, len(resumed.outputs), len(proof.modelRequests()))
+			}
+		})
 	}
 }

@@ -7,11 +7,13 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/adk"
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -291,7 +293,9 @@ func TestADKBoundaryCancellationModes(t *testing.T) {
 		defer proof.close()
 		cancelOpt, cancel := adk.WithCancel()
 		release := make(chan struct{})
+		finished := make(chan struct{})
 		echo := proofTool("echo", proof.countingExecutor("echo", func(call ToolCall) (ToolResult, error) {
+			defer close(finished)
 			_, _ = cancel(adk.WithAgentCancelMode(adk.CancelImmediate))
 			<-release
 			return ToolResult{Output: "late"}, nil
@@ -304,15 +308,119 @@ func TestADKBoundaryCancellationModes(t *testing.T) {
 		runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: proof.newAgent(t, proof.ledgerModel(scripted))})
 		iter := runner.Run(proof.ctx, proof.userInput(), cancelOpt)
 		drained := drainADKEvents(t, trace, iter)
-		close(release)
 		var cancelErr *adk.CancelError
 		if len(drained.errs) != 1 || !errors.As(drained.errs[0], &cancelErr) {
+			close(release)
 			t.Fatalf("errors = %v\n%s", drained.errs, strings.Join(trace.list(), "\n"))
 		}
 		if scripted.calls.Load() != 1 {
+			close(release)
 			t.Fatalf("provider calls = %d", scripted.calls.Load())
 		}
-		trace.add("test.observed_cancel")
-		t.Logf("trace:\n%s", strings.Join(trace.list(), "\n"))
+		// The immediate cancel ended the run while the leaf was still running.
+		// Release it, wait for the durable settlement to land, and check the
+		// row: the runtime settles the late result under its own claim.
+		calls := proof.toolCalls()
+		if len(calls) != 1 || calls[0].Status != session.ToolCallRunning {
+			close(release)
+			t.Fatalf("tool call during immediate cancel = %+v", calls)
+		}
+		close(release)
+		<-finished
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			calls = proof.toolCalls()
+			if session.TerminalToolCall(calls[0].Status) || time.Now().After(deadline) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if proof.executions("echo") != 1 || calls[0].Status != session.ToolCallCompleted {
+			t.Fatalf("late settlement: executions=%d row=%+v", proof.executions("echo"), calls[0])
+		}
 	})
+}
+
+func TestADKBoundaryUnsupportedBlocksFailClosed(t *testing.T) {
+	t.Parallel()
+	trace := &adkTrace{}
+	proof := newADKProof(t, filepath.Join(t.TempDir(), "proof.db"), adkProofOptions{trace: trace})
+	defer proof.close()
+	scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{
+		agenticAssistant(agenticText("searching"), schema.NewContentBlock(&schema.ServerToolCall{Name: "web_search", CallID: "srv-1"})),
+	}}
+	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: proof.newAgent(t, proof.ledgerModel(scripted))})
+	drained := drainADKEvents(t, trace, runner.Run(proof.ctx, proof.userInput()))
+	if len(drained.errs) != 1 || !errors.Is(drained.errs[0], errADKUnsupportedBlock) || len(drained.outputs) != 0 {
+		t.Fatalf("errs=%v outputs=%d", drained.errs, len(drained.outputs))
+	}
+	records := proof.modelRequests()
+	if len(records) != 1 || records[0].State != session.ModelRequestFailed {
+		t.Fatalf("ledger = %+v", records)
+	}
+}
+
+// askPolicy is a real permissions.Policy that asks for one tool and denies
+// another; without an approval requester an ask settles as expected_failure.
+type askPolicy struct{}
+
+func (askPolicy) Decide(_ context.Context, request permissions.Request) (permissions.Decision, error) {
+	switch request.ToolName {
+	case "guarded":
+		return permissions.Decision{Action: permissions.ActionAsk, Message: "needs a human"}, nil
+	case "forbidden":
+		return permissions.Decision{Action: permissions.ActionDeny, Message: "never"}, nil
+	}
+	return permissions.Decision{Action: permissions.ActionAllow}, nil
+}
+
+func TestADKBoundaryPermissionPolicyDecidesBeforeExecution(t *testing.T) {
+	t.Parallel()
+	trace := &adkTrace{}
+	proof := newADKProof(t, filepath.Join(t.TempDir(), "proof.db"), adkProofOptions{trace: trace, permissions: askPolicy{}})
+	defer proof.close()
+	guarded := proofTool("guarded", proof.countingExecutor("guarded", nil), nil)
+	forbidden := proofTool("forbidden", proof.countingExecutor("forbidden", nil), nil)
+	open := proofTool("open", proof.countingExecutor("open", nil), nil)
+	proof.tools, proof.snapshot.Tools = []Tool{guarded, forbidden, open}, []Tool{guarded, forbidden, open}
+	scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{
+		agenticAssistant(agenticCall("", "guarded", `{"value":"g"}`), agenticCall("", "forbidden", `{"value":"f"}`), agenticCall("", "open", `{"value":"o"}`)),
+		agenticAssistant(agenticText("done")),
+	}}
+	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: proof.newAgent(t, proof.ledgerModel(scripted))})
+	drained := drainADKEvents(t, trace, runner.Run(proof.ctx, proof.userInput()))
+	if len(drained.errs) != 0 {
+		t.Fatalf("errors = %v\n%s", drained.errs, strings.Join(trace.list(), "\n"))
+	}
+	calls := statusByName(proof.toolCalls())
+	if proof.executions("guarded") != 0 || proof.executions("forbidden") != 0 || proof.executions("open") != 1 {
+		t.Fatalf("executions guarded=%d forbidden=%d open=%d", proof.executions("guarded"), proof.executions("forbidden"), proof.executions("open"))
+	}
+	for name, want := range map[string]string{"guarded": "approval_required", "forbidden": "denied"} {
+		call := calls[name]
+		if call.Status != session.ToolCallFailed {
+			t.Fatalf("%s status = %s", name, call.Status)
+		}
+		var output ToolOutput
+		if err := json.Unmarshal(call.Output, &output); err != nil || output.Status != "expected_failure" {
+			t.Fatalf("%s output = %s (%v)", name, call.Output, err)
+		}
+		var structured struct{ Status string }
+		if err := json.Unmarshal(output.Structured, &structured); err != nil || structured.Status != want {
+			t.Fatalf("%s structured = %s (%v)", name, output.Structured, err)
+		}
+		if call.Metadata["permission_status"] != "" {
+			t.Fatalf("%s leaked permission metadata into the durable row: %v", name, call.Metadata)
+		}
+	}
+	// The model sees the settled permission outcomes, not the executor.
+	seen := map[string]string{}
+	for _, msg := range scripted.requests[1] {
+		if id, text := functionResultText(msg); id != "" {
+			seen[id] = text
+		}
+	}
+	if seen[string(calls["guarded"].ID)] != string(calls["guarded"].Output) || seen[string(calls["forbidden"].ID)] != string(calls["forbidden"].Output) {
+		t.Fatalf("model-visible results %v differ from durable rows", seen)
+	}
 }

@@ -266,8 +266,8 @@ func TestADKRecoveryUntargetedResumeKeepsLeafPaused(t *testing.T) {
 	proof := newADKProof(t, filepath.Join(t.TempDir(), "proof.db"), adkProofOptions{trace: trace})
 	defer proof.close()
 	recoveryTools(proof)
-	_, _ = interruptedFirstTurn(t, proof, trace, checkpoints, "run-checkpoint")
-	scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{agenticAssistant(agenticText("unreachable"))}}
+	first, _ := interruptedFirstTurn(t, proof, trace, checkpoints, "run-checkpoint")
+	scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{agenticAssistant(agenticText("resumed"))}}
 	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: proof.newAgent(t, proof.ledgerModel(scripted)), CheckPointStore: checkpoints})
 	iter, err := runner.Resume(proof.ctx, "run-checkpoint")
 	if err != nil {
@@ -282,6 +282,60 @@ func TestADKRecoveryUntargetedResumeKeepsLeafPaused(t *testing.T) {
 	}
 	if trace.count("checkpoint.set run-checkpoint") != 2 {
 		t.Fatalf("expected the paused leaf to checkpoint again:\n%s", strings.Join(trace.list(), "\n"))
+	}
+	// Eino mints a fresh interrupt ID on every pause; the address is the
+	// stable identity. A stale ID target resolves to nothing and re-pauses
+	// silently, so public pause identity must be the address (or a durable
+	// runtime record resolved to the current ID at resume time).
+	if resumed.interrupts[0].ID == first.interrupts[0].ID {
+		t.Fatalf("interrupt id unexpectedly stable across re-pause: %s", resumed.interrupts[0].ID)
+	}
+	if !resumed.interrupts[0].Address.Equals(first.interrupts[0].Address) {
+		t.Fatalf("interrupt address changed across re-pause: %v != %v", resumed.interrupts[0].Address, first.interrupts[0].Address)
+	}
+	iter, err = runner.ResumeWithParams(proof.ctx, "run-checkpoint", &adk.ResumeParams{Targets: map[string]any{first.interrupts[0].ID: "approve"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := drainADKEvents(t, trace, iter)
+	if len(stale.errs) != 0 || len(stale.interrupts) != 1 || proof.executions("gate") != 0 || scripted.calls.Load() != 0 {
+		t.Fatalf("stale interrupt id must be a silent no-op re-pause: errs=%v interrupts=%d gate=%d calls=%d", stale.errs, len(stale.interrupts), proof.executions("gate"), scripted.calls.Load())
+	}
+	iter, err = runner.ResumeWithParams(proof.ctx, "run-checkpoint", &adk.ResumeParams{Targets: map[string]any{stale.interrupts[0].ID: "approve"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := drainADKEvents(t, trace, iter)
+	if len(current.errs) != 0 || len(current.interrupts) != 0 || proof.executions("gate") != 1 {
+		t.Fatalf("current interrupt id must resume: errs=%v interrupts=%d gate=%d", current.errs, len(current.interrupts), proof.executions("gate"))
+	}
+}
+
+func TestADKRecoveryCheckpointSetFailureStillEmitsInterrupt(t *testing.T) {
+	t.Parallel()
+	trace := &adkTrace{}
+	checkpoints := newADKMemoryCheckpoints(trace)
+	checkpoints.setErr = errors.New("checkpoint store unavailable")
+	proof := newADKProof(t, filepath.Join(t.TempDir(), "proof.db"), adkProofOptions{trace: trace})
+	defer proof.close()
+	recoveryTools(proof)
+	scripted := &adkScriptedModel{trace: trace, responses: []*schema.AgenticMessage{
+		agenticAssistant(agenticCall("", "safe", `{"value":"1"}`), agenticCall("", "gate", `{"value":"2"}`)),
+	}}
+	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: proof.newAgent(t, proof.ledgerModel(scripted)), CheckPointStore: checkpoints})
+	drained := drainADKEvents(t, trace, runner.Run(proof.ctx, proof.userInput(), adk.WithCheckPointID("run-checkpoint")))
+	// The runner reports the failed Set as an error event and still sends the
+	// interrupt event, so an interrupt action alone never proves durability:
+	// public pause promotion requires the interrupt and an error-free drain.
+	if len(drained.errs) != 1 || !strings.Contains(drained.errs[0].Error(), "checkpoint store unavailable") || len(drained.interrupts) != 1 {
+		t.Fatalf("errs=%v interrupts=%d\n%s", drained.errs, len(drained.interrupts), strings.Join(trace.list(), "\n"))
+	}
+	if checkpoints.has("run-checkpoint") {
+		t.Fatal("failed Set left a checkpoint behind")
+	}
+	after := statusByName(proof.toolCalls())
+	if after["safe"].Status != session.ToolCallCompleted || after["gate"].Status != session.ToolCallPending {
+		t.Fatalf("durable rows after failed checkpoint = %+v", after)
 	}
 }
 
@@ -331,8 +385,13 @@ func TestADKRecoveryCancellationAfterCheckpointDoesNotDuplicateWork(t *testing.T
 		t.Fatalf("cancelled resume dispatched the model: %v", resumed.errs)
 	}
 	after := statusByName(proof.toolCalls())
-	if proof.executions("gate") != 0 && after["gate"].Status == session.ToolCallCompleted {
-		t.Fatalf("cancelled resume completed the gated tool")
+	if proof.executions("gate") != 0 {
+		t.Fatalf("cancelled resume ran the gated executor %d times", proof.executions("gate"))
 	}
-	t.Logf("cancelled resume: errs=%v gate=%s executions=%d", resumed.errs, after["gate"].Status, proof.executions("gate"))
+	if after["gate"].Status != session.ToolCallPending {
+		t.Fatalf("cancelled resume changed the gated call to %s", after["gate"].Status)
+	}
+	if len(resumed.errs) == 0 {
+		t.Fatalf("cancelled resume must surface an error:\n%s", strings.Join(trace.list(), "\n"))
+	}
 }

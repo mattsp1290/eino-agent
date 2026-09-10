@@ -22,6 +22,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
+	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 	sqlite "github.com/mattsp1290/eino-agent/store/sqlite"
 )
@@ -34,6 +35,9 @@ import (
 // promotes the proven adapters into the runtime and deletes this scaffolding.
 
 func init() {
+	// Both interrupt info and state reach the checkpoint: the tools node
+	// persists leaf interrupt info inside its composite rerun state, so the
+	// info types must be gob-registered as well.
 	schema.RegisterName[*adkHostDecisionInfo]("eino_agent_proof_host_decision_info")
 	schema.RegisterName[*adkHostDecisionState]("eino_agent_proof_host_decision_state")
 	schema.RegisterName[*adkApprovalInfo]("eino_agent_proof_approval_info")
@@ -181,7 +185,6 @@ type adkMemoryCheckpoints struct {
 	data   map[string][]byte
 	trace  *adkTrace
 	setErr error
-	sets   int
 }
 
 func newADKMemoryCheckpoints(trace *adkTrace) *adkMemoryCheckpoints {
@@ -201,7 +204,6 @@ func (s *adkMemoryCheckpoints) Get(_ context.Context, id string) ([]byte, bool, 
 func (s *adkMemoryCheckpoints) Set(_ context.Context, id string, raw []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.sets++
 	if s.trace != nil {
 		s.trace.add("checkpoint.set %s bytes=%d", id, len(raw))
 	}
@@ -288,13 +290,14 @@ func (p *adkProof) seedStepsFromLedger() {
 }
 
 type adkProofOptions struct {
-	sessionID session.ID
-	prompt    string
-	tools     []Tool
-	trace     *adkTrace
-	clock     func() time.Time
-	ids       IDGenerator
-	lease     time.Duration
+	sessionID   session.ID
+	prompt      string
+	tools       []Tool
+	trace       *adkTrace
+	clock       func() time.Time
+	ids         IDGenerator
+	lease       time.Duration
+	permissions permissions.Policy
 }
 
 func newADKProof(t testing.TB, dbPath string, options adkProofOptions) *adkProof {
@@ -418,7 +421,7 @@ func (p *adkProof) newHost(store *sqlite.Store, options adkProofOptions) *Stream
 	if lease <= 0 {
 		lease = time.Minute
 	}
-	host, err := NewStreamingOrchestrator(
+	hostOptions := []Option{
 		WithStore(store),
 		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*schema.Message, error) {
 			return nil, errors.New("classic streamer must not be used by the ADK proof")
@@ -428,7 +431,11 @@ func (p *adkProof) newHost(store *sqlite.Store, options adkProofOptions) *Stream
 		WithClock(clock),
 		WithOwnerID("adk-proof"),
 		WithLease(lease),
-	)
+	}
+	if options.permissions != nil {
+		hostOptions = append(hostOptions, WithPermissions(options.permissions))
+	}
+	host, err := NewStreamingOrchestrator(hostOptions...)
 	if err != nil {
 		p.t.Fatal(err)
 	}
@@ -518,6 +525,8 @@ func (p *adkProof) userInput() []*schema.AgenticMessage {
 	}
 	return []*schema.AgenticMessage{schema.UserAgenticMessage(text)}
 }
+
+var errADKUnsupportedBlock = errors.New("adk proof cannot durably record content block")
 
 // adkLedgerModel is the mandatory runtime model adapter for the proof.
 type adkLedgerModel struct {
@@ -643,6 +652,13 @@ func (m *adkLedgerModel) Generate(ctx context.Context, input []*schema.AgenticMe
 }
 
 func (m *adkLedgerModel) Stream(ctx context.Context, input []*schema.AgenticMessage, opts ...einomodel.Option) (*schema.StreamReader[*schema.AgenticMessage], error) {
+	if m.approval != nil {
+		continuation, err := m.approval.prepare(ctx, m, input)
+		if err != nil {
+			return nil, err
+		}
+		input = continuation
+	}
 	dispatch, err := m.begin(ctx, "stream", input, opts)
 	if err != nil {
 		return nil, err
@@ -686,6 +702,13 @@ func (m *adkLedgerModel) Stream(ctx context.Context, input []*schema.AgenticMess
 	if err := m.finish(ctx, dispatch, nil); err != nil {
 		return nil, err
 	}
+	if m.approval != nil {
+		if err := m.approval.pause(ctx, m, dispatch, committed); err != nil {
+			return nil, err
+		}
+	}
+	// The adapter drains the provider stream before committing, so ADK only
+	// observes one committed chunk; live deltas are a W3/W7 transport concern.
 	return schema.StreamReaderFromArray([]*schema.AgenticMessage{committed}), nil
 }
 
@@ -718,6 +741,16 @@ func (m *adkLedgerModel) commit(ctx context.Context, dispatch *adkDispatch, resu
 			if block.FunctionToolCall != nil {
 				calls = append(calls, schema.ToolCall{ID: block.FunctionToolCall.CallID, Type: "function", Function: schema.FunctionCall{Name: block.FunctionToolCall.Name, Arguments: block.FunctionToolCall.Arguments}})
 			}
+		case schema.ContentBlockTypeMCPToolApprovalRequest:
+			// Persisted by the approval binding as a durable approval record.
+			if m.approval == nil {
+				return nil, fmt.Errorf("%w: %s", errADKUnsupportedBlock, block.Type)
+			}
+		default:
+			// W1 scaffolding persists text, reasoning and function calls only.
+			// Anything else must fail closed rather than reach ADK as a fact
+			// without a durable row; W2 supplies the full content contract.
+			return nil, fmt.Errorf("%w: %s", errADKUnsupportedBlock, block.Type)
 		}
 	}
 	classic := &schema.Message{Role: schema.Assistant, Content: strings.Join(text, ""), ReasoningContent: strings.Join(reasoning, ""), ToolCalls: calls}
@@ -740,6 +773,9 @@ func (m *adkLedgerModel) commit(ctx context.Context, dispatch *adkDispatch, resu
 	for _, block := range committed.ContentBlocks {
 		if block == nil || block.Type != schema.ContentBlockTypeFunctionToolCall || block.FunctionToolCall == nil {
 			continue
+		}
+		if index >= len(prepared) {
+			return nil, errors.New("prepared tool calls do not cover every function call block")
 		}
 		block.FunctionToolCall.CallID = string(prepared[index].call.ID)
 		block.FunctionToolCall.Arguments = string(prepared[index].call.Input)
@@ -765,6 +801,21 @@ func auditAgenticInput(input []*schema.AgenticMessage, opts []einomodel.Option) 
 		audited.Messages = append(audited.Messages, AuditedMessage{Canonical: raw})
 	}
 	common := einomodel.GetCommonOptions(&einomodel.Options{}, opts...)
+	if common.Temperature != nil {
+		audited.SafeCallConfig["temperature"] = fmt.Sprint(*common.Temperature)
+	}
+	if common.TopP != nil {
+		audited.SafeCallConfig["top_p"] = fmt.Sprint(*common.TopP)
+	}
+	if common.MaxTokens != nil {
+		audited.SafeCallConfig["max_tokens"] = fmt.Sprint(*common.MaxTokens)
+	}
+	if len(common.Stop) != 0 {
+		audited.SafeCallConfig["stop"] = strings.Join(common.Stop, "\x00")
+	}
+	if common.ToolChoice != nil {
+		audited.SafeCallConfig["tool_choice"] = string(*common.ToolChoice)
+	}
 	for _, info := range common.Tools {
 		if info == nil {
 			continue
@@ -815,6 +866,9 @@ func (t *adkDurableTool) InvokableRun(ctx context.Context, arguments string, _ .
 	if err != nil {
 		return "", fmt.Errorf("persisted tool call %s: %w", callID, err)
 	}
+	if record.RunID != p.run.ID || record.SessionID != p.run.SessionID {
+		return "", fmt.Errorf("persisted tool call %s belongs to run %s, not %s", callID, record.RunID, p.run.ID)
+	}
 	switch {
 	case session.TerminalToolCall(record.Status):
 		p.trace.add("tool.replay %s status=%s", callID, record.Status)
@@ -832,9 +886,17 @@ func (t *adkDurableTool) InvokableRun(ctx context.Context, arguments string, _ .
 	decision := ""
 	if t.tool.Metadata["proof_interrupt"] == "host_decision" {
 		isResume, hasData, data := compose.GetResumeContext[string](ctx)
-		if !isResume || !hasData {
+		if !isResume {
 			p.trace.add("tool.interrupt %s", callID)
 			return "", compose.StatefulInterrupt(ctx, &adkHostDecisionInfo{ToolCallID: string(callID)}, &adkHostDecisionState{ToolCallID: string(callID)})
+		}
+		// A targeted leaf with a payload of the wrong type is a host bug, not
+		// a reason to pause forever without a diagnostic.
+		if !hasData {
+			return "", fmt.Errorf("host decision for %s must be a string", callID)
+		}
+		if data != "approve" && data != "deny" {
+			return "", fmt.Errorf("host decision for %s must be approve or deny, got %q", callID, data)
 		}
 		decision = data
 		p.trace.add("tool.resume %s decision=%s", callID, decision)

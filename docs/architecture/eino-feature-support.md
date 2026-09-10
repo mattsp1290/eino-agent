@@ -43,11 +43,18 @@ Verified invariants (each is an executable assertion, run with `-race -count=10`
   settles it completed or failed afterwards.
 - The model result is committed (text and reasoning parts, canonical pending
   tool-call records, finalized assistant message) before ADK emits the model
-  event, in both generate and streaming mode. Streaming chunks carrying
-  `StreamingMeta.Index` are concatenated with `schema.ConcatAgenticMessages`.
+  event, in both generate and streaming mode. The scaffolding drains the
+  provider stream to EOF, concatenates chunks carrying `StreamingMeta.Index`
+  with `schema.ConcatAgenticMessages`, and republishes one committed chunk;
+  no live delta reaches ADK. Live transport of deltas is W3/W7 work. Results
+  containing any block kind the scaffolding cannot record (server, MCP,
+  tool-search and generated media blocks) fail closed before ADK sees them.
 - ADK schedules function calls but only the durable adapter executes them:
-  claim under the run fence, existing permission and settlement pipeline,
-  then the settled output is the only model-visible and event-visible result.
+  claim under the run fence, the existing permission policy (a real
+  `permissions.Policy` asking and denying settles `expected_failure` rows
+  without running the executor) and the settlement pipeline, then the settled
+  output is the only model-visible and event-visible result. Replayed
+  terminal rows are checked against the current run and session.
 - A tool interrupt (`compose.StatefulInterrupt` from the tool) produces a real
   ADK checkpoint that is written before the interrupt event reaches the
   consumer. After closing and reopening SQLite under a new run fence, a
@@ -56,7 +63,10 @@ Verified invariants (each is an executable assertion, run with `-race -count=10`
   is settled interrupted without rerun; a call settled after a stale
   checkpoint replays its recorded output without running the executor.
 - An untargeted resume keeps the leaf paused, checkpoints again and dispatches
-  nothing. Stale fences and competing live claims are rejected.
+  nothing. Stale fences and competing live claims are rejected. A runner
+  checkpoint `Set` failure emits an error event and still emits the interrupt
+  event, so public pause promotion requires the interrupt and an error-free
+  drain, never the interrupt alone.
 - Cancellation: before dispatch produces no ledger row; `CancelAfterChatModel`
   commits the model result and checkpoints without running tools;
   `CancelAfterToolCalls` settles the tool then checkpoints; immediate
@@ -71,8 +81,10 @@ Verified invariants (each is an executable assertion, run with `-race -count=10`
   retires a loaded one; a preempting push cancels only the captured turn.
 - A completed model result carrying `MCPToolApprovalRequest` pauses at the
   model boundary through `compose.StatefulInterrupt`, before the ReAct loop can
-  schedule sibling function calls. The approval record is durable, resume
-  after reopen CASes it once, dispatches exactly one continuation whose input
+  schedule sibling function calls, in generate and streaming mode and with a
+  retry wrapper configured. The approval record is durable; resume after
+  reopen updates it once under the run fence, dispatches exactly one
+  continuation whose input
   is the original input, the committed transcript and the user-role
   `MCPToolApprovalResponse` bound to the request ID, and a duplicate decision
   cannot dispatch again. Approval-only results also pause instead of
@@ -91,8 +103,28 @@ Findings that shape later packages:
   `settleInterruptedTool` now treats `null` as absent so interrupted
   settlements carry a real bounded output.
 - Executed sibling tools are served from the ADK checkpoint state on resume;
-  SQL remains authoritative when the checkpoint is stale. Interrupt IDs are ADK
-  addresses and are distinct from native approval IDs.
+  SQL remains authoritative when the checkpoint is stale.
+- Eino mints a fresh UUID interrupt ID on every pause and re-pause, while the
+  `InterruptCtx.Address` (for example `agent:proof;tool:gate:call-9`) is the
+  stable identity. `ResumeWithParams` with an ID that no longer resolves is a
+  silent no-op re-pause. Public pause identity in W5 must therefore be the
+  address or a durable runtime record that is resolved to the current
+  interrupt ID from the freshly loaded checkpoint at resume time, and native
+  approval IDs remain distinct from both.
+- The scaffolding's ledger uses attempt `1` for every dispatch and a shared
+  per-run step sequence, so the `attempt` axis of the unique index is inert
+  until W5 defines invocation identity; audited safe call configuration
+  covers temperature, top-p, max tokens, stop and tool choice only.
+- Upstream retry and failover wrappers only recognize graph-level interrupt
+  errors (`compose.ExtractInterruptInfo`); a `compose.StatefulInterrupt`
+  returned by the model itself is treated as an ordinary failure by the
+  deprecated `IsRetryAble` path and re-dispatched. Host-provided
+  `ShouldRetry`/`ShouldFailover` decisions must refuse errors matched by
+  `compose.IsInterruptRerunError`; the proof covers both guarded wrappers and
+  the unguarded hazard.
+- The approval record's decision is a read-then-update under the run fence
+  and an in-process mutex, not a store-level conditional write; W2/W5 give
+  the typed content contract a conditional update.
 - The `TypedChatModelAgent` doc comment describes the agentic variant as
   single-shot, but v0.9.19 builds an agentic ReAct graph with a real
   `AgenticToolsNode`; local function tools do execute.

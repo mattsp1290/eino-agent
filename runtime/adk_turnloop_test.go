@@ -87,6 +87,13 @@ func (l *turnLoopProof) config(t *testing.T, checkpointID string) adk.TurnLoopCo
 	}
 }
 
+func mustPush(t *testing.T, loop *adk.TurnLoop[turnItem, *schema.AgenticMessage], item turnItem) {
+	t.Helper()
+	if ok, _ := loop.Push(item); !ok {
+		t.Fatalf("push %s rejected", item.ID)
+	}
+}
+
 func newTurnLoopProof(t *testing.T, proof *adkProof, trace *adkTrace, scripted *adkScriptedModel, checkpoints *adkMemoryCheckpoints) *turnLoopProof {
 	return &turnLoopProof{proof: proof, trace: trace, ledger: proof.ledgerModel(scripted), checkpoints: checkpoints, turnDone: make(chan int, 16)}
 }
@@ -186,8 +193,8 @@ func TestADKTurnLoopInterruptedTurnCheckpointsAfterEventsReturn(t *testing.T) {
 	loopProof := newTurnLoopProof(t, proof, trace, scripted, checkpoints)
 	loop := adk.NewTurnLoop(loopProof.config(t, "loop-1"))
 	loop.Run(proof.ctx)
-	loop.Push(turnItem{ID: "inbox-1", Text: "first"})
-	loop.Push(turnItem{ID: "inbox-2", Text: "queued"})
+	mustPush(t, loop, turnItem{ID: "inbox-1", Text: "first"})
+	mustPush(t, loop, turnItem{ID: "inbox-2", Text: "queued"})
 	state := loop.Wait()
 	trace.add("test.wait_returned")
 	var interruptErr *adk.InterruptError
@@ -228,9 +235,9 @@ func TestADKTurnLoopInterruptedTurnCheckpointsAfterEventsReturn(t *testing.T) {
 	}
 	assertTraceOrder(t, trace, "checkpoint.get loop-1", "loop.gen_resume interrupted=1 unhandled=1 new=0", "tool.resume", "adapter.generate.begin call=2", "loop.events_returned turn=2",
 		"loop.gen_input items=1 first=inbox-2", "adapter.generate.begin call=3", "loop.events_returned turn=3")
-	if !checkpoints.has("loop-1") {
-		// Clean exit deletes the loaded checkpoint through CheckPointDeleter.
-		t.Log("loaded checkpoint retired after clean exit")
+	// A clean exit retires the loaded checkpoint through CheckPointDeleter.
+	if checkpoints.has("loop-1") {
+		t.Fatalf("loaded checkpoint was not retired after clean exit:\n%s", strings.Join(trace.list(), "\n"))
 	}
 }
 
@@ -248,7 +255,7 @@ func TestADKTurnLoopCheckpointSetFailureIsReportedNotSilent(t *testing.T) {
 	loopProof := newTurnLoopProof(t, proof, trace, scripted, checkpoints)
 	loop := adk.NewTurnLoop(loopProof.config(t, "loop-1"))
 	loop.Run(proof.ctx)
-	loop.Push(turnItem{ID: "inbox-1", Text: "first"})
+	mustPush(t, loop, turnItem{ID: "inbox-1", Text: "first"})
 	state := loop.Wait()
 	if !state.CheckpointAttempted || state.CheckpointErr == nil || !strings.Contains(state.CheckpointErr.Error(), "disk full") {
 		t.Fatalf("exit state = %+v", state)
@@ -278,8 +285,8 @@ func TestADKTurnLoopBetweenTurnStopKeepsQueuedInput(t *testing.T) {
 	}
 	loop := adk.NewTurnLoop(loopProof.config(t, "loop-1"))
 	loop.Run(proof.ctx)
-	loop.Push(turnItem{ID: "inbox-1", Text: "first"})
-	loop.Push(turnItem{ID: "inbox-2", Text: "queued"})
+	mustPush(t, loop, turnItem{ID: "inbox-1", Text: "first"})
+	mustPush(t, loop, turnItem{ID: "inbox-2", Text: "queued"})
 	state := loop.Wait()
 	if state.ExitReason != nil || len(state.InterruptedItems) != 0 || len(state.UnhandledItems) != 1 || state.UnhandledItems[0].ID != "inbox-2" {
 		t.Fatalf("exit state = %+v\n%s", state, strings.Join(trace.list(), "\n"))
@@ -333,7 +340,7 @@ func TestADKTurnLoopPreemptTargetsOnlyCapturedTurn(t *testing.T) {
 		return nil
 	}
 	loop.Run(proof.ctx)
-	loop.Push(turnItem{ID: "inbox-1", Text: "first"})
+	mustPush(t, loop, turnItem{ID: "inbox-1", Text: "first"})
 	loopProof.waitTurn(t, 1)
 	if preempted != nil {
 		<-preempted

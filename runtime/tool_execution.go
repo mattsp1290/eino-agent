@@ -1,9 +1,11 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mattsp1290/eino-agent/extension"
@@ -76,7 +78,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	result := ToolResult{}
 	// SQL stores decode an unsettled call's absent output as JSON null rather
 	// than an empty payload; both mean no output was recorded.
-	if len(raw) == 0 || string(raw) == "null" {
+	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		var output ToolOutput
 		raw, output, _, _ = encodeToolOutput(claimed.ID, ToolResult{Output: "tool execution interrupted"}, tool.Retention, ToolInterrupted, nil)
 		metadata = toolSettlementMetadata(metadata, output)
@@ -84,7 +86,9 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 		result.Structured = cloneJSON(output.Structured)
 	} else {
 		var output ToolOutput
-		_ = json.Unmarshal(raw, &output)
+		if err := json.Unmarshal(raw, &output); err != nil {
+			return session.ToolSettlement{}, fmt.Errorf("stored output for tool call %s is malformed: %w", claimed.ID, err)
+		}
 		result.Output = output.Content
 		result.Structured = cloneJSON(output.Structured)
 	}

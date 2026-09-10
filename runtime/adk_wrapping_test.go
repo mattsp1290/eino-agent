@@ -185,8 +185,9 @@ func TestADKWrappingChildAgentCallsPassLedgerAndSettlement(t *testing.T) {
 	// The child is exposed to the parent as a frozen-registry tool whose
 	// executor runs the ADK agent tool: the durable wrapper claims and
 	// settles around the whole child execution.
+	var childCtx context.Context
 	childTool := proofTool("child", proof.countingExecutor("child", func(call ToolCall) (ToolResult, error) {
-		output, err := invokable.InvokableRun(context.Background(), string(call.Input))
+		output, err := invokable.InvokableRun(childCtx, string(call.Input))
 		if err != nil {
 			return ToolResult{}, err
 		}
@@ -206,6 +207,7 @@ func TestADKWrappingChildAgentCallsPassLedgerAndSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := adk.NewTypedRunner(adk.TypedRunnerConfig[*schema.AgenticMessage]{Agent: parent})
+	childCtx = proof.ctx
 	drained := drainADKEvents(t, trace, runner.Run(proof.ctx, proof.userInput()))
 	if len(drained.errs) != 0 {
 		t.Fatalf("errors = %v\n%s", drained.errs, strings.Join(trace.list(), "\n"))

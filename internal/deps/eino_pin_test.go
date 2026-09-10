@@ -1,6 +1,7 @@
 package deps
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -20,10 +21,16 @@ const (
 
 func TestEinoIsPinnedExactlyWithoutReplacement(t *testing.T) {
 	t.Parallel()
+	// go may print download progress on stderr with a cold module cache, so
+	// only stdout is parsed. GOWORK=off keeps a stray parent workspace from
+	// redirecting the pin.
 	command := exec.Command("go", "list", "-m", "-json", einoModulePath)
-	output, err := command.CombinedOutput()
+	command.Env = append(os.Environ(), "GOWORK=off")
+	var stderr bytes.Buffer
+	command.Stderr = &stderr
+	output, err := command.Output()
 	if err != nil {
-		t.Fatalf("go list -m: %v\n%s", err, output)
+		t.Fatalf("go list -m: %v\n%s", err, stderr.String())
 	}
 	var module struct {
 		Path    string
@@ -39,9 +46,12 @@ func TestEinoIsPinnedExactlyWithoutReplacement(t *testing.T) {
 	if module.Replace != nil {
 		t.Fatalf("eino must not be replaced: %+v", module.Replace)
 	}
-	root, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/mattsp1290/eino-agent").Output()
+	rootCommand := exec.Command("go", "list", "-m", "-f", "{{.Dir}}", "github.com/mattsp1290/eino-agent")
+	rootCommand.Env = append(os.Environ(), "GOWORK=off")
+	rootCommand.Stderr = &stderr
+	root, err := rootCommand.Output()
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("go list -m root: %v\n%s", err, stderr.String())
 	}
 	sum, err := os.ReadFile(filepath.Join(strings.TrimSpace(string(root)), "go.sum"))
 	if err != nil {
