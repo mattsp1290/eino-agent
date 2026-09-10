@@ -106,12 +106,16 @@ func TestADKBoundaryFreshRunInterceptsEveryModelAndToolCall(t *testing.T) {
 			// the model event, claim before executor, settlement before the tool
 			// event and before the next dispatch.
 			kind := map[bool]string{false: "generate", true: "stream"}[streaming]
+			// Two causal chains share the commit: the model event is only
+			// published after the commit, and the tool is only claimed after
+			// the commit. Events are delivered asynchronously through the
+			// iterator, so their order relative to the tool chain is free.
 			assertTraceOrder(t, trace,
 				"adapter."+kind+".begin call=1", "ledger.dispatch_started", "provider.call 1", "adapter.commit", "ledger.completed",
-				"event.output role=assistant", "tool.claimed", "executor.echo", "tool.settled",
+				"event.output role=assistant", "iterator.drained")
+			assertTraceOrder(t, trace,
+				"adapter.commit", "tool.claimed", "executor.echo", "tool.settled",
 				"adapter."+kind+".begin call=2", "provider.call 2", "iterator.drained")
-			// The tool result event is delivered asynchronously, but always after
-			// settlement.
 			assertTraceOrder(t, trace, "tool.settled", "event.output role=user")
 			if streaming {
 				if trace.count("adapter.stream.chunk") < 2 {
