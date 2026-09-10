@@ -173,6 +173,50 @@ Superseded part kinds (`text`, `tool_call`, `tool_result`, `file`, `step`,
 `state`) remain declared until the runtime cutover replaces the assistant
 persistence path in W3/W5.
 
-## W3 through W8
+## W3: agentic model boundary
+
+Status: landed (commits e4dd842, 84b7bdd); dual review applied.
+
+- `model.Request` carries `[]*schema.AgenticMessage` and typed
+  `RequestControls` (tools, deferred tools, tool-search tool, agentic tool
+  choice, temperature, top-p, max tokens, stop). `ValidateControls` rejects
+  bad partitions and selectors before any dispatch. `NewAgenticStreamer`
+  translates controls into Eino call options in a fixed order and always
+  sends the tool list, so an empty list clears the client's tools.
+- Provider-private state is block-bound: `NewTypedExtensionStateCodec`
+  captures reasoning signatures, Claude encrypted citation indexes, Gemini
+  SDK blobs and provider response/continuation IDs into `ProviderStateItem`s
+  keyed by block ID and restores them only into the dispatched clone; the
+  restored message is re-captured and any codec that alters public content
+  is rejected. The codec's item shapes are proven byte-equal to the W2
+  content split for every private kind.
+- `NewClassicStreamer` and `NewClassicStreamerWithProviderState` adapt
+  classic `ToolCallingChatModel` providers: faithful translation of text,
+  multi-content user input, assistant text/reasoning/calls and tool results,
+  typed `capability_unsupported` rejection before dispatch for server, MCP
+  and tool-search blocks, deferred tools, tool search, assistant media and
+  MCP/server tool-choice selectors, and stable block indices for streamed
+  classic tool calls. Native provider translation remains an eino-providers
+  deliverable (`eino-agent-td8`); the runtime consumes `model.AgenticModel`.
+- Runtime: turn snapshots, admission, context assembly, streaming (bounded
+  by `StreamLimits`), audit and the tool loop run on agentic messages. Each
+  physical dispatch is one ledger row whose messages, tools, deferred tools,
+  search tool, tool choice and scalar controls are persisted and hashed;
+  private fields never reach the row. Assistant results persist as rich
+  content parts plus response meta and block-bound provider-state parts in
+  one transaction; tool results persist as user-role `function_tool_result`
+  blocks whose text is the unchanged model-visible `ToolOutput` JSON, with
+  retention clamped to the content block budget. Provider-state restore
+  follows the projected message, dropping items bound to blocks the
+  projection excluded (for example reasoning under default history
+  options). Store envelope identity checks and replay decode under hard
+  ceilings, not admission defaults.
+
+Findings: Eino's `StreamReader.Close` is single-use; the classic adapter
+round-trips classic `Extra` through a transient agentic `Extra` so the
+existing Extra-key codecs keep working, and `Request.Clone` rejects any
+`Extra` so that transient state can never re-enter a request.
+
+## W4 through W8
 
 Not started. Each package adds its rows here when it lands.
