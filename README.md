@@ -27,7 +27,7 @@ and observability remain provider-neutral.
   host-owned SQLite and PostgreSQL APIs.
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
-- CloudWeGo Eino: `github.com/cloudwego/eino v0.8.13`
+- CloudWeGo Eino: `github.com/cloudwego/eino v0.9.19` (exact pin; see [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md))
 - AG-UI bridge: `github.com/mattsp1290/eino-agui v0.1.1`
 - Observability: `github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b`
 - Coding tools: `github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2`

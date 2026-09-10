@@ -8,6 +8,28 @@ The initial baseline below is historical. Do not
 upgrade them inside unrelated implementation work; file a dependency-upgrade
 bead with compatibility gates instead.
 
+## Eino v0.9.19 pin
+
+Verified on 2026-09-10 (UTC): `github.com/cloudwego/eino v0.9.19`, origin
+`9d983b36a5112a1c233056b1a099825298fafb8f` (`refs/tags/v0.9.19`), module
+checksum `h1:i71YUBK3nwY4L53dkzRgZpAcPSZ4v4eRponN7W9sDtk=`, resolved through
+`go mod download -json` with no `replace` directive. The exact pin is enforced
+by `internal/deps/eino_pin_test.go`. The typed ADK interception proof and its
+findings are recorded in
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md).
+
+External pins for the agentic adoption:
+
+- `github.com/mattsp1290/eino-agui`: accepted contract published at commit
+  `0e1d33d4f27f934226b707f252b7499484f4762e`
+  (`v0.1.2-0.20260910172717-0e1d33d4f27f`); it requires the root replacement
+  `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
+  `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`.
+  Adopted in W7.
+- `github.com/mattsp1290/eino-providers`: native `AgenticModel` contract not
+  yet answered (`eino-agent-td8`); no pin recorded. Native provider integration
+  and the final W8 gate remain blocked on it.
+
 ## SQL-store consumer publication
 
 The current reusable SQL-store implementation is full remote commit

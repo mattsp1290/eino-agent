@@ -4,7 +4,7 @@ go 1.26.3
 
 require (
 	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9
-	github.com/cloudwego/eino v0.8.13
+	github.com/cloudwego/eino v0.9.19
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0

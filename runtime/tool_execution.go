@@ -74,7 +74,9 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	raw := cloneJSON(claimed.Output)
 	metadata := cloneStringMap(claimed.Metadata)
 	result := ToolResult{}
-	if len(raw) == 0 {
+	// SQL stores decode an unsettled call's absent output as JSON null rather
+	// than an empty payload; both mean no output was recorded.
+	if len(raw) == 0 || string(raw) == "null" {
 		var output ToolOutput
 		raw, output, _, _ = encodeToolOutput(claimed.ID, ToolResult{Output: "tool execution interrupted"}, tool.Retention, ToolInterrupted, nil)
 		metadata = toolSettlementMetadata(metadata, output)

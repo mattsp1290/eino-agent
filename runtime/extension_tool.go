@@ -177,10 +177,16 @@ func sameProtectedToolInfo(left, right *einoschema.ToolInfo) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	leftRaw, leftErr := json.Marshal(left)
-	rightRaw, rightErr := json.Marshal(right)
+	// Eino v0.9.19 ToolInfo marshals ParamsOneOf natively and distinguishes the
+	// params form from the JSON-schema form. Protected clones normalize to the
+	// JSON-schema form, so compare the converted schema separately from the
+	// remaining fields.
 	leftSchema, leftSchemaErr := protectedParamsOneOfJSON(left.ParamsOneOf)
 	rightSchema, rightSchemaErr := protectedParamsOneOfJSON(right.ParamsOneOf)
+	leftInfo, rightInfo := *left, *right
+	leftInfo.ParamsOneOf, rightInfo.ParamsOneOf = nil, nil
+	leftRaw, leftErr := json.Marshal(&leftInfo)
+	rightRaw, rightErr := json.Marshal(&rightInfo)
 	return leftErr == nil && rightErr == nil && leftSchemaErr == nil && rightSchemaErr == nil && bytes.Equal(leftRaw, rightRaw) && bytes.Equal(leftSchema, rightSchema)
 }
 

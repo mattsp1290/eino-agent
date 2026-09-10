@@ -23,7 +23,7 @@ watch. On 2026-09-10 (UTC), its local gates and an unrelated PostgreSQL consumer
 passed through the public Go proxy and checksum database with an empty module
 cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
 See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
-CloudWeGo Eino is `v0.8.13`; PostgreSQL 17 is the supported server baseline.
+CloudWeGo Eino is pinned to exactly `v0.9.19`; PostgreSQL 17 is the supported server baseline.
 
 The separately published generated-bindings dependency remains
 `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, through repository tag
