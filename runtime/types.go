@@ -14,10 +14,12 @@ import (
 
 // UserMessage is the one current user submission admitted by Start.
 //
-// Runtime owns its durable message and part identities. Callers must not copy
-// transcript history into this value. Block IDs may be left empty: Start
-// assigns any missing block ID from the orchestrator's IDGenerator before
-// validating and admitting the message.
+// Runtime owns its durable message, part, and content-block identities.
+// Callers must not copy transcript history into this value. Block IDs must
+// be left empty: Start rejects any caller-supplied ContentBlock.ID and mints
+// every block's durable ID itself from the orchestrator's IDGenerator before
+// validating and admitting the message. Durable Part IDs are minted
+// independently of block IDs, so callers must not assume the two coincide.
 type UserMessage struct {
 	Blocks []session.ContentBlock
 }

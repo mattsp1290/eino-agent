@@ -67,7 +67,14 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	if err := o.validateConfigured(); err != nil {
 		return nil, err
 	}
-	request.Message.Blocks = assignContentBlockIDs(request.Message.Blocks, o.ids)
+	if err := rejectCallerContentBlockIDs(request.Message.Blocks); err != nil {
+		return nil, err
+	}
+	blocks, err := assignContentBlockIDs(request.Message.Blocks, o.ids)
+	if err != nil {
+		return nil, err
+	}
+	request.Message.Blocks = blocks
 	if err := o.validate(request); err != nil {
 		return nil, err
 	}
@@ -95,17 +102,25 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		SessionID:          request.SessionID,
 		RunID:              o.ids.NewRunID(),
 		UserMessageID:      o.ids.NewMessageID(),
-		UserPartIDs:        partIDsFromBlocks(request.Message.Blocks),
+		UserPartIDs:        partIDsFromBlocks(request.Message.Blocks, o.ids),
 		AssistantMessageID: o.ids.NewMessageID(),
 		ContextEpochID:     o.ids.NewEpochID(),
 		EventID:            o.ids.NewEventID(),
 		RunClaimToken:      string(o.ids.NewEventID()),
 	}
+	// history.Options.ContentLimits must track the orchestrator's configured
+	// content bounds so decoding never diverges from the bounds admission
+	// encoded under (WithContentLimits can raise them above the durable
+	// defaults). WithHistory has no visibility into WithContentLimits at
+	// option-application time, so the override happens here instead of
+	// being baked into o.history.
+	historyOptions := o.history
+	historyOptions.ContentLimits = o.contentLimits
 	admitter := o.admitter()
 	admitted, err := admitter.admit(ctx, admissionRequest{
 		IDs:           ids,
 		UserMessage:   request.Message,
-		History:       o.history,
+		History:       historyOptions,
 		Config:        request.Config,
 		Model:         resolved,
 		OwnerID:       o.ownerID(),
@@ -486,7 +501,10 @@ func (o *StreamingOrchestrator) finalRunEvent(result Result) session.RunSettleme
 	eventErr := eventError(result.Error)
 	return session.RunSettlementEvent{
 		ID: o.ids.NewEventID(), MessageID: result.MessageID,
-		Usage:     session.Usage{InputTokens: result.Usage.InputTokens, OutputTokens: result.Usage.OutputTokens, ReasoningTokens: result.Usage.ReasoningTokens, CacheReadTokens: result.Usage.CacheReadTokens, CacheWriteTokens: result.Usage.CacheWriteTokens, Cost: result.Usage.Cost},
+		Usage: session.Usage{
+			InputTokens: result.Usage.InputTokens, TotalTokens: result.Usage.TotalTokens, OutputTokens: result.Usage.OutputTokens,
+			ReasoningTokens: result.Usage.ReasoningTokens, CacheReadTokens: result.Usage.CacheReadTokens, CacheWriteTokens: result.Usage.CacheWriteTokens, Cost: result.Usage.Cost,
+		},
 		ErrorCode: eventErr.Code, Retryable: eventErr.Retryable,
 	}
 }
@@ -515,38 +533,58 @@ func (o *StreamingOrchestrator) validate(request Request) error {
 	return nil
 }
 
-// assignContentBlockIDs returns a copy of blocks with a fresh durable block
-// ID assigned to every block whose ID is empty. It never mutates the
-// caller's slice or its elements. ids may be nil, in which case blocks with
-// empty IDs are left unassigned (validate then rejects them).
-func assignContentBlockIDs(blocks []session.ContentBlock, ids IDGenerator) []session.ContentBlock {
-	if len(blocks) == 0 {
-		return blocks
-	}
-	out := make([]session.ContentBlock, len(blocks))
-	copy(out, blocks)
-	if ids == nil {
-		return out
-	}
-	for i := range out {
-		if out[i].ID == "" {
-			out[i].ID = string(ids.NewPartID())
+// rejectCallerContentBlockIDs enforces that content block identity is
+// entirely runtime-owned (see UserMessage's doc comment): a caller must not
+// supply its own ContentBlock.ID. It runs on the caller's original blocks,
+// before assignContentBlockIDs clones and overwrites them, so it fails
+// loudly instead of silently discarding caller-supplied identity.
+func rejectCallerContentBlockIDs(blocks []session.ContentBlock) error {
+	for _, b := range blocks {
+		if b.ID != "" {
+			return fmt.Errorf("%w: content block ID is runtime-assigned; callers must leave ContentBlock.ID empty", ErrInvalidOrchestrator)
 		}
 	}
-	return out
+	return nil
 }
 
-// partIDsFromBlocks derives the durable Part ID used to store each user
-// content block from the block's own durable identity (assignContentBlockIDs
-// has already filled every block's ID by the time Start calls this). Reusing
-// the block ID as the Part ID avoids minting a second identifier per block.
-func partIDsFromBlocks(blocks []session.ContentBlock) []session.PartID {
+// assignContentBlockIDs returns a deep copy of blocks with a fresh durable
+// block ID minted for every block, unconditionally. It never mutates the
+// caller's slice or its elements: the copy is a full session.Content.Clone,
+// not just a shallow slice copy, so the caller's *TextBlock, *MediaBlock, and
+// json.RawMessage pointers never reach validation or the admission
+// transaction. ids may be nil, in which case block IDs are left empty
+// (validate then rejects them).
+func assignContentBlockIDs(blocks []session.ContentBlock, ids IDGenerator) ([]session.ContentBlock, error) {
+	if len(blocks) == 0 {
+		return blocks, nil
+	}
+	cloned, err := session.Content{Role: session.RoleUser, Blocks: blocks}.Clone()
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidOrchestrator, err)
+	}
+	out := cloned.Blocks
+	if ids == nil {
+		return out, nil
+	}
+	for i := range out {
+		out[i].ID = string(ids.NewPartID())
+	}
+	return out, nil
+}
+
+// partIDsFromBlocks mints one durable Part ID per block, independent of the
+// block's own ContentBlock.ID. Block identity and Part identity are separate
+// concerns: parts.id is a store-wide UNIQUE primary key, so reusing a block
+// ID as a Part ID would let caller-influenced values collide with unrelated
+// parts. Both identifiers are minted from the same IDGenerator, but
+// independently.
+func partIDsFromBlocks(blocks []session.ContentBlock, ids IDGenerator) []session.PartID {
 	if len(blocks) == 0 {
 		return nil
 	}
 	out := make([]session.PartID, len(blocks))
-	for i, block := range blocks {
-		out[i] = session.PartID(block.ID)
+	for i := range blocks {
+		out[i] = ids.NewPartID()
 	}
 	return out
 }

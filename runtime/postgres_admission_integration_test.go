@@ -171,6 +171,12 @@ CREATE TRIGGER runtime_admission_order_probe BEFORE INSERT ON public.runs FOR EA
 	return remove
 }
 
+// installRuntimeAdmissionRollbackTrigger's witness checks part id
+// 'part-2', not 'part-1': reverseAdmissionIDs.NewPartID() is called once by
+// assignContentBlockIDs to mint the block's own ContentBlock.ID ("part-1")
+// and once more, independently, by partIDsFromBlocks to mint the durable
+// Part ID actually stored in parts.id ("part-2") — block identity and part
+// identity are deliberately separate durable identifiers.
 func installRuntimeAdmissionRollbackTrigger(t *testing.T, f *postgresRuntimeFixture) func() {
 	t.Helper()
 	remove := registerRuntimeAdmissionTriggerCleanup(t, f)
@@ -178,7 +184,7 @@ func installRuntimeAdmissionRollbackTrigger(t *testing.T, f *postgresRuntimeFixt
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM public.context_epochs WHERE id = convert_to('epoch-1', 'UTF8')) OR
      NOT EXISTS (SELECT 1 FROM public.messages WHERE id = convert_to('z-user-1', 'UTF8') AND role = 'user') OR
-     NOT EXISTS (SELECT 1 FROM public.parts WHERE id = convert_to('part-1', 'UTF8') AND kind = 'user_input_text') OR
+     NOT EXISTS (SELECT 1 FROM public.parts WHERE id = convert_to('part-2', 'UTF8') AND kind = 'user_input_text') OR
      NOT EXISTS (SELECT 1 FROM public.messages WHERE id = convert_to('a-assistant-1', 'UTF8') AND role = 'assistant') THEN
     RAISE EXCEPTION 'runtime admission order witness missing' USING ERRCODE = 'P0001';
   END IF;

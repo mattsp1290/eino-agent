@@ -138,7 +138,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 			if err := model.ValidateProviderStateIdentity(envelope.ProviderID, envelope.SourceModelID); err != nil {
 				return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
 			}
-			items = append(items, model.ProviderStateItem{Data: append(json.RawMessage(nil), envelope.Data...)})
+			items = append(items, model.ProviderStateItem{BlockID: envelope.BlockID, Data: append(json.RawMessage(nil), envelope.Data...)})
 		}
 		if err := model.ValidateProviderStateItems(items, contract.Limits); err != nil {
 			if errors.Is(err, model.ErrProviderStateTooLarge) {
@@ -205,7 +205,7 @@ func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.Mess
 		payload, err := session.EncodeProviderStatePayload(session.ProviderStateEnvelope{
 			CodecID: contract.CodecID, Version: contract.Version, ProviderID: string(snapshot.Model.Provider.ID),
 			SourceModelID: string(snapshot.Model.Model.ID), CompatibilityKey: contract.CompatibilityKey,
-			ItemIndex: index, Data: item.Data,
+			ItemIndex: index, BlockID: item.BlockID, Data: item.Data,
 		})
 		if err != nil {
 			return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)

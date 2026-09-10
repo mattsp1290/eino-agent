@@ -75,15 +75,25 @@ func roundTripMessage(t *testing.T, role Role, msg *einoschema.AgenticMessage) (
 	return decoded, parts, rebuilt
 }
 
-func TestContentBlockRoundTrip_AllKinds(t *testing.T) {
-	type tc struct {
-		name   string
-		role   Role
-		in     *einoschema.ContentBlock
-		expect *einoschema.ContentBlock // nil means identical to in
-	}
+// contentKindCase is one fixture in the shared 20-kind BlockKind table: an
+// Eino content block that should round trip through
+// ContentFromAgenticMessage -> EncodeContentParts -> DecodeContentParts ->
+// ContentToAgenticMessage unchanged (or into expect, if non-nil).
+type contentKindCase struct {
+	name   string
+	role   Role
+	in     *einoschema.ContentBlock
+	expect *einoschema.ContentBlock // nil means identical to in
+}
 
-	cases := []tc{
+// contentAllKindsCases returns one fixture per BlockKind (20 total). It is
+// shared by TestContentBlockRoundTrip_AllKinds and
+// TestContentValidateImpliesProjectable, which both need the same
+// known-good fixture table: the former proves the full durable round trip
+// is exact, the latter proves the narrower invariant that anything
+// Content.Validate accepts, ContentToAgenticMessage can always project.
+func contentAllKindsCases() []contentKindCase {
+	return []contentKindCase{
 		{
 			name: "reasoning",
 			role: RoleAssistant,
@@ -246,6 +256,10 @@ func TestContentBlockRoundTrip_AllKinds(t *testing.T) {
 			}},
 		},
 	}
+}
+
+func TestContentBlockRoundTrip_AllKinds(t *testing.T) {
+	cases := contentAllKindsCases()
 
 	if len(cases) != len(AllBlockKinds()) {
 		t.Fatalf("fixture count = %d, want %d (one per BlockKind)", len(cases), len(AllBlockKinds()))
@@ -272,6 +286,80 @@ func TestContentBlockRoundTrip_AllKinds(t *testing.T) {
 	}
 }
 
+// TestContentValidateImpliesProjectable pins the invariant behind C1: every
+// Content value that Content.Validate accepts must also succeed through
+// ContentToAgenticMessage. Before that fix, an unrecognised OpenAI/Claude
+// annotation type or a non-ToolInfo tool_search entry could pass Validate
+// (and therefore be durably persisted) but permanently fail projection.
+// This drives the invariant over the full 20-kind fixture table (built
+// directly through ContentFromAgenticMessage, independent of the encode/
+// decode round trip TestContentBlockRoundTrip_AllKinds already covers) plus
+// the two hostile inputs C1 identified.
+func TestContentValidateImpliesProjectable(t *testing.T) {
+	assertInvariant := func(t *testing.T, content Content) {
+		t.Helper()
+		limits := DefaultContentLimits()
+		err := content.Validate(limits)
+		if err != nil {
+			// Validate rejected it: the invariant holds vacuously, but make
+			// sure it is rejected for a content-contract reason, not
+			// something unrelated.
+			if !errors.Is(err, ErrContentInvalid) && !errors.Is(err, ErrContentUnsupported) && !errors.Is(err, ErrContentTooLarge) {
+				t.Fatalf("Validate returned unexpected error: %v", err)
+			}
+			return
+		}
+		if _, err := ContentToAgenticMessage(content); err != nil {
+			t.Fatalf("Content.Validate accepted content that ContentToAgenticMessage rejected: %v\ncontent: %s", err, mustJSON(t, content))
+		}
+	}
+
+	t.Run("every fixture in the 20-kind table", func(t *testing.T) {
+		for _, c := range contentAllKindsCases() {
+			t.Run(c.name, func(t *testing.T) {
+				msg := &einoschema.AgenticMessage{Role: agenticRole(c.role), ContentBlocks: []*einoschema.ContentBlock{c.in}}
+				content, _, err := ContentFromAgenticMessage(msg, sequentialIDs("b"))
+				if err != nil {
+					t.Fatalf("ContentFromAgenticMessage: %v", err)
+				}
+				assertInvariant(t, content)
+			})
+		}
+	})
+
+	t.Run("hostile: unknown openai/claude annotation type", func(t *testing.T) {
+		content := Content{Role: RoleAssistant, Blocks: []ContentBlock{
+			{ID: "b1", Kind: BlockKindAssistantGenText, Text: &TextBlock{
+				Text: "hi", Annotations: []TextAnnotation{{Type: "future_citation_type"}},
+			}},
+		}}
+		// This must be rejected outright (not merely "vacuously fine"):
+		// before the fix, validateAnnotation accepted any non-empty,
+		// UTF-8-valid Type, so this exact fixture passed Validate and then
+		// failed ContentToAgenticMessage forever once persisted.
+		if err := content.Validate(DefaultContentLimits()); !errors.Is(err, ErrContentUnsupported) {
+			t.Fatalf("Validate err = %v, want ErrContentUnsupported", err)
+		}
+		assertInvariant(t, content)
+	})
+
+	t.Run("hostile: tool_search entry that is valid JSON but not a ToolInfo", func(t *testing.T) {
+		content := Content{Role: RoleUser, Blocks: []ContentBlock{
+			{ID: "b1", Kind: BlockKindToolSearchResult, ToolSearch: &ToolSearchBlock{
+				CallID: "call-1", Name: "search", Tools: []json.RawMessage{json.RawMessage(`[1,2,3]`)},
+			}},
+		}}
+		// Before the fix, validateVariant only checked json.Valid on each
+		// Tools entry, so this exact fixture passed Validate and then
+		// failed toolSearchToEino's json.Unmarshal into *ToolInfo forever
+		// once persisted.
+		if err := content.Validate(DefaultContentLimits()); !errors.Is(err, ErrContentInvalid) {
+			t.Fatalf("Validate err = %v, want ErrContentInvalid", err)
+		}
+		assertInvariant(t, content)
+	})
+}
+
 func agenticRole(role Role) einoschema.AgenticRoleType {
 	switch role {
 	case RoleSystem:
@@ -292,6 +380,8 @@ func assistantGenTextFixture() *einoschema.ContentBlock {
 			Refusal: &openai.OutputRefusal{Reason: "none"},
 			Annotations: []*openai.TextAnnotation{
 				{Type: openai.TextAnnotationTypeURLCitation, URLCitation: &openai.TextAnnotationURLCitation{Title: "src", URL: "https://example.com", StartIndex: 1, EndIndex: 5}},
+				{Type: openai.TextAnnotationTypeFileCitation, FileCitation: &openai.TextAnnotationFileCitation{FileID: "file-1", Filename: "report.pdf", Index: 42}},
+				{Type: openai.TextAnnotationTypeFilePath, FilePath: &openai.TextAnnotationFilePath{FileID: "file-2", Index: 7}},
 			},
 		},
 		ClaudeExtension: &claude.AssistantGenTextExtension{
@@ -311,6 +401,8 @@ func assistantGenTextFixtureExpected() *einoschema.ContentBlock {
 			Refusal: &openai.OutputRefusal{Reason: "none"},
 			Annotations: []*openai.TextAnnotation{
 				{Type: openai.TextAnnotationTypeURLCitation, URLCitation: &openai.TextAnnotationURLCitation{Title: "src", URL: "https://example.com", StartIndex: 1, EndIndex: 5}},
+				{Type: openai.TextAnnotationTypeFileCitation, FileCitation: &openai.TextAnnotationFileCitation{FileID: "file-1", Filename: "report.pdf", Index: 42}},
+				{Type: openai.TextAnnotationTypeFilePath, FilePath: &openai.TextAnnotationFilePath{FileID: "file-2", Index: 7}},
 			},
 		},
 		ClaudeExtension: &claude.AssistantGenTextExtension{
@@ -446,6 +538,36 @@ func TestContentUnknownEnvelopeFields(t *testing.T) {
 	if _, err := decodeBlockEnvelope(raw, BlockKindUserInputText, limits); !errors.Is(err, ErrContentInvalid) {
 		t.Fatalf("err = %v, want ErrContentInvalid", err)
 	}
+}
+
+// TestContentDuplicateEnvelopeKeys pins I1's fix: encoding/json silently
+// accepts duplicate object keys (last value wins) even with
+// DisallowUnknownFields set, so decodeStrict must additionally re-marshal
+// the decoded value and require byte equality with the trimmed input. Before
+// that canonical-form gate, both fixtures below decoded successfully (the
+// first silently resolving to "second", the second to schema 1), which
+// means the same durable bytes could mean two different things to two
+// readers (this package's encoding/json versus Eino's sonic decoder).
+func TestContentDuplicateEnvelopeKeys(t *testing.T) {
+	limits := DefaultContentLimits()
+	t.Run("duplicate text key", func(t *testing.T) {
+		raw := json.RawMessage(`{"schema":1,"block_id":"b1","kind":"user_input_text","text":{"text":"first"},"text":{"text":"second"}}`)
+		if _, err := decodeBlockEnvelope(raw, BlockKindUserInputText, limits); !errors.Is(err, ErrContentInvalid) {
+			t.Fatalf("err = %v, want ErrContentInvalid", err)
+		}
+	})
+	t.Run("duplicate schema key", func(t *testing.T) {
+		raw := json.RawMessage(`{"schema":99,"schema":1,"block_id":"b1","kind":"user_input_text","text":{"text":"hi"}}`)
+		if _, err := decodeBlockEnvelope(raw, BlockKindUserInputText, limits); !errors.Is(err, ErrContentInvalid) {
+			t.Fatalf("err = %v, want ErrContentInvalid", err)
+		}
+	})
+	t.Run("duplicate response_meta schema key", func(t *testing.T) {
+		raw := json.RawMessage(`{"schema":1,"schema":1,"meta":{}}`)
+		if _, err := decodeResponseMetaEnvelope(raw, limits); !errors.Is(err, ErrContentInvalid) {
+			t.Fatalf("err = %v, want ErrContentInvalid", err)
+		}
+	})
 }
 
 func TestContentLimitsBoundaries(t *testing.T) {
@@ -676,7 +798,7 @@ func TestContentResponseMetaRoundTrip(t *testing.T) {
 		ContentBlocks: []*einoschema.ContentBlock{{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: "done"}}},
 		ResponseMeta: &einoschema.AgenticResponseMeta{
 			TokenUsage: &einoschema.TokenUsage{
-				PromptTokens: 10, CompletionTokens: 5, TotalTokens: 15,
+				PromptTokens: 10, CompletionTokens: 5, TotalTokens: 17,
 				PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 2},
 				CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 1},
 			},
@@ -719,7 +841,10 @@ func TestContentClone(t *testing.T) {
 			{ID: "b2", Kind: BlockKindUserInputFile, Media: &MediaBlock{URL: "https://example.com/a.pdf", Name: "a.pdf"}},
 		},
 	}
-	clone := original.Clone()
+	clone, err := original.Clone()
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
 	assertJSONEqual(t, clone, original)
 
 	clone.Blocks[0].Text.Text = "mutated"
@@ -738,6 +863,31 @@ func TestContentClone(t *testing.T) {
 	}
 	if original.Blocks[0].ID != "b1" {
 		t.Fatal("clone mutation leaked into original block ID")
+	}
+}
+
+// TestContentCloneMarshalFailureReturnsError pins the fix for I6: Clone must
+// report an error, never silently return an empty or partial copy, when the
+// content cannot round trip through JSON (here, a json.RawMessage field
+// holding non-JSON bytes, which json.Marshal refuses to compact).
+func TestContentCloneMarshalFailureReturnsError(t *testing.T) {
+	original := Content{
+		Role: RoleAssistant,
+		Blocks: []ContentBlock{
+			{ID: "b1", Kind: BlockKindServerToolCall, ServerCall: &ServerCallBlock{
+				Name: "search", CallID: "call-1", Arguments: json.RawMessage("not-json"),
+			}},
+		},
+	}
+	clone, err := original.Clone()
+	if err == nil {
+		t.Fatalf("Clone succeeded on unmarshalable content, want error; got %d blocks", len(clone.Blocks))
+	}
+	if !errors.Is(err, ErrContentInvalid) {
+		t.Fatalf("Clone err = %v, want ErrContentInvalid", err)
+	}
+	if len(clone.Blocks) != 0 || clone.Role != "" {
+		t.Fatalf("Clone returned a non-empty partial value on error: %+v", clone)
 	}
 }
 

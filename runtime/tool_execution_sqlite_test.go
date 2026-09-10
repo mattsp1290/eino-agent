@@ -39,7 +39,11 @@ func TestSettleInterruptedToolTreatsSQLNullOutputAsAbsent(t *testing.T) {
 	}
 	resolved, _ := host.model.Resolve(ctx, orchestratorConfig().Model, model.Runtime{})
 	ids := admissionIDs{SessionID: "null-output", RunID: "run-null", UserMessageID: "user", UserPartIDs: []session.PartID{"user-part"}, AssistantMessageID: "assistant", ContextEpochID: "epoch", EventID: "event", RunClaimToken: "claim"}
-	userMessage := UserMessage{Blocks: assignContentBlockIDs(TextUserMessage("hello").Blocks, host.ids)}
+	assignedBlocks, err := assignContentBlockIDs(TextUserMessage("hello").Blocks, host.ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	userMessage := UserMessage{Blocks: assignedBlocks}
 	admitted, err := host.admitter().admit(ctx, admissionRequest{IDs: ids, UserMessage: userMessage, Config: orchestratorConfig(), Model: resolved, OwnerID: host.ownerID(), LeaseDuration: time.Minute, ExtensionPlan: plan.Descriptor(), ContentLimits: host.contentLimits})
 	if err != nil {
 		t.Fatal(err)

@@ -241,6 +241,15 @@ func freezeAdmission(request admissionRequest) (admissionRequest, error) {
 	request.History = cloneHistoryOptions(request.History)
 	request.Metadata = cloneStringMap(request.Metadata)
 	request.ExtensionPlan = request.ExtensionPlan.Clone()
+	// Deep-clone the caller-supplied block payloads (every *TextBlock,
+	// *MediaBlock, json.RawMessage, ...) so a caller mutating its own
+	// request concurrently with Start cannot race with, or disagree with,
+	// what validate and the encoder inside the admission transaction see.
+	frozenBlocks, err := session.Content{Role: session.RoleUser, Blocks: request.UserMessage.Blocks}.Clone()
+	if err != nil {
+		return admissionRequest{}, fmt.Errorf("%w: freeze user message: %v", ErrInvalidAdmission, err)
+	}
+	request.UserMessage.Blocks = frozenBlocks.Blocks
 	return request, nil
 }
 

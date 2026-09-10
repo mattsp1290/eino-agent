@@ -3,6 +3,7 @@ package agui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -191,6 +192,64 @@ func (t *replayTail) Subscribe(ctx context.Context, _ session.ID) (<-chan sessio
 		close(t.canceled)
 	}()
 	return t.events, nil
+}
+
+// TestReplayMessageSnapshotIncludesUserMediaBlock proves that a durable user
+// message carrying a media block (persisted as a user_input_image part) does
+// not break emitMessageSnapshot's history.Load call. history.Load uses the
+// classic projector, which the storage-projection review flagged as
+// permanently bricking replay for any session whose history contains a
+// user-role media block, once that projector started rejecting
+// BlockKind-backed kinds it did not explicitly support.
+func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-replay-media"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-media", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-media", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "user-media-1", SessionID: sessionID, RunID: "run-media", Role: session.RoleUser, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+
+	content := session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{
+		{ID: "blk-text", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "look at this"}},
+		{ID: "blk-image", Kind: session.BlockKindUserInputImage, Media: &session.MediaBlock{URL: "https://example.com/pic.png", MIMEType: "image/png"}},
+	}}
+	n := 0
+	nextPartID := func() session.PartID { n++; return session.PartID(fmt.Sprintf("part-media-%d", n)) }
+	parts, err := session.EncodeContentParts(content, nextPartID, "user-media-1", sessionID, "run-media", now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("EncodeContentParts: %v", err)
+	}
+	for _, part := range parts {
+		if _, err := execution.AppendPart(ctx, part); err != nil {
+			t.Fatalf("append part %s: %v", part.ID, err)
+		}
+	}
+
+	sink := newSSESink()
+	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), string(sessionID), "run-media", nil)
+	if err := emitMessageSnapshot(ctx, bridge, store, sessionID); err != nil {
+		t.Fatalf("emitMessageSnapshot error = %v, want nil (a user-role media block must not brick history.Load)", err)
+	}
+	frames := frameData(t, sink.Bytes())
+	if len(frames) != 1 || frames[0]["messages"] == nil {
+		t.Fatalf("messages snapshot missing or malformed: %#v", frames)
+	}
 }
 
 func stringsJoined(values []string) string {

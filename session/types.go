@@ -346,7 +346,12 @@ type EventRecord struct {
 
 // Usage records provider usage data in a store-level event projection.
 type Usage struct {
-	InputTokens      int64
+	InputTokens int64
+	// TotalTokens is the provider-reported total, which is not always
+	// InputTokens + OutputTokens (reasoning tokens, cache accounting, or
+	// provider-side rounding can make it differ). It is carried verbatim,
+	// never derived.
+	TotalTokens      int64
 	OutputTokens     int64
 	ReasoningTokens  int64
 	CacheReadTokens  int64

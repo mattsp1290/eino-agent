@@ -37,6 +37,9 @@ func contentContract(t *testing.T, factory Factory) {
 		t.Run("provider state sentinel never leaks into public content", func(t *testing.T) {
 			testContentProviderStateSentinel(t, factory)
 		})
+		t.Run("provider state part preceding a block part decodes successfully", func(t *testing.T) {
+			testContentProviderStateInterleavedOrdinal(t, factory)
+		})
 	})
 }
 
@@ -492,13 +495,31 @@ func testContentProviderStateSentinel(t *testing.T, factory Factory) {
 	}}
 	content := appendContentMessage(t, ctx, execution, sessionID, runID, messageID, role, msg)
 
+	sentinelData := json.RawMessage(fmt.Sprintf(`{"secret":%q}`, sentinel))
 	statePayload, err := session.EncodeProviderStatePayload(session.ProviderStateEnvelope{
+		// CompatibilityKey is stored verbatim (not base64-encoded), unlike
+		// Data, so putting the sentinel there too makes the scans below
+		// meaningful for a leak of either field.
 		CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model",
-		CompatibilityKey: "compat", ItemIndex: 0, BlockID: content.Blocks[0].ID,
-		Data: json.RawMessage(fmt.Sprintf(`{"secret":%q}`, sentinel)),
+		CompatibilityKey: sentinel, ItemIndex: 0, BlockID: content.Blocks[0].ID,
+		Data: sentinelData,
 	})
 	if err != nil {
 		t.Fatalf("encode provider state: %v", err)
+	}
+	// EncodeProviderStatePayload stores Data as base64(Data), so a scan for
+	// the literal sentinel string alone would pass even if the entire
+	// envelope (including Data) leaked verbatim into decoded output. Scan
+	// for both forms.
+	encodedSentinelData := base64.StdEncoding.EncodeToString(sentinelData)
+	leaked := func(t *testing.T, label, raw string) {
+		t.Helper()
+		if strings.Contains(raw, sentinel) {
+			t.Fatalf("%s leaked provider state sentinel: %s", label, raw)
+		}
+		if strings.Contains(raw, encodedSentinelData) {
+			t.Fatalf("%s leaked base64-encoded provider state data: %s", label, raw)
+		}
 	}
 	appendPart(t, ctx, execution, session.Part{
 		ID: "provider-state-1", MessageID: messageID, SessionID: sessionID, RunID: runID,
@@ -520,9 +541,7 @@ func testContentProviderStateSentinel(t *testing.T, factory Factory) {
 	if err != nil {
 		t.Fatalf("marshal decoded content: %v", err)
 	}
-	if strings.Contains(string(raw), sentinel) {
-		t.Fatalf("decoded content leaked provider state sentinel: %s", raw)
-	}
+	leaked(t, "decoded content", string(raw))
 
 	rebuilt, err := session.ContentToAgenticMessage(decoded)
 	if err != nil {
@@ -532,9 +551,7 @@ func testContentProviderStateSentinel(t *testing.T, factory Factory) {
 	if err != nil {
 		t.Fatalf("marshal rebuilt message: %v", err)
 	}
-	if strings.Contains(string(rebuiltRaw), sentinel) {
-		t.Fatalf("rebuilt agentic message leaked provider state sentinel: %s", rebuiltRaw)
-	}
+	leaked(t, "rebuilt agentic message", string(rebuiltRaw))
 
 	reader, ok := subject.Store.(session.ObservationReader)
 	if !ok {
@@ -549,12 +566,76 @@ func testContentProviderStateSentinel(t *testing.T, factory Factory) {
 	if err != nil {
 		t.Fatalf("marshal snapshot: %v", err)
 	}
-	if strings.Contains(string(snapshotRaw), sentinel) {
-		t.Fatalf("observation snapshot leaked provider state sentinel: %s", snapshotRaw)
-	}
+	leaked(t, "observation snapshot", string(snapshotRaw))
 	for _, m := range snapshot.Messages {
 		if m.ID == messageID && m.Text != "visible answer" {
 			t.Fatalf("observation text = %q, want %q", m.Text, "visible answer")
 		}
+	}
+}
+
+// testContentProviderStateInterleavedOrdinal asserts that a provider_state
+// part sharing an ordinal range with content-kind block parts (per
+// DecodeContentParts' documented contract: block/response_meta ordinals must
+// be strictly increasing among themselves but need not be contiguous, since
+// other part kinds may occupy interleaved ordinals) decodes successfully
+// even when the provider_state part's ordinal precedes the first block.
+func testContentProviderStateInterleavedOrdinal(t *testing.T, factory Factory) {
+	subject := setup(t, factory)
+	ctx := context.Background()
+	sessionID := session.ID("content-provider-state-ordinal")
+	runID := session.RunID("content-provider-state-ordinal-run")
+	messageID := session.MessageID("msg-provider-state-ordinal")
+	role := session.RoleAssistant
+
+	s := createSession(t, ctx, subject.Store, sessionID)
+	r := admitRun(t, ctx, subject.Store, run(runID, s.ID, "owner"))
+	execution := executionFor(subject.Store, r)
+
+	msg := &einoschema.AgenticMessage{Role: contentAgenticRole(role), ContentBlocks: []*einoschema.ContentBlock{
+		{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: "ordinal check"}},
+	}}
+	content, _, err := session.ContentFromAgenticMessage(msg, contentSequentialBlockIDs(string(messageID)))
+	if err != nil {
+		t.Fatalf("ContentFromAgenticMessage: %v", err)
+	}
+	blockParts, err := session.EncodeContentParts(content, contentSequentialPartIDs(string(messageID)), messageID, sessionID, runID, time.Now().UTC(), session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("EncodeContentParts: %v", err)
+	}
+	if len(blockParts) != 1 {
+		t.Fatalf("EncodeContentParts produced %d parts, want 1", len(blockParts))
+	}
+	blockPart := blockParts[0]
+	// Move the block part's ordinal past the provider_state part appended
+	// below, so provider_state occupies the lower ordinal.
+	blockPart.Ordinal = 1
+
+	statePayload, err := session.EncodeProviderStatePayload(session.ProviderStateEnvelope{
+		CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model",
+		CompatibilityKey: "compat", ItemIndex: 0, BlockID: content.Blocks[0].ID, Data: json.RawMessage(`{"k":"v"}`),
+	})
+	if err != nil {
+		t.Fatalf("encode provider state: %v", err)
+	}
+
+	appendMessage(t, ctx, execution, message(messageID, sessionID, runID, role))
+	// provider_state precedes the block part in ordinal order.
+	appendPart(t, ctx, execution, session.Part{
+		ID: "provider-state-1", MessageID: messageID, SessionID: sessionID, RunID: runID,
+		Kind: session.PartProviderState, Ordinal: 0, Payload: statePayload,
+	})
+	appendPart(t, ctx, execution, blockPart)
+
+	batch, err := subject.Store.ListMessages(ctx, sessionID, session.ReplayCursor{Limit: 50})
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	decoded, err := session.DecodeContentParts(role, batch.Parts, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("DecodeContentParts with provider_state preceding block part: %v", err)
+	}
+	if len(decoded.Blocks) != 1 || decoded.Blocks[0].ID != content.Blocks[0].ID {
+		t.Fatalf("decoded blocks = %+v, want one block with ID %q", decoded.Blocks, content.Blocks[0].ID)
 	}
 }

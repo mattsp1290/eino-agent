@@ -5,6 +5,7 @@ import (
 	_ "embed"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -26,6 +27,44 @@ const (
 	baselineRowIDBytes            = 8
 	baselineMaxIndexValueBytes    = 2*baselineOversizeIdentityBytes + baselineTimestampBytes + baselineRowIDBytes
 )
+
+// baselineEnumLiteral matches one single-quoted SQL string literal.
+var baselineEnumLiteral = regexp.MustCompile(`'([^']*)'`)
+
+// baselineMaxEnumBytes is the maximum byte length of any string value
+// permitted by the "status", "role", "kind", or "tool_transition" CHECK
+// (... IN (...)) constraints declared in the embedded baseline schema. It is
+// derived directly from that schema (rather than hand-maintained) so the
+// index-tuple-size proof below cannot silently go stale the way a hardcoded
+// constant did: parts.kind's CHECK list grew from a 14-byte longest value
+// ("provider_state") to a 26-byte one ("mcp_tool_approval_response") when
+// the BlockKind-backed part kinds were added, and nothing forced this proof
+// to notice.
+var baselineMaxEnumBytes = computeBaselineMaxEnumBytes()
+
+func computeBaselineMaxEnumBytes() int {
+	max := 0
+	for _, line := range strings.Split(string(baselineSQL), "\n") {
+		if !strings.Contains(line, " IN (") {
+			continue
+		}
+		switch {
+		case strings.Contains(line, "kind"), strings.Contains(line, "role"),
+			strings.Contains(line, "status"), strings.Contains(line, "tool_transition"):
+		default:
+			continue
+		}
+		for _, m := range baselineEnumLiteral.FindAllStringSubmatch(line, -1) {
+			if len(m[1]) > max {
+				max = len(m[1])
+			}
+		}
+	}
+	if max == 0 {
+		panic("computeBaselineMaxEnumBytes: found no enum literals in the embedded baseline schema")
+	}
+	return max
+}
 
 func openBaseline(t *testing.T) *sql.DB {
 	t.Helper()
@@ -113,7 +152,7 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 					case "created_at":
 						valueBytes += baselineTimestampBytes
 					case "status", "role", "kind", "tool_transition":
-						valueBytes += 14
+						valueBytes += baselineMaxEnumBytes
 					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "ordinal", "attempt", "step", "finalized", "text_valid":
 						valueBytes += baselineRowIDBytes
 					default:

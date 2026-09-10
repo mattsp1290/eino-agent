@@ -51,7 +51,7 @@ func providerStatePart(id session.PartID, messageID session.MessageID, ordinal i
 // user message that already carries a function_tool_result block, and a
 // durable RoleTool message carrying a rich function_tool_result block (which
 // must decode as though it were RoleUser).
-func richAgenticFixture(t *testing.T) (session.ReplayBatch, map[string]session.PartID) {
+func richAgenticFixture(t *testing.T) (session.ReplayBatch, map[BlockRef]session.PartID) {
 	t.Helper()
 
 	userContent := session.Content{
@@ -95,14 +95,14 @@ func richAgenticFixture(t *testing.T) (session.ReplayBatch, map[string]session.P
 	}
 	toolRoleParts := encodeRichParts(t, toolRoleContent, "tool-rich", "tp")
 
-	wantPartIDs := map[string]session.PartID{
-		"blk-utext":       userParts[0].ID,
-		"blk-uimage":      userParts[1].ID,
-		"blk-reasoning":   assistantParts[0].ID,
-		"blk-text":        assistantParts[1].ID,
-		"blk-call":        assistantParts[2].ID,
-		"blk-result":      resultParts[0].ID,
-		"blk-tool-result": toolRoleParts[0].ID,
+	wantPartIDs := map[BlockRef]session.PartID{
+		{MessageID: "user-rich", BlockID: "blk-utext"}:             userParts[0].ID,
+		{MessageID: "user-rich", BlockID: "blk-uimage"}:            userParts[1].ID,
+		{MessageID: "assistant-rich", BlockID: "blk-reasoning"}:    assistantParts[0].ID,
+		{MessageID: "assistant-rich", BlockID: "blk-text"}:         assistantParts[1].ID,
+		{MessageID: "assistant-rich", BlockID: "blk-call"}:         assistantParts[2].ID,
+		{MessageID: "user-toolresult-rich", BlockID: "blk-result"}: resultParts[0].ID,
+		{MessageID: "tool-rich", BlockID: "blk-tool-result"}:       toolRoleParts[0].ID,
 	}
 
 	batch := session.ReplayBatch{
@@ -184,10 +184,47 @@ func TestProjectAgenticRichRoundTrip(t *testing.T) {
 		t.Fatalf("RoleTool function result call id = %q", toolRoleMsg.ContentBlocks[0].FunctionToolResult.CallID)
 	}
 
-	for blockID, wantPartID := range wantPartIDs {
-		if got := projection.PartIDs[blockID]; got != wantPartID {
-			t.Fatalf("PartIDs[%q] = %q, want %q", blockID, got, wantPartID)
+	for ref, wantPartID := range wantPartIDs {
+		if got := projection.PartIDs[ref]; got != wantPartID {
+			t.Fatalf("PartIDs[%+v] = %q, want %q", ref, got, wantPartID)
 		}
+	}
+}
+
+// TestProjectAgenticPartIDsDistinctAcrossMessages pins the fix for I2: two
+// different messages using the same block ID must keep distinct PartIDs
+// entries, keyed by (MessageID, BlockID), instead of one silently
+// overwriting the other in a map keyed by bare BlockID.
+func TestProjectAgenticPartIDsDistinctAcrossMessages(t *testing.T) {
+	t.Parallel()
+
+	firstContent := session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "first"}}},
+	}
+	secondContent := session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "second"}}},
+	}
+	firstParts := encodeRichParts(t, firstContent, "msg-1", "m1")
+	secondParts := encodeRichParts(t, secondContent, "msg-2", "m2")
+
+	batch := session.ReplayBatch{
+		Messages: []session.Message{message("msg-1", session.RoleAssistant), message("msg-2", session.RoleAssistant)},
+		Parts:    append(append([]session.Part{}, firstParts...), secondParts...),
+	}
+	projection, err := ProjectAgentic(batch, Options{})
+	if err != nil {
+		t.Fatalf("ProjectAgentic: %v", err)
+	}
+	if len(projection.PartIDs) != 2 {
+		t.Fatalf("PartIDs = %+v, want 2 distinct entries", projection.PartIDs)
+	}
+	if got := projection.PartIDs[BlockRef{MessageID: "msg-1", BlockID: "b1"}]; got != firstParts[0].ID {
+		t.Fatalf("PartIDs[msg-1/b1] = %q, want %q", got, firstParts[0].ID)
+	}
+	if got := projection.PartIDs[BlockRef{MessageID: "msg-2", BlockID: "b1"}]; got != secondParts[0].ID {
+		t.Fatalf("PartIDs[msg-2/b1] = %q, want %q", got, secondParts[0].ID)
 	}
 }
 

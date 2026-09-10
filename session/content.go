@@ -167,6 +167,12 @@ type TextAnnotation struct {
 
 	StartBlock int `json:"start_block,omitempty"`
 	EndBlock   int `json:"end_block,omitempty"`
+
+	// AnnotationIndex carries the provider's own index for this citation
+	// (openai file_citation.index / file_path.index). It is distinct from
+	// the outer openai.TextAnnotation.Index, which Eino clears on
+	// finalisation and which this contract does not persist.
+	AnnotationIndex int `json:"annotation_index,omitempty"`
 }
 
 // TextBlock is the public payload for user_input_text and assistant_gen_text
@@ -504,7 +510,7 @@ func (c Content) Validate(limits ContentLimits) error {
 		if err != nil {
 			return err
 		}
-		if err := validateVariant(block.Kind, variant, seenFunctionResultCallIDs); err != nil {
+		if err := validateVariant(block.Kind, variant, seenFunctionResultCallIDs, limits); err != nil {
 			return err
 		}
 		raw, err := json.Marshal(variant)
@@ -654,7 +660,7 @@ func blockVariant(kind BlockKind, block ContentBlock) (any, error) {
 	}
 }
 
-func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[string]bool) error {
+func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[string]bool, limits ContentLimits) error {
 	switch v := variant.(type) {
 	case *ReasoningBlock:
 		if !utf8.ValidString(v.Text) {
@@ -666,6 +672,9 @@ func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[
 			}
 		}
 	case *TextBlock:
+		if len(v.Text) > limits.MaxBlockBytes {
+			return ErrContentTooLarge
+		}
 		if !utf8.ValidString(v.Text) || !utf8.ValidString(v.Refusal) {
 			return ErrContentInvalid
 		}
@@ -678,7 +687,7 @@ func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[
 			}
 		}
 	case *MediaBlock:
-		if err := validateMedia(kind, v); err != nil {
+		if err := validateMedia(kind, v, limits); err != nil {
 			return err
 		}
 	case *FunctionCallBlock:
@@ -694,7 +703,7 @@ func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[
 		}
 		seenFunctionResultCallIDs[v.CallID] = true
 		for _, item := range v.Content {
-			if err := validateResultContent(item); err != nil {
+			if err := validateResultContent(item, limits); err != nil {
 				return err
 			}
 		}
@@ -703,7 +712,10 @@ func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[
 			return ErrContentInvalid
 		}
 		for _, raw := range v.Tools {
-			if !json.Valid(raw) {
+			if len(raw) > limits.MaxBlockBytes {
+				return ErrContentTooLarge
+			}
+			if err := json.Unmarshal(raw, &einoschema.ToolInfo{}); err != nil {
 				return ErrContentInvalid
 			}
 		}
@@ -711,12 +723,18 @@ func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[
 		if v.Name == "" || !utf8.ValidString(v.Name) || !utf8.ValidString(v.CallID) {
 			return ErrContentInvalid
 		}
+		if len(v.Arguments) > limits.MaxBlockBytes {
+			return ErrContentTooLarge
+		}
 		if err := boundedFiniteJSON(v.Arguments); err != nil {
 			return err
 		}
 	case *ServerResultBlock:
 		if v.Name == "" || !utf8.ValidString(v.Name) || !utf8.ValidString(v.CallID) {
 			return ErrContentInvalid
+		}
+		if len(v.Content) > limits.MaxBlockBytes {
+			return ErrContentTooLarge
 		}
 		if err := boundedFiniteJSON(v.Content); err != nil {
 			return err
@@ -738,6 +756,9 @@ func validateVariant(kind BlockKind, variant any, seenFunctionResultCallIDs map[
 				return ErrContentInvalid
 			}
 			if len(tool.InputSchema) > 0 {
+				if len(tool.InputSchema) > limits.MaxBlockBytes {
+					return ErrContentTooLarge
+				}
 				if err := boundedFiniteJSON(tool.InputSchema); err != nil {
 					return err
 				}
@@ -763,10 +784,13 @@ func validateAnnotation(a TextAnnotation) error {
 		!utf8.ValidString(a.CitedText) || !utf8.ValidString(a.DocumentTitle) {
 		return ErrContentInvalid
 	}
+	if !isOpenAIAnnotationType(a.Type) && !isClaudeAnnotationType(a.Type) {
+		return ErrContentUnsupported
+	}
 	return nil
 }
 
-func validateMediaFields(m *MediaBlock, allowName, allowDetail bool) error {
+func validateMediaFields(m *MediaBlock, allowName, allowDetail bool, limits ContentLimits) error {
 	if m == nil {
 		return ErrContentInvalid
 	}
@@ -779,6 +803,11 @@ func validateMediaFields(m *MediaBlock, allowName, allowDetail bool) error {
 		return ErrContentInvalid
 	}
 	if hasData {
+		// Cheap upper bound before the base64 decode: the encoded string is
+		// never shorter than the bytes it represents.
+		if len(m.Base64Data) > limits.MaxBlockBytes {
+			return ErrContentTooLarge
+		}
 		if _, err := base64.StdEncoding.Strict().DecodeString(m.Base64Data); err != nil {
 			return ErrContentInvalid
 		}
@@ -799,13 +828,13 @@ func validateMediaFields(m *MediaBlock, allowName, allowDetail bool) error {
 	return nil
 }
 
-func validateMedia(kind BlockKind, m *MediaBlock) error {
+func validateMedia(kind BlockKind, m *MediaBlock, limits ContentLimits) error {
 	allowName := kind == BlockKindUserInputFile
 	allowDetail := kind == BlockKindUserInputImage || kind == BlockKindAssistantGenImage
-	return validateMediaFields(m, allowName, allowDetail)
+	return validateMediaFields(m, allowName, allowDetail, limits)
 }
 
-func validateResultContent(item ResultContent) error {
+func validateResultContent(item ResultContent, limits ContentLimits) error {
 	switch item.Type {
 	case ResultContentText:
 		if item.Media != nil || !utf8.ValidString(item.Text) {
@@ -815,17 +844,17 @@ func validateResultContent(item ResultContent) error {
 		if item.Text != "" {
 			return ErrContentInvalid
 		}
-		return validateMediaFields(item.Media, false, true)
+		return validateMediaFields(item.Media, false, true, limits)
 	case ResultContentAudio, ResultContentVideo:
 		if item.Text != "" {
 			return ErrContentInvalid
 		}
-		return validateMediaFields(item.Media, false, false)
+		return validateMediaFields(item.Media, false, false, limits)
 	case ResultContentFile:
 		if item.Text != "" {
 			return ErrContentInvalid
 		}
-		return validateMediaFields(item.Media, true, false)
+		return validateMediaFields(item.Media, true, false, limits)
 	default:
 		return ErrContentInvalid
 	}
@@ -1006,6 +1035,17 @@ func decodeStrict[T any](raw json.RawMessage, limits ContentLimits) (T, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return value, ErrContentInvalid
 	}
+	// Go's encoding/json silently accepts duplicate object keys (last value
+	// wins) even with DisallowUnknownFields set, so re-marshal the decoded
+	// value and require it to be byte-identical to the trimmed input. This
+	// is the same canonical-form gate DecodeProviderStatePayload applies
+	// (session/provider_state.go); without it, a duplicate-key payload could
+	// mean two different things to two readers (this package's
+	// encoding/json versus Eino's sonic decoder).
+	canonical, err := json.Marshal(value)
+	if err != nil || !bytes.Equal(canonical, trimmed) {
+		return value, ErrContentInvalid
+	}
 	return value, nil
 }
 
@@ -1049,8 +1089,18 @@ func decodeResponseMetaEnvelope(raw json.RawMessage, limits ContentLimits) (*Res
 
 // EncodeContentParts encodes validated content into one Part per block
 // (ordinal = block index, in order) followed by an optional response_meta
-// Part. Bounds are enforced by Content.Validate before any block is
-// marshaled or measured.
+// Part at ordinal len(content.Blocks). Bounds are enforced by Content.Validate
+// before any block is marshaled or measured.
+//
+// The ordinals this function assigns are contiguous, but DecodeContentParts
+// does not require that: content-kind parts (block kinds and response_meta)
+// must appear in strictly increasing ordinal order among themselves, with
+// response_meta after the last block, but they need not be contiguous —
+// other part kinds persisted in the same message (provider_state, legacy,
+// compaction) may occupy ordinals interleaved between them and are ignored
+// regardless of their own ordinal values. This lets callers such as
+// persistAssistantTurn share one ordinal counter across content and
+// provider-state parts.
 func EncodeContentParts(content Content, ids func() PartID, messageID MessageID, sessionID ID, runID RunID, at time.Time, limits ContentLimits) ([]Part, error) {
 	if ids == nil {
 		return nil, ErrContentInvalid
@@ -1101,8 +1151,14 @@ func EncodeContentParts(content Content, ids func() PartID, messageID MessageID,
 
 // DecodeContentParts strictly decodes the block-kind and response_meta parts
 // of the given slice back into Content, in ordinal order. Parts of any other
-// kind (legacy kinds, compaction, provider_state) are ignored; provider_state
-// parts are specifically never decoded here.
+// kind (legacy kinds, compaction, provider_state) are ignored regardless of
+// their ordinal; provider_state parts are specifically never decoded here.
+//
+// Content-kind parts (block kinds and, if present, response_meta) must occupy
+// strictly increasing ordinals, with response_meta's ordinal greater than
+// every block's — but that ordinal sequence need not be contiguous, since
+// other part kinds may share the same message's ordinal space at
+// interleaved positions.
 func DecodeContentParts(role Role, parts []Part, limits ContentLimits) (Content, error) {
 	if err := limits.Validate(); err != nil {
 		return Content{}, err
@@ -1138,13 +1194,14 @@ func DecodeContentParts(role Role, parts []Part, limits ContentLimits) (Content,
 	blocks := make([]ContentBlock, 0, recognizedBlocks)
 	var meta *ResponseMeta
 	metaSeen := false
-	wantOrdinal := int64(0)
+	lastOrdinal := int64(-1)
+	haveLastOrdinal := false
 	for _, part := range parts {
 		if part.Kind == PartProviderState {
 			continue
 		}
 		if blockKind, ok := BlockKindForPart(part.Kind); ok {
-			if metaSeen || part.Ordinal != wantOrdinal {
+			if metaSeen || (haveLastOrdinal && part.Ordinal <= lastOrdinal) {
 				return Content{}, ErrContentInvalid
 			}
 			block, err := decodeBlockEnvelope(part.Payload, blockKind, limits)
@@ -1152,11 +1209,12 @@ func DecodeContentParts(role Role, parts []Part, limits ContentLimits) (Content,
 				return Content{}, err
 			}
 			blocks = append(blocks, block)
-			wantOrdinal++
+			lastOrdinal = part.Ordinal
+			haveLastOrdinal = true
 			continue
 		}
 		if part.Kind == PartResponseMeta {
-			if metaSeen || part.Ordinal != wantOrdinal {
+			if metaSeen || (haveLastOrdinal && part.Ordinal <= lastOrdinal) {
 				return Content{}, ErrContentInvalid
 			}
 			decoded, err := decodeResponseMetaEnvelope(part.Payload, limits)
@@ -1165,9 +1223,11 @@ func DecodeContentParts(role Role, parts []Part, limits ContentLimits) (Content,
 			}
 			meta = decoded
 			metaSeen = true
+			lastOrdinal = part.Ordinal
+			haveLastOrdinal = true
 			continue
 		}
-		// legacy/unrecognized kinds are ignored by design.
+		// legacy/unrecognized kinds are ignored by design, regardless of ordinal.
 	}
 	content := Content{Role: role, Blocks: blocks, Meta: meta}
 	if err := content.Validate(limits); err != nil {
@@ -1537,7 +1597,11 @@ func assistantGenTextFromEino(id string, t *einoschema.AssistantGenText) (*TextB
 			if a == nil {
 				continue
 			}
-			block.Annotations = append(block.Annotations, openAIAnnotationToContent(a))
+			annotation, err := openAIAnnotationToContent(a)
+			if err != nil {
+				return nil, nil, err
+			}
+			block.Annotations = append(block.Annotations, annotation)
 		}
 	}
 	if t.ClaudeExtension != nil {
@@ -1546,7 +1610,10 @@ func assistantGenTextFromEino(id string, t *einoschema.AssistantGenText) (*TextB
 			if c == nil {
 				continue
 			}
-			annotation, encIndex := claudeCitationToContent(c)
+			annotation, encIndex, err := claudeCitationToContent(c)
+			if err != nil {
+				return nil, nil, err
+			}
 			if encIndex != "" {
 				encrypted = append(encrypted, privateEncryptedIndex{Annotation: len(block.Annotations), EncryptedIndex: encIndex})
 			}
@@ -1563,13 +1630,14 @@ func assistantGenTextFromEino(id string, t *einoschema.AssistantGenText) (*TextB
 	return block, private, nil
 }
 
-func openAIAnnotationToContent(a *openai.TextAnnotation) TextAnnotation {
+func openAIAnnotationToContent(a *openai.TextAnnotation) (TextAnnotation, error) {
 	out := TextAnnotation{Type: string(a.Type)}
 	switch a.Type {
 	case openai.TextAnnotationTypeFileCitation:
 		if a.FileCitation != nil {
 			out.FileID = a.FileCitation.FileID
 			out.Filename = a.FileCitation.Filename
+			out.AnnotationIndex = a.FileCitation.Index
 		}
 	case openai.TextAnnotationTypeURLCitation:
 		if a.URLCitation != nil {
@@ -1589,12 +1657,15 @@ func openAIAnnotationToContent(a *openai.TextAnnotation) TextAnnotation {
 	case openai.TextAnnotationTypeFilePath:
 		if a.FilePath != nil {
 			out.FileID = a.FilePath.FileID
+			out.AnnotationIndex = a.FilePath.Index
 		}
+	default:
+		return TextAnnotation{}, ErrContentUnsupported
 	}
-	return out
+	return out, nil
 }
 
-func claudeCitationToContent(c *claude.TextCitation) (TextAnnotation, string) {
+func claudeCitationToContent(c *claude.TextCitation) (TextAnnotation, string, error) {
 	out := TextAnnotation{Type: string(c.Type)}
 	encrypted := ""
 	switch c.Type {
@@ -1629,8 +1700,10 @@ func claudeCitationToContent(c *claude.TextCitation) (TextAnnotation, string) {
 			out.URL = c.WebSearchResultLocation.URL
 			encrypted = c.WebSearchResultLocation.EncryptedIndex
 		}
+	default:
+		return TextAnnotation{}, "", ErrContentUnsupported
 	}
-	return out, encrypted
+	return out, encrypted, nil
 }
 
 func functionResultContentFromEino(items []*einoschema.FunctionToolResultContentBlock) ([]ResultContent, error) {
@@ -1707,6 +1780,7 @@ func usageFromTokenUsage(tu *einoschema.TokenUsage) *Usage {
 	return &Usage{
 		InputTokens:     int64(tu.PromptTokens),
 		OutputTokens:    int64(tu.CompletionTokens),
+		TotalTokens:     int64(tu.TotalTokens),
 		ReasoningTokens: int64(tu.CompletionTokensDetails.ReasoningTokens),
 		CacheReadTokens: int64(tu.PromptTokenDetails.CachedTokens),
 	}
@@ -1719,7 +1793,7 @@ func tokenUsageFromUsage(u *Usage) *einoschema.TokenUsage {
 	return &einoschema.TokenUsage{
 		PromptTokens:            int(u.InputTokens),
 		CompletionTokens:        int(u.OutputTokens),
-		TotalTokens:             int(u.InputTokens + u.OutputTokens),
+		TotalTokens:             int(u.TotalTokens),
 		PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: int(u.CacheReadTokens)},
 		CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: int(u.ReasoningTokens)},
 	}
@@ -1917,7 +1991,7 @@ func annotationToOpenAI(a TextAnnotation) *openai.TextAnnotation {
 	out := &openai.TextAnnotation{Type: openai.TextAnnotationType(a.Type)}
 	switch out.Type {
 	case openai.TextAnnotationTypeFileCitation:
-		out.FileCitation = &openai.TextAnnotationFileCitation{FileID: a.FileID, Filename: a.Filename}
+		out.FileCitation = &openai.TextAnnotationFileCitation{FileID: a.FileID, Filename: a.Filename, Index: a.AnnotationIndex}
 	case openai.TextAnnotationTypeURLCitation:
 		out.URLCitation = &openai.TextAnnotationURLCitation{Title: a.Title, URL: a.URL, StartIndex: a.StartIndex, EndIndex: a.EndIndex}
 	case openai.TextAnnotationTypeContainerFileCitation:
@@ -1925,7 +1999,7 @@ func annotationToOpenAI(a TextAnnotation) *openai.TextAnnotation {
 			ContainerID: a.ContainerID, FileID: a.FileID, Filename: a.Filename, StartIndex: a.StartIndex, EndIndex: a.EndIndex,
 		}
 	case openai.TextAnnotationTypeFilePath:
-		out.FilePath = &openai.TextAnnotationFilePath{FileID: a.FileID}
+		out.FilePath = &openai.TextAnnotationFilePath{FileID: a.FileID, Index: a.AnnotationIndex}
 	}
 	return out
 }
@@ -2288,15 +2362,18 @@ func contentBlockToEino(block ContentBlock) (*einoschema.ContentBlock, error) {
 }
 
 // Clone returns a deep copy of c. Mutating the clone's blocks, metadata, or
-// any nested slice never affects c.
-func (c Content) Clone() Content {
+// any nested slice never affects c. An error is returned, rather than a
+// partial or empty copy, if c cannot be round-tripped through JSON (for
+// example a json.RawMessage field holding non-JSON bytes, or a NaN/Inf float
+// in Grounding.Supports[].ConfidenceScores).
+func (c Content) Clone() (Content, error) {
 	raw, err := json.Marshal(c)
 	if err != nil {
-		return Content{Role: c.Role}
+		return Content{}, errors.Join(ErrContentInvalid, err)
 	}
 	var out Content
 	if err := json.Unmarshal(raw, &out); err != nil {
-		return Content{Role: c.Role}
+		return Content{}, errors.Join(ErrContentInvalid, err)
 	}
-	return out
+	return out, nil
 }

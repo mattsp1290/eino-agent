@@ -557,3 +557,145 @@ func mutateSQLiteRecord[T any](t *testing.T, db *sql.DB, table, id string, mutat
 		t.Fatal(err)
 	}
 }
+
+// blockBoundProviderStateCodec wraps a base ProviderStateCodec to stamp a
+// fixed BlockID onto every captured item and record every item passed to
+// RestoreAssistant, so a test can observe BlockID surviving the full
+// capture -> persist -> reopen -> restore journey without needing a codec
+// that natively understands content-block binding.
+type blockBoundProviderStateCodec struct {
+	model.ProviderStateCodec
+	blockID       string
+	mu            sync.Mutex
+	restoredItems []model.ProviderStateItem
+}
+
+func (c *blockBoundProviderStateCodec) CaptureAssistant(message *einoschema.Message) (model.ProviderStateCapture, error) {
+	capture, err := c.ProviderStateCodec.CaptureAssistant(message)
+	if err != nil {
+		return capture, err
+	}
+	for i := range capture.Items {
+		capture.Items[i].BlockID = c.blockID
+	}
+	return capture, nil
+}
+
+func (c *blockBoundProviderStateCodec) RestoreAssistant(message *einoschema.Message, items []model.ProviderStateItem) error {
+	c.mu.Lock()
+	c.restoredItems = append(c.restoredItems, items...)
+	c.mu.Unlock()
+	return c.ProviderStateCodec.RestoreAssistant(message, items)
+}
+
+func (c *blockBoundProviderStateCodec) Restored() []model.ProviderStateItem {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]model.ProviderStateItem(nil), c.restoredItems...)
+}
+
+// TestProviderStateBlockIDSurvivesCapturePersistReopenRestore is the
+// runtime-level pin for the fix wiring model.ProviderStateItem.BlockID
+// through session.ProviderStateEnvelope.BlockID in both directions
+// (runtime/provider_state.go). Before that fix, a non-empty BlockID
+// produced by a codec's capture was silently discarded on write and never
+// reconstructed on restore, so nothing block-bound could ever be restored
+// to its owning content block.
+func TestProviderStateBlockIDSurvivesCapturePersistReopenRestore(t *testing.T) {
+	t.Parallel()
+
+	const boundBlockID = "blk-bound-reasoning-1"
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "state-block-id.db")
+	store, storePool, err := openTestSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = storePool.Close() }()
+
+	baseCodec, err := model.NewEinoJSONExtraStateCodec(model.EinoJSONExtraStateConfig{ExtraKey: providerStateExtraKey, Contract: runtimeProviderStateContract()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ids := &sequenceIDs{}
+	firstCodec := &blockBoundProviderStateCodec{ProviderStateCodec: baseCodec, blockID: boundBlockID}
+	firstStreamer, err := model.NewEinoStreamerWithProviderState(&runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("first answer")}}, firstCodec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: firstStreamer}), WithIDGenerator(ids),
+		WithRunPlanProvider(emptyTestRunPlanProvider()), WithClock(func() time.Time { return time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC) }),
+	)
+	firstResult := startAndWaitRequest(t, first, Request{SessionID: "state-block-id-session", Message: TextUserMessage("first question"), Config: orchestratorConfig()})
+	if firstResult.Status != session.RunCompleted || firstResult.Error != nil {
+		t.Fatalf("first result = %+v", firstResult)
+	}
+
+	// Capture -> persist: every durable provider_state part for this
+	// message must carry the bound BlockID.
+	batch, err := history.LoadBatch(ctx, store, "state-block-id-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stateParts []session.Part
+	for _, part := range batch.Parts {
+		if part.Kind == session.PartProviderState && part.MessageID == firstResult.MessageID {
+			stateParts = append(stateParts, part)
+		}
+	}
+	if len(stateParts) == 0 {
+		t.Fatal("no provider_state parts persisted for the first assistant message")
+	}
+	for _, part := range stateParts {
+		envelope, err := session.DecodeProviderStatePayload(part.Payload)
+		if err != nil {
+			t.Fatalf("DecodeProviderStatePayload: %v", err)
+		}
+		if envelope.BlockID != boundBlockID {
+			t.Fatalf("persisted envelope.BlockID = %q, want %q", envelope.BlockID, boundBlockID)
+		}
+	}
+
+	// Reopen: the store round trips through SQLite close/reopen before the
+	// restore leg, so this also proves BlockID is not lost on disk.
+	if err := storePool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, storePool, err = reopenTestSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore: a second run in the same session must trigger
+	// loadProviderHistory -> RestoreAssistant with BlockID intact.
+	secondCodec := &blockBoundProviderStateCodec{ProviderStateCodec: baseCodec, blockID: boundBlockID}
+	secondStreamer, err := model.NewEinoStreamerWithProviderState(&runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("second answer", nil)}}, secondCodec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: secondStreamer}), WithIDGenerator(ids),
+		WithRunPlanProvider(emptyTestRunPlanProvider()), WithClock(func() time.Time { return time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC) }),
+	)
+	secondResult := startAndWaitRequest(t, second, Request{SessionID: "state-block-id-session", Message: TextUserMessage("second question"), Config: orchestratorConfig()})
+	if secondResult.Status != session.RunCompleted || secondResult.Error != nil {
+		t.Fatalf("second result = %+v", secondResult)
+	}
+
+	restored := secondCodec.Restored()
+	if len(restored) == 0 {
+		t.Fatal("RestoreAssistant was never called with any items")
+	}
+	found := false
+	for _, item := range restored {
+		if item.BlockID == boundBlockID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("no restored item carried BlockID %q: %#v", boundBlockID, restored)
+	}
+}

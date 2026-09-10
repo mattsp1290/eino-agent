@@ -23,10 +23,23 @@ var ErrMixedContentKinds = errors.New("session history: message mixes legacy and
 type AgenticProjection struct {
 	Messages         []*einoschema.AgenticMessage
 	SourceMessageIDs []session.MessageID
-	// PartIDs maps a durable content block's identity (ContentBlock.ID) to
-	// the durable Part that carries it. Only populated for messages
-	// projected through the durable BlockKind pipeline.
-	PartIDs map[string]session.PartID
+	// PartIDs maps a durable content block's identity, scoped to its owning
+	// message, to the durable Part that carries it. Only populated for
+	// messages projected through the durable BlockKind pipeline.
+	//
+	// It is keyed by (MessageID, BlockID) rather than bare BlockID because
+	// Content.Validate only enforces block-ID uniqueness within a single
+	// message: two different messages in the same session batch are free to
+	// reuse the same block ID, and a bare-BlockID map would silently
+	// collapse one of them.
+	PartIDs map[BlockRef]session.PartID
+}
+
+// BlockRef identifies one durable content block scoped to its owning
+// message.
+type BlockRef struct {
+	MessageID session.MessageID
+	BlockID   string
 }
 
 // ProjectAgentic converts durable session messages and parts into Eino
@@ -44,7 +57,7 @@ func ProjectAgentic(batch session.ReplayBatch, options Options) (AgenticProjecti
 	result := AgenticProjection{
 		Messages:         make([]*einoschema.AgenticMessage, 0, len(batch.Messages)),
 		SourceMessageIDs: make([]session.MessageID, 0, len(batch.Messages)),
-		PartIDs:          map[string]session.PartID{},
+		PartIDs:          map[BlockRef]session.PartID{},
 	}
 	for _, message := range batch.Messages {
 		parts := partsByMessage[message.ID]
@@ -73,7 +86,7 @@ func LoadAgentic(ctx context.Context, store session.Store, sessionID session.ID,
 	return ProjectAgentic(batch, options)
 }
 
-func projectAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[string]session.PartID) ([]*einoschema.AgenticMessage, error) {
+func projectAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, error) {
 	richCount, legacyCount := 0, 0
 	for _, part := range parts {
 		if part.Kind == session.PartProviderState {
@@ -112,14 +125,14 @@ func isRichContentPart(part session.Part) bool {
 	return false
 }
 
-func projectRichAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[string]session.PartID) ([]*einoschema.AgenticMessage, error) {
+func projectRichAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, error) {
 	decodeRole := message.Role
 	if decodeRole == session.RoleTool {
 		// RoleTool durable messages carry function_tool_result content,
 		// which the durable content contract only allows on RoleUser.
 		decodeRole = session.RoleUser
 	}
-	content, err := session.DecodeContentParts(decodeRole, parts, session.DefaultContentLimits())
+	content, err := session.DecodeContentParts(decodeRole, parts, options.contentLimits())
 	if err != nil {
 		return nil, fmt.Errorf("message %s: %w", message.ID, err)
 	}
@@ -131,7 +144,7 @@ func projectRichAgenticMessage(message session.Message, parts []session.Part, op
 			continue
 		}
 		if id, ok := blockIDFromPayload(part.Payload); ok {
-			partIDs[id] = part.ID
+			partIDs[BlockRef{MessageID: message.ID, BlockID: id}] = part.ID
 		}
 	}
 	if !options.IncludeReasoning {

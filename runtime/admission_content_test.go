@@ -222,35 +222,117 @@ func TestAdmissionMutatingCallerBlocksAfterStartDoesNotChangeStoredParts(t *test
 		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
 	}))
 	textBlock := &session.TextBlock{Text: "original"}
-	blocks := []session.ContentBlock{{Kind: session.BlockKindUserInputText, Text: textBlock}}
+	mediaBlock := &session.MediaBlock{URL: "https://example.com/original.png", MIMEType: "image/png"}
+	blocks := []session.ContentBlock{
+		{Kind: session.BlockKindUserInputText, Text: textBlock},
+		{Kind: session.BlockKindUserInputImage, Media: mediaBlock},
+	}
 	handle, err := orch.Start(context.Background(), Request{SessionID: "mutation-session", Message: UserMessage{Blocks: blocks}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
 
-	// Mutate the caller's own block content and ID after Start has returned.
+	// Mutate the caller's own block content (both a *TextBlock and a
+	// *MediaBlock pointer) after Start has returned. assignContentBlockIDs
+	// and freezeAdmission both deep-clone the block payloads (via
+	// session.Content.Clone), so the durable copy is fully independent of
+	// these caller-owned pointers even though Start only shallow-copies the
+	// outer ContentBlock slice header.
 	textBlock.Text = "mutated"
+	mediaBlock.URL = "https://example.com/mutated.png"
 	blocks[0].ID = "caller-mutated-id"
 
 	result := <-handle.Done()
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("result = %+v", result)
 	}
-	var userPart session.Part
-	found := false
+	var userPart, mediaPart session.Part
+	foundText, foundMedia := false, false
 	for _, part := range store.parts {
-		if part.Kind == session.PartUserInputText {
-			userPart, found = part, true
+		switch part.Kind {
+		case session.PartUserInputText:
+			userPart, foundText = part, true
+		case session.PartUserInputImage:
+			mediaPart, foundMedia = part, true
 		}
 	}
-	if !found {
-		t.Fatal("user part was not persisted")
+	if !foundText {
+		t.Fatal("user text part was not persisted")
+	}
+	if !foundMedia {
+		t.Fatal("user media part was not persisted")
 	}
 	decoded, err := session.DecodeContentParts(session.RoleUser, []session.Part{userPart}, session.DefaultContentLimits())
 	if err != nil || len(decoded.Blocks) != 1 || decoded.Blocks[0].Text == nil || decoded.Blocks[0].Text.Text != "original" {
-		t.Fatalf("stored content was mutated by the caller: decoded=%#v error=%v", decoded, err)
+		t.Fatalf("stored text content was mutated by the caller: decoded=%#v error=%v", decoded, err)
 	}
 	if decoded.Blocks[0].ID == "caller-mutated-id" {
 		t.Fatalf("stored block ID was mutated by the caller: %#v", decoded.Blocks[0])
+	}
+	decodedMedia, err := session.DecodeContentParts(session.RoleUser, []session.Part{mediaPart}, session.DefaultContentLimits())
+	if err != nil || len(decodedMedia.Blocks) != 1 || decodedMedia.Blocks[0].Media == nil || decodedMedia.Blocks[0].Media.URL != "https://example.com/original.png" {
+		t.Fatalf("stored media content was mutated by the caller: decoded=%#v error=%v", decodedMedia, err)
+	}
+}
+
+// TestAdmissionMediaBlockSurvivesSecondTurnInSameSession admits a user turn
+// carrying text and a media block, then starts a second run in the same
+// session and requires it to succeed. Before the classic projector's
+// user-role media support (session/history/projector.go), the first turn's
+// persisted user_input_image part would permanently brick every later turn
+// in the session: loadProviderHistory decodes prior turns through the
+// classic projector to build the model request, and it rejected
+// user_input_image (and the other media kinds) with ErrClassicUnsupported.
+// This also asserts the model actually receives the first turn's text and
+// media as an ordered UserInputMultiContent, not silently dropped.
+func TestAdmissionMediaBlockSurvivesSecondTurnInSameSession(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	var secondTurnMessages []*einoschema.Message
+	turn := 0
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		turn++
+		if turn == 2 {
+			secondTurnMessages = request.Messages
+		}
+		return []*einoschema.Message{einoschema.AssistantMessage("seen", nil)}, nil
+	}))
+
+	const sessionID session.ID = "media-then-text-session"
+	mediaBlocks := []session.ContentBlock{
+		{Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "look at this"}},
+		{Kind: session.BlockKindUserInputImage, Media: &session.MediaBlock{URL: "https://example.com/first.png", MIMEType: "image/png"}},
+	}
+	first := startAndWaitRequest(t, orch, Request{SessionID: sessionID, Message: UserMessage{Blocks: mediaBlocks}, Config: orchestratorConfig()})
+	if first.Error != nil || first.Status != session.RunCompleted {
+		t.Fatalf("first run result = %+v", first)
+	}
+
+	textBlocks := []session.ContentBlock{{Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "and this follow-up"}}}
+	second := startAndWaitRequest(t, orch, Request{SessionID: sessionID, Message: UserMessage{Blocks: textBlocks}, Config: orchestratorConfig()})
+	if second.Error != nil || second.Status != session.RunCompleted {
+		t.Fatalf("second run result = %+v (media block from the first turn must not brick later turns)", second)
+	}
+
+	var withMedia *einoschema.Message
+	for _, msg := range secondTurnMessages {
+		if msg.Role == einoschema.User && len(msg.UserInputMultiContent) > 0 {
+			withMedia = msg
+			break
+		}
+	}
+	if withMedia == nil {
+		t.Fatalf("second turn's model request never carried the first turn's media as UserInputMultiContent: %#v", secondTurnMessages)
+	}
+	if len(withMedia.UserInputMultiContent) != 2 {
+		t.Fatalf("UserInputMultiContent = %#v, want 2 parts (text then image, order preserved)", withMedia.UserInputMultiContent)
+	}
+	textPart, imagePart := withMedia.UserInputMultiContent[0], withMedia.UserInputMultiContent[1]
+	if textPart.Type != einoschema.ChatMessagePartTypeText || textPart.Text != "look at this" {
+		t.Fatalf("UserInputMultiContent[0] = %#v, want text %q", textPart, "look at this")
+	}
+	if imagePart.Type != einoschema.ChatMessagePartTypeImageURL || imagePart.Image == nil || imagePart.Image.URL == nil || *imagePart.Image.URL != "https://example.com/first.png" {
+		t.Fatalf("UserInputMultiContent[1] = %#v, want image URL %q", imagePart, "https://example.com/first.png")
 	}
 }
