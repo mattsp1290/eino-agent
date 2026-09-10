@@ -69,6 +69,54 @@ func TestProviderStateContractValidation(t *testing.T) {
 	}
 }
 
+func TestProviderStateItemsBlockIDValidation(t *testing.T) {
+	limits := testProviderStateContract().Limits
+
+	t.Run("empty block id is message-level and accepted", func(t *testing.T) {
+		if err := ValidateProviderStateItems([]ProviderStateItem{{Data: json.RawMessage(`{"x":1}`)}}, limits); err != nil {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("maximum-length printable ASCII block id accepted", func(t *testing.T) {
+		if err := ValidateProviderStateItems([]ProviderStateItem{
+			{BlockID: strings.Repeat("i", maxProviderStateBlockIDBytes), Data: json.RawMessage(`{"x":1}`)},
+		}, limits); err != nil {
+			t.Fatalf("error = %v", err)
+		}
+	})
+
+	t.Run("over-length block id rejected", func(t *testing.T) {
+		err := ValidateProviderStateItems([]ProviderStateItem{
+			{BlockID: strings.Repeat("i", maxProviderStateBlockIDBytes+1), Data: json.RawMessage(`{"x":1}`)},
+		}, limits)
+		if !errors.Is(err, ErrProviderStateInvalid) {
+			t.Fatalf("error = %v, want ErrProviderStateInvalid", err)
+		}
+	})
+
+	t.Run("non-printable block id rejected", func(t *testing.T) {
+		err := ValidateProviderStateItems([]ProviderStateItem{
+			{BlockID: "bad\nid", Data: json.RawMessage(`{"x":1}`)},
+		}, limits)
+		if !errors.Is(err, ErrProviderStateInvalid) {
+			t.Fatalf("error = %v, want ErrProviderStateInvalid", err)
+		}
+	})
+}
+
+func TestProviderStateItemsCloneOwnsBlockIDAndBytes(t *testing.T) {
+	src := []ProviderStateItem{{BlockID: "block-1", Data: json.RawMessage(`{"x":1}`)}}
+	cloned := cloneProviderStateItems(src)
+	if cloned[0].BlockID != "block-1" {
+		t.Fatalf("BlockID = %q, want block-1", cloned[0].BlockID)
+	}
+	cloned[0].Data[2] = 'z'
+	if string(src[0].Data) != `{"x":1}` {
+		t.Fatalf("source bytes mutated: %q", src[0].Data)
+	}
+}
+
 func TestProviderStateIdentityAndRegistrationByteBoundaries(t *testing.T) {
 	if err := ValidateProviderStateIdentity(strings.Repeat("p", MaxProviderStateProviderIDBytes), strings.Repeat("m", MaxProviderStateModelIDBytes)); err != nil {
 		t.Fatalf("maximum identity rejected: %v", err)

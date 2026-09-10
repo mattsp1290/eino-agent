@@ -35,7 +35,11 @@ type ProviderStateEnvelope struct {
 	SourceModelID    string
 	CompatibilityKey string
 	ItemIndex        int
-	Data             json.RawMessage
+	// BlockID binds this private state item to the durable content block it
+	// belongs to. "" means the item is message-level rather than bound to a
+	// specific block.
+	BlockID string
+	Data    json.RawMessage
 }
 
 type providerStatePayload struct {
@@ -45,6 +49,7 @@ type providerStatePayload struct {
 	SourceModelID    string `json:"source_model_id"`
 	CompatibilityKey string `json:"compatibility_key"`
 	ItemIndex        int    `json:"item_index"`
+	BlockID          string `json:"block_id"`
 	DataBase64       string `json:"data_base64"`
 }
 
@@ -57,6 +62,7 @@ func EncodeProviderStatePayload(envelope ProviderStateEnvelope) (json.RawMessage
 		CodecID: envelope.CodecID, Version: envelope.Version,
 		ProviderID: envelope.ProviderID, SourceModelID: envelope.SourceModelID,
 		CompatibilityKey: envelope.CompatibilityKey, ItemIndex: envelope.ItemIndex,
+		BlockID:    envelope.BlockID,
 		DataBase64: base64.StdEncoding.EncodeToString(envelope.Data),
 	}
 	raw, err := json.Marshal(payload)
@@ -92,7 +98,8 @@ func DecodeProviderStatePayload(raw json.RawMessage) (ProviderStateEnvelope, err
 		CodecID: payload.CodecID, Version: payload.Version,
 		ProviderID: payload.ProviderID, SourceModelID: payload.SourceModelID,
 		CompatibilityKey: payload.CompatibilityKey, ItemIndex: payload.ItemIndex,
-		Data: append(json.RawMessage(nil), data...),
+		BlockID: payload.BlockID,
+		Data:    append(json.RawMessage(nil), data...),
 	}
 	if err := validateProviderStateEnvelope(envelope); err != nil {
 		return ProviderStateEnvelope{}, err
@@ -108,7 +115,8 @@ func validateProviderStateEnvelope(envelope ProviderStateEnvelope) error {
 		envelope.CompatibilityKey == "" || !utf8.ValidString(envelope.CompatibilityKey) ||
 		len(envelope.CompatibilityKey) > ProviderStateMaxCompatibilityKeyBytes ||
 		envelope.ItemIndex < 0 || envelope.ItemIndex >= ProviderStateHardMaxItems ||
-		len(envelope.Data) > ProviderStateHardMaxItemBytes || !providerStateJSONObject(envelope.Data) {
+		len(envelope.Data) > ProviderStateHardMaxItemBytes || !providerStateJSONObject(envelope.Data) ||
+		!validBlockID(envelope.BlockID) {
 		return ErrProviderStateInvalid
 	}
 	return nil
@@ -120,4 +128,13 @@ func providerStateJSONObject(raw json.RawMessage) bool {
 
 func providerStateASCIIToken(value string, max int) bool {
 	return providerstatewire.ValidASCIIToken(value, max)
+}
+
+// validBlockID reports whether id is a valid provider-state block binding:
+// either empty (message-level) or <= 128 bytes of printable ASCII.
+func validBlockID(id string) bool {
+	if id == "" {
+		return true
+	}
+	return printableASCII(id, maxBlockIDBytes)
 }

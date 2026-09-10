@@ -50,7 +50,11 @@ type ProviderStateContract struct {
 
 // ProviderStateItem owns one opaque JSON object exactly as emitted by a provider.
 type ProviderStateItem struct {
-	Data json.RawMessage
+	// BlockID binds this item to the durable content block it belongs to.
+	// "" means the item is message-level rather than bound to a specific
+	// block.
+	BlockID string
+	Data    json.RawMessage
 }
 
 // ProviderMessageState binds ordered provider items to one durable assistant message.
@@ -147,6 +151,9 @@ func ValidateProviderStateItems(items []ProviderStateItem, limits ProviderStateL
 		if !isJSONObject(item.Data) {
 			return providerStateError(ErrProviderStateInvalid)
 		}
+		if !validBlockID(item.BlockID) {
+			return providerStateError(ErrProviderStateInvalid)
+		}
 	}
 	return nil
 }
@@ -169,6 +176,7 @@ func cloneProviderStateItems(src []ProviderStateItem) []ProviderStateItem {
 	}
 	dst := make([]ProviderStateItem, len(src))
 	for i := range src {
+		dst[i].BlockID = src[i].BlockID
 		dst[i].Data = append(json.RawMessage(nil), src[i].Data...)
 	}
 	return dst
@@ -193,4 +201,25 @@ func isJSONObject(raw json.RawMessage) bool {
 
 func validASCIIToken(value string, max int) bool {
 	return providerstatewire.ValidASCIIToken(value, max)
+}
+
+// maxProviderStateBlockIDBytes bounds ProviderStateItem.BlockID. It matches
+// the durable session.ProviderStateEnvelope.BlockID bound.
+const maxProviderStateBlockIDBytes = 128
+
+// validBlockID reports whether id is a valid provider-state block binding:
+// either empty (message-level) or <= 128 bytes of printable ASCII.
+func validBlockID(id string) bool {
+	if id == "" {
+		return true
+	}
+	if len(id) > maxProviderStateBlockIDBytes {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < 0x20 || id[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

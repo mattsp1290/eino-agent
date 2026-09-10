@@ -138,24 +138,68 @@ type PartKind string
 
 const (
 	// PartText stores text content or a settled text delta.
+	//
+	// PartText, PartToolCall, PartToolResult, PartFile, PartStep, and
+	// PartState are superseded by the 20 block-kind PartKind constants and
+	// PartResponseMeta declared below (see content.go for the BlockKind
+	// contract they persist). They are kept only so already-durable history
+	// continues to decode during the W2-to-W5 cutover, and are removed once
+	// the runtime cutover to durable ordered rich content lands in W5.
 	PartText PartKind = "text"
-	// PartReasoning stores model reasoning content when a provider exposes it.
+	// PartReasoning stores model reasoning content when a provider exposes
+	// it. This constant is also the PartKind for BlockKindReasoning content
+	// blocks (see PartKindForBlock in content.go): both already share the
+	// "reasoning" string, so no separate constant is declared for the block
+	// variant.
 	PartReasoning PartKind = "reasoning"
-	// PartToolCall stores a tool-call state transition.
+	// PartToolCall stores a tool-call state transition. Superseded; see
+	// PartText.
 	PartToolCall PartKind = "tool_call"
-	// PartToolResult stores a tool result sent back to the model.
+	// PartToolResult stores a tool result sent back to the model. Superseded;
+	// see PartText.
 	PartToolResult PartKind = "tool_result"
-	// PartFile stores a durable file or media reference.
+	// PartFile stores a durable file or media reference. Superseded; see
+	// PartText.
 	PartFile PartKind = "file"
 	// PartStep stores provider/runtime step start and finish markers.
+	// Superseded; see PartText.
 	PartStep PartKind = "step"
 	// PartCompaction stores compaction request or summary metadata.
 	PartCompaction PartKind = "compaction"
-	// PartState stores app-visible state snapshots or patches.
+	// PartState stores app-visible state snapshots or patches. Superseded;
+	// see PartText.
 	PartState PartKind = "state"
 	// PartProviderState stores provider-private continuity data. Public history
 	// projection and replay surfaces always omit this kind.
 	PartProviderState PartKind = "provider_state"
+
+	// The following PartKind constants persist the 19 non-reasoning
+	// BlockKind values declared in content.go, one part kind per block kind,
+	// using identical string values (BlockKindReasoning reuses PartReasoning
+	// above). See PartKindForBlock / BlockKindForPart in content.go.
+	PartUserInputText           PartKind = "user_input_text"
+	PartUserInputImage          PartKind = "user_input_image"
+	PartUserInputAudio          PartKind = "user_input_audio"
+	PartUserInputVideo          PartKind = "user_input_video"
+	PartUserInputFile           PartKind = "user_input_file"
+	PartToolSearchResult        PartKind = "tool_search_result"
+	PartAssistantGenText        PartKind = "assistant_gen_text"
+	PartAssistantGenImage       PartKind = "assistant_gen_image"
+	PartAssistantGenAudio       PartKind = "assistant_gen_audio"
+	PartAssistantGenVideo       PartKind = "assistant_gen_video"
+	PartFunctionToolCall        PartKind = "function_tool_call"
+	PartFunctionToolResult      PartKind = "function_tool_result"
+	PartServerToolCall          PartKind = "server_tool_call"
+	PartServerToolResult        PartKind = "server_tool_result"
+	PartMCPToolCall             PartKind = "mcp_tool_call"
+	PartMCPToolResult           PartKind = "mcp_tool_result"
+	PartMCPListToolsResult      PartKind = "mcp_list_tools_result"
+	PartMCPToolApprovalRequest  PartKind = "mcp_tool_approval_request"
+	PartMCPToolApprovalResponse PartKind = "mcp_tool_approval_response"
+
+	// PartResponseMeta stores one durable ResponseMeta projection per
+	// assistant message, ordered after all of that message's block parts.
+	PartResponseMeta PartKind = "response_meta"
 )
 
 // Part is an ordered, replayable fragment of a message. Payload is structured
