@@ -234,3 +234,70 @@ func TestBuildClonesRuntime(t *testing.T) {
 		t.Fatalf("runtime options mutated to %q", base.runtime.Options["session"])
 	}
 }
+
+// TestProviderStepBlocksAreClonedIndependently guards against a fixture's
+// Step.Blocks being shared by reference across streams: the runtime clears
+// StreamingMeta on the blocks it dispatches (runtime.clearStreamingMeta), and
+// Eino's single-chunk ConcatAgenticMessages returns the chunk unmodified, so
+// a shared *ContentBlock would (a) make a replayed Provider emit different
+// blocks on its second use and (b) race under concurrent streams. cloneSteps
+// must deep-copy each block and its StreamingMeta so every stream — and the
+// original fixture — owns independent *ContentBlock values.
+func TestProviderStepBlocksAreClonedIndependently(t *testing.T) {
+	t.Parallel()
+
+	originalBlock := einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "answer"}, &einoschema.StreamingMeta{Index: 0})
+	provider := &Provider{
+		ID:    "fake",
+		Steps: []Step{{Blocks: []*einoschema.ContentBlock{originalBlock}}},
+	}
+
+	streamOnce := func() *einoschema.ContentBlock {
+		streamer, err := provider.Build(context.Background(), model.Selection{ProviderID: "fake", ModelID: "m1"}, model.Runtime{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		reader, err := streamer.StreamProvider(context.Background(), model.Request{})
+		if err != nil {
+			t.Fatalf("StreamProvider error = %v", err)
+		}
+		defer reader.Close()
+		delta, err := reader.Recv()
+		if err != nil {
+			t.Fatalf("Recv error = %v", err)
+		}
+		if len(delta.Message.ContentBlocks) != 1 {
+			t.Fatalf("blocks = %d, want 1", len(delta.Message.ContentBlocks))
+		}
+		return delta.Message.ContentBlocks[0]
+	}
+
+	first := streamOnce()
+	second := streamOnce()
+
+	if first == originalBlock || second == originalBlock {
+		t.Fatal("emitted block shares a pointer with the fixture's Step.Blocks entry")
+	}
+	if first == second {
+		t.Fatal("two streams over one Provider emitted the same *ContentBlock pointer")
+	}
+	if first.StreamingMeta == originalBlock.StreamingMeta || second.StreamingMeta == originalBlock.StreamingMeta {
+		t.Fatal("emitted StreamingMeta shares a pointer with the fixture's")
+	}
+
+	// Simulate runtime.clearStreamingMeta mutating the first emitted message
+	// in place; neither the fixture nor the second stream's block may see it.
+	first.StreamingMeta = nil
+
+	if originalBlock.StreamingMeta == nil {
+		t.Fatal("clearing the first stream's block mutated the fixture's Step.Blocks entry")
+	}
+	if second.StreamingMeta == nil {
+		t.Fatal("clearing the first stream's block mutated the second stream's block")
+	}
+
+	third := streamOnce()
+	if third.StreamingMeta == nil {
+		t.Fatal("replaying the Provider after a prior stream's mutation emitted a block with nil StreamingMeta")
+	}
+}

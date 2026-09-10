@@ -46,14 +46,20 @@ type Tail interface {
 // SSEConfig wires a consuming server's route to the AG-UI replay/live-tail
 // primitives without owning product-specific paths or auth policy.
 type SSEConfig struct {
-	Store      session.Store
-	Tail       Tail
-	Session    SessionFunc
-	Auth       AuthFunc
-	Cursor     func(*http.Request) session.EventCursor
-	ThreadID   func(*http.Request, session.ID) string
-	RunID      func(*http.Request) string
-	OnComplete func(session.EventCursor, error)
+	Store    session.Store
+	Tail     Tail
+	Session  SessionFunc
+	Auth     AuthFunc
+	Cursor   func(*http.Request) session.EventCursor
+	ThreadID func(*http.Request, session.ID) string
+	RunID    func(*http.Request) string
+	// ContentLimits must match the session.ContentLimits the runtime.Runtime
+	// backing this handler was configured with (see runtime.WithContentLimits).
+	// The zero value falls back to session.DefaultContentLimits(); a
+	// mismatch does not corrupt data, but content legitimately admitted
+	// under raised limits fails to decode for the initial message snapshot.
+	ContentLimits session.ContentLimits
+	OnComplete    func(session.EventCursor, error)
 }
 
 // SSEHandler returns an http.Handler for AG-UI SSE reconnect streams.
@@ -102,7 +108,7 @@ func SSEHandler(config SSEConfig) http.Handler {
 		tracked := &trackingWriter{ResponseWriter: w}
 		writer := bufio.NewWriter(flushWriter{writer: tracked, flusher: flusher})
 		bridge := agentagui.NewBridge(ctx, writer, sse.NewSSEWriter(), threadID, runID, nil)
-		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor)
+		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor, config.ContentLimits)
 		if err != nil && !tracked.wrote {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			if config.OnComplete != nil {

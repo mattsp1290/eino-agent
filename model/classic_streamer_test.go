@@ -18,6 +18,12 @@ type scriptedClassicModel struct {
 	calls    int
 
 	chunks []*einoschema.Message
+
+	// withToolsCalls records every WithTools invocation (nil entry for a
+	// call whose argument was nil, an empty-but-non-nil slice for a call
+	// whose argument explicitly cleared tools).
+	withToolsCalls [][]*einoschema.ToolInfo
+	withToolsErr   error
 }
 
 func (m *scriptedClassicModel) Generate(context.Context, []*einoschema.Message, ...einomodel.Option) (*einoschema.Message, error) {
@@ -31,7 +37,11 @@ func (m *scriptedClassicModel) Stream(_ context.Context, messages []*einoschema.
 	return einoschema.StreamReaderFromArray(append([]*einoschema.Message(nil), m.chunks...)), nil
 }
 
-func (m *scriptedClassicModel) WithTools([]*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
+func (m *scriptedClassicModel) WithTools(tools []*einoschema.ToolInfo) (einomodel.ToolCallingChatModel, error) {
+	m.withToolsCalls = append(m.withToolsCalls, tools)
+	if m.withToolsErr != nil {
+		return nil, m.withToolsErr
+	}
 	return m, nil
 }
 
@@ -299,5 +309,134 @@ func TestClassicProviderStateStreamerCaptureConvertsAgenticOutput(t *testing.T) 
 	}
 	if message.Extra != nil {
 		t.Fatalf("message Extra = %#v, want nil", message.Extra)
+	}
+}
+
+// TestClassicAdapterNilIndexToolCallsDoNotCollide guards against a nil-Index
+// tool call from one chunk colliding on block index with a nil-Index tool
+// call from a different chunk (both would otherwise land on
+// toolCallBase+position == the same slot for a single-call chunk). Eino's own
+// classic accumulator (schema.concatToolCalls) keeps nil-index calls
+// separate; classicMessageToAgenticDelta must preserve that when converting
+// to agentic blocks so schema.ConcatAgenticMessages does not merge them.
+func TestClassicAdapterNilIndexToolCallsDoNotCollide(t *testing.T) {
+	client := &scriptedClassicModel{chunks: []*einoschema.Message{
+		{Role: einoschema.Assistant, ToolCalls: []einoschema.ToolCall{
+			{ID: "call-a", Function: einoschema.FunctionCall{Name: "a", Arguments: `{"x":1}`}},
+		}},
+		{Role: einoschema.Assistant, ToolCalls: []einoschema.ToolCall{
+			{ID: "call-b", Function: einoschema.FunctionCall{Name: "b", Arguments: `{"y":2}`}},
+		}},
+	}}
+	streamer := NewClassicStreamer(client)
+	reader, err := streamer.StreamProvider(context.Background(), Request{
+		Identity: Identity{ProviderID: "fake", ModelID: "m1"},
+		Messages: []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("hi")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+
+	var chunks []*einoschema.AgenticMessage
+	for {
+		delta, err := reader.Recv()
+		if err != nil {
+			break
+		}
+		chunks = append(chunks, delta.Message)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("chunks = %d, want 2", len(chunks))
+	}
+	if chunks[0].ContentBlocks[0].StreamingMeta == nil || chunks[1].ContentBlocks[0].StreamingMeta == nil {
+		t.Fatalf("missing StreamingMeta: %#v / %#v", chunks[0].ContentBlocks[0], chunks[1].ContentBlocks[0])
+	}
+	if chunks[0].ContentBlocks[0].StreamingMeta.Index == chunks[1].ContentBlocks[0].StreamingMeta.Index {
+		t.Fatalf("both nil-Index tool calls got the same block index %d", chunks[0].ContentBlocks[0].StreamingMeta.Index)
+	}
+
+	merged, err := einoschema.ConcatAgenticMessages(chunks)
+	if err != nil {
+		t.Fatalf("ConcatAgenticMessages: %v", err)
+	}
+	var calls []*einoschema.FunctionToolCall
+	for _, b := range merged.ContentBlocks {
+		if b.Type == einoschema.ContentBlockTypeFunctionToolCall {
+			calls = append(calls, b.FunctionToolCall)
+		}
+	}
+	if len(calls) != 2 {
+		t.Fatalf("merged function tool call blocks = %d, want 2: %#v", len(calls), merged.ContentBlocks)
+	}
+	ids := map[string]bool{}
+	for _, c := range calls {
+		ids[c.CallID] = true
+	}
+	if !ids["call-a"] || !ids["call-b"] {
+		t.Fatalf("merged call ids = %#v, want call-a and call-b", ids)
+	}
+}
+
+// TestClassicAdapterEmptyToolsStillClears mirrors
+// TestAgenticCallOptionsEmptyToolsStillClears for the classic path: an
+// explicitly empty (non-nil) Tools list must call WithTools to clear
+// whatever the base client was constructed with, not silently no-op.
+func TestClassicAdapterEmptyToolsStillClears(t *testing.T) {
+	client := &scriptedClassicModel{}
+	streamer := NewClassicStreamer(client)
+	req := Request{
+		Identity: Identity{ProviderID: "fake", ModelID: "m1"},
+		Messages: []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("hi")},
+		Controls: RequestControls{Tools: []*einoschema.ToolInfo{}},
+	}
+	if _, err := streamer.StreamProvider(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.withToolsCalls) != 1 {
+		t.Fatalf("WithTools calls = %d, want 1", len(client.withToolsCalls))
+	}
+	if client.withToolsCalls[0] == nil || len(client.withToolsCalls[0]) != 0 {
+		t.Fatalf("WithTools arg = %#v, want empty non-nil slice", client.withToolsCalls[0])
+	}
+}
+
+// TestClassicAdapterNilToolsDoesNotCallWithTools asserts the classic path
+// leaves the base client untouched when the caller did not supply a Tools
+// list at all (nil), as opposed to an explicit empty list which clears.
+func TestClassicAdapterNilToolsDoesNotCallWithTools(t *testing.T) {
+	client := &scriptedClassicModel{}
+	streamer := NewClassicStreamer(client)
+	req := Request{
+		Identity: Identity{ProviderID: "fake", ModelID: "m1"},
+		Messages: []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("hi")},
+	}
+	if _, err := streamer.StreamProvider(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	if len(client.withToolsCalls) != 0 {
+		t.Fatalf("WithTools calls = %d, want 0", len(client.withToolsCalls))
+	}
+}
+
+// TestClassicAdapterWithToolsErrorPropagates asserts a concrete classic
+// adapter's rejection of a tool list (e.g. an empty one it cannot represent)
+// surfaces as the StreamProvider error rather than silently dispatching with
+// stale tools.
+func TestClassicAdapterWithToolsErrorPropagates(t *testing.T) {
+	wantErr := errors.New("adapter rejects empty tool list")
+	client := &scriptedClassicModel{withToolsErr: wantErr}
+	streamer := NewClassicStreamer(client)
+	req := Request{
+		Identity: Identity{ProviderID: "fake", ModelID: "m1"},
+		Messages: []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("hi")},
+		Controls: RequestControls{Tools: []*einoschema.ToolInfo{}},
+	}
+	_, err := streamer.StreamProvider(context.Background(), req)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("err = %v, want %v", err, wantErr)
+	}
+	if client.calls != 0 {
+		t.Fatalf("calls = %d, want 0 (Stream must not run after WithTools error)", client.calls)
 	}
 }

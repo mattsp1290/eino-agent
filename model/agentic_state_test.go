@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -312,5 +313,74 @@ func TestAgenticProviderStateStreamerRejectsMismatches(t *testing.T) {
 				t.Fatalf("calls = %d, want 0", client.callCount())
 			}
 		})
+	}
+}
+
+// misbehavingRestoreCodec wraps a well-behaved AgenticStateCodec but appends
+// an extra text block during Restore, violating the "Restore is the exact
+// inverse of Capture" contract. It is used to prove the streamer catches a
+// codec that smuggles un-audited content past restore.
+type misbehavingRestoreCodec struct {
+	inner AgenticStateCodec
+}
+
+func (c *misbehavingRestoreCodec) Contract() ProviderStateContract {
+	return c.inner.Contract()
+}
+
+func (c *misbehavingRestoreCodec) Capture(msg *einoschema.AgenticMessage, blockID func(index int) string) (ProviderStateCapture, *einoschema.AgenticMessage, error) {
+	return c.inner.Capture(msg, blockID)
+}
+
+func (c *misbehavingRestoreCodec) Restore(public *einoschema.AgenticMessage, items []ProviderStateItem, blockID func(index int) string) (*einoschema.AgenticMessage, error) {
+	restored, err := c.inner.Restore(public, items, blockID)
+	if err != nil {
+		return nil, err
+	}
+	// Smuggle in content that was never part of the audited public message.
+	restored.ContentBlocks = append(restored.ContentBlocks, einoschema.NewContentBlock(&einoschema.AssistantGenText{Text: "smuggled"}))
+	return restored, nil
+}
+
+func TestAgenticProviderStateStreamerRejectsCodecThatAltersRestoredContent(t *testing.T) {
+	codec, err := NewTypedExtensionStateCodec(typedContract())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bad := &misbehavingRestoreCodec{inner: codec}
+	client := &scriptedAgenticModel{chunks: []*einoschema.AgenticMessage{{Role: einoschema.AgenticRoleTypeAssistant}}}
+	streamer, err := NewAgenticStreamerWithProviderState(client, bad)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assistant := &einoschema.AgenticMessage{
+		Role:          einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{einoschema.NewContentBlock(&einoschema.Reasoning{Text: "because"})},
+	}
+	item, err := json.Marshal(privateSignature{Signature: "SENTINEL-SIG"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := Request{
+		Identity: Identity{SessionID: "session", ProviderID: "provider", ModelID: "model"},
+		Messages: []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("hi"), assistant},
+		ProviderState: []ProviderMessageState{{
+			MessageIndex: 1, MessageID: "message", SourceSessionID: "session", SourceRunID: "run",
+			ProviderID: "provider", SourceModelID: "model", CodecID: typedContract().CodecID, Version: 1, CompatibilityKey: "typed-v1",
+			BlockIDs: []string{"block-0"},
+			Items:    []ProviderStateItem{{BlockID: "block-0", Data: item}},
+		}},
+	}
+	_, err = streamer.StreamProvider(context.Background(), request)
+	if err == nil {
+		t.Fatal("expected an error from a codec that alters restored content")
+	}
+	var modelErr Error
+	if !errors.As(err, &modelErr) || modelErr.Code != "provider_state_mismatch" || !errors.Is(err, ErrProviderStateMismatch) {
+		t.Fatalf("error = %v, want provider_state_mismatch/ErrProviderStateMismatch", err)
+	}
+	if client.callCount() != 0 {
+		t.Fatalf("calls = %d, want 0 (must fail before dispatch)", client.callCount())
 	}
 }

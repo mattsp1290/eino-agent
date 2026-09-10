@@ -29,9 +29,9 @@ func (m *discoveryModel) StreamProvider(_ context.Context, request model.Request
 	m.mu.Lock()
 	m.requests = append(m.requests, request)
 	m.mu.Unlock()
-	prompt := request.Messages[len(request.Messages)-1].Content
+	prompt := agenticMessageText(request.Messages[len(request.Messages)-1])
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
-	writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("reply:"+prompt, nil)}, nil)
+	writer.Send(model.StreamDelta{Message: agenticAssistantText("reply:" + prompt)}, nil)
 	writer.Close()
 	return reader, nil
 }
@@ -130,6 +130,26 @@ func assertDiscoveryMessages(t *testing.T, messages []*einoschema.Message, conte
 		}
 	}
 }
+
+// assertDiscoveryAgenticMessages is assertDiscoveryMessages' counterpart for
+// the provider-visible []*schema.AgenticMessage shape carried on
+// model.Request.Messages (as opposed to the durable classic projection
+// discoveryHistory returns).
+func assertDiscoveryAgenticMessages(t *testing.T, messages []*einoschema.AgenticMessage, contents ...string) {
+	t.Helper()
+	if len(messages) != len(contents) {
+		t.Fatalf("messages=%+v want contents=%v", messages, contents)
+	}
+	for i, m := range messages {
+		role := einoschema.AgenticRoleTypeUser
+		if i%2 == 1 {
+			role = einoschema.AgenticRoleTypeAssistant
+		}
+		if agenticMessageText(m) != contents[i] || m.Role != role {
+			t.Fatalf("message %d = %+v want %s %q", i, m, role, contents[i])
+		}
+	}
+}
 func TestPublicSessionDiscoveryReopenAndIndependentContinuation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
@@ -194,7 +214,7 @@ func TestPublicSessionDiscoveryReopenAndIndependentContinuation(t *testing.T) {
 		if len(requests) != i+1 {
 			t.Fatal("unexpected provider calls")
 		}
-		assertDiscoveryMessages(t, requests[i].Messages, string(id)+"-first", "reply:"+string(id)+"-first", string(id)+"-second")
+		assertDiscoveryAgenticMessages(t, requests[i].Messages, string(id)+"-first", "reply:"+string(id)+"-first", string(id)+"-second")
 		assertDiscoveryMessages(t, discoveryHistory(t, ctx, reopened, id), string(id)+"-first", "reply:"+string(id)+"-first", string(id)+"-second", "reply:"+string(id)+"-second")
 	}
 	if !reflect.DeepEqual(bBefore, discoveryHistory(t, ctx, reopened, "b1")) {
@@ -242,3 +262,109 @@ func (discoveryIDs) NewPartID() session.PartID         { return session.PartID(r
 func (discoveryIDs) NewToolCallID() session.ToolCallID { return session.ToolCallID(rand.Text()) }
 func (discoveryIDs) NewEventID() session.EventID       { return session.EventID(rand.Text()) }
 func (discoveryIDs) NewEpochID() session.EpochID       { return session.EpochID(rand.Text()) }
+
+// --- Agentic test message helpers -----------------------------------------
+//
+// Small local mirrors of the agentic test-message helpers in
+// runtime/orchestrator_test_support_test.go (agenticAssistantText,
+// agenticAssistantToolCalls, agenticMessageText, isFunctionToolResultMessage,
+// agenticFunctionResultText). This fixture package cannot import runtime's
+// _test.go files, and check.sh only copies a fixed set of fixture files into
+// the scratch module, so the handful of constructors/readers every fixture
+// here needs are replicated in this always-copied file instead.
+
+// agenticAssistantText returns one complete assistant message carrying a
+// single assistant_gen_text block.
+func agenticAssistantText(text string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role:          einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: text}}},
+	}
+}
+
+// agenticAssistantTextAndReasoning returns one complete assistant message
+// carrying both an assistant_gen_text block and a reasoning block.
+func agenticAssistantTextAndReasoning(text, reasoning string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role: einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{
+			{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: text}},
+			{Type: einoschema.ContentBlockTypeReasoning, Reasoning: &einoschema.Reasoning{Text: reasoning}},
+		},
+	}
+}
+
+// agenticAssistantToolCalls returns one complete assistant message carrying
+// one function_tool_call block per call.
+func agenticAssistantToolCalls(calls ...*einoschema.FunctionToolCall) *einoschema.AgenticMessage {
+	blocks := make([]*einoschema.ContentBlock, len(calls))
+	for index, call := range calls {
+		blocks[index] = &einoschema.ContentBlock{Type: einoschema.ContentBlockTypeFunctionToolCall, FunctionToolCall: call}
+	}
+	return &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant, ContentBlocks: blocks}
+}
+
+// agenticToolCall is a small constructor for one function_tool_call value.
+func agenticToolCall(callID, name, arguments string) *einoschema.FunctionToolCall {
+	return &einoschema.FunctionToolCall{CallID: callID, Name: name, Arguments: arguments}
+}
+
+// agenticMessageText concatenates every user_input_text/assistant_gen_text
+// block's text on message, in order.
+func agenticMessageText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb []byte
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeUserInputText:
+			if block.UserInputText != nil {
+				sb = append(sb, block.UserInputText.Text...)
+			}
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				sb = append(sb, block.AssistantGenText.Text...)
+			}
+		}
+	}
+	return string(sb)
+}
+
+// agenticFunctionResultText concatenates the text content of every
+// function_tool_result block on message.
+func agenticFunctionResultText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb []byte
+	for _, block := range message.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
+			continue
+		}
+		for _, item := range block.FunctionToolResult.Content {
+			if item != nil && item.Type == einoschema.FunctionToolResultContentBlockTypeText && item.Text != nil {
+				sb = append(sb, item.Text.Text...)
+			}
+		}
+	}
+	return string(sb)
+}
+
+// isFunctionToolResultMessage reports whether message carries at least one
+// function_tool_result block (the agentic replacement for the classic
+// schema.Tool role check).
+func isFunctionToolResultMessage(message *einoschema.AgenticMessage) bool {
+	if message == nil {
+		return false
+	}
+	for _, block := range message.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolResult {
+			return true
+		}
+	}
+	return false
+}

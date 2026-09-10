@@ -221,7 +221,36 @@ func cloneSteps(src []Step) []Step {
 		return nil
 	}
 	dst := make([]Step, len(src))
-	copy(dst, src)
+	for i, step := range src {
+		dst[i] = step
+		dst[i].Blocks = cloneContentBlocks(step.Blocks)
+	}
+	return dst
+}
+
+// cloneContentBlocks deep-copies each block (and its StreamingMeta) so that
+// fixtures handed to Provider are never mutated by a consumer. The runtime
+// clears StreamingMeta on the blocks it dispatches (clearStreamingMeta), and
+// Eino's single-chunk ConcatAgenticMessages returns the input unchanged, so
+// without this copy a replayed Provider or two concurrent streams over one
+// Provider would read and write the same *ContentBlock from different call
+// sites.
+func cloneContentBlocks(src []*einoschema.ContentBlock) []*einoschema.ContentBlock {
+	if src == nil {
+		return nil
+	}
+	dst := make([]*einoschema.ContentBlock, len(src))
+	for i, b := range src {
+		if b == nil {
+			continue
+		}
+		clone := *b
+		if b.StreamingMeta != nil {
+			meta := *b.StreamingMeta
+			clone.StreamingMeta = &meta
+		}
+		dst[i] = &clone
+	}
 	return dst
 }
 

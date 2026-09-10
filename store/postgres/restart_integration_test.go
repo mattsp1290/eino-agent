@@ -108,7 +108,7 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 		ID: "restart-model-request", SessionID: sessionID, RunID: runID, AssistantMessageID: assistant.ID,
 		Attempt: 0, Step: 1, ProviderID: run.ProviderID, ModelID: run.ModelID, State: session.ModelRequestPrepared,
 		Messages: json.RawMessage(`[{"role":"user","content":"restart history"}]`), System: "restart system",
-		Tools: json.RawMessage(`[{"name":"echo"}]`), SafeCallConfig: json.RawMessage(`{"mode":"safe"}`),
+		Tools: json.RawMessage(`[{"name":"echo"}]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{"mode":"safe"}`),
 		ContentSHA256: "restart-content", ExtensionPlanHash: plan.Fingerprint, CreatedAt: now.Add(4 * time.Nanosecond), UpdatedAt: now.Add(4 * time.Nanosecond),
 	}
 	if _, err := execution.CreateModelRequest(ctx, request); err != nil {

@@ -311,20 +311,18 @@ func testContentAllBlockKinds(t *testing.T, factory Factory) {
 			}},
 		},
 		{
-			// A production-realistic function_tool_result: exactly one text
-			// content item, matching what runtime's buildTerminalToolEnvelope
-			// always produces (and what store/internal/sqlstore's
-			// ValidToolResultEnvelope therefore requires: a settlement's sole
-			// text item must equal its ToolSettlement.Output byte-for-byte).
-			// This fixture is routed through the real
-			// CreateToolCall/ClaimToolCall/SettleToolCall lifecycle (see
+			// All five nested FunctionToolResultContentBlock variants (text,
+			// image, audio, video, file) in one function_tool_result, exactly
+			// as session.TestContentBlockRoundTrip_AllKinds's own
+			// "function_tool_result_all_variants" case exercises without a
+			// store dependency. This fixture additionally routes through the
+			// real CreateToolCall/ClaimToolCall/SettleToolCall lifecycle (see
 			// appendFunctionToolResultPart) to prove the store round-trips
-			// this kind end to end, including through the tool_calls table.
-			// Round-trip fidelity across all five nested
-			// FunctionToolResultContentBlock variants (text, image, audio,
-			// video, file) is already covered without a store dependency by
-			// session.TestContentBlockRoundTrip_AllKinds's "function_tool_result_all_variants"
-			// case.
+			// non-text result content end to end, including through the
+			// tool_calls table and store/internal/sqlstore's
+			// ValidToolResultEnvelope (which requires call-ID identity plus a
+			// text-item concatenation equal to ToolSettlement.Output, and
+			// otherwise allows any of the five variants alongside it).
 			name: "function_tool_result_all_variants", kind: session.BlockKindFunctionToolResult, role: session.RoleUser,
 			block: &einoschema.ContentBlock{Type: einoschema.ContentBlockTypeFunctionToolResult, FunctionToolResult: &einoschema.FunctionToolResult{
 				// A distinct CallID from the "function_tool_call" fixture
@@ -335,6 +333,10 @@ func testContentAllBlockKinds(t *testing.T, factory Factory) {
 				CallID: "call-2", Name: "get_weather",
 				Content: []*einoschema.FunctionToolResultContentBlock{
 					{Type: einoschema.FunctionToolResultContentBlockTypeText, Text: &einoschema.UserInputText{Text: `{"forecast":"sunny"}`}},
+					{Type: einoschema.FunctionToolResultContentBlockTypeImage, Image: &einoschema.UserInputImage{URL: "https://example.com/a.png", MIMEType: "image/png", Detail: einoschema.ImageURLDetailLow}},
+					{Type: einoschema.FunctionToolResultContentBlockTypeAudio, Audio: &einoschema.UserInputAudio{URL: "https://example.com/a.wav", MIMEType: "audio/wav"}},
+					{Type: einoschema.FunctionToolResultContentBlockTypeVideo, Video: &einoschema.UserInputVideo{URL: "https://example.com/a.mp4", MIMEType: "video/mp4"}},
+					{Type: einoschema.FunctionToolResultContentBlockTypeFile, File: &einoschema.UserInputFile{URL: "https://example.com/a.pdf", Name: "a.pdf", MIMEType: "application/pdf"}},
 				},
 			}},
 		},

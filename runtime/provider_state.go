@@ -115,6 +115,16 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 	if !ok || streamer == nil {
 		return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 	}
+	// blockBound is true only for the native model.AgenticProviderStateStreamer
+	// boundary, where a codec resolves ProviderStateItem.BlockID against a
+	// specific dispatched content block via the blockID(index) callback
+	// (model/agentic_state.go). The classic model.ProviderStateStreamer
+	// bridge never reads ProviderMessageState.BlockIDs or cross-checks an
+	// item's BlockID against real content-block identity (see
+	// model/classic_streamer.go's StreamProvider) — there, BlockID is an
+	// opaque annotation a codec may set to any value it likes. Only the
+	// block-bound path may drop or reject items based on block identity.
+	_, blockBound := resolved.Streamer.(model.AgenticProviderStateStreamer)
 	contract, err := safeProviderStateContract(streamer)
 	if err != nil {
 		return nil, nil, err
@@ -145,12 +155,34 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 			run.ModelID != message.ModelID {
 			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
-		blockIDs, err := orderedBlockIDs(batch.Parts, partOwners, owner)
+		// storedBlockIDs is every durable content-block identity the
+		// message actually stored (including, e.g., a reasoning block even
+		// when the current history.Options excludes it from the
+		// projection); it is used only to distinguish an item bound to a
+		// block that was filtered out of this dispatch (dropped, since its
+		// continuation is irrelevant when the block is not sent) from an
+		// item bound to a block ID that never existed on the message at all
+		// (a real mismatch, failed closed).
+		storedBlockIDs, err := orderedBlockIDs(batch.Parts, partOwners, owner)
 		if err != nil {
 			return nil, nil, err
 		}
-		if len(blockIDs) != len(projection.Messages[indexes[0]].ContentBlocks) {
+		// dispatchedBlockIDs is parallel to the message the projection
+		// actually emits (projection.Messages[indexes[0]].ContentBlocks),
+		// i.e. after any reasoning filtering. This is what state.BlockIDs
+		// must match, so a block-bound provider-state item resolves to the
+		// right position in the dispatched message.
+		dispatchedBlockIDs := projection.BlockIDs[indexes[0]]
+		if len(dispatchedBlockIDs) != len(projection.Messages[indexes[0]].ContentBlocks) {
 			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		}
+		knownBlockIDs := make(map[string]bool, len(storedBlockIDs))
+		for _, id := range storedBlockIDs {
+			knownBlockIDs[id] = true
+		}
+		dispatchedBlockIDSet := make(map[string]bool, len(dispatchedBlockIDs))
+		for _, id := range dispatchedBlockIDs {
+			dispatchedBlockIDSet[id] = true
 		}
 		parts := groups[owner]
 		sort.Slice(parts, func(i, j int) bool {
@@ -193,7 +225,27 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 			if err := model.ValidateProviderStateIdentity(envelope.ProviderID, envelope.SourceModelID); err != nil {
 				return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
 			}
+			if blockBound && envelope.BlockID != "" {
+				if !knownBlockIDs[envelope.BlockID] {
+					// The item names a block ID that never existed on this
+					// stored message: a real mismatch, fail closed.
+					return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+				}
+				if !dispatchedBlockIDSet[envelope.BlockID] {
+					// The block existed but the projection excluded it from
+					// this dispatch (e.g. a reasoning block under
+					// IncludeReasoning=false); its private continuation is
+					// irrelevant when the block itself is not sent.
+					continue
+				}
+			}
 			items = append(items, model.ProviderStateItem{BlockID: envelope.BlockID, Data: append(json.RawMessage(nil), envelope.Data...)})
+		}
+		if blockBound && len(items) == 0 {
+			// Every item this message stored was bound to a block the
+			// projection dropped; there is nothing left to restore for this
+			// message this turn.
+			continue
 		}
 		if err := model.ValidateProviderStateItems(items, contract.Limits); err != nil {
 			if errors.Is(err, model.ErrProviderStateTooLarge) {
@@ -204,7 +256,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		states = append(states, model.ProviderMessageState{
 			MessageIndex: indexes[0], MessageID: string(owner), SourceSessionID: string(sessionRecord.ID), SourceRunID: string(message.RunID),
 			ProviderID: run.ProviderID, SourceModelID: message.ModelID, CodecID: contract.CodecID, Version: contract.Version,
-			CompatibilityKey: contract.CompatibilityKey, BlockIDs: blockIDs, Items: items,
+			CompatibilityKey: contract.CompatibilityKey, BlockIDs: dispatchedBlockIDs, Items: items,
 		})
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].MessageIndex < states[j].MessageIndex })

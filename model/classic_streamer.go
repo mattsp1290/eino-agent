@@ -18,6 +18,10 @@ import (
 // represent (server/MCP/tool-search blocks, deferred tools, a tool-search
 // tool, MCP/server tool-choice selectors, assistant-generated media and
 // non-text function-tool-result content).
+// classicToolCallIndexBase is the first StreamingMeta.Index slot used for
+// tool-call blocks; 0 and 1 are reserved for text and reasoning respectively.
+const classicToolCallIndexBase = 2
+
 func NewClassicStreamer(client einomodel.ToolCallingChatModel) Streamer {
 	if client == nil {
 		return nil
@@ -227,7 +231,7 @@ func dispatchClassic(ctx context.Context, base einomodel.ToolCallingChatModel, r
 	}
 	client := base
 	var err error
-	if len(req.Controls.Tools) != 0 {
+	if req.Controls.Tools != nil {
 		client, err = client.WithTools(req.Controls.Tools)
 		if err != nil {
 			return nil, err
@@ -243,11 +247,12 @@ func dispatchClassic(ctx context.Context, base einomodel.ToolCallingChatModel, r
 	if upstream == nil {
 		return nil, Error{Code: "nil_provider_stream", Message: "classic model returned nil stream"}
 	}
+	nextFreeToolCallIndex := classicToolCallIndexBase
 	return einoschema.StreamReaderWithConvert(upstream, func(message *einoschema.Message) (StreamDelta, error) {
 		if message == nil {
 			return StreamDelta{}, Error{Code: "malformed_provider_stream", Message: "classic model returned a nil chunk", Cause: ErrProviderRejected}
 		}
-		agentic, usage := classicMessageToAgenticDelta(message)
+		agentic, usage := classicMessageToAgenticDelta(message, &nextFreeToolCallIndex)
 		return StreamDelta{Message: agentic, Usage: usage}, nil
 	}), nil
 }
@@ -559,13 +564,19 @@ func assistantAgenticMessageToClassic(msg *einoschema.AgenticMessage) (*einosche
 
 // classicMessageToAgenticDelta converts one classic streamed message into an
 // agentic chunk. StreamingMeta.Index is a stable per-kind slot: 0 for text,
-// 1 for reasoning, and 2+position (or 2+call.Index when the classic model
-// sets it) for tool calls, so accumulation across chunks groups correctly.
-func classicMessageToAgenticDelta(message *einoschema.Message) (*einoschema.AgenticMessage, Usage) {
+// 1 for reasoning, and classicToolCallIndexBase+ for tool calls. A tool call
+// that sets Index is placed at classicToolCallIndexBase+*Index (Eino's own
+// classic accumulator, schema.concatToolCalls, groups explicit indices this
+// way); a tool call with a nil Index is instead assigned the next free slot
+// via nextFreeIndex, which is threaded through by the caller (dispatchClassic)
+// so nil-index calls from different chunks never collide on the same block
+// index the way "toolCallBase+position" would. nextFreeIndex is also bumped
+// past any explicit index it observes, so later nil-index calls never land on
+// a slot already claimed by an explicit one.
+func classicMessageToAgenticDelta(message *einoschema.Message, nextFreeIndex *int) (*einoschema.AgenticMessage, Usage) {
 	const (
 		textIndex      = 0
 		reasoningIndex = 1
-		toolCallBase   = 2
 	)
 	var blocks []*einoschema.ContentBlock
 	if message.Content != "" {
@@ -574,10 +585,16 @@ func classicMessageToAgenticDelta(message *einoschema.Message) (*einoschema.Agen
 	if message.ReasoningContent != "" {
 		blocks = append(blocks, einoschema.NewContentBlockChunk(&einoschema.Reasoning{Text: message.ReasoningContent}, &einoschema.StreamingMeta{Index: reasoningIndex}))
 	}
-	for position, call := range message.ToolCalls {
-		idx := toolCallBase + position
+	for _, call := range message.ToolCalls {
+		var idx int
 		if call.Index != nil {
-			idx = toolCallBase + *call.Index
+			idx = classicToolCallIndexBase + *call.Index
+			if idx >= *nextFreeIndex {
+				*nextFreeIndex = idx + 1
+			}
+		} else {
+			idx = *nextFreeIndex
+			*nextFreeIndex++
 		}
 		blocks = append(blocks, einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{
 			CallID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments,

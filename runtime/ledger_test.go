@@ -64,8 +64,24 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	wantMessages, _ := json.Marshal(audited.Messages)
 	wantTools, _ := json.Marshal(audited.Tools)
 	wantConfig, _ := json.Marshal(audited.SafeCallConfig)
+	wantControls, _ := json.Marshal(auditedControlsPayload(audited))
 	if !bytes.Equal(record.Messages, wantMessages) || !bytes.Equal(record.Tools, wantTools) || !bytes.Equal(record.SafeCallConfig, wantConfig) || record.ContentSHA256 != hash {
 		t.Fatalf("record projection does not equal submitted request: %#v", record)
+	}
+	// runtime-persistence-reviewer I4: the durable row must carry the rest
+	// of the audited request (deferred tools, tool-search tool, tool
+	// choice, scalar controls) that Tools alone does not capture, not just
+	// a subset that happens to match the hash.
+	if !bytes.Equal(record.Controls, wantControls) {
+		t.Fatalf("record.Controls = %s, want %s", record.Controls, wantControls)
+	}
+	var gotControls AuditedControlsPayload
+	if err := json.Unmarshal(record.Controls, &gotControls); err != nil {
+		t.Fatalf("unmarshal record.Controls: %v", err)
+	}
+	if len(gotControls.DeferredTools) != 0 || gotControls.ToolSearchTool != nil || gotControls.ToolChoice != nil ||
+		gotControls.Controls.Temperature != nil || gotControls.Controls.TopP != nil || gotControls.Controls.MaxTokens != nil || gotControls.Controls.Stop != nil {
+		t.Fatalf("record.Controls unexpectedly carries a value in this run: %#v", gotControls)
 	}
 	raw, _ := json.Marshal(record)
 	if bytes.Contains(raw, []byte("credential-sentinel")) || bytes.Contains(raw, []byte("SECRET_TOKEN")) {
@@ -710,6 +726,76 @@ func TestAuditModelRequestRejectsUnsafeAndDeprecatedMessageShapes(t *testing.T) 
 				t.Fatal("unsafe nested Extra was accepted")
 			}
 		})
+	}
+}
+
+// TestLedgerControlsPayloadReconstructsFullAuditedRequest is the pure-function
+// regression pin for runtime-persistence-reviewer I4: the ledger's Controls
+// column must reconstruct the whole audited model-visible request beyond
+// Messages/Tools/SafeCallConfig -- DeferredTools, ToolSearchTool, ToolChoice,
+// and the scalar generation controls -- byte-for-byte, and the hash
+// auditModelRequest returns must cover this same payload (any of these
+// fields changing must change the hash).
+func TestLedgerControlsPayloadReconstructsFullAuditedRequest(t *testing.T) {
+	temperature := float32(0.5)
+	topP := float32(0.9)
+	maxTokens := 256
+	request := model.Request{
+		Identity: model.Identity{ProviderID: "fake", ModelID: "m1"},
+		Messages: []*einoschema.AgenticMessage{agenticUserText("hello")},
+		Controls: model.RequestControls{
+			Tools:          []*einoschema.ToolInfo{{Name: "search"}},
+			DeferredTools:  []*einoschema.ToolInfo{{Name: "deferred_one"}},
+			ToolSearchTool: &einoschema.ToolInfo{Name: "tool_search"},
+			ToolChoice: &einoschema.AgenticToolChoice{
+				Type:   einoschema.ToolChoiceForced,
+				Forced: &einoschema.AgenticForcedToolChoice{Tools: []*einoschema.AllowedTool{{FunctionName: "search"}}},
+			},
+			Temperature: &temperature, TopP: &topP, MaxTokens: &maxTokens, Stop: []string{"STOP"},
+		},
+	}
+	_, audited, hash, err := auditModelRequest(request, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := auditedControlsPayload(audited)
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var roundTripped AuditedControlsPayload
+	if err := json.Unmarshal(raw, &roundTripped); err != nil {
+		t.Fatal(err)
+	}
+	if len(roundTripped.DeferredTools) != 1 || roundTripped.DeferredTools[0].Name != "deferred_one" {
+		t.Fatalf("DeferredTools = %#v", roundTripped.DeferredTools)
+	}
+	if roundTripped.ToolSearchTool == nil || roundTripped.ToolSearchTool.Name != "tool_search" {
+		t.Fatalf("ToolSearchTool = %#v", roundTripped.ToolSearchTool)
+	}
+	var choice einoschema.AgenticToolChoice
+	if err := json.Unmarshal(roundTripped.ToolChoice, &choice); err != nil || choice.Type != einoschema.ToolChoiceForced ||
+		choice.Forced == nil || len(choice.Forced.Tools) != 1 || choice.Forced.Tools[0].FunctionName != "search" {
+		t.Fatalf("ToolChoice = %s, err = %v", roundTripped.ToolChoice, err)
+	}
+	if roundTripped.Controls.Temperature == nil || *roundTripped.Controls.Temperature != temperature ||
+		roundTripped.Controls.TopP == nil || *roundTripped.Controls.TopP != topP ||
+		roundTripped.Controls.MaxTokens == nil || *roundTripped.Controls.MaxTokens != maxTokens ||
+		len(roundTripped.Controls.Stop) != 1 || roundTripped.Controls.Stop[0] != "STOP" {
+		t.Fatalf("Controls = %#v", roundTripped.Controls)
+	}
+
+	// The hash must cover this payload: changing any field the payload
+	// carries must change the hash auditModelRequest returns.
+	mutated := request
+	mutated.Controls.Temperature = nil
+	_, _, mutatedHash, err := auditModelRequest(mutated, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutatedHash == hash {
+		t.Fatal("hash did not change when a Controls field changed")
 	}
 }
 

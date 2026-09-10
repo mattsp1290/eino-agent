@@ -31,12 +31,20 @@ type ModelRequestRecord struct {
 	Messages           json.RawMessage
 	System             string
 	Tools              json.RawMessage
-	SafeCallConfig     json.RawMessage
-	ContentSHA256      string
-	ExtensionPlanHash  string
-	ErrorCode          string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// Controls carries the marshaled remainder of the audited model-visible
+	// request that Tools alone does not capture: DeferredTools,
+	// ToolSearchTool, ToolChoice, and the scalar generation controls
+	// (temperature, top_p, max_tokens, stop). See
+	// runtime.AuditedModelInput / runtime.prepareModelRequest. Optional:
+	// empty for requests that set none of these (matching legacy rows that
+	// predate this field).
+	Controls          json.RawMessage
+	SafeCallConfig    json.RawMessage
+	ContentSHA256     string
+	ExtensionPlanHash string
+	ErrorCode         string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type ModelRequestCursor struct {

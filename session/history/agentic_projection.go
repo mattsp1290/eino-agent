@@ -23,9 +23,22 @@ var ErrMixedContentKinds = errors.New("session history: message mixes legacy and
 type AgenticProjection struct {
 	Messages         []*einoschema.AgenticMessage
 	SourceMessageIDs []session.MessageID
+	// BlockIDs is parallel to Messages: BlockIDs[i] is the ordered list of
+	// durable content-block identities backing Messages[i].ContentBlocks,
+	// i.e. it reflects the projection actually emitted (including any
+	// filtering, such as reasoning blocks dropped when
+	// !Options.IncludeReasoning). It is nil for a message projected through
+	// the legacy pipeline, which carries no durable block identity. Callers
+	// that need to bind provider-private state to a specific dispatched
+	// block (see runtime/provider_state.go) must use this rather than
+	// re-deriving block IDs from the raw stored parts, which would include
+	// blocks the projection dropped.
+	BlockIDs [][]string
 	// PartIDs maps a durable content block's identity, scoped to its owning
 	// message, to the durable Part that carries it. Only populated for
-	// messages projected through the durable BlockKind pipeline.
+	// messages projected through the durable BlockKind pipeline. Unlike
+	// BlockIDs, this is populated from every block present in storage
+	// before any reasoning filtering is applied.
 	//
 	// It is keyed by (MessageID, BlockID) rather than bare BlockID because
 	// Content.Validate only enforces block-ID uniqueness within a single
@@ -57,6 +70,7 @@ func ProjectAgentic(batch session.ReplayBatch, options Options) (AgenticProjecti
 	result := AgenticProjection{
 		Messages:         make([]*einoschema.AgenticMessage, 0, len(batch.Messages)),
 		SourceMessageIDs: make([]session.MessageID, 0, len(batch.Messages)),
+		BlockIDs:         make([][]string, 0, len(batch.Messages)),
 		PartIDs:          map[BlockRef]session.PartID{},
 	}
 	for _, message := range batch.Messages {
@@ -64,13 +78,18 @@ func ProjectAgentic(batch session.ReplayBatch, options Options) (AgenticProjecti
 		sort.SliceStable(parts, func(i, j int) bool {
 			return parts[i].Ordinal < parts[j].Ordinal
 		})
-		projected, err := projectAgenticMessage(message, parts, options, result.PartIDs)
+		projected, blockIDs, err := projectAgenticMessage(message, parts, options, result.PartIDs)
 		if err != nil {
 			return AgenticProjection{}, err
 		}
-		for _, msg := range projected {
+		for i, msg := range projected {
 			result.Messages = append(result.Messages, msg)
 			result.SourceMessageIDs = append(result.SourceMessageIDs, message.ID)
+			var ids []string
+			if i < len(blockIDs) {
+				ids = blockIDs[i]
+			}
+			result.BlockIDs = append(result.BlockIDs, ids)
 		}
 	}
 	return result, nil
@@ -86,7 +105,7 @@ func LoadAgentic(ctx context.Context, store session.Store, sessionID session.ID,
 	return ProjectAgentic(batch, options)
 }
 
-func projectAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, error) {
+func projectAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, [][]string, error) {
 	richCount, legacyCount := 0, 0
 	for _, part := range parts {
 		if part.Kind == session.PartProviderState {
@@ -100,11 +119,19 @@ func projectAgenticMessage(message session.Message, parts []session.Part, option
 	}
 	switch {
 	case richCount > 0 && legacyCount > 0:
-		return nil, fmt.Errorf("message %s: %w", message.ID, ErrMixedContentKinds)
+		return nil, nil, fmt.Errorf("message %s: %w", message.ID, ErrMixedContentKinds)
 	case richCount > 0:
-		return projectRichAgenticMessage(message, parts, options, partIDs)
+		msgs, blockIDs, err := projectRichAgenticMessage(message, parts, options, partIDs)
+		if err != nil {
+			return nil, nil, err
+		}
+		return msgs, [][]string{blockIDs}, nil
 	default:
-		return projectLegacyAgenticMessage(message, parts, options)
+		msgs, err := projectLegacyAgenticMessage(message, parts, options)
+		if err != nil {
+			return nil, nil, err
+		}
+		return msgs, nil, nil
 	}
 }
 
@@ -125,7 +152,7 @@ func isRichContentPart(part session.Part) bool {
 	return false
 }
 
-func projectRichAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, error) {
+func projectRichAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, []string, error) {
 	decodeRole := message.Role
 	if decodeRole == session.RoleTool {
 		// RoleTool durable messages carry function_tool_result content,
@@ -134,7 +161,7 @@ func projectRichAgenticMessage(message session.Message, parts []session.Part, op
 	}
 	content, err := session.DecodeContentParts(decodeRole, parts, options.contentLimits())
 	if err != nil {
-		return nil, fmt.Errorf("message %s: %w", message.ID, err)
+		return nil, nil, fmt.Errorf("message %s: %w", message.ID, err)
 	}
 	for _, part := range parts {
 		if part.Kind == session.PartProviderState || part.Kind == session.PartResponseMeta {
@@ -150,11 +177,18 @@ func projectRichAgenticMessage(message session.Message, parts []session.Part, op
 	if !options.IncludeReasoning {
 		content.Blocks = withoutReasoningBlocks(content.Blocks)
 	}
+	// blockIDs reflects the blocks actually emitted below, in the same
+	// order as the resulting agentic.ContentBlocks (ContentToAgenticMessage
+	// preserves block order 1:1), i.e. after any reasoning filtering above.
+	blockIDs := make([]string, len(content.Blocks))
+	for i, b := range content.Blocks {
+		blockIDs[i] = b.ID
+	}
 	agentic, err := session.ContentToAgenticMessage(content)
 	if err != nil {
-		return nil, fmt.Errorf("message %s: %w", message.ID, err)
+		return nil, nil, fmt.Errorf("message %s: %w", message.ID, err)
 	}
-	return []*einoschema.AgenticMessage{agentic}, nil
+	return []*einoschema.AgenticMessage{agentic}, blockIDs, nil
 }
 
 func withoutReasoningBlocks(blocks []session.ContentBlock) []session.ContentBlock {

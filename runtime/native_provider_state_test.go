@@ -66,6 +66,27 @@ func nativeProviderStateOrchestrator(t *testing.T, store session.Store, ids IDGe
 	)
 }
 
+// nativeProviderStateOrchestratorDefaultHistory is identical to
+// nativeProviderStateOrchestrator except it does not call WithHistory, so
+// history.Options stays at its zero value (IncludeReasoning: false) — the
+// default every orchestrator gets unless a caller opts in, and the exact
+// case runtime-persistence-reviewer C1 covers.
+func nativeProviderStateOrchestratorDefaultHistory(t *testing.T, store session.Store, ids IDGenerator, client *nativeAgenticProviderStateModel) *StreamingOrchestrator {
+	t.Helper()
+	codec, err := model.NewTypedExtensionStateCodec(runtimeProviderStateContract())
+	if err != nil {
+		t.Fatal(err)
+	}
+	streamer, err := model.NewAgenticStreamerWithProviderState(client, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(ids),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+}
+
 // TestNativeAgenticProviderStateReasoningSignatureRestoresAcrossReopenWithoutLeakage
 // exercises the native, block-bound model.AgenticProviderStateStreamer
 // boundary end to end through the runtime (captureAssistantProviderState /
@@ -199,6 +220,77 @@ func TestNativeAgenticProviderStateReasoningSignatureRestoresAcrossReopenWithout
 	for _, part := range secondBatch.Parts {
 		if part.Kind != session.PartProviderState && strings.Contains(string(part.Payload), sentinel) {
 			t.Fatalf("public part leaked the signature after reopen: %#v", part)
+		}
+	}
+}
+
+// TestNativeAgenticProviderStateSecondTurnSucceedsUnderDefaultHistoryOptions
+// is the regression pin for runtime-persistence-reviewer C1: under the
+// default history.Options{} (IncludeReasoning: false is the zero value used
+// whenever WithHistory is not passed), a first turn that captures
+// block-bound provider state on a message containing a reasoning block must
+// not break the *second* turn of the same session.
+//
+// Before the fix, loadProviderHistory derived the durable block-ID list from
+// every stored content-block part (orderedBlockIDs), which still counts the
+// reasoning block even though session/history's projection drops it whenever
+// IncludeReasoning is false. That length mismatch tripped
+// provider_state_mismatch on every turn after the first, permanently, for
+// any session that ever captured state on a reasoning-bearing message under
+// the (default) non-reasoning history projection.
+func TestNativeAgenticProviderStateSecondTurnSucceedsUnderDefaultHistoryOptions(t *testing.T) {
+	const sentinel = "SENTINEL-NATIVE-REASONING-SIG-DEFAULT"
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "native-state-default.db")
+	store, storePool, err := openTestSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = storePool.Close() }()
+	ids := &sequenceIDs{}
+
+	firstAssistant := agenticAssistantReasoning("because")
+	firstAssistant.ContentBlocks[0].Reasoning.Signature = sentinel
+	firstAssistant.ContentBlocks = append(firstAssistant.ContentBlocks, &einoschema.ContentBlock{
+		Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: "first answer"},
+	})
+	firstClient := &nativeAgenticProviderStateModel{responses: []*einoschema.AgenticMessage{firstAssistant}}
+	first := nativeProviderStateOrchestratorDefaultHistory(t, store, ids, firstClient)
+	firstResult := startAndWaitRequest(t, first, Request{SessionID: "native-state-session-default", Message: TextUserMessage("first question"), Config: orchestratorConfig()})
+	if firstResult.Status != session.RunCompleted || firstResult.Error != nil {
+		t.Fatalf("first result = %+v", firstResult)
+	}
+
+	if err := storePool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, storePool, err = reopenTestSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondClient := &nativeAgenticProviderStateModel{responses: []*einoschema.AgenticMessage{agenticAssistantText("second answer")}}
+	second := nativeProviderStateOrchestratorDefaultHistory(t, store, ids, secondClient)
+	secondResult := startAndWaitRequest(t, second, Request{SessionID: "native-state-session-default", Message: TextUserMessage("second question"), Config: orchestratorConfig()})
+	if secondResult.Status != session.RunCompleted || secondResult.Error != nil {
+		t.Fatalf("second result = %+v, want RunCompleted (default history.Options must not break every later turn of a session that captured state on a reasoning-bearing message)", secondResult)
+	}
+
+	inputs := secondClient.Inputs()
+	if len(inputs) != 1 {
+		t.Fatalf("second inputs = %#v", inputs)
+	}
+	// Under IncludeReasoning=false the reasoning block itself must not be
+	// dispatched to the provider at all, so there is nothing to restore a
+	// signature onto.
+	for _, message := range inputs[0] {
+		if message == nil {
+			continue
+		}
+		for _, block := range message.ContentBlocks {
+			if block != nil && block.Type == einoschema.ContentBlockTypeReasoning {
+				t.Fatalf("reasoning block dispatched under default history.Options (IncludeReasoning=false): %#v", block)
+			}
 		}
 	}
 }

@@ -23,7 +23,7 @@ func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 
-	next, err := Replay(ctx, bridge, store, "session-replay", session.EventCursor{Limit: 10})
+	next, err := Replay(ctx, bridge, store, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
 	if err != nil {
 		t.Fatalf("Replay error = %v", err)
 	}
@@ -55,7 +55,7 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10})
+		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
 		done <- err
 	}()
 	<-tail.subscribed
@@ -93,7 +93,7 @@ func TestReconnectReportsTailOverflow(t *testing.T) {
 	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10})
+		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
 		done <- err
 	}()
 	<-tail.subscribed
@@ -114,7 +114,7 @@ func TestReconnectCancelsTailOnDisconnect(t *testing.T) {
 	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10})
+		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
 		done <- err
 	}()
 	<-tail.subscribed
@@ -243,7 +243,7 @@ func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
 
 	sink := newSSESink()
 	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), string(sessionID), "run-media", nil)
-	if err := emitMessageSnapshot(ctx, bridge, store, sessionID); err != nil {
+	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, session.ContentLimits{}); err != nil {
 		t.Fatalf("emitMessageSnapshot error = %v, want nil (a user-role media block must not brick history.Load)", err)
 	}
 	frames := frameData(t, sink.Bytes())

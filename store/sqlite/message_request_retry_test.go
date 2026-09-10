@@ -120,7 +120,7 @@ func TestDistinctModelRequestIDCollisionReturnsConflict(t *testing.T) {
 	ctx := context.Background()
 	original := session.ModelRequestRecord{
 		ID: "request-a", SessionID: "session-tool", RunID: "run-tool", AssistantMessageID: "msg-tool",
-		Attempt: 1, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
+		Attempt: 1, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := execution.CreateModelRequest(ctx, original); err != nil {
 		t.Fatal(err)
@@ -145,7 +145,7 @@ func TestCaughtModelRequestCollisionLeavesOuterTransactionUsable(t *testing.T) {
 	ctx := context.Background()
 	original := session.ModelRequestRecord{
 		ID: "request-a", SessionID: "session-tool", RunID: "run-tool", AssistantMessageID: "msg-tool",
-		Attempt: 2, Step: 3, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
+		Attempt: 2, Step: 3, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := execution.CreateModelRequest(ctx, original); err != nil {
 		t.Fatal(err)

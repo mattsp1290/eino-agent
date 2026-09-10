@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"reflect"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -507,14 +508,27 @@ func (s *agenticProviderStateStreamer) StreamProvider(ctx context.Context, reque
 			return nil, err
 		}
 		blockIDs := state.BlockIDs
-		restored, err := s.codec.Restore(message, state.Items, func(index int) string {
+		blockIDFn := func(index int) string {
 			if index < 0 || index >= len(blockIDs) {
 				return ""
 			}
 			return blockIDs[index]
-		})
+		}
+		restored, err := s.codec.Restore(message, state.Items, blockIDFn)
 		if err != nil {
 			return nil, err
+		}
+		// Restore must be the exact inverse of Capture, as the interface
+		// documents. Restore runs after runtime.auditModelRequest has
+		// already hashed and audited the public `message` we started from,
+		// so a misbehaving (or malicious) AgenticStateCodec implementation
+		// that rewrites, adds, or drops content in `restored` could
+		// otherwise smuggle un-audited content in front of the provider.
+		// Re-capturing `restored` must reproduce both the original public
+		// message and the exact items just restored.
+		recapture, public, cerr := s.codec.Capture(restored, blockIDFn)
+		if cerr != nil || !reflect.DeepEqual(public, message) || !equalProviderStateItems(recapture.Items, state.Items) {
+			return nil, providerStateError(ErrProviderStateMismatch)
 		}
 		req.Messages[state.MessageIndex] = restored
 		previousIndex = state.MessageIndex

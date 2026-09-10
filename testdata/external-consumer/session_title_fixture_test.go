@@ -106,7 +106,7 @@ func TestPublicSessionTitleReopenAndIndependentHistories(t *testing.T) {
 	if len(requests) != 1 {
 		t.Fatalf("model requests = %d", len(requests))
 	}
-	assertDiscoveryMessages(t, requests[0].Messages, "a1-first", "reply:a1-first", "a1-second", "reply:a1-second", "a1-third")
+	assertDiscoveryAgenticMessages(t, requests[0].Messages, "a1-first", "reply:a1-first", "a1-second", "reply:a1-second", "a1-third")
 	assertDiscoveryMessages(t, discoveryHistory(t, ctx, reopened, "a1"), "a1-first", "reply:a1-first", "a1-second", "reply:a1-second", "a1-third", "reply:a1-third")
 	assertDiscoveryMessages(t, discoveryHistory(t, ctx, reopened, "a2"), "a2-first", "reply:a2-first")
 	page, err := reopened.ListSessions(ctx, session.SessionDiscoveryQuery{WorkspaceID: "A", Limit: 1})
@@ -124,9 +124,9 @@ type titleToolModel struct{ calls atomic.Int32 }
 func (m *titleToolModel) StreamProvider(_ context.Context, _ model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	if m.calls.Add(1) == 1 {
-		writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "rename-call", Type: "function", Function: einoschema.FunctionCall{Name: "rename_session", Arguments: `{"title":"Agent chosen"}`}}})}, nil)
+		writer.Send(model.StreamDelta{Message: agenticAssistantToolCalls(agenticToolCall("rename-call", "rename_session", `{"title":"Agent chosen"}`))}, nil)
 	} else {
-		writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("renamed", nil)}, nil)
+		writer.Send(model.StreamDelta{Message: agenticAssistantText("renamed")}, nil)
 	}
 	writer.Close()
 	return reader, nil
@@ -281,13 +281,22 @@ func TestPublicSessionTitleWriterRebindsOnPendingToolResume(t *testing.T) {
 		RequestPartID: "resume-title-request", ResultMessageID: "resume-title-result-message", ResultPartID: "resume-title-result-part",
 		Name: "rename_session", Pattern: "rename_session", Input: json.RawMessage(`{"title":"resumed title"}`), Status: session.ToolCallPending,
 	}
-	payload, err := json.Marshal(map[string]any{"id": call.ID, "name": call.Name, "arguments": call.Input})
+	requestParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "resume-title-request-block", Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(call.ID), Name: call.Name, Arguments: string(call.Input)},
+		}},
+	}, func() session.PartID { return call.RequestPartID }, assistant.ID, run.SessionID, run.ID, now, session.DefaultContentLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(requestParts) != 1 {
+		t.Fatal("unexpected resume-title request part count")
+	}
 	if _, err := oldExecution.CreateToolCall(ctx, session.CreateToolCallRequest{
 		Call:        call,
-		RequestPart: session.Part{ID: call.RequestPartID, MessageID: assistant.ID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartToolCall, Payload: payload, CreatedAt: now, UpdatedAt: now},
+		RequestPart: requestParts[0],
 		Event:       session.ToolTransitionEvent{ID: "resume-title-pending", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now},
 	}); err != nil {
 		t.Fatal(err)
@@ -371,7 +380,7 @@ func titleStateRuntime(t *testing.T, st session.Store, client *titleStateModel) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamer, err := model.NewEinoStreamerWithProviderState(client, codec)
+	streamer, err := model.NewClassicStreamerWithProviderState(client, codec)
 	if err != nil {
 		t.Fatal(err)
 	}

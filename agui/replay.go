@@ -20,16 +20,23 @@ type EventTail interface {
 // Replay emits durable events after cursor through bridge. Live-only deltas are
 // intentionally skipped because token deltas are transport events, not durable
 // conversation facts.
-func Replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, cursor session.EventCursor) (session.EventCursor, error) {
-	next, _, err := replay(ctx, bridge, store, sessionID, cursor)
+//
+// contentLimits must match the session.ContentLimits the orchestrator that
+// produced this session's durable content was configured with (see
+// runtime.WithContentLimits); the zero value falls back to
+// session.DefaultContentLimits(). A mismatch here does not corrupt data, but
+// content legitimately admitted under raised limits fails to decode for the
+// message snapshot this replay emits first.
+func Replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, cursor session.EventCursor, contentLimits session.ContentLimits) (session.EventCursor, error) {
+	next, _, err := replay(ctx, bridge, store, sessionID, cursor, contentLimits)
 	return next, err
 }
 
-func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, cursor session.EventCursor) (session.EventCursor, map[session.EventID]bool, error) {
+func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, cursor session.EventCursor, contentLimits session.ContentLimits) (session.EventCursor, map[session.EventID]bool, error) {
 	if store == nil {
 		return cursor, nil, session.ErrNotFound
 	}
-	if err := emitMessageSnapshot(ctx, bridge, store, sessionID); err != nil {
+	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, contentLimits); err != nil {
 		return cursor, nil, err
 	}
 	next := cursor
@@ -62,8 +69,9 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 }
 
 // Reconnect subscribes to live tailing, replays durable events, then forwards
-// live events until ctx is canceled or the tail disconnects.
-func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail EventTail, sessionID session.ID, cursor session.EventCursor) (session.EventCursor, error) {
+// live events until ctx is canceled or the tail disconnects. See Replay for
+// the contentLimits contract.
+func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail EventTail, sessionID session.ID, cursor session.EventCursor, contentLimits session.ContentLimits) (session.EventCursor, error) {
 	var live <-chan session.EventRecord
 	subCtx, subCancel := context.WithCancel(ctx)
 	defer subCancel()
@@ -74,7 +82,7 @@ func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail Ev
 			return cursor, err
 		}
 	}
-	next, seen, err := replay(ctx, bridge, store, sessionID, cursor)
+	next, seen, err := replay(ctx, bridge, store, sessionID, cursor, contentLimits)
 	if err != nil {
 		return next, err
 	}
@@ -111,11 +119,11 @@ func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail Ev
 	}
 }
 
-func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID) error {
+func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, contentLimits session.ContentLimits) error {
 	if bridge == nil {
 		return nil
 	}
-	messages, err := history.Load(ctx, store, sessionID, history.Options{})
+	messages, err := history.Load(ctx, store, sessionID, history.Options{ContentLimits: contentLimits})
 	if err != nil {
 		return err
 	}

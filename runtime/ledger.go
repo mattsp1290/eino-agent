@@ -121,6 +121,24 @@ func auditModelRequest(request model.Request, safeOptionKeys []string, maxBytes 
 	return request, input, hex.EncodeToString(digest[:]), nil
 }
 
+// AuditedControlsPayload is the shape persisted in
+// session.ModelRequestRecord.Controls: everything auditModelRequest hashes
+// into the ledger's ContentSHA256 that the Messages/Tools/SafeCallConfig
+// columns do not already carry.
+type AuditedControlsPayload struct {
+	DeferredTools  []AuditedToolSchema `json:"deferred_tools,omitempty"`
+	ToolSearchTool *AuditedToolSchema  `json:"tool_search_tool,omitempty"`
+	ToolChoice     json.RawMessage     `json:"tool_choice,omitempty"`
+	Controls       AuditedControls     `json:"controls"`
+}
+
+func auditedControlsPayload(audited AuditedModelInput) AuditedControlsPayload {
+	return AuditedControlsPayload{
+		DeferredTools: audited.DeferredTools, ToolSearchTool: audited.ToolSearchTool,
+		ToolChoice: audited.ToolChoice, Controls: audited.Controls,
+	}
+}
+
 func auditToolSchemas(tools []*einoschema.ToolInfo) ([]AuditedToolSchema, error) {
 	out := make([]AuditedToolSchema, 0, len(tools))
 	for _, tool := range tools {
@@ -159,6 +177,16 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	if err != nil {
 		return session.ModelRequestRecord{}, fmt.Errorf("encode audited tools: %w", err)
 	}
+	// Controls persists the rest of the audited model-visible request beyond
+	// Tools: DeferredTools, ToolSearchTool, ToolChoice, and the scalar
+	// generation controls. auditModelRequest hashes all of these into
+	// contentHash already; this makes the durable ledger row able to
+	// reconstruct the exact request that hash covers, not just a subset of
+	// it.
+	controls, err := json.Marshal(auditedControlsPayload(audited))
+	if err != nil {
+		return session.ModelRequestRecord{}, fmt.Errorf("encode audited controls: %w", err)
+	}
 	safeConfig, err := json.Marshal(audited.SafeCallConfig)
 	if err != nil {
 		return session.ModelRequestRecord{}, fmt.Errorf("encode audited call config: %w", err)
@@ -173,7 +201,7 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, AssistantMessageID: messageID,
 		Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
 		State: session.ModelRequestPrepared, Messages: messages, System: audited.System, Tools: tools,
-		SafeCallConfig: safeConfig, ContentSHA256: contentHash, ExtensionPlanHash: planHash,
+		Controls: controls, SafeCallConfig: safeConfig, ContentSHA256: contentHash, ExtensionPlanHash: planHash,
 		CreatedAt: now, UpdatedAt: now,
 	}
 	created, err := execution.store.CreateModelRequest(ctx, record)

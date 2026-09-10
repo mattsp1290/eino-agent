@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"unicode/utf8"
@@ -189,6 +190,21 @@ func cloneProviderStateItems(src []ProviderStateItem) []ProviderStateItem {
 		dst[i].Data = append(json.RawMessage(nil), src[i].Data...)
 	}
 	return dst
+}
+
+// equalProviderStateItems reports whether a and b carry the same ordered
+// BlockID bindings and byte-identical Data payloads. Order matters: items
+// are positional within one ProviderMessageState.
+func equalProviderStateItems(a, b []ProviderStateItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].BlockID != b[i].BlockID || !bytes.Equal(a[i].Data, b[i].Data) {
+			return false
+		}
+	}
+	return true
 }
 
 func providerStateError(kind error) error {

@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -139,6 +143,44 @@ func TestBuildToolSettlementRejectsInvalidDisposition(t *testing.T) {
 	}
 }
 
+// TestBuildToolSettlementClampsRetentionPolicyToBlockBudget guards against
+// runtime-persistence-reviewer I1: a tool's own RetentionPolicy.MaxInlineBytes
+// can be larger than -- or (via a negative sentinel) unbounded relative to --
+// session.ContentLimits.MaxBlockBytes, the hard per-block byte cap
+// buildTerminalToolEnvelope's session.EncodeContentParts call enforces. Before
+// the fix, that combination made the whole run fail
+// ("encode function tool result content: session content exceeds configured
+// limits") instead of truncating, and the tool call was then re-terminalized
+// as interrupted so the model never saw any result at all.
+func TestBuildToolSettlementClampsRetentionPolicyToBlockBudget(t *testing.T) {
+	oversized := strings.Repeat("a", 2<<20) // 2 MiB > the 1 MiB default MaxBlockBytes
+	tests := map[string]RetentionPolicy{
+		"policy larger than block budget":      {MaxInlineBytes: 8 << 20, StoreExternal: true},
+		"policy unbounded (negative sentinel)": {MaxInlineBytes: -1, StoreExternal: true},
+	}
+	for name, retention := range tests {
+		t.Run(name, func(t *testing.T) {
+			input := settlementTestInput(Tool{Retention: retention}, settlementTestCall(), ToolResult{Output: oversized}, nil)
+			settlement, output, err := BuildToolSettlement(input)
+			if err != nil {
+				t.Fatalf("BuildToolSettlement returned an error instead of truncating: %v", err)
+			}
+			if !output.Truncated || !output.External {
+				t.Fatalf("output = %+v, want Truncated and External", output)
+			}
+			if int64(len(output.Content)) >= int64(len(oversized)) {
+				t.Fatalf("content was not truncated: len = %d", len(output.Content))
+			}
+			if len(settlement.ResultPart.Payload) == 0 {
+				t.Fatal("result part payload is empty")
+			}
+			if int64(len(settlement.ResultPart.Payload)) > int64(input.ContentLimits.MaxBlockBytes) {
+				t.Fatalf("result part payload (%d bytes) still exceeds MaxBlockBytes (%d)", len(settlement.ResultPart.Payload), input.ContentLimits.MaxBlockBytes)
+			}
+		})
+	}
+}
+
 func settlementTestInput(tool Tool, call ToolCall, result ToolResult, err error) ToolSettlementInput {
 	disposition := ToolExecuted
 	if err != nil {
@@ -159,4 +201,55 @@ func settlementTestInput(tool Tool, call ToolCall, result ToolResult, err error)
 
 func settlementTestCall() ToolCall {
 	return ToolCall{ID: "call-1", SessionID: "session-1", RunID: "run-1", MessageID: "message-1", ResultMessageID: "result-message-1", ResultPartID: "result-part-1", Name: "read_file"}
+}
+
+// TestToolCallSettlementRoundTripsUnderRaisedContentLimits is the runtime
+// integration regression pin for runtime-persistence-reviewer I1 and I2
+// together: a tool that returns oversized output, executed under an
+// orchestrator configured with WithContentLimits raised above
+// session.DefaultContentLimits, must settle successfully end to end
+// (through buildToolSettlement's RetentionPolicy clamp and
+// store/internal/sqlstore's ValidToolResultEnvelope decoding with
+// session.MaxContentLimits) rather than fail the run or surface an opaque
+// session.ErrConflict.
+func TestToolCallSettlementRoundTripsUnderRaisedContentLimits(t *testing.T) {
+	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "raised-limits.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = storePool.Close() }()
+
+	raised := session.ContentLimits{MaxMessageBytes: 32 << 20, MaxBlocks: 1024, MaxBlockBytes: 4 << 20}
+	oversized := strings.Repeat("x", 2<<20) // 2 MiB, over the 1 MiB default MaxBlockBytes but under the 4 MiB raised one
+	providerCalls := 0
+	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
+		providerCalls++
+		if providerCalls == 1 {
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-oversized", "big_tool", `{}`))}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	})
+	orchestrator, err := NewStreamingOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()), WithContentLimits(raised),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configureTestTools(orchestrator, staticToolRegistry{tools: []Tool{{
+		Name:      "big_tool",
+		Retention: RetentionPolicy{MaxInlineBytes: 8 << 20, StoreExternal: true}, // wider than even the raised block budget
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: oversized}, nil
+		}),
+	}}})
+
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "raised-limits-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if result.Error != nil || result.Status != session.RunCompleted {
+		t.Fatalf("result = %#v, want RunCompleted with no error", result)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-oversized")
+	if err != nil || call.Status != session.ToolCallCompleted {
+		t.Fatalf("tool call = %#v, err = %v, want ToolCallCompleted", call, err)
+	}
 }

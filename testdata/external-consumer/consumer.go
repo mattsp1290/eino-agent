@@ -25,5 +25,5 @@ var (
 		Limits: model.ProviderStateLimits{MaxItems: 1, MaxItemBytes: 1024, MaxMessageBytes: 1024, MaxEnvelopeBytes: 4096, MaxStoredMessageBytes: 4096},
 	}
 	_ = model.NewEinoJSONExtraStateCodec
-	_ = model.NewEinoStreamerWithProviderState
+	_ = model.NewClassicStreamerWithProviderState
 )

@@ -12,8 +12,9 @@ import (
 // generation controls.
 type RequestControls struct {
 	// Tools are ordinary function tools bound to the model for this request.
-	// A nil slice leaves the provider's prior tool set untouched; a non-nil
-	// (possibly empty) slice explicitly replaces it, including clearing it.
+	// The list is always sent to the provider: a nil or empty slice
+	// explicitly clears any tool set the underlying client was constructed
+	// with.
 	Tools []*einoschema.ToolInfo
 	// DeferredTools are registered with defer_loading=true for the model's
 	// built-in tool-search capability. Nil means "do not set"; a non-nil

@@ -237,7 +237,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 	var foundResult bool
 	for _, part := range replay.Parts {
 		if part.ID == call.ResultPartID {
-			foundResult = part.Kind == session.PartToolResult && bytes.Equal(part.Payload, call.Output)
+			foundResult = part.Kind == session.PartFunctionToolResult && delegatedResultPartText(t, part) == string(call.Output)
 		}
 	}
 	if !foundResult {
@@ -482,7 +482,7 @@ func testDelegatedSearchFailureRedaction(t *testing.T) {
 	var foundResult bool
 	for _, part := range replay.Parts {
 		if part.ID == call.ResultPartID {
-			foundResult = part.Kind == session.PartToolResult && bytes.Equal(part.Payload, call.Output)
+			foundResult = part.Kind == session.PartFunctionToolResult && delegatedResultPartText(t, part) == string(call.Output)
 		}
 	}
 	if !foundResult {
@@ -582,26 +582,28 @@ func assertDelegatedOrchestratorResumeRejectsDrift(t *testing.T, persisted sessi
 		t.Fatal(err)
 	}
 	input := json.RawMessage(`{"query":"bounded test"}`)
-	requestPartPayload, err := json.Marshal(struct {
-		ID        string          `json:"id"`
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	}{ID: "identity-call", Name: delegatedToolName, Arguments: input})
-	if err != nil {
-		t.Fatal(err)
-	}
 	pending := session.ToolCall{
 		ID: "identity-call", SessionID: run.SessionID, RunID: run.ID, MessageID: assistant.ID,
 		RequestPartID: "identity-request-part", ResultMessageID: "identity-result-message", ResultPartID: "identity-result-part",
 		Name: delegatedToolName, Pattern: delegatedPattern, Input: input, Status: session.ToolCallPending, RetrySafe: false,
 	}
+	requestParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "identity-request-block", Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(pending.ID), Name: pending.Name, Arguments: string(pending.Input)},
+		}},
+	}, func() session.PartID { return pending.RequestPartID }, pending.MessageID, pending.SessionID, pending.RunID, now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requestParts) != 1 {
+		t.Fatal("unexpected identity request part count")
+	}
 	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
-		Call: pending,
-		RequestPart: session.Part{
-			ID: pending.RequestPartID, MessageID: pending.MessageID, SessionID: pending.SessionID, RunID: pending.RunID,
-			Kind: session.PartToolCall, Payload: requestPartPayload, CreatedAt: now, UpdatedAt: now,
-		},
-		Event: session.ToolTransitionEvent{ID: "identity-pending-event", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now},
+		Call:        pending,
+		RequestPart: requestParts[0],
+		Event:       session.ToolTransitionEvent{ID: "identity-pending-event", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -819,6 +821,19 @@ func checkedDelegatedMul(left, right int64) (int64, error) {
 	return left * right, nil
 }
 
+// delegatedResultPartText decodes a durable function_tool_result part back
+// to its public FunctionResultBlock text, mirroring what buildTerminalToolEnvelope
+// (runtime/tool_settlement.go) encoded: the raw tool output now lives inside
+// a versioned content-block envelope rather than as the part's whole payload.
+func delegatedResultPartText(t *testing.T, part session.Part) string {
+	t.Helper()
+	content, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.DefaultContentLimits())
+	if err != nil || len(content.Blocks) != 1 || content.Blocks[0].FunctionResult == nil || len(content.Blocks[0].FunctionResult.Content) != 1 || content.Blocks[0].FunctionResult.Content[0].Type != session.ResultContentText {
+		t.Fatalf("decode function tool result part %#v: %v", part, err)
+	}
+	return content.Blocks[0].FunctionResult.Content[0].Text
+}
+
 func delegatedComponent(artifactHash, configHash string) extension.Component {
 	return extension.Component{
 		InstanceID: "delegated-web-search-proof",
@@ -839,21 +854,18 @@ type delegatedSearchModel struct {
 }
 
 func (m *delegatedSearchModel) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
-	var response *einoschema.Message
+	var response *einoschema.AgenticMessage
 	for _, message := range request.Messages {
-		if message.Role == einoschema.Tool {
+		if isFunctionToolResultMessage(message) {
 			m.mu.Lock()
-			m.result = message.Content
+			m.result = agenticFunctionResultText(message)
 			m.mu.Unlock()
-			response = einoschema.AssistantMessage("done", nil)
+			response = agenticAssistantText("done")
 			break
 		}
 	}
 	if response == nil {
-		response = einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID: m.callID, Type: "function",
-			Function: einoschema.FunctionCall{Name: delegatedToolName, Arguments: `{"query":"bounded test"}`},
-		}})
+		response = agenticAssistantToolCalls(agenticToolCall(m.callID, delegatedToolName, `{"query":"bounded test"}`))
 	}
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	go func() {

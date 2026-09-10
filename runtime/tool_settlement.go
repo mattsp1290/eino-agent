@@ -62,7 +62,8 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 	if err := validateSettlementInput(input); err != nil {
 		return session.ToolSettlement{}, ToolOutput{}, err
 	}
-	raw, output, status, errText := encodeToolOutput(input.Call.ID, input.Result, input.Tool.Retention, input.Disposition, input.Err)
+	policy := effectiveToolRetentionPolicy(input.Tool.Retention, input.ContentLimits)
+	raw, output, status, errText := encodeToolOutput(input.Call.ID, input.Result, policy, input.Disposition, input.Err)
 	metadata := toolSettlementMetadata(input.Claimed.Metadata, output)
 	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed:       input.Claimed,
@@ -176,6 +177,37 @@ func validateSettlementInput(input ToolSettlementInput) error {
 		return errors.New("tool settlement completion time required")
 	}
 	return nil
+}
+
+// toolResultEnvelopeOverhead reserves headroom in the content-block byte
+// budget for the function_tool_result envelope surrounding the tool's raw
+// output bytes (the durable content-block/part JSON, the ToolOutput field
+// names and status, an escaped call ID, JSON string-escaping overhead on the
+// content itself, etc.), so a MaxInlineBytes clamped to exactly
+// ContentLimits.MaxBlockBytes doesn't itself overflow the block once
+// wrapped.
+const toolResultEnvelopeOverhead = 4 << 10 // 4 KiB
+
+// effectiveToolRetentionPolicy clamps policy.MaxInlineBytes so the encoded
+// tool result can never exceed contentLimits.MaxBlockBytes. A tool result is
+// always persisted as exactly one function_tool_result content block
+// (buildTerminalToolEnvelope), so an output the tool's own RetentionPolicy
+// would let through uncapped (MaxInlineBytes < 0) -- or capped above the
+// block budget -- must still be clamped here, or
+// session.EncodeContentParts hard-fails the whole run instead of truncating
+// it. An oversized tool output should become a truncated/external
+// ToolOutput via the existing Truncated/External signalling, not a
+// run-killer: buildTerminalToolEnvelope then re-terminalizes the call as
+// interrupted and the model never sees any result at all.
+func effectiveToolRetentionPolicy(policy RetentionPolicy, contentLimits session.ContentLimits) RetentionPolicy {
+	budget := int64(contentLimits.MaxBlockBytes) - toolResultEnvelopeOverhead
+	if budget <= 0 {
+		return policy
+	}
+	if policy.MaxInlineBytes < 0 || policy.MaxInlineBytes > budget {
+		policy.MaxInlineBytes = budget
+	}
+	return policy
 }
 
 func encodeToolOutput(callID session.ToolCallID, result ToolResult, policy RetentionPolicy, disposition ToolDisposition, err error) (json.RawMessage, ToolOutput, session.ToolCallStatus, string) {

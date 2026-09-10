@@ -433,6 +433,24 @@ func DefaultContentLimits() ContentLimits {
 	}
 }
 
+// MaxContentLimits returns the widest content bounds the durable contract
+// allows: the hard ceilings a caller may raise DefaultContentLimits up to
+// (e.g. via runtime.WithContentLimits), but never past.
+//
+// It exists for identity/shape checks that decode content already admitted
+// under some writer's own configured limits -- not for admission itself.
+// Decoding admitted content with DefaultContentLimits would reject anything
+// written under a raised ContentLimits as invalid, turning a legitimate
+// write into a spurious conflict; MaxContentLimits decodes as permissively
+// as the contract ever allows instead.
+func MaxContentLimits() ContentLimits {
+	return ContentLimits{
+		MaxMessageBytes: 64 << 20,
+		MaxBlocks:       4096,
+		MaxBlockBytes:   16 << 20,
+	}
+}
+
 // Validate requires every bound to be positive.
 func (l ContentLimits) Validate() error {
 	if l.MaxMessageBytes <= 0 || l.MaxBlocks <= 0 || l.MaxBlockBytes <= 0 {

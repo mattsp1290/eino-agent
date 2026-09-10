@@ -67,6 +67,7 @@ func testReplayProviderBytes(t *testing.T, server *testpostgres.Server) {
 		Messages:           json.RawMessage(`{"messages":["\u0000","雪"]}`),
 		System:             "system-\x00-システム",
 		Tools:              json.RawMessage(`{"tools":[]}`),
+		Controls:           json.RawMessage(`null`),
 		SafeCallConfig:     json.RawMessage(`{"mode":"safe"}`),
 		ContentSHA256:      "hash-\x00-摘要",
 		ExtensionPlanHash:  "plan-\x00-計画",
