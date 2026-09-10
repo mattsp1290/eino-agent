@@ -11,31 +11,25 @@ For a runnable starting point, see `examples/minimal-server` and
 
 ## Installation
 
-The supported root pin is `github.com/mattsp1290/eino-agent@v0.3.3` at commit
-`36fe8d8a046b4dd193e97b8f49a580a71bf07bbc` and requires Go 1.26.3. On
-2026-09-04, that exact clean commit passed `make check`; its remote annotated
-tag peeled to the same commit; and an unrelated module verified its complete
-graph, state-aware public API, and delegated web-search runtime contract
-through the standard public Go proxy and checksum database with no `replace`,
-workspace, vendor tree, or checkout access.
-
-The release depends on the separately published generated-bindings
-module `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, whose repository
-tag is `wasmext/gen/v0.1.0`. Consumers must not add a workaround for that
-internal dependency.
-
-For workspace discovery and session watch, use the newer verified commit
-`034b315a517520d18010c0bd9429ef404a2df73d` (module version
-`v0.3.4-0.20260908144805-034b315a5175`):
+Use the verified SQL-store implementation `v0.3.4-0.20260910012408-cec27e5eb734` at
+commit `cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e` with Go 1.26.3:
 
 ```sh
-go get github.com/mattsp1290/eino-agent@034b315a517520d18010c0bd9429ef404a2df73d
+go get github.com/mattsp1290/eino-agent@cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e
 ```
 
-This pin passed `make check` and the fresh published-mode discovery/reopen,
-watch and delegated-search fixtures on 2026-09-08. Its SQLite schema is
-incompatible with earlier databases; see the
-[discovery contract](architecture/storage.md#workspace-session-discovery).
+This pin includes the host-owned SQLite/PostgreSQL APIs, discovery and session
+watch. On 2026-09-10 (UTC), its local gates and an unrelated PostgreSQL consumer
+passed through the public Go proxy and checksum database with an empty module
+cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
+See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
+CloudWeGo Eino is `v0.8.13`; PostgreSQL 17 is the supported server baseline.
+
+The separately published generated-bindings dependency remains
+`github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, through repository tag
+`wasmext/gen/v0.1.0`. Consumers need no workaround for that dependency. Earlier
+release/discovery pins use older store APIs or schemas; their evidence is
+historical. Existing SQLite files are unsupported and remain untouched.
 
 ## Package Surface
 
@@ -44,6 +38,7 @@ incompatible with earlier databases; see the
 | `runtime` | Run admission, active run handles, interruption, resume, turn snapshots, tool execution, typed extension dispatch, and runtime events. | Store, provider/model resolver, run-plan provider, config snapshot, auth, HTTP routes. |
 | `session` | Durable sessions, runs, messages, parts, tool calls, context epochs, replay cursors, and recovery records. | A concrete store backend and tenancy-specific session IDs. |
 | `store/sqlite` | Embedded transactional `session.Store` implementation. | Database path, lifecycle, backups, migrations policy, production HA choice. |
+| `store/postgres` | Transactional `session.Store` over a pgx-backed `*sql.DB` for a dedicated PostgreSQL 17 database. | Pool configuration and shutdown, credentials, auth, migration timing, backups and retention. |
 | `store/storetest` | Contract tests for custom stores. | Backend-specific persistence and isolation tests. |
 | `transport` | HTTP adapters for AG-UI SSE replay/live tail, interrupt, resume, and message decoding. | Route layout, middleware, auth, request validation, cursor persistence. |
 | `agui` | Durability/replay policy for AG-UI event families and client-tool classification. | Product decisions for conditional reasoning/state/custom-event replay. |
@@ -68,6 +63,57 @@ until all stores finish. Do not set connection lifetimes or idle timeouts that
 close the final memory connection. Closing the last connection loses that database.
 Only the fresh Goose baseline is supported; legacy schemas are rejected without
 repair or import. The host owns shutdown and any disposable database cleanup.
+
+### PostgreSQL pool and schema ownership
+
+Both SQL stores share the internal GORM implementation; Goose is their sole
+schema authority. PostgreSQL uses fixed `public` tables in a dedicated database.
+Shared application schemas, namespace options, other SQL backends and legacy
+imports are unsupported. Provision the database in the host, stop writers for
+setup, and explicitly call `postgres.Migrate(ctx, pool)`. Normal startup calls
+only `postgres.New(ctx, pool)`, which verifies the current schema without DDL.
+See [the runnable host example](../examples/postgres-store/README.md).
+
+```go
+// Import database/sql, store/postgres and pgx/v5/stdlib.
+pool, err := sql.Open("pgx", dsn) // host-supplied secret; do not log it
+if err != nil { return err }
+defer pool.Close()
+if err := pool.PingContext(ctx); err != nil { return err }
+// Host setup only, with writers quiesced: postgres.Migrate(ctx, pool).
+st, err := postgres.New(ctx, pool)
+if err != nil { return err }
+_ = st // pass to runtime.WithStore and the committed read adapters
+```
+
+Use a finite caller deadline for opening, migration and requests. Hosts using
+`pgxpool` can borrow it through `stdlib.OpenDBFromPool(nativePool)`. The host
+closes the SQL wrapper first and then the native pool; the store closes neither
+and does not change connection settings. Abandoning a store instance releases
+no host resource, and store errors do not transfer pool ownership.
+
+Nil pools and unsupported drivers match `session.ErrConflict`; an uninitialized
+or unsupported schema also conflicts. Closed pools and canceled contexts return
+their underlying errors. Use `errors.Is`/`errors.As`, not formatted error text.
+Initialization errors suppress connection text but hosts must still avoid
+logging credentials or unwrapped driver details.
+
+Both backends expose the optional `session.ObservationReader` and
+`session.SessionDiscoveryReader` capabilities. These read committed snapshots
+outside caller transactions and reject transaction-bound store handles.
+PostgreSQL writes use read-committed transactions and row locks; its observation
+and discovery reads use repeatable-read snapshots. Lease decisions use the
+database clock. [Storage architecture](architecture/storage.md#transactions)
+describes public nesting and internal mutation savepoints.
+
+Hosts own backups, authorization, retention/deletion scheduling and PostgreSQL
+vacuum/health. There is no retention API or automatic Down/reset. Ad hoc row
+deletion can break durable relationships and observation invariants. Dropping
+a dedicated disposable test database is cleanup, not a production retention
+strategy. Rollback requires a database compatible with the chosen implementation
+or explicitly disposable fresh data; old SQLite files remain untouched and
+cannot be opened by this baseline. Ensemble and Birbparty adoption are separate
+projects; existing Ensemble schemas are not migration inputs.
 
 ## Minimal Embed
 
@@ -300,11 +346,10 @@ Required semantics:
   claims use owner/token fencing and terminal settlement happens exactly once.
 - Startup recovery can list unfinished runs and unfinished tool calls.
 
-SQLite is available as an embedded implementation. Hosted or multi-region
-backends must preserve the same observable behavior at the `session.Store`
-boundary. The pre-release SQLite backend accepts only its current schema. After
-a schema change, recreate local databases rather than relying on upgrade or
-rollback compatibility.
+SQLite and PostgreSQL implement this boundary through shared persistence code.
+Their constructors accept only the current explicit baseline. This does not
+promise compatibility with older SQLite files, existing application-owned
+PostgreSQL schemas, or other hosted/multi-region database implementations.
 
 ## Tool Lifecycle
 
@@ -638,9 +683,7 @@ and allowlist only non-secret option keys. See the
 
 ## Session state observation
 
-Session observation is included in the verified
-`v0.3.4-0.20260908144805-034b315a5175` pin described under Installation;
-it is not included in the earlier `v0.3.3` release.
+Session observation is included in the verified SQL-store pin under Installation.
 Construct one observation service for the store and share it with all observed
 orchestrators in this process:
 

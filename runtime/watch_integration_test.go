@@ -21,14 +21,18 @@ import (
 func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 	for _, mode := range []string{"empty", "model-error", "model-panic", "persistence-error", "tool-error", "tool-denied", "tool-cancel"} {
 		t.Run(mode, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			// These cases assert terminal state, not read latency. Give reads the
+			// same bound so race instrumentation and waiting for the shared SQLite
+			// connection cannot exhaust a shorter observer deadline.
+			const testTimeout = 30 * time.Second
+			ctx, cancel := context.WithTimeout(t.Context(), testTimeout)
 			defer cancel()
 			st, stPool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "watch.db"))
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer func() { _ = stPool.Close() }()
-			options := watch.Options{Snapshot: session.ObservationLimits{MaxMessages: 20, MaxTools: 20, MaxParts: 40, MaxSnapshotBytes: 64000, MaxTextBytes: 1000}, PollInterval: time.Millisecond, ReadTimeout: time.Second, MaxSubscriptions: 10, MaxWatchedSessions: 10, MaxLiveRuns: 10, MaxLiveTextBytes: 1000, PendingUpdates: 20}
+			options := watch.Options{Snapshot: session.ObservationLimits{MaxMessages: 20, MaxTools: 20, MaxParts: 40, MaxSnapshotBytes: 64000, MaxTextBytes: 1000}, PollInterval: time.Millisecond, ReadTimeout: testTimeout, MaxSubscriptions: 10, MaxWatchedSessions: 10, MaxLiveRuns: 10, MaxLiveTextBytes: 1000, PendingUpdates: 20}
 			service, err := watch.NewService(st, options)
 			if err != nil {
 				t.Fatal(err)

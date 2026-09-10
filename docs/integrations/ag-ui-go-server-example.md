@@ -10,6 +10,7 @@ This sketch maps the current `ag-ui-go-server-example` shape to stable `eino-age
 | Current AG-UI submission | Validate the raw terminal message and copy only its plain-text user content into `runtime.Request.Message` |
 | SSE stream/reconnect boilerplate | `transport.SSEHandler` with `session.Store`, `stream.Tail`, route-owned session lookup, and `after` cursor parsing |
 | Local paused/history storage | `store/sqlite.Migrate` followed by `store/sqlite.New` for durable sessions, runs, messages, parts, tool calls, epochs, and replayable events |
+| PostgreSQL paused/history storage | Host-owned pgx pool, explicit `store/postgres.Migrate` during setup, then verify-only `store/postgres.New` on normal startup |
 | Client-defined AG-UI tools | `tools/agui.MountClientTools` plus `composition.Registry` and `agui.ClientToolSnapshot` |
 | Interrupt route | `transport.InterruptHandler` and an app-owned active-handle lookup |
 
@@ -101,3 +102,9 @@ The integration should keep these in `ag-ui-go-server-example`:
 - explicit product-specific AG-UI approval/resume semantics.
 
 The runtime can replace the reusable session/run/tool/replay layers without changing those application-owned concerns.
+
+PostgreSQL hosts can use [the public store example](../../examples/postgres-store)
+without changing these HTTP adapters. Select a dedicated PostgreSQL 17 database;
+the host owns pool shutdown, auth, backups and retention. Migrate only with
+writers quiesced, and use `New` alone when reopening. Neither this sketch nor
+the store imports an existing application's schema or claims consumer adoption.
