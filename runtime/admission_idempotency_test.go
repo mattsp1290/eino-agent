@@ -17,6 +17,94 @@ type countingResolver struct {
 	calls atomic.Int32
 }
 
+type sequencedLookupStore struct {
+	session.Store
+	record session.AdmissionRecord
+	err    error
+	calls  atomic.Int32
+}
+
+func (s *sequencedLookupStore) LookupAdmission(context.Context, session.ID, string) (session.AdmissionRecord, error) {
+	if s.calls.Add(1) == 1 {
+		return session.AdmissionRecord{}, session.ErrNotFound
+	}
+	if s.err != nil {
+		return session.AdmissionRecord{}, s.err
+	}
+	return s.record, nil
+}
+
+type failingPlanProvider struct{ err error }
+
+func (p failingPlanProvider) AcquireRunPlan(context.Context, RunPlanRequest) (*RunPlan, error) {
+	return nil, p.err
+}
+func (p failingPlanProvider) AcquireResumePlan(context.Context, ResumePlanRequest) (*RunPlan, error) {
+	return nil, p.err
+}
+
+type invalidResolvedModel struct{}
+
+func (invalidResolvedModel) Resolve(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+	return model.Resolved{Provider: model.Provider{ID: "wrong"}, Model: model.Descriptor{ID: "wrong", ProviderID: "wrong"}}, nil
+}
+
+func TestKeyedAdmissionRechecksAfterPlanAndResolvedValidationFailures(t *testing.T) {
+	request := Request{SessionID: "recheck", AdmissionKey: "event-recheck", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	fingerprint, err := fingerprintAdmission(frozenRequest(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := session.AdmissionRecord{
+		Receipt:            session.AdmissionReceipt{SessionID: request.SessionID, Key: request.AdmissionKey, RunID: "winner", UserMessageID: "user", AssistantMessageID: "assistant"},
+		FingerprintVersion: session.AdmissionFingerprintVersion, Fingerprint: fingerprint,
+	}
+	for _, tc := range []struct {
+		name string
+		opts []Option
+	}{
+		{name: "plan", opts: []Option{WithRunPlanProvider(failingPlanProvider{err: errors.New("plan failed")})}},
+		{name: "resolved validation", opts: []Option{WithModelResolver(invalidResolvedModel{})}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := newAdmissionStore()
+			store := &sequencedLookupStore{Store: base, record: record}
+			opts := []Option{WithStore(store), WithModelResolver(&countingResolver{}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider())}
+			orch := mustConfiguredOrchestrator(append(opts, tc.opts...)...)
+			got, err := orch.Start(t.Context(), request)
+			if err != nil || got.Disposition != AdmissionExisting || got.Receipt != record.Receipt {
+				t.Fatalf("result=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestKeyedAdmissionMasksFailedRecoveryLookup(t *testing.T) {
+	request := Request{SessionID: "unknown", AdmissionKey: "event-unknown", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	store := &sequencedLookupStore{Store: newAdmissionStore(), err: errors.New("private driver details")}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(&countingResolver{}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(failingPlanProvider{err: errors.New("private plan details")}),
+	)
+	_, err := orch.Start(t.Context(), request)
+	if !errors.Is(err, session.ErrAdmissionUnknown) || err.Error() != session.ErrAdmissionUnknown.Error() {
+		t.Fatalf("error=%q", err)
+	}
+}
+
+type unknownOutcomeError struct{ error }
+
+func (unknownOutcomeError) TransactionOutcomeUnknown() bool { return true }
+
+func TestKeyedAdmissionMapsAbsentAmbiguousCommitToUnknown(t *testing.T) {
+	request := Request{SessionID: "ambiguous", AdmissionKey: "event-ambiguous"}
+	orch := &StreamingOrchestrator{store: newAdmissionStore()}
+	_, err := orch.resolveFailedAdmission(t.Context(), request, [32]byte{}, unknownOutcomeError{errors.New("commit ack lost")})
+	if !errors.Is(err, session.ErrAdmissionUnknown) || err.Error() != session.ErrAdmissionUnknown.Error() {
+		t.Fatalf("error=%q", err)
+	}
+}
+
 func (r *countingResolver) Resolve(_ context.Context, selection model.Selection, _ model.Runtime) (model.Resolved, error) {
 	r.calls.Add(1)
 	return model.Resolved{

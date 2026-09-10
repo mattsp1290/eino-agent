@@ -5,6 +5,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
+	"github.com/mattsp1290/eino-agent/store/postgres"
 )
 
 const runtimeAdmissionTriggerError = "runtime admission rollback trigger"
@@ -67,6 +69,67 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 		historyMessages[1].Role != einoschema.Assistant || historyMessages[1].Content != "postgres answer" {
 		t.Fatalf("reopened history=%#v", historyMessages)
 	}
+}
+
+func testPostgresKeyedAdmissionRace(t *testing.T, server *testpostgres.Server) {
+	f := newPostgresRuntimeFixture(t, server)
+	secondStore, err := postgres.New(f.ctx, f.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := &sequenceIDs{}
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	})
+	newOrchestrator := func(store session.Store) *StreamingOrchestrator {
+		return mustConfiguredOrchestrator(
+			WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(ids),
+			WithRunPlanProvider(emptyTestRunPlanProvider()),
+		)
+	}
+	request := Request{SessionID: "postgres-keyed-race", AdmissionKey: "same-event", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	const contenders = 8
+	results := make(chan AdmissionResult, contenders)
+	errs := make(chan error, contenders)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	stores := []session.Store{f.store, secondStore}
+	for index := range contenders {
+		wg.Add(1)
+		go func(orch *StreamingOrchestrator) {
+			defer wg.Done()
+			<-start
+			result, err := orch.Start(f.ctx, request)
+			results <- result
+			errs <- err
+		}(newOrchestrator(stores[index%len(stores)]))
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	newCount := 0
+	var receipt session.AdmissionReceipt
+	for result := range results {
+		if result.Disposition == AdmissionNew {
+			newCount++
+			<-result.Handle.Done()
+		}
+		if receipt == (session.AdmissionReceipt{}) {
+			receipt = result.Receipt
+		} else if result.Receipt != receipt {
+			t.Fatalf("receipts differ: %+v and %+v", receipt, result.Receipt)
+		}
+	}
+	if newCount != 1 {
+		t.Fatalf("new admissions=%d, want 1", newCount)
+	}
+
 }
 
 func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Server) {

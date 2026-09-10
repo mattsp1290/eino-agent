@@ -31,6 +31,24 @@ func (postgresDialect) ClockSQL() string {
 	return "(EXTRACT(EPOCH FROM pg_catalog.clock_timestamp()) * 1000000)::bigint"
 }
 
+func (postgresDialect) ValidateAdmissionReader(ctx context.Context, reader sqlstore.SQLReader) error {
+	var recovering bool
+	if err := reader.QueryRowContext(ctx, "SELECT pg_catalog.pg_is_in_recovery()").Scan(&recovering); err != nil {
+		return admissionUnknown(ctx)
+	}
+	if recovering {
+		return session.ErrAdmissionUnknown
+	}
+	return nil
+}
+
+func admissionUnknown(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return errors.Join(session.ErrAdmissionUnknown, err)
+	}
+	return session.ErrAdmissionUnknown
+}
+
 // LockRows adds a row lock for only the query's current table. Joins (such as
 // the run/session lookup) therefore do not accidentally lock every relation.
 // PostgreSQL requires the unqualified relation name or alias in FOR UPDATE OF.
@@ -100,7 +118,7 @@ func (t *postgresTransaction) Commit(ctx context.Context) error {
 	t.active = false
 	if err != nil {
 		t.closed = true
-		return errors.Join(err, ctx.Err(), discardAndClose(t.Conn))
+		return sqlstore.MarkTransactionOutcomeUnknown(errors.Join(err, ctx.Err(), discardAndClose(t.Conn)))
 	}
 	if tag.String() == "ROLLBACK" {
 		return pgx.ErrTxCommitRollback

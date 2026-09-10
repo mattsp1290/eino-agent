@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/mattsp1290/eino-agent/internal/testpostgres"
@@ -19,6 +20,28 @@ func TestPostgresReaders(t *testing.T) {
 	t.Run("privacy", func(t *testing.T) { testReadersPrivacy(t, server) })
 	t.Run("bounds", func(t *testing.T) { testReadersBounds(t, server) })
 	t.Run("availability", func(t *testing.T) { testReadersAvailability(t, server) })
+	t.Run("admission primary", func(t *testing.T) { testAdmissionReaderPrimaryCheck(t, server) })
+}
+
+func testAdmissionReaderPrimaryCheck(t *testing.T, server *testpostgres.Server) {
+	database := server.Database(t)
+	db := database.Open(t)
+	defer func() { _ = db.Close() }()
+	if err := postgres.Migrate(t.Context(), db); err != nil {
+		t.Fatal(err)
+	}
+	var queries []string
+	reader, err := postgres.NewReaderTestStore(db, nil, func(query string, _ []any) { queries = append(queries, query) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = reader.LookupAdmission(t.Context(), "missing-session", "missing-key")
+	if !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("lookup error=%v", err)
+	}
+	if len(queries) < 2 || !strings.Contains(queries[0], "pg_is_in_recovery") || !strings.Contains(queries[1], "admission_receipts") {
+		t.Fatalf("authoritative lookup queries=%q", queries)
+	}
 }
 
 func readerLimits() session.ObservationLimits {

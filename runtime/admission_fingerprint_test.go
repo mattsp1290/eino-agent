@@ -65,3 +65,11 @@ func TestKeyedAdmissionBoundsAndWorkspaceValidation(t *testing.T) {
 		t.Fatalf("workspace error=%v", err)
 	}
 }
+
+func TestAdmissionInputBudgetRejectsOversizedMetadataBeforeClone(t *testing.T) {
+	request := Request{AdmissionKey: "bounded", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request.Metadata = map[string]string{"hostile": strings.Repeat("x", maxAdmissionPayloadBytes)}
+	if err := validateAdmissionInputBudget(request); !errors.Is(err, session.ErrAdmissionInvalid) {
+		t.Fatalf("budget error=%v", err)
+	}
+}

@@ -67,6 +67,113 @@ func frozenRequest(request Request) Request {
 
 func emptySlice(value []string) []string { return append([]string{}, value...) }
 
+// validateAdmissionInputBudget bounds work before Clone or JSON encoding can
+// copy attacker-controlled keyed input. JSON escaping can only add bytes, and
+// the exact encoded limit remains enforced after canonical marshaling.
+func validateAdmissionInputBudget(request Request) error {
+	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil || len(request.Message.Content) > maxAdmissionMessageBytes {
+		return session.ErrAdmissionInvalid
+	}
+	used := 281 // canonical payload with empty strings and containers
+	add := func(value string, emptyBytes int) bool {
+		encoded, valid := encodedJSONStringBytes(value)
+		increment := encoded - emptyBytes
+		if !valid || increment < 0 || used > maxAdmissionPayloadBytes-increment {
+			return false
+		}
+		used += increment
+		return true
+	}
+	values := []string{
+		request.Message.Content, request.Config.Agent.Name, request.Config.Agent.SystemPrompt,
+		request.Config.Agent.Mode, string(request.Config.Agent.Model.ProviderID), string(request.Config.Agent.Model.ModelID),
+		request.Config.Agent.Model.Variant, string(request.Config.Model.ProviderID), string(request.Config.Model.ModelID),
+		request.Config.Model.Variant,
+	}
+	for _, value := range values {
+		if !add(value, 2) {
+			return session.ErrAdmissionInvalid
+		}
+	}
+	for _, values := range []map[string]string{request.Config.Agent.Options, request.Config.Metadata, request.Metadata} {
+		if len(values) > 0 {
+			increment := 2*len(values) - 1
+			if used > maxAdmissionPayloadBytes-increment {
+				return session.ErrAdmissionInvalid
+			}
+			used += increment
+		}
+		for key, value := range values {
+			if !add(key, 0) || !add(value, 0) {
+				return session.ErrAdmissionInvalid
+			}
+		}
+	}
+	for _, values := range [][]string{request.Config.Tools.Enabled, request.Config.Tools.Disabled} {
+		if len(values) > 0 {
+			increment := len(values) - 1
+			if used > maxAdmissionPayloadBytes-increment {
+				return session.ErrAdmissionInvalid
+			}
+			used += increment
+		}
+		for _, value := range values {
+			if !add(value, 0) {
+				return session.ErrAdmissionInvalid
+			}
+		}
+	}
+	if len(request.Config.Tools.Permissions) > 0 {
+		increment := 43*len(request.Config.Tools.Permissions) - 1
+		if used > maxAdmissionPayloadBytes-increment {
+			return session.ErrAdmissionInvalid
+		}
+		used += increment
+	}
+	for _, rule := range request.Config.Tools.Permissions {
+		for _, value := range []string{rule.Permission, rule.Pattern, rule.Action} {
+			if !add(value, 2) {
+				return session.ErrAdmissionInvalid
+			}
+		}
+	}
+	return nil
+}
+
+func encodedJSONStringBytes(value string) (int, bool) {
+	if !utf8.ValidString(value) {
+		return 0, false
+	}
+	size := 2
+	for index := 0; index < len(value); {
+		c := value[index]
+		if c < utf8.RuneSelf {
+			index++
+			switch c {
+			case '\\', '"', '\b', '\f', '\n', '\r', '\t':
+				size += 2
+			case '<', '>', '&':
+				size += 6
+			default:
+				if c < 0x20 {
+					size += 6
+				} else {
+					size++
+				}
+			}
+			continue
+		}
+		r, width := utf8.DecodeRuneInString(value[index:])
+		if r == '\u2028' || r == '\u2029' {
+			size += 6
+		} else {
+			size += width
+		}
+		index += width
+	}
+	return size, true
+}
+
 func fingerprintAdmission(request Request) ([32]byte, error) {
 	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil {
 		return [32]byte{}, err

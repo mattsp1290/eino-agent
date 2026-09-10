@@ -16,6 +16,7 @@ import (
 )
 
 var errCleanupInjected = errors.New("injected savepoint cleanup failure")
+var errCommitAckInjected = errors.New("injected commit acknowledgement failure")
 
 type cleanupDialect struct {
 	Dialect
@@ -87,5 +88,56 @@ func TestSavepointCleanupPoisonsOuterTransaction(t *testing.T) {
 				t.Fatalf("poisoned transaction committed %d rows: %v", count, err)
 			}
 		})
+	}
+}
+
+type commitAckDialect struct{ Dialect }
+
+func (commitAckDialect) MapError(err error) error { return err }
+func (commitAckDialect) Begin(ctx context.Context, db *sql.DB) (Transaction, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	return &commitAckTransaction{Tx: tx}, nil
+}
+
+type commitAckTransaction struct{ *sql.Tx }
+
+func (t *commitAckTransaction) Commit(context.Context) error {
+	if err := t.Tx.Commit(); err != nil {
+		return err
+	}
+	return MarkTransactionOutcomeUnknown(errCommitAckInjected)
+}
+func (t *commitAckTransaction) Rollback(context.Context) error { return t.Tx.Rollback() }
+func (t *commitAckTransaction) Close() error                   { return nil }
+
+func TestWithinTxMarksLostCommitAcknowledgementWhileDataCommits(t *testing.T) {
+	pool, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+	pool.SetMaxOpenConns(1)
+	if _, err := pool.Exec("CREATE TABLE witness(value TEXT)"); err != nil {
+		t.Fatal(err)
+	}
+	orm, err := gorm.Open(gormsqlite.New(gormsqlite.Config{Conn: pool, DriverName: "sqlite"}), &gorm.Config{DisableAutomaticPing: true, Logger: logger.Discard})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := New(orm, pool, commitAckDialect{})
+	err = store.WithinTx(t.Context(), func(ctx context.Context, view session.Store) error {
+		_, err := view.(*Store).dbFor(ctx).Statement.ConnPool.ExecContext(ctx, "INSERT INTO witness(value) VALUES (?)", "committed")
+		return err
+	})
+	var marked interface{ TransactionOutcomeUnknown() bool }
+	if !errors.As(err, &marked) || !marked.TransactionOutcomeUnknown() || !errors.Is(err, errCommitAckInjected) {
+		t.Fatalf("commit result=%v", err)
+	}
+	var count int
+	if err := pool.QueryRow("SELECT count(*) FROM witness").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("committed rows=%d err=%v", count, err)
 	}
 }

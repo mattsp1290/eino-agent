@@ -64,10 +64,15 @@ type StreamingOrchestrator struct {
 
 // Start admits and asynchronously executes one streaming turn.
 func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (AdmissionResult, error) {
-	request = frozenRequest(request)
 	if err := o.validate(request); err != nil {
 		return AdmissionResult{}, err
 	}
+	if request.AdmissionKey != "" {
+		if err := validateAdmissionInputBudget(request); err != nil {
+			return AdmissionResult{}, err
+		}
+	}
+	request = frozenRequest(request)
 	var fingerprint [32]byte
 	if request.AdmissionKey != "" {
 		var err error
@@ -85,7 +90,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Adm
 	}
 	plan, err := o.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
 	if err != nil {
-		return AdmissionResult{}, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	ownershipTransferred := false
 	defer func() {
@@ -98,15 +103,10 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Adm
 		Options:   cloneStringMap(request.Config.Agent.Options),
 	})
 	if err != nil {
-		if existing, found, lookupErr := o.recheckAdmission(ctx, request, fingerprint); lookupErr != nil {
-			return AdmissionResult{}, lookupErr
-		} else if found {
-			return existing, nil
-		}
-		return AdmissionResult{}, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	if err := model.ValidateResolved(request.Config.Model, resolved); err != nil {
-		return AdmissionResult{}, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	ids := admissionIDs{
 		SessionID:          request.SessionID,
@@ -133,12 +133,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Adm
 		Fingerprint:   fingerprint,
 	})
 	if err != nil {
-		if existing, found, lookupErr := o.recheckAdmission(ctx, request, fingerprint); lookupErr != nil {
-			return AdmissionResult{}, lookupErr
-		} else if found {
-			return existing, nil
-		}
-		return AdmissionResult{}, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	if admitted.Existing {
 		return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionExisting}, nil
@@ -162,6 +157,38 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Adm
 	ownershipTransferred = true
 	go o.execute(runCtx, execution, admitted, handle.done)
 	return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionNew, Handle: handle}, nil
+}
+
+type transactionOutcomeUnknown interface{ TransactionOutcomeUnknown() bool }
+
+func (o *StreamingOrchestrator) resolveFailedAdmission(ctx context.Context, request Request, fingerprint [32]byte, cause error) (AdmissionResult, error) {
+	if request.AdmissionKey == "" {
+		return AdmissionResult{}, cause
+	}
+	existing, found, lookupErr := o.recheckAdmission(ctx, request, fingerprint)
+	if lookupErr != nil {
+		if errors.Is(lookupErr, session.ErrAdmissionConflict) {
+			return AdmissionResult{}, lookupErr
+		}
+		return AdmissionResult{}, admissionUnknownError(cause)
+	}
+	if found {
+		return existing, nil
+	}
+	var unknown transactionOutcomeUnknown
+	if errors.As(cause, &unknown) && unknown.TransactionOutcomeUnknown() {
+		return AdmissionResult{}, admissionUnknownError(cause)
+	}
+	return AdmissionResult{}, cause
+}
+
+func admissionUnknownError(cause error) error {
+	for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(cause, sentinel) {
+			return errors.Join(session.ErrAdmissionUnknown, sentinel)
+		}
+	}
+	return session.ErrAdmissionUnknown
 }
 
 func (o *StreamingOrchestrator) recheckAdmission(ctx context.Context, request Request, fingerprint [32]byte) (AdmissionResult, bool, error) {

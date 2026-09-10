@@ -52,7 +52,9 @@ type AdmissionRecord struct {
 	Receipt            AdmissionReceipt
 	FingerprintVersion uint32
 	Fingerprint        [32]byte
-	RunStatus          RunStatus
+	// RunStatus is a point-in-time projection from the same committed read as
+	// the receipt. Callers must read again to observe later run transitions.
+	RunStatus RunStatus
 }
 
 // ValidateAdmissionKey validates an externally supplied idempotency key.

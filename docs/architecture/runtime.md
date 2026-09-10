@@ -70,8 +70,11 @@ The runtime treats a run as durable before it is executable.
 returns `AdmissionNew`, an immutable receipt, and the only live `Handle` for
 that admission. A nonempty `Request.AdmissionKey` scopes a durable receipt to
 the session. The same key and frozen payload returns `AdmissionExisting` with
-the original receipt and a nil handle; it never constructs a provider, starts
-or resumes execution, publishes an event, or transfers a claim. A changed
+the original receipt and a nil handle. A retry that sees the receipt on its
+entry lookup does not acquire a plan or construct a provider; concurrent
+contenders can perform that setup before the winning receipt becomes visible.
+No duplicate starts or resumes execution, publishes an event, or transfers a
+claim. A changed
 payload returns the content-free `session.ErrAdmissionConflict` error.
 
 The v1 fingerprint is SHA-256 of `eino-agent-admission-v1`, a NUL byte, and

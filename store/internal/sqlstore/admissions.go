@@ -21,6 +21,13 @@ func (s *Store) LookupAdmission(ctx context.Context, sessionID session.ID, key s
 	}
 	var result session.AdmissionRecord
 	err := s.read(ctx, func(reader *Store) error {
+		conn, ok := reader.dbFor(ctx).Statement.ConnPool.(SQLReader)
+		if !ok {
+			return session.ErrAdmissionUnknown
+		}
+		if err := reader.dialect.ValidateAdmissionReader(ctx, conn); err != nil {
+			return err
+		}
 		var err error
 		result, err = reader.admission(ctx, sessionID, key)
 		return err

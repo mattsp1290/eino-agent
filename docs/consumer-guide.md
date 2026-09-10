@@ -176,8 +176,10 @@ The returned `runtime.Handle` is the live control surface for that admitted
 run. Use `Done()` for terminal status and `Interrupt()` for cancellation.
 
 For retried ingress, set `AdmissionKey` from the host's frozen event identity.
-The first caller receives `AdmissionNew` and its handle. A matching retry
-receives `AdmissionExisting`, the same immutable receipt, and no handle; use
+The caller that commits the receipt receives `AdmissionNew` and its handle.
+Other concurrent contenders may finish setup before observing that receipt,
+but a matching retry ultimately receives `AdmissionExisting`, the same
+immutable receipt, and no handle; use
 `LookupAdmission` or the store/watch APIs to observe the original run. A retry
 with different message or included configuration receives
 `session.ErrAdmissionConflict`. Keep credentials out of included metadata.
