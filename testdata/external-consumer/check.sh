@@ -23,6 +23,11 @@ cleanup() {
 trap cleanup EXIT
 
 published_version="${EINO_AGENT_CONSUMER_VERSION:-}"
+postgres_mode="${EINO_AGENT_CONSUMER_POSTGRES:-}"
+if [[ -n "${postgres_mode}" && "${postgres_mode}" != "1" ]]; then
+	printf 'external-consumer: EINO_AGENT_CONSUMER_POSTGRES must be 1 when set\n' >&2
+	exit 1
+fi
 if [[ -n "${published_version}" ]]; then
 	mode="published"
 	required_version="${published_version}"
@@ -76,6 +81,10 @@ cp -f -- "${script_dir}/sqlite_pool_test.go" "${consumer_dir}/sqlite_pool_test.g
 cp -f -- "${script_dir}/session_discovery_fixture_test.go" "${consumer_dir}/session_discovery_fixture_test.go"
 cp -f -- "${script_dir}/session_watch_fixture_test.go" "${consumer_dir}/session_watch_fixture_test.go"
 cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"
+if [[ "${postgres_mode}" == "1" ]]; then
+	cp -f -- "${script_dir}/../../internal/testpostgres/check_output.py" "${temporary_root}/check_output.py"
+	cp -f -- "${script_dir}/postgres_store_fixture_test.go" "${consumer_dir}/postgres_store_fixture_test.go"
+fi
 
 cd -- "${consumer_dir}"
 
@@ -142,6 +151,16 @@ if [[ "${mode}" == "published" ]]; then
 			"${root_selection}" "${selected_required_version}|" >&2
 		exit 1
 	fi
+	root_provenance="$("${go_command[@]}" list -m -f '{{.Version}}|{{if .Origin}}{{.Origin.Hash}}{{end}}' "${root_module}@${selected_required_version}")"
+	printf 'ROOT_MODULE_PROVENANCE=%s\n' "${root_provenance}"
+	if [[ "${root_provenance}" != "${selected_required_version}|"* || -z "${root_provenance#*|}" ]]; then
+		printf 'external-consumer: published root module has no full commit provenance\n' >&2
+		exit 1
+	fi
+	if [[ "${required_version}" =~ ^[0-9a-f]{40}$ && "${root_provenance#*|}" != "${required_version}" ]]; then
+		printf 'external-consumer: published commit provenance does not match requested pin\n' >&2
+		exit 1
+	fi
 	if grep -Eq '^[[:space:]]*replace[[:space:](]' go.mod; then
 		printf 'external-consumer: tidy introduced a replacement in published mode\n' >&2
 		exit 1
@@ -149,7 +168,11 @@ if [[ "${mode}" == "published" ]]; then
 fi
 
 "${go_command[@]}" mod verify
-"${go_command[@]}" test ./...
+if [[ "${postgres_mode}" == "1" ]]; then
+	"${go_command[@]}" test -tags postgres_integration -timeout 10m -json ./... | python3 "${temporary_root}/check_output.py" "example.com/eino-agent-external-consumer:TestPostgresConsumer"
+else
+	"${go_command[@]}" test ./...
+fi
 "${go_command[@]}" build ./...
 
 if [[ -e "${consumer_dir}/go.work" || -d "${consumer_dir}/vendor" ]]; then

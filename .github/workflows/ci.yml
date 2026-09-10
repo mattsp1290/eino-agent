@@ -71,3 +71,7 @@ jobs:
         run: make postgres-test
       - name: PostgreSQL race tests (required, zero skips)
         run: make postgres-race
+      - name: PostgreSQL external consumer (required, zero skips)
+        env:
+          EINO_AGENT_CONSUMER_POSTGRES: "1"
+        run: make external-consumer-check
