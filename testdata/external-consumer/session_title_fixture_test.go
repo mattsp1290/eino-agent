@@ -182,11 +182,14 @@ func TestPublicExecutorOnlySessionTitleWriter(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := o.Start(ctx, runtime.Request{SessionID: "agent", Message: runtime.UserMessage{Content: "rename"}, Config: config.Snapshot{Agent: config.Agent{Name: "consumer", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": "A"}}})
+	admission, err := o.Start(ctx, runtime.Request{SessionID: "agent", Message: runtime.UserMessage{Content: "rename"}, Config: config.Snapshot{Agent: config.Agent{Name: "consumer", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": "A"}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := <-handle.Done()
+	if admission.Disposition != runtime.AdmissionNew || admission.Handle == nil {
+		t.Fatalf("admission = %#v", admission)
+	}
+	result := <-admission.Handle.Done()
 	if result.Error != nil || result.Status != session.RunCompleted || retained == nil {
 		t.Fatalf("result = %#v", result)
 	}

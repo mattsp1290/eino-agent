@@ -14,10 +14,13 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/mattsp1290/eino-agent/session"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
 type sqliteDialect struct{}
+
+func (sqliteDialect) ValidateAdmissionReader(context.Context, sqlstore.SQLReader) error { return nil }
 
 func (sqliteDialect) IndexHint(index string) string   { return " INDEXED BY " + index }
 func (sqliteDialect) ByteLength(column string) string { return "length(CAST(" + column + " AS BLOB))" }
@@ -77,14 +80,25 @@ type writerTransaction struct {
 func (t *writerTransaction) Commit(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	err := retryDiscoveryRead(ctx, time.Duration(t.timeout)*time.Millisecond, func() error {
 		_, err := t.ExecContext(ctx, "COMMIT")
 		return err
 	})
 	if err == nil {
 		t.active = false
+		return nil
 	}
-	return err
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if _, rollbackErr := t.ExecContext(cleanup, "ROLLBACK"); rollbackErr == nil {
+		t.active = false
+		return err
+	} else {
+		return storepkg.MarkTransactionOutcomeUnknown(errors.Join(err, rollbackErr))
+	}
 }
 func (t *writerTransaction) Rollback(ctx context.Context) error {
 	t.mu.Lock()

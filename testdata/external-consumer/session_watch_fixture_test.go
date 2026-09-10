@@ -187,7 +187,7 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	config := delegatedRuntimeConfig()
 	config.Agent.SystemPrompt = "PRIVATE_SYSTEM"
 	config.Metadata["secret"] = "PRIVATE_METADATA"
-	handle, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.UserMessage{Content: "new submission"}, Config: config})
+	admission, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.UserMessage{Content: "new submission"}, Config: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,27 +222,27 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	close(script.release)
 	select {
 	case <-script.toolStarted:
-	case result := <-handle.Done():
+	case result := <-admission.Handle.Done():
 		t.Fatalf("run finished before tool: %+v", result)
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
 	// Detachment has left the native tool independently running.
 	select {
-	case <-handle.Done():
+	case <-admission.Handle.Done():
 		t.Fatal("run ended while tool paused")
 	default:
 	}
 	close(script.toolRelease)
 	select {
-	case result := <-handle.Done():
+	case result := <-admission.Handle.Done():
 		if result.Status != session.RunCompleted {
 			t.Fatal(result)
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	final := watchTerminal(t, second, handle.RunID())
+	final := watchTerminal(t, second, admission.Handle.RunID())
 	if final.Messages[len(final.Messages)-1].Text != "durable final" || !final.Messages[len(final.Messages)-1].Finalized || len(final.Tools) != 1 || final.Tools[0].Status != session.ToolCallCompleted || script.toolCalls.Load() != 1 {
 		t.Fatal(final)
 	}
@@ -268,18 +268,18 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	if err = interrupted.Interrupt(ctx, "fixture"); err != nil {
+	if err = interrupted.Handle.Interrupt(ctx, "fixture"); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case result := <-interrupted.Done():
+	case result := <-interrupted.Handle.Done():
 		if result.Status != session.RunInterrupted {
 			t.Fatal(result)
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	terminal := watchTerminal(t, observer, interrupted.RunID())
+	terminal := watchTerminal(t, observer, interrupted.Handle.RunID())
 	observer.Close()
 	mount.Deactivate()
 	if err = mount.Close(ctx); err != nil {

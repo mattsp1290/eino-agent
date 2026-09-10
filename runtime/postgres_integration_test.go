@@ -16,6 +16,7 @@ func TestPostgresRuntime(t *testing.T) {
 	server := testpostgres.Start(t)
 	t.Run("admission", func(t *testing.T) { testPostgresRuntimeAdmission(t, server) })
 	t.Run("admission_rollback", func(t *testing.T) { testPostgresRuntimeAdmissionRollback(t, server) })
+	t.Run("keyed_admission_race", func(t *testing.T) { testPostgresKeyedAdmissionRace(t, server) })
 	t.Run("pending_resume", func(t *testing.T) { testPostgresRuntimeResume(t, server) })
 	t.Run("optional_references", func(t *testing.T) { testPostgresRuntimeOptionalReferences(t, server) })
 }

@@ -20,6 +20,7 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 	"github.com/mattsp1290/eino-agent/watch"
 )
 
@@ -63,13 +64,34 @@ type StreamingOrchestrator struct {
 }
 
 // Start admits and asynchronously executes one streaming turn.
-func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Handle, error) {
+func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (AdmissionResult, error) {
 	if err := o.validate(request); err != nil {
-		return nil, err
+		return AdmissionResult{}, err
+	}
+	if request.AdmissionKey != "" {
+		if err := validateAdmissionInputBudget(request); err != nil {
+			return AdmissionResult{}, err
+		}
+	}
+	request = frozenRequest(request)
+	var fingerprint [32]byte
+	if request.AdmissionKey != "" {
+		var err error
+		if err = validateKeyedWorkspace(request); err != nil {
+			return AdmissionResult{}, err
+		}
+		if fingerprint, err = fingerprintAdmission(request); err != nil {
+			return AdmissionResult{}, err
+		}
+		if existing, found, err := o.lookupExistingAdmission(ctx, request.SessionID, request.AdmissionKey, fingerprint); err != nil {
+			return AdmissionResult{}, err
+		} else if found {
+			return existing, nil
+		}
 	}
 	plan, err := o.acquireRunPlan(ctx, RunPlanRequest{SessionID: request.SessionID, Config: request.Config})
 	if err != nil {
-		return nil, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	ownershipTransferred := false
 	defer func() {
@@ -82,10 +104,10 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		Options:   cloneStringMap(request.Config.Agent.Options),
 	})
 	if err != nil {
-		return nil, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	if err := model.ValidateResolved(request.Config.Model, resolved); err != nil {
-		return nil, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
 	}
 	ids := admissionIDs{
 		SessionID:          request.SessionID,
@@ -108,9 +130,14 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		LeaseDuration: o.lease(),
 		Metadata:      request.Metadata,
 		ExtensionPlan: plan.Descriptor(),
+		AdmissionKey:  request.AdmissionKey,
+		Fingerprint:   fingerprint,
 	})
 	if err != nil {
-		return nil, err
+		return o.resolveFailedAdmission(ctx, request, fingerprint, err)
+	}
+	if admitted.Existing {
+		return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionExisting}, nil
 	}
 	execution := newRunExecution(o, plan, admitted.Run)
 	execution.seedDurableMessageFloor(admitted.AssistantMessage.CreatedAt)
@@ -130,7 +157,43 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	}
 	ownershipTransferred = true
 	go o.execute(runCtx, execution, admitted, handle.done)
-	return handle, nil
+	return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionNew, Handle: handle}, nil
+}
+
+func (o *StreamingOrchestrator) resolveFailedAdmission(ctx context.Context, request Request, fingerprint [32]byte, cause error) (AdmissionResult, error) {
+	if request.AdmissionKey == "" {
+		return AdmissionResult{}, cause
+	}
+	existing, found, lookupErr := o.recheckAdmission(ctx, request, fingerprint)
+	if lookupErr != nil {
+		if errors.Is(lookupErr, session.ErrAdmissionConflict) {
+			return AdmissionResult{}, lookupErr
+		}
+		return AdmissionResult{}, admissionUnknownError(cause)
+	}
+	if found {
+		return existing, nil
+	}
+	if storepkg.IsTransactionOutcomeUnknown(cause) {
+		return AdmissionResult{}, admissionUnknownError(cause)
+	}
+	return AdmissionResult{}, cause
+}
+
+func admissionUnknownError(cause error) error {
+	for _, sentinel := range []error{context.Canceled, context.DeadlineExceeded} {
+		if errors.Is(cause, sentinel) {
+			return errors.Join(session.ErrAdmissionUnknown, sentinel)
+		}
+	}
+	return session.ErrAdmissionUnknown
+}
+
+func (o *StreamingOrchestrator) recheckAdmission(ctx context.Context, request Request, fingerprint [32]byte) (AdmissionResult, bool, error) {
+	if request.AdmissionKey == "" {
+		return AdmissionResult{}, false, nil
+	}
+	return o.lookupExistingAdmission(context.WithoutCancel(ctx), request.SessionID, request.AdmissionKey, fingerprint)
 }
 
 // Status returns the current active run for a session.

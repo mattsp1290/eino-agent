@@ -16,6 +16,7 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
+	"github.com/mattsp1290/eino-agent/store/postgres"
 )
 
 const runtimeAdmissionTriggerError = "runtime admission rollback trigger"
@@ -51,14 +52,14 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	handle, err := orchestrator.Start(f.ctx, Request{
+	admission, err := orchestrator.Start(f.ctx, Request{
 		SessionID: sessionID, Message: UserMessage{Content: "postgres question"},
 		Config: orchestratorConfig(), Metadata: map[string]string{"source": "postgres"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitPostgresRuntime(t, f.ctx, handle)
+	result := awaitPostgresRuntime(t, f.ctx, admission.Handle)
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("result=%+v model calls=%d", result, calls.Load())
 	}
@@ -81,6 +82,15 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 		historyMessages[1].Role != einoschema.Assistant || historyMessages[1].Content != "postgres answer" {
 		t.Fatalf("reopened history=%#v", historyMessages)
 	}
+}
+
+func testPostgresKeyedAdmissionRace(t *testing.T, server *testpostgres.Server) {
+	f := newPostgresRuntimeFixture(t, server)
+	secondStore, err := postgres.New(f.ctx, f.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertConcurrentKeyedAdmission(t, f.ctx, []session.Store{f.store, secondStore}, "postgres-keyed-race")
 }
 
 func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Server) {
@@ -113,14 +123,14 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 	assertPostgresAdmissionCountsZero(t, f)
 	removeProbe()
 
-	handle, err := orchestrator.Start(f.ctx, Request{
+	admission, err := orchestrator.Start(f.ctx, Request{
 		SessionID: "postgres-admission-rollback", Message: UserMessage{Content: "retry question"},
 		Config: orchestratorConfig(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitPostgresRuntime(t, f.ctx, handle)
+	result := awaitPostgresRuntime(t, f.ctx, admission.Handle)
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("retry result=%+v model calls=%d", result, calls.Load())
 	}

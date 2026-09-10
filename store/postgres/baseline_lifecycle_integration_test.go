@@ -96,6 +96,7 @@ func testLargeIdentityIndexes(t *testing.T, server *testpostgres.Server) {
 		insertPGRun(t, db, key, ids["runs"], key, "pending")
 		mustExec(t, db, `INSERT INTO public.context_epochs(row_key,id,session_key,record,created_at,closed_at) VALUES($1,$2,$3,'{}'::bytea,$4,'')`, key, []byte(ids["context_epochs"]), key, pgTime)
 		insertPGMessage(t, db, key, ids["messages"], key, key, "assistant")
+		insertPGAdmissionReceipt(t, db, key, key, key, key)
 		insertPGPart(t, db, key, ids["parts"], key, key, key, 0, "tool_call")
 		insertPGTool(t, db, key, ids["tool_calls"], key, key, key, key, "pending")
 		insertPGModelRequest(t, db, ids["model_requests"], key, key, string(incompressibleBytes(size, uint32(77+n))), 0, 0)

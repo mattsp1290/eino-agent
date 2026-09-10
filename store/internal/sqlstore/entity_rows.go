@@ -34,6 +34,18 @@ type messageRow struct {
 	CreatedAt  string `gorm:"column:created_at"`
 }
 
+type admissionRow struct {
+	SessionID          []byte `gorm:"column:session_id"`
+	RunID              []byte `gorm:"column:run_id"`
+	UserMessageID      []byte `gorm:"column:user_message_id"`
+	AssistantMessageID []byte `gorm:"column:assistant_message_id"`
+	AdmissionKey       []byte `gorm:"column:admission_key"`
+	FingerprintVersion uint32 `gorm:"column:fingerprint_version"`
+	Fingerprint        []byte `gorm:"column:fingerprint"`
+	RunStatus          string `gorm:"column:run_status"`
+	CreatedAt          string `gorm:"column:created_at"`
+}
+
 type replayMessageRow struct {
 	ID        []byte `gorm:"column:id"`
 	SessionID []byte `gorm:"column:session_id"`

@@ -83,7 +83,7 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer observer.Close()
-			handle, err := orchestrator.Start(ctx, Request{SessionID: "watched", Message: UserMessage{Content: "user"}, Config: orchestratorConfig()})
+			admission, err := orchestrator.Start(ctx, Request{SessionID: "watched", Message: UserMessage{Content: "user"}, Config: orchestratorConfig()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -93,13 +93,13 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
 				}
-				if err = handle.Interrupt(ctx, "fixture"); err != nil {
+				if err = admission.Handle.Interrupt(ctx, "fixture"); err != nil {
 					t.Fatal(err)
 				}
 			}
 			var result Result
 			select {
-			case result = <-handle.Done():
+			case result = <-admission.Handle.Done():
 			case <-ctx.Done():
 				t.Fatal(ctx.Err())
 			}
@@ -128,7 +128,7 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 				}
 				terminal := false
 				for _, r := range u.Snapshot.Runs {
-					if r.ID == handle.RunID() && r.Terminal() {
+					if r.ID == admission.Handle.RunID() && r.Terminal() {
 						terminal = true
 					}
 				}

@@ -266,15 +266,15 @@ func TestLedgerCancellationAfterDispatchSettlesFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := orchestrator.Start(context.Background(), Request{SessionID: "cancel-ledger-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	admission, err := orchestrator.Start(context.Background(), Request{SessionID: "cancel-ledger-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-started
-	if err := handle.Interrupt(context.Background(), "test cancellation"); err != nil {
+	if err := admission.Handle.Interrupt(context.Background(), "test cancellation"); err != nil {
 		t.Fatal(err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Handle.Done()
 	if result.Status != session.RunInterrupted {
 		t.Fatalf("result = %#v", result)
 	}
@@ -777,9 +777,9 @@ func (s *recordingRequestStreamer) StreamProvider(_ context.Context, request mod
 
 func startAndWaitRequest(t *testing.T, orchestrator *StreamingOrchestrator, request Request) Result {
 	t.Helper()
-	handle, err := orchestrator.Start(context.Background(), request)
+	admission, err := orchestrator.Start(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return <-handle.Done()
+	return <-admission.Handle.Done()
 }

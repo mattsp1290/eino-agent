@@ -22,6 +22,7 @@ type admissionStore struct {
 	toolCalls         map[session.ToolCallID]session.ToolCall
 	epochs            map[session.EpochID]session.ContextEpoch
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
+	admissions        map[string]session.AdmissionRecord
 	appendEventErr    error
 	appendPartErrAt   int
 	appendPartCalls   int
@@ -46,6 +47,7 @@ func newAdmissionStore() *admissionStore {
 		toolCalls:     map[session.ToolCallID]session.ToolCall{},
 		epochs:        map[session.EpochID]session.ContextEpoch{},
 		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
+		admissions:    map[string]session.AdmissionRecord{},
 	}
 }
 
@@ -63,6 +65,7 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
+	s.admissions = tx.admissions
 	return nil
 }
 
@@ -77,6 +80,7 @@ func (s *admissionStore) clone() *admissionStore {
 		toolCalls:         cloneMap(s.toolCalls),
 		epochs:            cloneMap(s.epochs),
 		modelRequests:     cloneMap(s.modelRequests),
+		admissions:        cloneMap(s.admissions),
 		appendEventErr:    s.appendEventErr,
 		appendPartErrAt:   s.appendPartErrAt,
 		appendPartCalls:   s.appendPartCalls,
@@ -87,6 +91,32 @@ func (s *admissionStore) clone() *admissionStore {
 		normalizeEvent:    s.normalizeEvent,
 		listMessagesHook:  s.listMessagesHook,
 	}
+}
+
+func admissionStoreKey(id session.ID, key string) string { return string(id) + "\x00" + key }
+
+func (s *admissionStore) LookupAdmission(_ context.Context, id session.ID, key string) (session.AdmissionRecord, error) {
+	if err := session.ValidateAdmissionKey(key); err != nil {
+		return session.AdmissionRecord{}, err
+	}
+	record, ok := s.admissions[admissionStoreKey(id, key)]
+	if !ok {
+		return session.AdmissionRecord{}, session.ErrNotFound
+	}
+	record.RunStatus = s.runs[record.Receipt.RunID].Status
+	return record, nil
+}
+
+func (s *admissionStore) GetAdmission(ctx context.Context, id session.ID, key string) (session.AdmissionRecord, error) {
+	return s.LookupAdmission(ctx, id, key)
+}
+
+func (s *admissionStore) LockAdmissionSession(_ context.Context, candidate session.Session) (session.Session, error) {
+	if existing, ok := s.sessions[candidate.ID]; ok {
+		return existing, nil
+	}
+	s.sessions[candidate.ID] = candidate
+	return candidate, nil
 }
 
 func (s *admissionStore) CreateSession(_ context.Context, record session.Session) (session.Session, error) {
@@ -466,6 +496,7 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
+	s.admissions = tx.admissions
 	return nil
 }
 
@@ -490,6 +521,25 @@ func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (s
 	run.StartedAt = startedAt
 	s.runs[run.ID] = run
 	return run, nil
+}
+
+func (s *fakeExecutionStore) RecordAdmission(_ context.Context, record session.AdmissionRecord) error {
+	if !s.valid() || session.ValidateAdmissionRecord(record) != nil {
+		return session.ErrAdmissionInvalid
+	}
+	r := record.Receipt
+	run, runOK := s.runs[r.RunID]
+	user, userOK := s.messages[r.UserMessageID]
+	assistant, assistantOK := s.messages[r.AssistantMessageID]
+	if !runOK || !userOK || !assistantOK || r.SessionID != run.SessionID || r.RunID != s.fence.RunID || user.SessionID != r.SessionID || user.RunID != r.RunID || user.Role != session.RoleUser || assistant.SessionID != r.SessionID || assistant.RunID != r.RunID || assistant.Role != session.RoleAssistant {
+		return session.ErrAdmissionInvalid
+	}
+	key := admissionStoreKey(r.SessionID, r.Key)
+	if _, exists := s.admissions[key]; exists {
+		return session.AdmissionConflictError{}
+	}
+	s.admissions[key] = record
+	return nil
 }
 
 func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Duration) (session.Run, error) {
