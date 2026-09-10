@@ -34,20 +34,13 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 	})}}}
 	orch := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 			for _, msg := range request.Messages {
-				if msg.Role == einoschema.Tool {
-					return []*einoschema.Message{einoschema.AssistantMessage("ok:"+request.Identity.SessionID, nil)}, nil
+				if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("ok:" + request.Identity.SessionID)}, nil
 				}
 			}
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID:   "call-" + request.Identity.SessionID,
-				Type: "function",
-				Function: einoschema.FunctionCall{
-					Name:      "echo",
-					Arguments: `{}`,
-				},
-			}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-"+request.Identity.SessionID, "echo", `{}`))}, nil
 		})}),
 		WithClock(func() time.Time { return time.Date(2026, 6, 28, 15, 0, 0, 0, time.UTC) }),
 		WithOwnerID("owner"),
@@ -108,7 +101,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	started := make(chan struct{}, 16)
 	orch := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 			started <- struct{}{}
 			<-ctx.Done()
 			return nil, ctx.Err()

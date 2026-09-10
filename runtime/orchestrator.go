@@ -60,6 +60,7 @@ type StreamingOrchestrator struct {
 	modelRequestSafeOptions []string
 	modelRequestMaxBytes    int
 	contentLimits           session.ContentLimits
+	streamLimits            StreamLimits
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -274,7 +275,7 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 			return TurnSnapshot{}, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		finalIndex := materialized.BaseToFinal[baseIndex]
-		if finalIndex < 0 || finalIndex >= len(snapshot.Messages) || snapshot.Messages[finalIndex] == nil || snapshot.Messages[finalIndex].Role != einoschema.Assistant {
+		if finalIndex < 0 || finalIndex >= len(snapshot.Messages) || snapshot.Messages[finalIndex] == nil || snapshot.Messages[finalIndex].Role != einoschema.AgenticRoleTypeAssistant {
 			return TurnSnapshot{}, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		states[index].MessageIndex = finalIndex
@@ -306,30 +307,33 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 }
 
 func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
-	messages := append([]*einoschema.Message(nil), snapshot.Messages...)
+	messages := append([]*einoschema.AgenticMessage(nil), snapshot.Messages...)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {
 		msg, err := o.streamModelAttempts(ctx, execution, snapshot, currentMessageID, messages, turn+1, usage)
 		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
-		capturedState, err := captureAssistantProviderState(snapshot, currentMessageID, msg)
+		blockIDs := make([]string, len(msg.ContentBlocks))
+		for index := range blockIDs {
+			blockIDs[index] = string(o.ids.NewPartID())
+		}
+		capturedState, publicMsg, err := captureAssistantProviderState(snapshot, currentMessageID, msg, blockIDs)
 		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
+		msg = publicMsg
 		normalizeToolCallIDs(msg, o.ids)
-		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, msg.ToolCalls)
+		calls := functionToolCalls(msg)
+		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, calls)
 		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
-		for index := range preparedCalls {
-			msg.ToolCalls[index] = preparedCalls[index].schemaCall
-		}
-		preparedCalls, err = o.persistAssistantTurn(ctx, execution, snapshot, currentMessageID, msg, capturedState.payloads, preparedCalls)
+		preparedCalls, err = o.persistAssistantTurn(ctx, execution, snapshot, currentMessageID, msg, blockIDs, capturedState.payloads, preparedCalls)
 		if err != nil {
 			return o.executionFailure(ctx, snapshot, currentMessageID, err)
 		}
-		if len(msg.ToolCalls) == 0 {
+		if len(calls) == 0 {
 			return Result{RunID: snapshot.RunID, MessageID: currentMessageID, Status: session.RunCompleted}
 		}
 		if turn >= o.toolTurns() {
@@ -367,7 +371,7 @@ func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runE
 	}
 }
 
-func (o *StreamingOrchestrator) streamModelAttempts(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, step int, usage *model.Usage) (*einoschema.Message, error) {
+func (o *StreamingOrchestrator) streamModelAttempts(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.AgenticMessage, step int, usage *model.Usage) (*einoschema.AgenticMessage, error) {
 	attempts := o.attempts()
 	var last error
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -661,12 +665,6 @@ func eventError(err error) session.EventError {
 	return session.EventError{Message: err.Error()}
 }
 
-type toolCallPayload struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-}
-
 func normalizedToolArguments(arguments string) (json.RawMessage, error) {
 	if arguments == "" {
 		return json.RawMessage(`{}`), nil
@@ -694,16 +692,18 @@ func canonicalToolObject(raw json.RawMessage) (json.RawMessage, error) {
 	return canonical, nil
 }
 
-func normalizeToolCallIDs(msg *einoschema.Message, ids IDGenerator) {
+// normalizeToolCallIDs assigns a durable call ID to every function_tool_call
+// block in msg that the provider left empty.
+func normalizeToolCallIDs(msg *einoschema.AgenticMessage, ids IDGenerator) {
 	if msg == nil {
 		return
 	}
-	for i := range msg.ToolCalls {
-		if msg.ToolCalls[i].ID == "" {
-			msg.ToolCalls[i].ID = string(ids.NewToolCallID())
+	for _, block := range msg.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolCall || block.FunctionToolCall == nil {
+			continue
 		}
-		if msg.ToolCalls[i].Type == "" {
-			msg.ToolCalls[i].Type = "function"
+		if block.FunctionToolCall.CallID == "" {
+			block.FunctionToolCall.CallID = string(ids.NewToolCallID())
 		}
 	}
 }

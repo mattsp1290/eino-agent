@@ -25,7 +25,7 @@ func TestSettleInterruptedToolTreatsSQLNullOutputAsAbsent(t *testing.T) {
 	defer func() { _ = pool.Close() }()
 	host, err := NewStreamingOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil })}),
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil })}),
 		WithIDGenerator(&sequenceIDs{}),
 		WithRunPlanProvider(emptyTestRunPlanProvider()),
 		WithClock(func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) }),
@@ -56,12 +56,16 @@ func TestSettleInterruptedToolTreatsSQLNullOutputAsAbsent(t *testing.T) {
 	snapshot := admitted.Snapshot
 	tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo"}, Retention: RetentionPolicy{MaxInlineBytes: 1 << 16}, Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{}, nil })}
 	snapshot.Tools = []Tool{tool}
-	classic := &einoschema.Message{Role: einoschema.Assistant, ToolCalls: []einoschema.ToolCall{{ID: "call-1", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}}}
-	prepared, err := host.prepareToolCalls(ctx, execution, snapshot, admitted.AssistantMessage.ID, classic.ToolCalls)
+	msg := agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{}`))
+	prepared, err := host.prepareToolCalls(ctx, execution, snapshot, admitted.AssistantMessage.ID, functionToolCalls(msg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := host.persistAssistantTurn(ctx, execution, snapshot, admitted.AssistantMessage.ID, classic, nil, prepared); err != nil {
+	blockIDs := make([]string, len(msg.ContentBlocks))
+	for index := range blockIDs {
+		blockIDs[index] = string(host.ids.NewPartID())
+	}
+	if _, err := host.persistAssistantTurn(ctx, execution, snapshot, admitted.AssistantMessage.ID, msg, blockIDs, nil, prepared); err != nil {
 		t.Fatal(err)
 	}
 	startedAt := host.now()

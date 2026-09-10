@@ -70,7 +70,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		Config: config.Snapshot{
 			Agent: config.Agent{Name: "agent", Mode: "primary", Options: map[string]string{"SECRET": "agent-secret"}},
 		},
-		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.Message{einoschema.SystemMessage("secret conversation"), einoschema.UserMessage("secret user")},
+		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.AgenticMessage{einoschema.SystemAgenticMessage("secret conversation"), einoschema.UserAgenticMessage("secret user")},
 		SystemPrompt: "secret system prompt",
 	}
 	materialized, err := tools.Materialize(context.Background(), definition, runtime.NewToolScopeContext(snapshot))
@@ -469,7 +469,7 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	defer func() { _ = source.close() }()
 	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}}
 	messages, err := source.loadBoundedContext(ctx, metadata)
-	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
+	if err != nil || len(messages) != 1 || agenticMessageText(messages[0]) != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
 	}
 	sink, err := loadEventSinkForTest(loader, ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
@@ -729,17 +729,25 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 	defer func() { _ = storePool.Close() }()
 	var modelTurns atomic.Int64
-	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if modelTurns.Add(1) == 1 {
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID: "wasm-call", Type: "function", Function: einoschema.FunctionCall{
-					Name: "wasm_echo", Arguments: `{"value":1}`,
+			return []*einoschema.AgenticMessage{{
+				Role: einoschema.AgenticRoleTypeAssistant,
+				ContentBlocks: []*einoschema.ContentBlock{
+					einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{
+						CallID: "wasm-call", Name: "wasm_echo", Arguments: `{"value":1}`,
+					}, &einoschema.StreamingMeta{Index: 0}),
 				},
-			}})}, nil
+			}}, nil
 		}
 		for _, message := range request.Messages {
-			if message.Role == einoschema.Tool && strings.Contains(message.Content, `"echo"`) {
-				return []*einoschema.Message{einoschema.AssistantMessage("complete", nil)}, nil
+			if message.Role == einoschema.AgenticRoleTypeUser && strings.Contains(agenticFunctionResultText(message), `"echo"`) {
+				return []*einoschema.AgenticMessage{{
+					Role: einoschema.AgenticRoleTypeAssistant,
+					ContentBlocks: []*einoschema.ContentBlock{
+						einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "complete"}, &einoschema.StreamingMeta{Index: 0}),
+					},
+				}}, nil
 			}
 		}
 		return nil, errors.New("Wasm tool result was not model-visible")
@@ -849,7 +857,7 @@ func (e *signalExporter) Export(context.Context, []einoobs.Observation) error {
 func (*signalExporter) Flush(context.Context) error    { return nil }
 func (*signalExporter) Shutdown(context.Context) error { return nil }
 
-type wasmScriptedStreamer func(context.Context, model.Request) ([]*einoschema.Message, error)
+type wasmScriptedStreamer func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error)
 
 func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	messages, err := s(ctx, request)
@@ -860,12 +868,57 @@ func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.
 	go func() {
 		defer writer.Close()
 		for _, message := range messages {
-			if writer.Send(model.StreamDelta{Message: message, Usage: model.UsageFromMessage(message)}, nil) {
+			if writer.Send(model.StreamDelta{Message: message, Usage: model.UsageFromAgenticMessage(message)}, nil) {
 				return
 			}
 		}
 	}()
 	return reader, nil
+}
+
+// agenticMessageText concatenates the text of every user_input_text or
+// assistant_gen_text block on message.
+func agenticMessageText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeUserInputText:
+			if block.UserInputText != nil {
+				sb.WriteString(block.UserInputText.Text)
+			}
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				sb.WriteString(block.AssistantGenText.Text)
+			}
+		}
+	}
+	return sb.String()
+}
+
+// agenticFunctionResultText concatenates the text content of every
+// function_tool_result block on message.
+func agenticFunctionResultText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, block := range message.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
+			continue
+		}
+		for _, item := range block.FunctionToolResult.Content {
+			if item != nil && item.Type == einoschema.FunctionToolResultContentBlockTypeText && item.Text != nil {
+				sb.WriteString(item.Text.Text)
+			}
+		}
+	}
+	return sb.String()
 }
 
 type wasmTestIDs struct{ next atomic.Uint64 }

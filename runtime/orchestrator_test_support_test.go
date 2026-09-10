@@ -76,7 +76,7 @@ func (r resolvedModel) Resolve(context.Context, model.Selection, model.Runtime) 
 	}, nil
 }
 
-type scriptedStreamer func(context.Context, model.Request) ([]*einoschema.Message, error)
+type scriptedStreamer func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error)
 
 func (s scriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	messages, err := s(ctx, request)
@@ -87,12 +87,177 @@ func (s scriptedStreamer) StreamProvider(ctx context.Context, request model.Requ
 	go func() {
 		defer writer.Close()
 		for _, msg := range messages {
-			if writer.Send(model.StreamDelta{Message: msg, Usage: model.UsageFromMessage(msg)}, nil) {
+			if writer.Send(model.StreamDelta{Message: msg, Usage: model.UsageFromAgenticMessage(msg)}, nil) {
 				return
 			}
 		}
 	}()
 	return reader, nil
+}
+
+// --- Agentic test message helpers -----------------------------------------
+//
+// These build/inspect *schema.AgenticMessage values for scriptedStreamer
+// scripts and assertions, mirroring the classic schema.AssistantMessage /
+// schema.UserMessage / .Content convenience the suite used before the
+// agentic cutover.
+
+// agenticTextChunk returns one streamed assistant_gen_text chunk at the
+// given StreamingMeta index, so concatenating several chunks at the same
+// index merges them into one final block (mirrors a provider streaming one
+// block across multiple deltas).
+func agenticTextChunk(index int, text string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role: einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{
+			einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: text}, &einoschema.StreamingMeta{Index: index}),
+		},
+	}
+}
+
+// agenticToolCallChunk returns one streamed function_tool_call chunk at the
+// given StreamingMeta index.
+func agenticToolCallChunk(index int, callID, name, arguments string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role: einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{
+			einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{CallID: callID, Name: name, Arguments: arguments}, &einoschema.StreamingMeta{Index: index}),
+		},
+	}
+}
+
+// agenticAssistantText returns one complete (non-chunked) assistant message
+// carrying a single assistant_gen_text block.
+func agenticAssistantText(text string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role:          einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: text}}},
+	}
+}
+
+// agenticAssistantReasoning returns one complete assistant message carrying
+// a single reasoning block.
+func agenticAssistantReasoning(text string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role:          einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{{Type: einoschema.ContentBlockTypeReasoning, Reasoning: &einoschema.Reasoning{Text: text}}},
+	}
+}
+
+// agenticAssistantToolCalls returns one complete assistant message carrying
+// one function_tool_call block per call.
+func agenticAssistantToolCalls(calls ...*einoschema.FunctionToolCall) *einoschema.AgenticMessage {
+	blocks := make([]*einoschema.ContentBlock, len(calls))
+	for index, call := range calls {
+		blocks[index] = &einoschema.ContentBlock{Type: einoschema.ContentBlockTypeFunctionToolCall, FunctionToolCall: call}
+	}
+	return &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant, ContentBlocks: blocks}
+}
+
+// agenticToolCall is a small constructor for one function_tool_call value.
+func agenticToolCall(callID, name, arguments string) *einoschema.FunctionToolCall {
+	return &einoschema.FunctionToolCall{CallID: callID, Name: name, Arguments: arguments}
+}
+
+// agenticUserText returns one user message carrying a single
+// user_input_text block.
+func agenticUserText(text string) *einoschema.AgenticMessage {
+	return einoschema.UserAgenticMessage(text)
+}
+
+// agenticSystemText returns one system message carrying a single
+// user_input_text block.
+func agenticSystemText(text string) *einoschema.AgenticMessage {
+	return einoschema.SystemAgenticMessage(text)
+}
+
+// agenticMessageText concatenates every user_input_text/assistant_gen_text
+// block's text on message, in order.
+func agenticMessageText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb []byte
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeUserInputText:
+			if block.UserInputText != nil {
+				sb = append(sb, block.UserInputText.Text...)
+			}
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				sb = append(sb, block.AssistantGenText.Text...)
+			}
+		}
+	}
+	return string(sb)
+}
+
+// agenticReasoningText concatenates every reasoning block's text on message.
+func agenticReasoningText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb []byte
+	for _, block := range message.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeReasoning && block.Reasoning != nil {
+			sb = append(sb, block.Reasoning.Text...)
+		}
+	}
+	return string(sb)
+}
+
+// agenticToolCallsOf returns every function_tool_call block on message, in
+// order.
+func agenticToolCallsOf(message *einoschema.AgenticMessage) []*einoschema.FunctionToolCall {
+	if message == nil {
+		return nil
+	}
+	var calls []*einoschema.FunctionToolCall
+	for _, block := range message.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolCall && block.FunctionToolCall != nil {
+			calls = append(calls, block.FunctionToolCall)
+		}
+	}
+	return calls
+}
+
+// agenticFunctionResultText concatenates the text content of every
+// function_tool_result block on message.
+func agenticFunctionResultText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb []byte
+	for _, block := range message.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
+			continue
+		}
+		for _, item := range block.FunctionToolResult.Content {
+			if item != nil && item.Type == einoschema.FunctionToolResultContentBlockTypeText && item.Text != nil {
+				sb = append(sb, item.Text.Text...)
+			}
+		}
+	}
+	return string(sb)
+}
+
+// isFunctionToolResultMessage reports whether message carries at least one
+// function_tool_result block (the agentic replacement for the classic
+// schema.Tool role check).
+func isFunctionToolResultMessage(message *einoschema.AgenticMessage) bool {
+	if message == nil {
+		return false
+	}
+	for _, block := range message.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolResult {
+			return true
+		}
+	}
+	return false
 }
 
 type deltaStreamerFunc func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error)

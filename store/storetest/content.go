@@ -92,6 +92,13 @@ func contentInt64Ptr(v int64) *int64 { return &v }
 // appendContentMessage converts msg into durable Content, encodes it into
 // Parts, and appends the message and every part under execution. It returns
 // the converted Content for further assertions.
+//
+// function_tool_call and function_tool_result parts are not generically
+// appendable (see store/internal/sqlstore/execution.go's AppendPart guard):
+// the store requires them to arrive through the tool-call lifecycle
+// (CreateToolCall / ClaimToolCall / SettleToolCall) it already owns, so this
+// helper routes each such part through that lifecycle transparently to keep
+// exercising ordinary content round-tripping for every block kind.
 func appendContentMessage(t testing.TB, ctx context.Context, execution session.ExecutionStore, sessionID session.ID, runID session.RunID, id session.MessageID, role session.Role, msg *einoschema.AgenticMessage) session.Content {
 	t.Helper()
 	content, _, err := session.ContentFromAgenticMessage(msg, contentSequentialBlockIDs(string(id)))
@@ -102,11 +109,116 @@ func appendContentMessage(t testing.TB, ctx context.Context, execution session.E
 	if err != nil {
 		t.Fatalf("EncodeContentParts(%s): %v", id, err)
 	}
-	appendMessage(t, ctx, execution, message(id, sessionID, runID, role))
-	for _, p := range parts {
-		appendPart(t, ctx, execution, p)
+	// A message whose sole block is a function_tool_result settles against a
+	// synthetic prerequisite request/claim (see appendFunctionToolResultPart)
+	// and creates its own result message as part of that settlement, so the
+	// generic message append below is skipped for that one shape to avoid
+	// double-appending (and mismatching) the same message ID.
+	onlyResultBlock := len(parts) == 1 && parts[0].Kind == session.PartFunctionToolResult
+	if !onlyResultBlock {
+		appendMessage(t, ctx, execution, message(id, sessionID, runID, role))
+	}
+	for i, p := range parts {
+		switch {
+		case p.Kind == session.PartFunctionToolCall && i < len(content.Blocks):
+			appendFunctionToolCallPart(t, ctx, execution, id, content.Blocks[i], p)
+		case p.Kind == session.PartFunctionToolResult && i < len(content.Blocks):
+			appendFunctionToolResultPart(t, ctx, execution, id, sessionID, runID, role, content.Blocks[i], p)
+		default:
+			appendPart(t, ctx, execution, p)
+		}
 	}
 	return content
+}
+
+// appendFunctionToolCallPart persists a function_tool_call content-block
+// part through CreateToolCall, matching how runtime persists an assistant
+// message's tool calls.
+func appendFunctionToolCallPart(t testing.TB, ctx context.Context, execution session.ExecutionStore, messageID session.MessageID, block session.ContentBlock, part session.Part) {
+	t.Helper()
+	if block.FunctionCall == nil {
+		t.Fatalf("function_tool_call part %s: block missing FunctionCall payload", part.ID)
+	}
+	call := session.ToolCall{
+		ID: session.ToolCallID(block.FunctionCall.CallID), SessionID: part.SessionID, RunID: part.RunID, MessageID: messageID,
+		RequestPartID: part.ID, Name: block.FunctionCall.Name, Input: json.RawMessage(block.FunctionCall.Arguments), Status: session.ToolCallPending,
+	}
+	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+		Call: call, RequestPart: part, Event: session.ToolTransitionEvent{ID: session.EventID("event-create-" + string(part.ID)), CreatedAt: part.CreatedAt},
+	}); err != nil {
+		t.Fatalf("create tool call for part %s: %v", part.ID, err)
+	}
+}
+
+// appendFunctionToolResultPart persists a function_tool_result content-block
+// part through the full CreateToolCall/ClaimToolCall/SettleToolCall
+// lifecycle. Content round-trip fixtures exercise this block kind in
+// isolation (no preceding function_tool_call in the same fixture message),
+// so a synthetic prerequisite request/claim is created first, under its own
+// message: settlement requires an existing claimed call with a matching ID,
+// and the result message (resultMessageID, matching the fixture's own
+// message ID so the caller's part-ownership filter still finds it) is
+// created by the settlement itself rather than pre-appended, since its
+// fields (in particular ParentID) are only known once the synthetic call
+// exists.
+func appendFunctionToolResultPart(t testing.TB, ctx context.Context, execution session.ExecutionStore, resultMessageID session.MessageID, sessionID session.ID, runID session.RunID, role session.Role, block session.ContentBlock, part session.Part) {
+	t.Helper()
+	if block.FunctionResult == nil {
+		t.Fatalf("function_tool_result part %s: block missing FunctionResult payload", part.ID)
+	}
+	callID := session.ToolCallID(block.FunctionResult.CallID)
+	at := part.CreatedAt
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	requestMessageID := session.MessageID(string(resultMessageID) + "-synthetic-request")
+	appendMessage(t, ctx, execution, message(requestMessageID, sessionID, runID, session.RoleAssistant))
+	requestPartID := session.PartID(string(part.ID) + "-synthetic-request")
+	requestParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(requestPartID), Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(callID), Name: block.FunctionResult.Name, Arguments: "{}"},
+		}},
+	}, func() session.PartID { return requestPartID }, requestMessageID, sessionID, runID, at, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("encode synthetic tool request for part %s: %v", part.ID, err)
+	}
+	call := session.ToolCall{
+		ID: callID, SessionID: sessionID, RunID: runID, MessageID: requestMessageID,
+		RequestPartID: requestPartID, ResultMessageID: resultMessageID, ResultPartID: part.ID,
+		Name: block.FunctionResult.Name, Input: json.RawMessage(`{}`), Status: session.ToolCallPending,
+	}
+	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+		Call: call, RequestPart: requestParts[0], Event: session.ToolTransitionEvent{ID: session.EventID("event-create-" + string(part.ID)), CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("create synthetic tool call for result part %s: %v", part.ID, err)
+	}
+	claimed, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+		ID: callID, ClaimedBy: "storetest", ClaimToken: "storetest-" + string(part.ID), StartedAt: at, LeaseDuration: time.Minute,
+		Event: session.ToolTransitionEvent{ID: session.EventID("event-claim-" + string(part.ID)), CreatedAt: at},
+	})
+	if err != nil {
+		t.Fatalf("claim synthetic tool call for result part %s: %v", part.ID, err)
+	}
+	outputText := ""
+	for _, item := range block.FunctionResult.Content {
+		if item.Type == session.ResultContentText {
+			outputText = item.Text
+			break
+		}
+	}
+	settlement := session.ToolSettlement{
+		ID: callID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted,
+		Output: json.RawMessage(outputText), CompletedAt: at,
+		ResultMessage: session.Message{ID: resultMessageID, SessionID: sessionID, RunID: runID, ParentID: requestMessageID, Role: role, CreatedAt: at, UpdatedAt: at},
+		ResultPart:    part,
+	}
+	if _, err := execution.SettleToolCall(ctx, session.SettleToolCallRequest{
+		Settlement: settlement, Event: session.ToolTransitionEvent{ID: session.EventID("event-settle-" + string(part.ID)), CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("settle synthetic tool call for result part %s: %v", part.ID, err)
+	}
 }
 
 // testContentAllBlockKinds round trips one message per BlockKind (plus all
@@ -199,18 +311,30 @@ func testContentAllBlockKinds(t *testing.T, factory Factory) {
 			}},
 		},
 		{
-			// Exercises all five nested FunctionToolResultContentBlock variants
-			// (text, image, audio, video, file) inside one function_tool_result
-			// block.
+			// A production-realistic function_tool_result: exactly one text
+			// content item, matching what runtime's buildTerminalToolEnvelope
+			// always produces (and what store/internal/sqlstore's
+			// ValidToolResultEnvelope therefore requires: a settlement's sole
+			// text item must equal its ToolSettlement.Output byte-for-byte).
+			// This fixture is routed through the real
+			// CreateToolCall/ClaimToolCall/SettleToolCall lifecycle (see
+			// appendFunctionToolResultPart) to prove the store round-trips
+			// this kind end to end, including through the tool_calls table.
+			// Round-trip fidelity across all five nested
+			// FunctionToolResultContentBlock variants (text, image, audio,
+			// video, file) is already covered without a store dependency by
+			// session.TestContentBlockRoundTrip_AllKinds's "function_tool_result_all_variants"
+			// case.
 			name: "function_tool_result_all_variants", kind: session.BlockKindFunctionToolResult, role: session.RoleUser,
 			block: &einoschema.ContentBlock{Type: einoschema.ContentBlockTypeFunctionToolResult, FunctionToolResult: &einoschema.FunctionToolResult{
-				CallID: "call-1", Name: "get_weather",
+				// A distinct CallID from the "function_tool_call" fixture
+				// above: both fixtures run against the same shared store
+				// (see testContentAllBlockKinds) and function_tool_call/
+				// function_tool_result parts are now routed through the
+				// tool_calls table, whose ID is a store-wide primary key.
+				CallID: "call-2", Name: "get_weather",
 				Content: []*einoschema.FunctionToolResultContentBlock{
-					{Type: einoschema.FunctionToolResultContentBlockTypeText, Text: &einoschema.UserInputText{Text: "sunny"}},
-					{Type: einoschema.FunctionToolResultContentBlockTypeImage, Image: &einoschema.UserInputImage{URL: "https://example.com/a.png", MIMEType: "image/png", Detail: einoschema.ImageURLDetailLow}},
-					{Type: einoschema.FunctionToolResultContentBlockTypeAudio, Audio: &einoschema.UserInputAudio{URL: "https://example.com/a.wav", MIMEType: "audio/wav"}},
-					{Type: einoschema.FunctionToolResultContentBlockTypeVideo, Video: &einoschema.UserInputVideo{URL: "https://example.com/a.mp4", MIMEType: "video/mp4"}},
-					{Type: einoschema.FunctionToolResultContentBlockTypeFile, File: &einoschema.UserInputFile{URL: "https://example.com/a.pdf", Name: "a.pdf", MIMEType: "application/pdf"}},
+					{Type: einoschema.FunctionToolResultContentBlockTypeText, Text: &einoschema.UserInputText{Text: `{"forecast":"sunny"}`}},
 				},
 			}},
 		},
@@ -284,11 +408,22 @@ func testContentAllBlockKinds(t *testing.T, factory Factory) {
 			if err != nil {
 				t.Fatalf("list messages: %v", err)
 			}
-			if len(batch.Messages) != 1 || len(batch.Parts) != len(content.Blocks) {
-				t.Fatalf("replay = %d messages, %d parts; want 1, %d", len(batch.Messages), len(batch.Parts), len(content.Blocks))
+			// function_tool_result parts settle against a synthetic
+			// prerequisite request (see appendFunctionToolResultPart), which
+			// adds its own message/part to the session; filter down to the
+			// fixture's own message so the content-fidelity comparison below
+			// still targets exactly the one block under test.
+			var ownParts []session.Part
+			for _, part := range batch.Parts {
+				if part.MessageID == messageID {
+					ownParts = append(ownParts, part)
+				}
+			}
+			if len(batch.Messages) < 1 || len(ownParts) != len(content.Blocks) {
+				t.Fatalf("replay = %d messages, %d own parts; want >=1, %d", len(batch.Messages), len(ownParts), len(content.Blocks))
 			}
 
-			decoded, err := session.DecodeContentParts(c.role, batch.Parts, session.DefaultContentLimits())
+			decoded, err := session.DecodeContentParts(c.role, ownParts, session.DefaultContentLimits())
 			if err != nil {
 				t.Fatalf("DecodeContentParts: %v", err)
 			}

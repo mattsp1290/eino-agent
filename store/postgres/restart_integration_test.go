@@ -93,11 +93,12 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 		Input: json.RawMessage(`{"text":"pending across restart"}`), Status: session.ToolCallPending,
 		RetrySafe: true, Metadata: map[string]string{"fixture": "restart"},
 	}
+	requestPart := postgresToolRequestPart(call.RequestPartID, assistant.ID, sessionID, runID, call.ID, call.Name, call.Input, now.Add(3*time.Nanosecond))
+	requestPart.Ordinal = 1
 	created, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
-		Call: call,
-		RequestPart: session.Part{ID: call.RequestPartID, MessageID: assistant.ID, SessionID: sessionID, RunID: runID, Kind: session.PartToolCall, Ordinal: 1,
-			Payload: json.RawMessage(`{"id":"restart-tool","name":"echo","arguments":{"text":"pending across restart"}}`), CreatedAt: now.Add(3 * time.Nanosecond), UpdatedAt: now.Add(3 * time.Nanosecond)},
-		Event: session.ToolTransitionEvent{ID: "restart-tool-pending", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now.Add(3 * time.Nanosecond)},
+		Call:        call,
+		RequestPart: requestPart,
+		Event:       session.ToolTransitionEvent{ID: "restart-tool-pending", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now.Add(3 * time.Nanosecond)},
 	})
 	if err != nil {
 		t.Fatalf("create pending tool: %v", err)

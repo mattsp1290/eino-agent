@@ -14,7 +14,7 @@ import (
 func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 	t.Parallel()
 
-	originalMessage := einoschema.UserMessage("hello")
+	originalMessage := agenticUserText("hello")
 	originalTool := &einoschema.ToolInfo{Name: "search"}
 	snapshot := TurnSnapshot{
 		SessionID: "session-1",
@@ -30,7 +30,7 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 			Provider: model.Provider{ID: "resolved-provider"},
 			Model:    model.Descriptor{ID: "resolved-model"},
 		},
-		Messages: []*einoschema.Message{originalMessage},
+		Messages: []*einoschema.AgenticMessage{originalMessage},
 		Tools: []Tool{{
 			Info: originalTool,
 		}},
@@ -38,7 +38,7 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 
 	traceAttributes := map[string]string{"request": "original"}
 	request, audited, _, err := auditModelRequest(
-		snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace", Attributes: traceAttributes}, []*einoschema.Message{originalMessage}),
+		snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace", Attributes: traceAttributes}, []*einoschema.AgenticMessage{originalMessage}),
 		[]string{"temperature"}, 0,
 	)
 	if err != nil {
@@ -50,20 +50,20 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 	if request.Identity.AssistantMessageID != "assistant-1" || request.Identity.TraceID != "trace" {
 		t.Fatalf("identity = %#v", request.Identity)
 	}
-	if len(request.Messages) != 1 || len(request.Tools) != 1 {
-		t.Fatalf("messages/tools = %d/%d", len(request.Messages), len(request.Tools))
+	if len(request.Messages) != 1 || len(request.Controls.Tools) != 1 {
+		t.Fatalf("messages/tools = %d/%d", len(request.Messages), len(request.Controls.Tools))
 	}
 	snapshot.Messages = nil
 	snapshot.Tools = nil
 	snapshot.Config.Agent.Options["temperature"] = "changed"
-	originalMessage.Content = "changed"
+	originalMessage.ContentBlocks[0].UserInputText.Text = "changed"
 	originalTool.Name = "changed"
 	traceAttributes["request"] = "changed"
-	if len(request.Messages) != 1 || len(request.Tools) != 1 || request.Messages[0].Content != "hello" || request.Tools[0].Name != "search" || request.Options["temperature"] != "0" || request.Identity.TraceAttributes["request"] != "original" {
+	if len(request.Messages) != 1 || len(request.Controls.Tools) != 1 || agenticMessageText(request.Messages[0]) != "hello" || request.Controls.Tools[0].Name != "search" || request.Options["temperature"] != "0" || request.Identity.TraceAttributes["request"] != "original" {
 		t.Fatalf("request was not cloned: %#v", request)
 	}
-	request.Messages[0].Content = "canonical changed"
-	request.Tools[0].Name = "canonical changed"
+	request.Messages[0].ContentBlocks[0].UserInputText.Text = "canonical changed"
+	request.Controls.Tools[0].Name = "canonical changed"
 	if !strings.Contains(string(audited.Messages[0].Canonical), `"hello"`) || strings.Contains(string(audited.Messages[0].Canonical), "canonical changed") || audited.Tools[0].Name != "search" || audited.SafeCallConfig["temperature"] != "0" {
 		t.Fatalf("audit projection changed with canonical request: %#v", audited)
 	}

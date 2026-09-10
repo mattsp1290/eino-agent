@@ -282,7 +282,7 @@ func TestTurnPreparePointRunsAfterPlannedToolsResolve(t *testing.T) {
 	tool.Resolve = func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil }
 	spec.Components = append(spec.Components, PlanComponent{Component: testPlanComponent("test-tools"), Tools: []PlanTool{tool}})
 	plan := mustTestRunPlan(spec)
-	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.Message{einoschema.UserMessage("hidden")}}
+	snapshot := TurnSnapshot{RunID: "run", SessionID: "session", Messages: []*einoschema.AgenticMessage{agenticUserText("hidden")}}
 	host := mustConfiguredOrchestrator()
 	prepared, err := host.prepareSnapshot(context.Background(), newTestRunExecution(host, plan), snapshot)
 	if err != nil {
@@ -317,7 +317,7 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	component := extension.Component{InstanceID: "clone-failure", Artifact: extension.Artifact{Name: "clone-failure", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
 	var contextEntered, toolEntered bool
 	_, err := registry.Mount(context.Background(), component, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		if err := OnContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, _ ContextSourceInput) ([]*einoschema.Message, error) {
+		if err := OnContextSource(registrar, extension.Registration{ID: "context", Scope: extension.GlobalScope()}, func(_ context.Context, _ ContextSourceInput) ([]*einoschema.AgenticMessage, error) {
 			contextEntered = true
 			return nil, nil
 		}); err != nil {
@@ -338,9 +338,9 @@ func TestProtectedCloneFailureStopsContextAndToolInterceptors(t *testing.T) {
 	}
 	defer plan.Release()
 	messageNested := map[string]any{"value": "original"}
-	message := einoschema.UserMessage("protected")
+	message := agenticUserText("protected")
 	message.Extra = map[string]any{"nested": messageNested, "unsupported": make(chan struct{})}
-	_, err = extension.ApplyTransforms(plan, context.Background(), contextAssemblePoint, contextAssembly{Base: []*einoschema.Message{message}})
+	_, err = extension.ApplyTransforms(plan, context.Background(), contextAssemblePoint, contextAssembly{Base: []*einoschema.AgenticMessage{message}})
 	if err == nil || contextEntered || messageNested["value"] != "original" {
 		t.Fatalf("context clone failure = %v entered=%t nested=%v", err, contextEntered, messageNested)
 	}

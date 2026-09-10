@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 
@@ -15,7 +16,7 @@ import (
 )
 
 type modelStreamResult struct {
-	message       *einoschema.Message
+	message       *einoschema.AgenticMessage
 	usage         model.Usage
 	receivedDelta bool
 	err           error
@@ -28,6 +29,10 @@ const (
 
 func newProviderStreamPanicError() error {
 	return model.Error{Code: providerStreamPanicCode, Message: providerStreamPanicMessage}
+}
+
+func streamLimitError(reason string) error {
+	return model.Error{Code: "stream_limit_exceeded", Message: reason, Cause: model.ErrProviderRejected}
 }
 
 type modelStreamReader interface {
@@ -48,7 +53,7 @@ type modelStreamAttempt struct {
 	modelID     string
 }
 
-func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.Message, attempt, step int, usage *model.Usage) (result modelStreamResult) {
+func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.AgenticMessage, attempt, step int, usage *model.Usage) (result modelStreamResult) {
 	state := modelStreamAttempt{
 		execution: execution, snapshot: snapshot, messageID: messageID, attempt: attempt, step: step,
 		observation: o.startObservedStream(ctx, snapshot, messageID, attempt),
@@ -89,7 +94,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	extension.Notify(execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Attempt: attempt, Step: step,
 		ProviderID: state.providerID, ModelID: state.modelID, RequestRecordID: state.record.ID,
-		MessageCount: len(request.Messages), ToolCount: len(request.Tools), ContentHash: contentHash,
+		MessageCount: len(request.Messages), ToolCount: len(request.Controls.Tools), ContentHash: contentHash,
 	})
 	reader, invokeErr := extension.InvokeAround(execution.dispatch(), ctx, ModelStreamPoint, ModelStreamInput{
 		ProviderID: state.providerID, ModelID: state.modelID, Audited: audited, ContentHash: contentHash,
@@ -107,21 +112,49 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		result.err = model.Error{Code: "nil_provider_stream", Message: "provider returned nil stream"}
 		return result
 	}
-	receiveModelStream(ctx, reader, &result, func(index int64, message *einoschema.Message) {
+	receiveModelStream(ctx, reader, o.streamLimits, &result, func(index int64, message *einoschema.AgenticMessage) {
 		state.observeDelta(ctx, o, index, message)
 	})
 	return result
 }
 
-func (a *modelStreamAttempt) observeDelta(ctx context.Context, host *StreamingOrchestrator, index int64, message *einoschema.Message) {
-	host.sessionObserver.AppendText(a.live, message.Content)
+func (a *modelStreamAttempt) observeDelta(ctx context.Context, host *StreamingOrchestrator, index int64, message *einoschema.AgenticMessage) {
+	content, reasoning := deltaText(message)
+	if content != "" {
+		host.sessionObserver.AppendText(a.live, content)
+	}
 	host.observeStreamChunk(a.observation, index)
 	a.execution.eventSink().Emit(ctx, session.EventRecord{
 		Kind: EventMessageDelta, SessionID: a.snapshot.SessionID, RunID: a.snapshot.RunID,
 		MessageID: a.messageID, EpochID: a.snapshot.EpochID, ProviderID: a.providerID, ModelID: a.modelID,
-		Payload:  mustJSON(map[string]string{"content": message.Content, "reasoning": message.ReasoningContent}),
+		Payload:  mustJSON(map[string]string{"content": content, "reasoning": reasoning}),
 		LiveOnly: true, CreatedAt: host.now(),
 	})
+}
+
+// deltaText extracts the live-visible text of one streamed agentic chunk:
+// the concatenation of every assistant_gen_text block's Text as content, and
+// every reasoning block's Text as reasoning.
+func deltaText(message *einoschema.AgenticMessage) (content, reasoning string) {
+	if message == nil {
+		return "", ""
+	}
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				content += block.AssistantGenText.Text
+			}
+		case einoschema.ContentBlockTypeReasoning:
+			if block.Reasoning != nil {
+				reasoning += block.Reasoning.Text
+			}
+		}
+	}
+	return content, reasoning
 }
 
 func (a *modelStreamAttempt) finalize(ctx context.Context, host *StreamingOrchestrator, result *modelStreamResult) {
@@ -158,9 +191,15 @@ func (a *modelStreamAttempt) observe(host *StreamingOrchestrator, result *modelS
 	host.endObservedStream(a.observation, result.usage)
 }
 
-func receiveModelStream(ctx context.Context, reader modelStreamReader, result *modelStreamResult, onDelta func(int64, *einoschema.Message)) {
+// receiveModelStream drains reader to completion, accumulating chunks under
+// the configured StreamLimits. reader.Close is called exactly once, via
+// defer, regardless of which return path is taken (including a panic
+// unwinding through this frame): Eino's StreamReader.Close is single-use, so
+// no other path in this function may call it.
+func receiveModelStream(ctx context.Context, reader modelStreamReader, limits StreamLimits, result *modelStreamResult, onDelta func(int64, *einoschema.AgenticMessage)) {
 	defer reader.Close()
-	var chunks []*einoschema.Message
+	var chunks []*einoschema.AgenticMessage
+	totalBytes := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			result.err = err
@@ -183,6 +222,20 @@ func receiveModelStream(ctx context.Context, reader modelStreamReader, result *m
 			result.err = model.Error{Code: "malformed_provider_stream", Message: "provider returned nil message chunk"}
 			return
 		}
+		if len(chunks) >= limits.MaxChunks {
+			result.err = streamLimitError("provider stream exceeded the maximum chunk count")
+			return
+		}
+		encoded, marshalErr := json.Marshal(delta.Message)
+		if marshalErr != nil {
+			result.err = model.Error{Code: "malformed_provider_stream", Message: marshalErr.Error(), Cause: marshalErr}
+			return
+		}
+		totalBytes += len(encoded)
+		if totalBytes > limits.MaxBytes {
+			result.err = streamLimitError("provider stream exceeded the maximum byte budget")
+			return
+		}
 		result.receivedDelta = true
 		if onDelta != nil {
 			onDelta(int64(len(chunks)), delta.Message)
@@ -190,20 +243,38 @@ func receiveModelStream(ctx context.Context, reader modelStreamReader, result *m
 		chunks = append(chunks, delta.Message)
 	}
 	if len(chunks) == 0 {
-		result.message = einoschema.AssistantMessage("", nil)
+		result.message = &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant}
 		return
 	}
-	message, err := einoschema.ConcatMessages(chunks)
+	message, err := einoschema.ConcatAgenticMessages(chunks)
 	if err != nil {
 		result.err = model.Error{Code: "malformed_provider_stream", Message: err.Error(), Cause: err}
 		return
 	}
+	// ConcatAgenticMessages short-circuits and returns the single chunk
+	// as-is when len(chunks) == 1, without clearing StreamingMeta the way
+	// its multi-chunk path does. The finalized message must never carry
+	// streaming metadata (model.Request.Clone and session.ContentFromAgenticMessage
+	// both reject it), so strip it defensively regardless of chunk count.
+	clearStreamingMeta(message)
 	result.message = message
 	result.usage = resolveStreamUsage(result.usage, message)
 }
 
-func resolveStreamUsage(observed model.Usage, msg *einoschema.Message) model.Usage {
-	return mergeUsage(model.UsageFromMessage(msg), observed)
+// clearStreamingMeta nils every content block's StreamingMeta on msg.
+func clearStreamingMeta(msg *einoschema.AgenticMessage) {
+	if msg == nil {
+		return
+	}
+	for _, block := range msg.ContentBlocks {
+		if block != nil {
+			block.StreamingMeta = nil
+		}
+	}
+}
+
+func resolveStreamUsage(observed model.Usage, msg *einoschema.AgenticMessage) model.Usage {
+	return mergeUsage(model.UsageFromAgenticMessage(msg), observed)
 }
 
 func mergeUsage(current model.Usage, next model.Usage) model.Usage {

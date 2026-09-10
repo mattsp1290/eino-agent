@@ -46,7 +46,7 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	messages, err := source.loadBoundedContext(context.Background(), runtime.BoundedTurnMetadata{
 		RunID: "run-1", SessionID: "session-1", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1},
 	})
-	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.System || messages[1].Content != "context" {
+	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.AgenticRoleTypeSystem || agenticMessageText(messages[1]) != "context" {
 		t.Fatalf("LoadContext = %#v, %v", messages, err)
 	}
 }
@@ -78,11 +78,16 @@ func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 	}
 	defer func() { _ = storePool.Close() }()
 	var messages []string
-	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, message := range request.Messages {
-			messages = append(messages, message.Content)
+			messages = append(messages, agenticMessageText(message))
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "done"}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}}, nil
 	})
 	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
 	orchestrator, err := runtime.NewStreamingOrchestrator(
@@ -593,7 +598,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	}
 	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", EpochID: "epoch", AgentName: "agent", AgentMode: "primary", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true}
 	messages, err := source.loadBoundedContext(context.Background(), metadata)
-	if err != nil || len(messages) != 1 || messages[0].Content != "from-wasm" {
+	if err != nil || len(messages) != 1 || agenticMessageText(messages[0]) != "from-wasm" {
 		t.Fatalf("context messages = %#v, %v", messages, err)
 	}
 	if contextTurn.AgentName != "agent" || contextTurn.AgentMode != "primary" || contextTurn.ProviderID != "provider" || contextTurn.ModelID != "model" || !contextTurn.HasSystemPrompt || contextTurn.RoleCounts.User != 1 {

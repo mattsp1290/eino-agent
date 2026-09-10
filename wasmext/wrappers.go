@@ -192,11 +192,11 @@ type loadedContextSource struct {
 
 func (s *loadedContextSource) close() error { return s.module.Close() }
 
-func (s *loadedContextSource) loadBoundedContext(ctx context.Context, metadata runtime.BoundedTurnMetadata) ([]*einoschema.Message, error) {
+func (s *loadedContextSource) loadBoundedContext(ctx context.Context, metadata runtime.BoundedTurnMetadata) ([]*einoschema.AgenticMessage, error) {
 	return s.loadContextMetadata(ctx, turnMetadataFromBounded(metadata))
 }
 
-func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.Message, error) {
+func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.AgenticMessage, error) {
 	var output []wittypes.TextMessage
 	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), func(callCtx context.Context) error {
 		var callErr error
@@ -205,7 +205,7 @@ func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 	}); err != nil {
 		return nil, err
 	}
-	messages := make([]*einoschema.Message, 0, len(output))
+	messages := make([]*einoschema.AgenticMessage, 0, len(output))
 	var total int64
 	for _, message := range output {
 		total += int64(len(message.Text))
@@ -214,9 +214,9 @@ func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 		}
 		switch message.Role {
 		case wittypes.TextRoleSystem:
-			messages = append(messages, einoschema.SystemMessage(message.Text))
+			messages = append(messages, einoschema.SystemAgenticMessage(message.Text))
 		case wittypes.TextRoleUser:
-			messages = append(messages, einoschema.UserMessage(message.Text))
+			messages = append(messages, einoschema.UserAgenticMessage(message.Text))
 		default:
 			return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
 		}

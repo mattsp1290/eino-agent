@@ -68,7 +68,14 @@ type ProviderMessageState struct {
 	CodecID          string
 	Version          int
 	CompatibilityKey string
-	Items            []ProviderStateItem
+	// BlockIDs is parallel to the addressed message's content blocks
+	// (BlockIDs[i] names the durable block at ContentBlocks[i]). A
+	// block-bound state-aware streamer uses it to resolve each
+	// ProviderStateItem.BlockID back to a specific content-block index when
+	// restoring. Empty for provider-state paths that only ever restore
+	// message-level items (BlockID "").
+	BlockIDs []string
+	Items    []ProviderStateItem
 }
 
 // ProviderStateCapture is a validated codec capture plus the complete set of
@@ -88,11 +95,12 @@ type ProviderStateCodec interface {
 }
 
 // ProviderStateStreamer is a provider boundary that can safely capture and
-// privately restore provider state.
+// privately restore provider state. It operates on the agentic message
+// boundary; adapters that wrap a classic Eino model translate internally.
 type ProviderStateStreamer interface {
 	Streamer
 	ProviderStateContract() ProviderStateContract
-	CaptureProviderState(*einoschema.Message) (ProviderStateCapture, error)
+	CaptureProviderState(*einoschema.AgenticMessage) (ProviderStateCapture, error)
 }
 
 // ValidateProviderStateContract validates a codec contract against the core ceilings.
@@ -165,6 +173,7 @@ func cloneProviderState(src []ProviderMessageState) []ProviderMessageState {
 	dst := make([]ProviderMessageState, len(src))
 	for i := range src {
 		dst[i] = src[i]
+		dst[i].BlockIDs = cloneSlice(src[i].BlockIDs)
 		dst[i].Items = cloneProviderStateItems(src[i].Items)
 	}
 	return dst

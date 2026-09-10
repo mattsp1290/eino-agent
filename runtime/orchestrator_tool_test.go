@@ -25,21 +25,14 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	var calls int
 	store := newAdmissionStore()
 	sink := &capturingSink{}
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls++
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"text":"hi"}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{"text":"hi"}`))}, nil
 	}), WithQueueSize(16))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -70,12 +63,17 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	}
 	var toolCallParts []session.Part
 	for _, part := range store.parts {
-		if part.Kind == session.PartToolCall {
+		if part.Kind == session.PartFunctionToolCall {
 			toolCallParts = append(toolCallParts, part)
 		}
 	}
-	if len(toolCallParts) != 1 || string(toolCallParts[0].Payload) != `{"id":"call-1","name":"echo","arguments":{"text":"hi"}}` {
+	if len(toolCallParts) != 1 {
 		t.Fatalf("tool call parts = %#v", toolCallParts)
+	}
+	toolCallContent, err := session.DecodeContentParts(session.RoleAssistant, toolCallParts, session.DefaultContentLimits())
+	if err != nil || len(toolCallContent.Blocks) != 1 || toolCallContent.Blocks[0].FunctionCall == nil ||
+		toolCallContent.Blocks[0].FunctionCall.CallID != "call-1" || toolCallContent.Blocks[0].FunctionCall.Name != "echo" || toolCallContent.Blocks[0].FunctionCall.Arguments != `{"text":"hi"}` {
+		t.Fatalf("tool call parts = %#v decoded=%#v err=%v", toolCallParts, toolCallContent, err)
 	}
 	var toolEvents []session.EventRecord
 	for _, event := range sink.waitForKind(t, EventToolCallUpdated, 3) {
@@ -137,13 +135,13 @@ func (s *listMessagesErrorStore) ListMessages(context.Context, session.ID, sessi
 func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 	store := newAdmissionStore()
 	sink := &selectiveToolPanickingSink{delivered: make(chan struct{})}
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-transport", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-transport", "echo", `{}`))}, nil
 	}), WithQueueSize(16))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		return ToolResult{Output: "ok"}, nil
@@ -168,8 +166,8 @@ func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 func TestToolTransitionPersistenceFailureFailsMutation(t *testing.T) {
 	store := newAdmissionStore()
 	store.toolTransitionErr = errors.New("persistent tool event failed")
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-persist", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-persist", "echo", `{}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		return ToolResult{Output: "should not run"}, nil
@@ -208,19 +206,13 @@ func TestStreamingOrchestratorGeneratesMissingToolCallIDsConsistently(t *testing
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("", "echo", `{}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -240,7 +232,7 @@ func TestStreamingOrchestratorGeneratesMissingToolCallIDsConsistently(t *testing
 		t.Fatal("tool call was not created")
 	}
 	for _, part := range store.parts {
-		if part.Kind == session.PartToolCall && !strings.Contains(string(part.Payload), `"id":"`+string(callID)+`"`) {
+		if part.Kind == session.PartFunctionToolCall && !strings.Contains(string(part.Payload), `"call_id":"`+string(callID)+`"`) {
 			t.Fatalf("tool call payload %s does not contain generated id %s", part.Payload, callID)
 		}
 	}
@@ -250,20 +242,13 @@ func TestStreamingOrchestratorBoundsToolOutput(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name:      "echo",
@@ -289,20 +274,13 @@ func TestStreamingOrchestratorContinuesAfterToolFailurePayload(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool && strings.Contains(msg.Content, "operational_failure") {
-				return []*einoschema.Message{einoschema.AssistantMessage("recovered", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) && strings.Contains(agenticFunctionResultText(msg), "operational_failure") {
+				return []*einoschema.AgenticMessage{agenticAssistantText("recovered")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -328,20 +306,13 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 
 	var executed bool
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("handled")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"target":"go"}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{"target":"go"}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name:      "echo",
@@ -379,10 +350,8 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 
 func TestStreamingOrchestratorPatternFailurePrecedesPolicyAndPersistence(t *testing.T) {
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID: "call-pattern-failure", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"value":1}`},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-pattern-failure", "echo", `{"value":1}`))}, nil
 	}))
 	patternErr := errors.New("pattern failed")
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -414,15 +383,8 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -483,13 +445,13 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 	}}}
 	orch := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 			for _, message := range request.Messages {
-				if message.Role == einoschema.Tool {
-					return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				if message.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(message) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 				}
 			}
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-cancel", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-cancel", "echo", `{}`))}, nil
 		})}),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
 		WithClock(func() time.Time { return time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC) }),
@@ -533,14 +495,14 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 	var modelVisible string
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 			for _, message := range request.Messages {
-				if message.Role == einoschema.Tool {
-					modelVisible = message.Content
-					return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				if message.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(message) {
+					modelVisible = agenticFunctionResultText(message)
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 				}
 			}
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-denied", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-denied", "echo", `{}`))}, nil
 		})}),
 		WithRunPlanProvider(staticRunPlanProvider{plan: plan}),
 		WithPermissions(permissions.PolicyFunc(func(context.Context, permissions.Request) (permissions.Decision, error) {
@@ -575,15 +537,8 @@ func TestStreamingOrchestratorFailsWhenToolLoopExceedsLimit(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-loop",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-loop", "echo", `{}`))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",

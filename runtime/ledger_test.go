@@ -25,13 +25,13 @@ func TestLedgerProjectionEqualsSubmittedRequestAndExcludesCredentials(t *testing
 	}
 	defer func() { _ = storePool.Close() }()
 	var submitted model.Request
-	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		var cloneErr error
 		submitted, cloneErr = request.Clone()
 		if cloneErr != nil {
 			return nil, cloneErr
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
@@ -80,9 +80,9 @@ func TestModelRequestLedgerPersistsAndSetsIdempotencyKeyByDefault(t *testing.T) 
 	}
 	defer func() { _ = storePool.Close() }()
 	var submitted model.Request
-	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		submitted = request
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
@@ -106,14 +106,14 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 	defer func() { _ = storePool.Close() }()
 	var mu sync.Mutex
 	calls := 0
-	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		calls++
 		if calls == 1 {
 			return nil, model.Error{Code: "temporary", Message: "temporary", Retryable: true}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()), WithAttempts(2))
 	if err != nil {
@@ -137,17 +137,15 @@ func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
 	defer func() { _ = storePool.Close() }()
 	providerCalls := 0
 	toolExecutions := 0
-	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(_ context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 		providerCalls++
 		switch providerCalls {
 		case 1:
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID: "call-once", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`},
-			}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-once", "echo", `{}`))}, nil
 		case 2:
 			return nil, model.Error{Code: "temporary", Message: "retry second step", Retryable: true}
 		default:
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		}
 	})
 	orchestrator, err := NewStreamingOrchestrator(
@@ -205,9 +203,9 @@ func TestLedgerDoesNotRetryAfterLiveDeltas(t *testing.T) {
 	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 		attempts++
 		reader, writer := einoschema.Pipe[model.StreamDelta](3)
-		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-a", nil), Usage: model.Usage{InputTokens: 3}}, nil)
-		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("partial-b", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 2}}, nil)
-		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("ignored", nil), Usage: model.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}}, model.Error{Code: "temporary", Message: "do not retry", Retryable: true})
+		_ = writer.Send(model.StreamDelta{Message: agenticAssistantText("partial-a"), Usage: model.Usage{InputTokens: 3}}, nil)
+		_ = writer.Send(model.StreamDelta{Message: agenticAssistantText("partial-b"), Usage: model.Usage{InputTokens: 3, OutputTokens: 2}}, nil)
+		_ = writer.Send(model.StreamDelta{Message: agenticAssistantText("ignored"), Usage: model.Usage{InputTokens: 3, OutputTokens: 4, ReasoningTokens: 1}}, model.Error{Code: "temporary", Message: "do not retry", Retryable: true})
 		writer.Close()
 		return reader, nil
 	})
@@ -294,7 +292,7 @@ func TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage(t *testing.
 	failingStore := &terminalUpdateFailingStore{Store: store, err: updateErr}
 	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 		reader, writer := einoschema.Pipe[model.StreamDelta](1)
-		_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil), Usage: model.Usage{InputTokens: 4, OutputTokens: 2}}, nil)
+		_ = writer.Send(model.StreamDelta{Message: agenticAssistantText("done"), Usage: model.Usage{InputTokens: 4, OutputTokens: 2}}, nil)
 		writer.Close()
 		return reader, nil
 	})
@@ -328,7 +326,7 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
 	defer cleanup()
 
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		panic(secret)
 	})
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
@@ -369,8 +367,8 @@ func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 	streamer := deltaStreamerFunc(func(context.Context, model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 		attempts++
 		origin := einoschema.StreamReaderFromArray([]model.StreamDelta{
-			{Message: einoschema.AssistantMessage("partial", nil), Usage: model.Usage{InputTokens: 5, OutputTokens: 2}},
-			{Message: einoschema.AssistantMessage("panic", nil), Usage: model.Usage{InputTokens: 5, OutputTokens: 4}},
+			{Message: agenticAssistantText("partial"), Usage: model.Usage{InputTokens: 5, OutputTokens: 2}},
+			{Message: agenticAssistantText("panic"), Usage: model.Usage{InputTokens: 5, OutputTokens: 4}},
 		})
 		converted := 0
 		return einoschema.StreamReaderWithConvert(origin, func(delta model.StreamDelta) (model.StreamDelta, error) {
@@ -420,9 +418,9 @@ func TestModelLifecycleNotificationsSkipDispatchStartFailure(t *testing.T) {
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
 	defer cleanup()
 	called := false
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		called = true
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(failingStore), WithModelResolver(resolvedModel{streamer: streamer}),
@@ -452,8 +450,8 @@ func TestModelLifecycleNotificationsPairOnSuccess(t *testing.T) {
 	var completed []ModelCompletedNotice
 	plan, cleanup := modelLifecycleNoticePlan(t, &sequence, &completed)
 	defer cleanup()
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
@@ -474,19 +472,19 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 	}
 	defer func() { _ = storePool.Close() }()
 	var calls int
-	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls++
 		if calls == 1 {
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "ledger-tool-call", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hello"}`}}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("ledger-tool-call", "echo", `{"text":"hello"}`))}, nil
 		}
 		foundResult := false
 		for _, message := range request.Messages {
-			foundResult = foundResult || message.Role == einoschema.Tool
+			foundResult = foundResult || (message.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(message))
 		}
 		if !foundResult {
 			return nil, errors.New("tool result missing from follow-up request")
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Desc: "echo"}, Retention: RetentionPolicy{MaxInlineBytes: 4096}, Executor: runtimeToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		return ToolResult{Output: string(call.Input)}, nil
@@ -508,21 +506,21 @@ func TestLedgerRecordsToolFollowUpAsNextStep(t *testing.T) {
 func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
 	tests := []struct {
 		name   string
-		mutate func(*einoschema.Message)
+		mutate func(*einoschema.AgenticMessage)
 	}{
-		{name: "extra", mutate: func(message *einoschema.Message) {
+		{name: "message extra", mutate: func(message *einoschema.AgenticMessage) {
 			message.Extra = map[string]any{"credential": "sentinel"}
 		}},
-		{name: "deprecated multi content", mutate: func(message *einoschema.Message) {
-			//nolint:staticcheck // The ownership boundary must reject this field.
-			message.MultiContent = []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}
+		{name: "block extra", mutate: func(message *einoschema.AgenticMessage) {
+			message.ContentBlocks[0].Extra = map[string]any{"credential": "sentinel"}
 		}},
-		{name: "streaming metadata", mutate: func(message *einoschema.Message) {
-			message.AssistantGenMultiContent = []einoschema.MessageOutputPart{{
-				Type: einoschema.ChatMessagePartTypeText, Text: "partial",
-				StreamingMeta: &einoschema.MessageStreamingMeta{Index: 0},
-			}}
-		}},
+		// Deliberately no "streaming metadata" case here: a legitimate
+		// single-chunk provider response (e.g. any classic-adapter turn)
+		// also carries StreamingMeta on its lone chunk, because
+		// schema.ConcatAgenticMessages short-circuits len==1 input without
+		// clearing it. receiveModelStream clears it defensively for that
+		// reason, so a stray StreamingMeta marker is no longer a
+		// distinguishable "unsafe output" signal.
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -532,14 +530,11 @@ func TestUnsafeProviderOutputFailsBeforeSecondRequest(t *testing.T) {
 			}
 			defer func() { _ = storePool.Close() }()
 			calls := 0
-			streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 				calls++
-				message := einoschema.AssistantMessage("", []einoschema.ToolCall{{
-					ID: "unsafe-call", Type: "function",
-					Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hello"}`},
-				}})
+				message := agenticAssistantToolCalls(agenticToolCall("unsafe-call", "echo", `{"text":"hello"}`))
 				test.mutate(message)
-				return []*einoschema.Message{message}, nil
+				return []*einoschema.AgenticMessage{message}, nil
 			})
 			tool := Tool{Name: "echo", Info: &einoschema.ToolInfo{Name: "echo"}, Executor: runtimeToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 				return ToolResult{Output: "hello"}, nil
@@ -576,9 +571,9 @@ func TestLedgerAuditFailureAfterAdmissionSettlesRunWithoutDispatch(t *testing.T)
 	}
 	defer func() { _ = storePool.Close() }()
 	called := false
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		called = true
-		return []*einoschema.Message{einoschema.AssistantMessage("unexpected", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("unexpected")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
@@ -695,33 +690,23 @@ func TestAuditModelRequestRejectsUnsafeAndDeprecatedMessageShapes(t *testing.T) 
 	unsafe := map[string]any{"credential": "sentinel"}
 	tests := []struct {
 		name   string
-		mutate func(*einoschema.Message)
+		mutate func(*einoschema.AgenticMessage)
 	}{
-		{name: "tool call", mutate: func(message *einoschema.Message) {
-			message.ToolCalls = []einoschema.ToolCall{{Extra: unsafe}}
+		{name: "message extra", mutate: func(message *einoschema.AgenticMessage) {
+			message.Extra = unsafe
 		}},
-		{name: "deprecated MultiContent", mutate: func(message *einoschema.Message) {
-			//nolint:staticcheck // The audit boundary must reject the deprecated field.
-			message.MultiContent = []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}
+		{name: "block extra", mutate: func(message *einoschema.AgenticMessage) {
+			message.ContentBlocks[0].Extra = unsafe
 		}},
-		{name: "input part", mutate: func(message *einoschema.Message) {
-			message.UserInputMultiContent = []einoschema.MessageInputPart{{Extra: unsafe}}
-		}},
-		{name: "input media", mutate: func(message *einoschema.Message) {
-			message.UserInputMultiContent = []einoschema.MessageInputPart{{Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{Extra: unsafe}}}}
-		}},
-		{name: "output part", mutate: func(message *einoschema.Message) {
-			message.AssistantGenMultiContent = []einoschema.MessageOutputPart{{Extra: unsafe}}
-		}},
-		{name: "output media", mutate: func(message *einoschema.Message) {
-			message.AssistantGenMultiContent = []einoschema.MessageOutputPart{{Audio: &einoschema.MessageOutputAudio{MessagePartCommon: einoschema.MessagePartCommon{Extra: unsafe}}}}
+		{name: "streaming metadata", mutate: func(message *einoschema.AgenticMessage) {
+			message.ContentBlocks[0].StreamingMeta = &einoschema.StreamingMeta{Index: 0}
 		}},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			message := einoschema.UserMessage("hello")
+			message := agenticUserText("hello")
 			test.mutate(message)
-			if _, _, _, err := auditModelRequest(model.Request{Messages: []*einoschema.Message{message}}, nil, 0); err == nil {
+			if _, _, _, err := auditModelRequest(model.Request{Messages: []*einoschema.AgenticMessage{message}}, nil, 0); err == nil {
 				t.Fatal("unsafe nested Extra was accepted")
 			}
 		})
@@ -729,7 +714,9 @@ func TestAuditModelRequestRejectsUnsafeAndDeprecatedMessageShapes(t *testing.T) 
 }
 
 func TestLedgerUsesExecutionScopedWriterCapability(t *testing.T) {
-	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, errors.New("unused") })}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
+	_, err := NewStreamingOrchestrator(WithStore(newAdmissionStore()), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return nil, errors.New("unused")
+	})}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()))
 	if err != nil {
 		t.Fatalf("construction error = %v", err)
 	}
@@ -770,7 +757,7 @@ func (s *recordingRequestStreamer) StreamProvider(_ context.Context, request mod
 		return nil, err
 	}
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
-	_ = writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil)}, nil)
+	_ = writer.Send(model.StreamDelta{Message: agenticAssistantText("done")}, nil)
 	writer.Close()
 	return reader, nil
 }

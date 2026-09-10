@@ -141,9 +141,9 @@ func TestLoadProviderHistoryIgnoresMalformedInactiveCompactedState(t *testing.T)
 		},
 		PartOwnerMessageIDs: []session.MessageID{"old", "tail", "summary"},
 	}
-	ordinary := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil })}
+	ordinary := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil })}
 	messages, states, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, ordinary)
-	if err != nil || len(states) != 0 || len(messages) != 2 || messages[0].Content != "summary" || messages[1].Content != "tail" {
+	if err != nil || len(states) != 0 || len(messages) != 2 || agenticMessageText(messages[0]) != "summary" || agenticMessageText(messages[1]) != "tail" {
 		t.Fatalf("messages/states/error = %#v/%#v/%v", messages, states, err)
 	}
 }
@@ -184,9 +184,9 @@ func TestProviderStateStreamerCallbackPanicsAreContentFree(t *testing.T) {
 
 	capturePanic := &panicRuntimeProviderStateStreamer{contract: runtimeProviderStateContract(), panicCapture: true}
 	snapshot := TurnSnapshot{SessionID: "session", RunID: "run", Model: model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: capturePanic}}
-	message := einoschema.AssistantMessage("answer", nil)
+	message := agenticAssistantText("answer")
 	message.Extra = map[string]any{providerStateExtraKey: []json.RawMessage{providerStateRawItems[0]}}
-	_, err = captureAssistantProviderState(snapshot, "assistant", message)
+	_, _, err = captureAssistantProviderState(snapshot, "assistant", message, nil)
 	if !errors.Is(err, model.ErrProviderStateInvalid) || strings.Contains(err.Error(), "STATE_SENTINEL") {
 		t.Fatalf("capture panic error = %v", err)
 	}
@@ -209,7 +209,7 @@ func (s *panicRuntimeProviderStateStreamer) ProviderStateContract() model.Provid
 	return s.contract
 }
 
-func (s *panicRuntimeProviderStateStreamer) CaptureProviderState(*einoschema.Message) (model.ProviderStateCapture, error) {
+func (s *panicRuntimeProviderStateStreamer) CaptureProviderState(*einoschema.AgenticMessage) (model.ProviderStateCapture, error) {
 	if s.panicCapture {
 		panic("STATE_SENTINEL")
 	}
@@ -222,7 +222,7 @@ func providerStateResolvedForTest(t *testing.T) model.Resolved {
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamer, err := model.NewEinoStreamerWithProviderState(&runtimeProviderStateModel{}, codec)
+	streamer, err := model.NewClassicStreamerWithProviderState(&runtimeProviderStateModel{}, codec)
 	if err != nil {
 		t.Fatal(err)
 	}

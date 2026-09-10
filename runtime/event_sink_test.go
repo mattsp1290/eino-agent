@@ -93,8 +93,8 @@ func TestBlockedInfrastructureSinkCannotBlockAdmissionOrHandleDone(t *testing.T)
 	release := make(chan struct{})
 	var once sync.Once
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}), WithEventSink(EventSinkFunc(func(context.Context, session.EventRecord) {
 		once.Do(func() { close(started) })
 		<-release

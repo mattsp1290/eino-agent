@@ -50,7 +50,7 @@ func (s *Store) createToolCall(ctx context.Context, record session.ToolCall) (se
 		}
 		return session.ToolCall{}, session.ErrConflict
 	}
-	if err := s.dbFor(ctx).Table(s.tableName("parts")).Where("row_key = ? AND message_key = ? AND session_key = ? AND run_key = ? AND kind = ?", partKey, messageKey, sessionKey, runKey, string(session.PartToolCall)).Count(&count).Error; err != nil || count != 1 {
+	if err := s.dbFor(ctx).Table(s.tableName("parts")).Where("row_key = ? AND message_key = ? AND session_key = ? AND run_key = ? AND kind = ?", partKey, messageKey, sessionKey, runKey, string(session.PartFunctionToolCall)).Count(&count).Error; err != nil || count != 1 {
 		if err != nil {
 			return session.ToolCall{}, s.mapErr(err)
 		}

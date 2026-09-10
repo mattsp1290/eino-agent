@@ -29,7 +29,11 @@ func TestSystemPromptMaterializationIsUnconditionalAndOrdered(t *testing.T) {
 
 func TestFallbackModelPrependsSystemWithoutReorderingDurableMessages(t *testing.T) {
 	client := &capturingChatModel{}
-	reader, err := model.NewEinoStreamer(client).StreamProvider(context.Background(), model.Request{System: "generated", Messages: []*einoschema.Message{einoschema.SystemMessage("durable"), einoschema.UserMessage("hello")}, Tools: []*einoschema.ToolInfo{{Name: "echo"}}})
+	reader, err := model.NewClassicStreamer(client).StreamProvider(context.Background(), model.Request{
+		System:   "generated",
+		Messages: []*einoschema.AgenticMessage{agenticSystemText("durable"), agenticUserText("hello")},
+		Controls: model.RequestControls{Tools: []*einoschema.ToolInfo{{Name: "echo"}}},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +102,6 @@ func TestMountedGuardsReceiveIsolatedRequests(t *testing.T) {
 
 type capturingChatModel struct {
 	messages      []*einoschema.Message
-	cloneErr      error
 	toolBindings  int
 	streamOptions int
 }
@@ -108,10 +111,7 @@ func (m *capturingChatModel) Generate(context.Context, []*einoschema.Message, ..
 }
 
 func (m *capturingChatModel) Stream(_ context.Context, messages []*einoschema.Message, options ...einomodel.Option) (*einoschema.StreamReader[*einoschema.Message], error) {
-	m.messages, m.cloneErr = cloneProtectedMessages(messages)
-	if m.cloneErr != nil {
-		return nil, m.cloneErr
-	}
+	m.messages = messages
 	m.streamOptions = len(options)
 	reader, writer := einoschema.Pipe[*einoschema.Message](1)
 	writer.Close()

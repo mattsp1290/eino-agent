@@ -6,8 +6,24 @@ import (
 	"io"
 	"testing"
 
+	einoschema "github.com/cloudwego/eino/schema"
+
 	"github.com/mattsp1290/eino-agent/model"
 )
+
+// textOf concatenates every assistant_gen_text block's text, in order.
+func textOf(msg *einoschema.AgenticMessage) string {
+	if msg == nil {
+		return ""
+	}
+	var out string
+	for _, block := range msg.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeAssistantGenText && block.AssistantGenText != nil {
+			out += block.AssistantGenText.Text
+		}
+	}
+	return out
+}
 
 func TestStreamProviderEmitsCumulativeUsageAndChunks(t *testing.T) {
 	t.Parallel()
@@ -41,7 +57,7 @@ func TestStreamProviderEmitsCumulativeUsageAndChunks(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Recv error = %v", err)
 		}
-		content += delta.Message.Content
+		content += textOf(delta.Message)
 		usages = append(usages, delta.Usage)
 	}
 	if content != "hello world" {
@@ -106,11 +122,11 @@ func TestStreamProviderSnapshotsProviderState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Recv error = %v", err)
 	}
-	if delta.Message.Content != "original" {
-		t.Fatalf("content = %q, want original", delta.Message.Content)
+	if textOf(delta.Message) != "original" {
+		t.Fatalf("content = %q, want original", textOf(delta.Message))
 	}
-	if delta.Message.Extra["provider_id"] != "fake" {
-		t.Fatalf("provider id = %q, want fake", delta.Message.Extra["provider_id"])
+	if len(delta.Message.Extra) != 0 {
+		t.Fatalf("agentic chunks must not carry Extra, got %v", delta.Message.Extra)
 	}
 }
 
@@ -148,6 +164,58 @@ func TestProviderSentinelErrorsPreserveRetryability(t *testing.T) {
 				t.Fatalf("provider error = %#v", providerErr)
 			}
 		})
+	}
+}
+
+func TestStepBlocksAreEmittedWithStreamingIndex(t *testing.T) {
+	t.Parallel()
+
+	provider := &Provider{
+		ID: "fake",
+		Steps: []Step{{Blocks: []*einoschema.ContentBlock{
+			einoschema.NewContentBlockChunk(&einoschema.Reasoning{Text: "thinking"}, &einoschema.StreamingMeta{Index: 1}),
+			einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "answer"}, &einoschema.StreamingMeta{Index: 0}),
+		}}},
+	}
+	streamer, err := provider.Build(context.Background(), model.Selection{ProviderID: "fake", ModelID: "m1"}, model.Runtime{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := streamer.StreamProvider(context.Background(), model.Request{})
+	if err != nil {
+		t.Fatalf("StreamProvider error = %v", err)
+	}
+	defer reader.Close()
+	delta, err := reader.Recv()
+	if err != nil {
+		t.Fatalf("Recv error = %v", err)
+	}
+	if len(delta.Message.ContentBlocks) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(delta.Message.ContentBlocks))
+	}
+	if delta.Message.ContentBlocks[0].StreamingMeta == nil || delta.Message.ContentBlocks[0].StreamingMeta.Index != 1 {
+		t.Fatalf("block 0 streaming meta = %#v", delta.Message.ContentBlocks[0].StreamingMeta)
+	}
+	if delta.Message.ContentBlocks[1].StreamingMeta == nil || delta.Message.ContentBlocks[1].StreamingMeta.Index != 0 {
+		t.Fatalf("block 1 streaming meta = %#v", delta.Message.ContentBlocks[1].StreamingMeta)
+	}
+}
+
+func TestNewAgenticModelDirectUse(t *testing.T) {
+	t.Parallel()
+
+	agentic := NewAgenticModel("fake", "m1", []Step{{Content: "hi"}})
+	reader, err := agentic.Stream(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	msg, err := reader.Recv()
+	if err != nil {
+		t.Fatalf("Recv error = %v", err)
+	}
+	if textOf(msg) != "hi" {
+		t.Fatalf("content = %q, want hi", textOf(msg))
 	}
 }
 

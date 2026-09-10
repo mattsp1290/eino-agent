@@ -330,7 +330,7 @@ func (s *admissionStore) CreateToolCall(_ context.Context, request session.Creat
 	if err != nil {
 		return session.ToolTransitionResult{}, err
 	}
-	if request.RequestPart.ID == "" || request.RequestPart.ID != call.RequestPartID || request.RequestPart.Kind != session.PartToolCall {
+	if request.RequestPart.ID == "" || request.RequestPart.ID != call.RequestPartID || request.RequestPart.Kind != session.PartFunctionToolCall {
 		return session.ToolTransitionResult{}, session.ErrConflict
 	}
 	if _, err := s.AppendPart(context.Background(), request.RequestPart); err != nil {

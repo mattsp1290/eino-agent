@@ -18,7 +18,7 @@ func FreezeTurnSnapshot(
 	epochID session.EpochID,
 	snapshot config.Snapshot,
 	resolved model.Resolved,
-	messages []*einoschema.Message,
+	messages []*einoschema.AgenticMessage,
 	systemPrompt string,
 	now time.Time,
 ) (TurnSnapshot, error) {
@@ -31,7 +31,7 @@ func freezeTurnSnapshotWithProviderState(
 	epochID session.EpochID,
 	snapshot config.Snapshot,
 	resolved model.Resolved,
-	messages []*einoschema.Message,
+	messages []*einoschema.AgenticMessage,
 	providerState []model.ProviderMessageState,
 	systemPrompt string,
 	now time.Time,

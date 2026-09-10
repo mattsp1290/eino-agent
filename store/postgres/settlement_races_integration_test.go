@@ -127,10 +127,11 @@ func seedClaimedTool(t *testing.T, f *raceFixture) session.ToolCall {
 	return claimed.Call
 }
 func toolSettlement(call session.ToolCall, at time.Time, status session.ToolCallStatus, output json.RawMessage, errText string, eventID session.EventID) session.SettleToolCallRequest {
+	resultMessage, resultPart := postgresToolResultEnvelope(call, output, at)
 	return session.SettleToolCallRequest{
 		Settlement: session.ToolSettlement{ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: status, Output: output, Error: errText, CompletedAt: at,
-			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: at, UpdatedAt: at},
-			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: at, UpdatedAt: at}},
+			ResultMessage: resultMessage,
+			ResultPart:    resultPart},
 		Event: session.ToolTransitionEvent{ID: eventID, CreatedAt: at},
 	}
 }
@@ -188,8 +189,7 @@ func assertCanonicalToolSettlement(t *testing.T, f *raceFixture, result session.
 		t.Fatalf("settlement envelope counts invalid: %v", err)
 	}
 	var messageFound, partFound bool
-	expectedMessage := session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: call.CompletedAt, UpdatedAt: call.CompletedAt}
-	expectedPart := session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: call.Output, CreatedAt: call.CompletedAt, UpdatedAt: call.CompletedAt}
+	expectedMessage, expectedPart := postgresToolResultEnvelope(call, call.Output, call.CompletedAt)
 	for _, message := range messages.Messages {
 		if message.ID == seeded.ResultMessageID {
 			if messageFound || !reflect.DeepEqual(message, expectedMessage) {
@@ -268,7 +268,7 @@ func testToolTransitionRace(t *testing.T, server *testpostgres.Server) {
 
 func pendingToolRequest(now time.Time, eventID session.EventID) session.CreateToolCallRequest {
 	call := session.ToolCall{ID: "tool", SessionID: "session", RunID: "run", MessageID: "request-message", RequestPartID: "request-part", ResultMessageID: "result-message", ResultPartID: "result-part", Name: "lookup", Input: json.RawMessage(`{"key":"value"}`), Status: session.ToolCallPending, RetrySafe: true}
-	part := session.Part{ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolCall, Payload: json.RawMessage(`{"id":"tool","name":"lookup","arguments":{"key":"value"}}`), CreatedAt: now, UpdatedAt: now}
+	part := postgresToolRequestPart(call.RequestPartID, call.MessageID, call.SessionID, call.RunID, call.ID, call.Name, call.Input, now)
 	return session.CreateToolCallRequest{Call: call, RequestPart: part, Event: session.ToolTransitionEvent{ID: eventID, CreatedAt: now}}
 }
 

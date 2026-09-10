@@ -319,7 +319,7 @@ func TestObservationAssistantToolFinalizationAtomic(t *testing.T) {
 	defer func() { _ = st.db.Close() }()
 	ctx := t.Context()
 	call.RequestPartID = "request"
-	request := session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolCall, Payload: []byte(`{"id":"call-tool","name":"tool","arguments":{"ok":true}}`)}, Event: session.ToolTransitionEvent{ID: "pending", CreatedAt: now}}
+	request := sqliteCreateRequest(call, "pending", now)
 	rollback := errors.New("rollback")
 	write := func(ctx context.Context, tx session.ExecutionStore) error {
 		if _, err := tx.AppendPart(ctx, session.Part{ID: "text", MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartText, Payload: []byte(`{"text":"atomic"}`)}); err != nil {

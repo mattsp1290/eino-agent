@@ -25,9 +25,9 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 	removeProbe := installRuntimeAdmissionOrderProbe(t, f)
 
 	var calls atomic.Int32
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls.Add(1)
-		return []*einoschema.Message{einoschema.AssistantMessage("postgres answer", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("postgres answer")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(f.store), WithModelResolver(resolvedModel{streamer: streamer}),
@@ -87,9 +87,9 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 	f := newPostgresRuntimeFixture(t, server)
 	removeProbe := installRuntimeAdmissionRollbackTrigger(t, f)
 	var calls atomic.Int32
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls.Add(1)
-		return []*einoschema.Message{einoschema.AssistantMessage("retry answer", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("retry answer")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(f.store), WithModelResolver(resolvedModel{streamer: streamer}),

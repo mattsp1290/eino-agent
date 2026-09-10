@@ -390,14 +390,15 @@ func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Reques
 	reader, writer := einoschema.Pipe[model.StreamDelta](2)
 	go func() {
 		defer writer.Close()
-		chunks := []*einoschema.Message{
-			einoschema.AssistantMessage("Minimal server received ", nil),
-			einoschema.AssistantMessage(lastUserText(request.Messages), nil),
+		chunks := []*einoschema.AgenticMessage{
+			agenticTextChunk(0, "Minimal server received "),
+			agenticTextChunk(0, lastUserText(request.Messages)),
 		}
 		if !currentTurnHasTool(request.Messages) {
-			chunks = []*einoschema.Message{einoschema.AssistantMessage("Checking input. ", nil), einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID: rand.Text(), Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"safe scripted input"}`},
-			}})}
+			chunks = []*einoschema.AgenticMessage{
+				agenticTextChunk(0, "Checking input. "),
+				agenticToolCallChunk(1, rand.Text(), "echo", `{"text":"safe scripted input"}`),
+			}
 		}
 		for _, chunk := range chunks {
 			select {
@@ -414,6 +415,28 @@ func (scriptedStreamer) StreamProvider(ctx context.Context, request model.Reques
 	return reader, nil
 }
 
+// agenticTextChunk builds one streamed assistant_gen_text chunk at the given
+// StreamingMeta index so ConcatAgenticMessages merges same-index chunks into
+// one final block.
+func agenticTextChunk(index int, text string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role: einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{
+			einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: text}, &einoschema.StreamingMeta{Index: index}),
+		},
+	}
+}
+
+// agenticToolCallChunk builds one streamed function_tool_call chunk.
+func agenticToolCallChunk(index int, callID, name, arguments string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role: einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{
+			einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{CallID: callID, Name: name, Arguments: arguments}, &einoschema.StreamingMeta{Index: index}),
+		},
+	}
+}
+
 func streamDelay(options map[string]string) time.Duration {
 	if raw := options["stream_delay_ms"]; raw != "" {
 		if ms, err := strconv.Atoi(raw); err == nil && ms >= 0 {
@@ -423,10 +446,20 @@ func streamDelay(options map[string]string) time.Duration {
 	return 50 * time.Millisecond
 }
 
-func lastUserText(messages []*einoschema.Message) string {
+func lastUserText(messages []*einoschema.AgenticMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i] != nil && messages[i].Role == einoschema.User {
-			return strconv.Quote(messages[i].Content)
+		msg := messages[i]
+		if msg == nil || msg.Role != einoschema.AgenticRoleTypeUser {
+			continue
+		}
+		var sb strings.Builder
+		for _, block := range msg.ContentBlocks {
+			if block != nil && block.Type == einoschema.ContentBlockTypeUserInputText && block.UserInputText != nil {
+				sb.WriteString(block.UserInputText.Text)
+			}
+		}
+		if sb.Len() > 0 {
+			return strconv.Quote(sb.String())
 		}
 	}
 	return "the request"

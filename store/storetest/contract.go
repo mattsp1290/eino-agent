@@ -509,11 +509,20 @@ func Run(t *testing.T, factory Factory) {
 			Name: "file_read", Input: json.RawMessage(`{}`), Status: session.ToolCallPending, RetrySafe: true,
 		}
 		createdAt := time.Now().UTC()
+		requestParts, err := session.EncodeContentParts(session.Content{
+			Role: session.RoleAssistant,
+			Blocks: []session.ContentBlock{{
+				ID: "block-request-part-1", Kind: session.BlockKindFunctionToolCall,
+				FunctionCall: &session.FunctionCallBlock{CallID: "call-1", Name: "file_read", Arguments: "{}"},
+			}},
+		}, func() session.PartID { return call.RequestPartID }, msg.ID, s.ID, r.ID, createdAt, session.DefaultContentLimits())
+		if err != nil {
+			t.Fatalf("encode tool request content: %v", err)
+		}
 		createRequest := session.CreateToolCallRequest{
-			Call: call,
-			RequestPart: session.Part{ID: call.RequestPartID, MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolCall,
-				Payload: json.RawMessage(`{"id":"call-1","name":"file_read","arguments":{}}`), CreatedAt: createdAt, UpdatedAt: createdAt},
-			Event: toolEvent("event-create", createdAt),
+			Call:        call,
+			RequestPart: requestParts[0],
+			Event:       toolEvent("event-create", createdAt),
 		}
 		created, err := execution.CreateToolCall(ctx, createRequest)
 		if err != nil {
@@ -525,7 +534,7 @@ func Run(t *testing.T, factory Factory) {
 		if _, err := execution.AppendPart(ctx, createRequest.RequestPart); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("generic tool request part write = %v, want ErrConflict", err)
 		}
-		if _, err := execution.AppendPart(ctx, session.Part{ID: "generic-result", MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolResult}); !errors.Is(err, session.ErrConflict) {
+		if _, err := execution.AppendPart(ctx, session.Part{ID: "generic-result", MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartFunctionToolResult}); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("generic tool result part write = %v, want ErrConflict", err)
 		}
 		unfinishedRun := r
@@ -577,10 +586,20 @@ func Run(t *testing.T, factory Factory) {
 		}
 		completedAt := startedAt.Add(time.Second)
 		output := json.RawMessage(`{"tool_call_id":"call-1","status":"completed","content":"ok"}`)
+		resultParts, err := session.EncodeContentParts(session.Content{
+			Role: session.RoleUser,
+			Blocks: []session.ContentBlock{{
+				ID: "block-result-part-1", Kind: session.BlockKindFunctionToolResult,
+				FunctionResult: &session.FunctionResultBlock{CallID: "call-1", Name: "file_read", Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(output)}}},
+			}},
+		}, func() session.PartID { return call.ResultPartID }, call.ResultMessageID, s.ID, r.ID, completedAt, session.DefaultContentLimits())
+		if err != nil {
+			t.Fatalf("encode tool result content: %v", err)
+		}
 		settlement := session.ToolSettlement{
 			ID: claimed.Call.ID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
-			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, ParentID: msg.ID, Role: session.RoleTool, CreatedAt: completedAt, UpdatedAt: completedAt},
-			ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolResult, Payload: output, CreatedAt: completedAt, UpdatedAt: completedAt},
+			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, ParentID: msg.ID, Role: session.RoleUser, CreatedAt: completedAt, UpdatedAt: completedAt},
+			ResultPart:    resultParts[0],
 		}
 		settleRequest := session.SettleToolCallRequest{Settlement: settlement, Event: toolEvent("event-terminal", completedAt)}
 		settled, err := execution.SettleToolCall(ctx, settleRequest)

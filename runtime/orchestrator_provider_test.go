@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ func TestStreamingOrchestratorFailsProviderErrors(t *testing.T) {
 
 	providerErr := model.Error{Code: "provider_rejected", Message: "bad request"}
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		return nil, providerErr
 	}))
 	result := startAndWait(t, orch)
@@ -63,7 +64,7 @@ func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 
 	store := newAdmissionStore()
 	started := make(chan struct{})
-	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 		close(started)
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -93,11 +94,11 @@ func TestStreamingOrchestratorCompletesWithBlockedInfrastructureSink(t *testing.
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{
-			einoschema.AssistantMessage("a", nil),
-			einoschema.AssistantMessage("b", nil),
-			einoschema.AssistantMessage("c", nil),
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{
+			agenticTextChunk(0, "a"),
+			agenticTextChunk(0, "b"),
+			agenticTextChunk(0, "c"),
 		}, nil
 	}))
 	orch.events = blockingSinkFunc(func(_ context.Context, event session.EventRecord) {
@@ -132,12 +133,12 @@ func TestStreamingOrchestratorRetriesRetryableProviderErrors(t *testing.T) {
 
 	var attempts int
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		attempts++
 		if attempts == 1 {
 			return nil, model.Error{Code: "rate_limited", Message: "retry", Retryable: true}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("ok", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("ok")}, nil
 	}))
 	orch.attemptsValue = 2
 	result := startAndWait(t, orch)
@@ -152,12 +153,13 @@ func TestStreamingOrchestratorRollsBackIncompleteAssistantParts(t *testing.T) {
 	store := newAdmissionStore()
 	store.appendPartErrAt = 2
 	var toolCalls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		msg := einoschema.AssistantMessage("answer", []einoschema.ToolCall{{
-			ID: "call-atomic", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`},
-		}})
-		msg.ReasoningContent = "reasoning"
-		return []*einoschema.Message{msg}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		msg := &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant, ContentBlocks: []*einoschema.ContentBlock{
+			{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: "answer"}},
+			{Type: einoschema.ContentBlockTypeReasoning, Reasoning: &einoschema.Reasoning{Text: "reasoning"}},
+			{Type: einoschema.ContentBlockTypeFunctionToolCall, FunctionToolCall: &einoschema.FunctionToolCall{CallID: "call-atomic", Name: "echo", Arguments: `{}`}},
+		}}
+		return []*einoschema.AgenticMessage{msg}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 		toolCalls++
@@ -177,11 +179,11 @@ func TestStreamingOrchestratorRollsBackIncompleteAssistantParts(t *testing.T) {
 func TestStreamingOrchestratorRollsBackWholeTurnWhenSecondToolCreationFails(t *testing.T) {
 	store := newAdmissionStore()
 	store.createToolErrAt = 2
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("answer", []einoschema.ToolCall{
-			{ID: "call-one", Type: "function", Function: einoschema.FunctionCall{Name: "one", Arguments: `{}`}},
-			{ID: "call-two", Type: "function", Function: einoschema.FunctionCall{Name: "two", Arguments: `{}`}},
-		})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(
+			agenticToolCall("call-one", "one", `{}`),
+			agenticToolCall("call-two", "two", `{}`),
+		)}, nil
 	}))
 	var executions int
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{
@@ -209,11 +211,11 @@ func TestStreamingOrchestratorBoundedQueueDropsWithoutBackpressure(t *testing.T)
 
 	sink := &blockingSink{delay: time.Millisecond}
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{
-			einoschema.AssistantMessage("a", nil),
-			einoschema.AssistantMessage("b", nil),
-			einoschema.AssistantMessage("c", nil),
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{
+			agenticTextChunk(0, "a"),
+			agenticTextChunk(0, "b"),
+			agenticTextChunk(0, "c"),
 		}, nil
 	}))
 	orch.events = sink
@@ -231,8 +233,8 @@ func TestStreamingOrchestratorFailsMalformedStreamWithoutPanic(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{nil}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{nil}, nil
 	}))
 	result := startAndWait(t, orch)
 	if result.Status != session.RunFailed || result.Error == nil {
@@ -244,17 +246,13 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		msg := einoschema.AssistantMessage("partial text", []einoschema.ToolCall{{
-			ID:   "call-bad-json",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"text":`,
-			},
-		}})
-		msg.ReasoningContent = "partial reasoning"
-		return []*einoschema.Message{msg}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		msg := &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant, ContentBlocks: []*einoschema.ContentBlock{
+			{Type: einoschema.ContentBlockTypeAssistantGenText, AssistantGenText: &einoschema.AssistantGenText{Text: "partial text"}},
+			{Type: einoschema.ContentBlockTypeReasoning, Reasoning: &einoschema.Reasoning{Text: "partial reasoning"}},
+			{Type: einoschema.ContentBlockTypeFunctionToolCall, FunctionToolCall: &einoschema.FunctionToolCall{CallID: "call-bad-json", Name: "echo", Arguments: `{"text":`}},
+		}}
+		return []*einoschema.AgenticMessage{msg}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -279,7 +277,7 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 			continue
 		}
 		switch part.Kind {
-		case session.PartText, session.PartReasoning, session.PartToolCall:
+		case session.PartAssistantGenText, session.PartReasoning, session.PartFunctionToolCall:
 			t.Fatalf("assistant part persisted despite malformed arguments: kind=%s payload=%s", part.Kind, part.Payload)
 		}
 	}
@@ -305,19 +303,13 @@ func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-empty-args",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name: "echo",
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-empty-args", "echo", ""))}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -384,25 +376,21 @@ func TestStreamingOrchestratorRunFinishedCarriesRunTotalUsage(t *testing.T) {
 	store := newAdmissionStore()
 	sink := &capturingSink{}
 	var calls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		_ = ctx
 		calls++
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
 				// Second stream (after the tool result): report usage, finish.
-				response := einoschema.AssistantMessage("done", nil)
-				response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{PromptTokens: 7, CompletionTokens: 3}}
-				return []*einoschema.Message{response}, nil
+				response := agenticAssistantText("done")
+				response.ResponseMeta = &einoschema.AgenticResponseMeta{TokenUsage: &einoschema.TokenUsage{PromptTokens: 7, CompletionTokens: 3}}
+				return []*einoschema.AgenticMessage{response}, nil
 			}
 		}
 		// First stream: report usage, emit a tool call to force a second turn.
-		response := einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:       "call-1",
-			Type:     "function",
-			Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hi"}`},
-		}})
-		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{PromptTokens: 10, CompletionTokens: 5}}
-		return []*einoschema.Message{response}, nil
+		response := agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{"text":"hi"}`))
+		response.ResponseMeta = &einoschema.AgenticResponseMeta{TokenUsage: &einoschema.TokenUsage{PromptTokens: 10, CompletionTokens: 5}}
+		return []*einoschema.AgenticMessage{response}, nil
 	}), WithQueueSize(16))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
 		Name: "echo",
@@ -443,10 +431,10 @@ func TestResolveStreamUsage(t *testing.T) {
 	t.Parallel()
 
 	observed := model.Usage{InputTokens: 11, OutputTokens: 7}
-	msgWithUsage := &einoschema.Message{ResponseMeta: &einoschema.ResponseMeta{
-		Usage: &einoschema.TokenUsage{PromptTokens: 23, CompletionTokens: 18},
+	msgWithUsage := &einoschema.AgenticMessage{ResponseMeta: &einoschema.AgenticResponseMeta{
+		TokenUsage: &einoschema.TokenUsage{PromptTokens: 23, CompletionTokens: 18},
 	}}
-	msgNoMeta := &einoschema.Message{}
+	msgNoMeta := &einoschema.AgenticMessage{}
 
 	// Delta usage wins over message metadata for fields it reports.
 	if got := resolveStreamUsage(observed, msgWithUsage); got != observed {
@@ -474,7 +462,7 @@ func TestStartRejectsInvalidResolvedModelBeforeHistoryReads(t *testing.T) {
 		return model.Resolved{
 			Provider: model.Provider{ID: "wrong-provider"},
 			Model:    model.Descriptor{ID: "test", ProviderID: "wrong-provider"},
-			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }),
+			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil }),
 		}, nil
 	})
 	orchestrator := mustConfiguredOrchestrator(WithStore(store), WithModelResolver(resolver))
@@ -487,5 +475,56 @@ func TestStartRejectsInvalidResolvedModelBeforeHistoryReads(t *testing.T) {
 	}
 	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.events) != 0 {
 		t.Fatal("invalid resolver output caused admission side effects")
+	}
+}
+
+// TestClassicAdapterCapabilityRejectionSurfacesAsTypedRunFailure proves the
+// real model.NewClassicStreamer adapter (not a scripted fake) rejecting a
+// non-representable agentic message before dispatch surfaces, end to end,
+// as a failed run carrying the adapter's typed capability_unsupported error
+// code and ErrCapabilityUnsupported cause -- not a generic or swallowed
+// failure. The first turn persists a real assistant_gen_image content block
+// (via a native agentic streamer, the only way such content legitimately
+// enters durable history); the second turn switches to the classic adapter,
+// which must reject that durable history block before it can dispatch.
+func TestClassicAdapterCapabilityRejectionSurfacesAsTypedRunFailure(t *testing.T) {
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "capability.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = storePool.Close() }()
+	ids := &sequenceIDs{}
+
+	imageStreamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{{
+				Type:              einoschema.ContentBlockTypeAssistantGenImage,
+				AssistantGenImage: &einoschema.AssistantGenImage{URL: "https://example.test/gen.png", MIMEType: "image/png"},
+			}},
+		}}, nil
+	})
+	first := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: imageStreamer}), WithIDGenerator(ids),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	firstResult := startAndWaitRequest(t, first, Request{SessionID: "capability-session", Message: TextUserMessage("draw something"), Config: orchestratorConfig()})
+	if firstResult.Status != session.RunCompleted || firstResult.Error != nil {
+		t.Fatalf("first result = %+v", firstResult)
+	}
+
+	classicStreamer := model.NewClassicStreamer(&capturingChatModel{})
+	second := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(resolvedModel{streamer: classicStreamer}), WithIDGenerator(ids),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	secondResult := startAndWaitRequest(t, second, Request{SessionID: "capability-session", Message: TextUserMessage("draw another"), Config: orchestratorConfig()})
+	if secondResult.Status != session.RunFailed || secondResult.Error == nil {
+		t.Fatalf("second result = %+v", secondResult)
+	}
+	var providerErr model.Error
+	if !errors.As(secondResult.Error, &providerErr) || providerErr.Code != "capability_unsupported" || !errors.Is(secondResult.Error, model.ErrCapabilityUnsupported) {
+		t.Fatalf("error = %v, want capability_unsupported/ErrCapabilityUnsupported", secondResult.Error)
 	}
 }

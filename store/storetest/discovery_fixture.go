@@ -68,8 +68,17 @@ func discoverySeedTool(t *testing.T, st session.Store, r session.Run, mid sessio
 	ex := executionFor(st, r)
 	at := time.Now().UTC()
 	call := session.ToolCall{ID: session.ToolCallID(r.SessionID) + "-tool", SessionID: r.SessionID, RunID: r.ID, MessageID: mid, RequestPartID: session.PartID(mid) + "request", ResultMessageID: session.MessageID(mid) + "result", ResultPartID: session.PartID(mid) + "result", Name: "echo", Input: json.RawMessage(`{"text":"PRIVATE_TOOL_INPUT"}`), Status: session.ToolCallPending, Metadata: map[string]string{"private": "PRIVATE_TOOL_METADATA"}}
-	raw, _ := json.Marshal(map[string]any{"id": call.ID, "name": call.Name, "arguments": call.Input})
-	_, err := ex.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: call.RequestPartID, MessageID: mid, SessionID: r.SessionID, RunID: r.ID, Kind: session.PartToolCall, Payload: raw}, Event: toolEvent(session.EventID(mid)+"create", at)})
+	requestParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(call.RequestPartID), Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(call.ID), Name: call.Name, Arguments: string(call.Input)},
+		}},
+	}, func() session.PartID { return call.RequestPartID }, mid, r.SessionID, r.ID, at, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = ex.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, RequestPart: requestParts[0], Event: toolEvent(session.EventID(mid)+"create", at)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,8 +90,18 @@ func discoverySeedTool(t *testing.T, st session.Store, r session.Run, mid sessio
 		return
 	}
 	output, _ := json.Marshal(map[string]any{"tool_call_id": call.ID, "status": "completed", "content": "PRIVATE_TOOL_OUTPUT"})
+	resultParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(call.ResultPartID), Kind: session.BlockKindFunctionToolResult,
+			FunctionResult: &session.FunctionResultBlock{CallID: string(call.ID), Name: call.Name, Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(output)}}},
+		}},
+	}, func() session.PartID { return call.ResultPartID }, call.ResultMessageID, r.SessionID, r.ID, at, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, err = ex.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: session.ToolSettlement{ID: call.ID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: at,
-		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: r.SessionID, RunID: r.ID, ParentID: mid, Role: session.RoleTool}, ResultPart: session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: r.SessionID, RunID: r.ID, Kind: session.PartToolResult, Payload: output}}, Event: toolEvent(session.EventID(mid)+"settle", at)})
+		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: r.SessionID, RunID: r.ID, ParentID: mid, Role: session.RoleUser}, ResultPart: resultParts[0]}, Event: toolEvent(session.EventID(mid)+"settle", at)})
 	if err != nil {
 		t.Fatal(err)
 	}

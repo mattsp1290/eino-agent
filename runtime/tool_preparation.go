@@ -9,45 +9,97 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.Message, providerStatePayloads []json.RawMessage, calls []preparedToolCall) ([]preparedToolCall, error) {
-	parts := make([]session.Part, 0, 2+len(providerStatePayloads))
-	ordinal := int64(0)
+// persistAssistantTurn splits msg into its durable public content (via
+// session.ContentFromAgenticMessage) and persists it as rich content parts,
+// any captured provider-state payloads, and one tool-call record per
+// prepared call, atomically. blockIDs is pre-minted, parallel to
+// msg.ContentBlocks (see orchestrator.go's executeTurn and
+// captureAssistantProviderState): the same durable block identity a
+// block-bound provider-state item is captured against is the identity
+// assigned to the corresponding durable content block here, so replay can
+// re-associate the two.
+func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, msg *einoschema.AgenticMessage, blockIDs []string, providerStatePayloads []json.RawMessage, calls []preparedToolCall) ([]preparedToolCall, error) {
 	now := o.now()
-	if msg.Content != "" {
-		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartText, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.Content}), CreatedAt: now, UpdatedAt: now})
-		ordinal++
+	blockIndex := 0
+	nextBlockID := func() string {
+		if blockIndex >= len(blockIDs) {
+			return ""
+		}
+		id := blockIDs[blockIndex]
+		blockIndex++
+		return id
 	}
-	if msg.ReasoningContent != "" {
-		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartReasoning, Ordinal: ordinal, Payload: mustJSON(map[string]string{"text": msg.ReasoningContent}), CreatedAt: now, UpdatedAt: now})
-		ordinal++
+	content, private, err := session.ContentFromAgenticMessage(msg, nextBlockID)
+	if err != nil {
+		return nil, err
+	}
+	if len(private) != 0 {
+		// The model returned provider-private material (a typed extension
+		// field session.ContentFromAgenticMessage knows how to split out)
+		// but no provider-state codec captured it beforehand: persisting it
+		// as public content would leak it, so this fails closed instead.
+		return nil, model.Error{
+			Code:    "provider_state_unregistered",
+			Message: "model returned provider-private content with no provider state codec registered",
+			Cause:   errors.Join(model.ErrProviderState, model.ErrProviderStateMismatch),
+		}
+	}
+	contentParts, err := session.EncodeContentParts(content, func() session.PartID { return o.ids.NewPartID() }, messageID, snapshot.SessionID, snapshot.RunID, now, o.contentLimits)
+	if err != nil {
+		return nil, err
+	}
+	// function_tool_call parts are excluded from the generic bulk-append
+	// list below: they are owned by store.CreateToolCall, which persists a
+	// tool call's request part atomically with its pending row (and, on the
+	// fenced execution store, a generic AppendPart of a function_tool_call
+	// or function_tool_result part is rejected outright, exactly like the
+	// legacy PartToolCall/PartToolResult kinds it replaces).
+	parts := make([]session.Part, 0, len(contentParts)+len(providerStatePayloads))
+	for _, part := range contentParts {
+		if part.Kind != session.PartFunctionToolCall {
+			parts = append(parts, part)
+		}
+	}
+	ordinal := int64(len(contentParts))
+
+	callIndex := 0
+	for blockPos, block := range content.Blocks {
+		if block.Kind != session.BlockKindFunctionToolCall {
+			continue
+		}
+		if callIndex >= len(calls) {
+			return nil, fmt.Errorf("assistant message carries more function call blocks than prepared tool calls")
+		}
+		prepared := &calls[callIndex]
+		requestPart := contentParts[blockPos]
+		resultMessageID := o.ids.NewMessageID()
+		resultPartID := o.ids.NewPartID()
+		prepared.request = session.CreateToolCallRequest{
+			Call: session.ToolCall{
+				ID: prepared.call.ID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				RequestPartID: requestPart.ID, ResultMessageID: resultMessageID, ResultPartID: resultPartID,
+				Name: prepared.call.Name, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
+				RetrySafe: prepared.tool.RetrySafe, Metadata: cloneStringMap(prepared.tool.Metadata),
+			},
+			RequestPart: requestPart,
+			Event:       toolTransitionEnvelope(o, snapshot, now),
+		}
+		callIndex++
+	}
+	if callIndex != len(calls) {
+		return nil, fmt.Errorf("assistant message carries fewer function call blocks than prepared tool calls")
 	}
 	for _, payload := range providerStatePayloads {
 		parts = append(parts, session.Part{ID: o.ids.NewPartID(), MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartProviderState, Ordinal: ordinal, Payload: cloneJSON(payload), CreatedAt: now, UpdatedAt: now})
 		ordinal++
 	}
-	for index := range calls {
-		prepared := &calls[index]
-		requestPartID := o.ids.NewPartID()
-		resultMessageID := o.ids.NewMessageID()
-		resultPartID := o.ids.NewPartID()
-		payload := toolCallPayload{ID: string(prepared.call.ID), Name: prepared.call.Name, Arguments: prepared.call.Input}
-		prepared.request = session.CreateToolCallRequest{
-			Call: session.ToolCall{
-				ID: prepared.call.ID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
-				RequestPartID: requestPartID, ResultMessageID: resultMessageID, ResultPartID: resultPartID,
-				Name: prepared.call.Name, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
-				RetrySafe: prepared.tool.RetrySafe, Metadata: cloneStringMap(prepared.tool.Metadata),
-			},
-			RequestPart: session.Part{ID: requestPartID, MessageID: messageID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, Kind: session.PartToolCall, Ordinal: ordinal, Payload: mustJSON(payload), CreatedAt: now, UpdatedAt: now},
-			Event:       toolTransitionEnvelope(o, snapshot, now),
-		}
-		ordinal++
-	}
+
 	created := make([]session.ToolTransitionResult, len(calls))
-	err := execution.store.WithinTx(ctx, func(ctx context.Context, store session.ExecutionStore) error {
+	err = execution.store.WithinTx(ctx, func(ctx context.Context, store session.ExecutionStore) error {
 		for _, part := range parts {
 			if _, err := store.AppendPart(ctx, part); err != nil {
 				return err
@@ -76,7 +128,10 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 }
 
 type preparedToolCall struct {
-	schemaCall    einoschema.ToolCall
+	// block points at the function_tool_call block inside the assistant
+	// message being persisted; prepareToolCalls rewrites its CallID and
+	// Arguments to their canonical values in place.
+	block         *einoschema.FunctionToolCall
 	tool          Tool
 	call          ToolCall
 	middlewareErr error
@@ -84,24 +139,43 @@ type preparedToolCall struct {
 	record        session.ToolCall
 }
 
-func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []einoschema.ToolCall) ([]preparedToolCall, error) {
+// functionToolCalls extracts msg's function_tool_call blocks, in content
+// block order.
+func functionToolCalls(msg *einoschema.AgenticMessage) []*einoschema.FunctionToolCall {
+	if msg == nil {
+		return nil
+	}
+	var calls []*einoschema.FunctionToolCall
+	for _, block := range msg.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolCall && block.FunctionToolCall != nil {
+			calls = append(calls, block.FunctionToolCall)
+		}
+	}
+	return calls
+}
+
+func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []*einoschema.FunctionToolCall) ([]preparedToolCall, error) {
 	byName := map[string]Tool{}
 	for _, tool := range snapshot.Tools {
 		byName[tool.Name] = tool
 	}
 	prepared := make([]preparedToolCall, 0, len(calls))
-	for _, schemaCall := range calls {
-		callID := session.ToolCallID(schemaCall.ID)
+	for _, block := range calls {
+		if block == nil {
+			continue
+		}
+		callID := session.ToolCallID(block.CallID)
 		if callID == "" {
 			callID = o.ids.NewToolCallID()
+			block.CallID = string(callID)
 		}
-		tool, ok := byName[schemaCall.Function.Name]
+		tool, ok := byName[block.Name]
 		if !ok || tool.Executor == nil {
-			err := fmt.Errorf("tool %q unavailable", schemaCall.Function.Name)
-			o.observeToolSettled(ctx, snapshot, Tool{Name: schemaCall.Function.Name}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name}, session.ToolCallFailed, 0, err, nil)
+			err := fmt.Errorf("tool %q unavailable", block.Name)
+			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
 			return nil, err
 		}
-		input, err := normalizedToolArguments(schemaCall.Function.Arguments)
+		input, err := normalizedToolArguments(block.Arguments)
 		if err != nil {
 			return nil, err
 		}
@@ -115,7 +189,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 				return nil, fmt.Errorf("malformed normalized tool input: %w", err)
 			}
 		}
-		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: schemaCall.Function.Name, Scope: tool.Scope, Pattern: schemaCall.Function.Name, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
+		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name, Scope: tool.Scope, Pattern: block.Name, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
 		input = cloneJSON(call.Input)
 		var prepareErr error
 		preparedCall, err := extension.ApplyTransforms(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)})
@@ -138,18 +212,22 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		if call.Pattern == "" || len(call.Pattern) > 4096 {
 			return nil, fmt.Errorf("invalid permission pattern for tool %q", call.Name)
 		}
-		schemaCall.Function.Arguments = string(input)
+		block.Arguments = string(input)
 		extension.Notify(execution.dispatch(), ctx, ToolPreparedPoint, ToolPreparedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, ToolCallID: call.ID, ToolName: call.Name, Input: call.Input, Component: cloneStringMap(tool.Metadata)})
-		prepared = append(prepared, preparedToolCall{schemaCall: schemaCall, tool: tool, call: call, middlewareErr: prepareErr})
+		prepared = append(prepared, preparedToolCall{block: block, tool: tool, call: call, middlewareErr: prepareErr})
 	}
 	return prepared, nil
 }
 
-func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.Message, error) {
-	messages := make([]*einoschema.Message, 0, len(calls))
+// executePreparedTools executes calls and returns one user-role
+// function_tool_result agentic message per call, in order. Each message's
+// single text content is exactly string(settlement.Output) (the ToolOutput
+// JSON), unchanged from the classic model-visible shape.
+func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.AgenticMessage, error) {
+	messages := make([]*einoschema.AgenticMessage, 0, len(calls))
 	var fatal error
 	for _, prepared := range calls {
-		schemaCall, tool, call := prepared.schemaCall, prepared.tool, prepared.call
+		toolName, call := prepared.call.Name, prepared.call
 		callID := call.ID
 		record := prepared.record
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
@@ -166,13 +244,26 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 		record = claimed.Call
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
 		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ToolStartedPoint, ToolStartedNotice{SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: callID, ToolName: call.Name, Time: record.StartedAt})
-		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, call, record, prepared.middlewareErr)
+		settled, err := execution.executeAndSettleClaimedTool(ctx, snapshot, prepared.tool, call, record, prepared.middlewareErr)
 		if err != nil {
 			fatal = err
 			break
 		}
 		output := settled.Settlement.Output
-		messages = append(messages, einoschema.ToolMessage(string(output), string(callID), einoschema.WithToolName(schemaCall.Function.Name)))
+		messages = append(messages, &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeUser,
+			ContentBlocks: []*einoschema.ContentBlock{{
+				Type: einoschema.ContentBlockTypeFunctionToolResult,
+				FunctionToolResult: &einoschema.FunctionToolResult{
+					CallID: string(callID),
+					Name:   toolName,
+					Content: []*einoschema.FunctionToolResultContentBlock{{
+						Type: einoschema.FunctionToolResultContentBlockTypeText,
+						Text: &einoschema.UserInputText{Text: string(output)},
+					}},
+				},
+			}},
+		})
 		if errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled) {
 			fatal = settled.Outcome.RawError
 			break

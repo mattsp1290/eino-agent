@@ -31,6 +31,7 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		leaseValue:           time.Minute,
 		modelRequestMaxBytes: defaultModelRequestMaxBytes,
 		contentLimits:        session.DefaultContentLimits(),
+		streamLimits:         defaultStreamLimits(),
 	}
 	for index, option := range opts {
 		if option == nil {
@@ -221,4 +222,30 @@ func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator
 // WithSessionObserver attaches the bounded same-process state-watch tap.
 func WithSessionObserver(value *watch.Service) Option {
 	return interfaceOption("SessionObserver", value, func(o *StreamingOrchestrator, value *watch.Service) { o.sessionObserver = value })
+}
+
+// StreamLimits bounds provider stream accumulation: the chunk count and the
+// cumulative encoded-JSON byte budget receiveModelStream accepts before
+// failing closed with a typed stream_limit_exceeded error.
+type StreamLimits struct {
+	MaxChunks int
+	MaxBytes  int
+}
+
+// defaultStreamLimits returns the production stream accumulation bounds:
+// up to 1<<20 chunks and 8 MiB of encoded chunk bytes.
+func defaultStreamLimits() StreamLimits {
+	return StreamLimits{MaxChunks: 1 << 20, MaxBytes: 8 << 20}
+}
+
+// WithStreamLimits overrides the default provider stream accumulation
+// bounds. Both fields must be positive.
+func WithStreamLimits(value StreamLimits) Option {
+	return func(o *StreamingOrchestrator) error {
+		if value.MaxChunks <= 0 || value.MaxBytes <= 0 {
+			return fmt.Errorf("%w: StreamLimits must be positive", ErrInvalidOrchestrator)
+		}
+		o.streamLimits = value
+		return nil
+	}
 }

@@ -41,7 +41,10 @@ func TestBuildToolSettlementIsAcceptedByAtomicStore(t *testing.T) {
 	}
 	durable = claimResult.Call
 	call := ToolCall{ID: durable.ID, SessionID: durable.SessionID, RunID: durable.RunID, MessageID: durable.MessageID, ResultMessageID: durable.ResultMessageID, ResultPartID: durable.ResultPartID, Name: durable.Name}
-	settlement, _, err := BuildToolSettlement(ToolSettlementInput{Tool: Tool{Retention: RetentionPolicy{MaxInlineBytes: 100}}, Call: call, Claimed: durable, Disposition: ToolExecuted, Result: ToolResult{Output: "ok"}, CompletedAt: now.Add(time.Second)})
+	settlement, _, err := BuildToolSettlement(ToolSettlementInput{
+		Tool: Tool{Retention: RetentionPolicy{MaxInlineBytes: 100}}, Call: call, Claimed: durable, Disposition: ToolExecuted, Result: ToolResult{Output: "ok"}, CompletedAt: now.Add(time.Second),
+		BlockID: "block-result", ContentLimits: session.DefaultContentLimits(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

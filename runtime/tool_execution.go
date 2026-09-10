@@ -95,6 +95,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, Error: errText,
 		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,
+		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits,
 	})
 	if err != nil {
 		return session.ToolSettlement{}, err
@@ -129,6 +130,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	settlement, _, err := buildToolSettlement(ToolSettlementInput{
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
+		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits,
 	}, messageAt)
 	eventEnvelope := toolTransitionEnvelope(e.host, snapshot, completedAt)
 	if err == nil {

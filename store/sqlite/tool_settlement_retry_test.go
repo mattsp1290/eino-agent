@@ -18,11 +18,12 @@ func TestTerminalToolSettlementRetryValidatesReservedResultRows(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+	resultMessage, resultPart := sqliteToolResultEnvelope(call, output, now)
 	settlement := session.ToolSettlement{
 		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken,
 		Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
-		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
-		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+		ResultMessage: resultMessage,
+		ResultPart:    resultPart,
 	}
 	request := sqliteSettleRequest(settlement, "event-settle-retry")
 	if _, err := execution.SettleToolCall(ctx, request); err != nil {

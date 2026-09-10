@@ -11,7 +11,7 @@ import (
 // ProviderRequest assembles the transport-neutral request for one turn. The
 // caller validates and takes canonical ownership of the complete graph before
 // dispatch.
-func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, messages []*einoschema.Message) model.Request {
+func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, messages []*einoschema.AgenticMessage) model.Request {
 	tools := make([]*einoschema.ToolInfo, 0, len(s.Tools))
 	for _, tool := range s.Tools {
 		if tool.Info != nil {
@@ -22,7 +22,7 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		Identity:      modelIdentity(s.ContextIdentity(messageID, "", trace)),
 		Messages:      messages,
 		ProviderState: s.providerState,
-		Tools:         tools,
+		Controls:      model.RequestControls{Tools: tools},
 		Options:       s.Config.Agent.Options,
 	}
 }

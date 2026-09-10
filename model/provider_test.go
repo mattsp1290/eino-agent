@@ -135,27 +135,22 @@ func TestAdapterResolverClonesCatalogDescriptor(t *testing.T) {
 func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 	t.Parallel()
 
-	index := 3
-	url := "https://example.test/image.png"
 	params := einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
 		"text": {Type: einoschema.String, Required: true},
 	})
+	temperature := float32(0.5)
 	request := Request{
 		Identity: Identity{TraceAttributes: map[string]string{"trace": "value"}},
-		Messages: []*einoschema.Message{{
-			Content: "hello",
-			ToolCalls: []einoschema.ToolCall{{
-				Index: &index,
-			}},
-			UserInputMultiContent: []einoschema.MessageInputPart{{
-				Type:  einoschema.ChatMessagePartTypeImageURL,
-				Image: &einoschema.MessageInputImage{MessagePartCommon: einoschema.MessagePartCommon{URL: &url}},
-			}},
+		Messages: []*einoschema.AgenticMessage{{
+			Role: einoschema.AgenticRoleTypeUser,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlock(&einoschema.UserInputText{Text: "hello"}),
+			},
 		}},
-		Tools: []*einoschema.ToolInfo{{
-			Name:        "tool",
-			ParamsOneOf: params,
-		}},
+		Controls: RequestControls{
+			Tools:       []*einoschema.ToolInfo{{Name: "tool", ParamsOneOf: params}},
+			Temperature: &temperature,
+		},
 		Options: map[string]string{"temperature": "0"},
 	}
 
@@ -164,35 +159,43 @@ func TestRequestCloneCopiesMutableEinoObjects(t *testing.T) {
 		t.Fatal(err)
 	}
 	cloned.Identity.TraceAttributes["trace"] = "changed"
-	cloned.Messages[0].Content = "changed"
-	*cloned.Messages[0].ToolCalls[0].Index = 4
-	*cloned.Messages[0].UserInputMultiContent[0].Image.URL = "changed"
-	cloned.Tools[0].Name = "changed"
+	cloned.Messages[0].ContentBlocks[0].UserInputText.Text = "changed"
+	cloned.Controls.Tools[0].Name = "changed"
+	*cloned.Controls.Temperature = 1
 	cloned.Options["temperature"] = "1"
 
 	if request.Identity.TraceAttributes["trace"] != "value" ||
-		request.Messages[0].Content != "hello" ||
-		index != 3 ||
-		url != "https://example.test/image.png" ||
-		request.Tools[0].Name != "tool" ||
+		request.Messages[0].ContentBlocks[0].UserInputText.Text != "hello" ||
+		request.Controls.Tools[0].Name != "tool" ||
+		*request.Controls.Temperature != 0.5 ||
 		request.Options["temperature"] != "0" {
 		t.Fatalf("request mutated after clone: %#v", request)
 	}
-	if cloned.Tools[0].ParamsOneOf == nil || cloned.Tools[0].ParamsOneOf == params {
+	if cloned.Controls.Tools[0].ParamsOneOf == nil || cloned.Controls.Tools[0].ParamsOneOf == params {
 		t.Fatal("tool parameter schema was not cloned")
+	}
+	if cloned.Controls.Temperature == request.Controls.Temperature {
+		t.Fatal("temperature pointer was not cloned")
 	}
 }
 
 func TestRequestCloneRejectsUnsupportedMetadata(t *testing.T) {
 	t.Parallel()
 	tests := map[string]Request{
-		"message extra": {Messages: []*einoschema.Message{{Extra: map[string]any{"value": 1}}}},
-		"tool extra":    {Tools: []*einoschema.ToolInfo{{Name: "tool", Extra: map[string]any{"value": 1}}}},
-		//nolint:staticcheck // The clone boundary must reject the deprecated field.
-		"deprecated MultiContent": {Messages: []*einoschema.Message{{MultiContent: []einoschema.ChatMessagePart{{Type: einoschema.ChatMessagePartTypeText, Text: "legacy"}}}}},
-		"streaming metadata": {Messages: []*einoschema.Message{{AssistantGenMultiContent: []einoschema.MessageOutputPart{{
-			Type: einoschema.ChatMessagePartTypeText, Text: "chunk", StreamingMeta: &einoschema.MessageStreamingMeta{Index: 1},
-		}}}}},
+		"message extra": {Messages: []*einoschema.AgenticMessage{{Role: einoschema.AgenticRoleTypeUser, Extra: map[string]any{"value": 1}}}},
+		"tool extra":    {Controls: RequestControls{Tools: []*einoschema.ToolInfo{{Name: "tool", Extra: map[string]any{"value": 1}}}}},
+		"block extra": {Messages: []*einoschema.AgenticMessage{{
+			Role: einoschema.AgenticRoleTypeUser,
+			ContentBlocks: []*einoschema.ContentBlock{
+				{Type: einoschema.ContentBlockTypeUserInputText, UserInputText: &einoschema.UserInputText{Text: "hi"}, Extra: map[string]any{"value": 1}},
+			},
+		}}},
+		"streaming metadata": {Messages: []*einoschema.AgenticMessage{{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "chunk"}, &einoschema.StreamingMeta{Index: 1}),
+			},
+		}}},
 	}
 	for name, request := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -203,19 +206,19 @@ func TestRequestCloneRejectsUnsupportedMetadata(t *testing.T) {
 	}
 }
 
-func TestUsageFromMessageMapsDetailedEinoUsage(t *testing.T) {
-	message := einoschema.AssistantMessage("done", nil)
-	message.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+func TestUsageFromAgenticMessageMapsDetailedEinoUsage(t *testing.T) {
+	message := &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant}
+	message.ResponseMeta = &einoschema.AgenticResponseMeta{TokenUsage: &einoschema.TokenUsage{
 		PromptTokens: 11, CompletionTokens: 7,
 		CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 3},
 		PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 5},
 	}}
-	got := UsageFromMessage(message)
+	got := UsageFromAgenticMessage(message)
 	want := Usage{InputTokens: 11, OutputTokens: 7, ReasoningTokens: 3, CacheReadTokens: 5}
 	if got != want {
 		t.Fatalf("usage = %#v, want %#v", got, want)
 	}
-	if got := UsageFromMessage(nil); got != (Usage{}) {
+	if got := UsageFromAgenticMessage(nil); got != (Usage{}) {
 		t.Fatalf("nil message usage = %#v", got)
 	}
 }

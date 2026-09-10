@@ -27,6 +27,17 @@ func cloneModelStreamInput(value ModelStreamInput) (ModelStreamInput, error) {
 	for index := range value.Audited.Tools {
 		value.Audited.Tools[index].Schema = cloneJSON(value.Audited.Tools[index].Schema)
 	}
+	value.Audited.DeferredTools = append([]AuditedToolSchema(nil), value.Audited.DeferredTools...)
+	for index := range value.Audited.DeferredTools {
+		value.Audited.DeferredTools[index].Schema = cloneJSON(value.Audited.DeferredTools[index].Schema)
+	}
+	if value.Audited.ToolSearchTool != nil {
+		cloned := *value.Audited.ToolSearchTool
+		cloned.Schema = cloneJSON(cloned.Schema)
+		value.Audited.ToolSearchTool = &cloned
+	}
+	value.Audited.ToolChoice = cloneJSON(value.Audited.ToolChoice)
+	value.Audited.Controls.Stop = cloneSlice(value.Audited.Controls.Stop)
 	value.Audited.SafeCallConfig = cloneStringMap(value.Audited.SafeCallConfig)
 	return value, nil
 }
@@ -38,7 +49,11 @@ func validateStreamReader(reader *einoschema.StreamReader[model.StreamDelta]) er
 	return nil
 }
 
-func cloneProtectedMessages(messages []*einoschema.Message) ([]*einoschema.Message, error) {
+// cloneProtectedMessages deep-clones agentic messages via the same rules
+// model.Request.Clone enforces (rejects StreamingMeta and Extra), so
+// extension-visible context snapshots can never alias caller-owned or
+// runtime-owned message state.
+func cloneProtectedMessages(messages []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
 	request, err := (model.Request{Messages: messages}).Clone()
 	if err != nil {
 		return nil, err
@@ -46,8 +61,8 @@ func cloneProtectedMessages(messages []*einoschema.Message) ([]*einoschema.Messa
 	return request.Messages, nil
 }
 
-func cloneMessageDeep(message *einoschema.Message) (*einoschema.Message, error) {
-	messages, err := cloneProtectedMessages([]*einoschema.Message{message})
+func cloneMessageDeep(message *einoschema.AgenticMessage) (*einoschema.AgenticMessage, error) {
+	messages, err := cloneProtectedMessages([]*einoschema.AgenticMessage{message})
 	if err != nil {
 		return nil, err
 	}

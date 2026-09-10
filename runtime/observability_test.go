@@ -24,14 +24,14 @@ func TestStreamingOrchestratorRecordsNoNetworkObservations(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		response := einoschema.AssistantMessage("hello", nil)
-		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		response := agenticAssistantText("hello")
+		response.ResponseMeta = &einoschema.AgenticResponseMeta{TokenUsage: &einoschema.TokenUsage{
 			PromptTokens: 3, CompletionTokens: 2,
 			CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 1},
 			PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 4},
 		}}
-		return []*einoschema.Message{response}, nil
+		return []*einoschema.AgenticMessage{response}, nil
 	}))
 	orch.observer = observer
 	orch.trace = agentcontext.TraceContext{TraceID: "trace-1"}
@@ -60,7 +60,7 @@ func TestStreamingOrchestratorRecordsRetryAndProviderError(t *testing.T) {
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
 	var calls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls++
 		return nil, model.Error{Code: "rate_limited", Message: "SECRET prompt retry me", Retryable: true, Cause: model.ErrProviderRateLimited}
 	}))
@@ -97,7 +97,7 @@ func TestStreamingOrchestratorRecordsCancellation(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		return nil, context.Canceled
 	}))
 	orch.observer = observer
@@ -118,7 +118,7 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}))
@@ -193,20 +193,13 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"text":"SECRET tool input"}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{"text":"SECRET tool input"}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -242,20 +235,13 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("handled")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-denied",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"target":"SECRET danger pattern"}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-denied", "echo", `{"target":"SECRET danger pattern"}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -297,20 +283,13 @@ func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("handled")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-fail",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-fail", "echo", `{}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -337,15 +316,8 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-missing",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "missing",
-				Arguments: `{"text":"SECRET missing tool input"}`,
-			},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-missing", "missing", `{"text":"SECRET missing tool input"}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{})
@@ -372,15 +344,8 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
 	store.settleToolCallErr = errors.New("SECRET settlement detail")
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-settle",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-settle", "echo", `{}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{

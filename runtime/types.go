@@ -83,7 +83,7 @@ type TurnSnapshot struct {
 	EpochID       session.EpochID
 	Config        config.Snapshot
 	Model         model.Resolved
-	Messages      []*einoschema.Message
+	Messages      []*einoschema.AgenticMessage
 	providerState []model.ProviderMessageState
 	Tools         []Tool
 	SystemPrompt  string

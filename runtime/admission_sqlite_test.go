@@ -36,9 +36,9 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	var responseNumber int
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			responseNumber++
-			return []*einoschema.Message{einoschema.AssistantMessage(fmt.Sprintf("answer-%d", responseNumber), nil)}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantText(fmt.Sprintf("answer-%d", responseNumber))}, nil
 		})}),
 		WithIDGenerator(&reverseAdmissionIDs{}),
 		WithRunPlanProvider(emptyTestRunPlanProvider()),

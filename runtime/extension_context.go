@@ -84,14 +84,14 @@ type contextAssembly struct {
 	RunID         session.RunID
 	EpochID       session.EpochID
 	Metadata      BoundedTurnMetadata
-	Base          []*einoschema.Message
+	Base          []*einoschema.AgenticMessage
 	Contributions []contextContribution
 }
 
 type contextContribution struct {
 	Source  string
 	Order   int
-	Message *einoschema.Message
+	Message *einoschema.AgenticMessage
 }
 
 // ContextSourceInput is the bounded, read-only runtime state exposed to a
@@ -105,7 +105,7 @@ type ContextSourceInput struct {
 
 // ContextSource returns independent context messages. The host owns their
 // source identity and ordering.
-type ContextSource func(context.Context, ContextSourceInput) ([]*einoschema.Message, error)
+type ContextSource func(context.Context, ContextSourceInput) ([]*einoschema.AgenticMessage, error)
 
 // OnContextSource registers a context source without exposing cumulative
 // context assembly to the extension.
@@ -273,19 +273,23 @@ func contextContributionSource(instanceID string, spec extension.Registration, i
 	return fmt.Sprintf("context/%d:%s/%d:%s/%d:%s/%d:%s/%06d", len(parts[0]), parts[0], len(parts[1]), parts[1], len(parts[2]), parts[2], len(parts[3]), parts[3], index)
 }
 
-func validateContextContributionMessage(message *einoschema.Message) error {
+func validateContextContributionMessage(message *einoschema.AgenticMessage) error {
 	if message == nil {
 		return errors.New("message required")
 	}
-	if message.Role != einoschema.System && message.Role != einoschema.User {
+	if message.Role != einoschema.AgenticRoleTypeSystem && message.Role != einoschema.AgenticRoleTypeUser {
 		return fmt.Errorf("unsupported role %q", message.Role)
 	}
-	if message.Name != "" || len(message.ToolCalls) != 0 || message.ToolCallID != "" || message.ToolName != "" || message.ResponseMeta != nil || message.ReasoningContent != "" || len(message.Extra) != 0 || len(message.UserInputMultiContent) != 0 || len(message.AssistantGenMultiContent) != 0 {
+	if message.ResponseMeta != nil || len(message.Extra) != 0 {
 		return errors.New("only role and text content are supported")
 	}
-	//nolint:staticcheck // This boundary rejects the dependency's deprecated field.
-	if len(message.MultiContent) != 0 {
-		return errors.New("deprecated MultiContent is unsupported")
+	for _, block := range message.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeUserInputText || block.UserInputText == nil {
+			return errors.New("only role and text content are supported")
+		}
+		if block.StreamingMeta != nil || len(block.Extra) != 0 {
+			return errors.New("only role and text content are supported")
+		}
 	}
 	return nil
 }
@@ -328,14 +332,12 @@ func boundedTurnMetadata(snapshot TurnSnapshot) BoundedTurnMetadata {
 			continue
 		}
 		switch message.Role {
-		case einoschema.System:
+		case einoschema.AgenticRoleTypeSystem:
 			counts.System = saturatingUint32Increment(counts.System)
-		case einoschema.User:
+		case einoschema.AgenticRoleTypeUser:
 			counts.User = saturatingUint32Increment(counts.User)
-		case einoschema.Assistant:
+		case einoschema.AgenticRoleTypeAssistant:
 			counts.Assistant = saturatingUint32Increment(counts.Assistant)
-		case einoschema.Tool:
-			counts.Tool = saturatingUint32Increment(counts.Tool)
 		}
 	}
 	messageCount := len(snapshot.Messages)
@@ -365,13 +367,13 @@ func validateBoundedTurnMetadataInput(original, candidate BoundedTurnMetadata) e
 	return nil
 }
 
-func materializeContextAssembly(value contextAssembly) ([]*einoschema.Message, error) {
+func materializeContextAssembly(value contextAssembly) ([]*einoschema.AgenticMessage, error) {
 	materialized, err := materializeContextAssemblyWithMapping(value)
 	return materialized.Messages, err
 }
 
 type materializedContext struct {
-	Messages    []*einoschema.Message
+	Messages    []*einoschema.AgenticMessage
 	BaseToFinal []int
 }
 
@@ -386,14 +388,14 @@ func materializeContextAssemblyWithMapping(value contextAssembly) (materializedC
 		}
 		return contributions[i].Source < contributions[j].Source
 	})
-	prelude := make([]*einoschema.Message, 0, len(contributions))
-	suffix := make([]*einoschema.Message, 0, len(contributions))
+	prelude := make([]*einoschema.AgenticMessage, 0, len(contributions))
+	suffix := make([]*einoschema.AgenticMessage, 0, len(contributions))
 	for _, contribution := range contributions {
 		message, err := cloneMessageDeep(contribution.Message)
 		if err != nil {
 			return materializedContext{}, err
 		}
-		if message.Role == einoschema.System {
+		if message.Role == einoschema.AgenticRoleTypeSystem {
 			prelude = append(prelude, message)
 		} else {
 			suffix = append(suffix, message)
@@ -403,7 +405,7 @@ func materializeContextAssemblyWithMapping(value contextAssembly) (materializedC
 	if err != nil {
 		return materializedContext{}, err
 	}
-	messages := make([]*einoschema.Message, 0, len(prelude)+len(base)+len(suffix))
+	messages := make([]*einoschema.AgenticMessage, 0, len(prelude)+len(base)+len(suffix))
 	messages = append(messages, prelude...)
 	messages = append(messages, base...)
 	messages = append(messages, suffix...)

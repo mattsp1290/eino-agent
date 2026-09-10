@@ -45,6 +45,11 @@ type ToolSettlementInput struct {
 	Err         error
 	ModelID     string
 	CompletedAt time.Time
+	// BlockID is the durable content-block identity minted for the single
+	// function_tool_result block this settlement persists. Required.
+	BlockID string
+	// ContentLimits bounds the encoded result content. Required.
+	ContentLimits session.ContentLimits
 }
 
 // BuildToolSettlement builds the canonical terminal call, result message, and
@@ -60,14 +65,16 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 	raw, output, status, errText := encodeToolOutput(input.Call.ID, input.Result, input.Tool.Retention, input.Disposition, input.Err)
 	metadata := toolSettlementMetadata(input.Claimed.Metadata, output)
 	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
-		Claimed:     input.Claimed,
-		Status:      status,
-		Output:      raw,
-		Error:       errText,
-		Metadata:    metadata,
-		ModelID:     input.ModelID,
-		CompletedAt: input.CompletedAt,
-		MessageAt:   messageAt,
+		Claimed:       input.Claimed,
+		Status:        status,
+		Output:        raw,
+		Error:         errText,
+		Metadata:      metadata,
+		ModelID:       input.ModelID,
+		CompletedAt:   input.CompletedAt,
+		MessageAt:     messageAt,
+		BlockID:       input.BlockID,
+		ContentLimits: input.ContentLimits,
 	})
 	return settlement, output, err
 }
@@ -81,8 +88,23 @@ type terminalToolEnvelopeInput struct {
 	ModelID     string
 	CompletedAt time.Time
 	MessageAt   time.Time
+	// BlockID is the durable content-block identity minted for the single
+	// function_tool_result block this settlement persists. Required.
+	BlockID string
+	// ContentLimits bounds the encoded result content. Required.
+	ContentLimits session.ContentLimits
 }
 
+// buildTerminalToolEnvelope persists a tool result as a single
+// function_tool_result content block on a user-role result message: the
+// durable content contract only allows BlockKindFunctionToolResult under
+// RoleUser (see session/content.go's roleAllowedKinds), and
+// session/history/agentic_projection.go's projector maps that role/kind
+// pairing straight back to a user-role agentic message carrying one
+// function_tool_result block, matching the model-visible shape a tool
+// result had before this durable representation existed. The block's single
+// text content is exactly string(input.Output) (the ToolOutput JSON), so the
+// model-visible payload is unchanged.
 func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSettlement, error) {
 	call := input.Claimed
 	if call.ID == "" || call.ClaimedBy == "" || call.ClaimToken == "" || call.ResultMessageID == "" || call.ResultPartID == "" {
@@ -93,6 +115,35 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 	}
 	if input.MessageAt.IsZero() {
 		return session.ToolSettlement{}, errors.New("tool settlement requires durable message time")
+	}
+	if input.BlockID == "" {
+		return session.ToolSettlement{}, errors.New("tool settlement requires a content block id")
+	}
+	content := session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{
+			ID:   input.BlockID,
+			Kind: session.BlockKindFunctionToolResult,
+			FunctionResult: &session.FunctionResultBlock{
+				CallID:  string(call.ID),
+				Name:    call.Name,
+				Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(input.Output)}},
+			},
+		}},
+	}
+	idUsed := false
+	parts, err := session.EncodeContentParts(content, func() session.PartID {
+		if idUsed {
+			return ""
+		}
+		idUsed = true
+		return call.ResultPartID
+	}, call.ResultMessageID, call.SessionID, call.RunID, input.MessageAt, input.ContentLimits)
+	if err != nil {
+		return session.ToolSettlement{}, fmt.Errorf("encode function tool result content: %w", err)
+	}
+	if len(parts) != 1 {
+		return session.ToolSettlement{}, errors.New("encode function tool result content: unexpected part count")
 	}
 	settlement := session.ToolSettlement{
 		ID:          call.ID,
@@ -105,12 +156,9 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 		CompletedAt: input.CompletedAt.UTC(),
 		ResultMessage: session.Message{
 			ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID,
-			Role: session.RoleTool, ModelID: input.ModelID, CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
+			Role: session.RoleUser, ModelID: input.ModelID, CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
 		},
-		ResultPart: session.Part{
-			ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID,
-			Kind: session.PartToolResult, Payload: cloneJSON(input.Output), CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
-		},
+		ResultPart: parts[0],
 	}
 	return settlement, nil
 }

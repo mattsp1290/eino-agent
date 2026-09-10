@@ -18,12 +18,60 @@ type capturedProviderState struct {
 	payloads []json.RawMessage
 }
 
-func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord session.Session, options history.Options, resolved model.Resolved) ([]*einoschema.Message, []model.ProviderMessageState, error) {
+// contractStreamer is the read-only subset of model.ProviderStateStreamer
+// and model.AgenticProviderStateStreamer shared by both provider-state
+// boundaries: enough to validate a durable envelope's codec identity against
+// the currently active provider without committing to either capture shape.
+type contractStreamer interface {
+	ProviderStateContract() model.ProviderStateContract
+}
+
+// blockEnvelopeIdentityProbe mirrors session/history/agentic_projection.go's
+// unexported probe of the same name: it reads the "block_id" field common to
+// every content block envelope (see session/content.go's
+// contentBlockEnvelope) without needing an exported accessor for it.
+type blockEnvelopeIdentityProbe struct {
+	BlockID string `json:"block_id"`
+}
+
+// orderedBlockIDs returns owner's durable content-block IDs, in the same
+// ordinal order session.ContentFromAgenticMessage/EncodeContentParts wrote
+// them, by reading the block_id field embedded in each content-block part's
+// envelope. It ignores provider_state and response_meta parts (neither is
+// block-shaped).
+func orderedBlockIDs(parts []session.Part, owners []session.MessageID, owner session.MessageID) ([]string, error) {
+	type located struct {
+		ordinal int64
+		id      string
+	}
+	var found []located
+	for index, part := range parts {
+		if owners[index] != owner {
+			continue
+		}
+		if _, ok := session.BlockKindForPart(part.Kind); !ok {
+			continue
+		}
+		var probe blockEnvelopeIdentityProbe
+		if err := json.Unmarshal(part.Payload, &probe); err != nil || probe.BlockID == "" {
+			return nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		}
+		found = append(found, located{ordinal: part.Ordinal, id: probe.BlockID})
+	}
+	sort.Slice(found, func(i, j int) bool { return found[i].ordinal < found[j].ordinal })
+	ids := make([]string, len(found))
+	for index, item := range found {
+		ids[index] = item.id
+	}
+	return ids, nil
+}
+
+func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord session.Session, options history.Options, resolved model.Resolved) ([]*einoschema.AgenticMessage, []model.ProviderMessageState, error) {
 	batch, err := history.LoadBatch(ctx, store, sessionRecord.ID)
 	if err != nil {
 		return nil, nil, err
 	}
-	projection, err := history.ProjectWithSources(batch, options)
+	projection, err := history.ProjectAgentic(batch, options)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -31,7 +79,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 	assistantIndexes := make(map[session.MessageID][]int)
 	for index, sourceID := range projection.SourceMessageIDs {
 		active[sourceID] = true
-		if projection.Messages[index] != nil && projection.Messages[index].Role == einoschema.Assistant {
+		if projection.Messages[index] != nil && projection.Messages[index].Role == einoschema.AgenticRoleTypeAssistant {
 			assistantIndexes[sourceID] = append(assistantIndexes[sourceID], index)
 		}
 	}
@@ -63,7 +111,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 	if len(groups) == 0 {
 		return projection.Messages, nil, nil
 	}
-	streamer, ok := resolved.Streamer.(model.ProviderStateStreamer)
+	streamer, ok := resolved.Streamer.(contractStreamer)
 	if !ok || streamer == nil {
 		return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 	}
@@ -95,6 +143,13 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		}
 		if run.ID != message.RunID || run.SessionID != sessionRecord.ID || run.ProviderID == "" || run.ModelID == "" ||
 			run.ModelID != message.ModelID {
+			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		}
+		blockIDs, err := orderedBlockIDs(batch.Parts, partOwners, owner)
+		if err != nil {
+			return nil, nil, err
+		}
+		if len(blockIDs) != len(projection.Messages[indexes[0]].ContentBlocks) {
 			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		parts := groups[owner]
@@ -149,59 +204,108 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		states = append(states, model.ProviderMessageState{
 			MessageIndex: indexes[0], MessageID: string(owner), SourceSessionID: string(sessionRecord.ID), SourceRunID: string(message.RunID),
 			ProviderID: run.ProviderID, SourceModelID: message.ModelID, CodecID: contract.CodecID, Version: contract.Version,
-			CompatibilityKey: contract.CompatibilityKey, Items: items,
+			CompatibilityKey: contract.CompatibilityKey, BlockIDs: blockIDs, Items: items,
 		})
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].MessageIndex < states[j].MessageIndex })
 	return projection.Messages, states, nil
 }
 
-func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.MessageID, message *einoschema.Message) (capturedProviderState, error) {
-	streamer, stateful := snapshot.Model.Streamer.(model.ProviderStateStreamer)
-	if !stateful || streamer == nil {
+// captureAssistantProviderState splits provider-private material out of the
+// finalized assistant message before it can ever be persisted or handed to
+// an extension. blockIDs is pre-minted, one entry per message.ContentBlocks
+// index (see orchestrator.go's executeTurn), so the same durable block
+// identity a block-bound codec captures against is the one
+// session.ContentFromAgenticMessage later assigns to the corresponding
+// durable content block.
+//
+// It returns the captured state (nil when the message carries no private
+// material) and the public message to persist and hand to extensions in
+// place of the raw provider output.
+func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.MessageID, message *einoschema.AgenticMessage, blockIDs []string) (capturedProviderState, *einoschema.AgenticMessage, error) {
+	switch streamer := snapshot.Model.Streamer.(type) {
+	case model.AgenticProviderStateStreamer:
+		if message == nil {
+			return capturedProviderState{}, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		contract, err := safeProviderStateContract(streamer)
+		if err != nil {
+			return capturedProviderState{}, nil, err
+		}
+		blockIDFn := func(index int) string {
+			if index < 0 || index >= len(blockIDs) {
+				return ""
+			}
+			return blockIDs[index]
+		}
+		capture, public, err := safeCaptureAgenticProviderState(streamer, message, blockIDFn)
+		if err != nil {
+			return capturedProviderState{}, nil, err
+		}
+		if public == nil || len(public.Extra) != 0 {
+			return capturedProviderState{}, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		result, err := buildCapturedProviderState(snapshot, messageID, contract, capture.Items, blockIDs)
+		if err != nil {
+			return capturedProviderState{}, nil, err
+		}
+		return result, public, nil
+	case model.ProviderStateStreamer:
+		if message == nil {
+			return capturedProviderState{}, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		contract, err := safeProviderStateContract(streamer)
+		if err != nil {
+			return capturedProviderState{}, nil, err
+		}
+		originalKeys := make(map[string]struct{}, len(message.Extra))
+		for key := range message.Extra {
+			originalKeys[key] = struct{}{}
+		}
+		capture, err := safeCaptureClassicProviderState(streamer, message)
+		if err != nil {
+			return capturedProviderState{}, nil, err
+		}
+		claimed := make(map[string]struct{}, len(capture.ClaimedKeys))
+		for _, key := range capture.ClaimedKeys {
+			if _, ok := originalKeys[key]; !ok {
+				return capturedProviderState{}, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+			}
+			if _, duplicate := claimed[key]; duplicate {
+				return capturedProviderState{}, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+			}
+			claimed[key] = struct{}{}
+		}
+		if len(message.Extra) != 0 || len(claimed) != len(originalKeys) ||
+			len(capture.Items) == 0 && len(capture.ClaimedKeys) != 0 || len(capture.Items) != 0 && len(claimed) == 0 {
+			return capturedProviderState{}, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+		if len(capture.Items) == 0 {
+			return capturedProviderState{}, message, nil
+		}
+		result, err := buildCapturedProviderState(snapshot, messageID, contract, capture.Items, nil)
+		if err != nil {
+			return capturedProviderState{}, nil, err
+		}
+		return result, message, nil
+	default:
 		if message != nil && len(message.Extra) != 0 {
-			return capturedProviderState{}, model.Error{Code: "provider_state_unregistered", Message: "provider state codec is not registered", Cause: errors.Join(model.ErrProviderState, model.ErrProviderStateMismatch)}
+			return capturedProviderState{}, nil, model.Error{Code: "provider_state_unregistered", Message: "provider state codec is not registered", Cause: errors.Join(model.ErrProviderState, model.ErrProviderStateMismatch)}
 		}
+		return capturedProviderState{}, message, nil
+	}
+}
+
+func buildCapturedProviderState(snapshot TurnSnapshot, messageID session.MessageID, contract model.ProviderStateContract, items []model.ProviderStateItem, blockIDs []string) (capturedProviderState, error) {
+	if len(items) == 0 {
 		return capturedProviderState{}, nil
 	}
-	if message == nil {
-		return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
-	}
-	contract, err := safeProviderStateContract(streamer)
-	if err != nil {
-		return capturedProviderState{}, err
-	}
-	originalKeys := make(map[string]struct{}, len(message.Extra))
-	for key := range message.Extra {
-		originalKeys[key] = struct{}{}
-	}
-	capture, err := safeCaptureProviderState(streamer, message)
-	if err != nil {
-		return capturedProviderState{}, err
-	}
-	claimed := make(map[string]struct{}, len(capture.ClaimedKeys))
-	for _, key := range capture.ClaimedKeys {
-		if _, ok := originalKeys[key]; !ok {
-			return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
-		}
-		if _, duplicate := claimed[key]; duplicate {
-			return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
-		}
-		claimed[key] = struct{}{}
-	}
-	if len(message.Extra) != 0 || len(claimed) != len(originalKeys) ||
-		len(capture.Items) == 0 && len(capture.ClaimedKeys) != 0 || len(capture.Items) != 0 && len(claimed) == 0 {
-		return capturedProviderState{}, runtimeProviderStateError(model.ErrProviderStateInvalid)
-	}
-	if len(capture.Items) == 0 {
-		return capturedProviderState{}, nil
-	}
-	if err := model.ValidateProviderStateItems(capture.Items, contract.Limits); err != nil {
+	if err := model.ValidateProviderStateItems(items, contract.Limits); err != nil {
 		return capturedProviderState{}, collapseProviderStateError(err)
 	}
-	result := capturedProviderState{payloads: make([]json.RawMessage, len(capture.Items))}
+	result := capturedProviderState{payloads: make([]json.RawMessage, len(items))}
 	storedBytes := 0
-	for index, item := range capture.Items {
+	for index, item := range items {
 		payload, err := session.EncodeProviderStatePayload(session.ProviderStateEnvelope{
 			CodecID: contract.CodecID, Version: contract.Version, ProviderID: string(snapshot.Model.Provider.ID),
 			SourceModelID: string(snapshot.Model.Model.ID), CompatibilityKey: contract.CompatibilityKey,
@@ -220,7 +324,7 @@ func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.Mess
 		MessageID: string(messageID), SourceSessionID: string(snapshot.SessionID), SourceRunID: string(snapshot.RunID),
 		ProviderID: string(snapshot.Model.Provider.ID), SourceModelID: string(snapshot.Model.Model.ID),
 		CodecID: contract.CodecID, Version: contract.Version, CompatibilityKey: contract.CompatibilityKey,
-		Items: capture.Items,
+		BlockIDs: blockIDs, Items: items,
 	}
 	cloned, err := (model.Request{ProviderState: []model.ProviderMessageState{state}}).Clone()
 	if err != nil {
@@ -230,7 +334,7 @@ func captureAssistantProviderState(snapshot TurnSnapshot, messageID session.Mess
 	return result, nil
 }
 
-func safeProviderStateContract(streamer model.ProviderStateStreamer) (contract model.ProviderStateContract, err error) {
+func safeProviderStateContract(streamer contractStreamer) (contract model.ProviderStateContract, err error) {
 	defer func() {
 		if recover() != nil {
 			contract = model.ProviderStateContract{}
@@ -247,7 +351,22 @@ func safeProviderStateContract(streamer model.ProviderStateStreamer) (contract m
 	return contract, nil
 }
 
-func safeCaptureProviderState(streamer model.ProviderStateStreamer, message *einoschema.Message) (capture model.ProviderStateCapture, err error) {
+func safeCaptureAgenticProviderState(streamer model.AgenticProviderStateStreamer, message *einoschema.AgenticMessage, blockID func(int) string) (capture model.ProviderStateCapture, public *einoschema.AgenticMessage, err error) {
+	defer func() {
+		if recover() != nil {
+			capture = model.ProviderStateCapture{}
+			public = nil
+			err = runtimeProviderStateError(model.ErrProviderStateInvalid)
+		}
+	}()
+	capture, public, err = streamer.CaptureProviderState(message, blockID)
+	if err != nil {
+		return model.ProviderStateCapture{}, nil, collapseProviderStateError(err)
+	}
+	return capture, public, nil
+}
+
+func safeCaptureClassicProviderState(streamer model.ProviderStateStreamer, message *einoschema.AgenticMessage) (capture model.ProviderStateCapture, err error) {
 	defer func() {
 		if recover() != nil {
 			capture = model.ProviderStateCapture{}

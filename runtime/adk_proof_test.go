@@ -428,7 +428,7 @@ func (p *adkProof) newHost(store *sqlite.Store, options adkProofOptions) *Stream
 	}
 	hostOptions := []Option{
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*schema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*schema.AgenticMessage, error) {
 			return nil, errors.New("classic streamer must not be used by the ADK proof")
 		})}),
 		WithIDGenerator(ids),
@@ -486,14 +486,14 @@ func (p *adkProof) toolCalls() []session.ToolCall {
 	}
 	var calls []session.ToolCall
 	for _, part := range batch.Parts {
-		if part.Kind != session.PartToolCall {
+		if part.Kind != session.PartFunctionToolCall {
 			continue
 		}
-		var payload toolCallPayload
-		if err := json.Unmarshal(part.Payload, &payload); err != nil {
-			p.t.Fatal(err)
+		content, err := session.DecodeContentParts(session.RoleAssistant, []session.Part{part}, session.DefaultContentLimits())
+		if err != nil || len(content.Blocks) != 1 || content.Blocks[0].FunctionCall == nil {
+			p.t.Fatalf("decode function tool call part: %v", err)
 		}
-		calls = append(calls, p.toolCall(session.ToolCallID(payload.ID)))
+		calls = append(calls, p.toolCall(session.ToolCallID(content.Blocks[0].FunctionCall.CallID)))
 	}
 	return calls
 }
@@ -524,8 +524,8 @@ func (p *adkProof) newAgent(t testing.TB, ledger *adkLedgerModel, handlers ...ad
 func (p *adkProof) userInput() []*schema.AgenticMessage {
 	var text string
 	for _, msg := range p.snapshot.Messages {
-		if msg != nil && msg.Role == schema.User {
-			text = msg.Content
+		if msg != nil && msg.Role == schema.AgenticRoleTypeUser {
+			text = agenticMessageText(msg)
 		}
 	}
 	return []*schema.AgenticMessage{schema.UserAgenticMessage(text)}
@@ -727,25 +727,13 @@ func (m *adkLedgerModel) commit(ctx context.Context, dispatch *adkDispatch, resu
 	if result == nil {
 		return nil, errors.New("nil agentic result")
 	}
-	var text, reasoning []string
-	var calls []schema.ToolCall
 	for _, block := range result.ContentBlocks {
 		if block == nil {
 			continue
 		}
 		switch block.Type {
-		case schema.ContentBlockTypeAssistantGenText:
-			if block.AssistantGenText != nil {
-				text = append(text, block.AssistantGenText.Text)
-			}
-		case schema.ContentBlockTypeReasoning:
-			if block.Reasoning != nil {
-				reasoning = append(reasoning, block.Reasoning.Text)
-			}
-		case schema.ContentBlockTypeFunctionToolCall:
-			if block.FunctionToolCall != nil {
-				calls = append(calls, schema.ToolCall{ID: block.FunctionToolCall.CallID, Type: "function", Function: schema.FunctionCall{Name: block.FunctionToolCall.Name, Arguments: block.FunctionToolCall.Arguments}})
-			}
+		case schema.ContentBlockTypeAssistantGenText, schema.ContentBlockTypeReasoning, schema.ContentBlockTypeFunctionToolCall:
+			// Persisted below via persistAssistantTurn/prepareToolCalls.
 		case schema.ContentBlockTypeMCPToolApprovalRequest:
 			// Persisted by the approval binding as a durable approval record.
 			if m.approval == nil {
@@ -758,9 +746,8 @@ func (m *adkLedgerModel) commit(ctx context.Context, dispatch *adkDispatch, resu
 			return nil, fmt.Errorf("%w: %s", errADKUnsupportedBlock, block.Type)
 		}
 	}
-	classic := &schema.Message{Role: schema.Assistant, Content: strings.Join(text, ""), ReasoningContent: strings.Join(reasoning, ""), ToolCalls: calls}
-	normalizeToolCallIDs(classic, p.host.ids)
-	prepared, err := p.host.prepareToolCalls(ctx, p.execution, p.snapshot, dispatch.messageID, classic.ToolCalls)
+	normalizeToolCallIDs(result, p.host.ids)
+	prepared, err := p.host.prepareToolCalls(ctx, p.execution, p.snapshot, dispatch.messageID, functionToolCalls(result))
 	if err != nil {
 		return nil, err
 	}
@@ -769,7 +756,11 @@ func (m *adkLedgerModel) commit(ctx context.Context, dispatch *adkDispatch, resu
 			return nil, err
 		}
 	}
-	prepared, err = p.host.persistAssistantTurn(ctx, p.execution, p.snapshot, dispatch.messageID, classic, nil, prepared)
+	blockIDs := make([]string, len(result.ContentBlocks))
+	for index := range blockIDs {
+		blockIDs[index] = string(p.host.ids.NewPartID())
+	}
+	prepared, err = p.host.persistAssistantTurn(ctx, p.execution, p.snapshot, dispatch.messageID, result, blockIDs, nil, prepared)
 	if err != nil {
 		return nil, err
 	}
@@ -932,6 +923,7 @@ func (t *adkDurableTool) InvokableRun(ctx context.Context, arguments string, _ .
 		settlement, _, err := buildToolSettlement(ToolSettlementInput{
 			Tool: t.tool, Call: call, Claimed: claimed.Call, Disposition: ToolDenied,
 			Result: modelVisiblePermissionResult("denied", "host denied the tool call"), ModelID: string(p.snapshot.Model.Model.ID), CompletedAt: completedAt,
+			BlockID: string(p.host.ids.NewPartID()), ContentLimits: p.host.contentLimits,
 		}, messageAt)
 		if err != nil {
 			return "", err

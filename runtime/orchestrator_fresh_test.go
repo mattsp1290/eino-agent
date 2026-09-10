@@ -50,9 +50,9 @@ func TestStreamingOrchestratorPreservesAcceptedUserMessageBytes(t *testing.T) {
 
 	const content = "  héllo 世界\n"
 	var providerContent string
-	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
-		providerContent = request.Messages[len(request.Messages)-1].Content
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		providerContent = agenticMessageText(request.Messages[len(request.Messages)-1])
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "exact-content", Message: TextUserMessage(content), Config: orchestratorConfig()})
 	if result.Error != nil {
@@ -81,7 +81,7 @@ func TestPreExecutionRejectionRetainsAdmittedPair(t *testing.T) {
 		t.Fatal(err)
 	}
 	providerCalls := 0
-	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		providerCalls++
 		return nil, errors.New("provider should not be called")
 	}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
@@ -116,9 +116,9 @@ func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 	newOrchestrator := func(sink *blockingSink) *StreamingOrchestrator {
 		return mustConfiguredOrchestrator(
 			WithStore(store),
-			WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 				dispatches.Add(1)
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			})}),
 			WithIDGenerator(&sequenceIDs{}),
 			WithRunPlanProvider(emptyTestRunPlanProvider()),
@@ -172,8 +172,8 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("hel", nil), einoschema.AssistantMessage("lo", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticTextChunk(0, "hel"), agenticTextChunk(0, "lo")}, nil
 	}))
 	handle, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
@@ -197,14 +197,18 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	var textParts, userInputTextParts []session.Part
 	for _, part := range store.parts {
 		switch part.Kind {
-		case session.PartText:
+		case session.PartAssistantGenText:
 			textParts = append(textParts, part)
 		case session.PartUserInputText:
 			userInputTextParts = append(userInputTextParts, part)
 		}
 	}
-	if len(textParts) != 1 || textParts[0].MessageID != result.MessageID || string(textParts[0].Payload) != `{"text":"hello"}` {
+	if len(textParts) != 1 || textParts[0].MessageID != result.MessageID {
 		t.Fatalf("assistant text part = %#v, want settled assistant text \"hello\"", textParts)
+	}
+	assistantDecoded, err := session.DecodeContentParts(session.RoleAssistant, textParts, session.DefaultContentLimits())
+	if err != nil || len(assistantDecoded.Blocks) != 1 || assistantDecoded.Blocks[0].Text == nil || assistantDecoded.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("decoded assistant text = %#v, error = %v", assistantDecoded, err)
 	}
 	if len(userInputTextParts) != 1 {
 		t.Fatalf("user input text parts = %#v", userInputTextParts)
@@ -249,8 +253,8 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}), WithEventSink(runtimeSink), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
 
 	result := startAndWait(t, orchestrator)
@@ -309,8 +313,8 @@ func TestAdmissionSinkPanicDoesNotPreventRunOrExtensionNotification(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}), WithEventSink(panickingEventSink{}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || result.Error != nil {
@@ -362,11 +366,11 @@ func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T
 		UpdatedAt: now,
 	})
 	var got []string
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			got = append(got, msg.Content)
+			got = append(got, agenticMessageText(msg))
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("next", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("next")}, nil
 	}))
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {

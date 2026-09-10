@@ -468,22 +468,31 @@ type catalogRuntimeStreamer struct {
 
 func (s *catalogRuntimeStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	s.turn++
-	var response *einoschema.Message
+	var response *einoschema.AgenticMessage
 	if s.turn == 1 {
-		got := make([]string, len(request.Tools))
-		for index := range request.Tools {
-			got[index] = request.Tools[index].Name
+		got := make([]string, len(request.Controls.Tools))
+		for index := range request.Controls.Tools {
+			got[index] = request.Controls.Tools[index].Name
 		}
 		if !reflect.DeepEqual(got, s.wantOrder) {
 			s.err = fmt.Errorf("provider tool order = %#v, want %#v", got, s.wantOrder)
 			return nil, s.err
 		}
-		response = einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID: "catalog-call", Type: "function",
-			Function: einoschema.FunctionCall{Name: "file_read", Arguments: `{"path":"dir/../hello.txt"}`},
-		}})
+		response = &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{
+					CallID: "catalog-call", Name: "file_read", Arguments: `{"path":"dir/../hello.txt"}`,
+				}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}
 	} else {
-		response = einoschema.AssistantMessage("done", nil)
+		response = &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "done"}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}
 	}
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	_ = writer.Send(model.StreamDelta{Message: response}, nil)

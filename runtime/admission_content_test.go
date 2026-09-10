@@ -41,8 +41,8 @@ func TestAdmissionPersistsRichContentAtomicallyWithRunAndUserMessage(t *testing.
 
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		})}),
 		WithClock(func() time.Time { return time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC) }),
 		WithOwnerID("rich-admission-sqlite"),
@@ -113,24 +113,27 @@ func TestAdmissionPersistsRichContentAtomicallyWithRunAndUserMessage(t *testing.
 
 // TestAdmissionAcceptsMediaOnlySubmission covers a submission with no text
 // block at all: it must be admitted, the media block must be durable, and
-// the classic provider snapshot carries an empty user text (acceptable until
-// W5 switches the classic path to the agentic projection).
+// the agentic provider snapshot carries the media block on the admitted
+// user message with no accompanying text block.
 func TestAdmissionAcceptsMediaOnlySubmission(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	var providerContent string
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
-		providerContent = request.Messages[len(request.Messages)-1].Content
-		return []*einoschema.Message{einoschema.AssistantMessage("seen", nil)}, nil
+	var providerMessages []*einoschema.AgenticMessage
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		providerMessages = request.Messages
+		return []*einoschema.AgenticMessage{agenticAssistantText("seen")}, nil
 	}))
 	blocks := []session.ContentBlock{{Kind: session.BlockKindUserInputImage, Media: &session.MediaBlock{URL: "https://example.com/only.png", MIMEType: "image/png"}}}
 	result := startAndWaitRequest(t, orch, Request{SessionID: "media-only-session", Message: UserMessage{Blocks: blocks}, Config: orchestratorConfig()})
 	if result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	if providerContent != "" {
-		t.Fatalf("classic provider content = %q, want empty for a media-only submission", providerContent)
+	last := providerMessages[len(providerMessages)-1]
+	if last.Role != einoschema.AgenticRoleTypeUser || len(last.ContentBlocks) != 1 ||
+		last.ContentBlocks[0].Type != einoschema.ContentBlockTypeUserInputImage || last.ContentBlocks[0].UserInputImage == nil ||
+		last.ContentBlocks[0].UserInputImage.URL != "https://example.com/only.png" {
+		t.Fatalf("provider message = %#v, want a single user_input_image block", last)
 	}
 	var mediaPart session.Part
 	found := false
@@ -156,7 +159,7 @@ func TestAdmissionRejectsAssistantKindBlockBeforeAnyRunRow(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }))
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil }))
 	blocks := []session.ContentBlock{{Kind: session.BlockKindFunctionToolCall, FunctionCall: &session.FunctionCallBlock{CallID: "call-1", Name: "lookup"}}}
 	_, err := orch.Start(context.Background(), Request{SessionID: "assistant-kind-session", Message: UserMessage{Blocks: blocks}, Config: orchestratorConfig()})
 	if !errors.Is(err, ErrInvalidOrchestrator) {
@@ -173,7 +176,7 @@ func TestAdmissionRejectsEmptySubmissionBeforeAnyRunRow(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }))
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil }))
 	_, err := orch.Start(context.Background(), Request{SessionID: "empty-session", Message: UserMessage{}, Config: orchestratorConfig()})
 	if !errors.Is(err, ErrInvalidOrchestrator) {
 		t.Fatalf("Start error = %v, want ErrInvalidOrchestrator", err)
@@ -190,7 +193,7 @@ func TestAdmissionRejectsOverLimitSubmissionBeforeAnyRunRow(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }),
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil }),
 		WithContentLimits(session.ContentLimits{MaxMessageBytes: 1 << 20, MaxBlocks: 1, MaxBlockBytes: 1 << 20}),
 	)
 	blocks := []session.ContentBlock{
@@ -218,8 +221,8 @@ func TestAdmissionMutatingCallerBlocksAfterStartDoesNotChangeStoredParts(t *test
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
 	textBlock := &session.TextBlock{Text: "original"}
 	mediaBlock := &session.MediaBlock{URL: "https://example.com/original.png", MIMEType: "image/png"}
@@ -277,26 +280,21 @@ func TestAdmissionMutatingCallerBlocksAfterStartDoesNotChangeStoredParts(t *test
 
 // TestAdmissionMediaBlockSurvivesSecondTurnInSameSession admits a user turn
 // carrying text and a media block, then starts a second run in the same
-// session and requires it to succeed. Before the classic projector's
-// user-role media support (session/history/projector.go), the first turn's
-// persisted user_input_image part would permanently brick every later turn
-// in the session: loadProviderHistory decodes prior turns through the
-// classic projector to build the model request, and it rejected
-// user_input_image (and the other media kinds) with ErrClassicUnsupported.
-// This also asserts the model actually receives the first turn's text and
-// media as an ordered UserInputMultiContent, not silently dropped.
+// session and requires it to succeed. This also asserts the model actually
+// receives the first turn's text and media as ordered content blocks on one
+// user-role agentic message, not silently dropped.
 func TestAdmissionMediaBlockSurvivesSecondTurnInSameSession(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	var secondTurnMessages []*einoschema.Message
+	var secondTurnMessages []*einoschema.AgenticMessage
 	turn := 0
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		turn++
 		if turn == 2 {
 			secondTurnMessages = request.Messages
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("seen", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("seen")}, nil
 	}))
 
 	const sessionID session.ID = "media-then-text-session"
@@ -315,24 +313,28 @@ func TestAdmissionMediaBlockSurvivesSecondTurnInSameSession(t *testing.T) {
 		t.Fatalf("second run result = %+v (media block from the first turn must not brick later turns)", second)
 	}
 
-	var withMedia *einoschema.Message
+	var withMedia *einoschema.AgenticMessage
 	for _, msg := range secondTurnMessages {
-		if msg.Role == einoschema.User && len(msg.UserInputMultiContent) > 0 {
-			withMedia = msg
-			break
+		if msg.Role != einoschema.AgenticRoleTypeUser {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block != nil && block.Type == einoschema.ContentBlockTypeUserInputImage {
+				withMedia = msg
+			}
 		}
 	}
 	if withMedia == nil {
-		t.Fatalf("second turn's model request never carried the first turn's media as UserInputMultiContent: %#v", secondTurnMessages)
+		t.Fatalf("second turn's model request never carried the first turn's media: %#v", secondTurnMessages)
 	}
-	if len(withMedia.UserInputMultiContent) != 2 {
-		t.Fatalf("UserInputMultiContent = %#v, want 2 parts (text then image, order preserved)", withMedia.UserInputMultiContent)
+	if len(withMedia.ContentBlocks) != 2 {
+		t.Fatalf("ContentBlocks = %#v, want 2 blocks (text then image, order preserved)", withMedia.ContentBlocks)
 	}
-	textPart, imagePart := withMedia.UserInputMultiContent[0], withMedia.UserInputMultiContent[1]
-	if textPart.Type != einoschema.ChatMessagePartTypeText || textPart.Text != "look at this" {
-		t.Fatalf("UserInputMultiContent[0] = %#v, want text %q", textPart, "look at this")
+	textBlock, imageBlock := withMedia.ContentBlocks[0], withMedia.ContentBlocks[1]
+	if textBlock.Type != einoschema.ContentBlockTypeUserInputText || textBlock.UserInputText == nil || textBlock.UserInputText.Text != "look at this" {
+		t.Fatalf("ContentBlocks[0] = %#v, want text %q", textBlock, "look at this")
 	}
-	if imagePart.Type != einoschema.ChatMessagePartTypeImageURL || imagePart.Image == nil || imagePart.Image.URL == nil || *imagePart.Image.URL != "https://example.com/first.png" {
-		t.Fatalf("UserInputMultiContent[1] = %#v, want image URL %q", imagePart, "https://example.com/first.png")
+	if imageBlock.Type != einoschema.ContentBlockTypeUserInputImage || imageBlock.UserInputImage == nil || imageBlock.UserInputImage.URL != "https://example.com/first.png" {
+		t.Fatalf("ContentBlocks[1] = %#v, want image URL %q", imageBlock, "https://example.com/first.png")
 	}
 }

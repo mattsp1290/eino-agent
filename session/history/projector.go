@@ -199,7 +199,21 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 				return nil, fmt.Errorf("part %s: unsupported part kind %q", part.ID, part.Kind)
 			}
 		}
-		result := []*einoschema.Message{projected}
+		// A user-role message whose parts are entirely tool-result parts
+		// (the durable shape a settled function_tool_result now uses: role
+		// user, one function_tool_result/tool_result part, nothing else)
+		// has nothing left to say through the primary projected message
+		// once its content is diverted to toolResultParts below; skip
+		// emitting that now-empty placeholder so a tool result still
+		// projects to exactly one classic message, matching the classic
+		// RoleTool shape it replaces. This is scoped to RoleUser
+		// specifically so an assistant- or system-role message that mixes
+		// (legacy) tool-result parts with otherwise no content keeps its
+		// prior placeholder-message behavior.
+		result := []*einoschema.Message{}
+		if message.Role != session.RoleUser || len(parts) == 0 || len(toolResultParts) != len(parts) {
+			result = append(result, projected)
+		}
 		toolMessages, err := projectToolResults(toolResultParts, limits)
 		if err != nil {
 			return nil, err

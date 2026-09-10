@@ -82,7 +82,7 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if admitted.Snapshot.Config.Agent.Options["temperature"] != "0.2" {
 		t.Fatalf("snapshot config mutated: %#v", admitted.Snapshot.Config.Agent.Options)
 	}
-	if admitted.Snapshot.Messages[0].Content != "hello" {
+	if agenticMessageText(admitted.Snapshot.Messages[0]) != "hello" {
 		t.Fatalf("snapshot messages mutated: %#v", admitted.Snapshot.Messages[0])
 	}
 	persistedUserContent, err := session.DecodeContentParts(session.RoleUser, []session.Part{admitted.UserParts[0]}, session.DefaultContentLimits())
@@ -162,7 +162,7 @@ func TestAdmitBuildsProviderInputFromFencedHistoryAndCurrentMessage(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(admitted.Snapshot.Messages) != 2 || admitted.Snapshot.Messages[0].Content != "prior" || admitted.Snapshot.Messages[1].Content != "hello" {
+	if len(admitted.Snapshot.Messages) != 2 || agenticMessageText(admitted.Snapshot.Messages[0]) != "prior" || agenticMessageText(admitted.Snapshot.Messages[1]) != "hello" {
 		t.Fatalf("provider messages = %#v, want prior then current user", admitted.Snapshot.Messages)
 	}
 	if !admitted.UserMessage.CreatedAt.Equal(priorAt.Add(time.Nanosecond)) || !admitted.AssistantMessage.CreatedAt.Equal(priorAt.Add(2*time.Nanosecond)) {
@@ -375,7 +375,7 @@ func testRunAdmission() admissionRequest {
 		Model: model.Resolved{
 			Provider: model.Provider{ID: "openai"},
 			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
-			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }),
+			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil }),
 		},
 		OwnerID:       "owner-1",
 		LeaseDuration: time.Minute,

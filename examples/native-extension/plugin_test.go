@@ -3,6 +3,7 @@ package nativeextension
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -142,15 +143,46 @@ type capturingStreamer struct {
 func (s *capturingStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	s.mu.Lock()
 	for _, message := range request.Messages {
-		s.messages = append(s.messages, message.Content)
+		s.messages = append(s.messages, agenticMessageText(message))
 	}
 	s.mu.Unlock()
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	go func() {
 		defer writer.Close()
-		writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil)}, nil)
+		writer.Send(model.StreamDelta{Message: &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "done"}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}}, nil)
 	}()
 	return reader, nil
+}
+
+// agenticMessageText concatenates every text-bearing content block on an
+// agentic message (user_input_text or assistant_gen_text) for test
+// assertions.
+func agenticMessageText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeUserInputText:
+			if block.UserInputText != nil {
+				sb.WriteString(block.UserInputText.Text)
+			}
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				sb.WriteString(block.AssistantGenText.Text)
+			}
+		}
+	}
+	return sb.String()
 }
 
 type testIDs struct{ next atomic.Int64 }

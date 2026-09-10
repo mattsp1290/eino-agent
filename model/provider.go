@@ -20,24 +20,46 @@ var (
 	ErrProviderRejected = errors.New("model provider rejected request")
 	// ErrInvalidResolution reports an incomplete or inconsistent resolved model.
 	ErrInvalidResolution = errors.New("invalid resolved model")
+	// ErrCapabilityUnsupported reports that an adapter cannot represent some
+	// part of a request or response. The classic-model interoperability
+	// adapter uses this to fail closed before dispatch instead of silently
+	// dropping content it cannot translate.
+	ErrCapabilityUnsupported = errors.New("model capability unsupported by adapter")
 )
 
 // StreamDelta is one normalized chunk from a provider stream. Usage is the
 // cumulative attempt-to-date provider usage at this point in the stream.
 type StreamDelta struct {
-	Message *einoschema.Message
+	Message *einoschema.AgenticMessage
 	Usage   Usage
+}
+
+// UsageFromAgenticMessage maps the usage metadata Eino exposes on a streamed
+// agentic message into the provider-neutral cumulative usage shape.
+func UsageFromAgenticMessage(message *einoschema.AgenticMessage) Usage {
+	if message == nil || message.ResponseMeta == nil || message.ResponseMeta.TokenUsage == nil {
+		return Usage{}
+	}
+	usage := message.ResponseMeta.TokenUsage
+	return Usage{
+		InputTokens:     int64(usage.PromptTokens),
+		OutputTokens:    int64(usage.CompletionTokens),
+		ReasoningTokens: int64(usage.CompletionTokensDetails.ReasoningTokens),
+		CacheReadTokens: int64(usage.PromptTokenDetails.CachedTokens),
+	}
 }
 
 // Request is the transport-neutral provider request shape.
 type Request struct {
 	Identity Identity
-	Messages []*einoschema.Message
+	Messages []*einoschema.AgenticMessage
+	// Controls carries the agentic call-time knobs (tools, tool choice and
+	// scalar generation controls) that used to live as scattered fields.
+	Controls RequestControls
 	// ProviderState is a private sidecar restored only by a state-aware adapter.
 	// It is deliberately excluded from provider-neutral message serialization.
 	ProviderState []ProviderMessageState
 	System        string
-	Tools         []*einoschema.ToolInfo
 	Options       map[string]string
 	// IdempotencyKey is assigned by a ledger-enabled runtime. It is not part of
 	// the model-visible audited projection. Adapters whose provider transport
@@ -73,15 +95,15 @@ func (r Request) Clone() (Request, error) {
 	next := r
 	next.Identity = r.Identity.Clone()
 	var err error
-	next.Messages, err = cloneMessages(r.Messages)
+	next.Messages, err = cloneAgenticMessages(r.Messages)
+	if err != nil {
+		return Request{}, err
+	}
+	next.Controls, err = r.Controls.clone()
 	if err != nil {
 		return Request{}, err
 	}
 	next.ProviderState = cloneProviderState(r.ProviderState)
-	next.Tools, err = cloneToolInfos(r.Tools)
-	if err != nil {
-		return Request{}, err
-	}
 	next.Options = cloneMap(r.Options)
 	return next, nil
 }
@@ -330,6 +352,39 @@ func cloneMessages(src []*einoschema.Message) ([]*einoschema.Message, error) {
 	return dst, nil
 }
 
+// cloneAgenticMessages deep-clones agentic messages via a JSON round trip,
+// mirroring cloneMessages' strictness: any block carrying non-nil
+// StreamingMeta or any non-empty Extra on the message or a block is rejected.
+func cloneAgenticMessages(src []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
+	if src == nil {
+		return nil, nil
+	}
+	dst := make([]*einoschema.AgenticMessage, len(src))
+	for index, message := range src {
+		if message == nil {
+			continue
+		}
+		for _, block := range message.ContentBlocks {
+			if block != nil && block.StreamingMeta != nil {
+				return nil, fmt.Errorf("clone message %d contains non-copyable streaming metadata", index)
+			}
+		}
+		raw, err := json.Marshal(message)
+		if err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		if err := rejectExtraJSON(raw); err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		var cloned einoschema.AgenticMessage
+		if err := json.Unmarshal(raw, &cloned); err != nil {
+			return nil, fmt.Errorf("clone message %d: %w", index, err)
+		}
+		dst[index] = &cloned
+	}
+	return dst, nil
+}
+
 func cloneToolInfos(src []*einoschema.ToolInfo) ([]*einoschema.ToolInfo, error) {
 	if src == nil {
 		return nil, nil
@@ -411,4 +466,12 @@ func cloneSlice[T any](src []T) []T {
 	dst := make([]T, len(src))
 	copy(dst, src)
 	return dst
+}
+
+func clonePtr[T any](src *T) *T {
+	if src == nil {
+		return nil
+	}
+	next := *src
+	return &next
 }

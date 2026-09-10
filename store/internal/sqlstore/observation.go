@@ -96,7 +96,7 @@ func (s *Store) boundedColumn(column string) string {
 	return "CASE WHEN " + s.dialect.ByteLength(column) + " <= ? THEN " + column + " ELSE NULL END"
 }
 func (s *Store) observationMessages(ctx context.Context, out *session.ObservationSnapshot, l session.ObservationLimits, b *observationBudget) error {
-	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("m.id")+", "+s.boundedColumn("r.id")+", m.role, m.finalized, COALESCE(r.session_key = m.session_key, FALSE) FROM "+s.tableName("messages")+" AS m"+s.dialect.IndexHint("messages_observation_idx")+" LEFT JOIN "+s.tableName("runs")+" AS r ON r.row_key = m.run_key WHERE m.session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND m.role IN ('user', 'assistant') ORDER BY m.created_at DESC, m.id DESC LIMIT ?", b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), l.MaxMessages+1)
+	rows, err := s.query(ctx, "SELECT "+s.boundedColumn("m.id")+", "+s.boundedColumn("r.id")+", m.role, m.finalized, COALESCE(r.session_key = m.session_key, FALSE) FROM "+s.tableName("messages")+" AS m"+s.dialect.IndexHint("messages_observation_idx")+" LEFT JOIN "+s.tableName("runs")+" AS r ON r.row_key = m.run_key WHERE m.session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND m.role IN ('user', 'assistant') AND NOT EXISTS (SELECT 1 FROM "+s.tableName("parts")+" AS otr WHERE otr.message_key = m.row_key AND otr.kind IN ('tool_result','function_tool_result')) ORDER BY m.created_at DESC, m.id DESC LIMIT ?", b.bytes/6, b.bytes/6, []byte(out.Watermark.SessionID), l.MaxMessages+1)
 	if err != nil {
 		return err
 	}

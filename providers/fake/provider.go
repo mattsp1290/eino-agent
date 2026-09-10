@@ -3,16 +3,22 @@ package fake
 import (
 	"context"
 	"errors"
+	"io"
 	"sync/atomic"
 
+	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
 )
 
-// Step is one scripted fake provider stream chunk.
+// Step is one scripted fake provider stream chunk. When Blocks is non-empty
+// it is emitted as-is, with each block's StreamingMeta.Index set to its
+// position in Blocks. Otherwise, when Content is non-empty, it becomes a
+// single assistant_gen_text block at index 0.
 type Step struct {
 	Content string
+	Blocks  []*einoschema.ContentBlock
 	Usage   model.Usage
 	Err     error
 }
@@ -52,59 +58,86 @@ func (p *Provider) Models(context.Context) ([]model.Descriptor, error) {
 	return models, nil
 }
 
-// Build returns an immutable fake provider streamer.
+// Build returns an immutable fake agentic provider streamer.
 func (p *Provider) Build(_ context.Context, selection model.Selection, runtime model.Runtime) (model.Streamer, error) {
 	if p == nil {
 		return nil, errors.New("fake provider is nil")
 	}
 	p.Builds.Add(1)
-	return &providerStreamer{
-		providerID: p.ID,
-		modelID:    selection.ModelID,
-		steps:      cloneSteps(p.Steps),
-		runtime:    cloneRuntime(runtime),
-	}, nil
+	agentic := NewAgenticModel(p.ID, selection.ModelID, p.Steps)
+	return &providerStreamer{inner: model.NewAgenticStreamer(agentic), runtime: cloneRuntime(runtime)}, nil
 }
 
+// providerStreamer wraps the model.NewAgenticStreamer result so Build keeps
+// its own defensive Runtime clone (independent of any clone the resolver
+// already performed), matching the immutable-adapter contract other
+// adapters follow.
 type providerStreamer struct {
+	inner   model.Streamer
+	runtime model.Runtime
+}
+
+func (s *providerStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+	return s.inner.StreamProvider(ctx, request)
+}
+
+// NewAgenticModel returns an einomodel.AgenticModel that plays back steps as
+// scripted stream chunks, tagging each emitted message with providerID and
+// modelID. It performs no network I/O and can be used directly by tests that
+// need an einomodel.AgenticModel rather than a model.Streamer.
+func NewAgenticModel(providerID model.ProviderID, modelID model.ID, steps []Step) einomodel.AgenticModel {
+	return &agenticModel{providerID: providerID, modelID: modelID, steps: cloneSteps(steps)}
+}
+
+type agenticModel struct {
 	providerID model.ProviderID
 	modelID    model.ID
 	steps      []Step
-	runtime    model.Runtime
 }
 
-// StreamProvider returns a fake stream of normalized cumulative deltas.
-func (s *providerStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
-	if s == nil {
-		return nil, errors.New("fake provider streamer is nil")
-	}
-	if _, err := request.Clone(); err != nil {
+func (m *agenticModel) Generate(ctx context.Context, input []*einoschema.AgenticMessage, opts ...einomodel.Option) (*einoschema.AgenticMessage, error) {
+	reader, err := m.Stream(ctx, input, opts...)
+	if err != nil {
 		return nil, err
 	}
-	providerID := s.providerID
-	modelID := s.modelID
-	steps := cloneSteps(s.steps)
-	reader, writer := einoschema.Pipe[model.StreamDelta](len(steps))
+	defer reader.Close()
+	var messages []*einoschema.AgenticMessage
+	for {
+		msg, err := reader.Recv()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return nil, err
+		}
+		messages = append(messages, msg)
+	}
+	if len(messages) == 0 {
+		return &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant}, nil
+	}
+	return einoschema.ConcatAgenticMessages(messages)
+}
+
+func (m *agenticModel) Stream(ctx context.Context, _ []*einoschema.AgenticMessage, _ ...einomodel.Option) (*einoschema.StreamReader[*einoschema.AgenticMessage], error) {
+	providerID := m.providerID
+	modelID := m.modelID
+	steps := cloneSteps(m.steps)
+	reader, writer := einoschema.Pipe[*einoschema.AgenticMessage](len(steps))
 	go func() {
 		defer writer.Close()
 		var usage model.Usage
 		for _, step := range steps {
 			if err := ctx.Err(); err != nil {
-				writer.Send(model.StreamDelta{Usage: usage}, err)
+				writer.Send(nil, err)
 				return
 			}
 			if step.Err != nil {
-				err := normalizeError(step.Err)
-				writer.Send(model.StreamDelta{Usage: usage}, err)
+				writer.Send(nil, normalizeError(step.Err))
 				return
 			}
 			usage = addUsage(usage, step.Usage)
-			msg := messageForStep(providerID, modelID, step)
-			delta := model.StreamDelta{
-				Message: msg,
-				Usage:   usage,
-			}
-			if writer.Send(delta, nil) {
+			msg := agenticMessageForStep(providerID, modelID, step, usage)
+			if writer.Send(msg, nil) {
 				return
 			}
 		}
@@ -112,14 +145,41 @@ func (s *providerStreamer) StreamProvider(ctx context.Context, request model.Req
 	return reader, nil
 }
 
-func messageForStep(providerID model.ProviderID, modelID model.ID, step Step) *einoschema.Message {
-	msg := einoschema.AssistantMessage(step.Content, nil)
-	msg.Extra = map[string]any{
-		"provider_id": string(providerID),
-		"model_id":    string(modelID),
-		"usage":       step.Usage,
+// agenticMessageForStep builds the message for one scripted step. usage is
+// the cumulative attempt-to-date usage (steps carry per-step deltas; the
+// emitted message carries the running total, matching StreamDelta.Usage's
+// documented cumulative contract).
+func agenticMessageForStep(providerID model.ProviderID, modelID model.ID, step Step, usage model.Usage) *einoschema.AgenticMessage {
+	blocks := step.Blocks
+	if len(blocks) == 0 && step.Content != "" {
+		blocks = []*einoschema.ContentBlock{einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: step.Content}, &einoschema.StreamingMeta{Index: 0})}
 	}
+	msg := &einoschema.AgenticMessage{
+		Role:          einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: blocks,
+		ResponseMeta: &einoschema.AgenticResponseMeta{TokenUsage: &einoschema.TokenUsage{
+			PromptTokens:            int(usage.InputTokens),
+			CompletionTokens:        int(usage.OutputTokens),
+			TotalTokens:             int(usage.InputTokens + usage.OutputTokens),
+			CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: int(usage.ReasoningTokens)},
+			PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: int(usage.CacheReadTokens)},
+		}},
+	}
+	// Provider and model identity are request identity, not message Extra:
+	// the agentic content contract rejects Extra on messages.
+	_ = providerID
+	_ = modelID
 	return msg
+}
+
+func addUsage(left model.Usage, right model.Usage) model.Usage {
+	left.InputTokens += right.InputTokens
+	left.OutputTokens += right.OutputTokens
+	left.ReasoningTokens += right.ReasoningTokens
+	left.CacheReadTokens += right.CacheReadTokens
+	left.CacheWriteTokens += right.CacheWriteTokens
+	left.Cost += right.Cost
+	return left
 }
 
 func normalizeError(err error) error {
@@ -154,16 +214,6 @@ func normalizeError(err error) error {
 		Message: err.Error(),
 		Cause:   err,
 	}
-}
-
-func addUsage(left model.Usage, right model.Usage) model.Usage {
-	left.InputTokens += right.InputTokens
-	left.OutputTokens += right.OutputTokens
-	left.ReasoningTokens += right.ReasoningTokens
-	left.CacheReadTokens += right.CacheReadTokens
-	left.CacheWriteTokens += right.CacheWriteTokens
-	left.Cost += right.Cost
-	return left
 }
 
 func cloneSteps(src []Step) []Step {

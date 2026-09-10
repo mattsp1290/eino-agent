@@ -14,7 +14,7 @@ func registerContextSource(registrar extension.Registrar, spec extension.Registr
 	if source == nil {
 		return fmt.Errorf("nil Wasm context source")
 	}
-	return runtime.OnContextSource(registrar, spec, func(ctx context.Context, input runtime.ContextSourceInput) ([]*einoschema.Message, error) {
+	return runtime.OnContextSource(registrar, spec, func(ctx context.Context, input runtime.ContextSourceInput) ([]*einoschema.AgenticMessage, error) {
 		return source.loadBoundedContext(ctx, input.Metadata)
 	})
 }

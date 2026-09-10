@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"maps"
 	"path/filepath"
-	"strings"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -117,9 +116,14 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	providerMessages := make([]*einoschema.Message, 0, len(historyMessages)+1)
+	admittedUserContent := session.Content{Role: session.RoleUser, Blocks: request.UserMessage.Blocks}
+	admittedUserMessage, err := session.ContentToAgenticMessage(admittedUserContent)
+	if err != nil {
+		return admittedRun{}, fmt.Errorf("%w: convert admitted user message: %v", ErrInvalidAdmission, err)
+	}
+	providerMessages := make([]*einoschema.AgenticMessage, 0, len(historyMessages)+1)
 	providerMessages = append(providerMessages, historyMessages...)
-	providerMessages = append(providerMessages, einoschema.UserMessage(joinedUserInputText(request.UserMessage.Blocks)))
+	providerMessages = append(providerMessages, admittedUserMessage)
 	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
@@ -375,18 +379,6 @@ func admissionUserParts(request admissionRequest, sessionID session.ID, runID se
 		return id
 	}
 	return session.EncodeContentParts(content, next, messageID, sessionID, runID, now, request.ContentLimits)
-}
-
-// joinedUserInputText concatenates every user_input_text block's text, in
-// order. It is empty for a media-only submission.
-func joinedUserInputText(blocks []session.ContentBlock) string {
-	var sb strings.Builder
-	for _, block := range blocks {
-		if block.Kind == session.BlockKindUserInputText && block.Text != nil {
-			sb.WriteString(block.Text.Text)
-		}
-	}
-	return sb.String()
 }
 
 func admissionAssistantMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time) session.Message {

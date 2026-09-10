@@ -149,9 +149,11 @@ func settlementTestInput(tool Tool, call ToolCall, result ToolResult, err error)
 	}
 	return ToolSettlementInput{
 		Tool: tool, Call: call,
-		Claimed:     session.ToolCall{ID: call.ID, SessionID: call.SessionID, RunID: call.RunID, MessageID: call.MessageID, ResultMessageID: call.ResultMessageID, ResultPartID: call.ResultPartID, ClaimedBy: "worker", ClaimToken: "token"},
+		Claimed:     session.ToolCall{ID: call.ID, SessionID: call.SessionID, RunID: call.RunID, MessageID: call.MessageID, ResultMessageID: call.ResultMessageID, ResultPartID: call.ResultPartID, Name: call.Name, ClaimedBy: "worker", ClaimToken: "token"},
 		Disposition: disposition, Result: result, Err: err,
-		CompletedAt: time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC),
+		CompletedAt:   time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC),
+		BlockID:       "block-1",
+		ContentLimits: session.DefaultContentLimits(),
 	}
 }
 

@@ -159,9 +159,9 @@ func TestActiveProviderStateWithoutCodecRollsBackAdmission(t *testing.T) {
 	}
 	calls := 0
 	ordinary := mustConfiguredOrchestrator(
-		WithStore(store), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		WithStore(store), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			calls++
-			return []*einoschema.Message{einoschema.AssistantMessage("bad", nil)}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantText("bad")}, nil
 		})}), WithIDGenerator(ids), WithRunPlanProvider(emptyTestRunPlanProvider()),
 	)
 	_, err = ordinary.Start(ctx, Request{SessionID: "state-session", Message: TextUserMessage("second"), Config: orchestratorConfig()})
@@ -241,7 +241,7 @@ func TestProviderStateContinuesWithinToolLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamer, err := model.NewEinoStreamerWithProviderState(client, codec)
+	streamer, err := model.NewClassicStreamerWithProviderState(client, codec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -359,7 +359,7 @@ func TestProviderStateRetriesUseIndependentRestoreCopiesAndCaptureOnce(t *testin
 			streamErrors: []error{model.Error{Code: "rate_limited", Message: "retry", Retryable: true, Cause: model.ErrProviderRateLimited}},
 			responses:    []*einoschema.Message{stateBearingAssistant("answer")},
 		}
-		streamer, err := model.NewEinoStreamerWithProviderState(client, codec)
+		streamer, err := model.NewClassicStreamerWithProviderState(client, codec)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -377,7 +377,7 @@ func providerStateOrchestrator(t *testing.T, store session.Store, ids IDGenerato
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamer, err := model.NewEinoStreamerWithProviderState(client, codec)
+	streamer, err := model.NewClassicStreamerWithProviderState(client, codec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,8 +391,8 @@ func providerStateContextDispatch(t *testing.T) *extension.Plan {
 	t.Helper()
 	registry := newTestExtensionRegistry(nil)
 	mount, err := registry.Mount(context.Background(), extension.Component{InstanceID: "provider-state-context", Artifact: extension.Artifact{Name: "provider-state-context", Version: "1", Hash: "hash", ConfigHash: "config", SourceKind: extension.SourceNative}}, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
-		return OnContextSource(registrar, extension.Registration{ID: "state-context", Scope: extension.GlobalScope()}, func(context.Context, ContextSourceInput) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.SystemMessage("provider-state-system"), einoschema.UserMessage("provider-state-suffix")}, nil
+		return OnContextSource(registrar, extension.Registration{ID: "state-context", Scope: extension.GlobalScope()}, func(context.Context, ContextSourceInput) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticSystemText("provider-state-system"), agenticUserText("provider-state-suffix")}, nil
 		})
 	}))
 	if err != nil {
@@ -620,7 +620,7 @@ func TestProviderStateBlockIDSurvivesCapturePersistReopenRestore(t *testing.T) {
 
 	ids := &sequenceIDs{}
 	firstCodec := &blockBoundProviderStateCodec{ProviderStateCodec: baseCodec, blockID: boundBlockID}
-	firstStreamer, err := model.NewEinoStreamerWithProviderState(&runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("first answer")}}, firstCodec)
+	firstStreamer, err := model.NewClassicStreamerWithProviderState(&runtimeProviderStateModel{responses: []*einoschema.Message{stateBearingAssistant("first answer")}}, firstCodec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestProviderStateBlockIDSurvivesCapturePersistReopenRestore(t *testing.T) {
 	// Restore: a second run in the same session must trigger
 	// loadProviderHistory -> RestoreAssistant with BlockID intact.
 	secondCodec := &blockBoundProviderStateCodec{ProviderStateCodec: baseCodec, blockID: boundBlockID}
-	secondStreamer, err := model.NewEinoStreamerWithProviderState(&runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("second answer", nil)}}, secondCodec)
+	secondStreamer, err := model.NewClassicStreamerWithProviderState(&runtimeProviderStateModel{responses: []*einoschema.Message{einoschema.AssistantMessage("second answer", nil)}}, secondCodec)
 	if err != nil {
 		t.Fatal(err)
 	}

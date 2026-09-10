@@ -153,8 +153,8 @@ func TestFunctionAdaptersParticipateInOrchestratorOptions(t *testing.T) {
 	orch, err := NewStreamingOrchestrator(
 		WithStore(store),
 		WithModelResolver(model.ResolverFunc(func(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
-			return resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-				return []*einoschema.Message{einoschema.AssistantMessage("ok", nil)}, nil
+			return resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("ok")}, nil
 			})}.Resolve(context.Background(), model.Selection{}, model.Runtime{})
 		})),
 		WithIDGenerator(&sequenceIDs{}),

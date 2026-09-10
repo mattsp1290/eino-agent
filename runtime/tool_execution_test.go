@@ -69,13 +69,13 @@ func TestFinalToolContextPreservesPlanOrderAndIsIsolated(t *testing.T) {
 		RunID: "run", SessionID: "session", EpochID: "epoch",
 		Config:   config.Snapshot{Agent: config.Agent{Name: "agent", Mode: "primary"}, Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": "/workspace"}},
 		Model:    model.Resolved{Provider: model.Provider{ID: "provider"}, Model: model.Descriptor{ID: "model"}},
-		Messages: []*einoschema.Message{einoschema.UserMessage("secret")},
+		Messages: []*einoschema.AgenticMessage{agenticUserText("secret")},
 	}
 	preparedSnapshot, err := host.prepareSnapshot(context.Background(), newTestRunExecution(host, plan), snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls, err := host.prepareToolCalls(context.Background(), newTestRunExecution(host, plan), preparedSnapshot, "message", []einoschema.ToolCall{{ID: "call", Function: einoschema.FunctionCall{Name: "zeta", Arguments: `{}`}}})
+	calls, err := host.prepareToolCalls(context.Background(), newTestRunExecution(host, plan), preparedSnapshot, "message", []*einoschema.FunctionToolCall{agenticToolCall("call", "zeta", `{}`)})
 	if err != nil || len(calls) != 1 {
 		t.Fatalf("prepared calls = %#v, %v", calls, err)
 	}
@@ -145,8 +145,8 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	})
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call-panic", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{}`}}})}, nil
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-panic", "echo", `{}`))}, nil
 		})}),
 		WithRunPlanProvider(staticRunPlanProvider{plan: plan}), WithEventSink(sink), WithOwnerID("owner-1"),
 		WithClock(func() time.Time { return time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC) }),
@@ -203,11 +203,11 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 func TestFreshToolPanicInterruptsEveryRemainingCommittedCall(t *testing.T) {
 	store := newAdmissionStore()
 	var secondExecutions int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{
-			{ID: "call-panic-first", Type: "function", Function: einoschema.FunctionCall{Name: "panic", Arguments: `{}`}},
-			{ID: "call-skipped-second", Type: "function", Function: einoschema.FunctionCall{Name: "second", Arguments: `{}`}},
-		})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(
+			agenticToolCall("call-panic-first", "panic", `{}`),
+			agenticToolCall("call-skipped-second", "second", `{}`),
+		)}, nil
 	}))
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{
 		{Name: "panic", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { panic("boom") })},
@@ -311,7 +311,7 @@ func assertDurableToolResult(t *testing.T, store *sqlitestore.Store, sessionID s
 		t.Fatal(err)
 	}
 	for _, part := range batch.Parts {
-		if part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && part.Kind == session.PartToolResult && strings.Contains(string(part.Payload), payloadFragment) {
+		if part.ID == call.ResultPartID && part.MessageID == call.ResultMessageID && part.Kind == session.PartFunctionToolResult && strings.Contains(string(part.Payload), payloadFragment) {
 			return
 		}
 	}

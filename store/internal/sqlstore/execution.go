@@ -209,7 +209,9 @@ func (e *executionStore) FinalizeAssistantMessage(ctx context.Context, id sessio
 }
 
 func (e *executionStore) AppendPart(ctx context.Context, record session.Part) (session.Part, error) {
-	if record.Kind == session.PartToolCall || record.Kind == session.PartToolResult || record.RunID != e.fence.RunID {
+	if record.Kind == session.PartToolCall || record.Kind == session.PartToolResult ||
+		record.Kind == session.PartFunctionToolCall || record.Kind == session.PartFunctionToolResult ||
+		record.RunID != e.fence.RunID {
 		return session.Part{}, session.ErrConflict
 	}
 	var result session.Part

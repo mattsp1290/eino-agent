@@ -147,15 +147,29 @@ func TestProviderStateIdentityAndRegistrationByteBoundaries(t *testing.T) {
 	}
 }
 
+func agenticUserText(text string) *einoschema.AgenticMessage {
+	return einoschema.UserAgenticMessage(text)
+}
+
+func agenticAssistantText(text string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role:          einoschema.AgenticRoleTypeAssistant,
+		ContentBlocks: []*einoschema.ContentBlock{einoschema.NewContentBlock(&einoschema.AssistantGenText{Text: text})},
+	}
+}
+
 func TestEinoJSONExtraStateCodecPreservesBytesAndRejectsShape(t *testing.T) {
 	codec, err := NewEinoJSONExtraStateCodec(EinoJSONExtraStateConfig{ExtraKey: "openaicodex:reasoning_items", Contract: testProviderStateContract()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	raw := []json.RawMessage{json.RawMessage(`{"encrypted":"SENTINEL", "n":1}`), json.RawMessage("{\n  \"n\": 2, \"encrypted\":\"other\"\n}"), json.RawMessage(`{"n":1e400}`)}
-	message := einoschema.AssistantMessage("done", nil)
+	message := agenticAssistantText("done")
 	message.Extra = map[string]any{"openaicodex:reasoning_items": raw}
-	stateful := &einoProviderStateStreamer{codec: codec, contract: codec.Contract(), owned: map[string]struct{}{"openaicodex:reasoning_items": {}}}
+	stateful, err := NewClassicStreamerWithProviderState(&providerStateRecordingModel{}, codec)
+	if err != nil {
+		t.Fatal(err)
+	}
 	capture, err := stateful.CaptureProviderState(message)
 	if err != nil {
 		t.Fatal(err)
@@ -181,20 +195,20 @@ func TestEinoJSONExtraStateCodecPreservesBytesAndRejectsShape(t *testing.T) {
 	}
 }
 
-func TestStateAwareEinoStreamerRestoresOnlyAtDispatch(t *testing.T) {
+func TestStateAwareClassicStreamerRestoresOnlyAtDispatch(t *testing.T) {
 	codec, err := NewEinoJSONExtraStateCodec(EinoJSONExtraStateConfig{ExtraKey: "openaicodex:reasoning_items", Contract: testProviderStateContract()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	client := &providerStateRecordingModel{}
-	streamer, err := NewEinoStreamerWithProviderState(client, codec)
+	streamer, err := NewClassicStreamerWithProviderState(client, codec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	item := json.RawMessage(`{"encrypted":"SENTINEL", "n":1}`)
 	request := Request{
 		Identity:      Identity{SessionID: "session", ProviderID: "provider", ModelID: "current"},
-		Messages:      []*einoschema.Message{einoschema.UserMessage("hi"), einoschema.AssistantMessage("old", nil)},
+		Messages:      []*einoschema.AgenticMessage{agenticUserText("hi"), agenticAssistantText("old")},
 		ProviderState: []ProviderMessageState{{MessageIndex: 1, MessageID: "message", SourceSessionID: "session", SourceRunID: "run", ProviderID: "provider", SourceModelID: "old-model", CodecID: testProviderStateContract().CodecID, Version: 1, CompatibilityKey: "reasoning-v1", Items: []ProviderStateItem{{Data: item}}}},
 	}
 	reader, err := streamer.StreamProvider(context.Background(), request)
@@ -223,24 +237,24 @@ func TestStateAwareEinoStreamerRestoresOnlyAtDispatch(t *testing.T) {
 	if _, err := streamer.StreamProvider(context.Background(), invalid); !errors.Is(err, ErrProviderStateMismatch) || client.calls != 0 || strings.Contains(err.Error(), "SENTINEL") {
 		t.Fatalf("invalid dispatch = calls %d error %v", client.calls, err)
 	}
-	if _, err := NewEinoStreamer(client).StreamProvider(context.Background(), request); !errors.Is(err, ErrProviderStateMismatch) {
+	if _, err := NewClassicStreamer(client).StreamProvider(context.Background(), request); !errors.Is(err, ErrProviderStateMismatch) {
 		t.Fatalf("ordinary streamer error = %v", err)
 	}
 }
 
-func TestStateAwareEinoStreamerRejectsInvalidSidecarsWithoutDispatch(t *testing.T) {
+func TestStateAwareClassicStreamerRejectsInvalidSidecarsWithoutDispatch(t *testing.T) {
 	codec, err := NewEinoJSONExtraStateCodec(EinoJSONExtraStateConfig{ExtraKey: "state", Contract: testProviderStateContract()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	client := &providerStateRecordingModel{}
-	streamer, err := NewEinoStreamerWithProviderState(client, codec)
+	streamer, err := NewClassicStreamerWithProviderState(client, codec)
 	if err != nil {
 		t.Fatal(err)
 	}
 	base := Request{
 		Identity:      Identity{SessionID: "session", ProviderID: "provider", ModelID: "model"},
-		Messages:      []*einoschema.Message{einoschema.AssistantMessage("old", nil), einoschema.UserMessage("new")},
+		Messages:      []*einoschema.AgenticMessage{agenticAssistantText("old"), agenticUserText("new")},
 		ProviderState: []ProviderMessageState{{MessageIndex: 0, MessageID: "message", SourceSessionID: "session", SourceRunID: "run", ProviderID: "provider", SourceModelID: "model", CodecID: testProviderStateContract().CodecID, Version: 1, CompatibilityKey: "reasoning-v1", Items: []ProviderStateItem{{Data: json.RawMessage(`{"x":1}`)}}}},
 	}
 	tests := map[string]func(*Request){
@@ -271,7 +285,7 @@ func TestStateAwareEinoStreamerRejectsInvalidSidecarsWithoutDispatch(t *testing.
 			}
 		})
 	}
-	withoutState := Request{Identity: Identity{SessionID: "session", ProviderID: "bad provider", ModelID: "model"}, Messages: []*einoschema.Message{einoschema.UserMessage("new")}}
+	withoutState := Request{Identity: Identity{SessionID: "session", ProviderID: "bad provider", ModelID: "model"}, Messages: []*einoschema.AgenticMessage{agenticUserText("new")}}
 	client.calls = 0
 	if _, err := streamer.StreamProvider(context.Background(), withoutState); !errors.Is(err, ErrProviderStateInvalid) || client.calls != 0 {
 		t.Fatalf("state-free invalid identity = calls %d error %v", client.calls, err)
@@ -284,23 +298,23 @@ func TestProviderStateCodecCannotMutateProviderNeutralMessageFields(t *testing.T
 		t.Fatal(err)
 	}
 	client := &providerStateRecordingModel{}
-	captureStreamer, err := NewEinoStreamerWithProviderState(client, &mutatingProviderStateCodec{ProviderStateCodec: base, mutateCapture: true})
+	captureStreamer, err := NewClassicStreamerWithProviderState(client, &mutatingProviderStateCodec{ProviderStateCodec: base, mutateCapture: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := einoschema.AssistantMessage("original", nil)
+	message := agenticAssistantText("original")
 	message.Extra = map[string]any{"state": []json.RawMessage{json.RawMessage(`{"x":1}`)}}
 	if _, err := captureStreamer.CaptureProviderState(message); !errors.Is(err, ErrProviderStateInvalid) {
 		t.Fatalf("capture mutation error = %v", err)
 	}
 
-	restoreStreamer, err := NewEinoStreamerWithProviderState(client, &mutatingProviderStateCodec{ProviderStateCodec: base, mutateRestore: true})
+	restoreStreamer, err := NewClassicStreamerWithProviderState(client, &mutatingProviderStateCodec{ProviderStateCodec: base, mutateRestore: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	request := Request{
 		Identity:      Identity{SessionID: "session", ProviderID: "provider", ModelID: "model"},
-		Messages:      []*einoschema.Message{einoschema.AssistantMessage("original", nil)},
+		Messages:      []*einoschema.AgenticMessage{agenticAssistantText("original")},
 		ProviderState: []ProviderMessageState{{MessageIndex: 0, MessageID: "message", SourceSessionID: "session", SourceRunID: "run", ProviderID: "provider", SourceModelID: "model", CodecID: testProviderStateContract().CodecID, Version: 1, CompatibilityKey: "reasoning-v1", Items: []ProviderStateItem{{Data: json.RawMessage(`{"x":1}`)}}}},
 	}
 	client.calls = 0
@@ -312,25 +326,25 @@ func TestProviderStateCodecCannotMutateProviderNeutralMessageFields(t *testing.T
 func TestProviderStateCodecPanicsAreContentFree(t *testing.T) {
 	client := &providerStateRecordingModel{}
 	registration := &panicProviderStateCodec{contract: testProviderStateContract(), keys: []string{"state"}, panicContract: true}
-	if _, err := NewEinoStreamerWithProviderState(client, registration); !errors.Is(err, ErrProviderStateInvalid) {
+	if _, err := NewClassicStreamerWithProviderState(client, registration); !errors.Is(err, ErrProviderStateInvalid) {
 		t.Fatalf("registration panic error = %v", err)
 	}
 	captureCodec := &panicProviderStateCodec{contract: testProviderStateContract(), keys: []string{"state"}, panicCapture: true}
-	streamer, err := NewEinoStreamerWithProviderState(client, captureCodec)
+	streamer, err := NewClassicStreamerWithProviderState(client, captureCodec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := einoschema.AssistantMessage("", nil)
+	message := agenticAssistantText("")
 	message.Extra = map[string]any{"state": []json.RawMessage{json.RawMessage(`{"secret":"SENTINEL"}`)}}
 	if _, err := streamer.CaptureProviderState(message); !errors.Is(err, ErrProviderStateInvalid) || strings.Contains(err.Error(), "SENTINEL") {
 		t.Fatalf("capture panic error = %v", err)
 	}
 	restoreCodec := &panicProviderStateCodec{contract: testProviderStateContract(), keys: []string{"state"}, panicRestore: true}
-	streamer, err = NewEinoStreamerWithProviderState(client, restoreCodec)
+	streamer, err = NewClassicStreamerWithProviderState(client, restoreCodec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := Request{Identity: Identity{SessionID: "session", ProviderID: "provider", ModelID: "model"}, Messages: []*einoschema.Message{einoschema.AssistantMessage("", nil)}, ProviderState: []ProviderMessageState{{MessageIndex: 0, MessageID: "message", SourceSessionID: "session", SourceRunID: "run", ProviderID: "provider", SourceModelID: "model", CodecID: testProviderStateContract().CodecID, Version: 1, CompatibilityKey: "reasoning-v1", Items: []ProviderStateItem{{Data: json.RawMessage(`{"secret":"SENTINEL"}`)}}}}}
+	request := Request{Identity: Identity{SessionID: "session", ProviderID: "provider", ModelID: "model"}, Messages: []*einoschema.AgenticMessage{agenticAssistantText("")}, ProviderState: []ProviderMessageState{{MessageIndex: 0, MessageID: "message", SourceSessionID: "session", SourceRunID: "run", ProviderID: "provider", SourceModelID: "model", CodecID: testProviderStateContract().CodecID, Version: 1, CompatibilityKey: "reasoning-v1", Items: []ProviderStateItem{{Data: json.RawMessage(`{"secret":"SENTINEL"}`)}}}}}
 	client.calls = 0
 	if _, err := streamer.StreamProvider(context.Background(), request); !errors.Is(err, ErrProviderStateInvalid) || client.calls != 0 || strings.Contains(err.Error(), "SENTINEL") {
 		t.Fatalf("restore panic = calls %d error %v", client.calls, err)

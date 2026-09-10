@@ -49,22 +49,44 @@ func sqliteCreateRequest(call session.ToolCall, id session.EventID, at time.Time
 	if len(call.Input) == 0 {
 		call.Input = json.RawMessage(`{}`)
 	}
-	payload, err := json.Marshal(map[string]any{"id": call.ID, "name": call.Name, "arguments": call.Input})
+	parts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(call.RequestPartID), Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(call.ID), Name: call.Name, Arguments: string(call.Input)},
+		}},
+	}, func() session.PartID { return call.RequestPartID }, call.MessageID, call.SessionID, call.RunID, at.UTC(), session.DefaultContentLimits())
 	if err != nil {
 		panic(err)
 	}
 	return session.CreateToolCallRequest{
-		Call: call,
-		RequestPart: session.Part{
-			ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID,
-			Kind: session.PartToolCall, Payload: payload, CreatedAt: at.UTC(), UpdatedAt: at.UTC(),
-		},
-		Event: sqliteToolEvent(id, at),
+		Call:        call,
+		RequestPart: parts[0],
+		Event:       sqliteToolEvent(id, at),
 	}
 }
 
 func sqliteSettleRequest(settlement session.ToolSettlement, id session.EventID) session.SettleToolCallRequest {
 	return session.SettleToolCallRequest{Settlement: settlement, Event: sqliteToolEvent(id, settlement.CompletedAt)}
+}
+
+// sqliteToolResultEnvelope builds a settlement's reserved result message and
+// content-block envelope part for call, with output as the sole
+// function_tool_result text content (matching what runtime's
+// buildTerminalToolEnvelope persists).
+func sqliteToolResultEnvelope(call session.ToolCall, output json.RawMessage, at time.Time) (session.Message, session.Part) {
+	message := session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleUser, CreatedAt: at.UTC(), UpdatedAt: at.UTC()}
+	parts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(call.ResultPartID), Kind: session.BlockKindFunctionToolResult,
+			FunctionResult: &session.FunctionResultBlock{CallID: string(call.ID), Name: call.Name, Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(output)}}},
+		}},
+	}, func() session.PartID { return call.ResultPartID }, call.ResultMessageID, call.SessionID, call.RunID, at.UTC(), session.DefaultContentLimits())
+	if err != nil {
+		panic(err)
+	}
+	return message, parts[0]
 }
 
 func sqliteRunSettlementRequest(run session.Run, id session.EventID) session.SettleRunRequest {
@@ -141,11 +163,12 @@ func TestSettleToolCallAtomicallyCreatesReservedResultAndIsIdempotent(t *testing
 	ctx := context.Background()
 	now := time.Now().UTC()
 	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+	resultMessage, resultPart := sqliteToolResultEnvelope(call, output, now)
 	settlement := session.ToolSettlement{
 		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output,
 		CompletedAt:   now,
-		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
-		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+		ResultMessage: resultMessage,
+		ResultPart:    resultPart,
 	}
 	if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); err != nil {
 		t.Fatal(err)
@@ -204,10 +227,11 @@ func TestToolTransitionEventIdentityAndGenericBypass(t *testing.T) {
 
 	completedAt := call.StartedAt.Add(time.Second)
 	output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+	resultMessage, resultPart := sqliteToolResultEnvelope(call, output, completedAt)
 	settlement := session.ToolSettlement{
 		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: completedAt,
-		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: completedAt, UpdatedAt: completedAt},
-		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: completedAt, UpdatedAt: completedAt},
+		ResultMessage: resultMessage,
+		ResultPart:    resultPart,
 	}
 	request := sqliteSettleRequest(settlement, "event-terminal-tool")
 	if _, err := execution.SettleToolCall(ctx, request); err != nil {
@@ -286,10 +310,11 @@ func TestSettleToolCallRollsBackEveryWriteWhenResultPersistenceFails(t *testing.
 			ctx := context.Background()
 			now := time.Now().UTC()
 			output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+			resultMessage, resultPart := sqliteToolResultEnvelope(call, output, now)
 			settlement := session.ToolSettlement{
 				ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
-				ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
-				ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+				ResultMessage: resultMessage,
+				ResultPart:    resultPart,
 			}
 			call, err := st.GetToolCall(ctx, call.ID)
 			if err != nil {
@@ -352,10 +377,11 @@ func TestSettleToolCallRejectsContradictoryResultEnvelopeWithoutWrites(t *testin
 			}
 			now := time.Now().UTC()
 			output := json.RawMessage(`{"tool_call_id":"call-tool","status":"completed","content":"ok"}`)
+			resultMessage, resultPart := sqliteToolResultEnvelope(call, output, now)
 			settlement := session.ToolSettlement{
 				ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: output, CompletedAt: now,
-				ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool, CreatedAt: now, UpdatedAt: now},
-				ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: output, CreatedAt: now, UpdatedAt: now},
+				ResultMessage: resultMessage,
+				ResultPart:    resultPart,
 			}
 			mutate(&settlement)
 			if _, err := execution.SettleToolCall(ctx, sqliteSettleRequest(settlement, "event-settle")); !errors.Is(err, session.ErrConflict) {
@@ -380,10 +406,12 @@ func TestSettleToolCallRejectsStaleClaimBeforeApplyingResult(t *testing.T) {
 	st, execution, call := setupClaimedToolCall(t)
 	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
+	staleOutput := json.RawMessage(`{"content":"stale"}`)
+	staleResultMessage, staleResultPart := sqliteToolResultEnvelope(call, staleOutput, time.Now().UTC())
 	stale := session.ToolSettlement{
-		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: json.RawMessage(`{"content":"stale"}`),
-		ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleTool},
-		ResultPart:    session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolResult, Payload: json.RawMessage(`{"content":"stale"}`)},
+		ID: call.ID, ClaimedBy: call.ClaimedBy, ClaimToken: call.ClaimToken, Status: session.ToolCallCompleted, Output: staleOutput,
+		ResultMessage: staleResultMessage,
+		ResultPart:    staleResultPart,
 	}
 
 	current := call
@@ -638,7 +666,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	if _, err := oldExecution.AppendEvent(ctx, session.EventRecord{ID: "stale-event", SessionID: run.SessionID, RunID: run.ID, Kind: "stale", CreatedAt: now}); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale AppendEvent error = %v", err)
 	}
-	staleCall := session.ToolCall{ID: "stale-call", SessionID: run.SessionID, RunID: run.ID, MessageID: "stale-message", Status: session.ToolCallPending}
+	staleCall := session.ToolCall{ID: "stale-call", SessionID: run.SessionID, RunID: run.ID, MessageID: "stale-message", Name: "stale-tool", Status: session.ToolCallPending}
 	if _, err := oldExecution.CreateToolCall(ctx, sqliteCreateRequest(staleCall, "stale-tool-create", now)); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale CreateToolCall error = %v", err)
 	}

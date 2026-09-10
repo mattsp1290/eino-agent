@@ -86,6 +86,20 @@ func TestContentPartsSurviveSQLiteCloseAndReopen(t *testing.T) {
 		t.Fatalf("EncodeContentParts: %v", err)
 	}
 	for _, p := range parts {
+		if p.Kind == session.PartFunctionToolCall {
+			// function_tool_call parts are owned by CreateToolCall, not the
+			// generic AppendPart path (see store/internal/sqlstore/execution.go).
+			call := session.ToolCall{
+				ID: "reopen-call-1", SessionID: message.SessionID, RunID: message.RunID, MessageID: message.ID,
+				RequestPartID: p.ID, Name: "get_weather", Input: json.RawMessage(`{"city":"nyc"}`), Status: session.ToolCallPending,
+			}
+			if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+				Call: call, RequestPart: p, Event: session.ToolTransitionEvent{ID: "reopen-tool-create", CreatedAt: now},
+			}); err != nil {
+				t.Fatalf("create tool call for part %s: %v", p.ID, err)
+			}
+			continue
+		}
 		if _, err := execution.AppendPart(ctx, p); err != nil {
 			t.Fatalf("append part %s: %v", p.ID, err)
 		}

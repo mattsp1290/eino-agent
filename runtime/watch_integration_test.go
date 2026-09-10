@@ -43,7 +43,7 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 				store = &finalizationFailureStore{Store: st}
 			}
 			var modelCalls atomic.Int32
-			streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 				n := modelCalls.Add(1)
 				switch mode {
 				case "model-error":
@@ -52,9 +52,9 @@ func TestSessionWatchRuntimeTerminalPaths(t *testing.T) {
 					panic("PRIVATE_MODEL_PANIC")
 				}
 				if strings.HasPrefix(mode, "tool-") && n == 1 {
-					return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "call", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"secret":"PRIVATE_ARGUMENT"}`}}})}, nil
+					return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call", "echo", `{"secret":"PRIVATE_ARGUMENT"}`))}, nil
 				}
-				return []*einoschema.Message{einoschema.AssistantMessage("", nil)}, nil
+				return []*einoschema.AgenticMessage{agenticAssistantText("")}, nil
 			})
 			toolStarted := make(chan struct{})
 			tool := Tool{Name: "echo", Executor: orchestratorToolExecutorFunc(func(ctx context.Context, _ ToolCall) (ToolResult, error) {

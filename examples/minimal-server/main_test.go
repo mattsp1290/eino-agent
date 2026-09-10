@@ -169,12 +169,12 @@ func TestMinimalServerSequentialRunsUseDurableHistory(t *testing.T) {
 	if err := json.Unmarshal(requests.Records[0].Messages, &audited); err != nil {
 		t.Fatalf("decode audited messages: %v", err)
 	}
-	wantRoles := []einoschema.RoleType{einoschema.User, einoschema.Assistant, einoschema.Tool, einoschema.Assistant, einoschema.User}
+	wantRoles := []einoschema.AgenticRoleType{einoschema.AgenticRoleTypeUser, einoschema.AgenticRoleTypeAssistant, einoschema.AgenticRoleTypeUser, einoschema.AgenticRoleTypeAssistant, einoschema.AgenticRoleTypeUser}
 	if len(audited) != len(wantRoles) {
 		t.Fatalf("provider history length=%d", len(audited))
 	}
 	for i, a := range audited {
-		var message einoschema.Message
+		var message einoschema.AgenticMessage
 		if err := json.Unmarshal(a.Canonical, &message); err != nil {
 			t.Fatal(err)
 		}

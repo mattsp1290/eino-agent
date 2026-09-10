@@ -77,15 +77,7 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 	}
 
 	call := session.ToolCall{ID: session.ToolCallID(ids.tool), SessionID: run.SessionID, RunID: run.ID, MessageID: message.ID, RequestPartID: session.PartID(ids.requestPart), ResultMessageID: session.MessageID(ids.resultMessage), ResultPartID: session.PartID(ids.resultPart), Name: "wide-tool", Pattern: "exact", Input: json.RawMessage(`{"input":"wide"}`), Status: session.ToolCallPending, RetrySafe: true, Metadata: map[string]string{"owner": "wide-owner"}}
-	requestPayload, err := json.Marshal(struct {
-		ID        session.ToolCallID `json:"id"`
-		Name      string             `json:"name"`
-		Arguments json.RawMessage    `json:"arguments"`
-	}{call.ID, call.Name, call.Input})
-	if err != nil {
-		t.Fatal(err)
-	}
-	requestPart := session.Part{ID: call.RequestPartID, MessageID: message.ID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartToolCall, Payload: requestPayload, CreatedAt: created, UpdatedAt: created}
+	requestPart := postgresToolRequestPart(call.RequestPartID, message.ID, run.SessionID, run.ID, call.ID, call.Name, call.Input, created)
 	if got, err := execution.CreateToolCall(f.ctx, session.CreateToolCallRequest{Call: call, RequestPart: requestPart, Event: session.ToolTransitionEvent{ID: session.EventID(ids.pending), EpochID: epoch.ID, ProviderID: "wide-provider", ModelID: "wide-model", CreatedAt: created}}); err != nil || got.Call.ID != call.ID || got.Call.Status != session.ToolCallPending || got.Event.ID != session.EventID(ids.pending) {
 		t.Fatalf("create wide tool: id length=%d status=%s event length=%d err=%v", len(got.Call.ID), got.Call.Status, len(got.Event.ID), err)
 	}
@@ -95,9 +87,9 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 		t.Fatalf("claim wide tool: id length=%d status=%s event length=%d err=%v", len(claimed.Call.ID), claimed.Call.Status, len(claimed.Event.ID), err)
 	}
 	finished := started.Add(time.Second)
-	resultMessage := session.Message{ID: call.ResultMessageID, SessionID: run.SessionID, RunID: run.ID, ParentID: message.ID, Role: session.RoleTool, CreatedAt: finished, UpdatedAt: finished}
-	resultPart := session.Part{ID: call.ResultPartID, MessageID: resultMessage.ID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartToolResult, Payload: json.RawMessage(`{"output":"wide result"}`), CreatedAt: finished, UpdatedAt: finished}
-	settled, err := execution.SettleToolCall(f.ctx, session.SettleToolCallRequest{Settlement: session.ToolSettlement{ID: call.ID, ClaimedBy: "wide-worker", ClaimToken: "wide-tool-claim", Status: session.ToolCallCompleted, Output: json.RawMessage(`{"output":"wide result"}`), Metadata: map[string]string{"owner": "wide-owner"}, CompletedAt: finished, ResultMessage: resultMessage, ResultPart: resultPart}, Event: session.ToolTransitionEvent{ID: session.EventID(ids.terminal), EpochID: epoch.ID, ProviderID: "wide-provider", ModelID: "wide-model", CreatedAt: finished}})
+	output := json.RawMessage(`{"output":"wide result"}`)
+	resultMessage, resultPart := postgresToolResultEnvelope(call, output, finished)
+	settled, err := execution.SettleToolCall(f.ctx, session.SettleToolCallRequest{Settlement: session.ToolSettlement{ID: call.ID, ClaimedBy: "wide-worker", ClaimToken: "wide-tool-claim", Status: session.ToolCallCompleted, Output: output, Metadata: map[string]string{"owner": "wide-owner"}, CompletedAt: finished, ResultMessage: resultMessage, ResultPart: resultPart}, Event: session.ToolTransitionEvent{ID: session.EventID(ids.terminal), EpochID: epoch.ID, ProviderID: "wide-provider", ModelID: "wide-model", CreatedAt: finished}})
 	if err != nil || settled.Call.ID != call.ID || settled.Call.Status != session.ToolCallCompleted || settled.Call.ResultMessageID != resultMessage.ID || settled.Call.ResultPartID != resultPart.ID || settled.Event.ID != session.EventID(ids.terminal) {
 		t.Fatalf("settle wide tool: id length=%d status=%s event length=%d err=%v", len(settled.Call.ID), settled.Call.Status, len(settled.Event.ID), err)
 	}
@@ -132,7 +124,7 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 	if err != nil || len(batch.Messages) != 2 || len(batch.Parts) != 3 || len(batch.PartOwnerMessageIDs) != 3 {
 		t.Fatalf("reopened wide replay shape: messages=%d parts=%d err=%v", len(batch.Messages), len(batch.Parts), err)
 	}
-	if batch.Messages[0].ID != message.ID || batch.Messages[0].RunID != run.ID || batch.Messages[0].Role != session.RoleAssistant || batch.Messages[1].ID != resultMessage.ID || batch.Messages[1].Role != session.RoleTool {
+	if batch.Messages[0].ID != message.ID || batch.Messages[0].RunID != run.ID || batch.Messages[0].Role != session.RoleAssistant || batch.Messages[1].ID != resultMessage.ID || batch.Messages[1].Role != session.RoleUser {
 		t.Fatalf("reopened wide replay messages: first id length=%d second role=%s", len(batch.Messages[0].ID), batch.Messages[1].Role)
 	}
 	wantParts := map[session.PartID]session.Part{textPart.ID: textPart, requestPart.ID: requestPart, resultPart.ID: resultPart}
@@ -152,7 +144,7 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 		t.Fatalf("wide model requests: count=%d err=%v", len(models.Records), err)
 	}
 	gotCall, err := f.store.GetToolCall(f.ctx, call.ID)
-	if err != nil || gotCall.ID != call.ID || gotCall.SessionID != createdSession.ID || gotCall.RunID != run.ID || gotCall.MessageID != message.ID || gotCall.RequestPartID != call.RequestPartID || gotCall.ResultMessageID != resultMessage.ID || gotCall.ResultPartID != resultPart.ID || gotCall.ClaimedBy != "wide-worker" || gotCall.Status != session.ToolCallCompleted || !reflect.DeepEqual(gotCall.Output, json.RawMessage(`{"output":"wide result"}`)) {
+	if err != nil || gotCall.ID != call.ID || gotCall.SessionID != createdSession.ID || gotCall.RunID != run.ID || gotCall.MessageID != message.ID || gotCall.RequestPartID != call.RequestPartID || gotCall.ResultMessageID != resultMessage.ID || gotCall.ResultPartID != resultPart.ID || gotCall.ClaimedBy != "wide-worker" || gotCall.Status != session.ToolCallCompleted || !reflect.DeepEqual(gotCall.Output, output) {
 		t.Fatalf("wide tool after reopen: id length=%d status=%s owner=%q err=%v", len(gotCall.ID), gotCall.Status, gotCall.ClaimedBy, err)
 	}
 	events, err := f.store.ListEvents(f.ctx, createdSession.ID, session.EventCursor{Limit: 20})

@@ -267,15 +267,19 @@ func assertPostgresRuntimeHistory(t *testing.T, ctx context.Context, store sessi
 	}
 	var results []session.Part
 	for _, part := range batch.Parts {
-		if part.Kind == session.PartToolResult {
+		if part.Kind == session.PartFunctionToolResult {
 			results = append(results, part)
 		}
 	}
 	if len(results) != 1 || results[0].ID != call.ResultPartID || results[0].MessageID != call.ResultMessageID {
 		t.Fatal("replay does not contain exactly one materialized reserved result")
 	}
+	resultContent, err := session.DecodeContentParts(session.RoleUser, results, session.DefaultContentLimits())
+	if err != nil || len(resultContent.Blocks) != 1 || resultContent.Blocks[0].FunctionResult == nil || len(resultContent.Blocks[0].FunctionResult.Content) != 1 {
+		t.Fatalf("decode function tool result: content=%#v err=%v", resultContent, err)
+	}
 	var output ToolOutput
-	if err := json.Unmarshal(results[0].Payload, &output); err != nil || output.Content != "resumed output" {
+	if err := json.Unmarshal([]byte(resultContent.Blocks[0].FunctionResult.Content[0].Text), &output); err != nil || output.Content != "resumed output" {
 		t.Fatalf("tool result content = %q, want resumed output", output.Content)
 	}
 }

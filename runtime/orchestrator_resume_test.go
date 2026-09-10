@@ -324,7 +324,7 @@ func TestStreamingOrchestratorResumeClaimsPendingToolOnce(t *testing.T) {
 	}
 	var toolResults int
 	for _, part := range batch.Parts {
-		if part.Kind == session.PartToolResult {
+		if part.Kind == session.PartFunctionToolResult {
 			toolResults++
 		}
 	}
@@ -411,11 +411,11 @@ func TestRunHeartbeatPreventsResumeAcrossInjectedClockSkew(t *testing.T) {
 			close(release)
 		}
 	}()
-	streamer := scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 		close(entered)
 		select {
 		case <-release:
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
