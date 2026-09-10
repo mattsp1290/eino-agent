@@ -131,6 +131,48 @@ Findings that shape later packages:
 - The runner writes the checkpoint before sending the interrupt event, so
   public pause promotion must wait for the iterator to drain.
 
-## W2 through W8
+## W2: durable ordered rich content
+
+Status: landed (commits 0574474, 3865683, 5b2922f); dual review applied.
+
+- `session/content.go` is the versioned public content contract: 20 block
+  kinds string-identical to Eino's `ContentBlockType`, closed typed payloads,
+  a public response-meta projection, bounds (8 MiB per message, 1024 blocks,
+  1 MiB per block by default, configurable through
+  `runtime.WithContentLimits`), strict canonical decoding (unknown fields,
+  duplicate keys, trailing values and unknown kinds are rejected) and exact
+  conversion to and from `schema.AgenticMessage`. Content that validates is
+  always projectable back to Eino.
+- Private material (reasoning signatures, Claude encrypted citation indexes,
+  Gemini SDK blobs, provider response and continuation IDs, `Extra`,
+  `Extension`) is split into block-addressed `PrivateBlockState` and never
+  enters public parts; provider-state envelopes and items carry a `BlockID`.
+- Parts: one part per block with the block kind as `PartKind`, plus one
+  `response_meta` part per assistant message; block parts need strictly
+  increasing ordinals so provider-state parts may interleave. Both SQL
+  baselines accept the new kinds; schema fingerprints were regenerated;
+  observation text is projected from user and assistant text kinds only.
+- Store contract: every kind and every nested function-result variant round
+  trips through SQLite and PostgreSQL, including a close/reopen of the SQLite
+  file, mixed ordering with response meta, observation exclusion of non-text
+  kinds, and a provider-state sentinel scan in verbatim and base64 forms.
+  The PostgreSQL required-suite list names every new subtest.
+- History: `history.ProjectAgentic`/`LoadAgentic` project durable parts into
+  agentic messages with `BlockRef` to part identity; legacy kinds map into
+  agentic form; the classic projector understands the new kinds, projects
+  user media into multi-content input and fails with `ErrClassicUnsupported`
+  on anything it cannot represent.
+- Admission: `runtime.UserMessage` is ordered content blocks
+  (`runtime.TextUserMessage` for text). Block and part IDs are runtime-owned,
+  caller-supplied block IDs are rejected, the submission is deep-cloned before
+  validation, and every block part is persisted atomically with the run.
+  Media-only submissions are admitted and a session that started with media
+  continues on later turns.
+
+Superseded part kinds (`text`, `tool_call`, `tool_result`, `file`, `step`,
+`state`) remain declared until the runtime cutover replaces the assistant
+persistence path in W3/W5.
+
+## W3 through W8
 
 Not started. Each package adds its rows here when it lands.
