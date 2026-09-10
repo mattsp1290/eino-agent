@@ -11,6 +11,7 @@ import (
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 )
 
 type countingResolver struct {
@@ -92,14 +93,10 @@ func TestKeyedAdmissionMasksFailedRecoveryLookup(t *testing.T) {
 	}
 }
 
-type unknownOutcomeError struct{ error }
-
-func (unknownOutcomeError) TransactionOutcomeUnknown() bool { return true }
-
 func TestKeyedAdmissionMapsAbsentAmbiguousCommitToUnknown(t *testing.T) {
 	request := Request{SessionID: "ambiguous", AdmissionKey: "event-ambiguous"}
 	orch := &StreamingOrchestrator{store: newAdmissionStore()}
-	_, err := orch.resolveFailedAdmission(t.Context(), request, [32]byte{}, unknownOutcomeError{errors.New("commit ack lost")})
+	_, err := orch.resolveFailedAdmission(t.Context(), request, [32]byte{}, storepkg.MarkTransactionOutcomeUnknown(errors.New("commit ack lost")))
 	if !errors.Is(err, session.ErrAdmissionUnknown) || err.Error() != session.ErrAdmissionUnknown.Error() {
 		t.Fatalf("error=%q", err)
 	}

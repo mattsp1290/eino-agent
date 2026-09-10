@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -71,5 +72,32 @@ func TestAdmissionInputBudgetRejectsOversizedMetadataBeforeClone(t *testing.T) {
 	request.Metadata = map[string]string{"hostile": strings.Repeat("x", maxAdmissionPayloadBytes)}
 	if err := validateAdmissionInputBudget(request); !errors.Is(err, session.ErrAdmissionInvalid) {
 		t.Fatalf("budget error=%v", err)
+	}
+}
+
+func TestAdmissionInputJSONSizeMatchesCanonicalPayload(t *testing.T) {
+	base := Request{AdmissionKey: "sized", Message: UserMessage{Content: ""}, Config: orchestratorConfig()}
+	cases := []Request{
+		base,
+		func() Request {
+			request := base
+			request.Message.Content = "quoted \" <html> \u2028"
+			request.Metadata = map[string]string{"line\n": "tab\t"}
+			return request
+		}(),
+		func() Request {
+			request := base
+			request.Config.Tools.Enabled = []string{"read", "write"}
+			request.Config.Tools.Disabled = []string{"shell"}
+			request.Config.Tools.Permissions = []config.PermissionRule{{Permission: "filesystem", Pattern: "/tmp/**", Action: "allow"}}
+			return request
+		}(),
+	}
+	for index, request := range cases {
+		got, err := admissionInputJSONSize(request)
+		encoded, marshalErr := json.Marshal(admissionFingerprintPayloadFor(request))
+		if err != nil || marshalErr != nil || got != len(encoded) {
+			t.Fatalf("case %d size=%d encoded=%d err=%v marshal=%v", index, got, len(encoded), err, marshalErr)
+		}
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"gorm.io/gorm/clause"
 
 	"github.com/mattsp1290/eino-agent/session"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
@@ -118,7 +119,7 @@ func (t *postgresTransaction) Commit(ctx context.Context) error {
 	t.active = false
 	if err != nil {
 		t.closed = true
-		return sqlstore.MarkTransactionOutcomeUnknown(errors.Join(err, ctx.Err(), discardAndClose(t.Conn)))
+		return storepkg.MarkTransactionOutcomeUnknown(errors.Join(err, ctx.Err(), discardAndClose(t.Conn)))
 	}
 	if tag.String() == "ROLLBACK" {
 		return pgx.ErrTxCommitRollback

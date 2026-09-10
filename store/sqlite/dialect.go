@@ -14,6 +14,7 @@ import (
 	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/mattsp1290/eino-agent/session"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 	"github.com/mattsp1290/eino-agent/store/internal/sqlstore"
 )
 
@@ -96,7 +97,7 @@ func (t *writerTransaction) Commit(ctx context.Context) error {
 		t.active = false
 		return err
 	} else {
-		return sqlstore.MarkTransactionOutcomeUnknown(errors.Join(err, rollbackErr))
+		return storepkg.MarkTransactionOutcomeUnknown(errors.Join(err, rollbackErr))
 	}
 }
 func (t *writerTransaction) Rollback(ctx context.Context) error {

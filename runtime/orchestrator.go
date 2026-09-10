@@ -20,6 +20,7 @@ import (
 	"github.com/mattsp1290/eino-agent/permissions"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 	"github.com/mattsp1290/eino-agent/watch"
 )
 
@@ -159,8 +160,6 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Adm
 	return AdmissionResult{Receipt: admitted.Receipt, Disposition: AdmissionNew, Handle: handle}, nil
 }
 
-type transactionOutcomeUnknown interface{ TransactionOutcomeUnknown() bool }
-
 func (o *StreamingOrchestrator) resolveFailedAdmission(ctx context.Context, request Request, fingerprint [32]byte, cause error) (AdmissionResult, error) {
 	if request.AdmissionKey == "" {
 		return AdmissionResult{}, cause
@@ -175,8 +174,7 @@ func (o *StreamingOrchestrator) resolveFailedAdmission(ctx context.Context, requ
 	if found {
 		return existing, nil
 	}
-	var unknown transactionOutcomeUnknown
-	if errors.As(cause, &unknown) && unknown.TransactionOutcomeUnknown() {
+	if storepkg.IsTransactionOutcomeUnknown(cause) {
 		return AdmissionResult{}, admissionUnknownError(cause)
 	}
 	return AdmissionResult{}, cause

@@ -67,14 +67,35 @@ func frozenRequest(request Request) Request {
 
 func emptySlice(value []string) []string { return append([]string{}, value...) }
 
+var emptyAdmissionPayloadBytes, emptyAdmissionPermissionBytes = func() (int, int) {
+	payload, payloadErr := json.Marshal(admissionFingerprintPayload{
+		Agent:          admissionAgent{Options: map[string]string{}},
+		Tools:          admissionTools{Enabled: []string{}, Disabled: []string{}, Permissions: []admissionPermission{}},
+		ConfigMetadata: map[string]string{}, RequestMetadata: map[string]string{},
+	})
+	permission, permissionErr := json.Marshal(admissionPermission{})
+	if payloadErr != nil || permissionErr != nil {
+		panic("runtime: fixed admission fingerprint shape cannot be encoded")
+	}
+	return len(payload), len(permission)
+}()
+
 // validateAdmissionInputBudget bounds work before Clone or JSON encoding can
 // copy attacker-controlled keyed input. JSON escaping can only add bytes, and
 // the exact encoded limit remains enforced after canonical marshaling.
 func validateAdmissionInputBudget(request Request) error {
-	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil || len(request.Message.Content) > maxAdmissionMessageBytes {
+	size, err := admissionInputJSONSize(request)
+	if err != nil || size > maxAdmissionPayloadBytes {
 		return session.ErrAdmissionInvalid
 	}
-	used := 281 // canonical payload with empty strings and containers
+	return nil
+}
+
+func admissionInputJSONSize(request Request) (int, error) {
+	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil || len(request.Message.Content) > maxAdmissionMessageBytes {
+		return 0, session.ErrAdmissionInvalid
+	}
+	used := emptyAdmissionPayloadBytes
 	add := func(value string, emptyBytes int) bool {
 		encoded, valid := encodedJSONStringBytes(value)
 		increment := encoded - emptyBytes
@@ -92,20 +113,20 @@ func validateAdmissionInputBudget(request Request) error {
 	}
 	for _, value := range values {
 		if !add(value, 2) {
-			return session.ErrAdmissionInvalid
+			return 0, session.ErrAdmissionInvalid
 		}
 	}
 	for _, values := range []map[string]string{request.Config.Agent.Options, request.Config.Metadata, request.Metadata} {
 		if len(values) > 0 {
 			increment := 2*len(values) - 1
 			if used > maxAdmissionPayloadBytes-increment {
-				return session.ErrAdmissionInvalid
+				return 0, session.ErrAdmissionInvalid
 			}
 			used += increment
 		}
 		for key, value := range values {
 			if !add(key, 0) || !add(value, 0) {
-				return session.ErrAdmissionInvalid
+				return 0, session.ErrAdmissionInvalid
 			}
 		}
 	}
@@ -113,31 +134,31 @@ func validateAdmissionInputBudget(request Request) error {
 		if len(values) > 0 {
 			increment := len(values) - 1
 			if used > maxAdmissionPayloadBytes-increment {
-				return session.ErrAdmissionInvalid
+				return 0, session.ErrAdmissionInvalid
 			}
 			used += increment
 		}
 		for _, value := range values {
 			if !add(value, 0) {
-				return session.ErrAdmissionInvalid
+				return 0, session.ErrAdmissionInvalid
 			}
 		}
 	}
 	if len(request.Config.Tools.Permissions) > 0 {
-		increment := 43*len(request.Config.Tools.Permissions) - 1
+		increment := (emptyAdmissionPermissionBytes+1)*len(request.Config.Tools.Permissions) - 1
 		if used > maxAdmissionPayloadBytes-increment {
-			return session.ErrAdmissionInvalid
+			return 0, session.ErrAdmissionInvalid
 		}
 		used += increment
 	}
 	for _, rule := range request.Config.Tools.Permissions {
 		for _, value := range []string{rule.Permission, rule.Pattern, rule.Action} {
 			if !add(value, 2) {
-				return session.ErrAdmissionInvalid
+				return 0, session.ErrAdmissionInvalid
 			}
 		}
 	}
-	return nil
+	return used, nil
 }
 
 func encodedJSONStringBytes(value string) (int, bool) {
@@ -181,6 +202,18 @@ func fingerprintAdmission(request Request) ([32]byte, error) {
 	if len(request.Message.Content) > maxAdmissionMessageBytes || !utf8.ValidString(request.Message.Content) {
 		return [32]byte{}, session.ErrAdmissionInvalid
 	}
+	payload := admissionFingerprintPayloadFor(request)
+	if !validAdmissionPayload(payload) {
+		return [32]byte{}, session.ErrAdmissionInvalid
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil || len(encoded) > maxAdmissionPayloadBytes {
+		return [32]byte{}, session.ErrAdmissionInvalid
+	}
+	return sha256.Sum256(append([]byte("eino-agent-admission-v1\x00"), encoded...)), nil
+}
+
+func admissionFingerprintPayloadFor(request Request) admissionFingerprintPayload {
 	payload := admissionFingerprintPayload{
 		Message:        request.Message.Content,
 		Agent:          admissionAgent{Name: request.Config.Agent.Name, SystemPrompt: request.Config.Agent.SystemPrompt, Mode: request.Config.Agent.Mode, Model: fingerprintSelection(request.Config.Agent.Model), Options: emptyMap(request.Config.Agent.Options)},
@@ -191,14 +224,7 @@ func fingerprintAdmission(request Request) ([32]byte, error) {
 	for _, rule := range request.Config.Tools.Permissions {
 		payload.Tools.Permissions = append(payload.Tools.Permissions, admissionPermission{Permission: rule.Permission, Pattern: rule.Pattern, Action: rule.Action})
 	}
-	if !validAdmissionPayload(payload) {
-		return [32]byte{}, session.ErrAdmissionInvalid
-	}
-	encoded, err := json.Marshal(payload)
-	if err != nil || len(encoded) > maxAdmissionPayloadBytes {
-		return [32]byte{}, session.ErrAdmissionInvalid
-	}
-	return sha256.Sum256(append([]byte("eino-agent-admission-v1\x00"), encoded...)), nil
+	return payload
 }
 
 func validAdmissionPayload(payload admissionFingerprintPayload) bool {

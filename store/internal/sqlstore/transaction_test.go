@@ -13,6 +13,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/mattsp1290/eino-agent/session"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 )
 
 var errCleanupInjected = errors.New("injected savepoint cleanup failure")
@@ -108,7 +109,7 @@ func (t *commitAckTransaction) Commit(context.Context) error {
 	if err := t.Tx.Commit(); err != nil {
 		return err
 	}
-	return MarkTransactionOutcomeUnknown(errCommitAckInjected)
+	return storepkg.MarkTransactionOutcomeUnknown(errCommitAckInjected)
 }
 func (t *commitAckTransaction) Rollback(context.Context) error { return t.Tx.Rollback() }
 func (t *commitAckTransaction) Close() error                   { return nil }
@@ -132,8 +133,7 @@ func TestWithinTxMarksLostCommitAcknowledgementWhileDataCommits(t *testing.T) {
 		_, err := view.(*Store).dbFor(ctx).Statement.ConnPool.ExecContext(ctx, "INSERT INTO witness(value) VALUES (?)", "committed")
 		return err
 	})
-	var marked interface{ TransactionOutcomeUnknown() bool }
-	if !errors.As(err, &marked) || !marked.TransactionOutcomeUnknown() || !errors.Is(err, errCommitAckInjected) {
+	if !storepkg.IsTransactionOutcomeUnknown(err) || !errors.Is(err, errCommitAckInjected) {
 		t.Fatalf("commit result=%v", err)
 	}
 	var count int
