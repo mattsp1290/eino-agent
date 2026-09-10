@@ -10,4 +10,15 @@
 // sessions should acquire those sessions in ascending bytewise ID order so
 // PostgreSQL deadlocks are avoided and can be propagated without retrying the
 // callback.
+//
+// Goose is the sole schema authority: Migrate initializes the fresh version-1
+// baseline with writers quiesced; normal startup calls verify-only New.
+// Shared application schemas, legacy imports, automatic Down/reset, retention
+// APIs, and arbitrary SQL backends are not supported. Hosts own backups,
+// authorization, retention scheduling and database maintenance.
+//
+// A host may pass stdlib.OpenDBFromPool(nativePool), retaining ownership of
+// both pools and closing the SQL wrapper before the native pgxpool. Nil pools
+// and unsupported drivers match session.ErrConflict; closed pools and canceled
+// contexts retain their underlying error classification.
 package postgres

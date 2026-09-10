@@ -10,4 +10,9 @@
 // Writer transactions acquire BEGIN IMMEDIATE before checking fences. Committed
 // observation/discovery readers use deferred read views outside caller transactions.
 // Projection writes accept valid UTF-8 and UTC years 0000–9999.
+//
+// Persistence algorithms are shared with store/postgres. Public nested callbacks
+// reuse the outer transaction; individual mutations use internal savepoints.
+// Hosts own backup, retention and migration policy. No automatic Down/reset or
+// legacy file import is provided, and unsupported files remain untouched.
 package sqlite

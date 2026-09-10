@@ -19,13 +19,12 @@ and observability remain provider-neutral.
 
 - Module: `github.com/mattsp1290/eino-agent`
 - Go: `1.26.3`
-- Supported root release: `v0.3.3` at commit
-  `36fe8d8a046b4dd193e97b8f49a580a71bf07bbc`, verified on 2026-09-04 with
-  `make check` and a fresh published consumer using no `replace`, workspace,
-  vendor tree, or checkout access
-- Verified workspace-discovery pin: `v0.3.4-0.20260908144805-034b315a5175` at
-  commit `034b315a517520d18010c0bd9429ef404a2df73d`, verified on 2026-09-08
-  with `make check` and a fresh published consumer (no replacement)
+- Verified SQL-store implementation: `v0.3.4-0.20260910012408-cec27e5eb734` at commit
+  `cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`, published and verified on 2026-09-10 (UTC)
+  with `make check`, the required PostgreSQL test/race suites, and a fresh
+  PostgreSQL consumer using no replacement, workspace, vendor tree or checkout
+  access. Earlier release/discovery pins are historical; use this pin for the
+  host-owned SQLite and PostgreSQL APIs.
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.8.13`
@@ -69,6 +68,14 @@ POST /runs/{run_id}/interrupt
 
 Use it as a reference for composition, not as an auth or tenancy policy.
 
+For a host-owned PostgreSQL pool, see
+[examples/postgres-store](examples/postgres-store). Its explicit `-migrate`
+setup mode initializes a fresh dedicated PostgreSQL 17 database; normal runs
+construct the store without DDL and persist/replay a small session lifecycle.
+`store/postgres` and `store/sqlite` use one internal GORM implementation with
+backend-specific Goose version-1 baselines. Hosts own pool lifetime, migration
+timing, credentials, backups and retention. Neither backend imports old schemas.
+
 ## Local Gates
 
 Run the full skeleton gate:
@@ -86,7 +93,13 @@ make test
 make race
 make mod-tidy-check
 make lint
+make postgres-test
+make postgres-race
+EINO_AGENT_CONSUMER_POSTGRES=1 testdata/external-consumer/check.sh
 ```
+
+The PostgreSQL gates require Docker and fail on startup errors or skipped
+integration cases. Ordinary `make check` remains Docker-free.
 
 `make lint` uses pinned `golangci-lint` v2.12.2 through `go run`.
 `make fmt` applies `gofmt` and pinned `goimports`.
@@ -110,6 +123,8 @@ make lint
 - `obs`: Datadog/eino-obs observability redaction and correlation policy
   definitions.
 - `store/sqlite`: embedded SQLite store implementation.
+- `store/postgres`: dedicated PostgreSQL database implementation over a borrowed pgx pool.
+- `store/internal/sqlstore`: shared GORM persistence, transactions and fenced mutations.
 - `store/storetest`: reusable durable store contract tests for backend
   implementations.
 - `examples/`: buildable embedding and integration sketches.
@@ -151,22 +166,20 @@ run. Detaching or closing observation leaves execution ownership with the host.
 See [the consumer guide](docs/consumer-guide.md#session-state-observation) for
 construction, limits, overflow recovery, and cleanup. The minimal server's
 existing events route now emits current AG-UI message/state snapshots. These
-APIs are included in the verified workspace-discovery pin above; they are not
-part of the earlier v0.3.3 release.
+APIs are included in the verified SQL-store pin above.
 Old development databases require explicit recreation for the new schema;
 opening an old schema fails without deleting or migrating it.
 
 ## Workspace session discovery
 
 `session.SessionDiscoveryReader` lists bounded durable summaries for one explicit
-workspace, including empty and completed conversations. Built-in SQLite provides
+workspace, including empty and completed conversations. SQLite and PostgreSQL provide
 indexed creation-time/ID pagination; hosts authorize each workspace and selected
 conversation. See the [consumer flow](docs/consumer-guide.md#workspace-conversation-discovery)
 and [storage contract](docs/architecture/storage.md#workspace-session-discovery)
 for bounds, concurrency, errors and the intentionally incompatible SQLite schema.
 Safe durable renaming remains a separate capability request.
 
-Verified implementation: [`034b315a5175`](https://github.com/mattsp1290/eino-agent/commit/034b315a517520d18010c0bd9429ef404a2df73d),
-Go module version `v0.3.4-0.20260908144805-034b315a5175`. The fresh
-published fixture verifies discovery and independent runtime continuation after
-reopen. See [dependency evidence](docs/dependency-status.md#workspace-discovery-publication).
+Discovery and independent runtime continuation after reopening are included in
+the current SQL-store publication. See
+[the publication evidence](docs/dependency-status.md#sql-store-consumer-publication).

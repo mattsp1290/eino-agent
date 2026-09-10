@@ -1,12 +1,60 @@
 # Dependency Status
 
 Date: 2026-06-27
-Last updated: 2026-09-08
+Last updated: 2026-09-10 (UTC)
 
-This note records the prerequisite state for `eino-agent` before runtime
-implementation starts. The exact pins below are the initial baseline. Do not
+This note retains prerequisite and publication evidence for `eino-agent`.
+The initial baseline below is historical. Do not
 upgrade them inside unrelated implementation work; file a dependency-upgrade
 bead with compatibility gates instead.
+
+## SQL-store consumer publication
+
+The current reusable SQL-store implementation is full remote commit
+`cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`, resolved as `v0.3.4-0.20260910012408-cec27e5eb734`.
+The public Go proxy returned that exact `Origin.Hash`; no tag or separate module
+was created. This implementation pin includes the public PostgreSQL example and
+consumer fixture. Later documentation commits record its results.
+
+Verified on 2026-09-10 (UTC): Go `1.26.3`, CloudWeGo Eino `v0.8.13`, pgx
+`v5.10.0`, GORM `v1.31.2`, PostgreSQL driver `v1.6.2`, SQLite driver `v1.6.0`,
+Goose `v3.27.3`, modernc SQLite `v1.54.0`, and Testcontainers core/PostgreSQL
+module `v0.42.0`. The server image is
+`postgres:17.9-bookworm@sha256:47f917f7409eacd22fc5dfb1dee634e1b55cf0c01d1a7eb701be2227a03e0641`.
+The external module selected `wasmext/gen v0.1.0` without replacement.
+
+Passed commands (Docker suites ran sequentially):
+
+```sh
+GOMAXPROCS=2 make check GO_TEST='go test -p 1'
+TESTCONTAINERS_RYUK_DISABLED=true GOMAXPROCS=2 GOFLAGS='-p=1' make postgres-test
+TESTCONTAINERS_RYUK_DISABLED=true GOMAXPROCS=2 GOFLAGS='-p=1' make postgres-race
+TESTCONTAINERS_RYUK_DISABLED=true GOMAXPROCS=2 EINO_AGENT_CONSUMER_POSTGRES=1 testdata/external-consumer/check.sh
+GOWORK=off GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
+  GOFLAGS= GOPRIVATE= GONOSUMDB= GONOPROXY= GOMAXPROCS=2 \
+  TESTCONTAINERS_RYUK_DISABLED=true EINO_AGENT_CONSUMER_POSTGRES=1 \
+  EINO_AGENT_CONSUMER_VERSION=cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e \
+  testdata/external-consumer/check.sh
+```
+
+Ryuk was disabled for this host's Docker environment; fixtures still explicitly
+close host pools and terminate disposable containers. CI uses normal Ryuk
+settings. Both PostgreSQL suites and both consumer modes reported required
+suites passed with zero skips. The published run downloaded through
+`https://proxy.golang.org` into a fresh empty module cache with no replacement,
+workspace, vendor tree or sibling checkout. It verified module checksums, built
+the consumer, and executed migration ordering, pool ownership after errors and
+abandonment, durable writes, and replay after closing/reopening without migration.
+SQLite named-memory/file lifecycle and existing discovery/watch/search fixtures
+also passed. Normal `make check` remains Docker-free.
+
+The [public example](../examples/postgres-store) and
+[consumer contract](consumer-guide.md#postgresql-pool-and-schema-ownership)
+describe setup, host ownership and limits. Maintainer Matt owns this capability
+in `github.com/mattsp1290/eino-agent`. The canonical local source-request response
+records reusable implementation delivery; Ensemble/Birbparty adoption remains a
+separate data-transition project. Existing application schemas and old SQLite
+files are not migration inputs. Historical evidence follows below.
 
 ## Summary
 
@@ -14,7 +62,7 @@ No runtime implementation blocker remains from the three required library
 dependencies. The local checkouts match the requested pins and their relevant
 validation gates pass.
 
-The supported root pin is `v0.3.3` at commit
+The historical root release is `v0.3.3` at commit
 `36fe8d8a046b4dd193e97b8f49a580a71bf07bbc`. Its generated-bindings
 dependency is published as module version `v0.1.0` through repository tag
 `wasmext/gen/v0.1.0` at commit

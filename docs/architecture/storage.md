@@ -9,6 +9,14 @@ downstream implementation beads.
 
 ## Scope
 
+`store/sqlite` and `store/postgres` are thin adapters over
+`store/internal/sqlstore`, which owns GORM CRUD, replay, fencing and transaction
+logic. Backend dialects supply locking, clock and snapshot behavior. The host
+owns a modernc SQLite or pgx-backed PostgreSQL `*sql.DB`; explicit `Migrate`
+applies the Goose version-1 baseline and `New` validates it without DDL. Neither
+method closes or configures the pool. PostgreSQL requires a dedicated database
+and fixed `public` schema; constructors do not provision databases.
+
 The public store boundary is transactional `session.Store`. Concrete backends
 may be SQLite, embedded log, in-memory test stores, or hosted databases, but
 they must expose the same atomic behavior to the runtime.
@@ -90,6 +98,28 @@ Every backend implements `session.Store.WithinTx`. The outermost call commits
 if `fn` returns nil and rolls back if `fn` returns a non-nil error or panics.
 Nested calls reuse the current transaction without a savepoint; only an error
 or panic that escapes the outermost callback forces rollback.
+
+Individual mutations inside that transaction use internal operation savepoints.
+If a caller catches a failed mutation, that operation leaves no partial writes,
+while other successful work can still commit. This differs from a nested public
+callback: catching its error preserves its earlier successful operations. Cleanup
+failure poisons the transaction so the outer callback cannot commit uncertain
+state. Callbacks are not automatically retried.
+
+SQLite acquires `BEGIN IMMEDIATE` before validating write fences. PostgreSQL
+uses read-committed transactions and locks the owning session/run rows; lease
+decisions use `clock_timestamp()` rather than a host or transaction-start clock.
+For callbacks spanning sessions, acquire them in ascending bytewise ID order;
+database deadlock errors propagate. Committed observation/discovery readers use
+separate SQLite read views or PostgreSQL repeatable-read transactions and reject
+transaction-bound handles.
+
+Public identities and byte-preserving record payloads remain separate from
+private integer relation keys. Composite PostgreSQL indexes use those compact
+ownership keys so simultaneous 1024-byte public identities fit the verified
+lifecycle. This is not an unlimited-key-size promise: PostgreSQL B-tree physical
+limits still apply, and discovery retains its explicit byte bounds. Public
+ordering is bytewise and nanosecond-precise across both backends.
 
 Transaction boundaries matter for:
 
