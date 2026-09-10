@@ -816,20 +816,59 @@ if err != nil { return err }
 ```
 
 Continue the chosen ID with the existing `orchestrator.Start` flow, supplying
-matching `Config.Metadata["workspace_id"]`. To pre-create sessions compatible
-with current runtime admission, initially use Title=ID, empty ParentID and
-Directory, nil session/request Metadata, and omit `workspace_root`. Reopening
+matching `Config.Metadata["workspace_id"]`. Runtime admission accepts and
+preserves a custom or subsequently changed title while continuing to require
+exact ID, parent, workspace, directory, and request metadata identity. Reopening
 the same database and rediscovering either ID preserves independent histories.
 The executable public journey is
 `testdata/external-consumer/session_discovery_fixture_test.go`.
 
-Discovery reads the current stored title, including empty or edited titles. Safe
-arbitrary title mutation and admission after renaming remain the separate request
-at `~/.agents/projects/eino-agent/requests/2026-09-08-durable-conversation-renaming.md`.
-This feature does not resolve that request or the full TUI milestone.
+## Durable conversation titles
 
-Workspace selectors are exact UTF-8 strings (1–1024 bytes), with no wildcard or
-normalization. They carry no authorization. Hosts authorize every page and every
+Validate a host-selected initial title, then create the session with the same
+identity fields that admission will derive. Later edits use the narrow mutation:
+
+```go
+if err := session.ValidateSessionTitle(initialTitle); err != nil { return err }
+_, err := st.CreateSession(ctx, session.Session{
+    ID: conversationID, WorkspaceID: authorizedWorkspace,
+    Directory: canonicalWorkspaceRoot, Title: initialTitle,
+    Metadata: requestMetadata, CreatedAt: now, UpdatedAt: now,
+})
+if err != nil { return err }
+
+result, err := st.SetSessionTitle(ctx, session.SessionTitleRequest{
+    SessionID: conversationID, WorkspaceID: authorizedWorkspace,
+    Title: editedTitle,
+})
+```
+
+Titles are unchanged valid UTF-8 strings of at most 16384 bytes. Empty and
+whitespace-only titles are allowed. The host authorizes both session and exact
+workspace on every call; selectors are not credentials and an empty workspace
+matches only an existing empty workspace. `Changed=false` means the title was
+already current and retains its existing `UpdatedAt`. Successful writes update
+title and nondecreasing metadata time together; competing writes serialize and
+the later successful write wins. Do not automatically retry an ambiguous commit
+after newer user intent. Success inside `WithinTx` remains provisional until the
+outer transaction commits.
+
+`CreateSession` and `UpdateSession` remain trusted whole-record APIs and retain
+their broader storage limits. `UpdateSession` can overwrite unrelated stale
+fields, so interactive renaming should use `SetSessionTitle`; coordinate any
+concurrent whole-record writer in host code.
+
+A trusted native tool definition may set `AllowSessionTitle: true`. Its concrete
+executor alone receives `execution.Call.SessionTitle`, whose `SetTitle(ctx,
+title)` method is already bound to the current session, workspace, and immutable
+run fence. Model input contains only the proposed title. Middleware, extensions,
+Wasm guests, schemas, events, and model-visible results do not receive the
+writer or claim token. Lease expiry alone does not revoke it, but claim takeover
+or terminal settlement does. The executable public journey is
+`testdata/external-consumer/session_title_fixture_test.go`.
+
+Discovery workspace selectors are exact UTF-8 strings (1–1024 bytes), with no
+wildcard or normalization. They carry no authorization. Hosts authorize every page and every
 selected conversation. Limit defaults to 50, maximum 100; cursors are bounded to
 8192 bytes and bind database/workspace. Summaries expose only ID, workspace,
 current title and creation/update timestamps. ID/workspace have 1024-byte ceilings,

@@ -306,9 +306,11 @@ matching earlier binary/database. There is no migration or automatic deletion.
 
 The [consumer flow](consumer-guide.md#workspace-conversation-discovery) and
 [storage contract](architecture/storage.md#workspace-session-discovery) are
-normative. The companion durable-conversation-renaming request remains unresolved.
-The downstream consumer owns verifying/adopting both pins before its TUI plan;
-this publication does not claim downstream adoption.
+normative. Durable title mutation is implemented in the current source and has
+its own [consumer flow](consumer-guide.md#durable-conversation-titles); publication
+evidence for that newer combined pin is recorded separately after release. The
+downstream consumer owns verifying and adopting the combined pin before its TUI
+plan; this repository does not claim downstream adoption.
 
 ## PostgreSQL baseline test pins
 

@@ -48,6 +48,8 @@ jobs:
         run: make mod-tidy-check
 
       - name: Check external consumer
+        env:
+          EINO_AGENT_CONSUMER_VERSION: ${{ github.event.pull_request.head.sha || github.sha }}
         run: make external-consumer-check
 
       - name: Lint
@@ -74,4 +76,5 @@ jobs:
       - name: PostgreSQL external consumer (required, zero skips)
         env:
           EINO_AGENT_CONSUMER_POSTGRES: "1"
+          EINO_AGENT_CONSUMER_VERSION: ${{ github.event.pull_request.head.sha || github.sha }}
         run: make external-consumer-check

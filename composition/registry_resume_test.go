@@ -112,6 +112,7 @@ func TestStrictResumeRejectsChangedToolRuntimePolicy(t *testing.T) {
 		{name: "external storage", mutate: func(definition *tools.Definition) { definition.Retention.StoreExternal = false }},
 		{name: "redaction", mutate: func(definition *tools.Definition) { definition.Retention.Redact = false }},
 		{name: "metadata", mutate: func(definition *tools.Definition) { definition.Metadata["policy"] = "changed" }},
+		{name: "session title", mutate: func(definition *tools.Definition) { definition.AllowSessionTitle = true }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

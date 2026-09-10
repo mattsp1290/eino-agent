@@ -350,6 +350,7 @@ type Store interface {
 	CreateSession(ctx context.Context, session Session) (Session, error)
 	GetSession(ctx context.Context, id ID) (Session, error)
 	UpdateSession(ctx context.Context, session Session) error
+	SetSessionTitle(ctx context.Context, request SessionTitleRequest) (SessionTitleResult, error)
 	// AdmitRun atomically creates a run and makes it the active owner for its
 	// session. Every existing run ID returns ErrConflict; implementations return
 	// ErrSessionBusy when another nonterminal run owns the session.
@@ -374,6 +375,7 @@ type ExecutionStore interface {
 	StartRun(ctx context.Context, startedAt time.Time) (Run, error)
 	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
 	SettleRun(ctx context.Context, request SettleRunRequest) (RunSettlementResult, error)
+	SetSessionTitle(ctx context.Context, request SessionTitleRequest) (SessionTitleResult, error)
 	AppendMessage(ctx context.Context, message Message) (Message, error)
 	FinalizeAssistantMessage(ctx context.Context, id MessageID) error
 	AppendPart(ctx context.Context, part Part) (Part, error)

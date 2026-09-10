@@ -176,7 +176,6 @@ func sameAdmissionSessionIdentity(left, right session.Session) bool {
 		left.ParentID == right.ParentID &&
 		left.WorkspaceID == right.WorkspaceID &&
 		left.Directory == right.Directory &&
-		left.Title == right.Title &&
 		maps.Equal(left.Metadata, right.Metadata)
 }
 

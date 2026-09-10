@@ -28,6 +28,7 @@ func TestValidateDefinitionRejectsIncompleteAndMalformedDefinitions(t *testing.T
 func TestMaterializeUsesBoundedScopeAndReturnsIndependentContainers(t *testing.T) {
 	t.Parallel()
 	definition := testDefinition("echo")
+	definition.AllowSessionTitle = true
 	definition.Scope = func(_ context.Context, scope runtime.ToolScopeContext) runtime.ToolScope {
 		return runtime.ToolScope{WorkspaceID: scope.WorkspaceID, Root: "session://" + string(scope.SessionID)}
 	}
@@ -41,6 +42,9 @@ func TestMaterializeUsesBoundedScopeAndReturnsIndependentContainers(t *testing.T
 	}
 	if first.Scope.WorkspaceID != "workspace-session-a" || first.Scope.Root != "session://session-a" || second.Scope.Root != "session://session-b" {
 		t.Fatalf("scopes = %#v, %#v", first.Scope, second.Scope)
+	}
+	if !first.AllowSessionTitle || !second.AllowSessionTitle {
+		t.Fatal("materialization dropped session title opt-in")
 	}
 	first.Info.Name = "mutated"
 	first.Scope.Permissions[0] = "mutated"

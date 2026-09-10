@@ -89,6 +89,15 @@ func (s *Store) ListSessions(ctx context.Context, q session.SessionDiscoveryQuer
 	}
 	return store.ListSessions(ctx, q)
 }
+
+func (s *Store) SetSessionTitle(ctx context.Context, request session.SessionTitleRequest) (session.SessionTitleResult, error) {
+	var store *sqlstore.Store
+	if s != nil {
+		store = s.Store
+	}
+	return store.SetSessionTitle(ctx, request)
+}
+
 func (s *Store) ReadObservationRevision(ctx context.Context, id session.ID) (session.ObservationWatermark, error) {
 	var store *sqlstore.Store
 	if s != nil {

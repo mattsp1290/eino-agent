@@ -54,6 +54,12 @@ Definitions can override this with a `ScopeResolver` when a tool needs a
 different authority root. The resolver receives no messages, configuration
 graph, provider clients, or executable definition.
 
+Definitions default `AllowSessionTitle` to false. Setting it true authorizes
+only the selected concrete Go executor to receive the current run's opaque
+`SessionTitleWriter`. This boolean participates in frozen composition identity;
+changing it makes strict resume incompatible. It does not add a model schema
+field or authorize middleware, Wasm, or standard catalog tools.
+
 ## Input And Output
 
 Every tool definition provides one JSON-native `Executor`. It receives

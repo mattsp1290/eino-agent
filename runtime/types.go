@@ -76,15 +76,16 @@ type TurnSnapshot struct {
 
 // Tool describes one runtime-materialized tool available to a turn.
 type Tool struct {
-	Name         string
-	Info         *einoschema.ToolInfo
-	Executor     ToolExecutor
-	RetrySafe    bool
-	Scope        ToolScope
-	InputDecoder InputDecoder
-	Pattern      PermissionPatternResolver
-	Retention    RetentionPolicy
-	Metadata     map[string]string
+	Name              string
+	Info              *einoschema.ToolInfo
+	Executor          ToolExecutor
+	RetrySafe         bool
+	AllowSessionTitle bool
+	Scope             ToolScope
+	InputDecoder      InputDecoder
+	Pattern           PermissionPatternResolver
+	Retention         RetentionPolicy
+	Metadata          map[string]string
 }
 
 // ToolScopeContext is the data-only input used while selecting and scoping
@@ -135,6 +136,7 @@ type ToolCall struct {
 	Pattern         string
 	Input           json.RawMessage
 	Approval        ApprovalRequester
+	SessionTitle    SessionTitleWriter `json:"-"`
 	Context         ToolContext
 }
 

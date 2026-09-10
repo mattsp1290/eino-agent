@@ -48,9 +48,10 @@ outcome fields for every semantic mode.
 
 Callback-facing model, tool, and call values are data-only projections.
 Provider clients, streamers, observers, tool executors, input decoders, and
-approval requesters are always nil at the extension boundary; attempts to
-inject callable values fail closed. Runtime keeps the authoritative callables
-outside the callback graph and closes over them only in the terminal adapter.
+approval and session-title writers are always nil at the extension boundary;
+attempts to inject callable values fail closed. Runtime keeps the authoritative
+callables outside the callback graph and closes over them only in the terminal
+adapter. The host's `AllowSessionTitle` boolean remains protected plan data.
 Every mounted executable callback, including tool scope resolution, receives
 the canonical callback context so closing its own mount fails with
 `extension.ErrSelfClose` instead of waiting on its own plan reference.
