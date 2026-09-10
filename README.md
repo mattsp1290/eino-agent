@@ -178,7 +178,12 @@ indexed creation-time/ID pagination; hosts authorize each workspace and selected
 conversation. See the [consumer flow](docs/consumer-guide.md#workspace-conversation-discovery)
 and [storage contract](docs/architecture/storage.md#workspace-session-discovery)
 for bounds, concurrency, errors and the intentionally incompatible SQLite schema.
-Safe durable renaming remains a separate capability request.
+
+Both built-in stores also implement `Store.SetSessionTitle`; runtime admission
+preserves custom names, and host-opted-in native tool executors can receive a
+run-fenced `ToolCall.SessionTitle` writer. Renaming changes only title metadata
+and does not append conversation history or change the stable session ID. See
+[the consumer flow](docs/consumer-guide.md#durable-conversation-titles).
 
 Discovery and independent runtime continuation after reopening are included in
 the current SQL-store publication. See

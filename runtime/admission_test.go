@@ -97,6 +97,22 @@ func TestAdmitRequiresContextEpochID(t *testing.T) {
 	}
 }
 
+func TestAdmissionAcceptsAndPreservesStoredTitle(t *testing.T) {
+	store := newAdmissionStore()
+	request := testRunAdmission()
+	frozen, err := freezeAdmission(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := admissionSession(frozen, time.Now().UTC().Add(-time.Hour))
+	stored.Title = "custom title"
+	store.sessions[stored.ID] = stored
+	got, err := getOrCreateAdmissionSession(context.Background(), store, frozen, time.Now().UTC())
+	if err != nil || got.Title != stored.Title || !got.UpdatedAt.Equal(stored.UpdatedAt) {
+		t.Fatalf("admission session = %#v, error = %v", got, err)
+	}
+}
+
 func TestAdmitRejectsCollidingGeneratedIDsBeforeStoreUse(t *testing.T) {
 	t.Parallel()
 

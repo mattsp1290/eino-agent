@@ -40,6 +40,17 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 		t.Fatal(err)
 	}
 	const sessionID session.ID = "postgres-admission-success"
+	namedAt := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	namedRoot, err := canonicalAdmissionWorkspace(orchestratorConfig().Metadata["workspace_root"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.CreateSession(f.ctx, session.Session{
+		ID: sessionID, WorkspaceID: "workspace-1", Directory: namedRoot,
+		Title: "Postgres named conversation", Metadata: map[string]string{"source": "postgres"}, CreatedAt: namedAt, UpdatedAt: namedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
 	handle, err := orchestrator.Start(f.ctx, Request{
 		SessionID: sessionID, Message: UserMessage{Content: "postgres question"},
 		Config: orchestratorConfig(), Metadata: map[string]string{"source": "postgres"},
@@ -50,6 +61,9 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 	result := awaitPostgresRuntime(t, f.ctx, handle)
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("result=%+v model calls=%d", result, calls.Load())
+	}
+	if named, err := f.store.GetSession(f.ctx, sessionID); err != nil || named.Title != "Postgres named conversation" || !named.UpdatedAt.Equal(namedAt) {
+		t.Fatalf("named session=%#v err=%v", named, err)
 	}
 	assertPostgresAdmissionGraph(t, f, sessionID, result.RunID, "postgres question", "postgres answer")
 

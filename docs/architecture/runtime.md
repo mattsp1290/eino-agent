@@ -134,6 +134,10 @@ Store implementations must provide these invariants:
 - unfinished runs and tool calls can be detected after restart;
 - non-idempotent unfinished tool calls are not automatically rerun.
 
+Admission treats the title as mutable display metadata. It returns a preexisting
+named record unchanged while retaining exact checks for every other session
+identity field. Runtime-created sessions still default their title to the ID.
+
 Recovery implementations use `ListUnfinishedRuns`, `ActiveRun`, and
 `ListUnfinishedToolCalls` to conservatively mark unfinished work interrupted,
 or to retry only when an explicit retry-safe contract allows it.
@@ -217,8 +221,9 @@ Every tool call follows this durable lifecycle:
 1. model requests a tool call;
 2. runtime persists a pending `session.ToolCall`;
 3. runtime claims the call with an owner and claim token before executing it;
-4. tool receives `context.Context`, session/run/message/call IDs, and an
-   approval requester;
+4. tool receives `context.Context`, session/run/message/call IDs, an approval
+   requester, and—only when the sealed host tool opted in—a title writer bound
+   to the current run;
 5. runtime converts the protected outcome to one bounded canonical output;
 6. runtime settles the call and reserved tool-result message/part through one
    shared fresh/resume operation;
@@ -234,6 +239,15 @@ own synchronization around canonical workspace roots so `file_read`,
 `file_write`, `file_edit`, search, shell, and patch operations do not corrupt
 shared state. Tool input decoding and output retention are runtime policy, not
 hidden metadata conventions.
+
+`runtime.Tool.AllowSessionTitle` is part of frozen plan identity. At the terminal
+executor adapter, runtime attaches `ToolCall.SessionTitle` only for an opted-in
+concrete native executor. The writer accepts title text only and captures the
+current `ExecutionStore`, session ID, and authoritative workspace from the run.
+Guards, preparation/result middleware, extension callbacks, provider schemas,
+Wasm guests, events, and serialization receive nil. A retained writer fails
+after terminal settlement or claim replacement because every call revalidates
+its original fence.
 
 ## Provider and Model Resolution
 

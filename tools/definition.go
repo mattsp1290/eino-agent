@@ -38,17 +38,18 @@ type ScopeResolver func(context.Context, runtime.ToolScopeContext) runtime.ToolS
 
 // Definition is a JSON-native tool declaration registered by host code or adapters.
 type Definition struct {
-	Name        string
-	Description string
-	Parameters  *einoschema.ParamsOneOf
-	Normalize   InputNormalizer
-	Pattern     PermissionPattern
-	Execute     Executor
-	RetrySafe   bool
-	Scope       ScopeResolver
-	Retention   runtime.RetentionPolicy
-	Permissions []string
-	Metadata    map[string]string
+	Name              string
+	Description       string
+	Parameters        *einoschema.ParamsOneOf
+	Normalize         InputNormalizer
+	Pattern           PermissionPattern
+	Execute           Executor
+	RetrySafe         bool
+	AllowSessionTitle bool
+	Scope             ScopeResolver
+	Retention         runtime.RetentionPolicy
+	Permissions       []string
+	Metadata          map[string]string
 }
 
 // Execution is canonical JSON input and durable runtime context for one call.
@@ -209,13 +210,14 @@ func materialize(ctx context.Context, definition Definition, context runtime.Too
 			Desc:        definition.Description,
 			ParamsOneOf: parameters,
 		},
-		Executor:     &toolExecutor{definition: executorDefinition, scope: context.Clone()},
-		RetrySafe:    definition.RetrySafe,
-		Scope:        cloneScope(scope),
-		InputDecoder: &toolDecoder{definition: decoderDefinition},
-		Pattern:      &toolPatternResolver{definition: decoderDefinition},
-		Retention:    definition.Retention,
-		Metadata:     cloneStringMap(definition.Metadata),
+		Executor:          &toolExecutor{definition: executorDefinition, scope: context.Clone()},
+		RetrySafe:         definition.RetrySafe,
+		AllowSessionTitle: definition.AllowSessionTitle,
+		Scope:             cloneScope(scope),
+		InputDecoder:      &toolDecoder{definition: decoderDefinition},
+		Pattern:           &toolPatternResolver{definition: decoderDefinition},
+		Retention:         definition.Retention,
+		Metadata:          cloneStringMap(definition.Metadata),
 	}, nil
 }
 

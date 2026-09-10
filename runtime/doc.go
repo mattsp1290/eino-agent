@@ -10,4 +10,6 @@
 // Once admission commits, failed and interrupted executions retain the user
 // message and their assistant placeholder for durable replay. A synchronous
 // admission failure commits none of the attempted run's transcript records.
+// Host-opted-in concrete tools may receive a title-only writer bound to the
+// current run fence; extension, protocol, and model surfaces never receive it.
 package runtime

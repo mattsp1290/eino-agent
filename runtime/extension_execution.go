@@ -13,13 +13,14 @@ import (
 // runExecution owns the frozen extension plan for one fresh or resumed run.
 // Request contexts carry cancellation and request values, never plan identity.
 type runExecution struct {
-	sessionID session.ID
-	runID     session.RunID
-	host      *StreamingOrchestrator
-	plan      *RunPlan
-	store     session.ExecutionStore
-	lease     *runLeaseHeartbeat
-	events    *eventQueue
+	sessionID   session.ID
+	runID       session.RunID
+	workspaceID string
+	host        *StreamingOrchestrator
+	plan        *RunPlan
+	store       session.ExecutionStore
+	lease       *runLeaseHeartbeat
+	events      *eventQueue
 
 	durableMessageMu          sync.Mutex
 	durableMessageFloor       time.Time
@@ -69,7 +70,7 @@ func newRunExecution(host *StreamingOrchestrator, plan *RunPlan, run session.Run
 		panic(fmt.Sprintf("nil run execution store for run %q", run.ID))
 	}
 	host.sessionObserver.Hint(run.SessionID)
-	return &runExecution{sessionID: run.SessionID, runID: run.ID, host: host, plan: plan, store: store, events: newEventQueue(host.queueSize, host.events)}
+	return &runExecution{sessionID: run.SessionID, runID: run.ID, workspaceID: run.Config["workspace_id"], host: host, plan: plan, store: store, events: newEventQueue(host.queueSize, host.events)}
 }
 
 func (e *runExecution) dispatch() *extension.Plan {
