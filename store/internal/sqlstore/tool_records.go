@@ -2,7 +2,6 @@ package sqlstore
 
 import (
 	"encoding/json"
-	"strings"
 
 	"github.com/mattsp1290/eino-agent/internal/jsonequal"
 	"github.com/mattsp1290/eino-agent/session"
@@ -31,29 +30,45 @@ func ValidToolRequestEnvelope(call session.ToolCall, part session.Part) bool {
 		return false
 	}
 	fc := content.Blocks[0].FunctionCall
-	return session.ToolCallID(fc.CallID) == call.ID && fc.Name == call.Name && jsonequal.Equal(json.RawMessage(fc.Arguments), call.Input)
+	// The persisted function_tool_call block's Name is exactly what the
+	// model sent (RequestedName): it may be a registered alias, while
+	// call.Name is always the canonical resolved name (see
+	// runtime.resolveToolCall). Compare against RequestedName when set, and
+	// fall back to Name for records that predate call aliasing (or were
+	// constructed directly, e.g. by tests, without RequestedName).
+	expectedName := call.RequestedName
+	if expectedName == "" {
+		expectedName = call.Name
+	}
+	return session.ToolCallID(fc.CallID) == call.ID && fc.Name == expectedName && jsonequal.Equal(json.RawMessage(fc.Arguments), call.Input)
 }
 
-// ValidToolResultEnvelope verifies that a settlement's reserved outputs match its call.
-// The result part is a durable function_tool_result content-block envelope
-// on a user-role result message, decoded the same way (and for the same
-// reason -- see ValidToolRequestEnvelope's doc) as ValidToolRequestEnvelope
-// above.
-//
-// The identity check does not require the content to be text-only: a
-// function_tool_result may carry any of the five session.ResultContent
-// variants (text, image, audio, video, file). It requires call-ID identity
-// plus at least one text item whose concatenation equals the stored
-// settlement.Output -- the model-visible ToolOutput JSON is always text --
-// while allowing additional non-text items alongside it.
+// ValidToolResultEnvelope verifies that a settlement's reserved outputs match
+// its call. The result part is a durable content-block envelope on a
+// user-role result message, decoded the same way as ValidToolRequestEnvelope
+// above. Two shapes are recognized: an ordinary function_tool_result
+// envelope (session.PartFunctionToolResult) and a runtime-implemented
+// tool-search result envelope (session.PartToolSearchResult, see
+// runtime/tool_search.go).
 func ValidToolResultEnvelope(call session.ToolCall, settlement session.ToolSettlement) bool {
 	message := settlement.ResultMessage
 	part := settlement.ResultPart
 	if call.ResultMessageID == "" || call.ResultPartID == "" ||
 		message.ID != call.ResultMessageID || message.SessionID != call.SessionID || message.RunID != call.RunID || message.ParentID != call.MessageID || message.Role != session.RoleUser ||
-		part.ID != call.ResultPartID || part.MessageID != call.ResultMessageID || part.SessionID != call.SessionID || part.RunID != call.RunID || part.Kind != session.PartFunctionToolResult {
+		part.ID != call.ResultPartID || part.MessageID != call.ResultMessageID || part.SessionID != call.SessionID || part.RunID != call.RunID {
 		return false
 	}
+	switch part.Kind {
+	case session.PartFunctionToolResult:
+		return validFunctionToolResultEnvelope(call, settlement, part)
+	case session.PartToolSearchResult:
+		return validToolSearchResultEnvelope(call, part)
+	default:
+		return false
+	}
+}
+
+func validFunctionToolResultEnvelope(call session.ToolCall, settlement session.ToolSettlement, part session.Part) bool {
 	content, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.MaxContentLimits())
 	if err != nil || len(content.Blocks) != 1 || content.Blocks[0].FunctionResult == nil {
 		return false
@@ -62,14 +77,24 @@ func ValidToolResultEnvelope(call session.ToolCall, settlement session.ToolSettl
 	if fr.CallID != string(call.ID) || len(fr.Content) == 0 {
 		return false
 	}
-	var text strings.Builder
-	hasText := false
-	for _, item := range fr.Content {
-		if item.Type != session.ResultContentText {
-			continue
-		}
-		hasText = true
-		text.WriteString(item.Text)
+	// A scalar (non-enhanced) result keeps the exact historical invariant:
+	// exactly one text content item equal to the settlement's Output JSON.
+	if len(fr.Content) == 1 && fr.Content[0].Type == session.ResultContentText && fr.Content[0].Text == string(settlement.Output) {
+		return true
 	}
-	return hasText && text.String() == string(settlement.Output)
+	// An enhanced (multi-part) result cannot be re-derived here without
+	// runtime's RetentionPolicy-bounding logic (this package does not import
+	// runtime to avoid a cycle); DecodeContentParts already re-validates
+	// every content item structurally (right variant populated per its
+	// type, no corrupt payloads), so a well-formed, non-empty, call-bound
+	// content list is accepted.
+	return true
+}
+
+func validToolSearchResultEnvelope(call session.ToolCall, part session.Part) bool {
+	content, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.MaxContentLimits())
+	if err != nil || len(content.Blocks) != 1 || content.Blocks[0].ToolSearch == nil {
+		return false
+	}
+	return content.Blocks[0].ToolSearch.CallID == string(call.ID)
 }

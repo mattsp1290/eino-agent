@@ -116,6 +116,12 @@ func translateDefinition(source catalog.Definition, retention runtime.RetentionP
 	if info == nil || info.Name != source.Name || info.ParamsOneOf == nil {
 		return agenttools.Definition{}, fmt.Errorf("%w: catalog metadata mismatch", agenttools.ErrInvalidDefinition)
 	}
+	// catalog.Definition.New is statically typed to return tool.InvokableTool
+	// (classic only): Eino v0.9.19's InvokableTool and EnhancedInvokableTool
+	// both declare a differently-typed InvokableRun method, so no concrete
+	// leaf can ever satisfy both. Every catalog tool therefore keeps the
+	// classic JSON executor; see execution.go's ExecuteEnhancedLeaf for
+	// wiring a directly-typed tool.EnhancedInvokableTool leaf instead.
 	return agenttools.Definition{
 		Name: source.Name, Description: info.Desc, Parameters: info.ParamsOneOf,
 		Normalize: func(_ context.Context, input json.RawMessage) (json.RawMessage, error) {

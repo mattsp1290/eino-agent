@@ -252,18 +252,25 @@ type ToolCall struct {
 	ResultMessageID MessageID
 	ResultPartID    PartID
 	Name            string
-	Pattern         string
-	Input           json.RawMessage
-	Output          json.RawMessage
-	Status          ToolCallStatus
-	RetrySafe       bool
-	Metadata        map[string]string
-	ClaimedBy       string
-	ClaimToken      string
-	LeaseUntil      time.Time
-	StartedAt       time.Time
-	CompletedAt     time.Time
-	Error           string
+	// RequestedName is the model-facing tool name as the model actually
+	// called it: equal to Name when the model used the canonical name,
+	// or the alias the model used when Name was resolved from an alias.
+	// It is persisted so the function_tool_result sent back to the model
+	// (and any replay of this call) can correlate on the name the model
+	// itself used.
+	RequestedName string
+	Pattern       string
+	Input         json.RawMessage
+	Output        json.RawMessage
+	Status        ToolCallStatus
+	RetrySafe     bool
+	Metadata      map[string]string
+	ClaimedBy     string
+	ClaimToken    string
+	LeaseUntil    time.Time
+	StartedAt     time.Time
+	CompletedAt   time.Time
+	Error         string
 }
 
 // ContextEpoch records the history segment used to build provider context.

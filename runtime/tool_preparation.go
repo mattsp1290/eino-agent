@@ -82,7 +82,7 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 			Call: session.ToolCall{
 				ID: prepared.call.ID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				RequestPartID: requestPart.ID, ResultMessageID: resultMessageID, ResultPartID: resultPartID,
-				Name: prepared.call.Name, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
+				Name: prepared.call.Name, RequestedName: prepared.call.RequestedName, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
 				RetrySafe: prepared.tool.RetrySafe, Metadata: cloneStringMap(prepared.tool.Metadata),
 			},
 			RequestPart: requestPart,
@@ -137,6 +137,12 @@ type preparedToolCall struct {
 	middlewareErr error
 	request       session.CreateToolCallRequest
 	record        session.ToolCall
+	// isSearch marks a call to this turn's configured tool-search tool
+	// (TurnSnapshot.ToolSearch). It bypasses the ordinary tool
+	// normalize/InputDecoder/ToolPrepare/Pattern/guard/permission pipeline
+	// entirely and is executed and settled by runtime/tool_search.go instead
+	// of executeAndSettleClaimedTool.
+	isSearch bool
 }
 
 // functionToolCalls extracts msg's function_tool_call blocks, in content
@@ -155,11 +161,8 @@ func functionToolCalls(msg *einoschema.AgenticMessage) []*einoschema.FunctionToo
 }
 
 func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []*einoschema.FunctionToolCall) ([]preparedToolCall, error) {
-	byName := map[string]Tool{}
-	for _, tool := range snapshot.Tools {
-		byName[tool.Name] = tool
-	}
 	prepared := make([]preparedToolCall, 0, len(calls))
+	discovered := execution.discoveredSnapshot()
 	for _, block := range calls {
 		if block == nil {
 			continue
@@ -169,16 +172,39 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			callID = o.ids.NewToolCallID()
 			block.CallID = string(callID)
 		}
-		tool, ok := byName[block.Name]
-		if !ok || tool.Executor == nil {
-			err := fmt.Errorf("tool %q unavailable", block.Name)
-			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
-			return nil, err
-		}
-		input, err := normalizedToolArguments(block.Arguments)
+		requestedInput, err := normalizedToolArguments(block.Arguments)
 		if err != nil {
 			return nil, err
 		}
+		if snapshot.isToolSearchCall(block.Name) {
+			call := ToolCall{
+				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				Name: block.Name, RequestedName: block.Name, Pattern: block.Name,
+				Input: cloneJSON(requestedInput), Context: toolContext(snapshot, snapshot.Tools),
+			}
+			block.Arguments = string(requestedInput)
+			prepared = append(prepared, preparedToolCall{block: block, tool: Tool{Name: block.Name, RetrySafe: true}, call: call, isSearch: true})
+			continue
+		}
+		// resolveToolCall resolves a model-requested tool name (which may be
+		// a registered alias) to its canonical tool and remaps argument
+		// aliases before normalization/InputDecoder/ToolPrepare/Pattern run,
+		// per tools.Definition.Aliases/ArgumentAliases (see adk_tools.go).
+		tool, canonicalName, remapped, requestedName, err := resolveToolCall(snapshot, block.Name, requestedInput)
+		if err != nil {
+			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
+			return nil, err
+		}
+		if tool.Deferred && !discovered[canonicalName] {
+			// A deferred tool must be discovered via tool search before it
+			// can be called: reject before any claim is made, exactly like
+			// an unknown tool name (privilege escalation via a hallucinated
+			// or premature deferred-tool call is rejected the same way).
+			err := fmt.Errorf("tool %q unavailable: not yet discovered via tool search", canonicalName)
+			o.observeToolSettled(ctx, snapshot, Tool{Name: canonicalName}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: canonicalName}, session.ToolCallFailed, 0, err, nil)
+			return nil, err
+		}
+		input := remapped
 		if tool.InputDecoder != nil {
 			decoded, err := tool.InputDecoder.DecodeToolInput(ctx, input)
 			if err != nil {
@@ -189,7 +215,11 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 				return nil, fmt.Errorf("malformed normalized tool input: %w", err)
 			}
 		}
-		call := ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name, Scope: tool.Scope, Pattern: block.Name, Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools)}
+		call := ToolCall{
+			ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+			Name: canonicalName, RequestedName: requestedName, Scope: tool.Scope, Pattern: canonicalName,
+			Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools),
+		}
 		input = cloneJSON(call.Input)
 		var prepareErr error
 		preparedCall, err := extension.ApplyTransforms(execution.dispatch(), ctx, ToolPreparePoint, PreparedToolCall{Tool: extensionTool(tool), Call: extensionToolCall(call)})
@@ -221,16 +251,41 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 
 // executePreparedTools executes calls and returns one user-role
 // function_tool_result agentic message per call, in order. Each message's
-// single text content is exactly string(settlement.Output) (the ToolOutput
-// JSON), unchanged from the classic model-visible shape.
+// content is built by toolOutputToResultContent from the same ToolOutput
+// settlement persisted: a scalar result's single text content is exactly
+// string(settlement.Output) (the ToolOutput JSON), unchanged from the
+// classic model-visible shape; an enhanced result carries one content item
+// per bounded part, identical to what was durably recorded.
 func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, calls []preparedToolCall) ([]*einoschema.AgenticMessage, error) {
 	messages := make([]*einoschema.AgenticMessage, 0, len(calls))
 	var fatal error
 	for _, prepared := range calls {
-		toolName, call := prepared.call.Name, prepared.call
+		// The function_tool_result sent back to the model must correlate on
+		// the name the model actually used to call the tool (RequestedName),
+		// which equals the canonical Name unless the model used an alias.
+		toolName, call := prepared.call.RequestedName, prepared.call
 		callID := call.ID
 		record := prepared.record
 		call.ResultMessageID, call.ResultPartID = record.ResultMessageID, record.ResultPartID
+		if prepared.isSearch {
+			matches, err := execution.executeToolSearchCall(ctx, snapshot, call, record)
+			if err != nil {
+				fatal = err
+				break
+			}
+			block, err := toolSearchResultBlock("", string(callID), toolName, matches)
+			if err != nil {
+				fatal = err
+				break
+			}
+			resultMessage, err := session.ContentToAgenticMessage(session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{block}})
+			if err != nil {
+				fatal = err
+				break
+			}
+			messages = append(messages, resultMessage)
+			continue
+		}
 		startedAt := o.now()
 		claimEvent := toolTransitionEnvelope(o, snapshot, startedAt)
 		claimed, err := execution.persistToolClaim(ctx, session.ClaimToolCallRequest{
@@ -249,21 +304,28 @@ func (o *StreamingOrchestrator) executePreparedTools(ctx context.Context, execut
 			fatal = err
 			break
 		}
-		output := settled.Settlement.Output
-		messages = append(messages, &einoschema.AgenticMessage{
-			Role: einoschema.AgenticRoleTypeUser,
-			ContentBlocks: []*einoschema.ContentBlock{{
-				Type: einoschema.ContentBlockTypeFunctionToolResult,
-				FunctionToolResult: &einoschema.FunctionToolResult{
-					CallID: string(callID),
-					Name:   toolName,
-					Content: []*einoschema.FunctionToolResultContentBlock{{
-						Type: einoschema.FunctionToolResultContentBlockTypeText,
-						Text: &einoschema.UserInputText{Text: string(output)},
-					}},
+		// Build the same-turn model-visible function_tool_result message from
+		// exactly the content settlement persisted (toolOutputToResultContent
+		// is the one function both use), so a scalar result keeps today's
+		// single-text-part shape and an enhanced result mirrors its bounded
+		// parts identically here and in the durable record.
+		resultContent := session.Content{
+			Role: session.RoleUser,
+			Blocks: []session.ContentBlock{{
+				Kind: session.BlockKindFunctionToolResult,
+				FunctionResult: &session.FunctionResultBlock{
+					CallID:  string(callID),
+					Name:    toolName,
+					Content: toolOutputToResultContent(settled.Settlement.Output, settled.Output),
 				},
 			}},
-		})
+		}
+		resultMessage, err := session.ContentToAgenticMessage(resultContent)
+		if err != nil {
+			fatal = err
+			break
+		}
+		messages = append(messages, resultMessage)
 		if errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled) {
 			fatal = settled.Outcome.RawError
 			break

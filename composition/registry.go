@@ -56,6 +56,16 @@ type RestrictionRegistration struct {
 	Denied  []string
 }
 
+// ToolSearchRegistration configures the runtime-implemented tool-search tool
+// (see runtime.ToolSearchConfig). At most one may be active across an
+// assembled plan; Registry.acquire rejects a second one.
+type ToolSearchRegistration struct {
+	ID          string
+	Scope       extension.Scope
+	Name        string
+	Description string
+}
+
 type Registrar struct {
 	extensions   extension.Registrar
 	component    extension.Component
@@ -63,6 +73,7 @@ type Registrar struct {
 	prompts      []PromptRegistration
 	guards       []GuardRegistration
 	restrictions []RestrictionRegistration
+	toolSearch   []ToolSearchRegistration
 }
 
 func (r *Registrar) Prompt(registration PromptRegistration) error {
@@ -128,6 +139,34 @@ func (r *Registrar) RestrictTools(registration RestrictionRegistration) error {
 	return nil
 }
 
+// ToolSearch registers this component's tool-search tool configuration.
+// registration.Name defaults to "tool_search" when empty. At most one
+// tool-search registration may be active across an assembled plan;
+// Registry.acquire rejects a plan whose selected components together
+// register more than one (even if only one component registers, but that
+// component is later mounted alongside another with its own).
+func (r *Registrar) ToolSearch(registration ToolSearchRegistration) error {
+	if err := extension.ValidateIdentifier(registration.ID); err != nil {
+		return err
+	}
+	if err := extension.ValidateScope(registration.Scope); err != nil {
+		return err
+	}
+	if registration.Name == "" {
+		registration.Name = "tool_search"
+	}
+	if err := extension.ValidateIdentifier(registration.Name); err != nil {
+		return err
+	}
+	for _, existing := range r.toolSearch {
+		if existing.ID == registration.ID && existing.Scope == registration.Scope {
+			return fmt.Errorf("%w: tool search %s", extension.ErrDuplicateRegistration, registration.ID)
+		}
+	}
+	r.toolSearch = append(r.toolSearch, registration)
+	return nil
+}
+
 func (r *Registrar) Extensions() extension.Registrar       { return r.extensions }
 func (r *Registrar) Defer(cleanup extension.Cleanup) error { return r.extensions.Defer(cleanup) }
 
@@ -175,6 +214,7 @@ type componentPayload struct {
 	prompts      []PromptRegistration
 	guards       []GuardRegistration
 	restrictions []RestrictionRegistration
+	toolSearch   []ToolSearchRegistration
 }
 
 func NewRegistry(reporter extension.Reporter, customPoints ...extension.Point) (*Registry, error) {
@@ -212,6 +252,7 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 	payload := componentPayload{
 		tools: append([]ToolRegistration(nil), staged.tools...), prompts: append([]PromptRegistration(nil), staged.prompts...),
 		guards: append([]GuardRegistration(nil), staged.guards...), restrictions: append([]RestrictionRegistration(nil), staged.restrictions...),
+		toolSearch: append([]ToolSearchRegistration(nil), staged.toolSearch...),
 	}
 	extensionMount, err := r.extensions.CommitMount(prepared, payload, payloadScopes(payload), validateComponentPayload)
 	if err != nil {
@@ -232,6 +273,9 @@ func payloadScopes(payload componentPayload) []extension.Scope {
 		result = append(result, registration.Scope)
 	}
 	for _, registration := range payload.restrictions {
+		result = append(result, registration.Scope)
+	}
+	for _, registration := range payload.toolSearch {
 		result = append(result, registration.Scope)
 	}
 	return result
@@ -372,7 +416,17 @@ func (r *Registry) acquire(ctx context.Context, sessionID session.ID, instances 
 		return nil, err
 	}
 	selection := newPlanSelection(target, selectTool, snapshot.Values())
-	return runtime.NewRunPlan(runtime.RunPlanSpec{SessionID: sessionID, Dispatch: snapshot.Dispatch(), Components: selection.components()})
+	toolSearch, err := selection.toolSearchConfig()
+	if err != nil {
+		// snapshot.Dispatch() owns a notification worker that only stops via
+		// its Plan.Release (normally taken over by the RunPlan this builds);
+		// erroring out before ever calling runtime.NewRunPlan must release it
+		// itself or the worker (and anything waiting on it, e.g. a mounted
+		// component's Close) leaks/blocks forever.
+		snapshot.Dispatch().Release()
+		return nil, err
+	}
+	return runtime.NewRunPlan(runtime.RunPlanSpec{SessionID: sessionID, Dispatch: snapshot.Dispatch(), Components: selection.components(), ToolSearch: toolSearch})
 }
 
 type planToolSelector func(extension.Component, ToolRegistration) bool
@@ -423,10 +477,14 @@ func toolSchemaHash(definition tools.Definition) (string, error) {
 		AllowSessionTitle bool
 		Retention         runtime.RetentionPolicy
 		Metadata          map[string]string
+		Aliases           []string
+		ArgumentAliases   map[string][]string
+		Deferred          bool
 	}{
 		Name: definition.Name, Description: definition.Description, Parameters: parameters,
 		Permissions: definition.Permissions, RetrySafe: definition.RetrySafe, AllowSessionTitle: definition.AllowSessionTitle,
 		Retention: definition.Retention, Metadata: definition.Metadata,
+		Aliases: definition.Aliases, ArgumentAliases: definition.ArgumentAliases, Deferred: definition.Deferred,
 	})
 	if err != nil {
 		return "", err

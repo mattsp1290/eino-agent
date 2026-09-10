@@ -40,6 +40,13 @@ type PlanTool struct {
 	SchemaHash, ExecutorHash string
 	Order                    int
 	Resolve                  func(context.Context, ToolScopeContext) (Tool, error)
+	// Aliases are additional model-visible names that resolve to this tool.
+	Aliases []string
+	// ArgumentAliases maps a canonical parameter name to alternate argument
+	// names a model may use for it.
+	ArgumentAliases map[string][]string
+	// Deferred marks the tool as advertised only through tool search.
+	Deferred bool
 }
 
 // PlanPrompt binds one prompt implementation to its registration.
@@ -74,22 +81,44 @@ type PlanComponent struct {
 	Restrictions []PlanRestriction
 }
 
+// ToolSearchConfig configures the runtime-implemented tool-search tool for a
+// plan (see runtime/tool_search.go). At most one may be active across an
+// assembled plan; composition.Registry.acquire rejects more than one before
+// ever calling NewRunPlan.
+type ToolSearchConfig struct {
+	// Name is the model-visible tool name. Defaults to "tool_search" when
+	// empty (applied by composition.Registrar.ToolSearch).
+	Name string
+	// Description is the model-visible tool description.
+	Description string
+}
+
 // RunPlanSpec is unfingerprinted, component-owned behavior evidence.
 type RunPlanSpec struct {
 	SessionID  session.ID
 	Dispatch   *extension.Plan
 	Components []PlanComponent
+	// ToolSearch configures the runtime tool-search tool for this plan, or
+	// nil when tool search is not enabled. It is deliberately NOT part of
+	// the sealed durable ExtensionPlanDescriptor/fingerprint (unlike
+	// tools/prompts/guards/restrictions): the search tool's own name and
+	// description carry no execution authority by themselves (every
+	// discovered tool it can ever surface is still validated against the
+	// frozen tool registry at claim time), so it is treated as run-time
+	// configuration rather than durable capability identity.
+	ToolSearch *ToolSearchConfig
 }
 
 // RunPlan is the immutable executable state for one run.
 type RunPlan struct {
-	dispatch  *extension.Plan
-	sessionID session.ID
-	tools     sealedPlanTools
-	prompts   []MountedPrompt
-	guards    []MountedToolGuard
-	sealed    session.SealedExtensionPlan
-	once      sync.Once
+	dispatch   *extension.Plan
+	sessionID  session.ID
+	tools      sealedPlanTools
+	prompts    []MountedPrompt
+	guards     []MountedToolGuard
+	sealed     session.SealedExtensionPlan
+	toolSearch *ToolSearchConfig
+	once       sync.Once
 }
 
 // NewRunPlan derives durable identity from registered behavior and seals it.
@@ -110,11 +139,30 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if err != nil {
 		return fail(err)
 	}
-	plan.tools = sealedPlanTools{capabilities: compiled.tools, restrictions: compiled.restrictions}
+	toolSearch, err := normalizeToolSearchConfig(spec.ToolSearch)
+	if err != nil {
+		return fail(err)
+	}
+	plan.tools = sealedPlanTools{capabilities: compiled.tools, restrictions: compiled.restrictions, aliasIndex: compiled.aliasIndex}
 	plan.prompts = compiled.prompts
 	plan.guards = compiled.guards
 	plan.sealed = sealed
+	plan.toolSearch = toolSearch
 	return plan, nil
+}
+
+func normalizeToolSearchConfig(cfg *ToolSearchConfig) (*ToolSearchConfig, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	next := *cfg
+	if next.Name == "" {
+		next.Name = "tool_search"
+	}
+	if err := extension.ValidateIdentifier(next.Name); err != nil {
+		return nil, fmt.Errorf("%w: invalid tool search name %q", ErrExtensionPlanMismatch, next.Name)
+	}
+	return &next, nil
 }
 
 type ownedPlanTool struct {
@@ -141,6 +189,7 @@ type compiledRunPlan struct {
 	ownedRules   []ownedPlanRestriction
 	tools        []PlanTool
 	restrictions []PlanRestriction
+	aliasIndex   map[string]string
 }
 
 func compileRunPlan(spec RunPlanSpec) (compiledRunPlan, error) {
@@ -269,6 +318,11 @@ func (c *compiledRunPlan) finalize() error {
 	if err := uniqueCapabilityNames(c.ownedTools, c.prompts); err != nil {
 		return err
 	}
+	aliasIndex, err := buildToolAliasIndex(c.ownedTools)
+	if err != nil {
+		return err
+	}
+	c.aliasIndex = aliasIndex
 	c.tools = make([]PlanTool, len(c.ownedTools))
 	c.restrictions = make([]PlanRestriction, len(c.ownedRules))
 	for index := range c.ownedTools {
@@ -302,7 +356,35 @@ func toolPlanIdentity(capability PlanTool) session.ToolPlanIdentity {
 	return session.ToolPlanIdentity{
 		Name: capability.Name, RegistrationID: capability.RegistrationID, Scope: capability.Scope,
 		SchemaHash: capability.SchemaHash, ExecutorHash: capability.ExecutorHash, Order: capability.Order,
+		Aliases: append([]string(nil), capability.Aliases...), Deferred: capability.Deferred,
 	}
+}
+
+// buildToolAliasIndex rejects any alias that collides with another tool's
+// canonical name or with another tool's alias across the whole plan, and
+// returns the compile-time alias -> canonical name index used by
+// sealedPlanTools and RunPlan.ResolveToolName.
+func buildToolAliasIndex(tools []ownedPlanTool) (map[string]string, error) {
+	canonicalNames := make(map[string]bool, len(tools))
+	for _, owned := range tools {
+		canonicalNames[owned.value.Name] = true
+	}
+	index := make(map[string]string)
+	for _, owned := range tools {
+		for _, alias := range owned.value.Aliases {
+			if canonicalNames[alias] {
+				return nil, fmt.Errorf("%w: tool alias %q collides with a tool name", ErrExtensionPlanMismatch, alias)
+			}
+			if existing, dup := index[alias]; dup {
+				return nil, fmt.Errorf("%w: tool alias %q is registered by both %q and %q", ErrExtensionPlanMismatch, alias, existing, owned.value.Name)
+			}
+			index[alias] = owned.value.Name
+		}
+	}
+	if len(index) == 0 {
+		return nil, nil
+	}
+	return index, nil
 }
 
 func comparePlanTool(leftOwner string, left session.ToolPlanIdentity, rightOwner string, right session.ToolPlanIdentity) int {
@@ -419,6 +501,9 @@ func CanonicalizeRestrictionRules(allowed, denied []string) (RestrictionRules, e
 type sealedPlanTools struct {
 	capabilities []PlanTool
 	restrictions []PlanRestriction
+	// aliasIndex maps a compile-time-validated alias to its canonical tool
+	// name; it never grants access to a tool absent from capabilities.
+	aliasIndex map[string]string
 }
 
 func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContext) ([]Tool, error) {
@@ -479,6 +564,35 @@ func (p *RunPlan) ResolveTools(ctx context.Context, scope ToolScopeContext) ([]T
 		return nil, nil
 	}
 	return p.tools.ResolveTools(ctx, scope)
+}
+
+// ToolSearch returns the plan's normalized tool-search configuration, or nil
+// when tool search is not enabled for this plan.
+func (p *RunPlan) ToolSearch() *ToolSearchConfig {
+	if p == nil || p.toolSearch == nil {
+		return nil
+	}
+	cfg := *p.toolSearch
+	return &cfg
+}
+
+// ResolveToolName returns the canonical tool name for name, which may
+// already be a canonical name or a compile-time-registered alias. It never
+// consults a live registry and never resolves an alias to a tool absent from
+// the sealed plan.
+func (p *RunPlan) ResolveToolName(name string) (string, bool) {
+	if p == nil {
+		return "", false
+	}
+	if canonical, ok := p.tools.aliasIndex[name]; ok {
+		return canonical, true
+	}
+	for _, capability := range p.tools.capabilities {
+		if capability.Name == name {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // Prompts returns a defensive copy of the sealed prompt capability list.

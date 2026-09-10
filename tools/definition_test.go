@@ -143,6 +143,133 @@ func TestMaterializeClonesParameterSchemas(t *testing.T) {
 	}
 }
 
+func TestValidateDefinitionRejectsAliasCollidingWithName(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.Aliases = []string{"echo"}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+func TestValidateDefinitionRejectsDuplicateAlias(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.Aliases = []string{"repeat", "repeat"}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+func TestValidateDefinitionRejectsArgumentAliasEqualToCanonicalKey(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.ArgumentAliases = map[string][]string{"text": {"text"}}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+func TestValidateDefinitionRejectsArgumentAliasReusedAcrossCanonicalKeys(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.ArgumentAliases = map[string][]string{"text": {"body"}, "content": {"body"}}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+func TestValidateDefinitionAcceptsDistinctAliasesAndArgumentAliases(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.Aliases = []string{"repeat", "say"}
+	definition.ArgumentAliases = map[string][]string{"text": {"body", "content"}}
+	if err := ValidateDefinition(definition); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+}
+
+func TestMaterializeCopiesAliasesArgumentAliasesAndDeferred(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.Aliases = []string{"repeat"}
+	definition.ArgumentAliases = map[string][]string{"text": {"body"}}
+	definition.Deferred = true
+	tool, err := Materialize(context.Background(), definition, toolScope("session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tool.Aliases) != 1 || tool.Aliases[0] != "repeat" {
+		t.Fatalf("tool.Aliases = %#v", tool.Aliases)
+	}
+	if len(tool.ArgumentAliases) != 1 || len(tool.ArgumentAliases["text"]) != 1 || tool.ArgumentAliases["text"][0] != "body" {
+		t.Fatalf("tool.ArgumentAliases = %#v", tool.ArgumentAliases)
+	}
+	if !tool.Deferred {
+		t.Fatal("tool.Deferred = false, want true")
+	}
+	// Mutating the materialized containers must not affect the source
+	// definition or a second materialization (defensive copies).
+	tool.Aliases[0] = "mutated"
+	tool.ArgumentAliases["text"][0] = "mutated"
+	second, err := Materialize(context.Background(), definition, toolScope("session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Aliases[0] != "repeat" || second.ArgumentAliases["text"][0] != "body" {
+		t.Fatalf("materializations shared alias containers: %#v", second)
+	}
+}
+
+func TestMaterializePrefersExecuteRichOverExecute(t *testing.T) {
+	t.Parallel()
+	var executeCalled, executeRichCalled bool
+	definition := Definition{
+		Name: "rich", Description: "returns rich parts",
+		Execute: func(context.Context, Execution) (json.RawMessage, error) {
+			executeCalled = true
+			return json.RawMessage(`{}`), nil
+		},
+		ExecuteRich: func(context.Context, Execution) (RichResult, error) {
+			executeRichCalled = true
+			return RichResult{Parts: []runtime.ToolResultPart{
+				{Type: runtime.ToolResultPartText, Text: "hello"},
+				{Type: runtime.ToolResultPartImage, Media: &runtime.ToolResultMedia{URL: "https://example/x.png"}},
+			}}, nil
+		},
+	}
+	tool, err := Materialize(context.Background(), definition, toolScope("session"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := tool.Executor.Execute(context.Background(), runtime.ToolCall{ID: "call-1", Input: json.RawMessage(`{}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executeCalled || !executeRichCalled {
+		t.Fatalf("executeCalled=%v executeRichCalled=%v, want false/true", executeCalled, executeRichCalled)
+	}
+	if result.Output != "" || len(result.Structured) != 0 {
+		t.Fatalf("scalar Output/Structured set alongside Parts: %#v", result)
+	}
+	if len(result.Parts) != 2 || result.Parts[0].Text != "hello" || result.Parts[1].Media == nil || result.Parts[1].Media.URL != "https://example/x.png" {
+		t.Fatalf("result.Parts = %#v", result.Parts)
+	}
+}
+
+func TestValidateDefinitionAllowsExecuteRichWithoutExecute(t *testing.T) {
+	t.Parallel()
+	definition := Definition{
+		Name: "rich",
+		ExecuteRich: func(context.Context, Execution) (RichResult, error) {
+			return RichResult{}, nil
+		},
+	}
+	if err := ValidateDefinition(definition); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+}
+
 func testDefinition(name string) Definition {
 	type input struct {
 		Text string `json:"text"`

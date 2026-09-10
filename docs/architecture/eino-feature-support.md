@@ -217,6 +217,97 @@ round-trips classic `Extra` through a transient agentic `Extra` so the
 existing Extra-key codecs keep working, and `Request.Clone` rejects any
 `Extra` so that transient state can never re-enter a request.
 
-## W4 through W8
+## W4: structured tools, aliases, deferred search, composition
+
+Status: landed; W1 scaffolding kept green.
+
+- `tools.Definition` gains `Aliases []string`, `ArgumentAliases
+  map[string][]string` (canonical key -> aliases) and `Deferred bool`.
+  `ValidateDefinition` rejects an alias equal to the tool's own name or to
+  another alias, and an argument alias equal to its own canonical key or
+  reused across canonical keys. `Materialize` copies all three onto
+  `runtime.Tool`. `composition.composedToolSchemaHash` folds aliases,
+  argument aliases and the deferred flag into the tool's schema identity, and
+  `session.ToolPlanIdentity` gains `Aliases`/`Deferred` so a sealed plan's
+  fingerprint changes whenever they do.
+- `runtime.RunPlan` compiles a plan-wide alias index at `NewRunPlan` time and
+  rejects (`ErrExtensionPlanMismatch`) an alias that collides with any tool's
+  canonical name or with another tool's alias; `RunPlan.ResolveToolName`
+  exposes the compiled index. `runtime/adk_tools.go`'s `resolveToolCall`
+  re-derives the same collision-checked index per turn from
+  `TurnSnapshot.Tools` and resolves a model-requested name (canonical or
+  alias) before normalization, remapping argument aliases with the exact
+  semantics of upstream Eino's `compose.remapArgs` (an alias key is renamed
+  to its canonical key unless the canonical key is already present, in which
+  case the alias key is left as an unrecognized field). `session.ToolCall`
+  gains `RequestedName` (the model-facing name actually used, persisted in
+  the JSON tool-call record with no DDL change); both the durable
+  `function_tool_result` block and the same-turn model-visible message use
+  `RequestedName`, so a live turn and a later replay always show the model
+  the name it actually called. `store/internal/sqlstore.ValidToolRequestEnvelope`
+  compares the persisted request block's name against `RequestedName` (falling
+  back to `Name` for pre-alias records).
+- Enhanced results: `runtime.ToolResult.Parts []ToolResultPart`
+  (text/image/audio/video/file/tool_search) is authoritative over
+  `Output`/`Structured` when non-empty. `runtime.ToolOutput.Parts` bounds each
+  part independently against `RetentionPolicy`: an oversized or redacted part
+  becomes an omission record (`{Type, Omitted:true, OriginalSize}`) rather
+  than a truncated or corrupt payload. `toolOutputToResultContent` is the one
+  function that turns a settled `ToolOutput` into the durable/model-visible
+  `session.ResultContent` list, used by both `buildTerminalToolEnvelope` and
+  the same-turn outgoing message builder: a scalar result keeps the exact
+  historical single-text-part shape (the full `ToolOutput` JSON as text); an
+  enhanced result carries one content item per bounded part.
+  `store/internal/sqlstore.ValidToolResultEnvelope` accepts either shape (and
+  a `tool_search_result` envelope, below) since an enhanced result's bounded
+  content cannot be re-derived from raw bytes without importing `runtime`.
+- `tools.Definition.ExecuteRich` (preferred over `Execute` by `Materialize`
+  when both are set) and `tools/einotools.ExecuteEnhancedLeaf` adapt an
+  `EnhancedInvokableTool` leaf's `schema.ToolResult` into `RichResult`.
+  Eino v0.9.19's `tool.InvokableTool` and `tool.EnhancedInvokableTool` both
+  declare a differently-typed `InvokableRun` method, so no concrete leaf can
+  satisfy both; `catalog.Definition.New` is statically typed to return
+  `tool.InvokableTool`, so no standard `eino-tools` catalog leaf can ever be
+  enhanced through that path today — `ExecuteEnhancedLeaf` exists for a
+  directly-typed `tool.EnhancedInvokableTool` (host-authored, or a future
+  catalog variant). `tools.WrapEnhanced` adapts a `runtime.Tool` into an Eino
+  `tool.EnhancedInvokableTool` whose `InvokableRun` always goes through an
+  injected `tools.Dispatch` callback (the durable, claim-fenced
+  implementation is runtime-owned work for a later package); see
+  `examples/agentic-graph`.
+- Deferred tools and runtime-implemented tool search: `RunPlanSpec.ToolSearch
+  *ToolSearchConfig{Name, Description}` (name defaults to `tool_search`) comes
+  from `composition.Registrar.ToolSearch`; at most one may be active across an
+  assembled plan (rejected at `Registry.AcquireRunPlan`, before
+  `runtime.NewRunPlan`). It is deliberately not part of the sealed durable
+  `ExtensionPlanDescriptor`/fingerprint: the search tool's name/description
+  carry no execution authority, since every tool it can surface is still
+  validated against the frozen registry at claim time.
+  `TurnSnapshot.ProviderRequest` partitions `snapshot.Tools` into
+  `Controls.Tools` (non-deferred, plus any deferred tool already in the
+  per-execution `discovered` set) and `Controls.DeferredTools` (the rest),
+  and sets `Controls.ToolSearchTool`; the search tool itself is never listed
+  in either partition. The search tool is not a leaf executor: a call to it
+  is recognized by name in `prepareToolCalls`, matched case-insensitively by
+  substring against deferred tools' name/description (bounded to the first 8
+  matches, in `snapshot.Tools` order), and settled via
+  `buildTerminalToolSearchEnvelope` into a `tool_search_result` content block
+  (`session.BlockKindToolSearchResult`) carrying the exact frozen
+  `schema.ToolInfo` JSON of each matched tool — never a name outside the
+  frozen registry. A call to a deferred tool not yet in `discovered` is
+  rejected in `prepareToolCalls`, before any claim. `discoveredToolsFromHistory`
+  rebuilds the advertised set from durable `tool_search_result` blocks; the
+  classic `Resume` path (`runtime/interrupt.go`) seeds `execution.discovered`
+  from it before resuming outstanding tool calls.
+- `examples/agentic-graph` builds a real `compose.Graph` (also a `Chain` with
+  `AddBranch` and chain-parallel `AddAgenticToolsNode`) from
+  `AddAgenticChatTemplateNode`, `AddAgenticModelNode` and
+  `AddAgenticToolsNode` over `tools.WrapEnhanced` adapters with a
+  `compose.ToolAliasConfig`, and an audit wrapper around the model node using
+  `runtime.AuditAgenticRequest` (exported for this purpose). Its test asserts
+  exactly one audited request and one settled dispatch per tool invocation,
+  and that alias resolution succeeds through the real `AgenticToolsNode`.
+
+## W5 through W8
 
 Not started. Each package adds its rows here when it lands.

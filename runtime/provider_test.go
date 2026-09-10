@@ -38,7 +38,7 @@ func TestProviderRequestCarriesRuntimeIdentityAndTools(t *testing.T) {
 
 	traceAttributes := map[string]string{"request": "original"}
 	request, audited, _, err := auditModelRequest(
-		snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace", Attributes: traceAttributes}, []*einoschema.AgenticMessage{originalMessage}),
+		snapshot.ProviderRequest("assistant-1", agentcontext.TraceContext{TraceID: "trace", Attributes: traceAttributes}, []*einoschema.AgenticMessage{originalMessage}, nil),
 		[]string{"temperature"}, 0,
 	)
 	if err != nil {

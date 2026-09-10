@@ -100,6 +100,13 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 	if len(calls) == 0 {
 		return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
 	}
+	// Rebuild the per-execution tool-search advertised set from durable
+	// history before resuming any outstanding call, so a future turn that
+	// continues past this resume (not yet built past the tool-call
+	// boundary) sees every tool the model had already discovered.
+	if history, historyErr := o.store.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 1000}); historyErr == nil {
+		execution.seedDiscovered(discoveredToolsFromHistory(history, o.contentLimits))
+	}
 	snapshot := o.resumeSnapshot(run)
 	withCleanup := func(result Result) Result {
 		if cleanupErr := execution.terminalizeUnfinishedTools(context.WithoutCancel(ctx), snapshot, calls); cleanupErr != nil {

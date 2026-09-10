@@ -49,6 +49,17 @@ type AuditedModelInput struct {
 	SafeCallConfig map[string]string   `json:"safe_call_config"`
 }
 
+// AuditAgenticRequest returns the credential-free audit projection of a
+// model.Request exactly as StreamingOrchestrator persists it into the
+// request ledger (see auditModelRequest), plus its content hash. It is
+// exported for hosts that build their own request-auditing wrapper around an
+// Eino AgenticModel node (e.g. examples/agentic-graph) outside the
+// StreamingOrchestrator's own model-stream pipeline.
+func AuditAgenticRequest(request model.Request, safeOptionKeys []string, maxBytes int) (AuditedModelInput, string, error) {
+	_, audited, hash, err := auditModelRequest(request, safeOptionKeys, maxBytes)
+	return audited, hash, err
+}
+
 // auditModelRequest takes canonical ownership of a request and derives the
 // credential-free subset persisted by the request ledger. Every message in
 // request.Messages is the request's public projection by construction (no

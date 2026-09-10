@@ -126,23 +126,27 @@ func TestValidToolResultEnvelopeAllowsNonTextResultContent(t *testing.T) {
 		ResultPart: part,
 	}
 
-	matching := baseSettlement
-	matching.Output = json.RawMessage("sunny") // concatenation of the two text items ("sun" + "ny")
-	if !ValidToolResultEnvelope(call, matching) {
-		t.Fatal("ValidToolResultEnvelope rejected non-text content alongside a matching text-item concatenation")
+	// An enhanced (multi-part) result is bound to its call and validated
+	// structurally; its text items are the tool's own parts, not the
+	// ToolOutput JSON, so Output equality is not required.
+	enhanced := baseSettlement
+	enhanced.Output = json.RawMessage(`{"tool_call_id":"call-1","status":"completed","parts":[]}`)
+	if !ValidToolResultEnvelope(call, enhanced) {
+		t.Fatal("ValidToolResultEnvelope rejected an enhanced multi-part result")
 	}
 
-	mismatched := baseSettlement
-	mismatched.Output = json.RawMessage("sun") // does not equal the full text-item concatenation
-	if ValidToolResultEnvelope(call, mismatched) {
-		t.Fatal("ValidToolResultEnvelope accepted an Output that does not equal the text-item concatenation")
+	otherCall := call
+	otherCall.ID = "call-2"
+	if ValidToolResultEnvelope(otherCall, enhanced) {
+		t.Fatal("ValidToolResultEnvelope accepted a result bound to a different call")
 	}
 }
 
-// TestValidToolResultEnvelopeRejectsResultWithNoTextItem asserts a
-// function_tool_result with only non-text content items is rejected: the
-// identity rule requires at least one text item.
-func TestValidToolResultEnvelopeRejectsResultWithNoTextItem(t *testing.T) {
+// TestValidToolResultEnvelopeAllowsMediaOnlyResultContent asserts an
+// enhanced function_tool_result carrying only media items is accepted when
+// it is bound to its call: the scalar exact-text rule applies only to the
+// single-text-item shape.
+func TestValidToolResultEnvelopeAllowsMediaOnlyResultContent(t *testing.T) {
 	content := session.Content{
 		Role: session.RoleUser,
 		Blocks: []session.ContentBlock{{
@@ -168,7 +172,11 @@ func TestValidToolResultEnvelopeRejectsResultWithNoTextItem(t *testing.T) {
 		},
 		ResultPart: part,
 	}
+	if !ValidToolResultEnvelope(call, settlement) {
+		t.Fatal("ValidToolResultEnvelope rejected a media-only enhanced result")
+	}
+	settlement.ResultPart.MessageID = "other-message"
 	if ValidToolResultEnvelope(call, settlement) {
-		t.Fatal("ValidToolResultEnvelope accepted a result with no text item")
+		t.Fatal("ValidToolResultEnvelope accepted a result part owned by another message")
 	}
 }

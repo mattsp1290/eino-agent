@@ -216,12 +216,17 @@ func validateToolResult(result ToolResult) error {
 	if len(result.Structured) != 0 && !json.Valid(result.Structured) {
 		return errors.New("invalid structured tool result")
 	}
+	if len(result.Parts) != 0 && (result.Output != "" || len(result.Structured) != 0) {
+		return errors.New("enhanced tool result parts are authoritative and must not also carry Output/Structured")
+	}
 	return nil
 }
 
 func cloneToolChecked(tool Tool) (Tool, error) {
 	tool.Scope.Permissions = cloneSlice(tool.Scope.Permissions)
 	tool.Metadata = cloneStringMap(tool.Metadata)
+	tool.Aliases = cloneSlice(tool.Aliases)
+	tool.ArgumentAliases = cloneArgumentAliasesMap(tool.ArgumentAliases)
 	if tool.Info != nil {
 		params, paramsErr := cloneProtectedParamsOneOf(tool.Info.ParamsOneOf)
 		raw, err := json.Marshal(tool.Info)
@@ -301,7 +306,36 @@ func cloneRuntimeToolResult(result ToolResult) ToolResult {
 	result.Structured = cloneJSON(result.Structured)
 	result.Attachments = cloneAttachments(result.Attachments)
 	result.Metadata = cloneStringMap(result.Metadata)
+	result.Parts = cloneToolResultPartsChecked(result.Parts)
 	return result
+}
+
+func cloneToolResultPartsChecked(parts []ToolResultPart) []ToolResultPart {
+	if parts == nil {
+		return nil
+	}
+	cloned := make([]ToolResultPart, len(parts))
+	for index, part := range parts {
+		next := part
+		if part.Media != nil {
+			media := *part.Media
+			next.Media = &media
+		}
+		next.ToolSearch = cloneJSON(part.ToolSearch)
+		cloned[index] = next
+	}
+	return cloned
+}
+
+func cloneArgumentAliasesMap(src map[string][]string) map[string][]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string][]string, len(src))
+	for key, value := range src {
+		dst[key] = cloneSlice(value)
+	}
+	return dst
 }
 
 func cloneAttachments(attachments []Attachment) []Attachment {

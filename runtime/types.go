@@ -88,6 +88,10 @@ type TurnSnapshot struct {
 	Tools         []Tool
 	SystemPrompt  string
 	CreatedAt     time.Time
+	// ToolSearch configures the runtime-implemented tool-search tool for
+	// this turn's plan, or nil when not enabled (see runtime/tool_search.go
+	// and RunPlan.ToolSearch).
+	ToolSearch *ToolSearchConfig
 }
 
 // Tool describes one runtime-materialized tool available to a turn.
@@ -102,6 +106,14 @@ type Tool struct {
 	Pattern           PermissionPatternResolver
 	Retention         RetentionPolicy
 	Metadata          map[string]string
+	// Aliases are additional model-visible names that resolve to this tool.
+	Aliases []string
+	// ArgumentAliases maps a canonical parameter name to alternate argument
+	// names a model may use for it.
+	ArgumentAliases map[string][]string
+	// Deferred marks the tool as advertised only through tool search rather
+	// than eagerly bound to every provider request.
+	Deferred bool
 }
 
 // ToolScopeContext is the data-only input used while selecting and scoping
@@ -148,12 +160,15 @@ type ToolCall struct {
 	ResultMessageID session.MessageID
 	ResultPartID    session.PartID
 	Name            string
-	Scope           ToolScope
-	Pattern         string
-	Input           json.RawMessage
-	Approval        ApprovalRequester
-	SessionTitle    SessionTitleWriter `json:"-"`
-	Context         ToolContext
+	// RequestedName is the model-facing tool name as the model actually
+	// called it (equal to Name unless the model used a registered alias).
+	RequestedName string
+	Scope         ToolScope
+	Pattern       string
+	Input         json.RawMessage
+	Approval      ApprovalRequester
+	SessionTitle  SessionTitleWriter `json:"-"`
+	Context       ToolContext
 }
 
 // ToolScope describes the authority scope for a tool.
@@ -193,6 +208,40 @@ type ToolResult struct {
 	Structured  json.RawMessage
 	Attachments []Attachment
 	Metadata    map[string]string
+	// Parts, when non-empty, is the authoritative enhanced-tool result and
+	// Output/Structured must be empty. It mirrors schema.ToolResult.Parts.
+	Parts []ToolResultPart
+}
+
+// ToolResultPartType identifies which field of a ToolResultPart is populated.
+type ToolResultPartType string
+
+const (
+	ToolResultPartText       ToolResultPartType = "text"
+	ToolResultPartImage      ToolResultPartType = "image"
+	ToolResultPartAudio      ToolResultPartType = "audio"
+	ToolResultPartVideo      ToolResultPartType = "video"
+	ToolResultPartFile       ToolResultPartType = "file"
+	ToolResultPartToolSearch ToolResultPartType = "tool_search"
+)
+
+// ToolResultMedia is one non-text payload inside a ToolResultPart. Exactly
+// one of URL or Base64Data should be set.
+type ToolResultMedia struct {
+	URL        string
+	Base64Data string
+	MIMEType   string
+	Name       string
+}
+
+// ToolResultPart is one ordered unit of an enhanced tool result.
+type ToolResultPart struct {
+	Type  ToolResultPartType
+	Text  string
+	Media *ToolResultMedia
+	// ToolSearch carries the raw schema.ToolSearchResult JSON for a
+	// tool_search part.
+	ToolSearch json.RawMessage
 }
 
 // Attachment is a durable reference to non-text tool output.

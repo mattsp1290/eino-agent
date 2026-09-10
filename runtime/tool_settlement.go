@@ -32,6 +32,33 @@ type ToolOutput struct {
 	InlineSize   int64           `json:"inline_size,omitempty"`
 	External     bool            `json:"external,omitempty"`
 	Redacted     bool            `json:"redacted,omitempty"`
+	// Parts, when non-empty, is the bounded enhanced-tool result. It is
+	// authoritative over Content/Structured (which stay empty) and is bounded
+	// by RetentionPolicy the same way, part by part: an oversized or redacted
+	// part becomes an omission record ({Type, Omitted:true, OriginalSize})
+	// rather than a truncated/corrupt payload.
+	Parts []ToolOutputPart `json:"parts,omitempty"`
+}
+
+// ToolOutputMedia is the bounded, durable projection of a ToolResultMedia.
+type ToolOutputMedia struct {
+	URL        string `json:"url,omitempty"`
+	Base64Data string `json:"base64_data,omitempty"`
+	MIMEType   string `json:"mime_type,omitempty"`
+	Name       string `json:"name,omitempty"`
+}
+
+// ToolOutputPart is one bounded, durable unit of an enhanced tool result.
+type ToolOutputPart struct {
+	Type       string           `json:"type"`
+	Text       string           `json:"text,omitempty"`
+	Media      *ToolOutputMedia `json:"media,omitempty"`
+	ToolSearch json.RawMessage  `json:"tool_search,omitempty"`
+	// Omitted marks a part whose payload was dropped by RetentionPolicy
+	// (oversized or redacted) instead of being persisted, corrupted or
+	// silently truncated mid-encoding. OriginalSize records its true size.
+	Omitted      bool  `json:"omitted,omitempty"`
+	OriginalSize int64 `json:"original_size,omitempty"`
 }
 
 // ToolSettlementInput contains every authoritative value required to build a
@@ -69,6 +96,7 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 		Claimed:       input.Claimed,
 		Status:        status,
 		Output:        raw,
+		OutputRecord:  output,
 		Error:         errText,
 		Metadata:      metadata,
 		ModelID:       input.ModelID,
@@ -81,14 +109,18 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 }
 
 type terminalToolEnvelopeInput struct {
-	Claimed     session.ToolCall
-	Status      session.ToolCallStatus
-	Output      json.RawMessage
-	Error       string
-	Metadata    map[string]string
-	ModelID     string
-	CompletedAt time.Time
-	MessageAt   time.Time
+	Claimed session.ToolCall
+	Status  session.ToolCallStatus
+	Output  json.RawMessage
+	// OutputRecord is the decoded ToolOutput raw marshals; it drives the
+	// model-visible content built via toolOutputToResultContent. Zero value
+	// (no Parts) reproduces the classic single-text-part shape.
+	OutputRecord ToolOutput
+	Error        string
+	Metadata     map[string]string
+	ModelID      string
+	CompletedAt  time.Time
+	MessageAt    time.Time
 	// BlockID is the durable content-block identity minted for the single
 	// function_tool_result block this settlement persists. Required.
 	BlockID string
@@ -103,9 +135,12 @@ type terminalToolEnvelopeInput struct {
 // session/history/agentic_projection.go's projector maps that role/kind
 // pairing straight back to a user-role agentic message carrying one
 // function_tool_result block, matching the model-visible shape a tool
-// result had before this durable representation existed. The block's single
-// text content is exactly string(input.Output) (the ToolOutput JSON), so the
-// model-visible payload is unchanged.
+// result had before this durable representation existed. The block's content
+// is built by toolOutputToResultContent: for a scalar (non-Parts) result it
+// is a single text content item that is exactly string(input.Output) (the
+// ToolOutput JSON), so the model-visible payload is unchanged from before
+// enhanced results existed; for an enhanced (Parts) result it is one content
+// item per bounded part.
 func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSettlement, error) {
 	call := input.Claimed
 	if call.ID == "" || call.ClaimedBy == "" || call.ClaimToken == "" || call.ResultMessageID == "" || call.ResultPartID == "" {
@@ -120,6 +155,17 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 	if input.BlockID == "" {
 		return session.ToolSettlement{}, errors.New("tool settlement requires a content block id")
 	}
+	// The persisted block's Name must be the model-facing name (RequestedName)
+	// so a live turn and a later replay always show the model the exact name
+	// it used to call the tool, whether or not that name was an alias (see
+	// resolveToolCall/session.ToolCall.RequestedName). RequestedName is
+	// empty only for settlements built before call aliasing existed or
+	// constructed without it, in which case Name (already canonical) is the
+	// correct fallback.
+	resultName := call.RequestedName
+	if resultName == "" {
+		resultName = call.Name
+	}
 	content := session.Content{
 		Role: session.RoleUser,
 		Blocks: []session.ContentBlock{{
@@ -127,8 +173,8 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 			Kind: session.BlockKindFunctionToolResult,
 			FunctionResult: &session.FunctionResultBlock{
 				CallID:  string(call.ID),
-				Name:    call.Name,
-				Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(input.Output)}},
+				Name:    resultName,
+				Content: toolOutputToResultContent(input.Output, input.OutputRecord),
 			},
 		}},
 	}
@@ -214,16 +260,23 @@ func encodeToolOutput(callID session.ToolCallID, result ToolResult, policy Reten
 	output := ToolOutput{ToolCallID: string(callID), Status: "completed"}
 	status := session.ToolCallCompleted
 	errText := ""
+	applyBounds := func() {
+		if len(result.Parts) != 0 {
+			applyToolOutputPartsBounds(&output, result, policy)
+		} else {
+			applyToolOutputBounds(&output, result, policy)
+		}
+	}
 	switch disposition {
 	case ToolDenied, ToolApprovalRequired:
 		output.Status = "expected_failure"
 		status = session.ToolCallFailed
-		applyToolOutputBounds(&output, result, policy)
+		applyBounds()
 	case ToolInterrupted:
 		output.Status = "interrupted"
 		status = session.ToolCallInterrupted
 		if err == nil {
-			applyToolOutputBounds(&output, result, policy)
+			applyBounds()
 		} else {
 			output.Content = "tool execution failed"
 			errText = err.Error()
@@ -242,7 +295,7 @@ func encodeToolOutput(callID session.ToolCallID, result ToolResult, policy Reten
 			output.Content = "tool execution failed"
 			errText = err.Error()
 		} else {
-			applyToolOutputBounds(&output, result, policy)
+			applyBounds()
 		}
 	default:
 		output.Status = "operational_failure"
@@ -286,6 +339,122 @@ func applyToolOutputBounds(output *ToolOutput, result ToolResult, policy Retenti
 	}
 	output.Structured = cloneJSON(result.Structured)
 	output.InlineSize += int64(len(result.Structured))
+}
+
+// applyToolOutputPartsBounds bounds an enhanced tool result part by part.
+// Redacted or oversized parts become omission records ({Type, Omitted:true,
+// OriginalSize}) instead of truncated or corrupt payloads: unlike text
+// output, a part-level payload (base64 media, a tool-search JSON blob) has no
+// safe byte-prefix truncation, so it is either kept whole or omitted whole.
+func applyToolOutputPartsBounds(output *ToolOutput, result ToolResult, policy RetentionPolicy) {
+	unbounded := policy.MaxInlineBytes < 0
+	remaining := policy.MaxInlineBytes
+	parts := make([]ToolOutputPart, 0, len(result.Parts))
+	var originalTotal, inlineTotal int64
+	for _, part := range result.Parts {
+		size := int64(toolResultPartByteSize(part))
+		originalTotal += size
+		switch {
+		case policy.Redact:
+			parts = append(parts, ToolOutputPart{Type: string(part.Type), Omitted: true, OriginalSize: size})
+		case !unbounded && size > remaining:
+			parts = append(parts, ToolOutputPart{Type: string(part.Type), Omitted: true, OriginalSize: size})
+			output.Truncated = true
+			output.External = policy.StoreExternal
+		default:
+			parts = append(parts, toolResultPartToOutputPart(part, size))
+			inlineTotal += size
+			if !unbounded {
+				remaining -= size
+			}
+		}
+	}
+	output.Parts = parts
+	output.OriginalSize = originalTotal
+	output.InlineSize = inlineTotal
+	if policy.Redact {
+		output.Redacted = true
+		output.External = policy.StoreExternal && originalTotal > 0
+	}
+}
+
+func toolResultPartByteSize(part ToolResultPart) int {
+	size := len(part.Text)
+	if part.Media != nil {
+		size += len(part.Media.Base64Data) + len(part.Media.URL) + len(part.Media.MIMEType) + len(part.Media.Name)
+	}
+	size += len(part.ToolSearch)
+	return size
+}
+
+func toolResultPartToOutputPart(part ToolResultPart, size int64) ToolOutputPart {
+	out := ToolOutputPart{Type: string(part.Type), Text: part.Text, OriginalSize: size}
+	if part.Media != nil {
+		out.Media = &ToolOutputMedia{URL: part.Media.URL, Base64Data: part.Media.Base64Data, MIMEType: part.Media.MIMEType, Name: part.Media.Name}
+	}
+	if len(part.ToolSearch) != 0 {
+		out.ToolSearch = cloneJSON(part.ToolSearch)
+	}
+	return out
+}
+
+// toolOutputToResultContent is the single function settlement uses to build
+// the model-visible session.ResultContent list for a persisted
+// function_tool_result block from a ToolOutput. Replayed history projects
+// that persisted block straight back (session.ContentToAgenticMessage), so
+// this is the one place the durable record and the model-visible shape are
+// derived together.
+//
+// When output.Parts is empty (the ordinary scalar-tool case) the result is
+// exactly today's shape: one text content item whose text is the complete
+// marshaled ToolOutput JSON (rawOutput), unchanged. When output.Parts is
+// non-empty it is authoritative: each part becomes its own content item and
+// rawOutput/output.Content/output.Structured are not surfaced.
+func toolOutputToResultContent(rawOutput json.RawMessage, output ToolOutput) []session.ResultContent {
+	if len(output.Parts) == 0 {
+		return []session.ResultContent{{Type: session.ResultContentText, Text: string(rawOutput)}}
+	}
+	content := make([]session.ResultContent, 0, len(output.Parts))
+	for _, part := range output.Parts {
+		content = append(content, toolOutputPartToResultContent(part))
+	}
+	return content
+}
+
+func toolOutputPartToResultContent(part ToolOutputPart) session.ResultContent {
+	if part.Omitted {
+		raw, _ := json.Marshal(struct {
+			Type         string `json:"type"`
+			Omitted      bool   `json:"omitted"`
+			OriginalSize int64  `json:"original_size"`
+		}{Type: part.Type, Omitted: true, OriginalSize: part.OriginalSize})
+		return session.ResultContent{Type: session.ResultContentText, Text: string(raw)}
+	}
+	switch ToolResultPartType(part.Type) {
+	case ToolResultPartImage:
+		return session.ResultContent{Type: session.ResultContentImage, Media: toolOutputMediaToBlock(part.Media)}
+	case ToolResultPartAudio:
+		return session.ResultContent{Type: session.ResultContentAudio, Media: toolOutputMediaToBlock(part.Media)}
+	case ToolResultPartVideo:
+		return session.ResultContent{Type: session.ResultContentVideo, Media: toolOutputMediaToBlock(part.Media)}
+	case ToolResultPartFile:
+		return session.ResultContent{Type: session.ResultContentFile, Media: toolOutputMediaToBlock(part.Media)}
+	case ToolResultPartToolSearch:
+		// session.ResultContentType has no tool_search variant (Eino's
+		// FunctionToolResultContentBlockType defines no such wire shape
+		// either): degrade to a text content item carrying the raw
+		// schema.ToolSearchResult JSON rather than failing closed.
+		return session.ResultContent{Type: session.ResultContentText, Text: string(part.ToolSearch)}
+	default:
+		return session.ResultContent{Type: session.ResultContentText, Text: part.Text}
+	}
+}
+
+func toolOutputMediaToBlock(media *ToolOutputMedia) *session.MediaBlock {
+	if media == nil {
+		return &session.MediaBlock{}
+	}
+	return &session.MediaBlock{URL: media.URL, Base64Data: media.Base64Data, MIMEType: media.MIMEType, Name: media.Name}
 }
 
 func validUTF8Prefix(content string, limit int) string {

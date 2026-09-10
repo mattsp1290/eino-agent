@@ -11,18 +11,41 @@ import (
 // ProviderRequest assembles the transport-neutral request for one turn. The
 // caller validates and takes canonical ownership of the complete graph before
 // dispatch.
-func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, messages []*einoschema.AgenticMessage) model.Request {
-	tools := make([]*einoschema.ToolInfo, 0, len(s.Tools))
-	for _, tool := range s.Tools {
-		if tool.Info != nil {
-			tools = append(tools, tool.Info)
+//
+// discovered is the per-execution advertised set of deferred tool names the
+// model has already discovered via the tool-search tool (see
+// runtime/tool_search.go); it may be nil. A tool is eager (listed in
+// Controls.Tools) when it is not Deferred, or once its name appears in
+// discovered; otherwise it is deferred (listed in Controls.DeferredTools).
+// The tool-search tool itself, if configured (s.ToolSearch), is never listed
+// in either list and instead becomes Controls.ToolSearchTool.
+func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, messages []*einoschema.AgenticMessage, discovered map[string]bool) model.Request {
+	var eager, deferred []*einoschema.ToolInfo
+	for _, t := range s.Tools {
+		if t.Info == nil {
+			continue
 		}
+		if s.ToolSearch != nil && t.Name == s.ToolSearch.Name {
+			continue
+		}
+		if t.Deferred && !discovered[t.Name] {
+			deferred = append(deferred, t.Info)
+			continue
+		}
+		eager = append(eager, t.Info)
+	}
+	controls := model.RequestControls{Tools: eager}
+	if len(deferred) != 0 {
+		controls.DeferredTools = deferred
+	}
+	if s.ToolSearch != nil {
+		controls.ToolSearchTool = &einoschema.ToolInfo{Name: s.ToolSearch.Name, Desc: s.ToolSearch.Description}
 	}
 	return model.Request{
 		Identity:      modelIdentity(s.ContextIdentity(messageID, "", trace)),
 		Messages:      messages,
 		ProviderState: s.providerState,
-		Controls:      model.RequestControls{Tools: tools},
+		Controls:      controls,
 		Options:       s.Config.Agent.Options,
 	}
 }

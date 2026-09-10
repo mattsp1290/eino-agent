@@ -30,6 +30,11 @@ type ToolPlanIdentity struct {
 	Scope                    extension.Scope
 	SchemaHash, ExecutorHash string
 	Order                    int
+	// Aliases and Deferred are part of this identity so the sealed plan
+	// fingerprint changes whenever a tool's aliases or deferred status
+	// change, even if nothing else about it did.
+	Aliases  []string
+	Deferred bool
 }
 
 type PromptPlanIdentity struct {
@@ -98,6 +103,9 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 	for index, component := range d.Components {
 		component.Handlers = append([]RegistrationIdentity(nil), component.Handlers...)
 		component.Tools = append([]ToolPlanIdentity(nil), component.Tools...)
+		for i := range component.Tools {
+			component.Tools[i].Aliases = append([]string(nil), component.Tools[i].Aliases...)
+		}
 		component.Prompts = append([]PromptPlanIdentity(nil), component.Prompts...)
 		component.Guards = append([]GuardPlanIdentity(nil), component.Guards...)
 		component.Restrictions = append([]RestrictionPlanIdentity(nil), component.Restrictions...)
@@ -321,6 +329,12 @@ func canonicalExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) (E
 		sort.Slice(component.Handlers, func(i, j int) bool {
 			return compareRegistrationIdentity(component.Handlers[i], component.Handlers[j]) < 0
 		})
+		for i := range component.Tools {
+			sort.Strings(component.Tools[i].Aliases)
+			if len(component.Tools[i].Aliases) == 0 {
+				component.Tools[i].Aliases = nil
+			}
+		}
 		sort.Slice(component.Tools, func(i, j int) bool { return compareToolPlanIdentity(component.Tools[i], component.Tools[j]) < 0 })
 		sort.Slice(component.Prompts, func(i, j int) bool { return comparePromptPlanIdentity(component.Prompts[i], component.Prompts[j]) < 0 })
 		sort.Slice(component.Guards, func(i, j int) bool { return compareGuardPlanIdentity(component.Guards[i], component.Guards[j]) < 0 })

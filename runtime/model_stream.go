@@ -69,7 +69,7 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 		o.sessionObserver.FinishAttempt(state.live)
 		state.finalize(ctx, o, &result)
 	}()
-	request := snapshot.ProviderRequest(messageID, o.trace, messages)
+	request := snapshot.ProviderRequest(messageID, o.trace, messages, execution.discoveredSnapshot())
 	state.providerID, state.modelID = string(request.Identity.ProviderID), string(request.Identity.ModelID)
 	request.System, result.err = o.renderSystemPrompt(ctx, execution.plan, snapshot, attempt, step)
 	if result.err != nil {

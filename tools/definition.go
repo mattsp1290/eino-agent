@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -13,6 +14,11 @@ import (
 	"github.com/mattsp1290/eino-agent/internal/jsonobject"
 	"github.com/mattsp1290/eino-agent/runtime"
 )
+
+// toolIdentifierPattern mirrors extension.ValidateIdentifier's stable
+// identifier shape so tool and argument aliases are validated the same way
+// as every other durable registration identity in this codebase.
+var toolIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$`)
 
 var (
 	// ErrInvalidDefinition reports an incomplete or inconsistent tool definition.
@@ -33,23 +39,53 @@ type PermissionPattern func(ctx context.Context, input json.RawMessage) (string,
 // Executor executes one JSON-native tool invocation.
 type Executor func(ctx context.Context, execution Execution) (json.RawMessage, error)
 
+// RichExecutor executes one call and returns a multi-part enhanced result
+// (text, media, and/or tool-search parts) instead of a single JSON payload.
+// When a Definition sets both Execute and ExecuteRich, Materialize prefers
+// ExecuteRich.
+type RichExecutor func(ctx context.Context, execution Execution) (RichResult, error)
+
+// RichResult is the enhanced-tool result returned by a Definition's
+// ExecuteRich. Parts mirrors schema.ToolResult.Parts converted to the
+// runtime's durable representation.
+type RichResult struct {
+	Parts []runtime.ToolResultPart
+}
+
 // ScopeResolver returns runtime authority from bounded, data-only scope input.
 type ScopeResolver func(context.Context, runtime.ToolScopeContext) runtime.ToolScope
 
 // Definition is a JSON-native tool declaration registered by host code or adapters.
 type Definition struct {
-	Name              string
-	Description       string
-	Parameters        *einoschema.ParamsOneOf
-	Normalize         InputNormalizer
-	Pattern           PermissionPattern
-	Execute           Executor
+	Name        string
+	Description string
+	Parameters  *einoschema.ParamsOneOf
+	Normalize   InputNormalizer
+	Pattern     PermissionPattern
+	Execute     Executor
+	// ExecuteRich, if set, is preferred over Execute by Materialize and
+	// produces a multi-part enhanced result (see RichResult).
+	ExecuteRich       RichExecutor
 	RetrySafe         bool
 	AllowSessionTitle bool
 	Scope             ScopeResolver
 	Retention         runtime.RetentionPolicy
 	Permissions       []string
 	Metadata          map[string]string
+	// Aliases are additional model-visible names that resolve to this tool.
+	// An alias must not equal Name or any other tool's name or alias within
+	// the same run plan (rejected at plan compile time).
+	Aliases []string
+	// ArgumentAliases maps a canonical parameter name to the alternate
+	// argument names a model may use for it. When a call supplies both the
+	// canonical key and an alias key, the alias key is left untouched (an
+	// unrecognized field, subject to normal schema validation) exactly like
+	// Eino's compose.ToolAliasConfig.ArgumentsAliases.
+	ArgumentAliases map[string][]string
+	// Deferred marks the tool as advertised only through tool search
+	// (model.RequestControls.DeferredTools) rather than eagerly bound to
+	// every request.
+	Deferred bool
 }
 
 // Execution is canonical JSON input and durable runtime context for one call.
@@ -134,7 +170,20 @@ func (d Definition) Clone() (Definition, error) {
 	next.Parameters = parameters
 	next.Permissions = cloneSlice(d.Permissions)
 	next.Metadata = cloneStringMap(d.Metadata)
+	next.Aliases = cloneSlice(d.Aliases)
+	next.ArgumentAliases = cloneArgumentAliases(d.ArgumentAliases)
 	return next, nil
+}
+
+func cloneArgumentAliases(src map[string][]string) map[string][]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string][]string, len(src))
+	for key, value := range src {
+		dst[key] = cloneSlice(value)
+	}
+	return dst
 }
 
 // ValidateDefinition reports whether definition can be safely composed and
@@ -143,11 +192,60 @@ func ValidateDefinition(definition Definition) error {
 	if strings.TrimSpace(definition.Name) == "" {
 		return fmt.Errorf("%w: name required", ErrInvalidDefinition)
 	}
-	if definition.Execute == nil {
+	if definition.Execute == nil && definition.ExecuteRich == nil {
 		return fmt.Errorf("%w: executor required for %s", ErrInvalidDefinition, definition.Name)
 	}
 	if err := validateParameters(definition.Parameters); err != nil {
 		return fmt.Errorf("%w: parameters for %s: %v", ErrInvalidDefinition, definition.Name, err)
+	}
+	if err := validateAliases(definition.Name, definition.Aliases, definition.ArgumentAliases); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidDefinition, err)
+	}
+	return nil
+}
+
+// validateAliases enforces that tool name aliases and argument aliases are
+// valid identifiers, distinct from the canonical name/key they alias, and
+// distinct from each other.
+func validateAliases(name string, aliases []string, argumentAliases map[string][]string) error {
+	seen := make(map[string]bool, len(aliases))
+	for _, alias := range aliases {
+		if !toolIdentifierPattern.MatchString(alias) {
+			return fmt.Errorf("invalid tool alias %q", alias)
+		}
+		if alias == name {
+			return fmt.Errorf("tool alias %q collides with tool name", alias)
+		}
+		if seen[alias] {
+			return fmt.Errorf("duplicate tool alias %q", alias)
+		}
+		seen[alias] = true
+	}
+	seenArgumentAlias := make(map[string]bool, len(argumentAliases))
+	for canonical, aliasesForKey := range argumentAliases {
+		if strings.TrimSpace(canonical) == "" {
+			return errors.New("argument alias canonical key required")
+		}
+		if len(aliasesForKey) == 0 {
+			return fmt.Errorf("argument alias list for %q is empty", canonical)
+		}
+		localSeen := make(map[string]bool, len(aliasesForKey))
+		for _, alias := range aliasesForKey {
+			if strings.TrimSpace(alias) == "" {
+				return fmt.Errorf("empty argument alias for %q", canonical)
+			}
+			if alias == canonical {
+				return fmt.Errorf("argument alias %q equals its canonical key %q", alias, canonical)
+			}
+			if localSeen[alias] {
+				return fmt.Errorf("duplicate argument alias %q for %q", alias, canonical)
+			}
+			localSeen[alias] = true
+			if seenArgumentAlias[alias] {
+				return fmt.Errorf("argument alias %q reused across canonical keys", alias)
+			}
+			seenArgumentAlias[alias] = true
+		}
 	}
 	return nil
 }
@@ -218,6 +316,9 @@ func materialize(ctx context.Context, definition Definition, context runtime.Too
 		Pattern:           &toolPatternResolver{definition: decoderDefinition},
 		Retention:         definition.Retention,
 		Metadata:          cloneStringMap(definition.Metadata),
+		Aliases:           cloneSlice(definition.Aliases),
+		ArgumentAliases:   cloneArgumentAliases(definition.ArgumentAliases),
+		Deferred:          definition.Deferred,
 	}, nil
 }
 
@@ -266,11 +367,22 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 	if executionContext.WorkspaceRoot == "" {
 		executionContext.WorkspaceRoot = e.scope.WorkspaceRoot
 	}
-	output, err := e.definition.Execute(ctx, Execution{
+	execution := Execution{
 		Input:   cloneRaw(call.Input),
 		Call:    call,
 		Context: executionContext,
-	})
+	}
+	if e.definition.ExecuteRich != nil {
+		rich, err := e.definition.ExecuteRich(ctx, execution)
+		if err != nil {
+			return runtime.ToolResult{}, err
+		}
+		return runtime.ToolResult{
+			Parts:    cloneToolResultParts(rich.Parts),
+			Metadata: cloneStringMap(e.definition.Metadata),
+		}, nil
+	}
+	output, err := e.definition.Execute(ctx, execution)
 	if err != nil {
 		return runtime.ToolResult{}, err
 	}
@@ -282,6 +394,24 @@ func (e toolExecutor) Execute(ctx context.Context, call runtime.ToolCall) (runti
 		Structured: cloneRaw(output),
 		Metadata:   cloneStringMap(e.definition.Metadata),
 	}, nil
+}
+
+// cloneToolResultParts returns a defensive deep copy of parts.
+func cloneToolResultParts(parts []runtime.ToolResultPart) []runtime.ToolResultPart {
+	if parts == nil {
+		return nil
+	}
+	cloned := make([]runtime.ToolResultPart, len(parts))
+	for index, part := range parts {
+		next := part
+		if part.Media != nil {
+			media := *part.Media
+			next.Media = &media
+		}
+		next.ToolSearch = cloneRaw(part.ToolSearch)
+		cloned[index] = next
+	}
+	return cloned
 }
 
 func normalizeInput(ctx context.Context, definition Definition, raw json.RawMessage) (json.RawMessage, error) {

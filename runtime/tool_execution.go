@@ -17,6 +17,11 @@ var errToolExecutionPanic = errors.New("tool execution panicked")
 type settledTool struct {
 	Outcome    toolOutcome
 	Settlement session.ToolSettlement
+	// Output is the decoded ToolOutput record backing Settlement.ResultPart,
+	// including any bounded Parts. executePreparedTools uses it (via
+	// toolOutputToResultContent) to build the same-turn model-visible
+	// function_tool_result message so it mirrors exactly what was persisted.
+	Output ToolOutput
 }
 
 func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run session.Run, tool Tool, claimed session.ToolCall) (session.ToolSettlement, error) {
@@ -76,16 +81,15 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	raw := cloneJSON(claimed.Output)
 	metadata := cloneStringMap(claimed.Metadata)
 	result := ToolResult{}
+	var output ToolOutput
 	// SQL stores decode an unsettled call's absent output as JSON null rather
 	// than an empty payload; both mean no output was recorded.
 	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
-		var output ToolOutput
 		raw, output, _, _ = encodeToolOutput(claimed.ID, ToolResult{Output: "tool execution interrupted"}, tool.Retention, ToolInterrupted, nil)
 		metadata = toolSettlementMetadata(metadata, output)
 		result.Output = output.Content
 		result.Structured = cloneJSON(output.Structured)
 	} else {
-		var output ToolOutput
 		if err := json.Unmarshal(raw, &output); err != nil {
 			return session.ToolSettlement{}, fmt.Errorf("stored output for tool call %s is malformed: %w", claimed.ID, err)
 		}
@@ -93,7 +97,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 		result.Structured = cloneJSON(output.Structured)
 	}
 	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
-		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, Error: errText,
+		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, OutputRecord: output, Error: errText,
 		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,
 		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits,
 	})
@@ -127,7 +131,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	if err != nil {
 		return failSettlement(err)
 	}
-	settlement, _, err := buildToolSettlement(ToolSettlementInput{
+	settlement, output, err := buildToolSettlement(ToolSettlementInput{
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
 		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits,
@@ -145,7 +149,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	})
 	e.host.finishObservedToolCall(observedTool, settlement.Status, outcome.RawError, outcome.Result.Metadata)
 	e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, settlement.Status, completedAt.Sub(claimed.StartedAt), outcome.RawError, outcome.Result.Metadata)
-	return settledTool{Outcome: outcome, Settlement: settlement}, nil
+	return settledTool{Outcome: outcome, Settlement: settlement, Output: output}, nil
 }
 
 func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error) (outcome toolOutcome) {

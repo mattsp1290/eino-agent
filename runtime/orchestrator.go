@@ -302,6 +302,9 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
+	if execution.plan != nil {
+		snapshot.ToolSearch = execution.plan.ToolSearch()
+	}
 	o.observeToolsResolved(ctx, snapshot, snapshot.Tools)
 	return snapshot, nil
 }
