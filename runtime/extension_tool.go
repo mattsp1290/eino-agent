@@ -185,10 +185,11 @@ func sameProtectedToolInfo(left, right *einoschema.ToolInfo) bool {
 }
 
 func sameProtectedToolCall(left, right ToolCall) bool {
-	if left.Approval != nil || right.Approval != nil {
+	if left.Approval != nil || right.Approval != nil || left.SessionTitle != nil || right.SessionTitle != nil {
 		return false
 	}
 	left.Approval, right.Approval = nil, nil
+	left.SessionTitle, right.SessionTitle = nil, nil
 	return reflect.DeepEqual(cloneToolCall(left), cloneToolCall(right))
 }
 
@@ -244,6 +245,7 @@ func extensionTool(tool Tool) Tool {
 func extensionToolCall(call ToolCall) ToolCall {
 	call = cloneToolCall(call)
 	call.Approval = nil
+	call.SessionTitle = nil
 	return call
 }
 

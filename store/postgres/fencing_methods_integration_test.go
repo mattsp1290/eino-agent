@@ -31,6 +31,13 @@ func testStaleMethods(t *testing.T, server *testpostgres.Server) {
 				return err
 			}
 		}},
+		{"SetSessionTitle", func(_ *testing.T, _ *raceFixture, run session.Run, _ session.ExecutionStore) func(context.Context, session.ExecutionStore) error {
+			request := session.SessionTitleRequest{SessionID: run.SessionID, Title: "stale title"}
+			return func(ctx context.Context, ex session.ExecutionStore) error {
+				_, err := ex.SetSessionTitle(ctx, request)
+				return err
+			}
+		}},
 		{"SettleRun", func(t *testing.T, f *raceFixture, run session.Run, old session.ExecutionStore) func(context.Context, session.ExecutionStore) error {
 			if _, err := old.StartRun(f.ctx, f.now.Add(time.Second)); err != nil {
 				t.Fatal(err)

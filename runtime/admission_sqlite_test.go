@@ -67,7 +67,13 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 			t.Fatal(err)
 		}
 		if index == 0 {
-			originalSession = storedSession
+			if _, err := store.SetSessionTitle(ctx, session.SessionTitleRequest{SessionID: sessionID, WorkspaceID: "workspace-1", Title: "renamed conversation"}); err != nil {
+				t.Fatal(err)
+			}
+			originalSession, err = store.GetSession(ctx, sessionID)
+			if err != nil || originalSession.Title != "renamed conversation" {
+				t.Fatalf("renamed session = %#v, error = %v", originalSession, err)
+			}
 		} else if !reflect.DeepEqual(storedSession, originalSession) {
 			t.Fatalf("session changed across admissions:\nfirst=%#v\nsecond=%#v", originalSession, storedSession)
 		}

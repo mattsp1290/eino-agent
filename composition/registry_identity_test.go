@@ -63,6 +63,23 @@ func TestToolSchemaHashCanonicalizesMetadataOrder(t *testing.T) {
 	}
 }
 
+func TestToolSchemaHashIncludesSessionTitleOptIn(t *testing.T) {
+	without := definition("title-tool", "stable")
+	with := without
+	with.AllowSessionTitle = true
+	withoutHash, err := toolSchemaHash(without)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withHash, err := toolSchemaHash(with)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withoutHash == withHash {
+		t.Fatal("session title opt-in did not change tool schema identity")
+	}
+}
+
 func TestComposedToolSchemaIdentityTracksSourceNotOrder(t *testing.T) {
 	schemaA, schemaB := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	executorA, executorB := strings.Repeat("c", 64), strings.Repeat("d", 64)

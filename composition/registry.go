@@ -415,16 +415,17 @@ func toolSchemaHash(definition tools.Definition) (string, error) {
 		return "", err
 	}
 	raw, err := json.Marshal(struct {
-		Name        string
-		Description string
-		Parameters  any
-		Permissions []string
-		RetrySafe   bool
-		Retention   runtime.RetentionPolicy
-		Metadata    map[string]string
+		Name              string
+		Description       string
+		Parameters        any
+		Permissions       []string
+		RetrySafe         bool
+		AllowSessionTitle bool
+		Retention         runtime.RetentionPolicy
+		Metadata          map[string]string
 	}{
 		Name: definition.Name, Description: definition.Description, Parameters: parameters,
-		Permissions: definition.Permissions, RetrySafe: definition.RetrySafe,
+		Permissions: definition.Permissions, RetrySafe: definition.RetrySafe, AllowSessionTitle: definition.AllowSessionTitle,
 		Retention: definition.Retention, Metadata: definition.Metadata,
 	})
 	if err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -72,4 +73,37 @@ func TestSQLiteConcurrentKeyedAdmissionCommitsOneReceipt(t *testing.T) {
 	}
 	defer func() { _ = secondPool.Close() }()
 	assertConcurrentKeyedAdmission(t, ctx, []session.Store{store, secondStore}, "sqlite-race")
+}
+
+func TestSQLiteKeyedAdmissionPreservesRenamedSession(t *testing.T) {
+	ctx := t.Context()
+	store, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "renamed.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+	request := Request{SessionID: "renamed-keyed", AdmissionKey: "renamed-event", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	namedAt := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{
+		ID: request.SessionID, WorkspaceID: request.Config.Metadata["workspace_id"], Directory: request.Config.Metadata["workspace_root"],
+		Title: "Host-owned title", CreatedAt: namedAt, UpdatedAt: namedAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(&countingResolver{}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	admission, err := orch.Start(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admission.Disposition != AdmissionNew || admission.Handle == nil {
+		t.Fatalf("admission=%#v", admission)
+	}
+	<-admission.Handle.Done()
+	stored, err := store.GetSession(ctx, request.SessionID)
+	if err != nil || stored.Title != "Host-owned title" || !stored.UpdatedAt.Equal(namedAt) {
+		t.Fatalf("stored session=%#v err=%v", stored, err)
+	}
 }

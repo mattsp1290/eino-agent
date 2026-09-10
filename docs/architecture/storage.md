@@ -344,14 +344,47 @@ verification and must be explicitly recreated by their owner. Never delete a
 database automatically. A binary rollback requires its matching database
 schema. Schema verification checks every table, index and trigger definition.
 
+## Durable session titles
+
+`session.Store.SetSessionTitle` accepts a bounded `SessionTitleRequest` with a
+nonempty session ID, an exact expected workspace, and an unchanged display
+title. ID/workspace use the 1024-byte identity ceiling; workspace may be empty.
+Title uses the 16384-byte discovery ceiling, permits empty and whitespace-only
+values, and must be valid UTF-8. Invalid input returns
+`ErrSessionTitleInvalid` before store access. Manual unknown sessions return
+`ErrNotFound`, workspace mismatch returns `ErrConflict`, and other database,
+nil, closed, or corrupt-record failures return content-free
+`ErrSessionTitleStore`. Context cancellation has entry precedence.
+
+Both SQL stores lock the session, decode and verify the latest full record, and
+change only `Title` and `UpdatedAt`. The JSON record and title/time projections
+update in one statement. The timestamp is the later of the current metadata
+time and a live database clock sample. A current-title retry validates authority
+but performs no update and leaves revision/time unchanged. Successful competing
+writes serialize; last lock order wins. Savepoints preserve rollback even when
+an outer transaction catches an operation error. A transaction-scoped success
+is provisional until its enclosing `WithinTx` commits.
+
+`session.ExecutionStore.SetSessionTitle` applies the same mutation after checking
+the immutable run fence, run/session identity, terminal state, and workspace.
+Expiry alone follows normal execution semantics; takeover replaces the token
+and makes the older capability conflict. Manual authorized edits remain allowed
+during a run. Rename emits no message, part, event, provider request, or watch
+payload; existing observation triggers advance the revision on a real update so
+readers can refresh `GetSession` or discovery.
+
+Generic `CreateSession` and `UpdateSession` remain trusted whole-record APIs and
+may store titles beyond discovery bounds. They do not provide this concurrency
+guarantee and hosts must coordinate them with interactive edits. No schema,
+migration, index, or observation snapshot change is required.
+
 ## Workspace session discovery
 
 `session.SessionDiscoveryReader` is a separate optional capability with
 `ListSessions(ctx, session.SessionDiscoveryQuery) (session.SessionDiscoveryPage, error)`.
 It enumerates durable conversation metadata, including empty, pending, running
 and completed conversations. It performs no admission, recovery, claims, lease
-renewal, event publication or provider calls. Store and ExecutionStore method
-sets are unchanged.
+renewal, event publication or provider calls.
 
 | Backend | Discovery support |
 | --- | --- |
@@ -402,7 +435,8 @@ inserts ahead require refresh; backdated inserts behind may appear later.
 Title-only updates do not reorder rows; unread titles reflect their page's view,
 while returned titles may be stale until refresh. Trusted UpdateSession can
 change workspace or creation keys; concurrent traversal may then miss/repeat
-records and must restart. This capability adds no move or rename workflow.
+records and must restart. Discovery itself performs no move or rename; use the
+narrow title mutation described above.
 
 Context errors take priority at method entry, followed by query validation and
 store work. Cancellation during a failed database operation prefers `ctx.Err()`.

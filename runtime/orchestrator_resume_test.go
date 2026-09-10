@@ -341,9 +341,18 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
 	var executions atomic.Int64
 	var resumedContext ToolContext
-	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+	oldWriter := boundSessionTitleWriter{store: store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken}), sessionID: run.SessionID, workspaceID: "workspace-1"}
+	var resumedWriter SessionTitleWriter
+	toolRegistry := staticToolRegistry{tools: []Tool{{Name: "echo", AllowSessionTitle: true, Executor: orchestratorToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		executions.Add(1)
 		resumedContext = call.Context.Clone()
+		resumedWriter = call.SessionTitle
+		if resumedWriter == nil {
+			return ToolResult{}, errors.New("resumed executor missing title writer")
+		}
+		if _, err := resumedWriter.SetTitle(ctx, "resumed title"); err != nil {
+			return ToolResult{}, err
+		}
 		return ToolResult{Output: "ok"}, nil
 	})}}}
 	orch := mustConfiguredOrchestrator(
@@ -367,6 +376,15 @@ func TestStreamingOrchestratorResumeTakesStaleRunOwnership(t *testing.T) {
 	}
 	if executions.Load() != 1 {
 		t.Fatalf("tool executions = %d, want 1", executions.Load())
+	}
+	if named, err := store.GetSession(ctx, run.SessionID); err != nil || named.Title != "resumed title" {
+		t.Fatalf("resumed session = %#v, error = %v", named, err)
+	}
+	if _, err := oldWriter.SetTitle(context.Background(), "stale title"); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("old writer error = %v, want ErrConflict", err)
+	}
+	if _, err := resumedWriter.SetTitle(context.Background(), "terminal title"); !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("settled writer error = %v, want ErrConflict", err)
 	}
 	if !reflect.DeepEqual(resumedContext.Turn.ToolNames, []string{"echo"}) || resumedContext.Turn.RunID != run.ID || resumedContext.Turn.SessionID != run.SessionID || resumedContext.WorkspaceID != "workspace-1" || resumedContext.WorkspaceRoot != "/workspace" {
 		t.Fatalf("resumed tool context = %#v", resumedContext)
@@ -506,7 +524,7 @@ func resumeStoreWithTool(t *testing.T, owner string, status session.ToolCallStat
 		_ = storePool.Close()
 	})
 	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
-	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume", CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume", WorkspaceID: "workspace-1", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("create session: %v", err)
 	}
 	run, err := store.AdmitRun(ctx, session.Run{

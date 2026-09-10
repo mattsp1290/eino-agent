@@ -19,4 +19,7 @@
 // session.ErrAdmissionConflict classification. Receipts have no expiry and do
 // not grant execution authority; hosts observe state through committed readers
 // and explicitly Resume stranded work when appropriate.
+//
+// Host-opted-in concrete tools may receive a title-only writer bound to the
+// current run fence; extension, protocol, and model surfaces never receive it.
 package runtime

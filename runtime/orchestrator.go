@@ -453,7 +453,11 @@ func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, executio
 	}
 	wrapped.Executor = runtimeToolExecutorFunc(func(ctx context.Context, call ToolCall) (ToolResult, error) {
 		return extension.InvokeAround(execution.dispatch(), ctx, ToolExecutePoint, ToolExecution{Tool: extensionTool(tool), Call: extensionToolCall(call)}, func(ctx context.Context) (ToolResult, error) {
-			return tool.Executor.Execute(ctx, cloneToolCall(call))
+			concrete := cloneToolCall(call)
+			if tool.AllowSessionTitle {
+				concrete.SessionTitle = boundSessionTitleWriter{store: execution.store, sessionID: execution.sessionID, workspaceID: execution.workspaceID}
+			}
+			return tool.Executor.Execute(ctx, concrete)
 		})
 	})
 	permission, permissionErr := executeToolWithPermissions(ctx, wrapped, call, o.permissions)

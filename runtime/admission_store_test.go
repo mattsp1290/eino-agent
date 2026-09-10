@@ -140,6 +140,29 @@ func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.S
 
 func (s *admissionStore) UpdateSession(context.Context, session.Session) error { return nil }
 
+func (s *admissionStore) SetSessionTitle(ctx context.Context, request session.SessionTitleRequest) (session.SessionTitleResult, error) {
+	if err := ctx.Err(); err != nil {
+		return session.SessionTitleResult{}, err
+	}
+	if err := request.Validate(); err != nil {
+		return session.SessionTitleResult{}, err
+	}
+	record, ok := s.sessions[request.SessionID]
+	if !ok {
+		return session.SessionTitleResult{}, session.ErrNotFound
+	}
+	if record.WorkspaceID != request.WorkspaceID {
+		return session.SessionTitleResult{}, session.ErrConflict
+	}
+	if record.Title == request.Title {
+		return session.SessionTitleResult{Title: record.Title, UpdatedAt: record.UpdatedAt}, nil
+	}
+	record.Title = request.Title
+	record.UpdatedAt = time.Now().UTC()
+	s.sessions[record.ID] = record
+	return session.SessionTitleResult{Title: record.Title, UpdatedAt: record.UpdatedAt, Changed: true}, nil
+}
+
 func (s *admissionStore) AdmitRun(_ context.Context, run session.Run, leaseDuration time.Duration) (session.Run, error) {
 	if _, ok := s.runs[run.ID]; ok {
 		return session.Run{}, session.ErrConflict
@@ -480,6 +503,13 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 func (s *fakeExecutionStore) valid() bool {
 	run, ok := s.runs[s.fence.RunID]
 	return ok && !run.Terminal() && run.ClaimToken == s.fence.ClaimToken
+}
+
+func (s *fakeExecutionStore) SetSessionTitle(ctx context.Context, request session.SessionTitleRequest) (session.SessionTitleResult, error) {
+	if !s.valid() || s.runs[s.fence.RunID].SessionID != request.SessionID {
+		return session.SessionTitleResult{}, session.ErrConflict
+	}
+	return s.admissionStore.SetSessionTitle(ctx, request)
 }
 
 func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (session.Run, error) {
