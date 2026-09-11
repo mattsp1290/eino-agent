@@ -21,7 +21,7 @@ import (
 // checkpoint-byte access (session.Store, session.ExecutionStore) -- see
 // HandlerBuildContext's doc comment and C1's fix in the W6 round-1 review.
 //
-// This capability grants exactly three things, and nothing else:
+// This capability grants exactly these things, and nothing else:
 //  1. minting the identities a compaction boundary needs;
 //  2. a read-only reload of this session's durable conversational history,
 //     for Finalize's position correlation only (session.Store's read
@@ -31,11 +31,15 @@ import (
 //     itself exposes -- the isolation is at the Go visibility boundary,
 //     the same mechanism authorizeRewrite already relies on);
 //  3. atomically starting a new session.ContextEpoch and appending its
-//     replayable summary boundary in ONE fenced transaction.
+//     replayable summary boundary in ONE fenced transaction;
+//  4. appending one durable, append-only audit event (recordSkillActivation)
+//     -- reused by the skill recipe to durably record which skill it
+//     activated and a content digest of what it loaded, since that is the
+//     same bounded "one recipe's own narrow write" shape as the epoch
+//     commit above, just a plain event instead of a boundary.
 //
 // It grants no ToolCall claim/settle authority and no arbitrary
-// AppendMessage/AppendPart access outside that one atomic boundary-commit
-// path.
+// AppendMessage/AppendPart access outside those two bounded write paths.
 type contextEpochCapability struct {
 	sessionID     session.ID
 	runID         session.RunID
@@ -114,6 +118,22 @@ func (c contextEpochCapability) commitSummaryEpoch(ctx context.Context, epoch se
 		return session.ContextEpoch{}, compaction.Boundary{}, err
 	}
 	return started, boundary, nil
+}
+
+// recordSkillActivation durably appends a SkillActivatedEventKind event
+// correlated to name, carrying a content digest of what was actually
+// loaded -- see NewSkillHandlerFactory.
+func (c contextEpochCapability) recordSkillActivation(ctx context.Context, name, digest string) error {
+	if !c.ready() {
+		return fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
+	}
+	event := session.EventRecord{
+		ID: c.ids.NewEventID(), SessionID: c.sessionID, RunID: c.runID,
+		Kind: session.SkillActivatedEventKind, Correlation: name,
+		Payload: mustJSON(map[string]string{"name": name, "content_digest": digest}), CreatedAt: c.now(),
+	}
+	_, err := c.execution.AppendEvent(ctx, event)
+	return err
 }
 
 // latestFinishedSummarizationEpoch returns the most recently created,

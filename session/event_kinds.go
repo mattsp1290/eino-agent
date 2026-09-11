@@ -38,4 +38,10 @@ const (
 	// and after -- see runtime.authorizedRewriteRecord. Correlation carries
 	// the call ID.
 	AuthorizedToolResultRewriteEventKind = "authorized_tool_result_rewrite"
+	// SkillActivatedEventKind durably records one skill activation: the
+	// skill's name and a content digest of what was actually loaded, so a
+	// SKILL.md later edited between activation and any later point can be
+	// told apart from the version this run actually used. Correlation
+	// carries the skill name.
+	SkillActivatedEventKind = "skill_activated"
 )

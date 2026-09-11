@@ -2,6 +2,9 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -111,17 +114,27 @@ type SkillConfig struct {
 // recipe does not wire AgentHub/ModelHub, so only inline-mode skills (no
 // "context: fork"/"fork_with_context" frontmatter) are supported -- a skill
 // requiring a fork fails with upstream's own "AgentHub required" error at
-// invocation time, not silently. Activated skill names are recorded on the
-// run-local ADK state (adk.SetRunLocalValue), which is carried through
-// ADK's own checkpoint payload across interrupt/resume, so a resumed run
-// can see which skills this turn activated without any new checkpoint
-// field.
+// invocation time, not silently.
+//
+// Every activation (the skill tool's own Backend.Get call, at the moment a
+// skill is actually loaded for use -- see activationRecordingSkillBackend)
+// is durably recorded as a SkillActivatedEventKind event: the skill's name
+// and a content digest of what was actually loaded. This is a durable
+// audit trail, not yet a resume-time enforcement: nothing today re-checks
+// on resume that Get(name) still hashes to the recorded digest, so a
+// SKILL.md edited between pause and resume is not detected and rejected --
+// see docs/architecture/eino-feature-support.md's W6 section for this open
+// limitation.
 func NewSkillHandlerFactory(cfg SkillConfig) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		if build.SkillBackend == nil {
 			return nil, fmt.Errorf("%w: skill requires a workspace skill backend", errHandlerMissingBackend)
 		}
-		skillCfg := &skill.TypedConfig[*einoschema.AgenticMessage]{Backend: build.SkillBackend}
+		backend := build.SkillBackend
+		if build.epochs.ready() {
+			backend = &activationRecordingSkillBackend{inner: backend, epochs: build.epochs}
+		}
+		skillCfg := &skill.TypedConfig[*einoschema.AgenticMessage]{Backend: backend}
 		if cfg.SkillToolName != "" {
 			name := cfg.SkillToolName
 			skillCfg.SkillToolName = &name
@@ -132,6 +145,43 @@ func NewSkillHandlerFactory(cfg SkillConfig) HandlerFactory {
 		}
 		return mw, nil
 	}
+}
+
+// activationRecordingSkillBackend wraps a skill.Backend so every successful
+// Get -- upstream's own skill tool calls Backend.Get(ctx, args.Skill)
+// exactly at activation time, not at List-time rendering -- durably records
+// {name, sha256(FrontMatter JSON + Content)} via the epochs capability
+// before returning the skill to upstream.
+type activationRecordingSkillBackend struct {
+	inner  skill.Backend
+	epochs contextEpochCapability
+}
+
+var _ skill.Backend = (*activationRecordingSkillBackend)(nil)
+
+func (b *activationRecordingSkillBackend) List(ctx context.Context) ([]skill.FrontMatter, error) {
+	return b.inner.List(ctx)
+}
+
+func (b *activationRecordingSkillBackend) Get(ctx context.Context, name string) (skill.Skill, error) {
+	loaded, err := b.inner.Get(ctx, name)
+	if err != nil {
+		return skill.Skill{}, err
+	}
+	digest := skillContentDigest(loaded)
+	if err := b.epochs.recordSkillActivation(ctx, name, digest); err != nil {
+		return skill.Skill{}, err
+	}
+	return loaded, nil
+}
+
+func skillContentDigest(loaded skill.Skill) string {
+	front, err := json.Marshal(loaded.FrontMatter)
+	if err != nil {
+		front = nil
+	}
+	sum := sha256.Sum256(append(front, []byte(loaded.Content)...))
+	return hex.EncodeToString(sum[:])
 }
 
 // --- filesystem -----------------------------------------------------------

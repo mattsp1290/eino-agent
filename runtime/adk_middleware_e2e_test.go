@@ -436,6 +436,36 @@ func TestSkillHandlerInlineActivationThroughDurableWrapper(t *testing.T) {
 	if !strings.Contains(sawSkillContent, "greet the user by name") {
 		t.Fatalf("skill tool output = %q, want it to contain the skill's own content", sawSkillContent)
 	}
+
+	// Item 8: activation is durably recorded (SkillActivatedEventKind),
+	// correlated to the skill's name, with a non-empty content digest.
+	events, err := store.ListEvents(context.Background(), "skill-session", session.EventCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawActivation bool
+	for _, event := range events.Events {
+		if event.Kind != session.SkillActivatedEventKind {
+			continue
+		}
+		if event.Correlation != "greeter" {
+			t.Fatalf("activation event correlation = %q, want %q", event.Correlation, "greeter")
+		}
+		var payload struct {
+			Name          string `json:"name"`
+			ContentDigest string `json:"content_digest"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			t.Fatalf("decode activation payload: %v", err)
+		}
+		if payload.Name != "greeter" || payload.ContentDigest == "" {
+			t.Fatalf("activation payload = %+v, want a name and non-empty digest", payload)
+		}
+		sawActivation = true
+	}
+	if !sawActivation {
+		t.Fatal("no SkillActivatedEventKind event found for this run")
+	}
 }
 
 // TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite proves
