@@ -468,29 +468,135 @@ func TestSkillHandlerInlineActivationThroughDurableWrapper(t *testing.T) {
 	}
 }
 
-// TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite proves
-// reduction's legitimate settled-result CLEARING is recognized by
-// settlementSeal as an authorized content-management rewrite (via
+// TestReductionTruncatesToolResultBeforeSettlement proves item 2 of the
+// round-two W6 review: reduction's MaxLengthForTrunc truncation (a host
+// handler's own WrapInvokableToolCall, including its offload write) now
+// runs INSIDE the durable boundary, before settlement and event emission
+// (adkEngine.applyHandlerToolResultWrappers, threaded through
+// executeClaimedToolPipeline before buildToolSettlement) -- not as an
+// after-settlement rewrite subject to settlementSeal's authorization dance.
+// The tool is sealed with Retention{MaxInlineBytes:-1} so the full payload
+// is genuinely inline (this runtime's own retention truncation cannot be
+// what shortens it -- see TestReductionWithoutMountLeavesOriginalPayloadIntact,
+// the control run proving the same config WITHOUT reduction mounted keeps
+// the original text). A single round is enough here (unlike clearing,
+// truncation is not gated by ClearRetentionSuffixLimit's recency
+// protection): the DURABLE settlement itself, the model-visible content on
+// the very same dispatch, and a fresh replay from the store must all show
+// the truncated form with reduction's own offload placeholder, never the
+// original.
+func TestReductionTruncatesToolResultBeforeSettlement(t *testing.T) {
+	store := newAdmissionStore()
+	const original = "this output is intentionally much longer than the configured truncation threshold so reduction truncates it"
+	echo := Tool{
+		Name: "bigecho", Info: &einoschema.ToolInfo{Name: "bigecho", Desc: "returns a large payload"},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: original}, nil
+		}),
+		Retention: RetentionPolicy{MaxInlineBytes: -1},
+	}
+	var calls int
+	var secondDispatchContent string
+	sessionID := session.ID("reduction-trunc-session")
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		if calls == 1 {
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-1", "bigecho", `{}`)}, nil
+		}
+		secondDispatchContent = functionToolResultText(request.Messages)
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	}))
+	handlerComponent := PlanComponent{
+		Component: testPlanComponent("reduction-trunc-component"),
+		AgentHandlers: []PlanAgentHandler{{
+			ID: "reduction", Order: 0, Scope: extension.GlobalScope(),
+			Kind: HandlerKindReduction, Version: HandlerVersion1, ConfigHash: "test-hash",
+			// MaxTokensForClear is left at zero (upstream's own default,
+			// 160000) so clearing never fires here -- it has its own
+			// dedicated proof, TestReductionClearsOlderSettledResultAsAuthorizedRewrite.
+			Factory: NewReductionHandlerFactory(ReductionConfig{MaxLengthForTrunc: 10}),
+		}},
+		Tools: testPlanTools(staticToolRegistry{tools: []Tool{echo}}),
+	}
+	root := t.TempDir()
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
+	cfg := orchestratorConfig()
+	cfg.Metadata = map[string]string{"workspace_id": "w", "workspace_root": root}
+	handle, err := orch.Start(context.Background(), Request{SessionID: sessionID, Message: TextUserMessage("hi"), Config: cfg})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed", result)
+	}
+	if secondDispatchContent == "" {
+		t.Fatal("second dispatch never saw the tool result")
+	}
+	if strings.Contains(secondDispatchContent, original) {
+		t.Fatalf("model-visible content = %q, want the truncated form (not the original)", secondDispatchContent)
+	}
+	if !strings.Contains(secondDispatchContent, "saved to:") {
+		t.Fatalf("model-visible content = %q, want reduction's own offload placeholder", secondDispatchContent)
+	}
+
+	// The DURABLE settlement itself must already be the truncated form:
+	// this is a pre-settlement transform, not an after-the-fact rewrite.
+	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(toolCall.Output), original) {
+		t.Fatalf("durable settlement = %s, want the truncated form", toolCall.Output)
+	}
+	if !strings.Contains(string(toolCall.Output), "saved to:") {
+		t.Fatalf("durable settlement = %s, want reduction's own offload placeholder", toolCall.Output)
+	}
+	if toolCall.Status != session.ToolCallCompleted {
+		t.Fatalf("durable settlement status = %q, want completed", toolCall.Status)
+	}
+
+	// A fresh replay from the store shows the exact same truncated content
+	// -- not the original -- proving durability, not just an in-memory
+	// rewrite for this one cycle.
+	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawReplayedTruncation bool
+	for _, part := range replay.Parts {
+		if part.Kind != session.PartFunctionToolResult {
+			continue
+		}
+		if strings.Contains(string(part.Payload), original) {
+			t.Fatalf("replay contains the original, untruncated payload: %s", part.Payload)
+		}
+		if strings.Contains(string(part.Payload), "saved to:") {
+			sawReplayedTruncation = true
+		}
+	}
+	if !sawReplayedTruncation {
+		t.Fatal("replay does not show the truncated settlement")
+	}
+}
+
+// TestReductionClearsOlderSettledResultAsAuthorizedRewrite proves reduction's
+// legitimate settled-result CLEARING is still recognized by settlementSeal
+// as an authorized content-management rewrite (via
 // wrapAuthorizedContentRewrites), not an unauthorized divergence, and that
-// it actually changes what the model dispatched against sees. The tool is
-// sealed with Retention{MaxInlineBytes:-1} so the full payload is genuinely
-// inline (this runtime's own retention truncation cannot be what shortens
-// it, unlike a zero-value-retention fixture -- see
-// TestReductionWithoutMountLeavesOriginalPayloadIntact, the control run
-// proving the same config WITHOUT reduction mounted keeps the original
-// text). Two tool-call rounds are driven, not one: upstream's own default
+// it actually changes what the model dispatched against sees. Unlike
+// truncation (see TestReductionTruncatesToolResultBeforeSettlement, now a
+// pre-settlement transform), clearing legitimately depends on accumulated
+// conversation size across MULTIPLE calls -- it cannot be decided at any
+// single tool's own execution time -- so it stays a post-settlement,
+// BeforeModelRewriteState-driven, explicitly authorized rewrite of the
+// durable baseline. MaxLengthForTrunc is left at upstream's own default (a
+// no-op for this fixture's short payload) so only clearing is exercised.
+// Two tool-call rounds are driven, not one: upstream's own default
 // ClearRetentionSuffixLimit is 1 (the single most-recent tool-call round is
 // always protected from clearing), so a fixture with only one round could
 // never observe clearing fire at all, regardless of MaxTokensForClear.
-// MaxTokensForClear is deliberately low: this recipe's
-// truncation-via-tool-wrapper path (MaxLengthForTrunc) does NOT survive
-// this runtime's per-cycle durable-baseline rebuild (durableBaselineHandler
-// reloads state.Messages fresh from the durable settlement every cycle,
-// discarding whatever a wrapped tool call's own return value held) --
-// clearing, which operates via BeforeModelRewriteState, is the mechanism
-// that actually works here, and is what this test (and the recipe's own
-// doc comment) documents as effective.
-func TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite(t *testing.T) {
+func TestReductionClearsOlderSettledResultAsAuthorizedRewrite(t *testing.T) {
 	store := newAdmissionStore()
 	const original = "this output is intentionally much longer than the configured truncation threshold so reduction truncates it"
 	echo := Tool{
@@ -517,11 +623,11 @@ func TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite(t *testing.
 		}
 	}))
 	handlerComponent := PlanComponent{
-		Component: testPlanComponent("reduction-component"),
+		Component: testPlanComponent("reduction-clear-component"),
 		AgentHandlers: []PlanAgentHandler{{
 			ID: "reduction", Order: 0, Scope: extension.GlobalScope(),
 			Kind: HandlerKindReduction, Version: HandlerVersion1, ConfigHash: "test-hash",
-			Factory: NewReductionHandlerFactory(ReductionConfig{MaxLengthForTrunc: 10, MaxTokensForClear: 1}),
+			Factory: NewReductionHandlerFactory(ReductionConfig{MaxTokensForClear: 1}),
 		}},
 		Tools: testPlanTools(staticToolRegistry{tools: []Tool{echo}}),
 	}
@@ -529,7 +635,7 @@ func TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite(t *testing.
 	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
 	cfg := orchestratorConfig()
 	cfg.Metadata = map[string]string{"workspace_id": "w", "workspace_root": root}
-	handle, err := orch.Start(context.Background(), Request{SessionID: "reduction-session", Message: TextUserMessage("hi"), Config: cfg})
+	handle, err := orch.Start(context.Background(), Request{SessionID: "reduction-clear-session", Message: TextUserMessage("hi"), Config: cfg})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}

@@ -276,26 +276,121 @@ func bigEchoDefinition(output string) tools.Definition {
 	}
 }
 
-// TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn proves both
-// the reduction positive path and "ordering with two rewrites": two large
-// read_file results settle in the same turn (filesystem is mounted
-// alongside reduction), and reduction's own BeforeModelRewriteState
-// authorized-rewrite truncates both of their content before the next
-// dispatch, without settlementSeal rejecting either as an unauthorized
-// divergence.
-func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
+// TestReductionTruncatesSettledToolResultBeforeSettlement proves item 2 of
+// the round-two W6 review through the public API: reduction's
+// MaxLengthForTrunc truncation now runs BEFORE this runtime durably settles
+// the tool call (runtime.adkEngine.applyHandlerToolResultWrappers), so a
+// single round is enough -- unlike clearing (see
+// TestReductionClearsOlderRoundAsAuthorizedRewrite below), truncation is not
+// gated by ClearRetentionSuffixLimit's recency protection.
+func TestReductionTruncatesSettledToolResultBeforeSettlement(t *testing.T) {
 	const original = "this output is intentionally much longer than the configured truncation threshold so reduction truncates it every time"
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
-	sessionID := session.ID("reduction-session")
+	sessionID := session.ID("reduction-trunc-session")
 	mount, err := Mount(context.Background(), registry, sessionID, Config{
 		ReductionMaxLengthForTrunc: 10,
-		// Low enough that clearing -- the only mechanism that actually
-		// survives this runtime's per-cycle durable-baseline rebuild (see
-		// runtime.TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite's
-		// doc comment) -- fires for both rounds once each is old enough
-		// not to be protected by upstream's default ClearRetentionSuffixLimit
-		// (1: the single most-recent tool-call round is always retained).
+		Disable:                    disableAllExcept(runtime.HandlerKindReduction),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	// Retention is explicit (MaxInlineBytes:-1), not the zero-value
+	// default: the payload must be genuinely inline so only reduction's own
+	// truncation -- not this runtime's own retention-policy truncation --
+	// can be what shortens it (see the runtime-internal proof's control
+	// test, TestReductionWithoutMountLeavesOriginalPayloadIntact, for why
+	// the zero-value default is a false-positive trap here).
+	toolMount, err := registry.Mount(context.Background(), testNativeComponent("bigecho", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			return registrar.Tool(composition.ToolRegistration{ID: "bigecho", Scope: testScope(sessionID), Definition: tools.Definition{
+				Name: "bigecho", Description: "returns a large payload for reduction to truncate",
+				Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
+				Execute: tools.TypedExecutor[map[string]any, map[string]any](func(context.Context, tools.TypedExecution[map[string]any]) (map[string]any, error) {
+					return map[string]any{"text": original}, nil
+				}),
+				Retention: runtime.RetentionPolicy{MaxInlineBytes: -1},
+			}})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = toolMount.Close(context.Background()) }()
+
+	var secondDispatchContent string
+	step := 0
+	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		step++
+		if step == 1 {
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-1", "bigecho", `{}`)}, nil
+		}
+		secondDispatchContent, _ = toolResultParts(request.Messages)
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	}))
+	root := t.TempDir()
+	handle, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed", result)
+	}
+	if secondDispatchContent == "" {
+		t.Fatal("second dispatch never saw the tool result")
+	}
+	if strings.Contains(secondDispatchContent, original) {
+		t.Fatalf("model-visible content = %q, want the truncated form (not the original)", secondDispatchContent)
+	}
+	if !strings.Contains(secondDispatchContent, "saved to:") {
+		t.Fatalf("model-visible content = %q, want reduction's own offload placeholder", secondDispatchContent)
+	}
+	// The durable settlement itself -- not just the model-visible copy --
+	// and replay must both already be the truncated form.
+	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(toolCall.Output), original) {
+		t.Fatalf("durable settlement = %s, want the truncated form", toolCall.Output)
+	}
+	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range replay.Parts {
+		if part.Kind == session.PartFunctionToolResult && strings.Contains(string(part.Payload), original) {
+			t.Fatalf("replay contains the original, untruncated payload: %s", part.Payload)
+		}
+	}
+}
+
+// TestReductionClearsOlderRoundAsAuthorizedRewrite proves reduction's
+// legitimate settled-result CLEARING is still recognized by settlementSeal
+// as an authorized content-management rewrite (via
+// wrapAuthorizedContentRewrites), not an unauthorized divergence, and that
+// it actually changes what the model dispatched against sees -- "ordering
+// with two rewrites in one turn". MaxLengthForTrunc is left at upstream's
+// default (a no-op for this fixture's short payload) so only clearing is
+// exercised; see TestReductionTruncatesSettledToolResultBeforeSettlement
+// for truncation's own, now pre-settlement, proof.
+func TestReductionClearsOlderRoundAsAuthorizedRewrite(t *testing.T) {
+	const original = "this output is intentionally much longer than the configured truncation threshold so reduction truncates it every time"
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("reduction-clear-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		// Larger than this fixture's payload, so truncation (Mount's own
+		// default MaxLengthForTrunc is 64, smaller than the payload below)
+		// never fires here -- this test exercises clearing only.
+		ReductionMaxLengthForTrunc: 4096,
+		// Low enough that clearing fires for the older round once a
+		// second, more recent round exists (upstream's default
+		// ClearRetentionSuffixLimit, 1, always protects the single
+		// most-recent tool-call round).
 		ReductionMaxTokensForClear: 1,
 		Disable:                    disableAllExcept(runtime.HandlerKindReduction),
 	})
@@ -729,9 +824,22 @@ func deferredSearchToolDefinition() tools.Definition {
 // undiscovered-deferred-tool gate (`tool.Deferred && !discovered[name]`)
 // still fires on the very next call to the tool the model just found --
 // this was never a permissions issue (this harness's nil permissions.Policy
-// gates nothing). toolSearchHandlerToolExecutor
-// (runtime/adk_middleware_frozen_tools.go) closes this by marking the
-// matched names discovered after a successful search call.
+// gates nothing). This test's live-run half of the fix is now superseded
+// by a durable one (round-two W6 review item 1): the recipe's own sealed
+// search tool no longer settles as an ordinary function_tool_result with
+// only an in-memory markDiscovered side effect -- adkTool.InvokableRun
+// type-asserts it as a toolSearchHandlerToolExecutor and routes it through
+// adkEngine.executeAndSettleHandlerToolSearch (runtime/tool_search.go),
+// which settles the call as a durable tool_search_result block via
+// buildTerminalToolSearchEnvelope, the SAME content-block shape the native
+// tool-search path produces. Because discoveredToolsFromMessages/
+// discoveredToolsFromHistoryPaged read that shape (not the live run's
+// in-memory set) to rebuild the advertised deferred-tool set, discovery
+// now replays across a fresh turn on the same session, across ResumeRun,
+// and across a brand-new orchestrator instance against the same store --
+// proved respectively by TestToolSearchDiscoveryReplaysOnNextTurn,
+// TestToolSearchDiscoveryReplaysAfterResumeRun, and
+// TestToolSearchDiscoveryReplaysAfterProcessRestart below.
 func TestToolSearchFindsDeferredTool(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
@@ -762,7 +870,11 @@ func TestToolSearchFindsDeferredTool(t *testing.T) {
 			args, _ := json.Marshal(map[string]string{"query": "select:hidden_capability"})
 			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-search", "tool_search", string(args))}, nil
 		case 2:
-			searchResult, _ = toolResultParts(request.Messages)
+			// The recipe's own sealed search tool now settles durably as a
+			// tool_search_result block (item 1 of the round-two W6 review),
+			// not an ordinary function_tool_result -- see
+			// toolSearchResultDiscoveredNames.
+			searchResult = strings.Join(toolSearchResultDiscoveredNames(request.Messages), ",")
 			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-hidden", "hidden_capability", `{}`)}, nil
 		default:
 			calledResult, _ = toolResultParts(request.Messages)
@@ -796,6 +908,285 @@ func TestToolSearchFindsDeferredTool(t *testing.T) {
 	}
 	if toolCall.Status != session.ToolCallCompleted {
 		t.Fatalf("hidden_capability settled status = %q, want completed", toolCall.Status)
+	}
+}
+
+// TestToolSearchDiscoveryReplaysOnNextTurn proves discovery survives across
+// a real turn boundary: turn 1 searches and discovers hidden_capability
+// (settling durably as a tool_search_result block, per item 1 of the
+// round-two W6 review); turn 2 is a genuinely separate orch.Start call on
+// the SAME session that calls hidden_capability directly, with no search
+// anywhere in turn 2's own script. This only succeeds if turn 2's snapshot
+// admission (discoveredToolsFromMessages, seeded from the durably replayed
+// history FreezeTurnSnapshot/prepareSnapshot load, not any live-run
+// in-memory carryover from turn 1) already sees the tool as discovered.
+func TestToolSearchDiscoveryReplaysOnNextTurn(t *testing.T) {
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("toolsearch-replay-next-turn-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		Disable: disableAllExcept(runtime.HandlerKindToolSearch),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = toolMount.Close(context.Background()) }()
+
+	var turn2Result string
+	step := 0
+	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		step++
+		switch step {
+		case 1:
+			args, _ := json.Marshal(map[string]string{"query": "select:hidden_capability"})
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-search-t1", "tool_search", string(args))}, nil
+		case 2:
+			return []*einoschema.AgenticMessage{agenticAssistantText("turn 1 done")}, nil
+		case 3:
+			// Turn 2's very first dispatch: call the deferred tool
+			// directly, with no search anywhere in this turn's own
+			// script.
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-hidden-t2", "hidden_capability", `{}`)}, nil
+		default:
+			turn2Result, _ = toolResultParts(request.Messages)
+			return []*einoschema.AgenticMessage{agenticAssistantText("turn 2 done")}, nil
+		}
+	}))
+	// A single shared workspace root across both turns: admission's own
+	// session-identity check (sameAdmissionSessionIdentity, comparing
+	// Session.Directory) rejects a second Start on the same session whose
+	// Config names a different workspace_root as session.ErrConflict, so
+	// two independent t.TempDir() calls here would fail turn 2 for a
+	// reason unrelated to what this test proves.
+	root := t.TempDir()
+	handle, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("turn 1 result = %+v, want completed", result)
+	}
+
+	handle2, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("call it directly this time"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result2 := awaitDone(t, handle2, 10*time.Second)
+	if result2.Status != session.RunCompleted {
+		t.Fatalf("turn 2 result = %+v, want completed", result2)
+	}
+	if strings.Contains(turn2Result, "expected_failure") || strings.Contains(turn2Result, "undiscovered") {
+		t.Fatalf("turn2Result = %q, want hidden_capability NOT denied as undiscovered in a fresh turn", turn2Result)
+	}
+	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden-t2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCall.Status != session.ToolCallCompleted {
+		t.Fatalf("hidden_capability settled status (turn 2, no re-search) = %q, want completed", toolCall.Status)
+	}
+}
+
+// TestToolSearchDiscoveryReplaysAfterResumeRun proves discovery survives a
+// checkpointed pause/resume: the run searches and discovers
+// hidden_capability, then a blocking tool call pauses the run
+// (orch.Stop(Immediate)) before the discovered tool is ever called; after
+// orch.ResumeRun, the SAME paused run calls hidden_capability and it must
+// not be denied as undiscovered. This exercises turn_loop.go's
+// resumeInterruptedTurn path, which reseeds the advertised deferred-tool
+// set via discoveredToolsFromHistoryPaged (the durable, paged-history
+// counterpart of discoveredToolsFromMessages) rather than trusting any
+// live in-memory state the paused run held before the pause.
+func TestToolSearchDiscoveryReplaysAfterResumeRun(t *testing.T) {
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("toolsearch-replay-resume-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		Disable: disableAllExcept(runtime.HandlerKindToolSearch),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = toolMount.Close(context.Background()) }()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var toolCalls int
+	blockerMount, err := registry.Mount(context.Background(), testNativeComponent("blocker", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			return registrar.Tool(composition.ToolRegistration{ID: "blocker", Scope: testScope(sessionID), Definition: blockingToolDefinition(started, release, &toolCalls)})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blockerMount.Close(context.Background()) }()
+
+	var calledResult string
+	step := 0
+	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		step++
+		switch step {
+		case 1:
+			args, _ := json.Marshal(map[string]string{"query": "select:hidden_capability"})
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-search-resume", "tool_search", string(args))}, nil
+		case 2:
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-block-resume", "blocker", `{}`)}, nil
+		case 3:
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-hidden-resume", "hidden_capability", `{}`)}, nil
+		default:
+			calledResult, _ = toolResultParts(request.Messages)
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+		}
+	}))
+	handle, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(t.TempDir()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := orch.Stop(context.Background(), handle.RunID(), runtime.StopPolicy{Immediate: true, Cause: "toolsearch-resume-example"}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunPaused {
+		t.Fatalf("result = %+v, want paused", result)
+	}
+
+	resumed, err := orch.ResumeRun(context.Background(), result.RunID, runtime.ResumeRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumedResult := awaitDone(t, resumed, 10*time.Second)
+	if resumedResult.Status != session.RunCompleted {
+		t.Fatalf("resumed result = %+v, want completed", resumedResult)
+	}
+	if toolCalls != 1 {
+		t.Fatalf("blocker executed %d times, want exactly 1 (no re-execution on resume)", toolCalls)
+	}
+	if strings.Contains(calledResult, "expected_failure") || strings.Contains(calledResult, "undiscovered") {
+		t.Fatalf("calledResult = %q, want hidden_capability NOT denied as undiscovered after resume", calledResult)
+	}
+	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden-resume"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCall.Status != session.ToolCallCompleted {
+		t.Fatalf("hidden_capability settled status (post-resume) = %q, want completed", toolCall.Status)
+	}
+}
+
+// TestToolSearchDiscoveryReplaysAfterProcessRestart proves discovery
+// survives a genuine process restart, not merely a live run's in-memory
+// markDiscovered set: turn 1 searches and discovers hidden_capability
+// under one *runtime.StreamingOrchestrator instance and completes; a
+// SECOND, brand-new orchestrator instance (fresh IDGenerator, fresh
+// in-process state, zero carryover -- newTestOrchestrator constructs a
+// wholly separate runtime.NewStreamingOrchestrator) is then pointed at the
+// same durable store/registry/session and calls hidden_capability
+// directly in its very first dispatch.
+func TestToolSearchDiscoveryReplaysAfterProcessRestart(t *testing.T) {
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("toolsearch-replay-restart-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		Disable: disableAllExcept(runtime.HandlerKindToolSearch),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = toolMount.Close(context.Background()) }()
+
+	// A shared IDGenerator across both orchestrator instances, so the
+	// second instance's counter doesn't restart from 1 and collide with
+	// IDs the first already durably wrote -- see
+	// newTestOrchestratorWithIDs's doc comment.
+	ids := &testIDs{}
+	turn1Step := 0
+	orch1 := newTestOrchestratorWithIDs(t, store, registry, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		turn1Step++
+		if turn1Step == 1 {
+			args, _ := json.Marshal(map[string]string{"query": "select:hidden_capability"})
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-search-restart", "tool_search", string(args))}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("turn 1 done")}, nil
+	}), ids)
+	// A single shared workspace root across both orchestrator instances --
+	// see the matching comment in TestToolSearchDiscoveryReplaysOnNextTurn
+	// on why a mismatched Config.Metadata["workspace_root"] across two
+	// Start calls on the same session fails admission with
+	// session.ErrConflict for a reason unrelated to what this test proves.
+	root := t.TempDir()
+	handle, err := orch1.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("turn 1 result = %+v, want completed", result)
+	}
+
+	var restartResult string
+	step := 0
+	orch2 := newTestOrchestratorWithIDs(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		step++
+		if step == 1 {
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-hidden-restart", "hidden_capability", `{}`)}, nil
+		}
+		restartResult, _ = toolResultParts(request.Messages)
+		return []*einoschema.AgenticMessage{agenticAssistantText("done after restart")}, nil
+	}), ids)
+	handle2, err := orch2.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("new orchestrator instance, call it directly"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result2 := awaitDone(t, handle2, 10*time.Second)
+	if result2.Status != session.RunCompleted {
+		t.Fatalf("post-restart result = %+v, want completed", result2)
+	}
+	if strings.Contains(restartResult, "expected_failure") || strings.Contains(restartResult, "undiscovered") {
+		t.Fatalf("restartResult = %q, want hidden_capability NOT denied as undiscovered after a process restart", restartResult)
+	}
+	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden-restart"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCall.Status != session.ToolCallCompleted {
+		t.Fatalf("hidden_capability settled status (post-restart) = %q, want completed", toolCall.Status)
 	}
 }
 

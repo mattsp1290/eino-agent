@@ -150,6 +150,21 @@ type adkEngine struct {
 	// instance is missing (a handler that stopped declaring a tool it
 	// previously sealed) fails that call, not the whole turn.
 	handlerTools map[string]tool.BaseTool
+
+	// handlerMiddlewares is this turn's live, ordered host agent-handler
+	// middleware instances (the same values installed into
+	// AgentBuildContext.Handlers), retained so a tool's raw result can be
+	// threaded through each handler's own WrapInvokableToolCall/
+	// WrapEnhancedInvokableToolCall BEFORE this runtime durably settles it
+	// (adkEngine.applyHandlerToolResultWrappers) -- the plan's "result
+	// transforms occur before settlement and event emission" requirement,
+	// applied to a host middleware's own ADK-native tool-wrapping
+	// mechanism (e.g. reduction's MaxLengthForTrunc truncation) rather than
+	// relying on ADK's own tools-node wrapping, which this runtime's tools
+	// never pass through (adkTool/adkToolSearch dispatch via this
+	// package's own durable claim/execute/settle pipeline, never ADK's
+	// generic tool-node call).
+	handlerMiddlewares []adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
 }
 
 // guardRan reports whether this turn's durable guard actually fired. A
@@ -379,6 +394,7 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 	if err != nil {
 		return nil, err
 	}
+	e.handlerMiddlewares = handlers
 	e.sealHandlerTools()
 
 	tools := make([]tool.BaseTool, 0, len(e.snapshot.Tools))
@@ -974,7 +990,19 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	call.ResultMessageID = claimed.Call.ResultMessageID
 	call.ResultPartID = claimed.Call.ResultPartID
 	prepareErr := e.takePrepareError(record.ID)
-	settled, err := e.execution.executeAndSettleClaimedTool(ctx, e.snapshot, t.tool, call, claimed.Call, prepareErr)
+	var settled settledTool
+	if _, isSearchKind := t.tool.Executor.(toolSearchHandlerToolExecutor); isSearchKind {
+		// The toolsearch recipe's own sealed search tool settles durably as
+		// a tool_search_result block (buildTerminalToolSearchEnvelope) and
+		// marks matches discovered, exactly like the native tool-search
+		// path -- see executeAndSettleHandlerToolSearch's doc comment.
+		settled, err = e.executeAndSettleHandlerToolSearch(ctx, t.tool, call, claimed.Call, prepareErr)
+	} else {
+		wrap := func(ctx context.Context, call ToolCall, result ToolResult) (ToolResult, error) {
+			return e.applyHandlerToolResultWrappers(ctx, call.Name, string(call.ID), call.Input, result)
+		}
+		settled, err = e.execution.executeAndSettleClaimedTool(ctx, e.snapshot, t.tool, call, claimed.Call, prepareErr, wrap)
+	}
 	if err != nil {
 		return "", err
 	}

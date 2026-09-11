@@ -129,14 +129,60 @@ func toolResultParts(messages []*einoschema.AgenticMessage) (text string, sawIma
 	return text, sawImage
 }
 
+// toolSearchResultDiscoveredNames extracts every discovered tool name out
+// of any tool_search_result content block across messages -- the durable
+// settlement shape both the native tool-search path and (since item 1 of
+// the round-two W6 review) the toolsearch recipe's own sealed search tool
+// now use, in place of an ordinary function_tool_result.
+func toolSearchResultDiscoveredNames(messages []*einoschema.AgenticMessage) []string {
+	var names []string
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil || block.Type != einoschema.ContentBlockTypeToolSearchResult || block.ToolSearchFunctionToolResult == nil {
+				continue
+			}
+			result := block.ToolSearchFunctionToolResult.Result
+			if result == nil {
+				continue
+			}
+			for _, info := range result.Tools {
+				if info != nil && info.Name != "" {
+					names = append(names, info.Name)
+				}
+			}
+		}
+	}
+	return names
+}
+
 // --- Orchestrator construction ---------------------------------------------
 
 func newTestOrchestrator(t *testing.T, store session.Store, registry *composition.Registry, streamer model.Streamer) *runtime.StreamingOrchestrator {
 	t.Helper()
+	return newTestOrchestratorWithIDs(t, store, registry, streamer, &testIDs{})
+}
+
+// newTestOrchestratorWithIDs is newTestOrchestrator with an explicit
+// runtime.IDGenerator, for tests that construct a second, independent
+// *runtime.StreamingOrchestrator instance (simulating a process restart)
+// against a store a first instance already wrote to: a second bare
+// &testIDs{} would restart its counter from 1 and collide with IDs the
+// first instance already durably used (this harness's testIDs is a
+// process-local sequential counter, not the UUID/ULID generation a real
+// deployment would use, which never collides like this across restarts).
+// Passing the SAME *testIDs across both instances keeps the counter
+// monotonic across the simulated restart without reintroducing any of the
+// production-relevant in-memory state (discovered-tool sets, provider
+// state, etc.) the restart is meant to drop.
+func newTestOrchestratorWithIDs(t *testing.T, store session.Store, registry *composition.Registry, streamer model.Streamer, ids *testIDs) *runtime.StreamingOrchestrator {
+	t.Helper()
 	orch, err := runtime.NewStreamingOrchestrator(
 		runtime.WithStore(store),
 		runtime.WithRunPlanProvider(registry),
-		runtime.WithIDGenerator(&testIDs{}),
+		runtime.WithIDGenerator(ids),
 		runtime.WithOwnerID("agentic-middleware-example"),
 		runtime.WithModelResolver(testResolver{streamer: streamer}),
 	)

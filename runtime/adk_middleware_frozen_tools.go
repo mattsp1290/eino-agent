@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cloudwego/eino/components/tool"
 	einoschema "github.com/cloudwego/eino/schema"
 )
 
@@ -30,21 +29,7 @@ func (h handlerToolExecutor) Execute(ctx context.Context, call ToolCall) (ToolRe
 	if !ok {
 		return ToolResult{}, fmt.Errorf("%w: handler tool %q has no live instance this turn", errADKUnsupportedBlock, h.name)
 	}
-	if enhanced, ok := live.(tool.EnhancedInvokableTool); ok {
-		result, err := enhanced.InvokableRun(ctx, &einoschema.ToolArgument{Text: string(call.Input)})
-		if err != nil {
-			return ToolResult{}, err
-		}
-		return convertEnhancedToolResult(result), nil
-	}
-	if invokable, ok := live.(tool.InvokableTool); ok {
-		output, err := invokable.InvokableRun(ctx, string(call.Input))
-		if err != nil {
-			return ToolResult{}, err
-		}
-		return ToolResult{Output: output}, nil
-	}
-	return ToolResult{}, fmt.Errorf("%w: handler tool %q supports neither invokable nor enhanced-invokable execution", errADKUnsupportedBlock, h.name)
+	return invokeLiveTool(ctx, live, call)
 }
 
 // convertEnhancedToolResult maps an upstream *schema.ToolResult (an
@@ -106,33 +91,38 @@ func mediaResultPart(kind ToolResultPartType, url, base64Data, mimeType string) 
 	return ToolResultPart{Type: kind, Media: &ToolResultMedia{URL: url, Base64Data: base64Data, MIMEType: mimeType}}, true
 }
 
-// toolSearchHandlerToolExecutor wraps handlerToolExecutor for the
-// dynamictool/toolsearch recipe's own sealed search tool (HandlerKindToolSearch):
-// upstream's toolSearchTool.InvokableRun settles as an ordinary function
-// result and never calls this runtime's own markDiscovered the way the
-// native tool-search path (adkToolSearch/executeToolSearchCall,
-// runtime/tool_search.go) does, so a deferred tool the model just found
-// through it was denied at its next call with "is deferred and no tool
-// search is configured" even though discovery genuinely happened -- see the
-// W6 round-1 review's I4 finding (the exact chain:
-// adk_middleware_frozen_tools.go's plain handlerToolExecutor ->
-// tool_preparation.go's undiscovered-deferred-tool gate ->
-// tool_execution.go settling it "expected_failure").
+// toolSearchHandlerToolExecutor marks the dynamictool/toolsearch recipe's
+// own sealed search tool (HandlerKindToolSearch) among sealHandlerTools'
+// ordinary handler-tool entries: adkTool.InvokableRun type-asserts a call's
+// tool.Executor against this type to route it through
+// adkEngine.executeAndSettleHandlerToolSearch (runtime/tool_search.go)
+// instead of the ordinary durable claim/execute/settle path
+// (executeAndSettleClaimedTool) every other handler tool uses.
 //
-// This wrapper closes that gap the bounded way: after a successful call, it
-// parses the matched tool names out of the result and marks them
-// discovered in this run's execution (runExecution.markDiscovered), the
-// SAME in-memory set TurnSnapshot.ProviderRequest and the undiscovered-
-// deferred-tool gate both consult. It is NOT full parity with the native
-// tool-search path: discovery here is recorded only in-memory for the live
-// run, never durably as a tool_search_result content block, so
-// discoveredToolsFromHistory cannot recover it after a resume/restart, and
-// the model is never actually re-advertised the tool the SAME cycle it
-// searched (only the next one) -- both are the same "next cycle, not
-// mid-cycle" limitation the native path already has. See
-// docs/architecture/eino-feature-support.md's W6 section for the preferred,
-// not-yet-built fix (mapping this recipe onto a native ToolSearchRegistration
-// instead).
+// Round-one W6 review finding I4: upstream's toolSearchTool.InvokableRun
+// settles as an ordinary function result and never calls this runtime's
+// own markDiscovered the way the native tool-search path
+// (adkToolSearch/executeToolSearchCall) does, so a deferred tool the model
+// just found through it was denied at its next call with "is deferred and
+// no tool search is configured" even though discovery genuinely happened.
+// Round-two fix: executeAndSettleHandlerToolSearch settles the call as a
+// durable tool_search_result block (buildTerminalToolSearchEnvelope) and
+// marks matches discovered via markDiscovered, the SAME durable mechanism
+// the native path uses, so discoveredToolsFromHistory/
+// discoveredToolsFromMessages can replay the discovery on the next turn,
+// after a resume, and after a process restart -- not merely for the live
+// run's own in-memory set.
+//
+// Execute below is consequently DEAD in every real code path (handler-
+// sealed tools, this one included, are only ever produced by
+// adkEngine.sealHandlerTools, which only an ADK-driven run ever builds, and
+// every ADK-driven run's tool dispatch -- fresh or resumed -- goes through
+// adkTool.InvokableRun's branch above, never through the ordinary
+// executeAndSettleClaimedTool path this method's embedded
+// handlerToolExecutor.Execute would need). It is kept only as a defensive
+// fallback (and to keep this type a genuine ToolExecutor) should that
+// invariant ever be violated; toolSearchMatchedNames is the one piece of
+// logic still genuinely shared with the live path.
 type toolSearchHandlerToolExecutor struct {
 	handlerToolExecutor
 }

@@ -233,7 +233,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 			Input:           cloneJSON(claimed.Input),
 			Context:         toolContext.Clone(),
 		}
-		settledTool, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, toolCall, claimed, nil)
+		settledTool, err := execution.executeAndSettleClaimedTool(ctx, snapshot, tool, toolCall, claimed, nil, nil)
 		if err != nil {
 			return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
 		}

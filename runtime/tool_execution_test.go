@@ -43,7 +43,7 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 	)
 	plan := newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})
 	call := runtimeCallFromClaim(tool, claimed)
-	settled, err := newRunExecution(orchestrator, plan, run).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
+	settled, err := newRunExecution(orchestrator, plan, run).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil, nil)
 	if err != nil {
 		t.Fatalf("execute and settle: %v", err)
 	}

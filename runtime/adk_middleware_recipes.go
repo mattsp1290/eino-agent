@@ -296,25 +296,35 @@ type ReductionConfig struct {
 // private, workspace-scoped scratch backend via upstream reduction.NewTyped,
 // with the default (character-estimate) token counter.
 //
-// Only cfg.MaxTokensForClear is effective in this runtime; cfg.MaxLengthForTrunc
-// is accepted (upstream requires it non-zero) but its truncation-via-tool-
-// wrapper mechanism (upstream's WrapInvokableToolCall/WrapEnhancedInvokableToolCall,
-// which intercepts a tool's own return value at execution time) does not
-// survive this runtime's per-cycle durable baseline: durableBaselineHandler
-// rebuilds state.Messages fresh from the durable settlement every cycle,
-// discarding whatever a wrapped tool call's own in-flight return value held
-// from an earlier cycle. Clearing works because it operates via
-// BeforeModelRewriteState -- the same seam durableBaselineHandler/
-// wrapAuthorizedContentRewrites are built for -- so it is applied fresh,
-// every cycle, directly against the current baseline. Set MaxTokensForClear
-// low enough (and remember upstream's own default ClearRetentionSuffixLimit
-// of 1 always protects the single most-recent tool-call round from
-// clearing) to actually shrink what the model sees; see
-// TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite for a
-// worked, non-false-positive example. Use
-// NewReductionHandlerFactoryWithTokenCounter to inject a custom counter --
-// funcs cannot round-trip through the JSON-serializable Config, so injection
-// is a separate constructor rather than a Config field.
+// Both cfg.MaxLengthForTrunc and cfg.MaxTokensForClear are effective, but
+// through two different mechanisms with two different timings:
+//
+//   - MaxLengthForTrunc (truncation) applies per call, at EXECUTION time,
+//     before this runtime durably settles the tool call: mw's own
+//     WrapInvokableToolCall/WrapEnhancedInvokableToolCall is threaded
+//     through adkEngine.applyHandlerToolResultWrappers, called from
+//     executeClaimedToolPipeline before buildToolSettlement/persistToolSettlement
+//     -- the plan's "result transforms occur before settlement and event
+//     emission" requirement. The settled row IS the truncated form (with
+//     reduction's own offload reference), not an in-memory rewrite of an
+//     already-settled result, so there is nothing for settlementSeal to
+//     authorize here at all -- see
+//     TestReductionTruncatesToolResultBeforeSettlement.
+//   - MaxTokensForClear (clearing) applies across the WHOLE conversation's
+//     accumulated size, which cannot be decided at any single tool's own
+//     execution time, so it stays a post-settlement rewrite of the durable
+//     baseline via BeforeModelRewriteState, explicitly authorized through
+//     wrapAuthorizedContentRewrites/settlementSeal exactly like
+//     patchtoolcalls' own patches. Set it low enough (and remember
+//     upstream's own default ClearRetentionSuffixLimit of 1 always
+//     protects the single most-recent tool-call round from clearing) to
+//     actually shrink what the model sees; see
+//     TestReductionClearsOlderSettledResultAsAuthorizedRewrite for a
+//     worked, non-false-positive example.
+//
+// Use NewReductionHandlerFactoryWithTokenCounter to inject a custom
+// counter -- funcs cannot round-trip through the JSON-serializable Config,
+// so injection is a separate constructor rather than a Config field.
 func NewReductionHandlerFactory(cfg ReductionConfig) HandlerFactory {
 	return NewReductionHandlerFactoryWithTokenCounter(cfg, nil)
 }

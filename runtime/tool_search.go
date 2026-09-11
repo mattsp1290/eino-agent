@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/components/tool"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/extension"
@@ -316,6 +317,128 @@ func (e *runExecution) executeToolSearchCall(ctx context.Context, snapshot TurnS
 	e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, searchTool, call, settlement.Status, completedAt.Sub(startedAt), nil, nil)
 	e.markDiscovered(toolNamesOf(matches)...)
 	return matches, nil
+}
+
+// executeAndSettleHandlerToolSearch is the toolsearch RECIPE's own durable-
+// discovery settlement path (round-two W6 review item 1): unlike an
+// ordinary handler tool (handlerToolExecutor, settled as a
+// function_tool_result via buildToolSettlement), the toolsearch recipe's
+// own sealed search tool settles as a durable tool_search_result block via
+// buildTerminalToolSearchEnvelope and marks every matched deferred tool
+// discovered (runExecution.markDiscovered) -- the SAME durable mechanism
+// the native tool-search path (executeToolSearchCall) uses, so
+// discoveredToolsFromHistory/discoveredToolsFromMessages can replay the
+// discovery on the next turn, after ResumeRun, and after a process
+// restart, instead of only marking discovery in-memory for the live run.
+//
+// The upstream toolsearch middleware's own search/selection LOGIC is still
+// reused verbatim (never reimplemented): this only changes how its RESULT
+// is durably settled. The call is already claimed by the caller
+// (adkTool.InvokableRun), unlike executeToolSearchCall (used by the native
+// adkToolSearch path, which is never pre-claimed and claims for itself).
+func (e *adkEngine) executeAndSettleHandlerToolSearch(ctx context.Context, tool Tool, call ToolCall, claimed session.ToolCall, prepareErr error) (settledTool, error) {
+	snapshot := e.snapshot
+	execution := e.execution
+	startedAt := claimed.StartedAt
+	execution.host.observeToolMaterialized(ctx, snapshot, tool, call)
+	observedTool := execution.host.startObservedToolCall(ctx, snapshot, tool, call)
+	failSettlement := func(err error) (settledTool, error) {
+		execution.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
+		execution.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, session.ToolCallFailed, execution.host.now().Sub(startedAt), err, nil)
+		return settledTool{}, err
+	}
+	if prepareErr != nil {
+		return failSettlement(prepareErr)
+	}
+	live, ok := e.handlerTools[tool.Name]
+	if !ok {
+		return failSettlement(fmt.Errorf("%w: handler tool %q has no live instance this turn", errADKUnsupportedBlock, tool.Name))
+	}
+	raw, err := invokeLiveTool(ctx, live, call)
+	if err != nil {
+		return failSettlement(err)
+	}
+	matches := resolveMatchedDeferredTools(snapshot, toolSearchMatchedNames(raw))
+	completedAt := execution.host.now()
+	messageAt, err := execution.nextDurableMessageTime(ctx, snapshot.SessionID, completedAt)
+	if err != nil {
+		return failSettlement(err)
+	}
+	settlement, err := buildTerminalToolSearchEnvelope(terminalToolSearchEnvelopeInput{
+		Claimed: claimed, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt, MessageAt: messageAt,
+		BlockID: string(execution.host.ids.NewPartID()), ContentLimits: execution.host.contentLimits, Matches: matches,
+	})
+	if err != nil {
+		return failSettlement(err)
+	}
+	if _, err := execution.persistToolSettlement(ctx, claimed, settlement, toolTransitionEnvelope(execution.host, snapshot, completedAt)); err != nil {
+		return failSettlement(err)
+	}
+	extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
+		SessionID: snapshot.SessionID, RunID: snapshot.RunID, ToolCallID: claimed.ID, ToolName: claimed.Name, Status: settlement.Status,
+	})
+	execution.host.finishObservedToolCall(observedTool, settlement.Status, nil, nil)
+	execution.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, tool, call, settlement.Status, completedAt.Sub(startedAt), nil, nil)
+	execution.markDiscovered(toolNamesOf(matches)...)
+	// settledTool.Output is left zero: a tool_search_result settlement has
+	// no ToolOutput/Content record the way an ordinary function result
+	// does; callers only need Settlement/Outcome.
+	return settledTool{Settlement: settlement}, nil
+}
+
+// resolveMatchedDeferredTools maps upstream toolsearch's own matched tool
+// names onto this run's frozen, resolved Tool entries -- it references only
+// snapshot.Tools (the turn's frozen registry), so a match can never name a
+// tool absent from it, exactly like the native search path's
+// searchDeferredTools. A name upstream returned that does not resolve to a
+// known deferred tool in this run is silently dropped rather than failing
+// the whole search: upstream's own matching may be broader (e.g. matching
+// on description text) than what this run's frozen registry actually
+// contains.
+func resolveMatchedDeferredTools(snapshot TurnSnapshot, names []string) []Tool {
+	if len(names) == 0 {
+		return nil
+	}
+	byName := make(map[string]Tool, len(snapshot.Tools))
+	for _, t := range snapshot.Tools {
+		if t.Deferred {
+			byName[t.Name] = t
+		}
+	}
+	matches := make([]Tool, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		if t, ok := byName[name]; ok {
+			seen[name] = true
+			matches = append(matches, t)
+		}
+	}
+	return matches
+}
+
+// invokeLiveTool calls a live handler tool instance directly (not through
+// the durable claim/execute/settle pipeline -- the caller owns that),
+// mirroring handlerToolExecutor.Execute's own InvokableTool/
+// EnhancedInvokableTool dispatch so both paths behave identically.
+func invokeLiveTool(ctx context.Context, live tool.BaseTool, call ToolCall) (ToolResult, error) {
+	if enhanced, ok := live.(tool.EnhancedInvokableTool); ok {
+		result, err := enhanced.InvokableRun(ctx, &einoschema.ToolArgument{Text: string(call.Input)})
+		if err != nil {
+			return ToolResult{}, err
+		}
+		return convertEnhancedToolResult(result), nil
+	}
+	if invokable, ok := live.(tool.InvokableTool); ok {
+		output, err := invokable.InvokableRun(ctx, string(call.Input))
+		if err != nil {
+			return ToolResult{}, err
+		}
+		return ToolResult{Output: output}, nil
+	}
+	return ToolResult{}, fmt.Errorf("%w: handler tool %q supports neither invokable nor enhanced-invokable execution", errADKUnsupportedBlock, call.Name)
 }
 
 // discoveredToolsFromMessages rebuilds the advertised set of deferred tool
