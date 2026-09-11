@@ -588,6 +588,12 @@ func Run(t *testing.T, factory Factory) {
 		if claimed.Event.ID != "event-claim-1" || claimed.Event.ToolTransition != session.ToolTransitionRunning {
 			t.Fatalf("claim transition result = %#v", claimed)
 		}
+		if claimed.Call.ProviderCallID != call.ProviderCallID {
+			t.Fatalf("claimed call provider call id = %q, want %q", claimed.Call.ProviderCallID, call.ProviderCallID)
+		}
+		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 1 || unfinished[0].ProviderCallID != call.ProviderCallID {
+			t.Fatalf("unfinished = %#v err=%v, want one call with provider call id %q", unfinished, err, call.ProviderCallID)
+		}
 		if _, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{ID: call.ID, ClaimedBy: "worker-2", ClaimToken: "claim-2", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolEvent("event-claim-2", startedAt)}); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("second claim err = %v, want ErrConflict", err)
 		}
@@ -619,6 +625,30 @@ func Run(t *testing.T, factory Factory) {
 			ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: s.ID, RunID: r.ID, ParentID: msg.ID, Role: session.RoleUser, CreatedAt: completedAt, UpdatedAt: completedAt},
 			ResultPart:    resultParts[0],
 		}
+		// A result envelope keyed on the call's PROVIDER id (rather than its
+		// durable id) must be refused by the settle fence: the durable id is
+		// the only identity the store's tool-call bookkeeping ever keys on
+		// (ProviderCallID exists purely so publicizeToolCallIDs can show the
+		// wire back the provider's own id -- see session.ToolCall.ProviderCallID),
+		// so a result part whose FunctionResult.CallID is the provider id
+		// instead of the durable id is exactly the shape a bug in that
+		// rewrite (or a corrupted replay) would produce, and must not settle
+		// silently against the wrong identity.
+		tamperedParts, err := session.EncodeContentParts(session.Content{
+			Role: session.RoleUser,
+			Blocks: []session.ContentBlock{{
+				ID: "block-result-part-1-tampered", Kind: session.BlockKindFunctionToolResult,
+				FunctionResult: &session.FunctionResultBlock{CallID: call.ProviderCallID, Name: "file_read", Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(output)}}},
+			}},
+		}, func() session.PartID { return call.ResultPartID }, call.ResultMessageID, s.ID, r.ID, completedAt, session.DefaultContentLimits())
+		if err != nil {
+			t.Fatalf("encode tampered tool result content: %v", err)
+		}
+		tampered := settlement
+		tampered.ResultPart = tamperedParts[0]
+		if _, err := execution.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: tampered, Event: toolEvent("event-terminal-tampered", completedAt)}); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("provider-id result envelope settle = %v, want ErrConflict", err)
+		}
 		settleRequest := session.SettleToolCallRequest{Settlement: settlement, Event: toolEvent("event-terminal", completedAt)}
 		settled, err := execution.SettleToolCall(ctx, settleRequest)
 		if err != nil {
@@ -647,6 +677,64 @@ func Run(t *testing.T, factory Factory) {
 		}
 		if unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID); err != nil || len(unfinished) != 0 {
 			t.Fatalf("unfinished calls = %d, err = %v; want none after settlement", len(unfinished), err)
+		}
+	})
+
+	t.Run("unfinished tool calls are ordered by declared position, not minted id", func(t *testing.T) {
+		// ListUnfinishedToolCalls is used by both the legacy non-ADK
+		// resumeRun (executes calls in this order) and by
+		// terminalizeUnfinishedTools crash reconciliation (interrupts calls
+		// in this order): it must reflect the order the calls were declared
+		// in (the request assistant message's own creation order, then the
+		// call's block position within it), not the lexical order of their
+		// minted ids. This test picks ids that sort in the OPPOSITE order
+		// from how the calls were declared/created, so a regression to
+		// "order by tool_calls.id" would be caught immediately.
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-tool-order")
+		r := admitRun(t, ctx, subject.Store, run("run-tool-order", s.ID, "owner"))
+		execution := executionFor(subject.Store, r)
+
+		createOrderedToolCall := func(id session.ToolCallID, msgSuffix string) {
+			t.Helper()
+			msg := appendMessage(t, ctx, execution, message(session.MessageID("msg-order-"+msgSuffix), s.ID, r.ID, session.RoleAssistant))
+			createdAt := time.Now().UTC()
+			requestParts, err := session.EncodeContentParts(session.Content{
+				Role: session.RoleAssistant,
+				Blocks: []session.ContentBlock{{
+					ID: "block-order-" + msgSuffix, Kind: session.BlockKindFunctionToolCall,
+					FunctionCall: &session.FunctionCallBlock{CallID: string(id), Name: "file_read", Arguments: "{}"},
+				}},
+			}, func() session.PartID { return session.PartID("request-part-order-" + msgSuffix) }, msg.ID, s.ID, r.ID, createdAt, session.DefaultContentLimits())
+			if err != nil {
+				t.Fatalf("encode tool request content: %v", err)
+			}
+			call := session.ToolCall{
+				ID: id, SessionID: s.ID, RunID: r.ID, MessageID: msg.ID,
+				RequestPartID:   requestParts[0].ID,
+				ResultMessageID: session.MessageID("result-message-order-" + msgSuffix), ResultPartID: session.PartID("result-part-order-" + msgSuffix),
+				Name: "file_read", Input: json.RawMessage(`{}`), Status: session.ToolCallPending, RetrySafe: true,
+			}
+			if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+				Call: call, RequestPart: requestParts[0], Event: toolEvent(session.EventID("event-order-"+msgSuffix), createdAt),
+			}); err != nil {
+				t.Fatalf("create tool call %s: %v", id, err)
+			}
+		}
+
+		// "zzz-first" is created first but sorts lexically AFTER
+		// "aaa-second", which is created second: declared/creation order is
+		// [zzz-first, aaa-second], the reverse of lexical id order.
+		createOrderedToolCall("zzz-first", "1")
+		createOrderedToolCall("aaa-second", "2")
+
+		unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("list unfinished tool calls: %v", err)
+		}
+		if len(unfinished) != 2 || unfinished[0].ID != "zzz-first" || unfinished[1].ID != "aaa-second" {
+			t.Fatalf("unfinished order = %#v, want [zzz-first, aaa-second] (declared order, not lexical id order)", unfinished)
 		}
 	})
 

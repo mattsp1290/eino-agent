@@ -104,8 +104,18 @@ func (s *Store) ListUnfinishedToolCalls(ctx context.Context, runID session.RunID
 	if err != nil {
 		return nil, err
 	}
+	// Ordered by the call's declared position -- the request assistant
+	// message's own creation order (reqm.row_key, an auto-increment
+	// identity), then the call's block position within that message
+	// (reqp.ordinal) -- not tool_calls.id: minted ids sort lexically by the
+	// IDGenerator's own format (a sequence generator's "tool-call-10" sorts
+	// before "tool-call-9"; a UUID generator's sorts arbitrarily), which has
+	// no relationship to the order the model actually declared the calls
+	// in. resumeRun (legacy non-ADK resume) executes calls in this order and
+	// terminalizeUnfinishedTools interrupts them in this order, so both must
+	// see the calls in the order they were requested.
 	var rows []toolCallRow
-	err = s.toolCallQuery(ctx).Where("tool_calls.run_key = ? AND tool_calls.status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Order("tool_calls.id").Find(&rows).Error
+	err = s.toolCallQuery(ctx).Where("tool_calls.run_key = ? AND tool_calls.status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Order("reqm.row_key, reqp.ordinal").Find(&rows).Error
 	if err != nil {
 		return nil, s.mapErr(err)
 	}
