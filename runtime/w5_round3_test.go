@@ -6,10 +6,12 @@ import (
 	"encoding/gob"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
@@ -128,35 +130,89 @@ func TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation(t *testing.T) {
 	}
 }
 
-// upstreamTurnLoopCheckpointShape is a field-identical mirror of eino's
-// private adk.turnLoopCheckpoint[session.InboxID] (adk/turn_loop.go): gob
-// matches by field name and type, not by concrete struct identity, so
-// decoding marshalEmptyLoopCheckpoint's bytes into this type proves what
-// eino's own unmarshalTurnLoopCheckpoint would see, without importing an
-// unexported upstream type. Round-three reconciliation item 5 (SR-5): the
-// turnLoopCheckpointShape doc comment in adk_checkpoint.go claims this
-// round trip is verified by a test; this is that test.
-type upstreamTurnLoopCheckpointShape struct {
-	RunnerCheckpoint []byte
-	HasRunnerState   bool
-	UnhandledItems   []session.InboxID
-	CanceledItems    []session.InboxID
+// staticCheckpointStore is a minimal adk.CheckPointStore that always
+// returns the same staged bytes for any checkpoint ID -- used by
+// TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop to hand a real
+// adk.TurnLoop a checkpoint payload without going through this package's
+// own adkCheckpointStore adapter (which would only prove this package's own
+// round trip, not upstream's).
+type staticCheckpointStore struct {
+	bytes []byte
 }
 
-func TestEmptyLoopCheckpointMatchesUpstreamGobShape(t *testing.T) {
-	raw, err := marshalEmptyLoopCheckpoint()
-	if err != nil {
-		t.Fatalf("marshalEmptyLoopCheckpoint: %v", err)
+func (s *staticCheckpointStore) Get(context.Context, string) ([]byte, bool, error) {
+	return s.bytes, true, nil
+}
+
+func (s *staticCheckpointStore) Set(context.Context, string, []byte) error {
+	return nil
+}
+
+// TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop proves round-four
+// reconciliation item 4 (CR-I3): unlike the round-three
+// TestEmptyLoopCheckpointMatchesUpstreamGobShape it replaces (which decoded
+// turnLoopCheckpointShape's OWN bytes into a hand-written duplicate declared
+// in this same test file -- so a rename of a field in BOTH places together
+// would still pass, and the zero-shape assertion could not even detect a
+// single renamed field), this test drives a NON-ZERO encoded shape through
+// eino's real adk.TurnLoop: the CheckPointStore below stages the raw bytes,
+// and a real TurnLoop.Run performs eino's own unmarshalTurnLoopCheckpoint +
+// tryLoadCheckpoint, handing the decoded UnhandledItems to GenInput. A
+// renamed field in turnLoopCheckpointShape decodes to its zero value through
+// gob (fields are matched by name), so GenInput would receive an empty (or
+// wrong) batch instead of the two items encoded below, failing the
+// assertion loudly.
+func TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop(t *testing.T) {
+	encoded := turnLoopCheckpointShape{UnhandledItems: []session.InboxID{"shape-item-a", "shape-item-b"}}
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(encoded); err != nil {
+		t.Fatalf("encode: %v", err)
 	}
-	if len(raw) == 0 {
-		t.Fatal("empty payload would fail decodeCheckpointEnvelope's len(Payload) != 0 guard")
+	store := &staticCheckpointStore{bytes: buf.Bytes()}
+
+	var mu sync.Mutex
+	var gotItems []session.InboxID
+	var prepareAgentCalled bool
+
+	cfg := adk.TurnLoopConfig[session.InboxID, *einoschema.AgenticMessage]{
+		CheckpointID: "cp-shape-test",
+		Store:        store,
+		GenInput: func(_ context.Context, loop *adk.TurnLoop[session.InboxID, *einoschema.AgenticMessage], items []session.InboxID) (*adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage], error) {
+			mu.Lock()
+			gotItems = append([]session.InboxID(nil), items...)
+			mu.Unlock()
+			// Stop synchronously from inside GenInput (the same technique
+			// genInput's own duplicate-delivery guard uses, see
+			// runtime/turn_loop.go): the run loop re-checks
+			// stopCtrl.isCommitted() immediately after this call returns
+			// and, when true, never calls PrepareAgent -- so this test
+			// needs no working agent/model at all to prove what items
+			// GenInput received.
+			loop.Stop(adk.WithSkipCheckpoint(), adk.WithStopCause("shape-test-stop"))
+			return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
+				Input:    &adk.TypedAgentInput[*einoschema.AgenticMessage]{},
+				Consumed: items,
+			}, nil
+		},
+		PrepareAgent: func(context.Context, *adk.TurnLoop[session.InboxID, *einoschema.AgenticMessage], []session.InboxID) (adk.TypedAgent[*einoschema.AgenticMessage], error) {
+			mu.Lock()
+			prepareAgentCalled = true
+			mu.Unlock()
+			return nil, errors.New("PrepareAgent must not be called: GenInput stops the loop before dispatch")
+		},
 	}
-	var out upstreamTurnLoopCheckpointShape
-	if err := gob.NewDecoder(bytes.NewReader(raw)).Decode(&out); err != nil {
-		t.Fatalf("eino's unmarshalTurnLoopCheckpoint would fail decoding this payload: %v", err)
+	loop := adk.NewTurnLoop(cfg)
+	loop.Run(context.Background())
+	loop.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if prepareAgentCalled {
+		t.Fatal("PrepareAgent was called; GenInput's synchronous Stop should have prevented dispatch")
 	}
-	if out.HasRunnerState || len(out.RunnerCheckpoint) != 0 || len(out.UnhandledItems) != 0 || len(out.CanceledItems) != 0 {
-		t.Fatalf("decoded = %+v, want the zero between-turns shape", out)
+	want := []session.InboxID{"shape-item-a", "shape-item-b"}
+	if !reflect.DeepEqual(gotItems, want) {
+		t.Fatalf("GenInput received items = %#v, want %#v -- this is eino's own unmarshalTurnLoopCheckpoint + tryLoadCheckpoint running, so a renamed field in turnLoopCheckpointShape fails here", gotItems, want)
 	}
 }
 
