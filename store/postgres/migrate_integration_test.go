@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io/fs"
 	"reflect"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 
@@ -19,6 +21,40 @@ import (
 
 func TestPostgresMigration(t *testing.T) {
 	server := testpostgres.Start(t)
+
+	// Suite-wide ownership guard: discardPGXConnection must only ever run on
+	// the goroutine that owns the *sql.Conn being discarded. Subtests that
+	// need discardObserved for their own purposes
+	// (canceled_waiter_race's rendezvous hook, canceled_waiter_owner_race's
+	// own, stricter per-iteration version) save this hook, install their
+	// own, and restore this one via t.Cleanup when done, so it stays armed
+	// for every other subtest - including physical_cleanup/expire, where
+	// the cleanupTimeout timer genuinely fires while the owner is blocked
+	// inside pg_sleep on the same *sql.Conn: exactly the shape a non-owner
+	// discard would need to hide in, and the one that a single-subtest
+	// version of this check could not see.
+	var suiteForeignDiscard atomic.Bool
+	var suiteForeignStack atomic.Pointer[string]
+	suiteHook := func(conn *sql.Conn, entering bool) {
+		if !entering {
+			return
+		}
+		buf := make([]byte, 16<<10)
+		trace := string(buf[:runtime.Stack(buf, false)])
+		if nonOwnerDiscardFrame(trace) {
+			suiteForeignDiscard.Store(true)
+			suiteForeignStack.Store(&trace)
+		}
+	}
+	discardObserved.Store(&suiteHook)
+	t.Cleanup(func() {
+		discardObserved.Store(nil)
+		if suiteForeignDiscard.Load() {
+			t.Fatalf("discardPGXConnection ran on a non-owner goroutine somewhere in "+
+				"this suite:\n%s", *suiteForeignStack.Load())
+		}
+	})
+
 	t.Run("lifecycle", func(t *testing.T) {
 		for _, state := range []schemaState{schemaEmpty, schemaBootstrap, schemaCurrent} {
 			db := server.Database(t).Open(t)
@@ -119,8 +155,17 @@ func TestPostgresMigration(t *testing.T) {
 			t.Fatalf("host settings changed: %q %q", path, quote)
 		}
 	})
+	t.Run("cancel_before_bind_aborts_pool_wait", func(t *testing.T) {
+		testMigrationCancelBeforeBindAbortsPoolWaitPromptly(t, server)
+	})
+	t.Run("discard_after_interrupt_no_io_avoids_misleading_error", func(t *testing.T) {
+		testMigrationDiscardAfterInterruptWithNoFurtherIOAvoidsMisleadingError(t, server)
+	})
 	t.Run("concurrent", func(t *testing.T) { testConcurrentMigration(t, server) })
 	t.Run("canceled_waiter", func(t *testing.T) { testCanceledMigration(t, server) })
+	t.Run("canceled_waiter_race", func(t *testing.T) { testCanceledMigrationRace(t, server) })
+	t.Run("canceled_waiter_owner_race", func(t *testing.T) { testCanceledMigrationOwnerRace(t, server) })
+	t.Run("delegate_error", func(t *testing.T) { testMigrationLockDelegateError(t, server) })
 	t.Run("physical_cleanup", func(t *testing.T) { testPhysicalMigrationCleanup(t, server) })
 }
 
