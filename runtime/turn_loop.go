@@ -1462,12 +1462,13 @@ type StopPolicy struct {
 	// (session.RunInterrupted), retiring its checkpoints (the plan's
 	// "Stop-with-abandon", docs/architecture/eino-feature-support.md's W5
 	// section): the operator escape for a paused run nobody intends to
-	// resume. It has no effect when a live loop IS registered for runID in
-	// this process (that case is already reachable via Graceful/Immediate,
-	// or Handle.Interrupt for a skip-checkpoint terminal stop); it applies
-	// ONLY to the no-live-loop, durably-paused case that would otherwise
-	// report ErrInvalidOrchestrator with no way forward. See
-	// (*StreamingOrchestrator).abandonPausedRun.
+	// resume. It applies ONLY to the no-live-loop, durably-paused case that
+	// would otherwise report ErrInvalidOrchestrator with no way forward.
+	// When a live loop IS registered for runID in this process, Stop
+	// reports ErrInvalidOrchestrator rather than silently downgrading to an
+	// ordinary stop -- that case is already reachable via Graceful/
+	// Immediate, or Handle.Interrupt for a skip-checkpoint terminal stop.
+	// See (*StreamingOrchestrator).abandonPausedRun.
 	Abandon bool
 }
 
@@ -1484,6 +1485,17 @@ func (o *StreamingOrchestrator) Stop(ctx context.Context, runID session.RunID, p
 			return o.abandonPausedRun(ctx, runID, policy.Cause)
 		}
 		return fmt.Errorf("%w: run %s has no live loop in this process", ErrInvalidOrchestrator, runID)
+	}
+	if policy.Abandon {
+		// Abandon is the escape for a durably PAUSED run this process is
+		// NOT driving (see StopPolicy.Abandon). A live loop is reachable
+		// via Graceful/Immediate (or Handle.Interrupt for a skip-checkpoint
+		// terminal stop); silently downgrading Abandon to a bare Stop()
+		// here would return nil while leaving the run nonterminal -- and a
+		// caller that believed it had abandoned the run would then fail
+		// ErrSessionBusy on its next Start. Refuse instead, matching
+		// docs/consumer-guide.md.
+		return fmt.Errorf("%w: run %s has a live loop in this process; stop it first (Graceful/Immediate), then abandon the resulting paused run", ErrInvalidOrchestrator, runID)
 	}
 	opts := []adk.StopOption{}
 	if policy.Cause != "" {
@@ -1520,7 +1532,7 @@ func (o *StreamingOrchestrator) abandonPausedRun(ctx context.Context, runID sess
 		return err
 	}
 	if !run.Paused() {
-		return fmt.Errorf("%w: run %s has no live loop in this process", ErrInvalidOrchestrator, runID)
+		return fmt.Errorf("%w: run %s is %s, not paused; Stop-with-abandon applies only to a durably paused run", ErrInvalidOrchestrator, runID, run.Status)
 	}
 	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
 	if err != nil {
@@ -1955,6 +1967,15 @@ func (o *StreamingOrchestrator) resumeStartFailureRepause(ctx context.Context, e
 	}
 	handle.done <- Result{RunID: runID, Status: status, Error: resultErr}
 	close(handle.done)
+	// Handle's contract (types.go): AwaitPause reports the durably promoted
+	// pause this run reaches, or is closed without a value if the run
+	// instead settles terminally -- never closed with no value while Done()
+	// reports RunPaused. runReconcileCrashedRun (interrupt.go) already gets
+	// this right; this compensation path must too (round-four reconciliation
+	// item 5/CR-I4's ambiguity, round-seven fix-pass-6 item 4/MG-I5).
+	if status == session.RunPaused {
+		handle.pause <- PauseInfo{RunID: runID, StopCause: "resume-start-failure-repause"}
+	}
 	close(handle.pause)
 	execution.release()
 }
