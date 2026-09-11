@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cloudwego/eino/adk"
 	einomodel "github.com/cloudwego/eino/components/model"
@@ -107,23 +108,51 @@ type adkEngine struct {
 	// guard is the durableGuard instance buildAgent handed this turn's
 	// AgentFactory (as AgentBuildContext.Guard). onAgentEvents checks
 	// guard.hasRun() after the agent finishes: a compliant agent's
-	// BeforeAgent hook always fires before any model dispatch, so this is
-	// the engine-side proof the factory actually installed it (see
-	// guardRan's doc comment).
+	// BeforeAgent hook always fires before any model dispatch, so this
+	// detects a factory that never wires AgentBuildContext.Guard into its
+	// agent's handler chain at all (see guardRan's doc comment). It does
+	// NOT detect a factory that installs the guard but substitutes its own
+	// model instead of build.Model: BeforeAgent only inspects the agent's
+	// tool list, never its model -- see dispatches below for that case.
 	guard *durableGuard
+	// dispatches counts this turn's durable model dispatches, incremented
+	// by adkModel.begin once a physical call's ledger row is durably
+	// committed. onAgentEvents checks it alongside guardRan after the
+	// events iterator drains: a factory that installs the guard but
+	// substitutes its own model passes guardRan (the guard only inspects
+	// tools) yet never routes a single dispatch through adkModel, so
+	// dispatches stays zero even though the provider was actually called --
+	// this is the engine-side proof that some model output was durably
+	// ledgered this turn (see onAgentEvents in runtime/turn_loop.go). Like
+	// guardRan, this check is necessarily post-hoc: it runs after the
+	// events iterator has fully drained, so a noncompliant factory's own
+	// (unledgered) provider call has already happened by the time the turn
+	// is failed.
+	dispatches atomic.Int64
 }
 
 // guardRan reports whether this turn's durable guard actually fired. A
 // factory that never wires AgentBuildContext.Guard into its agent's handler
-// chain -- or substitutes its own model instead of build.Model -- produces
-// an agent whose execution never touches this engine's adapters at all, so
-// this is the only point that can still detect it (see onAgentEvents in
-// runtime/turn_loop.go).
+// chain at all produces an agent whose execution never touches this
+// engine's adapters, so this is the only point that can still detect that
+// specific noncompliance (see onAgentEvents in runtime/turn_loop.go). See
+// adkEngine.dispatches for the complementary check that catches a factory
+// which installs the guard but substitutes its own model.
 func (e *adkEngine) guardRan() bool {
 	if e == nil || e.guard == nil {
 		return false
 	}
 	return e.guard.hasRun()
+}
+
+// dispatchCount reports how many of this turn's model dispatches were
+// durably ledgered via adkModel.begin -- see adkEngine.dispatches's doc
+// comment.
+func (e *adkEngine) dispatchCount() int64 {
+	if e == nil {
+		return 0
+	}
+	return e.dispatches.Load()
 }
 
 // registerToolBatch records the declared call order for a freshly committed
@@ -519,21 +548,26 @@ type adkToolInterruptState struct {
 func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
 	e := t.engine
 	callID := session.ToolCallID(compose.GetToolCallID(ctx))
-	if callID == "" {
-		return "", errors.New("tool call id missing from ADK context")
-	}
-	// Every exit path below must release the next sibling in this call's
-	// declared batch (see adkEngine.registerToolBatch's doc comment):
-	// compose.parallelRunToolCall never cancels a sibling on this one's
-	// failure, so a return without settling leaves the next call parked in
-	// awaitToolTurn until the run context dies. messageID is refined below
-	// once the durable record loads (the handful of exits before that point
-	// use a best-effort lookup; settleToolTurn treats an unknown callID as a
-	// harmless no-op, since those calls are never registered in a batch).
+	// Every exit path from here down must release the next sibling in this
+	// call's declared batch (see adkEngine.registerToolBatch's doc
+	// comment): compose.parallelRunToolCall never cancels a sibling on this
+	// one's failure, so a return without settling leaves the next call
+	// parked in awaitToolTurn until the run context dies. The defer is
+	// installed before the callID=="" check below (not after) so that
+	// invariant holds with no exception: an empty call ID can never be a
+	// registered batch member in the first place (registerToolBatch only
+	// ever registers IDs ADK itself declared on a committed assistant
+	// message), so messageIDForToolCall("") finds nothing and
+	// settleToolTurn is a harmless no-op for it, exactly like every other
+	// unregistered/unknown callID (see settleToolTurn's doc comment).
+	// messageID is refined below once the durable record loads.
 	messageID := e.messageIDForToolCall(callID)
 	fatal := false
 	defer func() { e.settleToolTurn(messageID, callID, fatal) }()
 
+	if callID == "" {
+		return "", errors.New("tool call id missing from ADK context")
+	}
 	record, err := e.host.store.GetToolCall(ctx, callID)
 	if err != nil {
 		fatal = true
@@ -675,17 +709,18 @@ func (t *adkToolSearch) Info(context.Context) (*einoschema.ToolInfo, error) {
 func (t *adkToolSearch) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
 	e := t.engine
 	callID := session.ToolCallID(compose.GetToolCallID(ctx))
-	if callID == "" {
-		return "", errors.New("tool call id missing from ADK context")
-	}
 	// tool_search participates in the same sibling-batch settlement protocol
-	// as adkTool.InvokableRun (see that method's doc comment): registered
+	// as adkTool.InvokableRun (see that method's doc comment, including why
+	// the defer below is installed before the callID=="" check): registered
 	// but never settled, it left the next sibling in a mixed batch parked
 	// in awaitToolTurn forever.
 	messageID := e.messageIDForToolCall(callID)
 	fatal := false
 	defer func() { e.settleToolTurn(messageID, callID, fatal) }()
 
+	if callID == "" {
+		return "", errors.New("tool call id missing from ADK context")
+	}
 	record, err := e.host.store.GetToolCall(ctx, callID)
 	if err != nil {
 		fatal = true

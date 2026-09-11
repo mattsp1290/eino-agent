@@ -78,56 +78,112 @@ func (s *Store) EnqueueInbox(ctx context.Context, item session.InboxItem, limits
 		if err != nil {
 			return relationError(err)
 		}
-		matchExisting := func(row inboxRow) error {
-			existing, err := decodeInboxRow(row)
-			if err != nil {
-				return err
+		var err2 error
+		result, _, err2 = st.enqueueInboxLocked(ctx, sessionKey, item)
+		return err2
+	})
+	return result, err
+}
+
+// EnqueueInboxForRun is EnqueueInbox, additionally checked atomically against
+// runID's current terminal status: lockRun locks the owning session row
+// before the run row, the exact same lock SettleRun's fenced terminal
+// transition takes via loadRunFence -- so this call and a concurrent
+// terminal SettleRun for the same run always serialize on that lock,
+// whichever commits first winning. If runID is already terminal once this
+// transaction holds the lock, nothing is persisted and ErrRunClosed is
+// returned; the residual case (this call's item commits first) is caught
+// symmetrically by SettleRun's own queued-inbox check before it may settle a
+// run RunCompleted (see execution.go's SettleRun).
+func (s *Store) EnqueueInboxForRun(ctx context.Context, runID session.RunID, item session.InboxItem, limits session.ContentLimits) (session.InboxItem, bool, error) {
+	if err := session.ValidateEnqueueInbox(item, limits); err != nil {
+		return session.InboxItem{}, false, err
+	}
+	if runID == "" {
+		return session.InboxItem{}, false, session.ErrConflict
+	}
+	var result session.InboxItem
+	var created bool
+	err := s.atomic(ctx, func(st *Store) error {
+		row, err := st.lockRun(ctx, runID)
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				return session.ErrRunClosed
 			}
-			// Ignore block ID: Enqueue's caller-facing entry point mints a
-			// fresh ID for every block on every call (see runtime's
-			// assignContentBlockIDs), including a genuine retry of the
-			// identical logical request under the same IdempotencyKey --
-			// comparing full equality (IDs included) would make every real
-			// retry mismatch and spike a false conflict instead of
-			// returning the original durably-admitted item, defeating the
-			// point of an idempotency key.
-			if !session.ContentBlocksEqualIgnoringID(existing.Blocks, item.Blocks) {
-				return session.ErrConflict
-			}
-			result = existing
-			return nil
-		}
-		if row, err := st.inboxRowByIdempotencyKey(ctx, sessionKey, item.IdempotencyKey); err == nil {
-			return matchExisting(row)
-		} else if !errors.Is(err, session.ErrNotFound) {
 			return err
 		}
-		raw, err := json.Marshal(item)
+		run, err := decodeRunRow(row)
 		if err != nil {
 			return err
 		}
-		created := st.dbFor(ctx).Table(st.tableName("inbox")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
-			"id": []byte(item.ID), "session_key": sessionKey, "idempotency_key": []byte(item.IdempotencyKey),
-			"state": string(item.State), "record": raw,
-			"created_at": TimeText(item.CreatedAt), "updated_at": TimeText(item.UpdatedAt),
-		})
-		if err := st.mapErr(created.Error); err != nil {
-			return err
+		if run.SessionID != item.SessionID {
+			return session.ErrConflict
 		}
-		if created.RowsAffected == 0 {
-			row, err := st.inboxRowByIdempotencyKey(ctx, sessionKey, item.IdempotencyKey)
-			if err != nil {
-				if errors.Is(err, session.ErrNotFound) {
-					return session.ErrConflict
-				}
-				return err
-			}
-			return matchExisting(row)
+		if run.Terminal() {
+			return session.ErrRunClosed
 		}
-		result = item
-		return nil
+		var err2 error
+		result, created, err2 = st.enqueueInboxLocked(ctx, row.SessionKey, item)
+		return err2
 	})
-	return result, err
+	if err != nil {
+		return session.InboxItem{}, false, err
+	}
+	return result, created, nil
+}
+
+// enqueueInboxLocked is EnqueueInbox's core insert-or-find-existing logic,
+// shared by EnqueueInbox and EnqueueInboxForRun: the caller has already
+// locked sessionKey's session row (directly, or transitively via lockRun)
+// before calling this. created reports whether this call durably inserted a
+// new row (false for an idempotent replay of an existing item).
+func (s *Store) enqueueInboxLocked(ctx context.Context, sessionKey int64, item session.InboxItem) (session.InboxItem, bool, error) {
+	matchExisting := func(row inboxRow) (session.InboxItem, bool, error) {
+		existing, err := decodeInboxRow(row)
+		if err != nil {
+			return session.InboxItem{}, false, err
+		}
+		// Ignore block ID: Enqueue's caller-facing entry point mints a
+		// fresh ID for every block on every call (see runtime's
+		// assignContentBlockIDs), including a genuine retry of the
+		// identical logical request under the same IdempotencyKey --
+		// comparing full equality (IDs included) would make every real
+		// retry mismatch and spike a false conflict instead of
+		// returning the original durably-admitted item, defeating the
+		// point of an idempotency key.
+		if !session.ContentBlocksEqualIgnoringID(existing.Blocks, item.Blocks) {
+			return session.InboxItem{}, false, session.ErrConflict
+		}
+		return existing, false, nil
+	}
+	if row, err := s.inboxRowByIdempotencyKey(ctx, sessionKey, item.IdempotencyKey); err == nil {
+		return matchExisting(row)
+	} else if !errors.Is(err, session.ErrNotFound) {
+		return session.InboxItem{}, false, err
+	}
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return session.InboxItem{}, false, err
+	}
+	createdRow := s.dbFor(ctx).Table(s.tableName("inbox")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
+		"id": []byte(item.ID), "session_key": sessionKey, "idempotency_key": []byte(item.IdempotencyKey),
+		"state": string(item.State), "record": raw,
+		"created_at": TimeText(item.CreatedAt), "updated_at": TimeText(item.UpdatedAt),
+	})
+	if err := s.mapErr(createdRow.Error); err != nil {
+		return session.InboxItem{}, false, err
+	}
+	if createdRow.RowsAffected == 0 {
+		row, err := s.inboxRowByIdempotencyKey(ctx, sessionKey, item.IdempotencyKey)
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				return session.InboxItem{}, false, session.ErrConflict
+			}
+			return session.InboxItem{}, false, err
+		}
+		return matchExisting(row)
+	}
+	return item, true, nil
 }
 
 func (s *Store) ListInbox(ctx context.Context, sessionID session.ID, states []session.InboxState) ([]session.InboxItem, error) {

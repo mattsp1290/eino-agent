@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/gob"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -130,6 +131,31 @@ func (s *adkCheckpointStore) Get(ctx context.Context, checkPointID string) ([]by
 // once this instance has staged anything, s.lastStaged is trusted and a
 // conflict is reported immediately as genuine.
 func (s *adkCheckpointStore) Set(ctx context.Context, checkPointID string, payload []byte) error {
+	return s.stage(ctx, checkPointID, session.CheckpointKindRunner, payload)
+}
+
+// stageLoopCheckpoint stages this adapter's own Kind=loop "between turns, no
+// runner state" checkpoint revision: an ADK-shaped envelope
+// (HasRunnerState=false, no unhandled/canceled items) that tryLoadCheckpoint
+// treats exactly like an ordinary between-turns checkpoint on any later
+// resume -- items simply flow through GenInput next time, never GenResume
+// (see eino's adk/turn_loop.go tryLoadCheckpoint). Used by
+// promoteQueuedContinuation when upstream's own cleanup found the loop idle
+// and so never called Set itself (see that function's doc comment), so
+// PromotePause always has a real staged revision to promote.
+func (s *adkCheckpointStore) stageLoopCheckpoint(ctx context.Context) error {
+	payload, err := marshalEmptyLoopCheckpoint()
+	if err != nil {
+		return err
+	}
+	return s.stage(ctx, string(s.runID), session.CheckpointKindLoop, payload)
+}
+
+// stage is Set/stageLoopCheckpoint's shared staging logic: it stages a new
+// unpromoted revision under the current run fence, probing forward past a
+// stale row from a crashed prior attempt exactly as Set's own doc comment
+// describes.
+func (s *adkCheckpointStore) stage(ctx context.Context, checkPointID string, kind session.CheckpointKind, payload []byte) error {
 	revision, err := s.stagedRevision(ctx)
 	if err != nil {
 		return err
@@ -144,7 +170,7 @@ func (s *adkCheckpointStore) Set(ctx context.Context, checkPointID string, paylo
 	for attempt := 0; ; attempt++ {
 		_, stageErr := s.execution.store.StageCheckpoint(ctx, session.StageCheckpointRequest{
 			Checkpoint: session.Checkpoint{
-				RunID: s.runID, Revision: revision, Kind: session.CheckpointKindRunner, AgentFingerprint: s.fingerprint,
+				RunID: s.runID, Revision: revision, Kind: kind, AgentFingerprint: s.fingerprint,
 				EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, CheckpointID: checkPointID,
 				Bytes: raw, CreatedAt: s.host.now(),
 			},
@@ -159,6 +185,30 @@ func (s *adkCheckpointStore) Set(ctx context.Context, checkPointID string, paylo
 		}
 		revision++
 	}
+}
+
+// turnLoopCheckpointShape mirrors the unexported field names/types of
+// eino's adk.turnLoopCheckpoint[session.InboxID] (adk/turn_loop.go): gob
+// matches by field name and type, not by concrete struct identity, so
+// encoding this shape produces bytes eino's own unmarshalTurnLoopCheckpoint
+// decodes correctly. Kept in exact sync with upstream's turnLoopCheckpoint;
+// verified by a checkpoint-shape round-trip test against a real TurnLoop.
+type turnLoopCheckpointShape struct {
+	RunnerCheckpoint []byte
+	HasRunnerState   bool
+	UnhandledItems   []session.InboxID
+	CanceledItems    []session.InboxID
+}
+
+// marshalEmptyLoopCheckpoint gob-encodes a turnLoopCheckpointShape with
+// HasRunnerState=false and no items: eino's tryLoadCheckpoint treats this
+// exactly like an ordinary "between turns, nothing pending" checkpoint.
+func marshalEmptyLoopCheckpoint() ([]byte, error) {
+	buf := new(bytes.Buffer)
+	if err := gob.NewEncoder(buf).Encode(turnLoopCheckpointShape{}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // Delete implements adk.CheckPointDeleter. It retires every staged revision

@@ -434,6 +434,23 @@ func admissionEvent(request admissionRequest, sessionID session.ID, runID sessio
 	}
 }
 
+// The run.Config map keys admissionConfig writes and ResumeRun later reads
+// back. Named once here, on both the encode and decode side, instead of
+// repeating the untyped string literals at every call site: this map
+// crosses a JSON serialization boundary (agentOptionsConfigKey) with no
+// compile-time check that either side spells a key the same way, exactly
+// the casing-mismatch risk a plain literal invites (see the W5 doc and
+// reconciliation item 6's "done when": a resumed dispatch's system prompt
+// and agent options must equal the fresh-run values, proven by
+// TestResumeRunRestoresSystemPromptAndAgentOptions).
+const (
+	agentNameConfigKey     = "agent"
+	workspaceIDConfigKey   = "workspace_id"
+	workspaceRootConfigKey = "workspace_root"
+	systemPromptConfigKey  = "system_prompt"
+	agentOptionsConfigKey  = "agent_options"
+)
+
 // admissionConfig durably persists the subset of a run's construction config
 // ResumeRun later needs to rebuild an equivalent turnLoopCoordinator: without
 // system_prompt and agent_options here, a resumed run's post-resume model
@@ -443,14 +460,14 @@ func admissionEvent(request admissionRequest, sessionID session.ID, runID sessio
 func admissionConfig(request admissionRequest) map[string]string {
 	snapshot := request.Config
 	cfg := map[string]string{
-		"agent":          snapshot.Agent.Name,
-		"workspace_id":   snapshot.Metadata["workspace_id"],
-		"workspace_root": snapshot.Metadata["workspace_root"],
-		"system_prompt":  snapshot.Agent.SystemPrompt,
+		agentNameConfigKey:     snapshot.Agent.Name,
+		workspaceIDConfigKey:   snapshot.Metadata["workspace_id"],
+		workspaceRootConfigKey: snapshot.Metadata["workspace_root"],
+		systemPromptConfigKey:  snapshot.Agent.SystemPrompt,
 	}
 	if len(snapshot.Agent.Options) != 0 {
 		if raw, err := json.Marshal(snapshot.Agent.Options); err == nil {
-			cfg["agent_options"] = string(raw)
+			cfg[agentOptionsConfigKey] = string(raw)
 		}
 	}
 	return cfg
@@ -469,4 +486,27 @@ func decodeAgentOptions(raw string) map[string]string {
 		return nil
 	}
 	return options
+}
+
+// resumeRunConfig is the typed view of admissionConfig's durable map that
+// ResumeRun rebuilds its turnLoopCoordinator from -- the accessor
+// reconciliation item 6 asked for, so a rename or a dropped key on either
+// side of the admissionConfig/decodeResumeRunConfig pair is a compile error
+// at every call site, not a silent empty string at resume time.
+type resumeRunConfig struct {
+	WorkspaceID   string
+	WorkspaceRoot string
+	SystemPrompt  string
+	AgentOptions  map[string]string
+}
+
+// decodeResumeRunConfig reads resumeRunConfig's fields out of a durable
+// run.Config map, using the same keys admissionConfig wrote.
+func decodeResumeRunConfig(config map[string]string) resumeRunConfig {
+	return resumeRunConfig{
+		WorkspaceID:   config[workspaceIDConfigKey],
+		WorkspaceRoot: config[workspaceRootConfigKey],
+		SystemPrompt:  config[systemPromptConfigKey],
+		AgentOptions:  decodeAgentOptions(config[agentOptionsConfigKey]),
+	}
 }

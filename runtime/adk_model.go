@@ -167,6 +167,12 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 		m.execution.publishPersisted(ctx, committed)
 		m.host.observeRetry(ctx, m.dispatchSnapshot(), messageID, record.Step, m.host.attempts(), replacedErr)
 	}
+	// This dispatch's ledger row (record) is now durably committed
+	// (ModelRequestDispatchStarted, above): count it so onAgentEvents can
+	// tell a genuinely dispatched-and-ledgered turn apart from one whose
+	// agent never routed a physical call through this adapter at all (see
+	// adkEngine.dispatches's doc comment).
+	m.engine.dispatches.Add(1)
 	return &adkDispatch{messageID: messageID, record: record, input: input}, nil
 }
 

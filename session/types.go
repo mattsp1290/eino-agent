@@ -38,6 +38,12 @@ var (
 	ErrConflict = errors.New("session store conflict")
 	// ErrNotFound reports that a durable session record does not exist.
 	ErrNotFound = errors.New("session record not found")
+	// ErrRunClosed reports that a run-scoped write (e.g. EnqueueInboxForRun)
+	// was rejected because the targeted run is already terminal. Distinct
+	// from ErrConflict so a caller can tell "the run is closed, do not
+	// acknowledge this input" apart from an unrelated write conflict (e.g. a
+	// mismatched idempotent retry payload).
+	ErrRunClosed = errors.New("session: run is closed")
 )
 
 // Session is durable conversation metadata. Runtime dependencies such as model
@@ -451,6 +457,16 @@ type Store interface {
 	// Replaying the same IdempotencyKey with the same payload returns the
 	// existing row; a different payload under the same key is ErrConflict.
 	EnqueueInbox(ctx context.Context, item InboxItem, limits ContentLimits) (InboxItem, error)
+	// EnqueueInboxForRun is EnqueueInbox, additionally checked -- atomically,
+	// under the same session-row lock SettleRun's fenced terminal transition
+	// takes -- against runID's current terminal status: if runID is already
+	// terminal by the time this call's transaction acquires that lock, the
+	// item is never persisted and ErrRunClosed is returned instead of a
+	// silent acknowledgement. created reports whether this call durably
+	// inserted a new row (false for an idempotent replay of an existing
+	// item), so a caller pushing the result into a live loop can skip an
+	// already-buffered/already-consumed ID instead of re-delivering it.
+	EnqueueInboxForRun(ctx context.Context, runID RunID, item InboxItem, limits ContentLimits) (InboxItem, bool, error)
 	ListInbox(ctx context.Context, sessionID ID, states []InboxState) ([]InboxItem, error)
 	GetTurn(ctx context.Context, id TurnID) (Turn, error)
 	ListTurns(ctx context.Context, runID RunID) ([]Turn, error)

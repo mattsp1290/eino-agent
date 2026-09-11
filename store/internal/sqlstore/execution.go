@@ -150,6 +150,29 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 			result = session.RunSettlementResult{Run: current, Event: existing}
 			return nil
 		}
+		// A run settling RunCompleted must never finalize while the session
+		// has any durably queued inbox item: an Enqueue that committed its
+		// item under the still-active run (racing this exact settlement --
+		// see runtime's Enqueue/EnqueueInboxForRun and the terminal-
+		// settlement race rule in the W5 plan) must force this settlement
+		// to divert to a queued-continuation pause instead of silently
+		// completing out from under it. Scoped to RunCompleted only: a run
+		// settling failed/interrupted is a legitimate terminal outcome
+		// regardless of unrelated queued input sitting in the session (that
+		// item simply waits, as designed, for the session's next Start).
+		if request.Settlement.Status == session.RunCompleted {
+			sessionKey, err := store.key(ctx, "sessions", string(current.SessionID))
+			if err != nil {
+				return err
+			}
+			var queuedCount int64
+			if err := store.dbFor(ctx).Table(store.tableName("inbox")).Where("session_key = ? AND state = ?", sessionKey, string(session.InboxQueued)).Count(&queuedCount).Error; err != nil {
+				return store.mapErr(err)
+			}
+			if queuedCount != 0 {
+				return session.ErrConflict
+			}
+		}
 		canonicalRun, err := session.ApplyRunSettlement(current, request.Settlement)
 		if err != nil {
 			return err
