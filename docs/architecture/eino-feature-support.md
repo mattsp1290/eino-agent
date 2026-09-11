@@ -449,15 +449,75 @@ Status: landed; W1 scaffolding kept green.
   its own id: `runtime.publicizeToolCallIDs` (`runtime/orchestrator.go`)
   rewrites `function_tool_call`/`function_tool_result`/`tool_search_result`
   block `CallID`s from the minted `ID` to `ProviderCallID` (falling back to
-  `ID` when the provider supplied none) in a copy of the messages, applied
-  exactly once, in `adkModel.dispatch`, right before building the
-  `ProviderRequest` actually sent over the wire — so both a live turn's
-  continuation and a replayed/resumed turn's next dispatch present the
-  provider its own ids for call/result correlation, while every durable
-  record and internal lookup stays keyed on the minted, always-unique `ID`.
+  `ID` when the provider supplied none, and to the durable `ID` again when
+  two or more calls in the same outgoing request would otherwise collide on
+  one provider id — see below) in a copy of the messages, applied exactly
+  once per physical dispatch, at the top of `adkModel.begin` — before that
+  request is audited/ledgered, so the request the ledger describes and the
+  `ProviderRequest` `adkModel.dispatch` actually sends are the same bytes —
+  so both a live turn's continuation and a replayed/resumed turn's next
+  dispatch present the provider its own ids for call/result correlation,
+  while every durable record and internal lookup stays keyed on the minted,
+  always-unique `ID`.
   AG-UI tool events and observability continue to report the durable `ID`
-  (unchanged). `store/storetest`'s tool-call contract test round-trips
-  `ProviderCallID` through `CreateToolCall`/`GetToolCall`/`SettleToolCall`.
+  (unchanged); tool-call observations (`tool.call`/`tool.settled`) also carry
+  `ProviderCallID` as a bounded, content-free `provider_call_id` metadata
+  attribute when the provider supplied one, so a failure can still be
+  correlated against that provider's own logs.
+  `store/storetest`'s tool-call contract test round-trips `ProviderCallID`
+  through `CreateToolCall`/`GetToolCall`/`ClaimToolCall`/
+  `ListUnfinishedToolCalls`/`SettleToolCall`, and asserts that a settle
+  envelope whose result block is keyed on the provider id instead of the
+  durable id is refused with `session.ErrConflict`.
+
+  Fidelity, duplicates, and failure modes this fix (and the round-two
+  reconciliation that followed it) guarantees:
+  - **Ledger fidelity.** `publicizeToolCallIDs` runs exactly once per
+    physical dispatch, at the top of `adkModel.begin` -- before
+    `nextStep`/`currentMessageID`, so a resolution failure neither consumes
+    a step nor appends an assistant placeholder row -- and its output
+    (`adkDispatch.wireInput`) is both what `begin` audits/hashes into the
+    request ledger (`ModelRequestRecord.Messages`/`ContentSHA256`, the
+    `ModelRequestedNotice.ContentHash`) and what `adkModel.dispatch` sends
+    over the wire. The two can never diverge: there is no second rewrite.
+  - **Duplicate provider ids.** A provider id is put on the wire only when
+    it is unique within that outgoing request, across every message (not
+    just the current turn's own calls) -- a provider that reissues the same
+    indexed id across unrelated turns, or that emits two calls sharing one
+    id in a single response, would otherwise produce two ambiguous
+    call/result pairs under the same id. Every call whose provider id
+    collides with another call's in that request is sent with its own
+    durable id instead (on both its call block and its result block,
+    deterministically), which stays unique store-wide.
+  - **Failing closed.** A tool-call block with no `tool_calls` row (only
+    reachable via direct store writes or imported history, since
+    `rejectNonCallerBlocks` refuses caller-authored tool blocks and context
+    contributions are text-only) fails the dispatch with
+    `errToolCallIDUnresolved`, a sentinel `defaultShouldRetry`/
+    `defaultShouldFailover` both refuse to retry or fail over -- a
+    deterministic, durable-consistency failure does not burn the run's
+    retry/failover budget.
+  - **Provider id validation.** `prepareToolCalls` treats a captured
+    provider id as absent (falls back to the minted id) unless it is valid
+    UTF-8 and no longer than `session.DiscoveryMaxIdentityBytes` -- the same
+    bound every other durable identity string in this codebase is checked
+    against -- so an invalid or oversized id from a misbehaving provider
+    never round-trips altered through the SQL stores' JSON encoding.
+  - **Model-visible body vs. wire id.** The model reads the provider's own
+    id on the wire `function_tool_call`/`function_tool_result`/
+    `tool_search_result` block's `CallID`. The result's model-visible body
+    (`ToolOutput.tool_call_id` inside the JSON content, and the tool-search
+    output) still carries the *durable* id -- it is never rewritten, since
+    that body is also the durably persisted and replayed content, and both
+    ids are legitimate: the block-level `CallID` is what a stateful
+    provider correlates by, while the body's `tool_call_id` is this
+    package's own durable identity for the call.
+  - **Ordering.** `ListUnfinishedToolCalls` (used by both the legacy
+    non-ADK `resumeRun` and by `terminalizeUnfinishedTools` crash
+    reconciliation) orders by the request assistant message's own creation
+    order and then the call's block position within it, not by the minted
+    tool-call id -- a sequence-generator id like `tool-call-10` sorts before
+    `tool-call-9`, which has no relationship to declared order.
 
 ## W5: typed ADK runtime, checkpoints and turn control
 
