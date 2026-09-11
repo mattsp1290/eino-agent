@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -318,3 +319,115 @@ func TestResumedHandleInterruptCancelsRun(t *testing.T) {
 		t.Fatal("resumed Handle.Interrupt did not cancel the in-flight tool's context")
 	}
 }
+
+// admitTurnFailingStore fails AdmitTurn on the given 1-indexed call number
+// (and every call after it), delegating every earlier call to the real
+// fixture -- simulating an injected write failure admitting a run's Nth
+// turn (the plan's acceptance-matrix item: "AdmitTurn injected write
+// failure rolls back").
+type admitTurnFailingStore struct {
+	*admissionStore
+	err      error
+	failFrom int
+
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *admitTurnFailingStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &admitTurnFailingExecution{ExecutionStore: s.admissionStore.Execution(fence), parent: s}
+}
+
+type admitTurnFailingExecution struct {
+	session.ExecutionStore
+	parent *admitTurnFailingStore
+}
+
+func (e *admitTurnFailingExecution) AdmitTurn(ctx context.Context, request session.AdmitTurnRequest) (session.AdmitTurnResult, error) {
+	e.parent.mu.Lock()
+	e.parent.calls++
+	call := e.parent.calls
+	e.parent.mu.Unlock()
+	if call >= e.parent.failFrom {
+		return session.AdmitTurnResult{}, e.parent.err
+	}
+	return e.ExecutionStore.AdmitTurn(ctx, request)
+}
+
+// TestAdmitTurnInjectedFailureRollsBackSecondTurn proves an injected
+// AdmitTurn write failure on a run's second turn (this run's first turn
+// admits durably via Start's own admission transaction, which does not go
+// through this fenced AdmitTurn call at all) fails the run without
+// consuming the durable inbox item that would have become that turn: the
+// item must still be `queued`, available to a later Start/ResumeRun to
+// retry, not silently lost.
+func TestAdmitTurnInjectedFailureRollsBackSecondTurn(t *testing.T) {
+	inner := newAdmissionStore()
+	injectedErr := errors.New("injected AdmitTurn failure")
+	store := &admitTurnFailingStore{admissionStore: inner, err: injectedErr, failFrom: 1}
+	firstDispatched := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	orch := newTestOrchestrator(inner, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		if calls == 1 {
+			close(firstDispatched)
+			<-release
+			return []*einoschema.AgenticMessage{agenticAssistantText("first")}, nil
+		}
+		// Not t.Fatal: this callback runs on ADK's own goroutine, where
+		// t.Fatal is unsafe. Returning an error here instead fails the
+		// (unexpected) second dispatch loudly through the normal result
+		// path, which the assertions below still catch.
+		return nil, errors.New("model dispatched again despite the injected AdmitTurn failure")
+	}), WithStore(store))
+
+	handle, err := orch.Start(context.Background(), Request{SessionID: "admit-turn-failure-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	select {
+	case <-firstDispatched:
+	case <-time.After(3 * time.Second):
+		t.Fatal("first turn never dispatched")
+	}
+	item, err := orch.Enqueue(context.Background(), "admit-turn-failure-session", EnqueueRequest{
+		RunID: handle.RunID(), IdempotencyKey: "admit-turn-failure-key", Message: TextUserMessage("second message"),
+	})
+	if err != nil {
+		t.Fatalf("Enqueue error = %v", err)
+	}
+	// Start's own first-turn admission (admission.go's admitDurable) goes
+	// through session.Store.WithinTx's transaction-scoped store clone, never
+	// through this wrapper's Execution() override -- only a later fenced
+	// ExecutionStore.AdmitTurn call (the Enqueue-driven second turn's
+	// admission, from turnLoopCoordinator.admitTurn) does. So failFrom=1
+	// (set at construction) already targets exactly that second-turn call.
+	close(release)
+
+	result := <-handle.Done()
+	if result.Status != session.RunFailed {
+		t.Fatalf("result = %+v, want failed", result)
+	}
+	if !errors.Is(result.Error, injectedErr) {
+		t.Fatalf("result.Error = %v, want %v", result.Error, injectedErr)
+	}
+	items, err := inner.ListInbox(context.Background(), "admit-turn-failure-session", nil)
+	if err != nil {
+		t.Fatalf("ListInbox error = %v", err)
+	}
+	var found bool
+	for _, it := range items {
+		if it.ID != item.ID {
+			continue
+		}
+		found = true
+		if it.State != session.InboxQueued {
+			t.Fatalf("item state after injected AdmitTurn failure = %q, want still queued (no partial consumption)", it.State)
+		}
+	}
+	if !found {
+		t.Fatalf("item %q missing after injected AdmitTurn failure", item.ID)
+	}
+}
+
