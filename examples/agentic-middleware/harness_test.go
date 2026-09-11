@@ -3,7 +3,9 @@ package agenticmiddleware
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -160,6 +162,24 @@ func toolSearchResultDiscoveredNames(messages []*einoschema.AgenticMessage) []st
 
 // --- Orchestrator construction ---------------------------------------------
 
+// testScratchRootOnce lazily creates ONE process-scoped temp directory used
+// as every test orchestrator's scratch root (runtime.WithScratchRoot),
+// mirroring the runtime package's own identically-named test helper
+// (runtime/orchestrator_test_support_test.go). Without this, every test in
+// this package that mounts reduction/plantask falls back to
+// NewStreamingOrchestrator's real, machine-global default
+// (os.UserCacheDir()/eino-agent/scratch), writing real, never-cleaned
+// directories into the actual user's cache directory every test run
+// instead of a temp directory the OS eventually reclaims (round-three W6
+// authority-regression review S6).
+var testScratchRootOnce = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "eino-agent-example-scratch-")
+	if err != nil {
+		panic(err)
+	}
+	return dir
+})
+
 func newTestOrchestrator(t *testing.T, store session.Store, registry *composition.Registry, streamer model.Streamer) *runtime.StreamingOrchestrator {
 	t.Helper()
 	return newTestOrchestratorWithIDs(t, store, registry, streamer, &testIDs{})
@@ -185,6 +205,7 @@ func newTestOrchestratorWithIDs(t *testing.T, store session.Store, registry *com
 		runtime.WithIDGenerator(ids),
 		runtime.WithOwnerID("agentic-middleware-example"),
 		runtime.WithModelResolver(testResolver{streamer: streamer}),
+		runtime.WithScratchRoot(testScratchRootOnce()),
 	)
 	if err != nil {
 		t.Fatal(err)

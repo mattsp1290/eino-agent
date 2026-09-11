@@ -705,12 +705,20 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 		t.Fatalf("turn 2's provider-visible message count (%d) did not narrow below the full durable replay (%d)", secondDispatchMessageCount, len(fullReplay.Messages))
 	}
 
-	// Third turn, same session, a real third orch.Start call: round-two W6
-	// review item 11's actual epoch-read-back proof. This turn's own
-	// admission starts completely fresh -- it has no in-memory carryover
-	// from turn 2's own Finalize call -- so its narrowed baseline can only
-	// come from resolveTurnHistoryOptions re-reading the durably committed
-	// epoch (latestFinishedSummarizationEpoch).
+	// Third turn, same session, a real third orch.Start call: a black-box
+	// end-to-end sanity check that a fresh admission after summarization
+	// still narrows and still completes. This turn's own admission starts
+	// completely fresh -- it has no in-memory carryover from turn 2's own
+	// Finalize call in this same process -- but this assertion alone is
+	// NOT proof that resolveTurnHistoryOptions actually re-reads the
+	// durably committed epoch (latestFinishedSummarizationEpoch): it still
+	// passes even with that read-back mechanism deliberately removed
+	// (round-three W6 summarization-correctness review, item 4), because a
+	// narrower-than-full-replay count is also consistent with other,
+	// unrelated causes at this black-box level. The actual, mutation-proven
+	// epoch-read-back proof is runtime/epochs_test.go's
+	// TestResolveTurnHistoryOptionsReadsBackTheCommittedEpoch, a direct
+	// unit test against resolveTurnHistoryOptions itself.
 	handle3, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("one more thing"), Config: testConfig(""),
 	})
@@ -830,10 +838,14 @@ func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
 	var sawSummaryGenerationAttempt bool
+	var failGeneration bool
 	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGeneration(request) {
 			sawSummaryGenerationAttempt = true
-			return nil, errors.New("simulated summary generation failure")
+			if failGeneration {
+				return nil, errors.New("simulated summary generation failure")
+			}
+			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, no summary needed")}, nil
 	}))
@@ -848,34 +860,82 @@ func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 	if result := awaitDone(t, handle, 10*time.Second); result.Status != session.RunCompleted {
 		t.Fatalf("turn 1 result = %+v, want completed", result)
 	}
-	// Turn 2: now above the threshold -- this MUST actually attempt
-	// summary generation (round-two W6 review item 10), not merely pass
-	// vacuously because the trigger never fired at all.
+	// Turn 2: now above the threshold, and generation SUCCEEDS -- this
+	// establishes a genuine PRIOR epoch (round-two W6 review item 16: the
+	// failure case must prove an existing epoch survives a later failure
+	// unchanged, not merely that zero epochs exist, which would also
+	// trivially pass if Finalize were never reached at all).
 	handle2, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("continue"), Config: testConfig(""),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitDone(t, handle2, 10*time.Second)
+	if result := awaitDone(t, handle2, 10*time.Second); result.Status != session.RunCompleted {
+		t.Fatalf("turn 2 result = %+v, want completed", result)
+	}
+	epochsAfterTurn2, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var priorEpoch session.ContextEpoch
+	var sawPriorEpoch bool
+	for _, epoch := range epochsAfterTurn2 {
+		if epoch.Trigger == "summarization" && epoch.SummaryMessageID != "" {
+			priorEpoch, sawPriorEpoch = epoch, true
+		}
+	}
+	if !sawPriorEpoch {
+		t.Fatalf("turn 2 never established a prior summarization epoch to test survival against: %+v", epochsAfterTurn2)
+	}
+	sawSummaryGenerationAttempt = false
+
+	// Turn 3: crosses the (still low) threshold again -- this MUST actually
+	// attempt summary generation (round-two W6 review item 10), not merely
+	// pass vacuously because the trigger never fired at all -- and this
+	// time generation FAILS.
+	failGeneration = true
+	handle3, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("one more"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle3, 10*time.Second)
 	// VERIFIED behavior (round-two W6 review item 10): a failed summary
 	// generation call fails the whole turn -- upstream's own
 	// BeforeModelRewriteState propagates the error, so the turn's own main
 	// dispatch never runs for this cycle either.
 	if result.Status != session.RunFailed {
-		t.Fatalf("turn 2 result = %+v, want failed (upstream propagates a failed summary-generation call's error, failing the turn)", result)
+		t.Fatalf("turn 3 result = %+v, want failed (upstream propagates a failed summary-generation call's error, failing the turn)", result)
 	}
 	if !sawSummaryGenerationAttempt {
 		t.Fatal("summary generation was never attempted -- this test proves nothing about failure handling unless the trigger actually fired")
 	}
-	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	epochsAfterTurn3, err := store.ListContextEpochs(context.Background(), sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, epoch := range epochs {
-		if epoch.Trigger == "summarization" {
-			t.Fatalf("a summarization epoch was created even though generation failed: %+v", epoch)
+	var sawNewEpoch bool
+	var stillSawPriorEpochUnchanged bool
+	for _, epoch := range epochsAfterTurn3 {
+		if epoch.Trigger != "summarization" {
+			continue
 		}
+		if epoch.ID == priorEpoch.ID {
+			if epoch != priorEpoch {
+				t.Fatalf("prior epoch changed across the failed turn:\nbefore=%+v\nafter =%+v", priorEpoch, epoch)
+			}
+			stillSawPriorEpochUnchanged = true
+			continue
+		}
+		sawNewEpoch = true
+	}
+	if !stillSawPriorEpochUnchanged {
+		t.Fatalf("prior epoch %+v did not survive the failed turn: %+v", priorEpoch, epochsAfterTurn3)
+	}
+	if sawNewEpoch {
+		t.Fatalf("a NEW summarization epoch was created even though generation failed: %+v", epochsAfterTurn3)
 	}
 }
 
@@ -901,10 +961,14 @@ func TestSummarizationCancelledGenerationKeepsPreviousEpoch(t *testing.T) {
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
 	var sawSummaryGenerationAttempt bool
+	var cancelGeneration bool
 	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGeneration(request) {
 			sawSummaryGenerationAttempt = true
-			return nil, context.Canceled
+			if cancelGeneration {
+				return nil, context.Canceled
+			}
+			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, no summary needed")}, nil
 	}))
@@ -919,30 +983,78 @@ func TestSummarizationCancelledGenerationKeepsPreviousEpoch(t *testing.T) {
 	if result := awaitDone(t, handle, 10*time.Second); result.Status != session.RunCompleted {
 		t.Fatalf("turn 1 result = %+v, want completed", result)
 	}
-	// Turn 2: now above the threshold -- this MUST actually attempt
-	// summary generation (round-two W6 review item 10), not merely pass
-	// vacuously because the trigger never fired at all.
+	// Turn 2: now above the threshold, and generation SUCCEEDS -- this
+	// establishes a genuine PRIOR epoch (round-two W6 review item 16: the
+	// cancellation case must prove an existing epoch survives a later
+	// cancellation unchanged, not merely that zero epochs exist, which
+	// would also trivially pass if Finalize were never reached at all).
 	handle2, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("continue"), Config: testConfig(""),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitDone(t, handle2, 10*time.Second)
+	if result := awaitDone(t, handle2, 10*time.Second); result.Status != session.RunCompleted {
+		t.Fatalf("turn 2 result = %+v, want completed", result)
+	}
+	epochsAfterTurn2, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var priorEpoch session.ContextEpoch
+	var sawPriorEpoch bool
+	for _, epoch := range epochsAfterTurn2 {
+		if epoch.Trigger == "summarization" && epoch.SummaryMessageID != "" {
+			priorEpoch, sawPriorEpoch = epoch, true
+		}
+	}
+	if !sawPriorEpoch {
+		t.Fatalf("turn 2 never established a prior summarization epoch to test survival against: %+v", epochsAfterTurn2)
+	}
+	sawSummaryGenerationAttempt = false
+
+	// Turn 3: crosses the (still low) threshold again -- this MUST actually
+	// attempt summary generation (round-two W6 review item 10), not merely
+	// pass vacuously because the trigger never fired at all -- and this
+	// time generation is CANCELLED.
+	cancelGeneration = true
+	handle3, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("one more"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle3, 10*time.Second)
 	if result.Status != session.RunInterrupted || !result.Interrupted {
-		t.Fatalf("turn 2 result = %+v, want interrupted (a cancelled summary-generation call maps to an interrupted outcome, not a plain failure)", result)
+		t.Fatalf("turn 3 result = %+v, want interrupted (a cancelled summary-generation call maps to an interrupted outcome, not a plain failure)", result)
 	}
 	if !sawSummaryGenerationAttempt {
 		t.Fatal("summary generation was never attempted -- this test proves nothing about cancellation handling unless the trigger actually fired")
 	}
-	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	epochsAfterTurn3, err := store.ListContextEpochs(context.Background(), sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, epoch := range epochs {
-		if epoch.Trigger == "summarization" {
-			t.Fatalf("a summarization epoch was created even though generation was cancelled: %+v", epoch)
+	var sawNewEpoch bool
+	var stillSawPriorEpochUnchanged bool
+	for _, epoch := range epochsAfterTurn3 {
+		if epoch.Trigger != "summarization" {
+			continue
 		}
+		if epoch.ID == priorEpoch.ID {
+			if epoch != priorEpoch {
+				t.Fatalf("prior epoch changed across the cancelled turn:\nbefore=%+v\nafter =%+v", priorEpoch, epoch)
+			}
+			stillSawPriorEpochUnchanged = true
+			continue
+		}
+		sawNewEpoch = true
+	}
+	if !stillSawPriorEpochUnchanged {
+		t.Fatalf("prior epoch %+v did not survive the cancelled turn: %+v", priorEpoch, epochsAfterTurn3)
+	}
+	if sawNewEpoch {
+		t.Fatalf("a NEW summarization epoch was created even though generation was cancelled: %+v", epochsAfterTurn3)
 	}
 }
 
