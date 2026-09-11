@@ -554,3 +554,49 @@ func TestSettlementSealRejectsUnauthorizedFabricatedToolResult(t *testing.T) {
 		t.Fatalf("result = %+v, want failed (settlement seal should reject the fabricated result)", result)
 	}
 }
+
+// TestSummarizationHandlerTriggersAndWritesContextEpoch proves
+// summarization's Finalize wiring works end to end through a real turn: a
+// low message-count trigger fires on the very first cycle, the fake
+// "summary" response (the model's own second dispatch is scripted to
+// return summary text) drives Finalize, and a new session.ContextEpoch row
+// is durably written with SummaryMessageID set.
+func TestSummarizationHandlerTriggersAndWritesContextEpoch(t *testing.T) {
+	store := newAdmissionStore()
+	sessionID := session.ID("summarization-session")
+	var calls int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
+	}))
+	handlerComponent := PlanComponent{
+		Component: testPlanComponent("summarization-component"),
+		AgentHandlers: []PlanAgentHandler{{
+			ID: "summarization", Order: 0, Scope: extension.GlobalScope(),
+			Kind: HandlerKindSummarization, Version: HandlerVersion1, ConfigHash: "test-hash",
+			Factory: NewSummarizationHandlerFactory(SummarizationConfig{TriggerContextMessages: 1, RetainTailCount: 0}),
+		}},
+	}
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
+	handle, err := orch.Start(context.Background(), Request{SessionID: sessionID, Message: TextUserMessage("hello there"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed", result)
+	}
+	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, epoch := range epochs {
+		if epoch.Trigger == "summarization" && epoch.SummaryMessageID != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no summarization ContextEpoch row found among %+v", epochs)
+	}
+}

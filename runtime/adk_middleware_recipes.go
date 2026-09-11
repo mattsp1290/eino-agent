@@ -349,12 +349,44 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 		if err != nil {
 			return nil, err
 		}
+		// An assistant-role message with zero owned parts is an unfinalized
+		// placeholder (AdmitTurn creates the turn's own placeholder row
+		// before this middleware ever runs, exactly like
+		// adkEngine.buildDurableBaseline's dropUnfinalizedAssistantPlaceholders,
+		// which uses the same "assistant role, no content" test on the
+		// projected message) -- ADK's own in-memory originalMessages never
+		// includes it either, so it must be excluded here too or the
+		// correlation-by-count below always fails by one. System/user
+		// messages are never placeholders and are always included
+		// regardless of part count.
+		owned := make(map[session.MessageID]bool, len(batch.PartOwnerMessageIDs))
+		for _, id := range batch.PartOwnerMessageIDs {
+			owned[id] = true
+		}
 		var durable []session.Message
 		for _, msg := range batch.Messages {
 			switch msg.Role {
-			case session.RoleSystem, session.RoleUser, session.RoleAssistant:
+			case session.RoleSystem, session.RoleUser:
 				durable = append(durable, msg)
+			case session.RoleAssistant:
+				if owned[msg.ID] {
+					durable = append(durable, msg)
+				}
 			}
+		}
+		// build.Model is the SAME ledger-audited adapter the main turn
+		// dispatches through (by design -- HandlerBuildContext.Model's doc
+		// comment: "any model call a handler's middleware makes... is still
+		// durably ledgered"), so upstream's OWN internal summary-generation
+		// call (made through build.Model before Finalize is ever invoked)
+		// already durably committed a new trailing assistant message by the
+		// time this reload runs -- one this session's real conversation
+		// never had and originalMessages (computed before that internal
+		// call) never included. Drop exactly that one trailing entry before
+		// requiring exact correlation, rather than accepting the more
+		// general "off by one" as fine.
+		if len(durable) == len(originalMessages)+1 && len(durable) > 0 && durable[len(durable)-1].Role == session.RoleAssistant {
+			durable = durable[:len(durable)-1]
 		}
 		if len(durable) != len(originalMessages) || len(durable) == 0 {
 			return nil, fmt.Errorf("%w: summarization could not correlate %d in-memory messages with %d durable messages", errADKUnsupportedBlock, len(originalMessages), len(durable))
