@@ -136,6 +136,37 @@ func requireContained(root, path string) error {
 	return nil
 }
 
+// reservedWorkspacePrefix is the workspace-relative top-level path segment
+// the read-only workspace/skill view refuses to surface, even though this
+// runtime's own scratch/offload state no longer lives inside the workspace
+// at all (see sessionScratchRoot) -- defense in depth (round-two W6 review
+// I5) against a host-created ".eino-agent" directory in a real workspace,
+// or a future regression that puts runtime state back under the workspace.
+const reservedWorkspacePrefix = ".eino-agent"
+
+// errReservedWorkspacePath reports a read-only workspace-view request whose
+// resolved path falls under reservedWorkspacePrefix.
+var errReservedWorkspacePath = fmt.Errorf("%w: path is reserved for runtime use", errWorkspacePathEscape)
+
+// resolveReadOnlyWorkspacePath is resolveWorkspacePath plus the
+// reservedWorkspacePrefix exclusion -- used by every workspaceFilesystemBackend/
+// workspaceSkillBackend method (the READ-ONLY views host recipes receive),
+// never by writableWorkspaceBackend (a separate, general-purpose writable
+// backend that legitimately uses ".eino-agent"-named subdirectories of its
+// own callers' choosing today, and is no longer used for plantask/reduction
+// scratch at all -- see adk_middleware_scratch_root.go).
+func resolveReadOnlyWorkspacePath(root, requested string) (string, error) {
+	resolved, err := resolveWorkspacePath(root, requested)
+	if err != nil {
+		return "", err
+	}
+	rel := workspaceRelative(root, resolved)
+	if rel == reservedWorkspacePrefix || strings.HasPrefix(rel, reservedWorkspacePrefix+"/") {
+		return "", fmt.Errorf("%w: %s", errReservedWorkspacePath, rel)
+	}
+	return resolved, nil
+}
+
 func workspaceRelative(root, path string) string {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
@@ -161,7 +192,7 @@ func (b *workspaceFilesystemBackend) LsInfo(_ context.Context, req *adkfilesyste
 	if req == nil {
 		return nil, errors.New("ls request required")
 	}
-	resolved, err := resolveWorkspacePath(b.root, req.Path)
+	resolved, err := resolveReadOnlyWorkspacePath(b.root, req.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -189,26 +220,14 @@ func readLinesRange(path string, offset, limit int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if offset < 1 {
-		offset = 1
-	}
-	lines := strings.Split(string(data), "\n")
-	start := offset - 1
-	if start > len(lines) {
-		return "", nil
-	}
-	end := len(lines)
-	if limit > 0 && start+limit < end {
-		end = start + limit
-	}
-	return strings.Join(lines[start:end], "\n"), nil
+	return linesRange(string(data), offset, limit), nil
 }
 
 func (b *workspaceFilesystemBackend) Read(_ context.Context, req *adkfilesystem.ReadRequest) (*adkfilesystem.FileContent, error) {
 	if req == nil {
 		return nil, errors.New("read request required")
 	}
-	resolved, err := resolveWorkspacePath(b.root, req.FilePath)
+	resolved, err := resolveReadOnlyWorkspacePath(b.root, req.FilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -223,7 +242,7 @@ func (b *workspaceFilesystemBackend) MultiModalRead(_ context.Context, req *adkf
 	if req == nil {
 		return nil, errors.New("multimodal read request required")
 	}
-	resolved, err := resolveWorkspacePath(b.root, req.FilePath)
+	resolved, err := resolveReadOnlyWorkspacePath(b.root, req.FilePath)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +289,7 @@ func (b *workspaceFilesystemBackend) GrepRaw(_ context.Context, req *adkfilesyst
 	if req == nil || req.Pattern == "" {
 		return nil, errors.New("grep pattern required")
 	}
-	resolvedBase, err := resolveWorkspacePath(b.root, req.Path)
+	resolvedBase, err := resolveReadOnlyWorkspacePath(b.root, req.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -314,7 +333,7 @@ func (b *workspaceFilesystemBackend) GrepRaw(_ context.Context, req *adkfilesyst
 		// the same containment check every other read goes through, and
 		// silently skip an escaping entry rather than failing the whole
 		// walk.
-		safe, err := resolveWorkspacePath(b.root, path)
+		safe, err := resolveReadOnlyWorkspacePath(b.root, path)
 		if err != nil {
 			return nil
 		}
@@ -352,7 +371,7 @@ func (b *workspaceFilesystemBackend) GlobInfo(_ context.Context, req *adkfilesys
 	if req == nil || req.Pattern == "" {
 		return nil, errors.New("glob pattern required")
 	}
-	resolvedBase, err := resolveWorkspacePath(b.root, req.Path)
+	resolvedBase, err := resolveReadOnlyWorkspacePath(b.root, req.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +391,7 @@ func (b *workspaceFilesystemBackend) GlobInfo(_ context.Context, req *adkfilesys
 		// See GrepRaw's identical containment re-check: a symlinked entry
 		// must not surface metadata (or, through Read/MultiModalRead called
 		// later with this Path) content from outside the workspace.
-		if _, err := resolveWorkspacePath(b.root, path); err != nil {
+		if _, err := resolveReadOnlyWorkspacePath(b.root, path); err != nil {
 			return nil
 		}
 		info, err := entry.Info()
@@ -492,7 +511,7 @@ func (b *workspaceSkillBackend) Get(_ context.Context, name string) (skill.Skill
 }
 
 func (b *workspaceSkillBackend) readSkillFile(dir string) (skill.FrontMatter, string, error) {
-	resolved, err := resolveWorkspacePath(b.root, filepath.Join(dir, "SKILL.md"))
+	resolved, err := resolveReadOnlyWorkspacePath(b.root, filepath.Join(dir, "SKILL.md"))
 	if err != nil {
 		return skill.FrontMatter{}, "", err
 	}

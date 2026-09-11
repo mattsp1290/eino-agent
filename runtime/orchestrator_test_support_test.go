@@ -55,6 +55,23 @@ func toolCallIDByName(t *testing.T, store *admissionStore, name string) session.
 	return id
 }
 
+// testScratchRootOnce lazily creates ONE process-scoped temp directory used
+// as every test orchestrator's default scratch root (WithScratchRoot),
+// unless a test explicitly overrides it via extra. Without this, every
+// runtime test exercising plantask/reduction would otherwise fall back to
+// NewStreamingOrchestrator's real, machine-global default
+// (os.UserCacheDir()/eino-agent/scratch), writing real files outside the
+// test sandbox and risking cross-test-run collisions on a repeated literal
+// session ID (sessionScratchDirName hashes the session id, but does not
+// scope it to a single test run) -- see round-two W6 review I5.
+var testScratchRootOnce = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "eino-agent-test-scratch-")
+	if err != nil {
+		panic(err)
+	}
+	return dir
+})
+
 func newTestOrchestrator(store *admissionStore, streamer model.Streamer, extra ...Option) *StreamingOrchestrator {
 	options := []Option{
 		WithStore(store),
@@ -63,6 +80,7 @@ func newTestOrchestrator(store *admissionStore, streamer model.Streamer, extra .
 		WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
 		WithOwnerID("owner-1"),
 		WithQueueSize(2),
+		WithScratchRoot(testScratchRootOnce()),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	}
 	return mustConfiguredOrchestrator(append(options, extra...)...)
@@ -73,6 +91,7 @@ func mustConfiguredOrchestrator(extra ...Option) *StreamingOrchestrator {
 		WithStore(newAdmissionStore()),
 		WithModelResolver(resolvedModel{}),
 		WithIDGenerator(&sequenceIDs{}),
+		WithScratchRoot(testScratchRootOnce()),
 		WithRunPlanProvider(emptyTestRunPlanProvider()),
 	}
 	orchestrator, err := NewStreamingOrchestrator(append(options, extra...)...)

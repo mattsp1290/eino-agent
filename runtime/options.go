@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -40,6 +41,17 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		if err := option(o); err != nil {
 			return nil, err
 		}
+	}
+	if o.scratchRoot == "" {
+		// No WithScratchRoot supplied: default to a private, non-workspace
+		// scratch root under the user cache directory (round-two W6 review
+		// I5 -- plantask/reduction scratch and offload state must never
+		// live inside a host's admitted workspace).
+		dir, err := defaultScratchRootDir()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidOrchestrator, err)
+		}
+		o.scratchRoot = dir
 	}
 	var missing []string
 	if nilInterface(o.store) {
@@ -215,6 +227,25 @@ func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator
 			return fmt.Errorf("%w: %s must be positive", ErrInvalidOrchestrator, name)
 		}
 		apply(o, value)
+		return nil
+	}
+}
+
+// WithScratchRoot overrides the runtime-owned root plantask/reduction
+// scratch and offload state is kept under (default: a directory under
+// os.UserCacheDir(), see defaultScratchRootDir). Must be an absolute,
+// non-empty path; NEVER point this at a directory a host also exposes as an
+// admitted workspace root -- see sessionScratchRoot/scratchRootBackend and
+// round-two W6 review I5.
+func WithScratchRoot(value string) Option {
+	return func(o *StreamingOrchestrator) error {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%w: ScratchRoot cannot be empty", ErrInvalidOrchestrator)
+		}
+		if !filepath.IsAbs(value) {
+			return fmt.Errorf("%w: ScratchRoot must be absolute: %s", ErrInvalidOrchestrator, value)
+		}
+		o.scratchRoot = value
 		return nil
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -575,23 +574,33 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, authorized *authoriz
 		}
 		build.FilesystemBackend = fsBackend
 		build.SkillBackend = skillBackend
-		// plantask/reduction scratch state is rooted per-session (never a
-		// workspace-wide directory two sessions on the same workspace would
-		// otherwise share, colliding task IDs and offload files across
-		// sessions -- see sessionScratchDirName), and constructed lazily,
-		// only for the recipe kinds this plan actually mounts: a workspace
-		// where only agentsmd/filesystem/skill are mounted never gets a
-		// ".eino-agent/sessions/..." directory written into it at all.
-		sessionDir := sessionScratchDirName(e.snapshot.SessionID)
+	}
+	// plantask/reduction scratch and offload state is rooted in this
+	// process's runtime-owned scratch root (e.host.scratchRoot -- NEVER the
+	// admitted workspace, round-two W6 review I5), per-session (see
+	// sessionScratchDirName -- a hash of the opaque session id, never the
+	// raw id, and never shared across sessions), through an *os.Root opened
+	// at that per-session subdirectory (round-two W6 review I4: no path,
+	// including one through a dangling or malicious symlink, can ever
+	// resolve outside it -- see sessionScratchRoot/scratchRootBackend).
+	// Constructed lazily, only for the recipe kinds this plan actually
+	// mounts, and independent of whether a workspace is configured at all
+	// (plantask/reduction never needed real workspace CONTENT, only a
+	// private place to keep their own state).
+	if planHasHandlerKind(plan, HandlerKindPlanTask) || planHasHandlerKind(plan, HandlerKindReduction) {
+		scratchRoot, err := sessionScratchRoot(e.host.scratchRootDir(), e.snapshot.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		}
 		if planHasHandlerKind(plan, HandlerKindPlanTask) {
-			planTaskBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "sessions", sessionDir, "plantask"))
+			planTaskBackend, err := newScratchRootBackend(scratchRoot, "plantask")
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
 			}
 			build.PlanTaskBackend = planTaskBackend
 		}
 		if planHasHandlerKind(plan, HandlerKindReduction) {
-			reductionBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "sessions", sessionDir, "reduction"))
+			reductionBackend, err := newScratchRootBackend(scratchRoot, "reduction")
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
 			}

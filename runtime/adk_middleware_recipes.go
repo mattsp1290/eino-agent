@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
+	adkfilesystem "github.com/cloudwego/eino/adk/filesystem"
 	"github.com/cloudwego/eino/adk/middlewares/agentsmd"
 	"github.com/cloudwego/eino/adk/middlewares/dynamictool/toolsearch"
 	filesystemmw "github.com/cloudwego/eino/adk/middlewares/filesystem"
@@ -18,6 +19,7 @@ import (
 	"github.com/cloudwego/eino/adk/middlewares/reduction"
 	"github.com/cloudwego/eino/adk/middlewares/skill"
 	"github.com/cloudwego/eino/adk/middlewares/summarization"
+	"github.com/cloudwego/eino/components/tool"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/session"
@@ -340,7 +342,7 @@ type PlanTaskConfig struct{}
 func NewPlanTaskHandlerFactory(PlanTaskConfig) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		if build.PlanTaskBackend == nil {
-			return nil, fmt.Errorf("%w: plantask requires a workspace root", errHandlerMissingBackend)
+			return nil, fmt.Errorf("%w: plantask requires a scratch backend", errHandlerMissingBackend)
 		}
 		mw, err := plantask.NewTyped[*einoschema.AgenticMessage](ctx, &plantask.Config{Backend: build.PlanTaskBackend, BaseDir: "."})
 		if err != nil {
@@ -445,15 +447,21 @@ type TypedTokenCounter func(ctx context.Context, msgs []*einoschema.AgenticMessa
 func NewReductionHandlerFactoryWithTokenCounter(cfg ReductionConfig, counter TypedTokenCounter) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		if build.ReductionBackend == nil {
-			return nil, fmt.Errorf("%w: reduction requires a workspace root", errHandlerMissingBackend)
+			return nil, fmt.Errorf("%w: reduction requires a scratch backend", errHandlerMissingBackend)
 		}
 		typedCfg := &reduction.TypedConfig[*einoschema.AgenticMessage]{
 			// RootDir must be relative: build.ReductionBackend
-			// (writableWorkspaceBackend) resolves every WriteRequest.FilePath
-			// against its own workspace-contained root and rejects an
+			// (scratchRootBackend) resolves every WriteRequest.FilePath
+			// against its own os.Root-sandboxed scratch root and rejects an
 			// absolute path outside it (upstream's own default, "/tmp", is
-			// exactly such a path).
-			Backend: build.ReductionBackend, ReadFileToolName: "read_file", RootDir: ".",
+			// exactly such a path). ReadFileToolName points the offload
+			// notice text at reductionOffloadReadToolName, NOT the
+			// filesystem recipe's "read_file" -- reduction's offloads live
+			// in this session's own runtime-owned scratch root, never the
+			// workspace, so the workspace's read-only filesystem tool
+			// cannot reach them at all (round-two W6 review I5/I6); see
+			// reductionOffloadReadTool below.
+			Backend: build.ReductionBackend, ReadFileToolName: reductionOffloadReadToolName, RootDir: ".",
 			MaxLengthForTrunc: cfg.MaxLengthForTrunc, MaxTokensForClear: cfg.MaxTokensForClear,
 		}
 		if counter != nil {
@@ -463,8 +471,77 @@ func NewReductionHandlerFactoryWithTokenCounter(cfg ReductionConfig, counter Typ
 		if err != nil {
 			return nil, err
 		}
-		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindReduction, build.baselineToolResultDigests, build.authorizeRewrite), nil
+		wrapped := wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindReduction, build.baselineToolResultDigests, build.authorizeRewrite)
+		return &toolAppendingMiddleware{
+			TypedChatModelAgentMiddleware: wrapped,
+			extra:                         []tool.BaseTool{reductionOffloadReadTool{backend: build.ReductionBackend}},
+		}, nil
 	}
+}
+
+// reductionOffloadReadToolName is the fixed, sealed tool name reduction's
+// own offload notices point the model at (see NewReductionHandlerFactoryWithTokenCounter's
+// ReadFileToolName) to read back the full content of a truncated or cleared
+// tool result.
+const reductionOffloadReadToolName = "reduction_read_offload"
+
+// reductionOffloadReadTool lets the model read back the full content of a
+// tool result THIS session's own reduction recipe previously truncated or
+// cleared, by the offload file path named in reduction's own notice text.
+// backend is this turn's own HandlerBuildContext.ReductionBackend -- itself
+// sandboxed to this session's own scratch *os.Root (see
+// scratchRootBackend/sessionScratchRoot) -- so this tool can never read
+// another session's offloads: a sealed per-session tool, never a shared,
+// workspace-wide one (round-two W6 review I5/I6).
+type reductionOffloadReadTool struct {
+	backend writableTaskBackend
+}
+
+var _ tool.InvokableTool = reductionOffloadReadTool{}
+
+func (t reductionOffloadReadTool) Info(context.Context) (*einoschema.ToolInfo, error) {
+	return &einoschema.ToolInfo{
+		Name: reductionOffloadReadToolName,
+		Desc: "Read back the full content of a tool result this session's own reduction recipe previously truncated or cleared. Pass the exact file path named in the offload notice (e.g. \"Full output saved to: trunc/<call_id>\").",
+		ParamsOneOf: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+			"file_path": {Type: einoschema.String, Desc: "The offload file path named in reduction's own notice text", Required: true},
+		}),
+	}, nil
+}
+
+func (t reductionOffloadReadTool) InvokableRun(ctx context.Context, argumentsInJSON string, _ ...tool.Option) (string, error) {
+	var args struct {
+		FilePath string `json:"file_path"`
+	}
+	if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil || args.FilePath == "" {
+		return "", fmt.Errorf("%w: %s requires a file_path argument", errADKUnsupportedBlock, reductionOffloadReadToolName)
+	}
+	if t.backend == nil {
+		return "", fmt.Errorf("%w: %s has no backend configured", errHandlerMissingBackend, reductionOffloadReadToolName)
+	}
+	content, err := t.backend.Read(ctx, &adkfilesystem.ReadRequest{FilePath: args.FilePath})
+	if err != nil {
+		return "", err
+	}
+	return content.Content, nil
+}
+
+// toolAppendingMiddleware decorates inner so its own BeforeAgent's returned
+// tool list always also includes extra -- used to seal
+// reductionOffloadReadTool into reduction's own contributed tool list
+// without upstream reduction.NewTyped itself ever needing to know about it.
+type toolAppendingMiddleware struct {
+	adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	extra []tool.BaseTool
+}
+
+func (m *toolAppendingMiddleware) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+	ctx, next, err := m.TypedChatModelAgentMiddleware.BeforeAgent(ctx, runCtx)
+	if err != nil || next == nil {
+		return ctx, next, err
+	}
+	next.Tools = append(next.Tools, m.extra...)
+	return ctx, next, nil
 }
 
 // --- summarization ----------------------------------------------------------

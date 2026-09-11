@@ -88,6 +88,12 @@ type StreamingOrchestrator struct {
 	modelRequestMaxBytes    int
 	contentLimits           session.ContentLimits
 	streamLimits            StreamLimits
+	// scratchRoot is the runtime-owned root plantask/reduction scratch and
+	// offload state is kept under -- NEVER inside a host's admitted
+	// workspace (see sessionScratchRoot/scratchRootBackend and round-two W6
+	// review I5). Defaulted by NewStreamingOrchestrator (defaultScratchRootDir)
+	// when WithScratchRoot is not supplied.
+	scratchRoot string
 
 	// loopsMu guards loops, this process's registry of live TurnLoops keyed
 	// by run ID (see runtime/turn_loop.go). It lets Enqueue/Stop/Interrupt
@@ -688,6 +694,14 @@ func (o *StreamingOrchestrator) toolTurns() int {
 
 func (o *StreamingOrchestrator) lease() time.Duration {
 	return o.leaseValue
+}
+
+// scratchRootDir returns this orchestrator's runtime-owned scratch root
+// (see the scratchRoot field's doc comment) -- always non-empty once
+// configured, since NewStreamingOrchestrator defaults it via
+// defaultScratchRootDir when WithScratchRoot is not supplied.
+func (o *StreamingOrchestrator) scratchRootDir() string {
+	return o.scratchRoot
 }
 
 // unwrapRetryExhausted returns err's original per-attempt cause when err is
