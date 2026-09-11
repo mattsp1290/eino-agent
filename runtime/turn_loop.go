@@ -509,6 +509,18 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 // rows in sessionID's history -- used by resumeEngine to derive
 // placeholderUsed from the resumed turn's actual durable state (see its
 // call site's doc comment) instead of assuming it either way.
+//
+// This is deliberately NOT the same predicate as
+// dropUnfinalizedAssistantPlaceholders' "unfinalized" check (adk_model.go):
+// that one counts only decoded ContentBlocks, while this one counts ANY
+// session.Part row, including a placeholder that carries only
+// PartProviderState/PartResponseMeta parts with no content block at all. A
+// message in that narrow shape is "used" here (true) but still
+// "unfinalized" there -- which is the safe direction to err in (it mints a
+// fresh message rather than risk a mismatched-content-kind append onto one
+// dropUnfinalizedAssistantPlaceholders would otherwise still be willing to
+// treat as absorbable), so the two are not meant to be unified into one
+// predicate (round-three reconciliation item 9, RD-S2).
 func messageHasParts(ctx context.Context, store session.Store, sessionID session.ID, messageID session.MessageID) (bool, error) {
 	cursor := session.ReplayCursor{Limit: 1000}
 	for {
@@ -810,6 +822,17 @@ func settleRunRetrying(ctx context.Context, store session.ExecutionStore, reques
 		committed, err := store.SettleRun(ctx, request)
 		if err == nil {
 			return committed, nil
+		}
+		// ErrRunHasQueuedInput is a structural conflict (a durably queued
+		// inbox item), not the in-flight tool settlement this retry loop
+		// exists for -- only a FUTURE run's drain can ever clear it, so
+		// retrying here only burns the full budget before the caller's own
+		// conflict branch takes the drain-and-divert path it was always
+		// going to take. Return it immediately (round-three reconciliation
+		// item 9, SR-S1/RD-S4); it still satisfies errors.Is(err,
+		// session.ErrConflict) for the caller's own check.
+		if errors.Is(err, session.ErrRunHasQueuedInput) {
+			return session.RunSettlementResult{}, err
 		}
 		if !errors.Is(err, session.ErrConflict) {
 			return session.RunSettlementResult{}, err
@@ -1394,8 +1417,8 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		return nil, err
 	}
 	cfg := config.Snapshot{Agent: config.Agent{
-		Name: run.Agent, Model: selection, SystemPrompt: durable.SystemPrompt, Options: durable.AgentOptions,
-	}, Metadata: map[string]string{
+		Name: run.Agent, Model: selection, SystemPrompt: durable.SystemPrompt, Options: durable.AgentOptions, Mode: durable.AgentMode,
+	}, Tools: config.ToolConfig{Enabled: durable.ToolsEnabled, Disabled: durable.ToolsDisabled}, Metadata: map[string]string{
 		"workspace_id": durable.WorkspaceID, "workspace_root": durable.WorkspaceRoot,
 	}}
 	turns, err := o.store.ListTurns(ctx, runID)

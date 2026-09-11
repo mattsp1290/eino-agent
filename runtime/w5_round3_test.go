@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,6 +15,118 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
+
+// deleteGateStore delays the SECOND call to ReadPromotedCheckpoint until
+// the test closes release. For a fresh, single-turn Start with no checkpoint
+// ever staged, the first call is adkCheckpointStore.Get inside upstream's
+// tryLoadCheckpoint (Run's very first step); the second is
+// adkCheckpointStore.Delete's lookup, made from inside upstream's cleanup
+// AFTER atomic.StoreInt32(&l.stopped, 1) but BEFORE Wait returns and
+// runTurnLoop unregisters the loop -- exactly the window an Enqueue must
+// land in to reach TurnLoop's late-item buffer (pushWithConfig routes any
+// Push once l.stopped != 0 to appendLate) rather than the normal buffer or
+// a sealed late buffer (TakeLateItems, called only later in
+// finishTurnLoop, well after Wait returns).
+type deleteGateStore struct {
+	session.Store
+	calls   int
+	mu      sync.Mutex
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (s *deleteGateStore) ReadPromotedCheckpoint(ctx context.Context, runID session.RunID) (session.Checkpoint, bool, error) {
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if n == 2 {
+		close(s.reached)
+		<-s.release
+	}
+	return s.Store.ReadPromotedCheckpoint(ctx, runID)
+}
+
+// TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation proves
+// round-three reconciliation item 8 (RD-I4): the genuine TakeLateItems
+// window -- an Enqueue reaching Push while the loop is still registered but
+// already stopped, so upstream routes it to appendLate -- is reachable from
+// outside this package and, once TakeLateItems drains it in
+// finishTurnLoop, must divert to a between-turn queued-continuation pause
+// with the item durably `queued`, never a panic and never a RunCompleted
+// settlement that strands it.
+func TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation(t *testing.T) {
+	ctx := context.Background()
+	sqliteStore, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("openTestSQLite: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	gate := &deleteGateStore{Store: sqliteStore, reached: make(chan struct{}), release: make(chan struct{})}
+	orch, err := NewStreamingOrchestrator(
+		WithStore(gate), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("first turn done")}, nil
+		})}),
+		WithIDGenerator(&sequenceIDs{}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
+		WithOwnerID("sqlite-owner-late-item"), WithQueueSize(2),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
+	)
+	if err != nil {
+		t.Fatalf("NewStreamingOrchestrator: %v", err)
+	}
+	configureTestTools(orch, staticToolRegistry{tools: nil})
+
+	handle, err := orch.Start(ctx, Request{SessionID: "sqlite-late-item-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+
+	var item session.InboxItem
+	var enqueueErr error
+	select {
+	case <-gate.reached:
+		item, enqueueErr = orch.Enqueue(ctx, "sqlite-late-item-session", EnqueueRequest{
+			RunID: handle.RunID(), IdempotencyKey: "late-item-key", Message: TextUserMessage("late message"),
+		})
+		close(gate.release)
+	case <-time.After(5 * time.Second):
+		t.Fatal("delete gate never reached")
+	}
+	if enqueueErr != nil {
+		t.Fatalf("Enqueue error = %v", enqueueErr)
+	}
+
+	result := <-handle.Done()
+	if result.Status != session.RunPaused {
+		t.Fatalf("result = %+v, want paused (the late item must divert to a queued-continuation pause)", result)
+	}
+	items, err := orch.store.ListInbox(ctx, "sqlite-late-item-session", nil)
+	if err != nil {
+		t.Fatalf("ListInbox error = %v", err)
+	}
+	var found bool
+	for _, it := range items {
+		if it.ID == item.ID {
+			found = true
+			if it.State != session.InboxQueued {
+				t.Fatalf("late item state = %q, want queued", it.State)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("late item %s not found in inbox: %#v", item.ID, items)
+	}
+
+	resumeHandle, err := orch.ResumeRun(ctx, result.RunID, ResumeRequest{})
+	if err != nil {
+		t.Fatalf("ResumeRun error = %v", err)
+	}
+	resumed := <-resumeHandle.Done()
+	if resumed.Status != session.RunCompleted || resumed.Error != nil {
+		t.Fatalf("resumed result = %+v", resumed)
+	}
+}
 
 // upstreamTurnLoopCheckpointShape is a field-identical mirror of eino's
 // private adk.turnLoopCheckpoint[session.InboxID] (adk/turn_loop.go): gob
@@ -191,5 +306,46 @@ func TestDuplicateDeliveryOfAlreadyAdmittedItemDoesNotDispatch(t *testing.T) {
 	finalRun, err := orch.store.GetRun(context.Background(), result.RunID)
 	if err != nil || finalRun.Status != session.RunPaused {
 		t.Fatalf("final run = %+v, err=%v, want status=paused", finalRun, err)
+	}
+}
+
+// queuedInputAlwaysStore is a minimal session.ExecutionStore whose SettleRun
+// always reports session.ErrRunHasQueuedInput, counting calls.
+type queuedInputAlwaysStore struct {
+	session.ExecutionStore
+	calls int
+}
+
+func (s *queuedInputAlwaysStore) SettleRun(context.Context, session.SettleRunRequest) (session.RunSettlementResult, error) {
+	s.calls++
+	return session.RunSettlementResult{}, session.ErrRunHasQueuedInput
+}
+
+// TestSettleRunRetryingSkipsRetryOnQueuedInput proves round-three
+// reconciliation item 9's settleRunRetrying half (SR-S1/RD-S4):
+// ErrRunHasQueuedInput is a structural conflict a bounded in-process retry
+// loop can never clear (only a future run's drain does), so it must be
+// returned on the FIRST attempt, not burn the full 40x5ms retry budget the
+// way an ordinary session.ErrConflict (an in-flight tool settlement that
+// really can clear) still does.
+func TestSettleRunRetryingSkipsRetryOnQueuedInput(t *testing.T) {
+	store := &queuedInputAlwaysStore{}
+	start := time.Now()
+	_, err := settleRunRetrying(context.Background(), store, session.SettleRunRequest{
+		Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: time.Now()},
+		Event:      session.RunSettlementEvent{ID: "settle-retry-test-event"},
+	})
+	elapsed := time.Since(start)
+	if !errors.Is(err, session.ErrRunHasQueuedInput) {
+		t.Fatalf("err = %v, want ErrRunHasQueuedInput", err)
+	}
+	if !errors.Is(err, session.ErrConflict) {
+		t.Fatalf("err = %v, want it to still satisfy errors.Is(err, session.ErrConflict)", err)
+	}
+	if store.calls != 1 {
+		t.Fatalf("SettleRun calls = %d, want exactly 1 (no retry)", store.calls)
+	}
+	if elapsed > 50*time.Millisecond {
+		t.Fatalf("settleRunRetrying took %v, want an immediate return with no retry sleep", elapsed)
 	}
 }

@@ -686,7 +686,7 @@ func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.Sett
 	if request.Settlement.Status == session.RunCompleted {
 		for _, item := range s.inbox {
 			if item.SessionID == current.SessionID && item.State == session.InboxQueued {
-				return session.RunSettlementResult{}, session.ErrConflict
+				return session.RunSettlementResult{}, session.ErrRunHasQueuedInput
 			}
 		}
 	}

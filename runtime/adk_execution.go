@@ -411,6 +411,19 @@ type AgentBuildContext struct {
 // bounded AgentBuildContext. It is frozen in RunPlanSpec.Agent (see
 // runtime/extension_plan.go) so a resumed run rebuilds an equivalent agent
 // graph deterministically.
+//
+// Every compliant agent must route at least one physical model call through
+// build.Model per turn: onAgentEvents (runtime/turn_loop.go) fails a
+// normally-completed turn whose adkEngine recorded zero durable model
+// dispatches, on the theory that a turn producing no ledgered provider call
+// means the agent's real execution routed its call through some model the
+// host never handed out (the "rogue model" case durableGuard cannot see,
+// since it only inspects the tool list). This is a real constraint, not
+// just a defensive check: a factory that legitimately never dispatches on
+// some turns (e.g. answering purely from tools or a cached/transferred
+// result, with no physical model call at all) will fail those turns under
+// this check today (see the W5 section of docs/architecture/eino-feature-support.md
+// for the exact scope).
 type AgentFactory interface {
 	BuildAgent(ctx context.Context, build AgentBuildContext) (adk.TypedAgent[*einoschema.AgenticMessage], error)
 }

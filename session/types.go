@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -44,6 +45,16 @@ var (
 	// acknowledge this input" apart from an unrelated write conflict (e.g. a
 	// mismatched idempotent retry payload).
 	ErrRunClosed = errors.New("session: run is closed")
+	// ErrRunHasQueuedInput reports that a SettleRun(RunCompleted) was
+	// refused because the run's session has a durably queued inbox item
+	// (see SettleRun's terminal-settlement race guard). It wraps
+	// ErrConflict (errors.Is(err, ErrConflict) still holds for existing
+	// callers), but is distinguished from a generic conflict so a caller
+	// like settleRunRetrying can skip retrying a conflict that a bounded
+	// retry loop can never clear -- only a FUTURE run's drain does -- and
+	// divert immediately instead of burning its full retry budget first
+	// (round-three reconciliation item 9, SR-S1/RD-S4).
+	ErrRunHasQueuedInput = fmt.Errorf("%w: run has queued input pending drain", ErrConflict)
 )
 
 // Session is durable conversation metadata. Runtime dependencies such as model

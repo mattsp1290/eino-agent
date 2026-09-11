@@ -363,6 +363,98 @@ func inboxContract(t *testing.T, factory Factory) {
 				t.Fatalf("oversize enqueue = %v, want ErrContentTooLarge", err)
 			}
 		})
+
+		// Round-three reconciliation item 7 (RD-I3): EnqueueInboxForRun is a
+		// new session.Store method with four distinct outcomes, previously
+		// pinned by nothing but the in-memory runtime fixture the same
+		// commit wrote -- exactly the divergence class item 7 was raised
+		// for, re-created while an earlier instance of it was being fixed.
+		t.Run("enqueue for run reports created exactly once and enforces run identity", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-inbox-for-run")
+			other := createSession(t, ctx, subject.Store, "session-inbox-for-run-other")
+			r := admitRun(t, ctx, subject.Store, run("run-inbox-for-run", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			item := inboxItem("inbox-for-run-1", s.ID, "for-run-key-1", "hello", at)
+			first, created, err := subject.Store.EnqueueInboxForRun(ctx, r.ID, item, session.DefaultContentLimits())
+			if err != nil || !created {
+				t.Fatalf("enqueue for run = %#v, created=%v, %v; want created=true", first, created, err)
+			}
+			replay := item
+			replay.ID = "inbox-for-run-1-replay"
+			replayed, replayCreated, err := subject.Store.EnqueueInboxForRun(ctx, r.ID, replay, session.DefaultContentLimits())
+			if err != nil || replayCreated || replayed.ID != first.ID {
+				t.Fatalf("enqueue for run replay = %#v, created=%v, %v; want created=false, id=%s", replayed, replayCreated, err, first.ID)
+			}
+			contradiction := item
+			contradiction.ID = "inbox-for-run-1-conflict"
+			contradiction.Blocks = inboxBlocks("different")
+			if _, _, err := subject.Store.EnqueueInboxForRun(ctx, r.ID, contradiction, session.DefaultContentLimits()); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("contradictory enqueue for run = %v, want ErrConflict", err)
+			}
+			wrongSession := inboxItem("inbox-for-run-wrong-session", other.ID, "for-run-key-wrong-session", "hello", at)
+			if _, _, err := subject.Store.EnqueueInboxForRun(ctx, r.ID, wrongSession, session.DefaultContentLimits()); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("enqueue for run with mismatched session = %v, want ErrConflict", err)
+			}
+			if _, _, err := subject.Store.EnqueueInboxForRun(ctx, "no-such-run", inboxItem("inbox-for-run-missing", s.ID, "for-run-key-missing", "hello", at), session.DefaultContentLimits()); !errors.Is(err, session.ErrRunClosed) {
+				t.Fatalf("enqueue for missing run = %v, want ErrRunClosed", err)
+			}
+			// RunInterrupted, not RunCompleted: the still-queued `first`
+			// item above (never consumed by any turn) would otherwise trip
+			// SettleRun's own RunCompleted-scoped queued-inbox guard (see
+			// the "settle run completed refuses..." case below) -- this
+			// case is only about EnqueueInboxForRun's terminal-run check.
+			if _, err := execution.SettleRun(ctx, session.SettleRunRequest{
+				Settlement: session.RunSettlement{Status: session.RunInterrupted, FinishedAt: at.Add(time.Second), Error: "test terminal"},
+				Event:      session.RunSettlementEvent{ID: "inbox-for-run-settle-event"},
+			}); err != nil {
+				t.Fatalf("settle run interrupted: %v", err)
+			}
+			terminal := inboxItem("inbox-for-run-terminal", s.ID, "for-run-key-terminal", "hello", at)
+			if _, _, err := subject.Store.EnqueueInboxForRun(ctx, r.ID, terminal, session.DefaultContentLimits()); !errors.Is(err, session.ErrRunClosed) {
+				t.Fatalf("enqueue for terminal run = %v, want ErrRunClosed", err)
+			}
+		})
+
+		// Round-three reconciliation item 7 (RD-I3): the residual
+		// terminal-settlement-race closer (SettleRun's queued-inbox guard)
+		// was mirrored by hand in the runtime fixture but pinned by no
+		// store contract, so it ran against PostgreSQL never.
+		t.Run("settle run completed refuses while the session has a queued inbox item", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-settle-queued")
+			r := admitRun(t, ctx, subject.Store, run("run-settle-queued", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			if _, err := subject.Store.EnqueueInbox(ctx, inboxItem("inbox-settle-queued", s.ID, "settle-queued-key", "hi", at), session.DefaultContentLimits()); err != nil {
+				t.Fatalf("enqueue inbox: %v", err)
+			}
+			completedSettlement := session.SettleRunRequest{
+				Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: at.Add(time.Second)},
+				Event:      session.RunSettlementEvent{ID: "settle-queued-completed-event"},
+			}
+			if _, err := execution.SettleRun(ctx, completedSettlement); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("settle completed with queued inbox = %v, want ErrConflict", err)
+			}
+			// The guard is deliberately scoped to RunCompleted: the same
+			// run can still settle failed/interrupted, leaving the item
+			// simply queued for the session's next Start.
+			failedSettlement := session.SettleRunRequest{
+				Settlement: session.RunSettlement{Status: session.RunFailed, FinishedAt: at.Add(time.Second), Error: "injected"},
+				Event:      session.RunSettlementEvent{ID: "settle-queued-failed-event"},
+			}
+			result, err := execution.SettleRun(ctx, failedSettlement)
+			if err != nil || result.Run.Status != session.RunFailed {
+				t.Fatalf("settle failed with queued inbox = %#v, %v, want success", result, err)
+			}
+			items, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued})
+			if err != nil || len(items) != 1 {
+				t.Fatalf("queued inbox after failed settlement = %#v, %v, want still queued", items, err)
+			}
+		})
 	})
 }
 

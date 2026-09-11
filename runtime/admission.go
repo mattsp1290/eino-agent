@@ -444,19 +444,44 @@ func admissionEvent(request admissionRequest, sessionID session.ID, runID sessio
 // and agent options must equal the fresh-run values, proven by
 // TestResumeRunRestoresSystemPromptAndAgentOptions).
 const (
+	// agentNameConfigKey is written for durable audit only: ResumeRun uses
+	// the run row's own Agent field instead (the better source, since it is
+	// never JSON-encoded), so this key has no decode side and is
+	// deliberately NOT part of the admissionConfig/decodeResumeRunConfig
+	// round trip the rest of this block's comment describes.
 	agentNameConfigKey     = "agent"
 	workspaceIDConfigKey   = "workspace_id"
 	workspaceRootConfigKey = "workspace_root"
 	systemPromptConfigKey  = "system_prompt"
 	agentOptionsConfigKey  = "agent_options"
+	// agentModeConfigKey and toolScopeConfigKey round-trip config.Agent.Mode
+	// and config.ToolConfig.Enabled/Disabled (round-three reconciliation
+	// item 6, RD-2): both are read on every post-resume turn --
+	// boundedTurnMetadata publishes AgentMode to every extension, and
+	// NewToolScopeContext projects Tools.Enabled/Disabled into what a
+	// host's ScopeResolver sees -- so leaving them unrestored would let a
+	// resumed run materialize a different effective tool set, or report a
+	// different agent mode to extensions, than its own pre-pause turns.
+	agentModeConfigKey = "agent_mode"
+	toolScopeConfigKey = "tool_scope"
 )
+
+// resumeToolScope is the JSON shape toolScopeConfigKey encodes: just the two
+// ToolConfig fields a resumed run's snapshot needs (Permissions is not part
+// of ToolScopeContext/NewToolScopeContext, so it is not durably needed here).
+type resumeToolScope struct {
+	Enabled  []string `json:"enabled,omitempty"`
+	Disabled []string `json:"disabled,omitempty"`
+}
 
 // admissionConfig durably persists the subset of a run's construction config
 // ResumeRun later needs to rebuild an equivalent turnLoopCoordinator: without
 // system_prompt and agent_options here, a resumed run's post-resume model
 // dispatches would silently run with an empty system prompt and a model
 // resolved without the agent's options (see ResumeRun's doc comment and the
-// W5 doc's Host API bullet).
+// W5 doc's Host API bullet). agent_mode and tool_scope close the remaining
+// gap RD-2 found: Agent.Mode and Tools.Enabled/Disabled were still silently
+// dropped across a resume.
 func admissionConfig(request admissionRequest) map[string]string {
 	snapshot := request.Config
 	cfg := map[string]string{
@@ -464,13 +489,34 @@ func admissionConfig(request admissionRequest) map[string]string {
 		workspaceIDConfigKey:   snapshot.Metadata["workspace_id"],
 		workspaceRootConfigKey: snapshot.Metadata["workspace_root"],
 		systemPromptConfigKey:  snapshot.Agent.SystemPrompt,
+		agentModeConfigKey:     snapshot.Agent.Mode,
 	}
 	if len(snapshot.Agent.Options) != 0 {
 		if raw, err := json.Marshal(snapshot.Agent.Options); err == nil {
 			cfg[agentOptionsConfigKey] = string(raw)
 		}
 	}
+	if len(snapshot.Tools.Enabled) != 0 || len(snapshot.Tools.Disabled) != 0 {
+		if raw, err := json.Marshal(resumeToolScope{Enabled: snapshot.Tools.Enabled, Disabled: snapshot.Tools.Disabled}); err == nil {
+			cfg[toolScopeConfigKey] = string(raw)
+		}
+	}
 	return cfg
+}
+
+// decodeToolScope reverses admissionConfig's tool_scope encoding. An empty
+// or malformed value decodes to the zero resumeToolScope rather than
+// failing ResumeRun, matching decodeAgentOptions' posture for a run
+// admitted before this field existed.
+func decodeToolScope(raw string) resumeToolScope {
+	if raw == "" {
+		return resumeToolScope{}
+	}
+	var scope resumeToolScope
+	if err := json.Unmarshal([]byte(raw), &scope); err != nil {
+		return resumeToolScope{}
+	}
+	return scope
 }
 
 // decodeAgentOptions reverses admissionConfig's agent_options encoding. An
@@ -498,15 +544,22 @@ type resumeRunConfig struct {
 	WorkspaceRoot string
 	SystemPrompt  string
 	AgentOptions  map[string]string
+	AgentMode     string
+	ToolsEnabled  []string
+	ToolsDisabled []string
 }
 
 // decodeResumeRunConfig reads resumeRunConfig's fields out of a durable
 // run.Config map, using the same keys admissionConfig wrote.
 func decodeResumeRunConfig(config map[string]string) resumeRunConfig {
+	scope := decodeToolScope(config[toolScopeConfigKey])
 	return resumeRunConfig{
 		WorkspaceID:   config[workspaceIDConfigKey],
 		WorkspaceRoot: config[workspaceRootConfigKey],
 		SystemPrompt:  config[systemPromptConfigKey],
 		AgentOptions:  decodeAgentOptions(config[agentOptionsConfigKey]),
+		AgentMode:     config[agentModeConfigKey],
+		ToolsEnabled:  scope.Enabled,
+		ToolsDisabled: scope.Disabled,
 	}
 }

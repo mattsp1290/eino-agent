@@ -223,7 +223,7 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 				return store.mapErr(err)
 			}
 			if queuedCount != 0 {
-				return session.ErrConflict
+				return session.ErrRunHasQueuedInput
 			}
 		}
 		canonicalRun, err := session.ApplyRunSettlement(current, request.Settlement)

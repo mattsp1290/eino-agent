@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -601,6 +603,9 @@ func TestResumeRunRestoresSystemPromptAndAgentOptions(t *testing.T) {
 	cfg := orchestratorConfig()
 	cfg.Agent.SystemPrompt = "AUDITED-SYSTEM-PROMPT"
 	cfg.Agent.Options = map[string]string{"temperature": "0", "audited_option": "present"}
+	cfg.Agent.Mode = "audited-mode"
+	cfg.Tools.Enabled = []string{"gate", "audited-enabled-tool"}
+	cfg.Tools.Disabled = []string{"audited-disabled-tool"}
 
 	handle, err := orch.Start(context.Background(), Request{SessionID: "sqlite-system-prompt-session", Message: TextUserMessage("hello"), Config: cfg})
 	if err != nil {
@@ -640,5 +645,38 @@ func TestResumeRunRestoresSystemPromptAndAgentOptions(t *testing.T) {
 	}
 	if optionsSeen[len(optionsSeen)-1]["audited_option"] != "present" {
 		t.Fatalf("post-resume agent options = %#v, want audited_option=present", optionsSeen[len(optionsSeen)-1])
+	}
+
+	// Round-three reconciliation item 6 (RD-2): Agent.Mode and
+	// Tools.Enabled/Disabled must round-trip through the same durable
+	// resumeRunConfig pair the system prompt/options above already do, and
+	// must reach the same BoundedTurnMetadata/ToolScopeContext a fresh
+	// run's turns see.
+	finalRun, err := orch.store.GetRun(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("GetRun after resume: %v", err)
+	}
+	durable := decodeResumeRunConfig(finalRun.Config)
+	if durable.AgentMode != cfg.Agent.Mode {
+		t.Fatalf("decoded AgentMode = %q, want %q", durable.AgentMode, cfg.Agent.Mode)
+	}
+	if !reflect.DeepEqual(durable.ToolsEnabled, cfg.Tools.Enabled) || !reflect.DeepEqual(durable.ToolsDisabled, cfg.Tools.Disabled) {
+		t.Fatalf("decoded tool scope = enabled=%#v disabled=%#v, want enabled=%#v disabled=%#v",
+			durable.ToolsEnabled, durable.ToolsDisabled, cfg.Tools.Enabled, cfg.Tools.Disabled)
+	}
+	resumedSnapshot := TurnSnapshot{
+		SessionID: finalRun.SessionID,
+		Config: config.Snapshot{
+			Agent: config.Agent{Name: finalRun.Agent, Mode: durable.AgentMode},
+			Tools: config.ToolConfig{Enabled: durable.ToolsEnabled, Disabled: durable.ToolsDisabled},
+		},
+	}
+	if got := boundedTurnMetadata(resumedSnapshot).AgentMode; got != cfg.Agent.Mode {
+		t.Fatalf("resumed BoundedTurnMetadata.AgentMode = %q, want %q", got, cfg.Agent.Mode)
+	}
+	scope := NewToolScopeContext(resumedSnapshot)
+	if !reflect.DeepEqual(scope.EnabledTools, cfg.Tools.Enabled) || !reflect.DeepEqual(scope.DisabledTools, cfg.Tools.Disabled) {
+		t.Fatalf("resumed ToolScopeContext = enabled=%#v disabled=%#v, want enabled=%#v disabled=%#v",
+			scope.EnabledTools, scope.DisabledTools, cfg.Tools.Enabled, cfg.Tools.Disabled)
 	}
 }
