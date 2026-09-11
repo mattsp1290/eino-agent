@@ -216,12 +216,22 @@ a construction error.
 `runtime.RunPlan.AgentHandlers()` exposes the sealed, ordered list with live
 `Factory` and discovered `Tools` attached; `adkEngine.buildAgent` invokes
 every factory fresh for each admitted turn with a bounded
-`runtime.HandlerBuildContext` (session/run identity, the mandatory
-ledger-audited model adapter, read-only workspace-scoped filesystem/skill
-backend views, private writable scratch backends for plantask/reduction,
-this turn's frozen deferred tools, and the durable store/ID
-generator/clock a recipe like summarization needs to write its own durable
-state) and installs the results into `AgentBuildContext.Handlers`, ahead of
+`runtime.HandlerBuildContext` (session/run identity, a ledger-audited model
+adapter -- the turn's own mandatory one for every recipe except
+summarization, which gets a bounded internal-dispatch adapter instead, see
+below -- read-only workspace-scoped filesystem/skill backend views, private
+writable scratch backends for plantask/reduction rooted per session, and
+this turn's frozen deferred tools). `HandlerBuildContext` carries no
+`session.Store`/`session.ExecutionStore` at all -- it is handed identically
+to every registered `HandlerFactory`, host-provided ones included, so
+either would let an arbitrary host handler fabricate a durable `ToolCall`
+settlement or read checkpoint/provider-private state; summarization, the
+one recipe that legitimately needs a bounded durable write (mapping a
+completed summary into a `session.ContextEpoch`), is given a narrow,
+unexported capability instead, reachable only from this package's own
+recipe code (the same Go-visibility isolation `authorizeRewrite` already
+used). `adkEngine.buildAgent` installs the results into
+`AgentBuildContext.Handlers`, ahead of
 this runtime's own mandatory tail handlers (`durableGuard`, `settlementSeal`
 -- `runtime/adk_middleware.go`), after `durableBaselineHandler`
 (`AgentBuildContext.DurableBaseline`), which is installed *first*.
@@ -238,12 +248,23 @@ innermost, directly around the mandatory `Model`/`Tools` adapters, so no
 host handler can substitute them) and first-registered-is-first-called for
 hook methods (`BeforeAgent`/`BeforeModelRewriteState`/...), which is why
 `durableBaselineHandler` -- installed first -- establishes the baseline
-before any host handler's own hook runs. `settlementSeal` compares every
-settled tool's model-visible content against `durableBaselineHandler`'s own
-reconstruction for that call ID and fails the run on divergence, or on a
-fabricated result for a call with no durable settlement, unless the
-rewrite was recorded as authorized by a sanctioned content-management
-recipe (patchtoolcalls, reduction -- `wrapAuthorizedContentRewrites`).
+before any host handler's own hook runs. The real settlement authority,
+though, is `verifySettledToolResults`, called from
+`adkModel.prepareDispatchInput` -- the innermost dispatch point every
+physical attempt passes through regardless of a host `WrapModel` wrapper
+nested around the model after every handler's hooks (including
+`settlementSeal`'s own `BeforeModelRewriteState`, kept only as an early,
+non-authoritative check calling the identical function) have already run.
+It compares every occurrence of a settled tool's model-visible content
+(not just the last one a map would remember) against
+`durableBaselineHandler`'s own reconstruction for that call ID, hashing the
+full canonical content including media fields, and fails the run on
+divergence, or on a fabricated result for a call with no durable
+settlement, unless the exact post-rewrite content digest was recorded as
+an authorized rewrite for that call ID THIS cycle (reset every cycle) by a
+sanctioned content-management recipe (patchtoolcalls, reduction --
+`wrapAuthorizedContentRewrites`), which also durably records the rewrite
+(handler ID, kind, call ID, before/after digest) as an audit event.
 
 Both integration gaps an earlier pass of this design left open --
 host-injected content never reaching the model, and a handler-injected tool
@@ -260,14 +281,20 @@ function wires all eight upstream recipes this package ships
 (`runtime.HandlerKindAgentsMD`/`Skill`/`Filesystem`/`PlanTask`/
 `PatchToolCalls`/`Reduction`/`Summarization`/`ToolSearch`), and its test
 suite drives real turns exercising each recipe's positive and failure
-paths, ordering (two authorized content rewrites in one turn), an
-immutable-input proof via a custom `HandlerFactory` that tries to rewrite a
-settled result without authorization, and interrupt/resume including a
-handler `Config` change being refused on resume -- see that package's own
-doc comment and the W6 section of `docs/architecture/eino-feature-support.md`
-for the two scope limits this pass left open (a dangling-call fixture for
-patchtoolcalls, and calling -- as opposed to finding -- a tool discovered
-through toolsearch's own dynamic resolution path).
+paths, ordering (two authorized content rewrites in one turn -- reduction
+clearing two settled tool results, with `Retention{MaxInlineBytes:-1}` so
+the payload is genuinely inline and only reduction, not this runtime's own
+retention truncation, can be what shortens it), an immutable-input proof
+via a custom `HandlerFactory` that tries to rewrite a settled result
+without authorization, a discovered deferred tool actually being called
+(not just found) after toolsearch surfaces it, and interrupt/resume
+including a handler `Config` change being refused on resume -- see that
+package's own doc comment and the W6 section of
+`docs/architecture/eino-feature-support.md` for the scope limits this
+pass left open (a dangling-call fixture for patchtoolcalls; toolsearch's
+discovery is only recorded in-memory for the live run, not durably, so it
+does not survive a resume/restart; skill activation is durably recorded
+but not yet re-verified against a live `Get` on resume).
 
 ## Request ledger and privacy
 

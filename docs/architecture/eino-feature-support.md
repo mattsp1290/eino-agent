@@ -1689,34 +1689,56 @@ below.
   (content edited in place or appended -- robust to ADK's retry/failover
   wrapper defensively cloning the message slice) and drops it, never
   misapplying it, when a handler shortens history (summarization
-  compacting). `settlementSeal.BeforeModelRewriteState` -- appended last, so
-  it observes `state.Messages` only after every host handler's own
-  `BeforeModelRewriteState` has run -- compares every `function_tool_result`
-  block's content against `adkEngine.baselineMessages`' own reconstruction
-  for that call ID (handling single- and multi-part/enhanced settled
-  results uniformly) and enforces two invariants: a settled call's result
-  may never diverge from that reconstruction
+  compacting). The real settlement authority is
+  `verifySettledToolResults`, called from `adkModel.prepareDispatchInput`
+  -- the innermost dispatch point every physical attempt passes through
+  regardless of a host `WrapModel` wrapper nested around the model after
+  every handler's `BeforeModelRewriteState` hook has already run.
+  `settlementSeal.BeforeModelRewriteState` calls the identical function and
+  is kept only as an early, non-authoritative check (round-one review
+  finding C2: a host `WrapModel` rewrite bypassed the hook-only seal --
+  `TestSettlementSealRejectsWrapModelTamperedToolResult`). The comparison
+  is per-occurrence, not a last-write-wins map (a duplicate/shadow
+  `function_tool_result` block for an already-settled call ID is rejected
+  even when the genuine block is also present --
+  `TestSettlementSealRejectsDuplicateShadowToolResult`), and hashes the
+  full canonical content of every block, media fields included, not just
+  `Text` (`TestSettlementSealRejectsMediaSwapOnSettledMultimodalResult`).
+  It enforces two invariants against `adkEngine.baselineMessages`' own
+  reconstruction for that call ID: a settled call's result may never
+  diverge from that reconstruction
   (`TestSettlementSealRejectsHostRewrittenToolResult`), and a
   `function_tool_result` with no durable settlement in the baseline is
   rejected as fabricated
   (`TestSettlementSealRejectsUnauthorizedFabricatedToolResult`) -- both
-  unless the callID was recorded as an authorized rewrite.
-  `authorizedRewriteSet` + `wrapAuthorizedContentRewrites` (diffing a
-  wrapped middleware's own `function_tool_result` content before/after its
-  `BeforeModelRewriteState`) give patchtoolcalls' legitimate dangling-call
-  patches and reduction's legitimate settled-result truncation/clearing
-  that authorization
-  (`TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite`); no
-  other recipe gets it. The ledger model adapter (`adkModel`) remains the
-  sole audit authority structurally -- `AgentBuildContext.Model` is always
-  the mandatory adapter, and W5's existing dispatch-count check
-  (`adkEngine.dispatches`/`onAgentEvents`) already detects a factory that
-  substitutes its own model -- so no separate "auditSeal" handler was
-  needed. A handler-injected tool belongs to the frozen tool universe (see
-  Group C); `durableGuard.BeforeAgent` deduplicates a handler's own
-  redundant raw copy of an already-sealed tool (its real `BeforeAgent`
-  still runs and re-appends it) rather than rejecting it, and still fails
-  any other non-durable or unsealed tool as a construction error.
+  unless the exact post-rewrite content digest was recorded as an
+  authorized rewrite for that call ID, THIS cycle
+  (`authorizedRewriteSet`, reset every cycle by
+  `durableBaselineHandler.BeforeModelRewriteState`). `wrapAuthorizedContentRewrites`
+  (diffing a wrapped middleware's own `function_tool_result` content
+  before/after its `BeforeModelRewriteState`) gives patchtoolcalls'
+  legitimate dangling-call patches and reduction's legitimate settled-result
+  truncation/clearing that authorization, and durably records each one
+  (handler ID, kind, call ID, before/after digest) as a
+  `session.AuthorizedToolResultRewriteEventKind` event, drained by
+  `adkModel.begin`; no other recipe gets it. `HandlerBuildContext` exposes
+  no `session.Store`/`session.ExecutionStore` to any registered
+  `HandlerFactory` (host-provided ones included) at all -- round-one review
+  finding C1: it previously did, letting a host handler fabricate a durable
+  settlement directly via `ExecutionStore.ClaimToolCall`/`SettleToolCall`
+  (`TestHandlerBuildContextExposesNoDurableStoreAuthority`); the one recipe
+  that legitimately needs a bounded durable write (summarization) is given
+  a narrow, unexported `contextEpochCapability` instead. The ledger model
+  adapter (`adkModel`) remains the sole audit authority structurally --
+  `AgentBuildContext.Model` is always the mandatory adapter, and W5's
+  existing dispatch-count check (`adkEngine.dispatches`/`onAgentEvents`)
+  already detects a factory that substitutes its own model -- so no
+  separate "auditSeal" handler was needed. A handler-injected tool belongs
+  to the frozen tool universe (see Group C); `durableGuard.BeforeAgent`
+  deduplicates a handler's own redundant raw copy of an already-sealed tool
+  (its real `BeforeAgent` still runs and re-appends it) rather than
+  rejecting it, and still fails any other non-durable or unsealed tool as a
+  construction error.
 - **Group C (`runtime/adk_middleware_recipes.go`,
   `adk_middleware_workspace.go`, `adk_middleware_scratch.go`,
   `adk_middleware_discovery.go`, `adk_middleware_frozen_tools.go`)**: typed
@@ -1734,7 +1756,24 @@ below.
   real tool call
   (`TestFilesystemHandlerMultiModalReadReturnsMediaPart`).
   `writableWorkspaceBackend` is a private, workspace-contained scratch area
-  for plantask/reduction's own state. A handler's tools are discovered once
+  for plantask/reduction's own state, rooted per-session
+  (`.eino-agent/sessions/<sha256(session id)>/{plantask,reduction}`, never
+  a workspace-wide directory two sessions on the same workspace would
+  otherwise share and collide task IDs/offload files in) and constructed
+  lazily, only for the recipe kinds a plan actually mounts. Both this
+  backend and the read-only `workspaceFilesystemBackend`
+  (`GrepRaw`/`GlobInfo`, and `resolveWorkspacePath` for a not-yet-existing
+  path) resolve every walked/targeted path through symlink evaluation and
+  require the result contained in the canonical workspace root, including
+  when the leaf doesn't exist yet (resolving the deepest existing ancestor
+  instead) -- a checked-in symlink inside an untrusted workspace can
+  neither leak content through grep/glob nor let the writable scratch
+  backends write outside the workspace
+  (`TestWorkspaceFilesystemBackendGrepRejectsSymlinkEscape`,
+  `TestWorkspaceFilesystemBackendGlobRejectsSymlinkEscape`,
+  `TestWritableWorkspaceBackendRejectsSymlinkedRoot`,
+  `TestWritableWorkspaceBackendRejectsSymlinkedIntermediateDirectoryOnWrite`).
+  A handler's tools are discovered once
   at plan-compile time (`discoverHandlerTools`, Group A) and, at real
   per-turn build time, `adkEngine.sealHandlerTools` splices a durable
   `runtime.Tool` per sealed entry into `TurnSnapshot.Tools` *before* the
@@ -1750,24 +1789,68 @@ below.
   `TestPlanTaskHandlerCreateAndUpdateThroughDurableWrapper` (TaskCreate then
   TaskUpdate, correlating the created task's numeric ID out of its own
   human-readable result message), `TestSkillHandlerInlineActivationThroughDurableWrapper`.
-  Summarization's `Finalize` maps a completed summary into an atomic
-  `session.ContextEpoch` via `session.Store.StartContextEpoch` +
-  `compaction.AppendBoundary`, correlating in-memory summarized messages to
-  durable `session.MessageID`s: an assistant message with zero owned durable
-  parts is an unfinalized placeholder and excluded (matching
-  `dropUnfinalizedAssistantPlaceholders`'s own test), and because
-  `HandlerBuildContext.Model` is deliberately the same ledger-audited
-  adapter the main turn dispatches through, upstream's own internal
-  summary-generation call durably commits one trailing assistant message
-  *before* `Finalize` ever runs -- exactly one such trailing entry is
-  dropped before requiring exact correlation, which then fails Finalize
-  closed (not fabricating a boundary) on any other mismatch
-  (`TestSummarizationFinalizeMapsSummaryIntoContextEpoch`,
-  `TestSummarizationFinalizeFailsClosedOnLengthMismatch`,
-  `TestSummarizationHandlerTriggersAndWritesContextEpoch` -- the last one
-  end to end through a real turn). Cancelled/failed summary generation
-  never calls `Finalize` (upstream's own contract, not this package's code),
-  so the previous epoch stays active for free.
+  Summarization's own internal summary-generation call runs through a
+  bounded `adkModel.internalDispatch` ("summarizer") adapter, not the
+  turn's own conversational adapter (round-one review finding C1/C3: it
+  previously did, so the summary text got persisted onto the turn's own
+  assistant message and corrupted the session -- a second turn on the same
+  session failed to admit). The internal-dispatch adapter is still fully
+  ledgered (its own `ModelRequestRecord` row, `AgentPath == "summarizer"`,
+  usage charged, retried/failed over through the same audited path) but
+  never claims the turn's assistant placeholder, never persists as
+  conversational content, sends no tool controls, and fails closed on
+  anything but plain text/reasoning
+  (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`
+  drives a real second `orch.Start` on the same session and asserts it
+  completes, the summarizer's ledger row carries `AgentPath ==
+  "summarizer"`, and the turn's own assistant message has exactly one
+  `assistant_gen_text` part).
+  `summarizationFinalize` maps a completed summary into an atomic
+  `session.ContextEpoch`, correlating in-memory summarized messages to
+  durable messages via `history.LoadAgentic` applied through whatever
+  summarization epoch is already active for the session (so a SECOND
+  summarization on an already-compacted session correlates correctly
+  instead of failing closed forever after the first one), and commits
+  `StartContextEpoch` + the compaction boundary in ONE fenced transaction
+  (`compaction.AppendBoundaryTx`) so a mid-sequence failure can never leave
+  an epoch row with no `SummaryMessageID`. It never creates an epoch whose
+  `SummarizedFromID`/`SummarizedToID`/`TailStartID` overlap, moves the
+  retained tail's start back so a `function_tool_call` is never separated
+  from its `function_tool_result` (`moveTailStartToGroupBoundary`), and
+  always keeps the session's leading system-message prefix out of the
+  summarized range. `applyEpoch` (`session/history/projector.go`) likewise
+  always preserves a session's leading system messages regardless of the
+  active epoch, and no longer treats an empty `TailStartID` (nothing
+  retained verbatim) as "nothing produced after this epoch is ever included
+  again" -- the projection picks back up after the boundary message for
+  content later turns produce.
+  `resolveTurnHistoryOptions` resolves the most recently finished
+  summarization epoch fresh at every turn admission (both a brand-new run
+  and a later turn on an existing run), so the provider projection actually
+  narrows for later turns without a host statically configuring
+  `history.Options.Epoch`
+  (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`
+  asserts turn 2's provider-visible message count is narrower than the
+  full durable replay). This resolution happens once per turn admission,
+  not once per ReAct cycle within a turn: `adkEngine.baseMessageCount` and
+  every cycle's `buildDurableBaseline` reload within ONE turn must agree on
+  the same epoch view for their prefix/fresh-reload-tail splice to stay
+  correct, so a summarization epoch a turn's own recipe commits mid-turn
+  takes effect starting the NEXT turn on that session, not later cycles of
+  the same turn that created it -- a documented, bounded scoping choice.
+  Cancelled/failed summary generation never calls `Finalize` (upstream's
+  own contract, not this package's code), so the previous epoch stays
+  active, proven by two dedicated tests that actually trigger and then fail
+  or cancel the internal summary-generation call specifically
+  (`TestSummarizationFailedGenerationKeepsPreviousEpoch`,
+  `TestSummarizationCancelledGenerationKeepsPreviousEpoch`) rather than
+  configuring the trigger so high summarization never runs at all.
+  Reduction's truncation/clearing is applied as an authorized rewrite of
+  the settled baseline (`wrapAuthorizedContentRewrites`), so it actually
+  changes what the model dispatched against sees -- proven with
+  `Retention{MaxInlineBytes:-1}` so the payload is genuinely inline and
+  only reduction (not the runtime's own retention truncation) can be
+  shortening it.
 - **Group D**: verified no-op. `runtime/extension_{context,model,tool,lifecycle}.go`
   and `wasmext/*.go` already carry only `*schema.AgenticMessage` (landed in
   W3), not classic `schema.Message`.
@@ -1793,6 +1876,18 @@ below.
     be sealed with fewer tools than it might produce at real execution
     time. A static `HandlerRegistration.Tools` declaration (bypassing
     probing) is the documented escape hatch; it was not added this pass.
+    The probe itself now runs under a bounded deadline
+    (`discoveryProbeBudget`) and through purely in-memory stub backends
+    (`probeWritableBackend`, wrapping upstream's own
+    `adk/filesystem.NewInMemoryBackend()`) -- no temp directory is created
+    -- and fails plan compilation closed, rather than silently sealing zero
+    tools, for a Kind this package knows is always tool-bearing once
+    correctly configured (filesystem, plantask, skill, toolsearch); every
+    other Kind keeps the documented graceful degradation
+    (`TestDiscoverHandlerToolsFailsClosedForKnownToolBearingKind`,
+    `TestDiscoverHandlerToolsDegradesGracefullyForOtherKinds`,
+    `TestDiscoverHandlerToolsBoundsTheProbeContext`,
+    `TestHandlerProbeBuildContextNeverTouchesTheFilesystem`).
   - A full "real dangling call, durably unsettled history" fixture for
     patchtoolcalls (seeding raw history with an unanswered
     `function_tool_call`) was not built -- fixture-engineering complexity,
@@ -1800,7 +1895,29 @@ below.
     on (`authorizedRewriteSet`/`wrapAuthorizedContentRewrites`,
     `settlementSeal`'s fabrication check) is directly tested via
     `TestSettlementSealRejectsUnauthorizedFabricatedToolResult` and
-    `TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite`.
+    `TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite`; but
+    `patchtoolcalls` itself still has no positive-patching or failure test
+    of its own beyond construction/registration
+    (`TestPatchToolCallsHandlerFactoryConstructs`) and the "mounts and does
+    nothing when nothing is dangling" proof
+    (`TestPatchToolCallsMountsAndCompletesNormalTurnWithoutAlteringSettlement`)
+    -- an open item from the round-one review (I7/item 12), not attempted
+    this pass.
+  - The toolsearch recipe maps discovery onto this runtime's discovery gate
+    via a bounded fix (`toolSearchHandlerToolExecutor`, marking matched
+    tool names discovered in-memory after a successful search call -- see
+    the Group C bullet above and `TestToolSearchFindsDeferredTool`), not
+    the preferred fix (mapping the recipe onto a native
+    `ToolSearchRegistration` so discovery is durably recorded as a
+    `tool_search_result` block and survives a resume/restart). Recovering
+    toolsearch's own discoveries after a resume is therefore still an open
+    item.
+  - Skill activation is durably recorded as an audit trail
+    (`SkillActivatedEventKind`, name plus a content digest -- see the
+    Group C bullet above) but resume does not yet re-check that digest
+    against a live `Get(name)` and fail closed on drift; a `SKILL.md`
+    edited between pause and resume is not detected. An open item from the
+    round-one review (I3/item 8).
   - Failover to an alternate model reuses the primary model's
     `buildDurableBaseline`-computed `providerState` rather than
     recomputing it against the failover provider's own projection (the

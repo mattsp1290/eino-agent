@@ -290,21 +290,25 @@ func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
 	sessionID := session.ID("reduction-session")
 	mount, err := Mount(context.Background(), registry, sessionID, Config{
 		ReductionMaxLengthForTrunc: 10,
+		// Low enough that clearing -- the only mechanism that actually
+		// survives this runtime's per-cycle durable-baseline rebuild (see
+		// runtime.TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite's
+		// doc comment) -- fires for both rounds once each is old enough
+		// not to be protected by upstream's default ClearRetentionSuffixLimit
+		// (1: the single most-recent tool-call round is always retained).
+		ReductionMaxTokensForClear: 1,
 		Disable:                    disableAllExcept(runtime.HandlerKindReduction),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
-	// Deliberately default (zero-value) Retention here, matching
-	// runtime's own internal proof
-	// (TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite):
-	// a handler-sealed tool's executor always sets Retention explicitly
-	// (MaxInlineBytes: -1, see sealHandlerTools) to avoid the zero-value
-	// "retain nothing inline" trap, but a *plain* composition tool's
-	// default retention is exactly that zero value, which is what makes
-	// the settled result large enough on the wire for reduction's own
-	// MaxLengthForTrunc to have unambiguous, large input to act on.
+	// Retention is explicit (MaxInlineBytes:-1), not the zero-value
+	// default: the payload must be genuinely inline so only reduction's own
+	// clearing -- not this runtime's own retention-policy truncation --
+	// can be what shortens it (see the runtime-internal proof's control
+	// test, TestReductionWithoutMountLeavesOriginalPayloadIntact, for why
+	// the zero-value default is a false-positive trap here).
 	toolMount, err := registry.Mount(context.Background(), testNativeComponent("bigecho", sessionID),
 		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
 			return registrar.Tool(composition.ToolRegistration{ID: "bigecho", Scope: testScope(sessionID), Definition: tools.Definition{
@@ -313,6 +317,7 @@ func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
 				Execute: tools.TypedExecutor[map[string]any, map[string]any](func(context.Context, tools.TypedExecution[map[string]any]) (map[string]any, error) {
 					return map[string]any{"text": original}, nil
 				}),
+				Retention: runtime.RetentionPolicy{MaxInlineBytes: -1},
 			}})
 		}))
 	if err != nil {
@@ -321,7 +326,7 @@ func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
 	defer func() { _ = toolMount.Close(context.Background()) }()
 
 	var secondDispatchContent string
-	var thirdDispatchContent string
+	var thirdDispatchByCallID map[string]string
 	step := 0
 	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		step++
@@ -332,7 +337,7 @@ func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
 			secondDispatchContent, _ = toolResultParts(request.Messages)
 			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-2", "bigecho", `{}`)}, nil
 		default:
-			thirdDispatchContent, _ = toolResultParts(request.Messages)
+			thirdDispatchByCallID = toolResultTextByCallID(request.Messages)
 			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		}
 	}))
@@ -347,12 +352,46 @@ func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v, want completed (both rewrites should be authorized, not rejected)", result)
 	}
-	if secondDispatchContent == "" || strings.Contains(secondDispatchContent, original) {
-		t.Fatalf("first result not truncated: %q", secondDispatchContent)
+	// Round 2 sees only call-1's result so far, the single most-recent
+	// round: upstream's default ClearRetentionSuffixLimit (1) protects it,
+	// so it must still be the full original text here.
+	if secondDispatchContent == "" || !strings.Contains(secondDispatchContent, original) {
+		t.Fatalf("second dispatch content = %q, want the only-so-far round still retained in full", secondDispatchContent)
 	}
-	if thirdDispatchContent == "" || strings.Contains(thirdDispatchContent, original) {
-		t.Fatalf("second result not truncated: %q", thirdDispatchContent)
+	if len(thirdDispatchByCallID) != 2 {
+		t.Fatalf("third dispatch tool results by call ID = %#v, want call-1 and call-2", thirdDispatchByCallID)
 	}
+	if strings.Contains(thirdDispatchByCallID["call-1"], original) {
+		t.Fatalf("call-1 content = %q, want it cleared once a second, more recent round exists", thirdDispatchByCallID["call-1"])
+	}
+	if !strings.Contains(thirdDispatchByCallID["call-2"], original) {
+		t.Fatalf("call-2 content = %q, want the most recent round's result still retained in full", thirdDispatchByCallID["call-2"])
+	}
+}
+
+// toolResultTextByCallID is toolResultParts keyed by call ID, so a test can
+// assert on one specific round's content independently of any other
+// round's.
+func toolResultTextByCallID(messages []*einoschema.AgenticMessage) map[string]string {
+	result := make(map[string]string)
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
+				continue
+			}
+			var b strings.Builder
+			for _, part := range block.FunctionToolResult.Content {
+				if part != nil && part.Type == einoschema.FunctionToolResultContentBlockTypeText && part.Text != nil {
+					b.WriteString(part.Text.Text)
+				}
+			}
+			result[block.FunctionToolResult.CallID] = b.String()
+		}
+	}
+	return result
 }
 
 // summaryGenerationMarker is upstream summarization's own fixed

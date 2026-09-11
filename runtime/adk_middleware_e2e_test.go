@@ -469,11 +469,27 @@ func TestSkillHandlerInlineActivationThroughDurableWrapper(t *testing.T) {
 }
 
 // TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite proves
-// reduction's legitimate settled-result truncation is recognized by
+// reduction's legitimate settled-result CLEARING is recognized by
 // settlementSeal as an authorized content-management rewrite (via
-// wrapAuthorizedContentRewrites), not an unauthorized divergence: the run
-// completes, and the second dispatch's tool_result content is shorter than
-// (and different from) the original settled output.
+// wrapAuthorizedContentRewrites), not an unauthorized divergence, and that
+// it actually changes what the model dispatched against sees. The tool is
+// sealed with Retention{MaxInlineBytes:-1} so the full payload is genuinely
+// inline (this runtime's own retention truncation cannot be what shortens
+// it, unlike a zero-value-retention fixture -- see
+// TestReductionWithoutMountLeavesOriginalPayloadIntact, the control run
+// proving the same config WITHOUT reduction mounted keeps the original
+// text). Two tool-call rounds are driven, not one: upstream's own default
+// ClearRetentionSuffixLimit is 1 (the single most-recent tool-call round is
+// always protected from clearing), so a fixture with only one round could
+// never observe clearing fire at all, regardless of MaxTokensForClear.
+// MaxTokensForClear is deliberately low: this recipe's
+// truncation-via-tool-wrapper path (MaxLengthForTrunc) does NOT survive
+// this runtime's per-cycle durable-baseline rebuild (durableBaselineHandler
+// reloads state.Messages fresh from the durable settlement every cycle,
+// discarding whatever a wrapped tool call's own return value held) --
+// clearing, which operates via BeforeModelRewriteState, is the mechanism
+// that actually works here, and is what this test (and the recipe's own
+// doc comment) documents as effective.
 func TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite(t *testing.T) {
 	store := newAdmissionStore()
 	const original = "this output is intentionally much longer than the configured truncation threshold so reduction truncates it"
@@ -482,6 +498,126 @@ func TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite(t *testing.
 		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
 			return ToolResult{Output: original}, nil
 		}),
+		Retention: RetentionPolicy{MaxInlineBytes: -1},
+	}
+	var calls int
+	var secondDispatchContent string
+	var thirdDispatchByCallID map[string]string
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-1", "bigecho", `{}`)}, nil
+		case 2:
+			secondDispatchContent = functionToolResultText(request.Messages)
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-2", "bigecho", `{}`)}, nil
+		default:
+			thirdDispatchByCallID = functionToolResultTextByCallID(request.Messages)
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+		}
+	}))
+	handlerComponent := PlanComponent{
+		Component: testPlanComponent("reduction-component"),
+		AgentHandlers: []PlanAgentHandler{{
+			ID: "reduction", Order: 0, Scope: extension.GlobalScope(),
+			Kind: HandlerKindReduction, Version: HandlerVersion1, ConfigHash: "test-hash",
+			Factory: NewReductionHandlerFactory(ReductionConfig{MaxLengthForTrunc: 10, MaxTokensForClear: 1}),
+		}},
+		Tools: testPlanTools(staticToolRegistry{tools: []Tool{echo}}),
+	}
+	root := t.TempDir()
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
+	cfg := orchestratorConfig()
+	cfg.Metadata = map[string]string{"workspace_id": "w", "workspace_root": root}
+	handle, err := orch.Start(context.Background(), Request{SessionID: "reduction-session", Message: TextUserMessage("hi"), Config: cfg})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed (reduction's rewrite should be authorized, not rejected)", result)
+	}
+	if secondDispatchContent == "" {
+		t.Fatal("second dispatch never saw the first tool result")
+	}
+	if !strings.Contains(secondDispatchContent, original) {
+		t.Fatalf("second dispatch content = %q, want the first (only, so far) round still retained (ClearRetentionSuffixLimit protects the most recent round)", secondDispatchContent)
+	}
+	if len(thirdDispatchByCallID) != 2 {
+		t.Fatalf("third dispatch tool results by call ID = %#v, want call-1 and call-2", thirdDispatchByCallID)
+	}
+	if strings.Contains(thirdDispatchByCallID["call-1"], original) {
+		t.Fatalf("call-1 content = %q, want it cleared once a second, more recent round exists", thirdDispatchByCallID["call-1"])
+	}
+	// The exact placeholder wording is upstream's own clear-with-offload
+	// text ("Full output saved to: ..."), which this runtime's own
+	// content-block encoding may itself re-wrap (e.g. "<persisted-output>")
+	// once decoded back for the provider request; "saved to:" is the
+	// stable substring across both.
+	if !strings.Contains(thirdDispatchByCallID["call-1"], "saved to:") {
+		t.Fatalf("call-1 content = %q, want upstream's own clear-with-offload placeholder", thirdDispatchByCallID["call-1"])
+	}
+	if !strings.Contains(thirdDispatchByCallID["call-2"], original) {
+		t.Fatalf("call-2 content = %q, want the most recent round's result still retained in full -- ClearRetentionSuffixLimit protects it", thirdDispatchByCallID["call-2"])
+	}
+}
+
+// functionToolResultText concatenates every function_tool_result text part
+// across every message, for reduction's own two-round clearing test above.
+func functionToolResultText(messages []*einoschema.AgenticMessage) string {
+	var b strings.Builder
+	for _, msg := range messages {
+		for _, block := range msg.ContentBlocks {
+			if block.Type == einoschema.ContentBlockTypeFunctionToolResult && block.FunctionToolResult != nil {
+				for _, part := range block.FunctionToolResult.Content {
+					if part.Text != nil {
+						b.WriteString(part.Text.Text)
+					}
+				}
+			}
+		}
+	}
+	return b.String()
+}
+
+// functionToolResultTextByCallID is functionToolResultText, keyed by call
+// ID, so a test can assert on one specific round's content independently
+// of any other round's (e.g. reduction clearing only the older of two
+// rounds).
+func functionToolResultTextByCallID(messages []*einoschema.AgenticMessage) map[string]string {
+	result := make(map[string]string)
+	for _, msg := range messages {
+		for _, block := range msg.ContentBlocks {
+			if block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
+				continue
+			}
+			var b strings.Builder
+			for _, part := range block.FunctionToolResult.Content {
+				if part.Text != nil {
+					b.WriteString(part.Text.Text)
+				}
+			}
+			result[block.FunctionToolResult.CallID] = b.String()
+		}
+	}
+	return result
+}
+
+// TestReductionWithoutMountLeavesOriginalPayloadIntact is the control run
+// for TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite: the
+// identical inline-retention tool and turn shape, WITHOUT reduction
+// mounted, must still show the model the full original payload -- proving
+// the prior test's shortened content is actually caused by reduction, not
+// by some other, incidental truncation.
+func TestReductionWithoutMountLeavesOriginalPayloadIntact(t *testing.T) {
+	store := newAdmissionStore()
+	const original = "this output is intentionally much longer than the configured truncation threshold so reduction truncates it"
+	echo := Tool{
+		Name: "bigecho", Info: &einoschema.ToolInfo{Name: "bigecho", Desc: "returns a large payload"},
+		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+			return ToolResult{Output: original}, nil
+		}),
+		Retention: RetentionPolicy{MaxInlineBytes: -1},
 	}
 	var calls int
 	var secondDispatchContent string
@@ -503,32 +639,20 @@ func TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite(t *testing.
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
-	handlerComponent := PlanComponent{
-		Component: testPlanComponent("reduction-component"),
-		AgentHandlers: []PlanAgentHandler{{
-			ID: "reduction", Order: 0, Scope: extension.GlobalScope(),
-			Kind: HandlerKindReduction, Version: HandlerVersion1, ConfigHash: "test-hash",
-			Factory: NewReductionHandlerFactory(ReductionConfig{MaxLengthForTrunc: 10, MaxTokensForClear: 1 << 30}),
-		}},
-		Tools: testPlanTools(staticToolRegistry{tools: []Tool{echo}}),
-	}
-	root := t.TempDir()
-	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
-	cfg := orchestratorConfig()
-	cfg.Metadata = map[string]string{"workspace_id": "w", "workspace_root": root}
-	handle, err := orch.Start(context.Background(), Request{SessionID: "reduction-session", Message: TextUserMessage("hi"), Config: cfg})
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{{
+		Component: testPlanComponent("no-reduction-component"),
+		Tools:     testPlanTools(staticToolRegistry{tools: []Tool{echo}}),
+	}}})}
+	handle, err := orch.Start(context.Background(), Request{SessionID: "no-reduction-session", Message: TextUserMessage("hi"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
 	result := <-handle.Done()
 	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v, want completed (reduction's rewrite should be authorized, not rejected)", result)
+		t.Fatalf("result = %+v, want completed", result)
 	}
-	if secondDispatchContent == "" {
-		t.Fatal("second dispatch never saw the tool result")
-	}
-	if strings.Contains(secondDispatchContent, original) {
-		t.Fatalf("second dispatch content = %q, want it truncated (shorter than the original settled output)", secondDispatchContent)
+	if !strings.Contains(secondDispatchContent, original) {
+		t.Fatalf("second dispatch content = %q, want the full original payload (no reduction mounted)", secondDispatchContent)
 	}
 }
 

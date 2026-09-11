@@ -294,7 +294,24 @@ type ReductionConfig struct {
 
 // NewReductionHandlerFactory offloads/clears large tool output into a
 // private, workspace-scoped scratch backend via upstream reduction.NewTyped,
-// with the default (character-estimate) token counter. Use
+// with the default (character-estimate) token counter.
+//
+// Only cfg.MaxTokensForClear is effective in this runtime; cfg.MaxLengthForTrunc
+// is accepted (upstream requires it non-zero) but its truncation-via-tool-
+// wrapper mechanism (upstream's WrapInvokableToolCall/WrapEnhancedInvokableToolCall,
+// which intercepts a tool's own return value at execution time) does not
+// survive this runtime's per-cycle durable baseline: durableBaselineHandler
+// rebuilds state.Messages fresh from the durable settlement every cycle,
+// discarding whatever a wrapped tool call's own in-flight return value held
+// from an earlier cycle. Clearing works because it operates via
+// BeforeModelRewriteState -- the same seam durableBaselineHandler/
+// wrapAuthorizedContentRewrites are built for -- so it is applied fresh,
+// every cycle, directly against the current baseline. Set MaxTokensForClear
+// low enough (and remember upstream's own default ClearRetentionSuffixLimit
+// of 1 always protects the single most-recent tool-call round from
+// clearing) to actually shrink what the model sees; see
+// TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite for a
+// worked, non-false-positive example. Use
 // NewReductionHandlerFactoryWithTokenCounter to inject a custom counter --
 // funcs cannot round-trip through the JSON-serializable Config, so injection
 // is a separate constructor rather than a Config field.
