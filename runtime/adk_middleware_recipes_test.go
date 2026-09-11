@@ -182,6 +182,26 @@ func TestSummarizationHandlerFactoryRequiresStoreAndModel(t *testing.T) {
 	}
 }
 
+// TestSummarizationHandlerFactoryRejectsNeitherTriggerConfigured is
+// round-two W6 review item 9's second half: a SummarizationConfig with
+// neither TriggerContextTokens nor TriggerContextMessages set must fail
+// construction closed, rather than silently falling through to upstream's
+// own hidden default trigger (a fixed 160000-token threshold the host never
+// asked for and cannot see reflected in its own sealed Config).
+func TestSummarizationHandlerFactoryRejectsNeitherTriggerConfigured(t *testing.T) {
+	store := newAdmissionStore()
+	sessionID := session.ID("no-trigger-session")
+	execution := testFencedExecutionStore(t, store, sessionID)
+	build := HandlerBuildContext{
+		SessionID: sessionID, Model: &adkModel{},
+		epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: &sequenceIDs{}, now: func() time.Time { return time.Unix(0, 0) }},
+	}
+	_, err := NewSummarizationHandlerFactory(SummarizationConfig{})(context.Background(), build)
+	if !errors.Is(err, ErrHandlerConfiguration) {
+		t.Fatalf("err = %v, want errors.Is(err, ErrHandlerConfiguration) for a config with neither trigger threshold set", err)
+	}
+}
+
 func testFencedExecutionStore(t *testing.T, store *admissionStore, sessionID session.ID) session.ExecutionStore {
 	t.Helper()
 	run := session.Run{ID: session.RunID("run-" + string(sessionID)), SessionID: sessionID, ClaimToken: "claim-" + string(sessionID), Status: session.RunRunning}

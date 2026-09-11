@@ -539,6 +539,12 @@ func requestIsSummaryGeneration(request model.Request) bool {
 // both completes (proving the prior "session content is invalid" admission
 // bug is fixed) and sees a narrower model-visible history than the full
 // durable replay, proving only the active provider projection changes.
+// TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection
+// uses SummarizationTriggerMsgs: 1 with the token threshold correctly
+// disabled (round-two W6 review item 9): turn 1's own first cycle has only
+// ONE message present, below the threshold, so it must NOT trigger yet --
+// summarization only fires on turn 2's first cycle, once the two turns'
+// combined history genuinely exceeds 1 message.
 func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
@@ -552,16 +558,19 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
 
+	var mainDispatchCount int
 	var secondDispatchMessageCount int
-	var sawSecondDispatch bool
 	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGeneration(request) {
 			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
 		}
-		if sawSecondDispatch {
-			// The turn-2 main dispatch: record how many messages the
-			// provider actually saw, to compare against the full durable
-			// replay below.
+		mainDispatchCount++
+		if mainDispatchCount == 2 {
+			// Turn 2's own main dispatch, AFTER Finalize has already
+			// narrowed history (summarization triggers, and Finalize runs,
+			// BEFORE ADK's own main dispatch for the cycle that triggered
+			// it): record how many messages the provider actually saw, to
+			// compare against the full durable replay below.
 			secondDispatchMessageCount = len(request.Messages)
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, understood")}, nil
@@ -577,6 +586,34 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	result := awaitDone(t, handle, 10*time.Second)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("turn 1 result = %+v, want completed", result)
+	}
+	epochsAfterTurn1, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, epoch := range epochsAfterTurn1 {
+		if epoch.Trigger == "summarization" {
+			t.Fatalf("summarization triggered on turn 1's very first cycle (a single message, below the configured threshold of 1): %+v", epoch)
+		}
+	}
+	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second turn, same session: a real second orch.Start call. Its own
+	// first cycle now has enough messages (turn 1's exchange plus this
+	// turn's own new user message) to cross the threshold, triggering
+	// summarization before turn 2's main dispatch.
+	handle2, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("please continue"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result2 := awaitDone(t, handle2, 10*time.Second)
+	if result2.Status != session.RunCompleted {
+		t.Fatalf("turn 2 result = %+v, want completed", result2)
 	}
 
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
@@ -598,7 +635,7 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	// every entry's bounded internal-dispatch adapter -- round-two W6
 	// review I7) -- never the turn's own (empty) agent path -- and never
 	// claims/persists onto the turn's own assistant message.
-	requests, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 100})
+	requests, err := store.ListModelRequests(context.Background(), result2.RunID, session.ModelRequestCursor{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -612,52 +649,28 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 		t.Fatalf("no model request ledger row has AgentPath == \"summarization\": %+v", requests.Records)
 	}
 
-	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(replay.Messages) < 2 {
-		t.Fatalf("full replay = %d messages, want the original turn's messages still present (nothing deleted)", len(replay.Messages))
-	}
-	owners, err := session.ResolveReplayPartOwners(replay.Parts, replay.PartOwnerMessageIDs)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var turnAssistantGenTextParts int
-	for i, part := range replay.Parts {
-		if owners[i] == result.MessageID && part.Kind == session.PartAssistantGenText {
-			turnAssistantGenTextParts++
-		}
-	}
-	if turnAssistantGenTextParts != 1 {
-		t.Fatalf("turn's own assistant message has %d assistant_gen_text parts, want exactly 1 (the summary must never be persisted onto it)", turnAssistantGenTextParts)
-	}
-
-	// Second turn, same session: a real second orch.Start call. This must
-	// complete -- the summarization recipe's internal-dispatch adapter no
-	// longer corrupts the turn's assistant message, so admission's durable
-	// history reload succeeds instead of failing with a content decode
-	// error.
-	sawSecondDispatch = true
-	handle2, err := orch.Start(context.Background(), runtime.Request{
-		SessionID: sessionID, Message: runtime.TextUserMessage("please continue"), Config: testConfig(""),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	result2 := awaitDone(t, handle2, 10*time.Second)
-	if result2.Status != session.RunCompleted {
-		t.Fatalf("turn 2 result = %+v, want completed", result2)
-	}
-	if secondDispatchMessageCount == 0 {
-		t.Fatal("turn 2's main dispatch was never observed")
-	}
 	fullReplay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(fullReplay.Messages) <= len(replay.Messages) {
 		t.Fatalf("full replay did not grow across turn 2: before=%d after=%d", len(replay.Messages), len(fullReplay.Messages))
+	}
+	owners, err := session.ResolveReplayPartOwners(fullReplay.Parts, fullReplay.PartOwnerMessageIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turnAssistantGenTextParts int
+	for i, part := range fullReplay.Parts {
+		if owners[i] == result2.MessageID && part.Kind == session.PartAssistantGenText {
+			turnAssistantGenTextParts++
+		}
+	}
+	if turnAssistantGenTextParts != 1 {
+		t.Fatalf("turn 2's own assistant message has %d assistant_gen_text parts, want exactly 1 (the summary must never be persisted onto it)", turnAssistantGenTextParts)
+	}
+	if secondDispatchMessageCount == 0 {
+		t.Fatal("turn 2's main dispatch was never observed")
 	}
 	if secondDispatchMessageCount >= len(fullReplay.Messages) {
 		t.Fatalf("turn 2's provider-visible message count (%d) did not narrow below the full durable replay (%d)", secondDispatchMessageCount, len(fullReplay.Messages))
@@ -736,12 +749,18 @@ func TestSummarizationWithAgentsMDMountedCorrelatesCorrectly(t *testing.T) {
 
 // TestSummarizationFailedGenerationKeepsPreviousEpoch proves the "failed
 // generation" half of the epoch-preservation contract with a streamer that
-// actually triggers summarization (SummarizationTriggerMsgs: 1) and then
-// fails specifically the internal summary-generation call (identified via
-// requestIsSummaryGeneration, upstream's own fixed marker text) while the
-// turn's own main dispatch still succeeds: upstream never calls Finalize
+// actually triggers summarization (SummarizationTriggerMsgs: 1, across two
+// turns so the threshold is genuinely exceeded -- see round-two W6 review
+// item 9) and then fails specifically the internal summary-generation call
+// (identified via requestIsSummaryGeneration, upstream's own fixed marker
+// text). VERIFIED (round-two W6 review item 10) upstream behavior, NOT the
+// previously assumed "turn still completes": upstream's own
+// BeforeModelRewriteState propagates the summary-generation error, which
+// fails the whole cycle/turn (session.RunFailed) -- the turn's own main
+// dispatch never even runs for this cycle. Upstream never calls Finalize
 // when its own model call fails, so no session.ContextEpoch row is ever
-// created for this run, and the turn still completes.
+// created either way, and the previously active epoch (none, here) stays
+// in force.
 func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
@@ -754,21 +773,44 @@ func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	var sawSummaryGenerationAttempt bool
 	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGeneration(request) {
+			sawSummaryGenerationAttempt = true
 			return nil, errors.New("simulated summary generation failure")
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, no summary needed")}, nil
 	}))
+	// Turn 1: below the message threshold (round-two W6 review item 9's
+	// disabled token check means this genuinely does not trigger yet).
 	handle, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(""),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitDone(t, handle, 10*time.Second)
-	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v, want completed even though the summary generation call failed", result)
+	if result := awaitDone(t, handle, 10*time.Second); result.Status != session.RunCompleted {
+		t.Fatalf("turn 1 result = %+v, want completed", result)
+	}
+	// Turn 2: now above the threshold -- this MUST actually attempt
+	// summary generation (round-two W6 review item 10), not merely pass
+	// vacuously because the trigger never fired at all.
+	handle2, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("continue"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle2, 10*time.Second)
+	// VERIFIED behavior (round-two W6 review item 10): a failed summary
+	// generation call fails the whole turn -- upstream's own
+	// BeforeModelRewriteState propagates the error, so the turn's own main
+	// dispatch never runs for this cycle either.
+	if result.Status != session.RunFailed {
+		t.Fatalf("turn 2 result = %+v, want failed (upstream propagates a failed summary-generation call's error, failing the turn)", result)
+	}
+	if !sawSummaryGenerationAttempt {
+		t.Fatal("summary generation was never attempted -- this test proves nothing about failure handling unless the trigger actually fired")
 	}
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
 	if err != nil {
@@ -784,9 +826,12 @@ func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 // TestSummarizationCancelledGenerationKeepsPreviousEpoch is the cancelled-
 // context counterpart to TestSummarizationFailedGenerationKeepsPreviousEpoch:
 // the summary generation call's own context is cancelled instead of
-// returning an ordinary error, and the same invariant holds -- no
-// session.ContextEpoch row is created, and the turn's own main dispatch
-// still completes.
+// returning an ordinary error. VERIFIED behavior (round-two W6 review item
+// 10): this runtime's own dispositionForError maps context.Canceled to an
+// INTERRUPTED outcome, not a plain failure -- session.RunInterrupted, with
+// Result.Interrupted true -- distinct from the ordinary-error case's
+// RunFailed. No session.ContextEpoch row is created either way (Finalize
+// never runs), and the turn's own main dispatch never runs for this cycle.
 func TestSummarizationCancelledGenerationKeepsPreviousEpoch(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
@@ -799,21 +844,40 @@ func TestSummarizationCancelledGenerationKeepsPreviousEpoch(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	var sawSummaryGenerationAttempt bool
 	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGeneration(request) {
+			sawSummaryGenerationAttempt = true
 			return nil, context.Canceled
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, no summary needed")}, nil
 	}))
+	// Turn 1: below the message threshold (round-two W6 review item 9's
+	// disabled token check means this genuinely does not trigger yet).
 	handle, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(""),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := awaitDone(t, handle, 10*time.Second)
-	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v, want completed even though the summary generation call was cancelled", result)
+	if result := awaitDone(t, handle, 10*time.Second); result.Status != session.RunCompleted {
+		t.Fatalf("turn 1 result = %+v, want completed", result)
+	}
+	// Turn 2: now above the threshold -- this MUST actually attempt
+	// summary generation (round-two W6 review item 10), not merely pass
+	// vacuously because the trigger never fired at all.
+	handle2, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("continue"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle2, 10*time.Second)
+	if result.Status != session.RunInterrupted || !result.Interrupted {
+		t.Fatalf("turn 2 result = %+v, want interrupted (a cancelled summary-generation call maps to an interrupted outcome, not a plain failure)", result)
+	}
+	if !sawSummaryGenerationAttempt {
+		t.Fatal("summary generation was never attempted -- this test proves nothing about cancellation handling unless the trigger actually fired")
 	}
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
 	if err != nil {

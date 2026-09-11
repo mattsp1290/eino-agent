@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
@@ -564,28 +565,53 @@ type SummarizationConfig struct {
 // NewSummarizationHandlerFactory generates a conversation summary via
 // upstream summarization.NewTyped, using build.Model -- for this recipe
 // ONLY, adkEngine.buildAgentHandlers hands it a bounded internal-dispatch
-// adapter (AgentPath "summarizer") instead of the turn's own conversational
-// adapter (see adkModel.internalDispatch): the summary-generation call is
-// still fully durably audited (its own ledger row, retried/failed over
-// through the same path, usage charged) but can never claim the turn's
-// assistant placeholder or persist as if the assistant said it to the user
-// -- and maps the completed summary into an atomic session.ContextEpoch
-// (Finalize below) via the narrow contextEpochCapability. On cancellation
-// or a failed summary generation, upstream never calls Finalize at all, so
-// no new epoch is created and the previously active epoch stays in force --
-// see summarizationFinalize's doc comment for the exact epoch-boundary
-// derivation.
+// adapter (AgentPath == this entry's own HandlerID) instead of the turn's
+// own conversational adapter (see adkModel.internalDispatch): the
+// summary-generation call is still fully durably audited (its own ledger
+// row, retried/failed over through the same path, usage charged) but can
+// never claim the turn's assistant placeholder or persist as if the
+// assistant said it to the user -- and maps the completed summary into an
+// atomic session.ContextEpoch (Finalize below) via the narrow
+// contextEpochCapability. On cancellation or a failed summary generation,
+// upstream never calls Finalize at all, so no new epoch is created and the
+// previously active epoch stays in force -- see summarizationFinalize's
+// doc comment for the exact epoch-boundary derivation.
+//
+// Trigger configuration (round-two W6 review item 9): at least one of
+// TriggerContextTokens/TriggerContextMessages must be configured --
+// construction fails closed rather than silently falling through to
+// upstream's own hidden default (a 160000-token threshold with no
+// message-count trigger at all). When only TriggerContextMessages is set,
+// the token threshold is bound to math.MaxInt, not left at its zero value:
+// upstream's own getTriggerContextTokens returns
+// TriggerCondition.ContextTokens VERBATIM whenever Trigger is non-nil (the
+// 160000 default applies only when Trigger is nil entirely) -- so a
+// message-only Trigger with ContextTokens left at 0 does not disable the
+// token check, it sets its threshold to zero, which very nearly every
+// non-empty conversation already exceeds (tokens > 0), triggering
+// summarization on almost every cycle instead of never on tokens at all.
+// The mirror case needs no such correction: upstream's own message-count
+// check is already gated behind `ContextMessages > 0`, so leaving it at 0
+// when only tokens are configured already means "disabled".
 func NewSummarizationHandlerFactory(cfg SummarizationConfig) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		if build.Model == nil || !build.epochs.ready() {
 			return nil, fmt.Errorf("%w: summarization requires a durable store and model adapter", errHandlerMissingBackend)
 		}
+		if cfg.TriggerContextTokens == 0 && cfg.TriggerContextMessages == 0 {
+			return nil, fmt.Errorf("%w: summarization requires at least one of TriggerContextTokens or TriggerContextMessages", ErrHandlerConfiguration)
+		}
+		if cfg.TriggerContextTokens < 0 || cfg.TriggerContextMessages < 0 {
+			return nil, fmt.Errorf("%w: summarization trigger thresholds must be non-negative", ErrHandlerConfiguration)
+		}
+		tokenThreshold := cfg.TriggerContextTokens
+		if tokenThreshold == 0 {
+			tokenThreshold = math.MaxInt
+		}
 		typedCfg := &summarization.TypedConfig[*einoschema.AgenticMessage]{
 			Model: build.Model, UserInstruction: cfg.UserInstruction, TranscriptFilePath: cfg.TranscriptFilePath,
 			Finalize: summarizationFinalize(build, cfg.RetainTailCount),
-		}
-		if cfg.TriggerContextTokens > 0 || cfg.TriggerContextMessages > 0 {
-			typedCfg.Trigger = &summarization.TriggerCondition{ContextTokens: cfg.TriggerContextTokens, ContextMessages: cfg.TriggerContextMessages}
+			Trigger:  &summarization.TriggerCondition{ContextTokens: tokenThreshold, ContextMessages: cfg.TriggerContextMessages},
 		}
 		mw, err := summarization.NewTyped[*einoschema.AgenticMessage](ctx, typedCfg)
 		if err != nil {

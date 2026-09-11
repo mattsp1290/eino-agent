@@ -825,13 +825,47 @@ func TestSettlementSealRejectsUnauthorizedFabricatedToolResult(t *testing.T) {
 // "summary" response (the model's own second dispatch is scripted to
 // return summary text) drives Finalize, and a new session.ContextEpoch row
 // is durably written with SummaryMessageID set.
+// summaryGenerationMarkerE2E is upstream summarization's own fixed
+// system-instruction marker text for its internal summary-generation call
+// (see the summarization middleware's own prompt template) -- used to
+// distinguish that call from an ordinary turn dispatch in a scripted
+// streamer, mirroring examples/agentic-middleware/middleware_test.go's
+// requestIsSummaryGeneration.
+const summaryGenerationMarkerE2E = "CRITICAL: Respond with TEXT ONLY"
+
+func requestIsSummaryGenerationE2E(request model.Request) bool {
+	for _, msg := range request.Messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil || block.UserInputText == nil {
+				continue
+			}
+			if strings.Contains(block.UserInputText.Text, summaryGenerationMarkerE2E) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestSummarizationHandlerTriggersAndWritesContextEpoch proves round-two W6
+// review item 9's fix in the positive direction: TriggerContextMessages: 1
+// with TriggerContextTokens left unset must NOT leave the token threshold
+// at its buggy near-zero value (which would trigger on turn 1's very first,
+// single-message cycle regardless of the configured message count) -- it
+// must be disabled, so summarization triggers ONLY once the message count
+// genuinely exceeds the configured threshold (turn 2, once turn 1's
+// exchange pushes the count past 1), not sooner.
 func TestSummarizationHandlerTriggersAndWritesContextEpoch(t *testing.T) {
 	store := newAdmissionStore()
 	sessionID := session.ID("summarization-session")
-	var calls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
-		calls++
-		return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if requestIsSummaryGenerationE2E(request) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("ok")}, nil
 	}))
 	handlerComponent := PlanComponent{
 		Component: testPlanComponent("summarization-component"),
@@ -848,7 +882,28 @@ func TestSummarizationHandlerTriggersAndWritesContextEpoch(t *testing.T) {
 	}
 	result := <-handle.Done()
 	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v, want completed", result)
+		t.Fatalf("turn 1 result = %+v, want completed", result)
+	}
+	// Turn 1 alone (a single user message at the point its own trigger
+	// check ran) must NOT have triggered summarization: this is the actual
+	// proof the token threshold is disabled, not merely defaulted.
+	epochsAfterTurn1, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, epoch := range epochsAfterTurn1 {
+		if epoch.Trigger == "summarization" {
+			t.Fatalf("summarization triggered on turn 1's very first cycle (a single message, below the configured threshold of 1) -- the token threshold was not actually disabled: %+v", epoch)
+		}
+	}
+
+	handle2, err := orch.Start(context.Background(), Request{SessionID: sessionID, Message: TextUserMessage("continue"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start (turn 2) error = %v", err)
+	}
+	result2 := <-handle2.Done()
+	if result2.Status != session.RunCompleted {
+		t.Fatalf("turn 2 result = %+v, want completed", result2)
 	}
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
 	if err != nil {
@@ -861,7 +916,50 @@ func TestSummarizationHandlerTriggersAndWritesContextEpoch(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Fatalf("no summarization ContextEpoch row found among %+v", epochs)
+		t.Fatalf("no summarization ContextEpoch row found among %+v (turn 2's message count genuinely exceeds the threshold)", epochs)
+	}
+}
+
+// TestSummarizationFiftyMessageTriggerDoesNotFireOnAShortConversation is
+// round-two W6 review item 9's exact named test: a 50-message trigger must
+// not fire on a short (well below 50 messages) conversation -- the direct
+// behavioral proof that the disabled token threshold (math.MaxInt) really
+// is unreachable, not merely a large-but-still-finite number a pathological
+// conversation could still exceed by accident.
+func TestSummarizationFiftyMessageTriggerDoesNotFireOnAShortConversation(t *testing.T) {
+	store := newAdmissionStore()
+	sessionID := session.ID("fifty-message-threshold-session")
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if requestIsSummaryGenerationE2E(request) {
+			t.Fatal("summarization triggered on a short conversation despite a 50-message threshold")
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("ok")}, nil
+	}))
+	handlerComponent := PlanComponent{
+		Component: testPlanComponent("summarization-fifty-component"),
+		AgentHandlers: []PlanAgentHandler{{
+			ID: "summarization", Order: 0, Scope: extension.GlobalScope(),
+			Kind: HandlerKindSummarization, Version: HandlerVersion1, ConfigHash: "test-hash",
+			Factory: NewSummarizationHandlerFactory(SummarizationConfig{TriggerContextMessages: 50}),
+		}},
+	}
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
+	handle, err := orch.Start(context.Background(), Request{SessionID: sessionID, Message: TextUserMessage("hello there"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed", result)
+	}
+	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, epoch := range epochs {
+		if epoch.Trigger == "summarization" {
+			t.Fatalf("summarization ContextEpoch was created on a short conversation despite a 50-message threshold: %+v", epoch)
+		}
 	}
 }
 
