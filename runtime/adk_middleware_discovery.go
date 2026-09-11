@@ -199,6 +199,19 @@ func (stubFilesystemBackend) Edit(context.Context, *adkfilesystem.EditRequest) e
 	return errWorkspaceReadOnly
 }
 
+// MultiModalRead makes the probe stub also satisfy
+// adkfilesystem.MultiModalReader: filesystem.NewTyped's own Validate
+// requires the backend to implement it whenever UseMultiModalRead is
+// configured, so without this method probing would fail closed for that
+// configuration and seal zero tools, leaving every real, runtime-built
+// filesystem tool (ls, read_file, ...) unsealed and rejected by
+// durableGuard.
+func (stubFilesystemBackend) MultiModalRead(context.Context, *adkfilesystem.MultiModalReadRequest) (*adkfilesystem.MultiFileContent, error) {
+	return &adkfilesystem.MultiFileContent{FileContent: &adkfilesystem.FileContent{}}, nil
+}
+
+var _ adkfilesystem.MultiModalReader = stubFilesystemBackend{}
+
 type stubSkillBackend struct{}
 
 func (stubSkillBackend) List(context.Context) ([]skill.FrontMatter, error) { return nil, nil }

@@ -265,7 +265,12 @@ func NewReductionHandlerFactoryWithTokenCounter(cfg ReductionConfig, counter Typ
 			return nil, fmt.Errorf("%w: reduction requires a workspace root", errHandlerMissingBackend)
 		}
 		typedCfg := &reduction.TypedConfig[*einoschema.AgenticMessage]{
-			Backend: build.ReductionBackend, ReadFileToolName: "read_file",
+			// RootDir must be relative: build.ReductionBackend
+			// (writableWorkspaceBackend) resolves every WriteRequest.FilePath
+			// against its own workspace-contained root and rejects an
+			// absolute path outside it (upstream's own default, "/tmp", is
+			// exactly such a path).
+			Backend: build.ReductionBackend, ReadFileToolName: "read_file", RootDir: ".",
 			MaxLengthForTrunc: cfg.MaxLengthForTrunc, MaxTokensForClear: cfg.MaxTokensForClear,
 		}
 		if counter != nil {
