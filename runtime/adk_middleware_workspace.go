@@ -30,6 +30,28 @@ var errWorkspaceReadOnly = errors.New("workspace backend is read-only")
 // via "..", or through a symlink) outside the canonical workspace root.
 var errWorkspacePathEscape = errors.New("path escapes workspace root")
 
+// maxMultiModalReadBytes bounds a single MultiModalRead's raw file read.
+// Handler tools are sealed with RetentionPolicy{MaxInlineBytes: -1}
+// (adkEngine.sealHandlerTools) -- unbounded at the durable-settlement
+// content-budget layer, which only clamps AFTER a result is already in
+// memory -- so without a cap here, a single large PDF or image request
+// would read the whole file into memory and base64-encode all of it into
+// both the provider request and the durable settlement before any clamp
+// ever has a chance to apply. This is a fixed, conservative ceiling
+// (comfortably above session.DefaultContentLimits' 8MiB message budget,
+// so an ordinarily-sized attachment is unaffected) rather than the
+// caller's own configured content limits: MultiModalRead has no access to
+// a specific run's ContentLimits (workspaceFilesystemBackend is
+// constructed once per turn from only a workspace root -- see
+// newWorkspaceBackends), and this suggestion (RW-S1 in the round-two W6
+// review) is about closing the unbounded-read hazard itself, not about
+// matching a dynamic per-run budget exactly.
+const maxMultiModalReadBytes = 20 << 20
+
+// errMultiModalReadTooLarge reports that MultiModalRead's source file
+// exceeds maxMultiModalReadBytes.
+var errMultiModalReadTooLarge = errors.New("multimodal read file exceeds the maximum bounded read size")
+
 // newWorkspaceBackends canonicalizes root (see internal/workspace.CanonicalRoot
 // -- symlink-resolved, absolute) and builds the shared, read-only
 // filesystem/skill backend views every host agent-handler recipe for this
@@ -212,6 +234,13 @@ func (b *workspaceFilesystemBackend) MultiModalRead(_ context.Context, req *adkf
 			return nil, err
 		}
 		return &adkfilesystem.MultiFileContent{FileContent: &adkfilesystem.FileContent{Content: content}}, nil
+	}
+	stat, err := os.Stat(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if stat.Size() > maxMultiModalReadBytes {
+		return nil, fmt.Errorf("%w: %q is %d bytes, max %d", errMultiModalReadTooLarge, req.FilePath, stat.Size(), int64(maxMultiModalReadBytes))
 	}
 	data, err := os.ReadFile(resolved)
 	if err != nil {

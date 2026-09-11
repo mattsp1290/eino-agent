@@ -115,6 +115,22 @@ type HandlerBuildContext struct {
 // plan-ordered factory fresh for each admitted turn and installs the
 // results into AgentBuildContext.Handlers, ahead of the runtime's mandatory
 // tail handlers (durableGuard, settlementSeal).
+//
+// BeforeAgent idempotence requirement (RW-S5 in the round-two W6 review):
+// the returned middleware's BeforeAgent is called TWICE per turn -- once by
+// adkEngine.buildAgentHandlers, purely observationally (its returned
+// context/runCtx are discarded), to collect the live tool instances it
+// contributes into e.handlerTools before the real agent is even
+// constructed, and once more, for real, when ADK actually executes the
+// agent. A HandlerFactory's BeforeAgent MUST therefore be safe to call
+// twice with equivalent results (e.g. returning the same static tool list
+// both times) -- it must not assume adk.GetRunLocalValue/SetRunLocalValue
+// or other run-scoped state is available or meaningful on the first,
+// out-of-context call, and must not have side effects that would be wrong
+// to repeat. Every one of this package's own eight recipes satisfies this
+// (each just appends a static tool list); a third-party HandlerFactory
+// whose tool list depends on such state should compute it lazily inside
+// the tool's own Invoke path instead of inside BeforeAgent.
 type HandlerFactory func(context.Context, HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error)
 
 // durableBaselineHandler is this runtime's mandatory FIRST (outermost)

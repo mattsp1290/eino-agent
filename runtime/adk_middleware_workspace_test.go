@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -226,6 +227,38 @@ func TestWorkspaceFilesystemBackendMultiModalRead(t *testing.T) {
 	}
 	if len(result.Parts[0].Data) != len(png) {
 		t.Fatalf("MultiModalRead data length = %d, want %d", len(result.Parts[0].Data), len(png))
+	}
+}
+
+// TestWorkspaceFilesystemBackendMultiModalReadRejectsOversizedFile proves
+// RW-S1's fix: a file larger than maxMultiModalReadBytes is rejected with
+// errMultiModalReadTooLarge before its contents are ever read into memory,
+// instead of being fully base64-encoded into the provider request and the
+// durable settlement unbounded.
+func TestWorkspaceFilesystemBackendMultiModalReadRejectsOversizedFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "huge.png")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A sparse file: Truncate sets the file's reported size without
+	// actually writing maxMultiModalReadBytes+1 real bytes to disk, so
+	// this test stays fast and light on disk usage while still exercising
+	// the real os.Stat-based size check.
+	if err := f.Truncate(maxMultiModalReadBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	backend, _, err := newWorkspaceBackends(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = backend.(adkfilesystem.MultiModalReader).MultiModalRead(context.Background(), &adkfilesystem.MultiModalReadRequest{ReadRequest: adkfilesystem.ReadRequest{FilePath: "huge.png"}})
+	if !errors.Is(err, errMultiModalReadTooLarge) {
+		t.Fatalf("err = %v, want errors.Is(err, errMultiModalReadTooLarge)", err)
 	}
 }
 
