@@ -39,9 +39,21 @@ type admissionStore struct {
 	// come back from ListEvents in Go's randomized map iteration order.
 	// Every write goes through putEvent, which is the only place these are
 	// mutated.
-	eventSeq          int64
-	eventOrder        map[session.EventID]int64
-	toolCalls         map[session.ToolCallID]session.ToolCall
+	eventSeq   int64
+	eventOrder map[session.EventID]int64
+	toolCalls  map[session.ToolCallID]session.ToolCall
+	// toolCallSeq/toolCallSeqNext record each tool call's creation order:
+	// declared order (message creation order, then block position within
+	// the message -- see session.Store.ListUnfinishedToolCalls's doc
+	// comment) IS creation order for this fixture, since createToolCallLocked
+	// is called once per call in exactly the order a real runtime declares
+	// them. ListUnfinishedToolCalls sorts by this sequence instead of Go's
+	// randomized map iteration order, so runtime tests that resume or
+	// terminalize more than one call against this fixture see the same
+	// order the real stores guarantee, and can catch an ordering regression
+	// in resumeRun/terminalizeUnfinishedTools.
+	toolCallSeq       map[session.ToolCallID]int64
+	toolCallSeqNext   int64
 	epochs            map[session.EpochID]session.ContextEpoch
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	turns             map[session.TurnID]session.Turn
@@ -70,6 +82,7 @@ func newAdmissionStore() *admissionStore {
 		events:        map[session.EventID]session.EventRecord{},
 		eventOrder:    map[session.EventID]int64{},
 		toolCalls:     map[session.ToolCallID]session.ToolCall{},
+		toolCallSeq:   map[session.ToolCallID]int64{},
 		epochs:        map[session.EpochID]session.ContextEpoch{},
 		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
 		turns:         map[session.TurnID]session.Turn{},
@@ -103,6 +116,8 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.eventSeq = tx.eventSeq
 	s.eventOrder = tx.eventOrder
 	s.toolCalls = tx.toolCalls
+	s.toolCallSeq = tx.toolCallSeq
+	s.toolCallSeqNext = tx.toolCallSeqNext
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
 	s.turns = tx.turns
@@ -124,6 +139,8 @@ func (s *admissionStore) clone() *admissionStore {
 		eventSeq:          s.eventSeq,
 		eventOrder:        cloneMap(s.eventOrder),
 		toolCalls:         cloneMap(s.toolCalls),
+		toolCallSeq:       cloneMap(s.toolCallSeq),
+		toolCallSeqNext:   s.toolCallSeqNext,
 		epochs:            cloneMap(s.epochs),
 		modelRequests:     cloneMap(s.modelRequests),
 		turns:             cloneMap(s.turns),
@@ -468,6 +485,11 @@ func (s *admissionStore) createToolCallLocked(_ context.Context, request session
 		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
+	if s.toolCallSeq == nil {
+		s.toolCallSeq = map[session.ToolCallID]int64{}
+	}
+	s.toolCallSeq[call.ID] = s.toolCallSeqNext
+	s.toolCallSeqNext++
 	s.putEvent(event)
 	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
@@ -489,6 +511,11 @@ func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID sessio
 			calls = append(calls, call)
 		}
 	}
+	// Declared order (see session.Store.ListUnfinishedToolCalls's doc
+	// comment): this fixture's toolCallSeq stands in for (message,
+	// ordinal) because CreateToolCall is always called once per call, in
+	// declared order, by every code path that reaches this fixture.
+	sort.Slice(calls, func(i, j int) bool { return s.toolCallSeq[calls[i].ID] < s.toolCallSeq[calls[j].ID] })
 	return calls, nil
 }
 func (s *admissionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
@@ -620,6 +647,8 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 	s.eventSeq = tx.eventSeq
 	s.eventOrder = tx.eventOrder
 	s.toolCalls = tx.toolCalls
+	s.toolCallSeq = tx.toolCallSeq
+	s.toolCallSeqNext = tx.toolCallSeqNext
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
 	s.turns = tx.turns

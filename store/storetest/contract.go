@@ -738,6 +738,84 @@ func Run(t *testing.T, factory Factory) {
 		}
 	})
 
+	t.Run("unfinished tool calls follow block position within a message and message creation order", func(t *testing.T) {
+		// The previous subtest only pins "not sorted by ToolCallID" -- every
+		// call there is alone in its own message, so message insertion
+		// order, message id order, tool-call row order and request-part row
+		// order all happen to agree with the expected result too. This one
+		// puts two calls in ONE message, with the ordinal-1 call created
+		// BEFORE the ordinal-0 call (so tool-call creation order disagrees
+		// with block position), and a later message whose id sorts BEFORE
+		// the earlier message's id (so message id order disagrees with
+		// message creation order). Only "message creation order, then block
+		// position" satisfies every constraint at once.
+		subject := setup(t, factory)
+		ctx := context.Background()
+		s := createSession(t, ctx, subject.Store, "session-tool-ordinal")
+		r := admitRun(t, ctx, subject.Store, run("run-tool-ordinal", s.ID, "owner"))
+		execution := executionFor(subject.Store, r)
+		createdAt := time.Now().UTC()
+
+		encode := func(msgID session.MessageID, calls ...session.ToolCallID) map[session.ToolCallID]session.Part {
+			t.Helper()
+			msg := appendMessage(t, ctx, execution, message(msgID, s.ID, r.ID, session.RoleAssistant))
+			var blocks []session.ContentBlock
+			for _, id := range calls {
+				blocks = append(blocks, session.ContentBlock{
+					ID: "block-" + string(id), Kind: session.BlockKindFunctionToolCall,
+					FunctionCall: &session.FunctionCallBlock{CallID: string(id), Name: "file_read", Arguments: "{}"},
+				})
+			}
+			n := 0
+			parts, err := session.EncodeContentParts(session.Content{Role: session.RoleAssistant, Blocks: blocks},
+				func() session.PartID { n++; return session.PartID(fmt.Sprintf("part-%s-%d", msgID, n)) },
+				msg.ID, s.ID, r.ID, createdAt, session.DefaultContentLimits())
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := map[session.ToolCallID]session.Part{}
+			for i, id := range calls {
+				out[id] = parts[i] // parts[i].Ordinal == i
+			}
+			return out
+		}
+		create := func(msgID session.MessageID, id session.ToolCallID, part session.Part) {
+			t.Helper()
+			call := session.ToolCall{
+				ID: id, SessionID: s.ID, RunID: r.ID, MessageID: msgID, RequestPartID: part.ID,
+				ResultMessageID: session.MessageID("rm-" + string(id)), ResultPartID: session.PartID("rp-" + string(id)),
+				Name: "file_read", Input: json.RawMessage(`{}`), Status: session.ToolCallPending, RetrySafe: true,
+			}
+			if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+				Call: call, RequestPart: part, Event: toolEvent(session.EventID("ev-"+string(id)), createdAt),
+			}); err != nil {
+				t.Fatalf("create %s: %v", id, err)
+			}
+		}
+
+		// Earlier message (id sorts LAST) declares zzz at ordinal 0, aaa at
+		// ordinal 1; the ordinal-1 call is created FIRST so creation order
+		// disagrees with block order.
+		first := encode("msg-zzz-earlier", "zzz-ordinal-0", "aaa-ordinal-1")
+		create("msg-zzz-earlier", "aaa-ordinal-1", first["aaa-ordinal-1"])
+		create("msg-zzz-earlier", "zzz-ordinal-0", first["zzz-ordinal-0"])
+		// Later message whose id sorts FIRST.
+		second := encode("msg-aaa-later", "mmm-later-message")
+		create("msg-aaa-later", "mmm-later-message", second["mmm-later-message"])
+
+		unfinished, err := subject.Store.ListUnfinishedToolCalls(ctx, r.ID)
+		if err != nil {
+			t.Fatalf("list unfinished tool calls: %v", err)
+		}
+		var got []session.ToolCallID
+		for _, c := range unfinished {
+			got = append(got, c.ID)
+		}
+		if want := []session.ToolCallID{"zzz-ordinal-0", "aaa-ordinal-1", "mmm-later-message"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("unfinished order = %v, want %v (message creation order, then block position)", got, want)
+		}
+	})
+
 	t.Run("unfinished runs and events are discoverable for recovery", func(t *testing.T) {
 		subject := setup(t, factory)
 		ctx := context.Background()

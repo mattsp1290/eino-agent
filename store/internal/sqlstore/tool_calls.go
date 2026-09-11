@@ -113,9 +113,15 @@ func (s *Store) ListUnfinishedToolCalls(ctx context.Context, runID session.RunID
 	// no relationship to the order the model actually declared the calls
 	// in. resumeRun (legacy non-ADK resume) executes calls in this order and
 	// terminalizeUnfinishedTools interrupts them in this order, so both must
-	// see the calls in the order they were requested.
+	// see the calls in the order they were requested. tool_calls.row_key is
+	// a final tie-breaker (the tool call's own creation order): production
+	// never produces two parts with the same (message, ordinal) --
+	// ValidToolRequestEnvelope ties one call to one single-block part -- but
+	// nothing else enforces that as a unique index, so a direct store
+	// writer could create two, and without a tie-breaker the order between
+	// them would be left to the database.
 	var rows []toolCallRow
-	err = s.toolCallQuery(ctx).Where("tool_calls.run_key = ? AND tool_calls.status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Order("reqm.row_key, reqp.ordinal").Find(&rows).Error
+	err = s.toolCallQuery(ctx).Where("tool_calls.run_key = ? AND tool_calls.status IN ?", runKey, []string{string(session.ToolCallPending), string(session.ToolCallRunning)}).Order("reqm.row_key, reqp.ordinal, tool_calls.row_key").Find(&rows).Error
 	if err != nil {
 		return nil, s.mapErr(err)
 	}

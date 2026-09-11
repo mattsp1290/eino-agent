@@ -473,6 +473,18 @@ type Store interface {
 	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
 	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
 	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
+	// ListUnfinishedToolCalls returns runID's pending and running tool
+	// calls in declared order: by the creation order of each call's
+	// request assistant message, then by the call's block position (part
+	// ordinal) within that message -- never by ToolCallID, whose lexical
+	// order is an IDGenerator implementation artifact with no relationship
+	// to the order the model actually declared the calls in.
+	// runtime.StreamingOrchestrator.resumeRun (the legacy non-ADK resume
+	// path) executes calls in exactly this order, and
+	// runtime.runExecution.terminalizeUnfinishedTools (crash
+	// reconciliation) settles them in exactly this order, so an
+	// implementation that returns any other order (message id order,
+	// tool-call creation order, or an unspecified order) breaks both.
 	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
 	// EnqueueInbox durably admits one idempotent submission for a session.
 	// Replaying the same IdempotencyKey with the same payload returns the
