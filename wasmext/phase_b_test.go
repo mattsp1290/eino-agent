@@ -112,14 +112,15 @@ func TestConvertContentBlockCases(t *testing.T) {
 			},
 		},
 		{
-			name:    "media-reference empty MIME still requires a valid URI, then falls back to file",
+			// Round-two W6 review item 13 / RA I8: the WIT's own doc
+			// comment on media-reference states its uri and mime-type are
+			// BOTH required; the host must enforce this itself (WIT's type
+			// system cannot express "non-empty string"). An empty
+			// mime-type previously fell through silently to a
+			// UserInputFile with MIMEType: "" instead of being rejected.
+			name:    "media-reference empty MIME is rejected (required per the WIT contract)",
 			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/x", MIMEType: ""}),
-			wantErr: false,
-			check: func(t *testing.T, block *einoschema.ContentBlock) {
-				if block.UserInputFile == nil {
-					t.Fatalf("block = %#v", block)
-				}
-			},
+			wantErr: true,
 		},
 		{
 			name:    "media-reference empty URI rejected",

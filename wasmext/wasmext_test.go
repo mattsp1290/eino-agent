@@ -455,6 +455,34 @@ func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
 	}
 }
 
+// TestCheckedInContextSourceEnforcesOutputByteBudget is round-two W6 review
+// item 13 / RA I8's byte-budget half, through the REAL compiled
+// context-source component (not the fake-component unit tests in
+// phase_b_test.go): a MaxOutputBytes limit tighter than the checked-in
+// fixture's own "wasm context" text (13 bytes) must make loadBoundedContext
+// fail closed with ErrorSize, proving the budget is actually enforced
+// against a genuine component's wasmtime-decoded output, not merely
+// against hand-constructed Go values.
+func TestCheckedInContextSourceEnforcesOutputByteBudget(t *testing.T) {
+	requireCGO(t)
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	ctx := context.Background()
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+
+	cfg := checkedInFixtureConfig(t, root, "context-source.wasm")
+	cfg.Limits.MaxOutputBytes = 5 // smaller than "wasm context" (13 bytes)
+	source, err := openContextSource(ctx, cfg, loader.engineFactory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = source.close() }()
+	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}}
+	if _, err := source.loadBoundedContext(ctx, metadata); !IsKind(err, ErrorSize) {
+		t.Fatalf("loadBoundedContext with a tighter-than-output MaxOutputBytes err = %v, want ErrorSize", err)
+	}
+}
+
 func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
@@ -471,6 +499,23 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	messages, err := source.loadBoundedContext(ctx, metadata)
 	if err != nil || len(messages) != 1 || agenticMessageText(messages[0]) != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
+	}
+	// Round-two W6 review item 13 / RA I8: the fixture's second content
+	// block is a media-reference (a bounded https URI, image/png), proving
+	// the real component path -- not just the fake-component unit tests in
+	// phase_b_test.go -- converts it into the matching typed UserInputImage
+	// block.
+	var sawMediaReference bool
+	for _, block := range messages[0].ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeUserInputImage && block.UserInputImage != nil {
+			if block.UserInputImage.MIMEType != "image/png" || block.UserInputImage.URL != "https://example.com/wasm-context-fixture.png" {
+				t.Fatalf("media-reference block = %+v, want the fixture's own URI/mime-type preserved", block.UserInputImage)
+			}
+			sawMediaReference = true
+		}
+	}
+	if !sawMediaReference {
+		t.Fatalf("context source messages = %#v, want a UserInputImage block converted from the fixture's media-reference", messages)
 	}
 	sink, err := loadEventSinkForTest(loader, ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
 	if err != nil {

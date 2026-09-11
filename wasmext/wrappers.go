@@ -327,10 +327,18 @@ func validateMediaReferenceURI(raw string) error {
 // its required MIME type into the matching typed user-input content block;
 // an unrecognized top-level MIME type is treated as an opaque file
 // reference rather than rejected, since media-reference intentionally
-// carries no separate kind discriminant of its own.
+// carries no separate kind discriminant of its own. MIMEType itself is
+// still required (round-two W6 review item 13 / RA I8): the WIT's own doc
+// comment on media-reference states "uri and mime-type are both required",
+// but WIT's type system has no way to express "non-empty string" -- the
+// host must enforce it. An empty MIMEType previously fell through silently
+// to the file-reference default case instead of being rejected.
 func convertMediaReference(ref wittypes.MediaReference) (*einoschema.ContentBlock, error) {
 	if err := validateMediaReferenceURI(ref.URI); err != nil {
 		return nil, err
+	}
+	if ref.MIMEType == "" {
+		return nil, errors.New("media-reference mime-type is empty")
 	}
 	switch {
 	case strings.HasPrefix(ref.MIMEType, "image/"):
