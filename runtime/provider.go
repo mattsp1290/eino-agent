@@ -39,7 +39,7 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		controls.DeferredTools = deferred
 	}
 	if s.ToolSearch != nil {
-		controls.ToolSearchTool = &einoschema.ToolInfo{Name: s.ToolSearch.Name, Desc: s.ToolSearch.Description}
+		controls.ToolSearchTool = toolSearchToolInfo(s.ToolSearch)
 	}
 	return model.Request{
 		Identity:      modelIdentity(s.ContextIdentity(messageID, "", trace)),

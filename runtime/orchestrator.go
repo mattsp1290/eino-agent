@@ -310,6 +310,14 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 }
 
 func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
+	// Seed the per-execution tool-search advertised set from the projected
+	// turn messages the model is about to see, not just this execution's own
+	// in-memory history: a fresh run (including a later run in a session
+	// that already discovered tools via tool search in an earlier run) would
+	// otherwise advertise an already-discovered deferred tool as deferred
+	// again, and a model call on it would fail the whole run (see
+	// prepareToolCalls's "not yet discovered" rejection).
+	execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
 	messages := append([]*einoschema.AgenticMessage(nil), snapshot.Messages...)
 	currentMessageID := messageID
 	for turn := 0; ; turn++ {

@@ -123,13 +123,21 @@ func TestResumeOrderingFloorFailureBalancesToolObservations(t *testing.T) {
 	}
 }
 
+// listMessagesErrorStore fails only the ListMessages paging shape
+// latestAdmissionMessageTime uses (Limit: 100) to compute the durable
+// message floor, so this test exercises exactly that failure path without
+// also tripping resumeRun's unrelated discoveredToolsFromHistoryPaged call
+// (Limit: 1000), which should succeed normally against the embedded store.
 type listMessagesErrorStore struct {
 	session.Store
 	err error
 }
 
-func (s *listMessagesErrorStore) ListMessages(context.Context, session.ID, session.ReplayCursor) (session.ReplayBatch, error) {
-	return session.ReplayBatch{}, s.err
+func (s *listMessagesErrorStore) ListMessages(ctx context.Context, sessionID session.ID, cursor session.ReplayCursor) (session.ReplayBatch, error) {
+	if cursor.Limit == 100 {
+		return session.ReplayBatch{}, s.err
+	}
+	return s.Store.ListMessages(ctx, sessionID, cursor)
 }
 
 func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {

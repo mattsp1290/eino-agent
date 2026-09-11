@@ -197,12 +197,31 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		}
 		if tool.Deferred && !discovered[canonicalName] {
 			// A deferred tool must be discovered via tool search before it
-			// can be called: reject before any claim is made, exactly like
-			// an unknown tool name (privilege escalation via a hallucinated
-			// or premature deferred-tool call is rejected the same way).
-			err := fmt.Errorf("tool %q unavailable: not yet discovered via tool search", canonicalName)
-			o.observeToolSettled(ctx, snapshot, Tool{Name: canonicalName}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: canonicalName}, session.ToolCallFailed, 0, err, nil)
-			return nil, err
+			// can be called. Unlike an unknown/hallucinated tool name (which
+			// stays fail-closed and aborts the run), this is a condition an
+			// otherwise well-behaved model can walk into legitimately (it
+			// may emit tool_search and a deferred call in the same
+			// assistant message, since `discovered` is snapshotted once
+			// before any call executes) and recover from: settle the call
+			// as a terminal, model-visible denial ("call <search> first")
+			// and let the turn continue, exactly like a guard denial
+			// (composition-search-reviewer I3). It deliberately skips
+			// normalize/InputDecoder/ToolPrepare/Pattern -- the tool has not
+			// been vetted for use yet -- using the search name as the
+			// permission pattern, mirroring the isSearch branch above.
+			searchName := "tool search"
+			if snapshot.ToolSearch != nil {
+				searchName = snapshot.ToolSearch.Name
+			}
+			call := ToolCall{
+				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				Name: canonicalName, RequestedName: requestedName, Pattern: canonicalName,
+				Input: cloneJSON(remapped), Context: toolContext(snapshot, snapshot.Tools),
+			}
+			block.Arguments = string(remapped)
+			denyErr := undiscoveredToolError{fmt.Errorf("tool %q unavailable: call %s first", canonicalName, searchName)}
+			prepared = append(prepared, preparedToolCall{block: block, tool: tool, call: call, middlewareErr: denyErr})
+			continue
 		}
 		input := remapped
 		if tool.InputDecoder != nil {

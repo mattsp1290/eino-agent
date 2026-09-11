@@ -178,14 +178,38 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 			},
 		}},
 	}
-	idUsed := false
-	parts, err := session.EncodeContentParts(content, func() session.PartID {
-		if idUsed {
-			return ""
+	mintResultPartID := func() func() session.PartID {
+		idUsed := false
+		return func() session.PartID {
+			if idUsed {
+				return ""
+			}
+			idUsed = true
+			return call.ResultPartID
 		}
-		idUsed = true
-		return call.ResultPartID
-	}, call.ResultMessageID, call.SessionID, call.RunID, input.MessageAt, input.ContentLimits)
+	}
+	parts, err := session.EncodeContentParts(content, mintResultPartID(), call.ResultMessageID, call.SessionID, call.RunID, input.MessageAt, input.ContentLimits)
+	if err != nil && len(input.OutputRecord.Parts) != 0 {
+		// Belt-and-braces: validateToolResultPart already rejects malformed
+		// enhanced parts at the executor boundary, but if an encoder rule
+		// change ever rejects a part that passed that validation, degrade
+		// every non-omitted part to an omission record rather than failing
+		// the whole settlement -- a tool result that executed must never
+		// turn into a run-killer (see effectiveToolRetentionPolicy's own
+		// comment on this invariant). Re-marshal the degraded record so the
+		// durable Output JSON and the model-visible content agree, which is
+		// what the store settle fence (validFunctionToolResultEnvelope)
+		// checks.
+		degraded := degradeToolOutputPartsToOmissions(input.OutputRecord)
+		degradedRaw, marshalErr := json.Marshal(degraded)
+		if marshalErr != nil {
+			return session.ToolSettlement{}, fmt.Errorf("encode function tool result content: %w", err)
+		}
+		input.Output = degradedRaw
+		input.OutputRecord = degraded
+		content.Blocks[0].FunctionResult.Content = toolOutputToResultContent(input.Output, input.OutputRecord)
+		parts, err = session.EncodeContentParts(content, mintResultPartID(), call.ResultMessageID, call.SessionID, call.RunID, input.MessageAt, input.ContentLimits)
+	}
 	if err != nil {
 		return session.ToolSettlement{}, fmt.Errorf("encode function tool result content: %w", err)
 	}
@@ -419,6 +443,23 @@ func toolOutputToResultContent(rawOutput json.RawMessage, output ToolOutput) []s
 		content = append(content, toolOutputPartToResultContent(part))
 	}
 	return content
+}
+
+// degradeToolOutputPartsToOmissions converts every non-omitted part of
+// output to an omission record ({Type, Omitted:true, OriginalSize}), the
+// belt-and-braces fallback buildTerminalToolEnvelope uses when a part that
+// passed validateToolResultPart still fails to encode.
+func degradeToolOutputPartsToOmissions(output ToolOutput) ToolOutput {
+	degraded := output
+	degraded.Parts = make([]ToolOutputPart, len(output.Parts))
+	for index, part := range output.Parts {
+		if part.Omitted {
+			degraded.Parts[index] = part
+			continue
+		}
+		degraded.Parts[index] = ToolOutputPart{Type: part.Type, Omitted: true, OriginalSize: part.OriginalSize}
+	}
+	return degraded
 }
 
 func toolOutputPartToResultContent(part ToolOutputPart) session.ResultContent {

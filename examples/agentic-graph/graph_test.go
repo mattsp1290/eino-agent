@@ -7,7 +7,14 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 )
 
-func TestBuildGraphInvokesToolThroughAliasWithOneAuditAndOneSettlement(t *testing.T) {
+// TestBuildGraphInvokesToolThroughAliasWithOneAuditAndOneDispatch asserts
+// exactly what this example proves: one audited model request and one call
+// through the fake Dispatch closure per graph invocation. It deliberately
+// does NOT claim "one settlement" -- dispatchFor's counters live entirely
+// in this example's own closure (see CallCounters' doc comment), not behind
+// a real runtime.BuildToolSettlement + store settle, so it cannot verify a
+// durable settlement count.
+func TestBuildGraphInvokesToolThroughAliasWithOneAuditAndOneDispatch(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 
@@ -33,9 +40,6 @@ func TestBuildGraphInvokesToolThroughAliasWithOneAuditAndOneSettlement(t *testin
 	}
 	if counters.Dispatch != 1 {
 		t.Fatalf("Dispatch = %d, want 1", counters.Dispatch)
-	}
-	if counters.Settled != 1 {
-		t.Fatalf("Settled = %d, want 1", counters.Settled)
 	}
 }
 

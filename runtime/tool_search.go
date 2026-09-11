@@ -8,6 +8,9 @@ import (
 	"strings"
 	"time"
 
+	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -21,22 +24,73 @@ func (s TurnSnapshot) isToolSearchCall(name string) bool {
 	return s.ToolSearch != nil && s.ToolSearch.Name == name
 }
 
+// toolSearchQueryDesc and defaultToolSearchDesc are the model-facing
+// parameter/tool descriptions advertised on the tool-search tool (see
+// toolSearchToolInfo) and mirror upstream Eino's own wording
+// (adk/middlewares/dynamictool/toolsearch/toolsearch.go's
+// getToolSearchToolInfo) so a model already familiar with the upstream
+// tool-search protocol recognizes this one.
+const (
+	toolSearchQueryDesc    = `Query to find deferred tools. Use "select:<tool_name>" for direct selection, or keywords to search.`
+	defaultToolSearchDesc  = `Search for or select deferred tools to make them available for use. Use "select:<tool_name>" for direct selection (comma-separated for more than one), or keywords to search.`
+	toolSearchSelectPrefix = "select:"
+)
+
 // toolSearchQuery is the canonical argument shape for a tool-search call:
-// {"query": "..."}. A missing or malformed query degrades to an empty query
-// (every deferred tool matches, bounded by toolSearchMaxResults) rather than
-// failing the call.
+// {"query": "...", "max_results": N}. A missing or malformed query degrades
+// to an empty keyword query (every deferred tool matches, bounded by
+// toolSearchMaxResults) rather than failing the call.
 type toolSearchQuery struct {
-	Query string `json:"query"`
+	Query      string `json:"query"`
+	MaxResults *int   `json:"max_results,omitempty"`
+}
+
+// toolSearchToolInfo builds the advertised ToolInfo for cfg's tool-search
+// tool: a required "query" string and an optional "max_results" integer,
+// with a default description documenting the select:<tool_name> direct
+// selection protocol when cfg.Description is empty. Mirrors upstream
+// Eino's getToolSearchToolInfo (eino@v0.9.19
+// adk/middlewares/dynamictool/toolsearch/toolsearch.go:416-433).
+func toolSearchToolInfo(cfg *ToolSearchConfig) *einoschema.ToolInfo {
+	if cfg == nil {
+		return nil
+	}
+	desc := cfg.Description
+	if desc == "" {
+		desc = defaultToolSearchDesc
+	}
+	return &einoschema.ToolInfo{
+		Name: cfg.Name,
+		Desc: desc,
+		ParamsOneOf: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+			"query": {Type: einoschema.String, Desc: toolSearchQueryDesc, Required: true},
+			"max_results": {
+				Type:     einoschema.Integer,
+				Desc:     fmt.Sprintf("Maximum number of results to return (default: %d)", toolSearchMaxResults),
+				Required: false,
+			},
+		}),
+	}
 }
 
 // searchDeferredTools matches query against every Deferred tool in
-// snapshot.Tools (case-insensitive substring on name or description),
-// bounded to the first toolSearchMaxResults matches in snapshot.Tools order.
-// It references only snapshot.Tools — the turn's frozen, resolved tool
-// registry — so a search result can never name a tool absent from it.
-func searchDeferredTools(snapshot TurnSnapshot, query string) []Tool {
-	needle := strings.ToLower(strings.TrimSpace(query))
-	matches := make([]Tool, 0, toolSearchMaxResults)
+// snapshot.Tools. A "select:<name>[,<name>...]" query performs direct
+// selection (see selectDeferredTools); anything else performs a
+// case-insensitive substring search on name or description, bounded to the
+// first limit matches in snapshot.Tools order (limit is clamped to
+// [1, toolSearchMaxResults]). It references only snapshot.Tools — the
+// turn's frozen, resolved tool registry — so a search result can never name
+// a tool absent from it.
+func searchDeferredTools(snapshot TurnSnapshot, query string, limit int) []Tool {
+	trimmed := strings.TrimSpace(query)
+	if rest, ok := strings.CutPrefix(trimmed, toolSearchSelectPrefix); ok {
+		return selectDeferredTools(snapshot, rest)
+	}
+	if limit <= 0 || limit > toolSearchMaxResults {
+		limit = toolSearchMaxResults
+	}
+	needle := strings.ToLower(trimmed)
+	matches := make([]Tool, 0, limit)
 	for _, tool := range snapshot.Tools {
 		if !tool.Deferred || tool.Info == nil {
 			continue
@@ -45,11 +99,51 @@ func searchDeferredTools(snapshot TurnSnapshot, query string) []Tool {
 			continue
 		}
 		matches = append(matches, tool)
-		if len(matches) >= toolSearchMaxResults {
+		if len(matches) >= limit {
 			break
 		}
 	}
 	return matches
+}
+
+// selectDeferredTools implements the "select:<name>[,<name>...]" direct
+// selection protocol mirrored from upstream Eino's toolsearch.search
+// (eino@v0.9.19 adk/middlewares/dynamictool/toolsearch/toolsearch.go:438-476):
+// each comma-separated name is matched against a deferred tool's canonical
+// name or any of its Aliases (aliases are an eino-agent extension over
+// upstream, which has no alias concept). max_results does not bound direct
+// selection -- the model has already named the exact tools it wants --
+// matching upstream's stated rationale.
+func selectDeferredTools(snapshot TurnSnapshot, names string) []Tool {
+	seen := make(map[string]bool)
+	var matches []Tool
+	for _, requested := range strings.Split(names, ",") {
+		requested = strings.TrimSpace(requested)
+		if requested == "" {
+			continue
+		}
+		for _, tool := range snapshot.Tools {
+			if !tool.Deferred || tool.Info == nil || seen[tool.Name] {
+				continue
+			}
+			if tool.Name != requested && !sliceContainsString(tool.Aliases, requested) {
+				continue
+			}
+			seen[tool.Name] = true
+			matches = append(matches, tool)
+			break
+		}
+	}
+	return matches
+}
+
+func sliceContainsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func toolNamesOf(tools []Tool) []string {
@@ -161,26 +255,137 @@ func (e *runExecution) executeToolSearchCall(ctx context.Context, snapshot TurnS
 	if err != nil {
 		return nil, err
 	}
-	var query toolSearchQuery
-	_ = json.Unmarshal(call.Input, &query) // malformed/missing query degrades to an empty query, not a failure
-	matches := searchDeferredTools(snapshot, query.Query)
+	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolStartedPoint, ToolStartedNotice{
+		SessionID: call.SessionID, RunID: call.RunID, ToolCallID: claimed.Call.ID, ToolName: claimed.Call.Name, Time: claimed.Call.StartedAt,
+	})
+	// A tool-search call carries no execution authority of its own -- every
+	// discovered tool is still validated against the frozen registry at
+	// claim time -- but it is still a durable, model-initiated action that
+	// expands the model's advertised tool surface, so it goes through the
+	// same observability points as an ordinary tool call, and through the
+	// mounted guard chain (not permissions, which are pattern/scope based
+	// and meaningless for a search) on a synthetic search Tool
+	// (composition-search-reviewer I8).
+	searchTool := Tool{Name: claimed.Call.Name, Info: toolSearchToolInfo(snapshot.ToolSearch)}
+	e.host.observeToolMaterialized(ctx, snapshot, searchTool, call)
+	observedTool := e.host.startObservedToolCall(ctx, snapshot, searchTool, call)
+	failSettlement := func(settleErr error) (settled []Tool, err error) {
+		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, settleErr, nil)
+		e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, searchTool, call, session.ToolCallFailed, e.host.now().Sub(startedAt), settleErr, nil)
+		return nil, settleErr
+	}
+
+	var matches []Tool
+	guard, guardErr := evaluateToolGuards(ctx, e.plan, searchTool, call)
+	if guardErr != nil || guard.Decision == ToolGuardDeny {
+		// Fail-safe rather than fail-closed: a guard denial or evaluation
+		// error degrades to zero discovered tools -- the model sees a
+		// legitimate, empty-match tool_search_result -- instead of aborting
+		// the run. A guard that wants to hard-stop a specific tool should
+		// deny that *discovered* tool's own calls, which still goes
+		// through the ordinary guard-checked execution pipeline.
+		matches = nil
+	} else {
+		var query toolSearchQuery
+		_ = json.Unmarshal(call.Input, &query) // malformed/missing query degrades to an empty query, not a failure
+		limit := toolSearchMaxResults
+		if query.MaxResults != nil && *query.MaxResults > 0 && *query.MaxResults < limit {
+			limit = *query.MaxResults
+		}
+		matches = searchDeferredTools(snapshot, query.Query, limit)
+	}
 	completedAt := e.host.now()
 	messageAt, err := e.nextDurableMessageTime(ctx, snapshot.SessionID, completedAt)
 	if err != nil {
-		return nil, err
+		return failSettlement(err)
 	}
 	settlement, err := buildTerminalToolSearchEnvelope(terminalToolSearchEnvelopeInput{
 		Claimed: claimed.Call, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt, MessageAt: messageAt,
 		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits, Matches: matches,
 	})
 	if err != nil {
-		return nil, err
+		return failSettlement(err)
 	}
 	if _, err := e.persistToolSettlement(ctx, claimed.Call, settlement, toolTransitionEnvelope(e.host, snapshot, completedAt)); err != nil {
-		return nil, err
+		return failSettlement(err)
 	}
+	extension.Notify(e.dispatch(), context.WithoutCancel(ctx), ToolSettledPoint, ToolSettledNotice{
+		SessionID: call.SessionID, RunID: call.RunID, ToolCallID: claimed.Call.ID, ToolName: claimed.Call.Name, Status: settlement.Status,
+	})
+	e.host.finishObservedToolCall(observedTool, settlement.Status, nil, nil)
+	e.host.observeToolSettled(context.WithoutCancel(ctx), snapshot, searchTool, call, settlement.Status, completedAt.Sub(startedAt), nil, nil)
 	e.markDiscovered(toolNamesOf(matches)...)
 	return matches, nil
+}
+
+// discoveredToolsFromMessages rebuilds the advertised set of deferred tool
+// names discovered via tool search from the projected turn messages the
+// model is about to see (snapshot.Messages, built via
+// session/history.ProjectAgentic -- see runtime/provider_state.go): every
+// ContentBlockTypeToolSearchResult block contributes the names of the tools
+// its ToolSearchFunctionToolResult.Result carries. executeTurn seeds
+// execution.discovered from this at the start of every turn (fresh or a
+// later run in the same session), mirroring upstream Eino's client-side
+// forward selection (adk/middlewares/dynamictool/toolsearch/toolsearch.go's
+// BeforeModelRewriteState), which rebuilds the visible set by scanning the
+// whole conversation on every model call rather than trusting a per-run
+// in-memory set alone.
+func discoveredToolsFromMessages(messages []*einoschema.AgenticMessage) []string {
+	seen := make(map[string]bool)
+	var names []string
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil || block.Type != einoschema.ContentBlockTypeToolSearchResult || block.ToolSearchFunctionToolResult == nil {
+				continue
+			}
+			result := block.ToolSearchFunctionToolResult.Result
+			if result == nil {
+				continue
+			}
+			for _, info := range result.Tools {
+				if info == nil || info.Name == "" || seen[info.Name] {
+					continue
+				}
+				seen[info.Name] = true
+				names = append(names, info.Name)
+			}
+		}
+	}
+	return names
+}
+
+// discoveredToolsFromHistoryPaged is the Resume-path counterpart of
+// discoveredToolsFromMessages: it rebuilds the advertised set from a
+// session's full durable history rather than one turn's projected messages,
+// paging until every message has been read (a single bounded page would
+// silently drop the most recent discoveries in a long session) and
+// decoding with session.MaxContentLimits() (the widest the durable content
+// contract ever allows), since a page may contain content admitted under a
+// writer's own raised session.ContentLimits.
+func discoveredToolsFromHistoryPaged(ctx context.Context, store session.Store, sessionID session.ID) ([]string, error) {
+	cursor := session.ReplayCursor{Limit: 1000}
+	seen := make(map[string]bool)
+	var names []string
+	for {
+		batch, err := store.ListMessages(ctx, sessionID, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range discoveredToolsFromHistory(batch, session.MaxContentLimits()) {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+		if batch.Next == (session.ReplayCursor{}) {
+			return names, nil
+		}
+		cursor = batch.Next
+	}
 }
 
 // discoveredToolsFromHistory rebuilds the advertised set of deferred tool

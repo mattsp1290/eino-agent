@@ -103,10 +103,17 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 	// Rebuild the per-execution tool-search advertised set from durable
 	// history before resuming any outstanding call, so a future turn that
 	// continues past this resume (not yet built past the tool-call
-	// boundary) sees every tool the model had already discovered.
-	if history, historyErr := o.store.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 1000}); historyErr == nil {
-		execution.seedDiscovered(discoveredToolsFromHistory(history, o.contentLimits))
+	// boundary) sees every tool the model had already discovered. Page the
+	// full session history (not just the first 1000 messages -- the
+	// discoveries that matter most are the most recent ones), decode with
+	// session.MaxContentLimits() (content may have been admitted under a
+	// writer's raised ContentLimits), and propagate a store failure instead
+	// of silently seeding an empty set.
+	discovered, err := discoveredToolsFromHistoryPaged(ctx, o.store, run.SessionID)
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
+	execution.seedDiscovered(discovered)
 	snapshot := o.resumeSnapshot(run)
 	withCleanup := func(result Result) Result {
 		if cleanupErr := execution.terminalizeUnfinishedTools(context.WithoutCancel(ctx), snapshot, calls); cleanupErr != nil {
@@ -115,12 +122,41 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		}
 		return result
 	}
-	tools, toolContext, err := o.resumeTools(ctx, execution, run)
+	tools, snapshot, toolContext, err := o.resumeTools(ctx, execution, run, snapshot)
 	if err != nil {
 		return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
 	}
+	searchName := ""
+	if ts := execution.plan.ToolSearch(); ts != nil {
+		searchName = ts.Name
+	}
 	for _, call := range calls {
 		if session.TerminalToolCall(call.Status) {
+			continue
+		}
+		if searchName != "" && call.Name == searchName {
+			// A tool-search call is persisted as an ordinary session.ToolCall
+			// (see prepareToolCalls/isToolSearchCall) but is never a plan
+			// tool, so it is absent from `tools` by design. Resuming it must
+			// never fail the run with "tool_search unavailable": search is
+			// side-effect free, so a pending call can simply be
+			// (re-)executed, and a running call settles as interrupted like
+			// any other outstanding call.
+			if call.Status == session.ToolCallRunning {
+				if _, err := execution.settleInterruptedRunningTool(ctx, run, Tool{Name: call.Name}, call); err != nil {
+					return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
+				}
+				continue
+			}
+			searchCall := ToolCall{
+				ID: call.ID, SessionID: call.SessionID, RunID: call.RunID, MessageID: call.MessageID,
+				ResultMessageID: call.ResultMessageID, ResultPartID: call.ResultPartID,
+				Name: call.Name, RequestedName: call.Name, Pattern: call.Pattern,
+				Input: cloneJSON(call.Input), Context: toolContext.Clone(),
+			}
+			if _, err := execution.executeToolSearchCall(ctx, snapshot, searchCall, call); err != nil {
+				return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
+			}
 			continue
 		}
 		canonicalInput, canonicalErr := canonicalToolObject(call.Input)
@@ -181,24 +217,29 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 	return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
 }
 
-func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runExecution, run session.Run) (map[string]Tool, ToolContext, error) {
+// resumeTools resolves the plan's tools for a resumed run and returns snapshot
+// updated with the resolved Tools and the plan's ToolSearch configuration
+// (see RunPlan.ToolSearch), so a resumed tool-search call has the same
+// resolved deferred-tool registry available to searchDeferredTools that a
+// live turn would.
+func (o *StreamingOrchestrator) resumeTools(ctx context.Context, execution *runExecution, run session.Run, snapshot TurnSnapshot) (map[string]Tool, TurnSnapshot, ToolContext, error) {
 	if len(execution.plan.tools.capabilities) == 0 {
-		return nil, ToolContext{}, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
+		return nil, snapshot, ToolContext{}, fmt.Errorf("%w: tool registry required", ErrInvalidOrchestrator)
 	}
-	snapshot := o.resumeSnapshot(run)
 	resolved, err := execution.plan.ResolveTools(ctx, NewToolScopeContext(snapshot))
 	if err != nil {
-		return nil, ToolContext{}, err
+		return nil, snapshot, ToolContext{}, err
 	}
 	snapshot.Tools = cloneSlice(resolved)
+	snapshot.ToolSearch = execution.plan.ToolSearch()
 	tools := make(map[string]Tool, len(resolved))
 	for _, tool := range resolved {
 		if _, exists := tools[tool.Name]; exists {
-			return nil, ToolContext{}, fmt.Errorf("duplicate effective tool %q", tool.Name)
+			return nil, snapshot, ToolContext{}, fmt.Errorf("duplicate effective tool %q", tool.Name)
 		}
 		tools[tool.Name] = tool
 	}
-	return tools, toolContext(snapshot, resolved), nil
+	return tools, snapshot, toolContext(snapshot, resolved), nil
 }
 
 func (o *StreamingOrchestrator) resumeSnapshot(run session.Run) TurnSnapshot {

@@ -201,16 +201,38 @@ func appendFunctionToolResultPart(t testing.TB, ctx context.Context, execution s
 	if err != nil {
 		t.Fatalf("claim synthetic tool call for result part %s: %v", part.ID, err)
 	}
-	outputText := ""
-	for _, item := range block.FunctionResult.Content {
-		if item.Type == session.ResultContentText {
-			outputText = item.Text
-			break
+	// store/internal/sqlstore's validFunctionToolResultEnvelope checks the
+	// durable content against a shape recorded in settlement.Output: the
+	// classic scalar shape (a single text item) is checked by exact
+	// equality against the recorded Output JSON itself; an enhanced
+	// (multi-item, or single non-text item) result is checked structurally
+	// against a minimal {"parts":[{"type":...}]} view agreeing in
+	// count/type/order with the content. Build whichever shape this
+	// fixture's content actually is.
+	var settlementOutput json.RawMessage
+	if len(block.FunctionResult.Content) == 1 && block.FunctionResult.Content[0].Type == session.ResultContentText {
+		settlementOutput = json.RawMessage(block.FunctionResult.Content[0].Text)
+	} else {
+		type recordedPart struct {
+			Type string `json:"type"`
 		}
+		parts := make([]recordedPart, len(block.FunctionResult.Content))
+		for i, item := range block.FunctionResult.Content {
+			parts[i] = recordedPart{Type: string(item.Type)}
+		}
+		raw, err := json.Marshal(struct {
+			ToolCallID string         `json:"tool_call_id"`
+			Status     string         `json:"status"`
+			Parts      []recordedPart `json:"parts"`
+		}{ToolCallID: string(callID), Status: "completed", Parts: parts})
+		if err != nil {
+			t.Fatalf("encode recorded output shape for result part %s: %v", part.ID, err)
+		}
+		settlementOutput = raw
 	}
 	settlement := session.ToolSettlement{
 		ID: callID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted,
-		Output: json.RawMessage(outputText), CompletedAt: at,
+		Output: settlementOutput, CompletedAt: at,
 		ResultMessage: session.Message{ID: resultMessageID, SessionID: sessionID, RunID: runID, ParentID: requestMessageID, Role: role, CreatedAt: at, UpdatedAt: at},
 		ResultPart:    part,
 	}

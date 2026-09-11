@@ -3,7 +3,9 @@ package einotools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 
 	"github.com/cloudwego/eino/components/tool"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -41,6 +43,52 @@ func executeDefinition(definition catalog.Definition) agenttools.Executor {
 func ExecuteEnhancedLeaf(leaf tool.EnhancedInvokableTool) agenttools.RichExecutor {
 	return func(ctx context.Context, execution agenttools.Execution) (agenttools.RichResult, error) {
 		toolResult, err := leaf.InvokableRun(ctx, &einoschema.ToolArgument{Text: string(execution.Input)})
+		if err != nil {
+			return agenttools.RichResult{}, err
+		}
+		parts, err := convertEnhancedToolResult(toolResult)
+		if err != nil {
+			return agenttools.RichResult{}, err
+		}
+		return agenttools.RichResult{Parts: parts}, nil
+	}
+}
+
+// ExecuteEnhancedStreamableLeaf adapts an already-typed
+// tool.EnhancedStreamableTool leaf (eino@v0.9.19 components/tool/interface.go's
+// StreamableRun(ctx, *schema.ToolArgument, ...Option) (*schema.StreamReader[*schema.ToolResult], error))
+// into a tools.Definition ExecuteRich executor: it drains the leaf's stream
+// of schema.ToolResult chunks and settles the final, concatenated parts
+// exactly once via schema.ConcatToolResults, mirroring how the model's own
+// streamed message is concatenated before anything downstream sees it (see
+// runtime/model_stream.go's receiveModelStream) -- an intermediate/partial
+// chunk must never become the tool's durable settlement.
+//
+// Not wired automatically for the same reason ExecuteEnhancedLeaf isn't (see
+// its doc comment): no leaf constructed through the standard eino-tools
+// catalog can satisfy this interface today.
+func ExecuteEnhancedStreamableLeaf(leaf tool.EnhancedStreamableTool) agenttools.RichExecutor {
+	return func(ctx context.Context, execution agenttools.Execution) (agenttools.RichResult, error) {
+		reader, err := leaf.StreamableRun(ctx, &einoschema.ToolArgument{Text: string(execution.Input)})
+		if err != nil {
+			return agenttools.RichResult{}, err
+		}
+		defer reader.Close()
+		var chunks []*einoschema.ToolResult
+		for {
+			if err := ctx.Err(); err != nil {
+				return agenttools.RichResult{}, err
+			}
+			chunk, err := reader.Recv()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				return agenttools.RichResult{}, err
+			}
+			chunks = append(chunks, chunk)
+		}
+		toolResult, err := einoschema.ConcatToolResults(chunks)
 		if err != nil {
 			return agenttools.RichResult{}, err
 		}

@@ -198,16 +198,48 @@ func ValidateDefinition(definition Definition) error {
 	if err := validateParameters(definition.Parameters); err != nil {
 		return fmt.Errorf("%w: parameters for %s: %v", ErrInvalidDefinition, definition.Name, err)
 	}
-	if err := validateAliases(definition.Name, definition.Aliases, definition.ArgumentAliases); err != nil {
+	schemaKeys, err := parameterPropertyNames(definition.Parameters)
+	if err != nil {
+		return fmt.Errorf("%w: parameters for %s: %v", ErrInvalidDefinition, definition.Name, err)
+	}
+	if err := validateAliases(definition.Name, definition.Aliases, definition.ArgumentAliases, schemaKeys); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidDefinition, err)
 	}
 	return nil
 }
 
+// parameterPropertyNames returns the set of top-level JSON schema property
+// names declared by parameters, mirroring upstream Eino's
+// compose.applyArgsAliases (eino@v0.9.19 compose/tool_node.go:434-450),
+// which builds the same set to reject an argument alias that shadows a real
+// schema property.
+func parameterPropertyNames(parameters *einoschema.ParamsOneOf) (map[string]bool, error) {
+	keys := make(map[string]bool)
+	if parameters == nil {
+		return keys, nil
+	}
+	schema, err := parameters.ToJSONSchema()
+	if err != nil {
+		return nil, err
+	}
+	if schema == nil || schema.Properties == nil {
+		return keys, nil
+	}
+	for pair := schema.Properties.Oldest(); pair != nil; pair = pair.Next() {
+		keys[pair.Key] = true
+	}
+	return keys, nil
+}
+
 // validateAliases enforces that tool name aliases and argument aliases are
 // valid identifiers, distinct from the canonical name/key they alias, and
-// distinct from each other.
-func validateAliases(name string, aliases []string, argumentAliases map[string][]string) error {
+// distinct from each other. It additionally mirrors upstream Eino's
+// compose.applyArgsAliases (eino@v0.9.19 compose/tool_node.go:434-486):
+// an argument alias must not collide with a declared schema property (which
+// would silently steal that property's value, see remapToolArguments), and
+// a canonical argument key must not contain "." (nested field matching is
+// not supported).
+func validateAliases(name string, aliases []string, argumentAliases map[string][]string, schemaKeys map[string]bool) error {
 	seen := make(map[string]bool, len(aliases))
 	for _, alias := range aliases {
 		if !toolIdentifierPattern.MatchString(alias) {
@@ -226,6 +258,9 @@ func validateAliases(name string, aliases []string, argumentAliases map[string][
 		if strings.TrimSpace(canonical) == "" {
 			return errors.New("argument alias canonical key required")
 		}
+		if strings.Contains(canonical, ".") {
+			return fmt.Errorf("unsupported '.' in canonical argument key %q: nested field matching is not supported", canonical)
+		}
 		if len(aliasesForKey) == 0 {
 			return fmt.Errorf("argument alias list for %q is empty", canonical)
 		}
@@ -236,6 +271,12 @@ func validateAliases(name string, aliases []string, argumentAliases map[string][
 			}
 			if alias == canonical {
 				return fmt.Errorf("argument alias %q equals its canonical key %q", alias, canonical)
+			}
+			if schemaKeys[alias] {
+				return fmt.Errorf("argument alias %q conflicts with schema property %q", alias, alias)
+			}
+			if _, isCanonical := argumentAliases[alias]; isCanonical {
+				return fmt.Errorf("argument alias %q conflicts with another canonical argument key", alias)
 			}
 			if localSeen[alias] {
 				return fmt.Errorf("duplicate argument alias %q for %q", alias, canonical)

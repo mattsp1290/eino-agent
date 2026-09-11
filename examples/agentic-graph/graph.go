@@ -31,12 +31,16 @@ import (
 )
 
 // CallCounters counts, across every invocation of the built graph, how many
-// times the model request was audited and how many times a tool dispatch
-// was settled. A correct single-tool-call turn produces exactly one of each.
+// times the model request was audited and how many times the fake Dispatch
+// closure was invoked. A correct single-tool-call turn produces exactly one
+// of each. This is NOT a durable settlement count: dispatchFor is an
+// in-process stand-in for the claim-fenced runtime.BuildToolSettlement +
+// store settle a real host performs (see its doc comment and BuildGraph's
+// package doc), so Dispatch counts one call through this example's fake
+// closure, not one durable ledger row or one store-settled tool call.
 type CallCounters struct {
 	mu       sync.Mutex
 	Audited  int
-	Settled  int
 	Dispatch int
 }
 
@@ -50,12 +54,6 @@ func (c *CallCounters) addDispatch() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.Dispatch++
-}
-
-func (c *CallCounters) addSettled() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.Settled++
 }
 
 // auditingAgenticModel wraps an Eino model.AgenticModel so every Generate
@@ -132,7 +130,6 @@ func dispatchFor(canonicalName, resultText string, counters *CallCounters) tools
 		if name != canonicalName {
 			return nil, fmt.Errorf("dispatch: got tool name %q, want canonical %q", name, canonicalName)
 		}
-		counters.addSettled()
 		return &einoschema.ToolResult{Parts: []einoschema.ToolOutputPart{{Type: einoschema.ToolPartTypeText, Text: resultText}}}, nil
 	}
 }

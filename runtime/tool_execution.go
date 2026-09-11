@@ -14,6 +14,14 @@ import (
 
 var errToolExecutionPanic = errors.New("tool execution panicked")
 
+// undiscoveredToolError marks a prepared call to a deferred tool the model
+// has not yet discovered via tool search. Unlike an ordinary prepareErr
+// (which settles as an opaque operational_failure), it settles as a
+// terminal, model-visible denied call -- exactly like a guard denial -- so
+// the model sees the reason and can recover by calling tool search first
+// (composition-search-reviewer I3).
+type undiscoveredToolError struct{ error }
+
 type settledTool struct {
 	Outcome    toolOutcome
 	Settlement session.ToolSettlement
@@ -158,6 +166,11 @@ func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool
 			outcome = newToolOutcome(call, ToolResult{}, toolPermissionAllowed, errToolExecutionPanic)
 		}
 	}()
+	if undiscovered, ok := prepareErr.(undiscoveredToolError); ok {
+		result := modelVisiblePermissionResult("undiscovered", undiscovered.Error())
+		outcome = newToolOutcome(call, result, toolPermissionDenied, nil)
+		return e.host.transformToolOutcome(ctx, e, outcome)
+	}
 	if prepareErr != nil {
 		outcome = newToolOutcome(call, ToolResult{}, toolPermissionAllowed, prepareErr)
 		return e.host.transformToolOutcome(ctx, e, outcome)

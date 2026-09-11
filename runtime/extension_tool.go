@@ -3,6 +3,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -218,6 +219,42 @@ func validateToolResult(result ToolResult) error {
 	}
 	if len(result.Parts) != 0 && (result.Output != "" || len(result.Structured) != 0) {
 		return errors.New("enhanced tool result parts are authoritative and must not also carry Output/Structured")
+	}
+	for index, part := range result.Parts {
+		if err := validateToolResultPart(part); err != nil {
+			return fmt.Errorf("tool result part %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateToolResultPart(part ToolResultPart) error {
+	switch part.Type {
+	case ToolResultPartText:
+		if part.Media != nil || len(part.ToolSearch) != 0 {
+			return errors.New("text part must carry only Text")
+		}
+	case ToolResultPartImage, ToolResultPartAudio, ToolResultPartVideo, ToolResultPartFile:
+		if part.Media == nil {
+			return errors.New("media part requires Media")
+		}
+		if (part.Media.URL != "") == (part.Media.Base64Data != "") {
+			return errors.New("media part requires exactly one of URL or Base64Data")
+		}
+		if part.Media.Base64Data != "" {
+			if _, err := base64.StdEncoding.Strict().DecodeString(part.Media.Base64Data); err != nil {
+				return errors.New("media part base64 payload is invalid")
+			}
+		}
+		if part.Media.Name != "" && part.Type != ToolResultPartFile {
+			return errors.New("only a file part may carry a media Name")
+		}
+	case ToolResultPartToolSearch:
+		if len(part.ToolSearch) != 0 && !json.Valid(part.ToolSearch) {
+			return errors.New("tool_search part payload is not valid JSON")
+		}
+	default:
+		return fmt.Errorf("unknown tool result part type %q", part.Type)
 	}
 	return nil
 }

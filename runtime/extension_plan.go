@@ -143,12 +143,44 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if err != nil {
 		return fail(err)
 	}
+	if toolSearch != nil {
+		if err := validateToolSearchNameCollision(toolSearch.Name, compiled); err != nil {
+			return fail(err)
+		}
+		// A restriction that denies the search tool's own name (or whose
+		// allow-list omits it) disables tool search for this plan, exactly
+		// as it would for an ordinary tool -- the collision check above
+		// guarantees the search name is disjoint from every tool name and
+		// alias, so this cannot accidentally disable an unrelated tool.
+		if !planToolAllowed(toolSearch.Name, compiled.restrictions, nil) {
+			toolSearch = nil
+		}
+	}
 	plan.tools = sealedPlanTools{capabilities: compiled.tools, restrictions: compiled.restrictions, aliasIndex: compiled.aliasIndex}
 	plan.prompts = compiled.prompts
 	plan.guards = compiled.guards
 	plan.sealed = sealed
 	plan.toolSearch = toolSearch
 	return plan, nil
+}
+
+// validateToolSearchNameCollision rejects a tool-search name that collides
+// with any owned tool's canonical name or alias. Without this check, a
+// colliding name would silently shadow the tool: prepareToolCalls tests
+// isToolSearchCall before resolving the call against the tool registry, so
+// every model call on that name diverts into the runtime search path and
+// the registered tool becomes permanently unreachable with no error
+// anywhere (tool-identity-reviewer I2 / composition-search-reviewer I1).
+func validateToolSearchNameCollision(name string, compiled compiledRunPlan) error {
+	if _, taken := compiled.aliasIndex[name]; taken {
+		return fmt.Errorf("%w: tool search name %q collides with a tool alias", ErrExtensionPlanMismatch, name)
+	}
+	for _, owned := range compiled.ownedTools {
+		if owned.value.Name == name {
+			return fmt.Errorf("%w: tool search name %q collides with a tool name", ErrExtensionPlanMismatch, name)
+		}
+	}
+	return nil
 }
 
 func normalizeToolSearchConfig(cfg *ToolSearchConfig) (*ToolSearchConfig, error) {
@@ -519,7 +551,7 @@ func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContex
 			return nil, fmt.Errorf("%w: sealed tool resolver returned %q for %q", ErrExtensionPlanMismatch, tool.Name, expected)
 		}
 		seen[tool.Name] = true
-		if planToolAllowed(tool.Name, s.restrictions) {
+		if planToolAllowed(tool.Name, s.restrictions, s.aliasIndex) {
 			cloned, cloneErr := cloneToolChecked(tool)
 			if cloneErr != nil {
 				return nil, fmt.Errorf("freeze resolved tool %q: %w", tool.Name, cloneErr)
@@ -530,17 +562,33 @@ func (s sealedPlanTools) ResolveTools(ctx context.Context, scope ToolScopeContex
 	return result, nil
 }
 
-func planToolAllowed(name string, restrictions []PlanRestriction) bool {
+// planToolAllowed reports whether name (a tool's canonical name, or the
+// tool-search tool's configured name) survives every restriction. Each
+// restriction entry is resolved through aliasIndex before comparison, so a
+// restriction authored against a tool's alias (e.g. Denied: ["say"] for a
+// tool "echo" with alias "say") denies the tool under both names instead of
+// silently doing nothing (composition-search-reviewer I2). aliasIndex may be
+// nil (the tool-search name is never itself an alias target, so it needs no
+// resolution). An entry naming no tool and no alias in the plan is not an
+// error -- restriction sets may be authored for a wider registry than this
+// plan's -- it is simply inert here.
+func planToolAllowed(name string, restrictions []PlanRestriction, aliasIndex map[string]string) bool {
+	canonicalize := func(entry string) string {
+		if canonical, ok := aliasIndex[entry]; ok {
+			return canonical
+		}
+		return entry
+	}
 	for _, restriction := range restrictions {
 		for _, denied := range restriction.Denied {
-			if denied == name {
+			if canonicalize(denied) == name {
 				return false
 			}
 		}
 		if len(restriction.Allowed) != 0 {
 			allowed := false
 			for _, candidate := range restriction.Allowed {
-				allowed = allowed || candidate == name
+				allowed = allowed || canonicalize(candidate) == name
 			}
 			if !allowed {
 				return false

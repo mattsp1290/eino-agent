@@ -62,10 +62,22 @@ func ValidToolResultEnvelope(call session.ToolCall, settlement session.ToolSettl
 	case session.PartFunctionToolResult:
 		return validFunctionToolResultEnvelope(call, settlement, part)
 	case session.PartToolSearchResult:
-		return validToolSearchResultEnvelope(call, part)
+		return validToolSearchResultEnvelope(call, settlement, part)
 	default:
 		return false
 	}
+}
+
+// recordedToolOutputShape is the minimal view of the runtime's ToolOutput
+// JSON (runtime/tool_settlement.go) this package needs to check that the
+// durable result content matches what was recorded, without importing
+// runtime (which would create an import cycle) to re-derive the exact
+// RetentionPolicy-bounded byte content.
+type recordedToolOutputShape struct {
+	Parts []struct {
+		Type    string `json:"type"`
+		Omitted bool   `json:"omitted"`
+	} `json:"parts"`
 }
 
 func validFunctionToolResultEnvelope(call session.ToolCall, settlement session.ToolSettlement, part session.Part) bool {
@@ -77,24 +89,92 @@ func validFunctionToolResultEnvelope(call session.ToolCall, settlement session.T
 	if fr.CallID != string(call.ID) || len(fr.Content) == 0 {
 		return false
 	}
-	// A scalar (non-enhanced) result keeps the exact historical invariant:
-	// exactly one text content item equal to the settlement's Output JSON.
-	if len(fr.Content) == 1 && fr.Content[0].Type == session.ResultContentText && fr.Content[0].Text == string(settlement.Output) {
-		return true
+	var recorded recordedToolOutputShape
+	if err := json.Unmarshal(settlement.Output, &recorded); err != nil {
+		return false
 	}
-	// An enhanced (multi-part) result cannot be re-derived here without
-	// runtime's RetentionPolicy-bounding logic (this package does not import
-	// runtime to avoid a cycle); DecodeContentParts already re-validates
-	// every content item structurally (right variant populated per its
-	// type, no corrupt payloads), so a well-formed, non-empty, call-bound
-	// content list is accepted.
+	if len(recorded.Parts) == 0 {
+		// Scalar (non-enhanced) result: the historical invariant holds
+		// exactly -- one text content item equal to the settlement's
+		// recorded Output JSON.
+		return len(fr.Content) == 1 && fr.Content[0].Type == session.ResultContentText &&
+			fr.Content[0].Text == string(settlement.Output)
+	}
+	// Enhanced (multi-part) result: the durable content cannot be
+	// re-derived byte-for-byte here without runtime's RetentionPolicy
+	// bounding logic, but its shape is recorded in settlement.Output
+	// alongside the content it was derived from (runtime.toolOutputToResultContent),
+	// so check that shape agrees: same item count, same content-item type
+	// per index (an omitted or text/tool_search part always degrades to a
+	// text content item; a non-omitted media part becomes its matching
+	// media content type).
+	if len(fr.Content) != len(recorded.Parts) {
+		return false
+	}
+	for index, recordedPart := range recorded.Parts {
+		want := session.ResultContentText // omitted parts and text/tool_search parts degrade to text
+		if !recordedPart.Omitted {
+			switch recordedPart.Type {
+			case "image":
+				want = session.ResultContentImage
+			case "audio":
+				want = session.ResultContentAudio
+			case "video":
+				want = session.ResultContentVideo
+			case "file":
+				want = session.ResultContentFile
+			}
+		}
+		if fr.Content[index].Type != want {
+			return false
+		}
+	}
 	return true
 }
 
-func validToolSearchResultEnvelope(call session.ToolCall, part session.Part) bool {
+// recordedToolSearchOutputShape is the minimal view of the runtime's tool
+// search Output JSON (runtime/tool_search.go's buildTerminalToolSearchEnvelope)
+// this package needs to cross-check the durable tool_search_result block
+// against what was recorded.
+type recordedToolSearchOutputShape struct {
+	DiscoveredToolNames []string `json:"discovered_tool_names"`
+}
+
+func validToolSearchResultEnvelope(call session.ToolCall, settlement session.ToolSettlement, part session.Part) bool {
 	content, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.MaxContentLimits())
 	if err != nil || len(content.Blocks) != 1 || content.Blocks[0].ToolSearch == nil {
 		return false
 	}
-	return content.Blocks[0].ToolSearch.CallID == string(call.ID)
+	block := content.Blocks[0].ToolSearch
+	if block.CallID != string(call.ID) {
+		return false
+	}
+	// call.Name is the canonical search tool name and the search tool is
+	// never aliased (see buildTerminalToolSearchEnvelope), so RequestedName
+	// carries no additional information here -- compare against Name
+	// directly.
+	if block.Name != call.Name {
+		return false
+	}
+	infos, err := block.ToolInfos()
+	if err != nil {
+		return false
+	}
+	var recorded recordedToolSearchOutputShape
+	if err := json.Unmarshal(settlement.Output, &recorded); err != nil {
+		return false
+	}
+	if len(infos) != len(recorded.DiscoveredToolNames) {
+		return false
+	}
+	for index, info := range infos {
+		name := ""
+		if info != nil {
+			name = info.Name
+		}
+		if name != recorded.DiscoveredToolNames[index] {
+			return false
+		}
+	}
+	return true
 }
