@@ -139,7 +139,7 @@ POSTGRES_REPLAY_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPos
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_REPLAY_SUITE) $(addprefix $(POSTGRES_REPLAY_SUITE)/,messages_parts events_models provider_bytes private_bounds canonical_time)
 POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_REPLAY_SUITE)/private_bounds/,items bytes owner)
 POSTGRES_RUNTIME_SUITE := github.com/mattsp1290/eino-agent/runtime:TestPostgresRuntime
-POSTGRES_REQUIRED_SUITES += $(POSTGRES_RUNTIME_SUITE) $(addprefix $(POSTGRES_RUNTIME_SUITE)/,admission admission_rollback pending_resume optional_references)
+POSTGRES_REQUIRED_SUITES += $(POSTGRES_RUNTIME_SUITE) $(addprefix $(POSTGRES_RUNTIME_SUITE)/,admission admission_rollback pending_resume optional_references turn_loop_pause_resume)
 POSTGRES_RESTART_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresRestart
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_RESTART_SUITE) $(addprefix $(POSTGRES_RESTART_SUITE)/,host container)
 .PHONY: postgres-test postgres-race

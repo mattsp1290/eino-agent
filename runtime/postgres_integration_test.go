@@ -18,6 +18,7 @@ func TestPostgresRuntime(t *testing.T) {
 	t.Run("admission_rollback", func(t *testing.T) { testPostgresRuntimeAdmissionRollback(t, server) })
 	t.Run("pending_resume", func(t *testing.T) { testPostgresRuntimeResume(t, server) })
 	t.Run("optional_references", func(t *testing.T) { testPostgresRuntimeOptionalReferences(t, server) })
+	t.Run("turn_loop_pause_resume", func(t *testing.T) { testPostgresRuntimeTurnLoopPauseResume(t, server) })
 }
 
 type postgresRuntimeFixture struct {
