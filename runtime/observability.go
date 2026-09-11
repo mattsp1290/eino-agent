@@ -142,6 +142,26 @@ func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnS
 	})
 }
 
+// observeRetry records that a physical dispatch is about to supersede a
+// previously failed one (see adkEngine.recordFailedAttempt/takeFailedAttempt
+// and the durable attempt_replaced event adkModel.begin also emits at the
+// same point). attempt is this new dispatch's ordinal (its ledger Step,
+// under the invocation-per-physical-dispatch model every retry/failover
+// attempt uses -- see adk_retry.go); failedErr is the prior attempt's error.
+func (o *StreamingOrchestrator) observeRetry(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt, maxAttempts int, failedErr error) {
+	if o == nil || o.observer == nil {
+		return
+	}
+	classification := errorClassification(failedErr, "retry")
+	o.observer.Retry(ctx, einoobs.RetryEvent{
+		Correlation:    o.snapshotCorrelation(snapshot, messageID, "retry"),
+		Attempt:        int64(attempt),
+		MaxAttempts:    int64(maxAttempts),
+		Classification: classification,
+		Time:           o.now(),
+	})
+}
+
 func (o *StreamingOrchestrator) observeInterrupt(ctx context.Context, run session.Run, messageID session.MessageID, reason string) {
 	if o == nil || o.observer == nil {
 		return
@@ -431,6 +451,7 @@ func errorClassification(err error, fallback string) string {
 	if err == nil {
 		return fallback
 	}
+	err = unwrapRetryExhausted(err)
 	var providerErr model.Error
 	if errors.As(err, &providerErr) && providerErr.Code != "" {
 		return providerErr.Code

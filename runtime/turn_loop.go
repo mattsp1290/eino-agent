@@ -431,7 +431,7 @@ func (o *StreamingOrchestrator) prepareTurnLoop(coordinator *turnLoopCoordinator
 	return entry
 }
 
-func (o *StreamingOrchestrator) runTurnLoop(ctx context.Context, entry *liveLoop, checkpoints *adkCheckpointStore, pushIDs []session.InboxID, done chan<- Result, pauseCh chan<- PauseInfo) Result {
+func (o *StreamingOrchestrator) runTurnLoop(ctx context.Context, entry *liveLoop, checkpoints *adkCheckpointStore, pushIDs []session.InboxID, done chan<- Result, pauseCh chan<- PauseInfo, beforeDone func(Result)) Result {
 	coordinator := entry.coordinator
 	loop := entry.loop
 	defer o.unregisterLoop(coordinator.runID)
@@ -470,9 +470,49 @@ func (o *StreamingOrchestrator) runTurnLoop(ctx context.Context, entry *liveLoop
 		pauseCh <- info
 	}
 	close(pauseCh)
+	// beforeDone must complete before done is observed by a receiver, for
+	// the same reason release() above does (see its comment): a fresh run's
+	// observability session/run spans (finishObservedRun) close here so a
+	// receiver reading Done() and immediately snapshotting the observer
+	// never races their still-open End() calls.
+	if beforeDone != nil {
+		beforeDone(result)
+	}
 	done <- result
 	close(done)
 	return result
+}
+
+// settleRunRetrying calls store.SettleRun, retrying briefly on
+// session.ErrConflict. SettleRun refuses to settle a run with any
+// non-terminal tool call (store/internal/sqlstore's SettleRun), and ADK's
+// WithImmediate stop tears an agent turn down "without waiting for any safe
+// point" (see turnLoopHandle.Interrupt, which issues it): an interrupted
+// tool call's own settlement -- durably written synchronously inside
+// adkTool.InvokableRun's own call stack, in ADK's tool-node goroutine, not
+// ours -- can still be completing that write for a brief window after
+// TurnLoop.Run has already returned to this goroutine. The run must not
+// finalize while that settlement is still in flight, so retry a bounded
+// number of times rather than surfacing a spurious conflict; a genuine
+// conflict (any other cause) still fails immediately.
+func settleRunRetrying(ctx context.Context, store session.ExecutionStore, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	const maxAttempts = 40
+	const retryDelay = 5 * time.Millisecond
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		committed, err := store.SettleRun(ctx, request)
+		if err == nil {
+			return committed, nil
+		}
+		if !errors.Is(err, session.ErrConflict) {
+			return session.RunSettlementResult{}, err
+		}
+		lastErr = err
+		if attempt < maxAttempts-1 {
+			time.Sleep(retryDelay)
+		}
+	}
+	return session.RunSettlementResult{}, lastErr
 }
 
 // finishTurnLoop implements the TurnLoop exit protocol: interrupted (or
@@ -503,21 +543,23 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 	case state.ExitReason != nil && !state.CheckpointAttempted && (errors.As(state.ExitReason, &interruptErr) || errors.As(state.ExitReason, &cancelErr)):
 		var messageID session.MessageID
 		var snapshot TurnSnapshot
+		var usage model.Usage
 		if engine := c.currentEngine(); engine != nil {
 			messageID = engine.assistantMessageID
 			snapshot = engine.snapshot
+			usage = engine.usageSnapshot()
 		}
 		o.observeError(settleCtx, snapshot, messageID, "provider_stream", state.ExitReason)
 		settlement := session.RunSettlement{Status: session.RunInterrupted, FinishedAt: o.now(), Error: state.ExitReason.Error()}
-		committed, err := c.execution.store.SettleRun(settleCtx, session.SettleRunRequest{
-			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID},
+		committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
+			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
 		})
 		if err != nil {
 			_ = c.execution.stopLease()
 			return Result{RunID: c.runID, Status: session.RunFailed, Error: errors.Join(state.ExitReason, err)}
 		}
 		c.execution.publishPersisted(settleCtx, committed.Event)
-		result := Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, MessageID: messageID, Error: state.ExitReason}
+		result := Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, MessageID: messageID, Error: state.ExitReason, Usage: runtimeUsage(usage)}
 		c.publishRunSettledNotice(settleCtx, result)
 		return result
 	// A checkpoint Set failure is conservative: no promotion, and the run
@@ -560,9 +602,11 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 		_ = c.execution.stopLease()
 		var messageID session.MessageID
 		var snapshot TurnSnapshot
+		var usage model.Usage
 		if engine := c.currentEngine(); engine != nil {
 			messageID = engine.assistantMessageID
 			snapshot = engine.snapshot
+			usage = engine.usageSnapshot()
 		}
 		o.observeError(settleCtx, snapshot, messageID, "provider_stream", state.ExitReason)
 		status := session.RunFailed
@@ -575,14 +619,14 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 			status = session.RunInterrupted
 		}
 		settlement := session.RunSettlement{Status: status, FinishedAt: o.now(), Error: state.ExitReason.Error()}
-		committed, err := c.execution.store.SettleRun(settleCtx, session.SettleRunRequest{
-			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID},
+		committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
+			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
 		})
 		if err != nil {
 			return Result{RunID: c.runID, Status: session.RunFailed, Error: errors.Join(state.ExitReason, err)}
 		}
 		c.execution.publishPersisted(settleCtx, committed.Event)
-		result := Result{RunID: c.runID, Status: status, Interrupted: status == session.RunInterrupted, MessageID: messageID, Error: state.ExitReason}
+		result := Result{RunID: c.runID, Status: status, Interrupted: status == session.RunInterrupted, MessageID: messageID, Error: state.ExitReason, Usage: runtimeUsage(usage)}
 		c.publishRunSettledNotice(settleCtx, result)
 		return result
 	default:
@@ -596,9 +640,37 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 				messageID = engine.assistantMessageID
 			}
 		}
+		// ADK reported state.ExitReason == nil (an ordinary clean exit,
+		// matching none of the interrupt/pause/fail cases above), but that
+		// alone is not proof no interruption was requested: Interrupt
+		// cancels this run's own ctx unconditionally and immediately (see
+		// turnLoopHandle.Interrupt), and if that cancellation lands after
+		// runFreshTurnLoop's own upfront ctx.Err() check but still before
+		// (or during) loop.Run ever dispatches anything, TurnLoop.Run can
+		// exit with nothing "in flight" to report as interrupted -- the
+		// same race runFreshTurnLoop's early check narrows but cannot fully
+		// close, since work still happens between that check and here.
+		// Cross-check ctx directly rather than trusting ExitReason alone.
+		if err := ctx.Err(); err != nil {
+			_ = c.execution.stopLease()
+			if engine := c.currentEngine(); engine != nil {
+				o.observeError(context.WithoutCancel(ctx), engine.snapshot, messageID, "provider_stream", err)
+			}
+			settlement := session.RunSettlement{Status: statusForError(err), FinishedAt: o.now(), Error: err.Error()}
+			committed, settleErr := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
+				Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
+			})
+			if settleErr != nil {
+				return Result{RunID: c.runID, Status: session.RunFailed, Error: errors.Join(err, settleErr)}
+			}
+			c.execution.publishPersisted(settleCtx, committed.Event)
+			result := Result{RunID: c.runID, Status: statusForError(err), Interrupted: errors.Is(err, context.Canceled), MessageID: messageID, Error: err, Usage: runtimeUsage(usage)}
+			c.publishRunSettledNotice(settleCtx, result)
+			return result
+		}
 		settlement := session.RunSettlement{Status: session.RunCompleted, FinishedAt: o.now()}
-		committed, err := c.execution.store.SettleRun(settleCtx, session.SettleRunRequest{
-			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID},
+		committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
+			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
 		})
 		if err != nil {
 			_ = c.execution.stopLease()
@@ -680,7 +752,7 @@ func (h *turnLoopHandle) Status(ctx context.Context) (session.Run, error) {
 // checkpointed) and ResumeRun. A run with no live loop in this process (for
 // example, already paused, or owned by a different process) reports
 // ErrInvalidOrchestrator.
-func (h *turnLoopHandle) Interrupt(_ context.Context, reason string) error {
+func (h *turnLoopHandle) Interrupt(ctx context.Context, reason string) error {
 	// Cancel the run's own context unconditionally and immediately: this
 	// must win even when it races ahead of the driving goroutine calling
 	// loop.Run (TurnLoop's Stop is a no-op signal until Run observes it --
@@ -690,6 +762,13 @@ func (h *turnLoopHandle) Interrupt(_ context.Context, reason string) error {
 	// classification, StopCause) whenever a live loop is registered.
 	if h.cancel != nil {
 		h.cancel()
+	}
+	// Recorded synchronously (best-effort: a lookup failure never fails the
+	// interrupt itself) so an interrupt that races ahead of the driving
+	// goroutine's own startup -- see runFreshTurnLoop's ctx.Err() check --
+	// still surfaces an "interrupt requested" observation.
+	if run, err := h.host.store.GetRun(context.WithoutCancel(ctx), h.runID); err == nil {
+		h.host.observeInterrupt(context.WithoutCancel(ctx), run, "", reason)
 	}
 	entry := h.host.liveLoopFor(h.runID)
 	if entry == nil {
@@ -887,7 +966,7 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		_ = started
 		runCtx := execution.startLease(ctx, o.lease())
 		defer execution.release()
-		o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause)
+		o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause, nil)
 	}()
 	return handle, nil
 }

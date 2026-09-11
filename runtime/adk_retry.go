@@ -2,11 +2,16 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/cloudwego/eino/adk"
+	einomodel "github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/compose"
 	einoschema "github.com/cloudwego/eino/schema"
+
+	"github.com/mattsp1290/eino-agent/model"
 )
 
 // defaultRetryBaseDelay/defaultRetryMaxDelay bound the exponential backoff
@@ -39,12 +44,20 @@ func defaultRetryConfig(attempts int) *adk.TypedModelRetryConfig[*einoschema.Age
 // recognizes compose.IsInterruptRerunError-shaped errors as "already
 // resumable state", and re-dispatching over one would join partial output
 // from an old attempt with a new one, or worse, duplicate a durably paused
-// interrupt. A successful result (Err == nil) is never retried.
+// interrupt. It also refuses to retry an error from a dispatch whose durable
+// output was already committed (errCommittedDispatchFailed) -- see that
+// sentinel's doc comment. A successful result (Err == nil) is never retried.
 func defaultShouldRetry(_ context.Context, retryCtx *adk.TypedRetryContext[*einoschema.AgenticMessage]) *adk.TypedRetryDecision[*einoschema.AgenticMessage] {
 	if retryCtx == nil || retryCtx.Err == nil {
 		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
 	}
 	if _, ok := compose.IsInterruptRerunError(retryCtx.Err); ok {
+		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
+	}
+	if errors.Is(retryCtx.Err, errCommittedDispatchFailed) {
+		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
+	}
+	if errors.Is(retryCtx.Err, errPartialStreamObserved) {
 		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
 	}
 	return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: true}
@@ -62,4 +75,69 @@ func defaultRetryBackoff(_ context.Context, attempt int) time.Duration {
 		delay = defaultRetryMaxDelay
 	}
 	return delay
+}
+
+// FailoverPolicy is a serializable descriptor for an ordered list of
+// alternate model selections to try, in order, when the primary (or a prior
+// failover) model call fails. It is frozen on RunPlanSpec.Failover, like
+// RunPlanSpec.Agent -- host construction config, not durable capability
+// evidence, so it is deliberately not part of the sealed fingerprint.
+type FailoverPolicy struct {
+	Models []model.Selection
+}
+
+// buildFailoverConfig reconstructs adk.ModelFailoverConfig from a
+// FailoverPolicy for one turn's engine. Each failover attempt resolves its
+// model through the same model.Resolver every primary dispatch uses (never
+// a cached/pinned client) and dispatches through a fresh *adkModel sharing
+// this turn's engine/execution/approval binding, so it is its own audited
+// ledger row (own InvocationID) exactly like a retry attempt; provider
+// state restoration for that attempt's own dispatch goes through the same
+// durableProjection contract check (loadProviderHistory validates codec
+// compatibility against activeModel()), so an incompatible failover target
+// fails before dispatch rather than silently dropping or corrupting state.
+func buildFailoverConfig(engine *adkEngine, approval *adkApprovalBinding, policy *FailoverPolicy) *adk.ModelFailoverConfig[*einoschema.AgenticMessage] {
+	if policy == nil || len(policy.Models) == 0 {
+		return nil
+	}
+	return &adk.ModelFailoverConfig[*einoschema.AgenticMessage]{
+		MaxRetries:     uint(len(policy.Models)),
+		ShouldFailover: defaultShouldFailover,
+		GetFailoverModel: func(ctx context.Context, failoverCtx *adk.FailoverContext[*einoschema.AgenticMessage]) (einomodel.BaseModel[*einoschema.AgenticMessage], []*einoschema.AgenticMessage, error) {
+			if failoverCtx.FailoverAttempt == 0 || int(failoverCtx.FailoverAttempt) > len(policy.Models) {
+				return nil, nil, fmt.Errorf("%w: failover attempt %d out of range for %d configured models", ErrInvalidOrchestrator, failoverCtx.FailoverAttempt, len(policy.Models))
+			}
+			selection := policy.Models[failoverCtx.FailoverAttempt-1]
+			resolved, err := engine.host.model.Resolve(ctx, selection, model.Runtime{})
+			if err != nil {
+				return nil, nil, err
+			}
+			return &adkModel{host: engine.host, execution: engine.execution, engine: engine, approval: approval, resolvedOverride: &resolved}, nil, nil
+		},
+	}
+}
+
+// defaultShouldFailover refuses to fail over on a graph-level interrupt-rerun
+// error (see defaultShouldRetry) and, per the same reasoning, on an error
+// from a physical dispatch whose durable output was already committed: this
+// adapter's model.Generate/Stream only ever return an error before
+// adkModel.commit succeeds (commit failures themselves surface as the
+// returned error, but by then the assistant message/tool-call records may
+// already be durably written), so failing over past that point would risk
+// a second physical call whose result this package has no slot left to
+// commit against. A successful result (Err == nil) is never failed over.
+func defaultShouldFailover(_ context.Context, _ *einoschema.AgenticMessage, outputErr error) bool {
+	if outputErr == nil {
+		return false
+	}
+	if _, ok := compose.IsInterruptRerunError(outputErr); ok {
+		return false
+	}
+	if errors.Is(outputErr, errCommittedDispatchFailed) {
+		return false
+	}
+	if errors.Is(outputErr, errPartialStreamObserved) {
+		return false
+	}
+	return true
 }

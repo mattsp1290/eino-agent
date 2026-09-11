@@ -14,6 +14,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -117,6 +118,16 @@ type RunPlanSpec struct {
 	// adapters at build time (see adkEngine.buildAgent). Defaults to
 	// DefaultChatModelAgentFactory when nil.
 	Agent AgentFactory
+	// Failover configures an ordered list of alternate model selections to
+	// try when the primary (or a prior failover) model call fails. Like
+	// Agent and ToolSearch, it is deliberately NOT part of the sealed
+	// durable ExtensionPlanDescriptor/fingerprint: it is host construction
+	// config, not durable capability evidence -- every failover model is
+	// still resolved fresh through the same model.Resolver every primary
+	// dispatch uses (see buildFailoverConfig), so an incompatible or
+	// since-removed model fails at resolve/dispatch time, not at plan
+	// construction. nil disables failover for this plan.
+	Failover *FailoverPolicy
 }
 
 // RunPlan is the immutable executable state for one run.
@@ -129,6 +140,7 @@ type RunPlan struct {
 	sealed     session.SealedExtensionPlan
 	toolSearch *ToolSearchConfig
 	agent      AgentFactory
+	failover   *FailoverPolicy
 	once       sync.Once
 }
 
@@ -193,6 +205,7 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if plan.agent == nil {
 		plan.agent = DefaultChatModelAgentFactory{}
 	}
+	plan.failover = spec.Failover
 	return plan, nil
 }
 
@@ -688,6 +701,17 @@ func (p *RunPlan) ToolSearch() *ToolSearchConfig {
 	}
 	cfg := *p.toolSearch
 	return &cfg
+}
+
+// FailoverPolicy returns the plan's failover policy, or nil when failover is
+// not configured for this plan.
+func (p *RunPlan) FailoverPolicy() *FailoverPolicy {
+	if p == nil || p.failover == nil {
+		return nil
+	}
+	policy := *p.failover
+	policy.Models = append([]model.Selection(nil), p.failover.Models...)
+	return &policy
 }
 
 // ResolveToolName returns the canonical tool name for name, which may

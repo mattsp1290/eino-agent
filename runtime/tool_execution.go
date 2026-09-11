@@ -36,21 +36,20 @@ func (e *runExecution) settleInterruptedRunningTool(ctx context.Context, run ses
 	return e.settleInterruptedTool(ctx, run, tool, claimed, "tool was running during resume and was not re-executed")
 }
 
-func (e *runExecution) interruptPendingTool(ctx context.Context, snapshot TurnSnapshot, pending session.ToolCall) error {
+func (e *runExecution) interruptPendingTool(ctx context.Context, snapshot TurnSnapshot, pending session.ToolCall) (session.ToolSettlement, error) {
 	startedAt := e.host.now()
 	claimed, err := e.persistToolClaim(ctx, session.ClaimToolCallRequest{
 		ID: pending.ID, ClaimedBy: e.host.ownerID(), ClaimToken: string(e.host.ids.NewEventID()), StartedAt: startedAt,
 		LeaseDuration: e.host.lease(), Event: toolTransitionEnvelope(e.host, snapshot, startedAt),
 	})
 	if err != nil {
-		return err
+		return session.ToolSettlement{}, err
 	}
 	extension.Notify(e.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{
 		SessionID: pending.SessionID, RunID: pending.RunID, ToolCallID: pending.ID, ToolName: pending.Name, Time: claimed.Call.StartedAt,
 	})
 	run := session.Run{ID: pending.RunID, SessionID: pending.SessionID, ModelID: string(snapshot.Model.Model.ID)}
-	_, err = e.settleInterruptedTool(ctx, run, Tool{Name: pending.Name, Metadata: cloneStringMap(pending.Metadata)}, claimed.Call, "tool was skipped after an earlier fatal tool outcome")
-	return err
+	return e.settleInterruptedTool(ctx, run, Tool{Name: pending.Name, Metadata: cloneStringMap(pending.Metadata)}, claimed.Call, "tool was skipped after an earlier fatal tool outcome")
 }
 
 func (e *runExecution) terminalizeUnfinishedTools(ctx context.Context, snapshot TurnSnapshot, calls []session.ToolCall) error {
@@ -66,7 +65,7 @@ func (e *runExecution) terminalizeUnfinishedTools(ctx context.Context, snapshot 
 		}
 		switch current.Status {
 		case session.ToolCallPending:
-			err = e.interruptPendingTool(ctx, snapshot, current)
+			_, err = e.interruptPendingTool(ctx, snapshot, current)
 		case session.ToolCallRunning:
 			run := session.Run{ID: current.RunID, SessionID: current.SessionID, ModelID: string(snapshot.Model.Model.ID)}
 			_, err = e.settleInterruptedTool(ctx, run, Tool{Name: current.Name, Metadata: cloneStringMap(current.Metadata)}, current, "tool was interrupted after a fatal tool lifecycle outcome")

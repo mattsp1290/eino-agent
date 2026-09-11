@@ -140,7 +140,13 @@ func TestLedgerRecordsRetryAttemptsAndTerminalFailure(t *testing.T) {
 		t.Fatalf("result = %#v", result)
 	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
-	if err != nil || len(batch.Records) != 2 || batch.Records[0].State != session.ModelRequestFailed || batch.Records[1].State != session.ModelRequestCompleted || batch.Records[0].Attempt != 1 || batch.Records[1].Attempt != 2 {
+	// Each physical retry attempt is its own audited ledger row (its own
+	// InvocationID) with the informational Attempt field pinned to 1: the
+	// engine's Step counter, not Attempt, is what advances across physical
+	// dispatches -- see adkModel.begin/adkEngine.nextStep.
+	if err != nil || len(batch.Records) != 2 || batch.Records[0].State != session.ModelRequestFailed || batch.Records[1].State != session.ModelRequestCompleted ||
+		batch.Records[0].Attempt != 1 || batch.Records[1].Attempt != 1 || batch.Records[0].Step != 1 || batch.Records[1].Step != 2 ||
+		batch.Records[0].InvocationID == batch.Records[1].InvocationID {
 		t.Fatalf("retry records = %#v, %v", batch.Records, err)
 	}
 }
@@ -188,10 +194,15 @@ func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
 	if err != nil || len(batch.Records) != 3 {
 		t.Fatalf("records=%#v error=%v", batch.Records, err)
 	}
+	// Every physical dispatch is its own ledger row with Attempt pinned to 1
+	// (informational); Step is the engine-wide monotonic counter across all
+	// physical dispatches of the turn, so the retried third provider call
+	// lands on its own Step (3), not a second Attempt at Step 2 -- see
+	// adkModel.begin/adkEngine.nextStep.
 	want := map[[2]int]session.ModelRequestState{
 		{1, 1}: session.ModelRequestCompleted,
 		{2, 1}: session.ModelRequestFailed,
-		{2, 2}: session.ModelRequestCompleted,
+		{3, 1}: session.ModelRequestCompleted,
 	}
 	for _, record := range batch.Records {
 		key := [2]int{record.Step, record.Attempt}
@@ -352,11 +363,15 @@ func TestLedgerMarksPanickingDispatchedRequestFailed(t *testing.T) {
 	orchestrator.plans = staticRunPlanProvider{plan: plan}
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "panic-ledger-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 	cleanup()
-	if result.Status != session.RunFailed || result.Error == nil || result.Error.Error() != providerStreamPanicMessage || strings.Contains(result.Error.Error(), secret) {
+	// The ADK compose graph wraps a node's error in its own
+	// "[NodeRunError] ...: node path: [...]" envelope (compose.internalError),
+	// so the durable/result error message contains, rather than equals, the
+	// sanitized panic sentinel; the secret must never appear in either.
+	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), providerStreamPanicMessage) || strings.Contains(result.Error.Error(), secret) {
 		t.Fatalf("result = %#v", result)
 	}
 	run, err := store.GetRun(context.Background(), result.RunID)
-	if err != nil || run.Error != providerStreamPanicMessage || strings.Contains(run.Error, secret) {
+	if err != nil || !strings.Contains(run.Error, providerStreamPanicMessage) || strings.Contains(run.Error, secret) {
 		t.Fatalf("durable run = %#v, %v", run, err)
 	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
@@ -405,11 +420,14 @@ func TestLedgerRetainsPartialStateAfterReceivePanic(t *testing.T) {
 	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "receive-panic-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 	cleanup()
 	wantUsage := session.Usage{InputTokens: 5, OutputTokens: 2}
-	if result.Status != session.RunFailed || result.Error == nil || result.Error.Error() != providerStreamPanicMessage || strings.Contains(result.Error.Error(), secret) || result.Usage != wantUsage || attempts != 1 {
+	// See TestLedgerMarksPanickingDispatchedRequestFailed: ADK's compose
+	// graph wraps the error in its own NodeRunError envelope, so this
+	// contains rather than equals the sanitized panic sentinel.
+	if result.Status != session.RunFailed || result.Error == nil || !strings.Contains(result.Error.Error(), providerStreamPanicMessage) || strings.Contains(result.Error.Error(), secret) || result.Usage != wantUsage || attempts != 1 {
 		t.Fatalf("result=%#v attempts=%d", result, attempts)
 	}
 	run, err := store.GetRun(context.Background(), result.RunID)
-	if err != nil || run.Error != providerStreamPanicMessage || strings.Contains(run.Error, secret) {
+	if err != nil || !strings.Contains(run.Error, providerStreamPanicMessage) || strings.Contains(run.Error, secret) {
 		t.Fatalf("durable run=%#v error=%v", run, err)
 	}
 	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})

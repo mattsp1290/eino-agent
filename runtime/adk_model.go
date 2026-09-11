@@ -10,6 +10,7 @@ import (
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/watch"
@@ -37,12 +38,41 @@ type adkModel struct {
 	engine    *adkEngine
 	approval  *adkApprovalBinding
 
+	// resolvedOverride, when set, is used instead of engine.snapshot.Model
+	// for this adapter instance's provider identity/streamer -- the failover
+	// path's mechanism (see adk_retry.go's buildFailoverConfig) for
+	// dispatching a physical attempt through an alternate resolved model
+	// while sharing the same engine/execution/approval as the primary
+	// adapter (same ledger, same durable projection, same turn identity).
+	resolvedOverride *model.Resolved
+
 	mu          sync.Mutex
 	messageID   session.MessageID
 	needMessage bool
 }
 
 var _ einomodel.AgenticModel = (*adkModel)(nil)
+
+// activeModel returns the resolved model this adapter instance dispatches
+// through: resolvedOverride when set (a failover attempt), otherwise the
+// turn's primary engine.snapshot.Model.
+func (m *adkModel) activeModel() model.Resolved {
+	if m.resolvedOverride != nil {
+		return *m.resolvedOverride
+	}
+	return m.engine.snapshot.Model
+}
+
+// dispatchSnapshot returns the turn's snapshot with Model swapped to
+// activeModel(): every provider-facing construction (ProviderRequest,
+// provider-state restoration in durableProjection) must key off the model
+// this specific physical attempt actually dispatches through, which for a
+// failover attempt is not engine.snapshot.Model.
+func (m *adkModel) dispatchSnapshot() TurnSnapshot {
+	snapshot := m.engine.snapshot
+	snapshot.Model = m.activeModel()
+	return snapshot
+}
 
 // adkDispatch carries the state a begin/commit/finish triple shares for one
 // physical model call.
@@ -74,7 +104,7 @@ func (m *adkModel) currentMessageID(ctx context.Context) (session.MessageID, err
 	}
 	if _, err := m.execution.store.AppendMessage(ctx, session.Message{
 		ID: nextID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, ParentID: m.engine.assistantMessageID,
-		Role: session.RoleAssistant, Agent: m.engine.snapshot.Config.Agent.Name, ModelID: string(m.engine.snapshot.Model.Model.ID),
+		Role: session.RoleAssistant, Agent: m.engine.snapshot.Config.Agent.Name, ModelID: string(m.activeModel().Model.ID),
 		CreatedAt: at, UpdatedAt: at,
 	}); err != nil {
 		return "", err
@@ -92,7 +122,7 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 	if err != nil {
 		return nil, err
 	}
-	request := m.engine.snapshot.ProviderRequest(messageID, m.host.trace, input, m.execution.discoveredSnapshot())
+	request := m.dispatchSnapshot().ProviderRequest(messageID, m.host.trace, input, m.execution.discoveredSnapshot())
 	request.System, err = m.host.renderSystemPrompt(ctx, m.engine.plan, m.engine.snapshot, 1, step)
 	if err != nil {
 		return nil, err
@@ -108,17 +138,70 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 		return nil, err
 	}
 	if err := updateModelRequest(ctx, m.execution.store, &record, session.ModelRequestDispatchStarted, nil, m.host.now()); err != nil {
+		// The physical call never happened (no dispatch, no
+		// ModelRequestedPoint/ModelCompletedPoint notification): best-effort
+		// mark the ledger row terminally failed so it does not sit in
+		// "prepared" forever, but the transition-to-dispatch-started write
+		// failing is itself the reported error regardless of whether this
+		// second write succeeds.
+		_ = updateModelRequest(ctx, m.execution.store, &record, session.ModelRequestFailed, err, m.host.now())
 		return nil, err
+	}
+	extension.Notify(m.execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{
+		SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, MessageID: messageID,
+		Attempt: record.Attempt, Step: record.Step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
+		RequestRecordID: record.ID, MessageCount: len(input), ToolCount: len(request.Controls.Tools) + len(request.Controls.DeferredTools), ContentHash: hash,
+	})
+	if replaced, replacedErr := m.engine.takeFailedAttempt(); replaced != "" && replaced != record.InvocationID {
+		event := session.EventRecord{
+			ID: m.host.ids.NewEventID(), SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
+			MessageID: messageID, EpochID: m.engine.snapshot.EpochID, TurnID: m.engine.turn.ID, AgentPath: m.engine.agentPath,
+			ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
+			Kind: session.AttemptReplacedEventKind, Correlation: replaced,
+			Payload: mustJSON(map[string]string{"old_invocation_id": replaced, "new_invocation_id": record.InvocationID}), CreatedAt: m.host.now(),
+		}
+		committed, err := m.execution.store.AppendEvent(ctx, event)
+		if err != nil {
+			return nil, err
+		}
+		m.execution.publishPersisted(ctx, committed)
+		m.host.observeRetry(ctx, m.dispatchSnapshot(), messageID, record.Step, m.host.attempts(), replacedErr)
 	}
 	return &adkDispatch{messageID: messageID, record: record, input: input}, nil
 }
 
-func (m *adkModel) finish(ctx context.Context, dispatch *adkDispatch, err error) error {
+// finish updates this dispatch's ledger row and notifies ModelCompletedPoint.
+// dispatchErr is the raw physical-call error (nil if the provider round trip
+// itself succeeded) and controls the ledger row's terminal State: a request
+// whose provider round trip completed is ledgered Completed even if a later
+// step (commit's durable-persist validation, or this very ledger write)
+// subsequently fails the overall Generate/Stream call -- that is a run-level
+// failure, not evidence the provider request itself never completed (see
+// TestUnsafeProviderOutputFailsBeforeSecondRequest). reportErr is the error
+// actually surfaced to the caller/classified into the notice/ledger
+// ErrorCode/recordFailedAttempt; it may be non-nil (a commit validation
+// failure) even when dispatchErr is nil.
+func (m *adkModel) finish(ctx context.Context, dispatch *adkDispatch, usage model.Usage, dispatchErr, reportErr error) error {
 	state := session.ModelRequestCompleted
-	if err != nil {
+	if dispatchErr != nil {
 		state = session.ModelRequestFailed
 	}
-	return updateModelRequest(ctx, m.execution.store, &dispatch.record, state, err, m.host.now())
+	if updateErr := updateModelRequest(ctx, m.execution.store, &dispatch.record, state, reportErr, m.host.now()); updateErr != nil {
+		return updateErr
+	}
+	extension.Notify(m.execution.dispatch(), ctx, ModelCompletedPoint, ModelCompletedNotice{
+		SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, MessageID: dispatch.messageID,
+		Attempt: dispatch.record.Attempt, Step: dispatch.record.Step, Usage: runtimeUsage(usage), Error: classifyExtensionError(reportErr),
+	})
+	if reportErr != nil {
+		// A retry or failover wrapper above this adapter may dispatch again;
+		// begin() on that next attempt emits attempt_replaced once it knows
+		// its own new InvocationID. Charged usage on this failed attempt is
+		// retained regardless (see Generate/Stream: addUsage runs on the
+		// error path too).
+		m.engine.recordFailedAttempt(dispatch.record.InvocationID, reportErr)
+	}
+	return nil
 }
 
 // Generate implements einomodel.AgenticModel.
@@ -139,21 +222,32 @@ func (m *adkModel) Generate(ctx context.Context, input []*einoschema.AgenticMess
 	result, dispatchErr := m.dispatch(ctx, dispatch, input, nil)
 	if dispatchErr != nil {
 		m.engine.addUsage(result.usage)
-		_ = m.finish(ctx, dispatch, dispatchErr)
+		if result.receivedDelta {
+			dispatchErr = fmt.Errorf("%w: %w", errPartialStreamObserved, dispatchErr)
+		}
+		_ = m.finish(ctx, dispatch, result.usage, dispatchErr, dispatchErr)
 		return nil, dispatchErr
 	}
 	committed, err := m.commit(ctx, dispatch, result.message)
-	if err != nil {
-		_ = m.finish(ctx, dispatch, err)
-		return nil, err
-	}
-	if err := m.finish(ctx, dispatch, nil); err != nil {
-		return nil, err
-	}
+	// The physical provider call succeeded regardless of what happens next
+	// (a commit validation failure or a subsequent ledger-write failure),
+	// so this dispatch's usage is charged now -- it must survive even if
+	// finish()'s own ledger update below fails and this call returns early
+	// (see TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage).
 	m.engine.addUsage(result.usage)
+	if err != nil {
+		// dispatchErr was nil (the provider call itself succeeded); this is
+		// a durable-persist validation failure, so the ledger row is still
+		// terminally Completed -- see finish's doc comment.
+		_ = m.finish(ctx, dispatch, result.usage, nil, err)
+		return nil, err
+	}
+	if err := m.finish(ctx, dispatch, result.usage, nil, nil); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCommittedDispatchFailed, err)
+	}
 	if m.approval != nil {
 		if err := m.approval.pause(ctx, m, dispatch, committed); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", errCommittedDispatchFailed, err)
 		}
 	}
 	return committed, nil
@@ -191,28 +285,39 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 		m.execution.eventSink().Emit(ctx, session.EventRecord{
 			Kind: EventMessageDelta, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
 			MessageID: dispatch.messageID, EpochID: m.engine.snapshot.EpochID, TurnID: m.engine.turn.ID, AgentPath: m.engine.agentPath,
-			ProviderID: string(m.engine.snapshot.Model.Provider.ID), ModelID: string(m.engine.snapshot.Model.Model.ID),
+			ProviderID: string(m.activeModel().Provider.ID), ModelID: string(m.activeModel().Model.ID),
 			Payload: mustJSON(map[string]string{"content": content, "reasoning": reasoning}), LiveOnly: true, CreatedAt: m.host.now(),
 		})
 	})
 	m.host.sessionObserver.FinishAttempt(live)
 	if dispatchErr != nil {
 		m.engine.addUsage(result.usage)
-		_ = m.finish(ctx, dispatch, dispatchErr)
+		if result.receivedDelta {
+			dispatchErr = fmt.Errorf("%w: %w", errPartialStreamObserved, dispatchErr)
+		}
+		_ = m.finish(ctx, dispatch, result.usage, dispatchErr, dispatchErr)
 		return nil, dispatchErr
 	}
 	committed, err := m.commit(ctx, dispatch, result.message)
-	if err != nil {
-		_ = m.finish(ctx, dispatch, err)
-		return nil, err
-	}
-	if err := m.finish(ctx, dispatch, nil); err != nil {
-		return nil, err
-	}
+	// The physical provider call succeeded regardless of what happens next
+	// (a commit validation failure or a subsequent ledger-write failure),
+	// so this dispatch's usage is charged now -- it must survive even if
+	// finish()'s own ledger update below fails and this call returns early
+	// (see TestTerminalLedgerFailureOverridesProviderResultAndRetainsUsage).
 	m.engine.addUsage(result.usage)
+	if err != nil {
+		// dispatchErr was nil (the provider call itself succeeded); this is
+		// a durable-persist validation failure, so the ledger row is still
+		// terminally Completed -- see finish's doc comment.
+		_ = m.finish(ctx, dispatch, result.usage, nil, err)
+		return nil, err
+	}
+	if err := m.finish(ctx, dispatch, result.usage, nil, nil); err != nil {
+		return nil, fmt.Errorf("%w: %w", errCommittedDispatchFailed, err)
+	}
 	if m.approval != nil {
 		if err := m.approval.pause(ctx, m, dispatch, committed); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %w", errCommittedDispatchFailed, err)
 		}
 	}
 	return einoschema.StreamReaderFromArray([]*einoschema.AgenticMessage{committed}), nil
@@ -266,6 +371,30 @@ func stripADKInternalExtra(messages []*einoschema.AgenticMessage) []*einoschema.
 // dropping settled tool results). This must fail the dispatch, not degrade.
 var errADKProjectionDiverged = errors.New("adk in-memory tool-call view diverged from the durable projection")
 
+// errCommittedDispatchFailed wraps an error that occurred strictly after
+// adkModel.commit durably persisted this dispatch's assistant message and
+// tool calls (a ledger-state-update or post-commit approval-pause failure).
+// A retry or failover wrapper re-dispatching past this point would issue a
+// second physical model call whose result has no durable slot left to
+// commit against -- the first attempt's output is already the turn's
+// record. defaultShouldRetry/defaultShouldFailover both refuse to retry an
+// error matching this sentinel (see their doc comments).
+var errCommittedDispatchFailed = errors.New("model output already durably committed; error occurred after commit")
+
+// errPartialStreamObserved wraps a mid-stream dispatch error that occurred
+// after this dispatch's underlying provider call (dispatch always uses the
+// streaming transport -- see dispatch's doc comment) had already received at
+// least one delta chunk (modelStreamResult.receivedDelta), in both Generate
+// and Stream. Usage has already been accumulated from those chunks (see
+// addUsage on the error path) and, for Stream, at least the first chunk may
+// already have been published to the session observer / live event sink.
+// Retrying or failing over past this point would double-count that usage or
+// show the user a second, possibly divergent response appended after a
+// partial one it already started receiving.
+// defaultShouldRetry/defaultShouldFailover both refuse to retry an error
+// matching this sentinel.
+var errPartialStreamObserved = errors.New("dispatch failed after a partial provider stream was already observed")
+
 // durableProjection replaces ADK's in-memory transcript with the durable
 // projection of this run's committed history: prior turns via
 // history.LoadAgentic/ProjectAgentic (loadProviderHistory) plus this turn's
@@ -285,7 +414,7 @@ var errADKProjectionDiverged = errors.New("adk in-memory tool-call view diverged
 // checked against the durable projection's set; any divergence fails closed
 // (errADKProjectionDiverged) rather than silently trusting either view.
 func (m *adkModel) durableProjection(ctx context.Context, adkInput []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
-	full, fullState, err := loadProviderHistory(ctx, m.host.store, session.Session{ID: m.engine.snapshot.SessionID}, m.engine.historyOptions, m.engine.snapshot.Model)
+	full, fullState, err := loadProviderHistory(ctx, m.host.store, session.Session{ID: m.engine.snapshot.SessionID}, m.engine.historyOptions, m.activeModel())
 	if err != nil {
 		return nil, err
 	}
@@ -419,17 +548,39 @@ func sortedKeys(set map[string]bool) []string {
 // (both Generate and Stream funnel through the streaming provider
 // transport), fully draining the response before returning: no live chunk
 // ever reaches ADK directly (see receiveModelStream's callers here).
-func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, input []*einoschema.AgenticMessage, onDelta func(int64, *einoschema.AgenticMessage)) (modelStreamResult, error) {
-	observation := m.host.startObservedStream(ctx, m.engine.snapshot, d.messageID, d.record.Attempt)
-	request := m.engine.snapshot.ProviderRequest(d.messageID, m.host.trace, input, m.execution.discoveredSnapshot())
+func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, input []*einoschema.AgenticMessage, onDelta func(int64, *einoschema.AgenticMessage)) (result modelStreamResult, err error) {
+	// d.record.Step, not Attempt, is what actually varies per physical
+	// dispatch under the invocation-per-physical-dispatch ledger model (see
+	// adk_retry.go): Attempt is pinned to 1 for every dispatch, so using it
+	// here would collide every retry/tool-loop dispatch's stream
+	// observation onto the same "attempt-1" correlation ID.
+	observation := m.host.startObservedStream(ctx, m.engine.snapshot, d.messageID, d.record.Step)
+	request := m.dispatchSnapshot().ProviderRequest(d.messageID, m.host.trace, input, m.execution.discoveredSnapshot())
 	request.System = d.record.System
 	request.IdempotencyKey = string(d.record.ID)
-	reader, err := m.engine.snapshot.Model.Streamer.StreamProvider(ctx, request)
-	if err != nil {
-		m.host.errorObservedStream(observation, err, model.Usage{})
-		return modelStreamResult{}, err
+	// A panic from the provider transport (either the initial
+	// StreamProvider call or a later Recv() while receiveModelStream drains
+	// it) must never propagate: its payload can carry provider-side
+	// secrets (e.g. request credentials echoed back into a panic message),
+	// and letting it unwind past this adapter would also skip finish()'s
+	// ledger update, leaving the request row stuck at "dispatch_started"
+	// forever. Recover, fold it into the fixed, secret-free
+	// providerStreamPanicMessage sentinel, and return normally so
+	// Generate/Stream's ordinary error path (which calls finish()) still
+	// runs. Usage receiveModelStream already merged into the named `result`
+	// return value before the panic survives regardless (see
+	// TestLedgerRetainsPartialStateAfterReceivePanic).
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = newProviderStreamPanicError()
+			m.host.errorObservedStream(observation, err, result.usage)
+		}
+	}()
+	reader, streamErr := m.activeModel().Streamer.StreamProvider(ctx, request)
+	if streamErr != nil {
+		m.host.errorObservedStream(observation, streamErr, model.Usage{})
+		return modelStreamResult{}, streamErr
 	}
-	var result modelStreamResult
 	receiveModelStream(ctx, reader, m.host.streamLimits, &result, func(index int64, chunk *einoschema.AgenticMessage) {
 		m.host.observeStreamChunk(observation, index)
 		if onDelta != nil {
@@ -462,7 +613,16 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 			continue
 		}
 		switch block.Type {
-		case einoschema.ContentBlockTypeAssistantGenText, einoschema.ContentBlockTypeReasoning, einoschema.ContentBlockTypeFunctionToolCall:
+		// Every block kind a model may legitimately emit as its own output:
+		// generated content (text/reasoning/media) and calls it originates
+		// (function tool calls). session.contentBlockFromEino durably
+		// supports each of these as ordinary content; there is no execution
+		// wiring gap for pure-content media blocks the way there would be
+		// for a call kind this runtime does not yet dispatch (e.g. a
+		// server-side or MCP tool call), so those remain unsupported here
+		// rather than silently accepted without a dispatch path.
+		case einoschema.ContentBlockTypeAssistantGenText, einoschema.ContentBlockTypeReasoning, einoschema.ContentBlockTypeFunctionToolCall,
+			einoschema.ContentBlockTypeAssistantGenImage, einoschema.ContentBlockTypeAssistantGenAudio, einoschema.ContentBlockTypeAssistantGenVideo:
 		case einoschema.ContentBlockTypeMCPToolApprovalRequest:
 			if m.approval == nil {
 				return nil, fmt.Errorf("%w: %s", errADKUnsupportedBlock, block.Type)
@@ -487,6 +647,11 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 		// settle; that next physical dispatch's result is a new logical
 		// assistant message, not a continuation of this one.
 		m.needMessage = true
+		callIDs := make([]session.ToolCallID, len(calls))
+		for i, call := range calls {
+			callIDs[i] = session.ToolCallID(call.CallID)
+		}
+		m.engine.registerToolBatch(dispatch.messageID, callIDs)
 	}
 	preparedCalls, err := m.host.prepareToolCalls(ctx, m.execution, m.engine.snapshot, dispatch.messageID, calls)
 	if err != nil {

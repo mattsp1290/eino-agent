@@ -144,9 +144,18 @@ func assertPostgresAdmissionGraph(t *testing.T, f *postgresRuntimeFixture, sessi
 	if err != nil || len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].SessionID != sessionID {
 		t.Fatalf("epoch count=%d err=%v", len(epochs), err)
 	}
+	// A completed run now durably records its turn's admission and normal
+	// completion (session.TurnStartedEventKind/TurnCompletedEventKind)
+	// alongside the run-level start/finish pair, reflecting the durable
+	// turn model -- not just the two run-level events a pre-turn-model run
+	// used to produce.
 	events, err := f.store.ListEvents(f.ctx, sessionID, session.EventCursor{Limit: 100})
-	if err != nil || len(events.Events) != 2 || events.Events[0].Kind != EventRunStarted || events.Events[0].EpochID != epochs[0].ID || events.Events[0].MessageID != assistant.ID || events.Events[1].Kind != EventRunFinished {
-		t.Fatalf("event count=%d err=%v", len(events.Events), err)
+	if err != nil || len(events.Events) != 4 ||
+		events.Events[0].Kind != EventRunStarted || events.Events[0].EpochID != epochs[0].ID || events.Events[0].MessageID != assistant.ID ||
+		events.Events[1].Kind != session.TurnStartedEventKind || events.Events[1].TurnID == "" ||
+		events.Events[2].Kind != session.TurnCompletedEventKind || events.Events[2].TurnID != events.Events[1].TurnID ||
+		events.Events[3].Kind != EventRunFinished {
+		t.Fatalf("event count=%d err=%v events=%#v", len(events.Events), err, events.Events)
 	}
 	observation, err := f.store.ReadObservationSnapshot(f.ctx, sessionID, session.ObservationLimits{MaxMessages: 10, MaxTools: 10, MaxParts: 20, MaxSnapshotBytes: 1 << 20, MaxTextBytes: 1 << 20})
 	if err != nil || len(observation.Messages) != 2 || observation.Messages[0].Text != userText || observation.Messages[1].Text != assistantText {

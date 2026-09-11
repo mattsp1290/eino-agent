@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -12,13 +13,34 @@ import (
 )
 
 // Shared in-memory Store and fenced ExecutionStore used by runtime tests.
+// ADK's tools node dispatches every tool call declared in one assistant
+// message concurrently (compose.parallelRunToolCall), and this fixture is
+// reached from those goroutines directly (through fakeExecutionStore, which
+// embeds *admissionStore), so every exported method must be safe for
+// concurrent use -- see mu's doc comment for the locking convention used to
+// avoid deadlocking on the handful of methods that call each other.
 type admissionStore struct {
-	sessions          map[session.ID]session.Session
-	runs              map[session.RunID]session.Run
-	messages          map[session.MessageID]session.Message
-	finalized         map[session.MessageID]bool
-	parts             map[session.PartID]session.Part
-	events            map[session.EventID]session.EventRecord
+	// mu guards every field below. Exported methods lock it at entry; a
+	// method that needs another method's behavior internally (e.g.
+	// CreateToolCall persisting its RequestPart via AppendPart) calls that
+	// method's unexported *Locked sibling instead of the exported,
+	// self-locking one, to avoid a non-reentrant self-deadlock. clone() is
+	// the one exception: it never locks itself, since its only caller
+	// (WithinTx) always holds mu already.
+	mu        sync.Mutex
+	sessions  map[session.ID]session.Session
+	runs      map[session.RunID]session.Run
+	messages  map[session.MessageID]session.Message
+	finalized map[session.MessageID]bool
+	parts     map[session.PartID]session.Part
+	events    map[session.EventID]session.EventRecord
+	// eventSeq/eventOrder track each event's insertion order: events sharing
+	// an identical CreatedAt (a fixed test clock is common) would otherwise
+	// come back from ListEvents in Go's randomized map iteration order.
+	// Every write goes through putEvent, which is the only place these are
+	// mutated.
+	eventSeq          int64
+	eventOrder        map[session.EventID]int64
 	toolCalls         map[session.ToolCallID]session.ToolCall
 	epochs            map[session.EpochID]session.ContextEpoch
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
@@ -46,6 +68,7 @@ func newAdmissionStore() *admissionStore {
 		finalized:     map[session.MessageID]bool{},
 		parts:         map[session.PartID]session.Part{},
 		events:        map[session.EventID]session.EventRecord{},
+		eventOrder:    map[session.EventID]int64{},
 		toolCalls:     map[session.ToolCallID]session.ToolCall{},
 		epochs:        map[session.EpochID]session.ContextEpoch{},
 		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
@@ -63,16 +86,22 @@ type fakeCheckpointKey struct {
 }
 
 func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
+	s.mu.Lock()
 	tx := s.clone()
+	s.mu.Unlock()
 	if err := fn(ctx, tx); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.sessions = tx.sessions
 	s.runs = tx.runs
 	s.messages = tx.messages
 	s.finalized = tx.finalized
 	s.parts = tx.parts
 	s.events = tx.events
+	s.eventSeq = tx.eventSeq
+	s.eventOrder = tx.eventOrder
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
@@ -82,6 +111,8 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	return nil
 }
 
+// clone must only be called with s.mu already held (WithinTx is the only
+// caller); it never locks itself.
 func (s *admissionStore) clone() *admissionStore {
 	return &admissionStore{
 		sessions:          cloneMap(s.sessions),
@@ -90,6 +121,8 @@ func (s *admissionStore) clone() *admissionStore {
 		finalized:         cloneMap(s.finalized),
 		parts:             cloneMap(s.parts),
 		events:            cloneMap(s.events),
+		eventSeq:          s.eventSeq,
+		eventOrder:        cloneMap(s.eventOrder),
 		toolCalls:         cloneMap(s.toolCalls),
 		epochs:            cloneMap(s.epochs),
 		modelRequests:     cloneMap(s.modelRequests),
@@ -109,6 +142,8 @@ func (s *admissionStore) clone() *admissionStore {
 }
 
 func (s *admissionStore) CreateSession(_ context.Context, record session.Session) (session.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if existing, ok := s.sessions[record.ID]; ok {
 		if existing.Title != record.Title || existing.Directory != record.Directory {
 			return session.Session{}, session.ErrConflict
@@ -120,6 +155,8 @@ func (s *admissionStore) CreateSession(_ context.Context, record session.Session
 }
 
 func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	record, ok := s.sessions[id]
 	if !ok {
 		return session.Session{}, session.ErrNotFound
@@ -130,6 +167,13 @@ func (s *admissionStore) GetSession(_ context.Context, id session.ID) (session.S
 func (s *admissionStore) UpdateSession(context.Context, session.Session) error { return nil }
 
 func (s *admissionStore) SetSessionTitle(ctx context.Context, request session.SessionTitleRequest) (session.SessionTitleResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.setSessionTitleLocked(ctx, request)
+}
+
+// setSessionTitleLocked is SetSessionTitle's body; callers must hold s.mu.
+func (s *admissionStore) setSessionTitleLocked(ctx context.Context, request session.SessionTitleRequest) (session.SessionTitleResult, error) {
 	if err := ctx.Err(); err != nil {
 		return session.SessionTitleResult{}, err
 	}
@@ -153,6 +197,8 @@ func (s *admissionStore) SetSessionTitle(ctx context.Context, request session.Se
 }
 
 func (s *admissionStore) AdmitRun(_ context.Context, run session.Run, leaseDuration time.Duration) (session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.runs[run.ID]; ok {
 		return session.Run{}, session.ErrConflict
 	}
@@ -167,6 +213,8 @@ func (s *admissionStore) AdmitRun(_ context.Context, run session.Run, leaseDurat
 }
 
 func (s *admissionStore) ClaimRun(_ context.Context, claim session.RunClaim) (session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	run, ok := s.runs[claim.RunID]
 	if !ok {
 		return session.Run{}, session.ErrNotFound
@@ -187,6 +235,8 @@ func (s *admissionStore) Execution(fence session.RunFence) session.ExecutionStor
 }
 
 func (s *admissionStore) GetRun(_ context.Context, id session.RunID) (session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.getRunCalls.Add(1)
 	run, ok := s.runs[id]
 	if !ok {
@@ -196,6 +246,8 @@ func (s *admissionStore) GetRun(_ context.Context, id session.RunID) (session.Ru
 }
 
 func (s *admissionStore) ActiveRun(_ context.Context, sessionID session.ID) (session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	for _, run := range s.runs {
 		if run.SessionID == sessionID && !run.Terminal() {
 			return run, nil
@@ -205,6 +257,8 @@ func (s *admissionStore) ActiveRun(_ context.Context, sessionID session.ID) (ses
 }
 
 func (s *admissionStore) ListUnfinishedRuns(context.Context) ([]session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var runs []session.Run
 	for _, run := range s.runs {
 		if !run.Terminal() {
@@ -218,7 +272,14 @@ func (s *admissionStore) RenewRunLease(context.Context, session.RunID, string, t
 	return nil
 }
 
-func (s *admissionStore) FinishRun(_ context.Context, run session.Run) error {
+func (s *admissionStore) FinishRun(ctx context.Context, run session.Run) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.finishRunLocked(ctx, run)
+}
+
+// finishRunLocked is FinishRun's body; callers must hold s.mu.
+func (s *admissionStore) finishRunLocked(_ context.Context, run session.Run) error {
 	if _, ok := s.runs[run.ID]; !ok {
 		return session.ErrNotFound
 	}
@@ -226,7 +287,14 @@ func (s *admissionStore) FinishRun(_ context.Context, run session.Run) error {
 	return nil
 }
 
-func (s *admissionStore) AppendMessage(_ context.Context, message session.Message) (session.Message, error) {
+func (s *admissionStore) AppendMessage(ctx context.Context, message session.Message) (session.Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendMessageLocked(ctx, message)
+}
+
+// appendMessageLocked is AppendMessage's body; callers must hold s.mu.
+func (s *admissionStore) appendMessageLocked(_ context.Context, message session.Message) (session.Message, error) {
 	if existing, ok := s.messages[message.ID]; ok {
 		if existing.Role != message.Role {
 			return session.Message{}, session.ErrConflict
@@ -237,7 +305,14 @@ func (s *admissionStore) AppendMessage(_ context.Context, message session.Messag
 	return message, nil
 }
 
-func (s *admissionStore) AppendPart(_ context.Context, part session.Part) (session.Part, error) {
+func (s *admissionStore) AppendPart(ctx context.Context, part session.Part) (session.Part, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendPartLocked(ctx, part)
+}
+
+// appendPartLocked is AppendPart's body; callers must hold s.mu.
+func (s *admissionStore) appendPartLocked(_ context.Context, part session.Part) (session.Part, error) {
 	s.appendPartCalls++
 	if s.appendPartErrAt > 0 && s.appendPartCalls == s.appendPartErrAt {
 		return session.Part{}, errors.New("injected append part failure")
@@ -253,6 +328,8 @@ func (s *admissionStore) AppendPart(_ context.Context, part session.Part) (sessi
 }
 
 func (s *admissionStore) UpdatePart(_ context.Context, part session.Part) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.parts[part.ID]; !ok {
 		return session.ErrNotFound
 	}
@@ -261,6 +338,8 @@ func (s *admissionStore) UpdatePart(_ context.Context, part session.Part) error 
 }
 
 func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _ session.ReplayCursor) (session.ReplayBatch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.listMessagesCalls.Add(1)
 	if s.listMessagesHook != nil {
 		s.listMessagesHook(s, sessionID)
@@ -292,7 +371,14 @@ func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _
 	return session.ReplayBatch{Messages: messages, Parts: parts}, nil
 }
 
-func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecord) (session.EventRecord, error) {
+func (s *admissionStore) AppendEvent(ctx context.Context, event session.EventRecord) (session.EventRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendEventLocked(ctx, event)
+}
+
+// appendEventLocked is AppendEvent's body; callers must hold s.mu.
+func (s *admissionStore) appendEventLocked(_ context.Context, event session.EventRecord) (session.EventRecord, error) {
 	if s.appendEventErr != nil {
 		return session.EventRecord{}, s.appendEventErr
 	}
@@ -308,7 +394,7 @@ func (s *admissionStore) AppendEvent(_ context.Context, event session.EventRecor
 		}
 		return existing, nil
 	}
-	s.events[event.ID] = event
+	s.putEvent(event)
 	return event, nil
 }
 
@@ -320,17 +406,43 @@ func cloneMap[K comparable, V any](src map[K]V) map[K]V {
 	return dst
 }
 
+// putEvent is the only place s.events is ever written; callers must hold
+// s.mu. It records each event's insertion order in eventOrder so ListEvents
+// can return a deterministic sequence even when several events share an
+// identical CreatedAt (a fixed test clock is common) -- Go's map iteration
+// order is randomized and cannot be relied on for that.
+func (s *admissionStore) putEvent(event session.EventRecord) {
+	if s.eventOrder == nil {
+		s.eventOrder = map[session.EventID]int64{}
+	}
+	if _, exists := s.events[event.ID]; !exists {
+		s.eventSeq++
+		s.eventOrder[event.ID] = s.eventSeq
+	}
+	s.events[event.ID] = event
+}
+
 func (s *admissionStore) ListEvents(_ context.Context, sessionID session.ID, _ session.EventCursor) (session.EventBatch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var events []session.EventRecord
 	for _, event := range s.events {
 		if event.SessionID == sessionID {
 			events = append(events, event)
 		}
 	}
+	sort.SliceStable(events, func(i, j int) bool { return s.eventOrder[events[i].ID] < s.eventOrder[events[j].ID] })
 	return session.EventBatch{Events: events}, nil
 }
 
-func (s *admissionStore) CreateToolCall(_ context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
+func (s *admissionStore) CreateToolCall(ctx context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.createToolCallLocked(ctx, request)
+}
+
+// createToolCallLocked is CreateToolCall's body; callers must hold s.mu.
+func (s *admissionStore) createToolCallLocked(_ context.Context, request session.CreateToolCallRequest) (session.ToolTransitionResult, error) {
 	s.createToolCalls++
 	if s.createToolErrAt > 0 && s.createToolCalls == s.createToolErrAt {
 		return session.ToolTransitionResult{}, errors.New("injected create tool failure")
@@ -352,14 +464,16 @@ func (s *admissionStore) CreateToolCall(_ context.Context, request session.Creat
 	if request.RequestPart.ID == "" || request.RequestPart.ID != call.RequestPartID || request.RequestPart.Kind != session.PartFunctionToolCall {
 		return session.ToolTransitionResult{}, session.ErrConflict
 	}
-	if _, err := s.AppendPart(context.Background(), request.RequestPart); err != nil {
+	if _, err := s.appendPartLocked(context.Background(), request.RequestPart); err != nil {
 		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
-	s.events[event.ID] = event
+	s.putEvent(event)
 	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
 func (s *admissionStore) GetToolCall(_ context.Context, id session.ToolCallID) (session.ToolCall, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	call, ok := s.toolCalls[id]
 	if !ok {
 		return session.ToolCall{}, session.ErrNotFound
@@ -367,6 +481,8 @@ func (s *admissionStore) GetToolCall(_ context.Context, id session.ToolCallID) (
 	return call, nil
 }
 func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID session.RunID) ([]session.ToolCall, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var calls []session.ToolCall
 	for _, call := range s.toolCalls {
 		if call.RunID == runID && !session.TerminalToolCall(call.Status) {
@@ -375,7 +491,14 @@ func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID sessio
 	}
 	return calls, nil
 }
-func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
+func (s *admissionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.claimToolCallLocked(ctx, request)
+}
+
+// claimToolCallLocked is ClaimToolCall's body; callers must hold s.mu.
+func (s *admissionStore) claimToolCallLocked(_ context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
 	if s.toolTransitionErr != nil {
 		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
@@ -392,10 +515,12 @@ func (s *admissionStore) ClaimToolCall(_ context.Context, request session.ClaimT
 		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
-	s.events[event.ID] = event
+	s.putEvent(event)
 	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
 func (s *admissionStore) SettleToolCall(_ context.Context, request session.SettleToolCallRequest) (session.ToolTransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.toolTransitionErr != nil {
 		return session.ToolTransitionResult{}, s.toolTransitionErr
 	}
@@ -418,10 +543,12 @@ func (s *admissionStore) SettleToolCall(_ context.Context, request session.Settl
 	s.toolCalls[terminal.ID] = terminal
 	s.messages[settlement.ResultMessage.ID] = settlement.ResultMessage
 	s.parts[settlement.ResultPart.ID] = settlement.ResultPart
-	s.events[event.ID] = event
+	s.putEvent(event)
 	return session.ToolTransitionResult{Call: terminal, Event: event}, nil
 }
 func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.ContextEpoch) (session.ContextEpoch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if existing, ok := s.epochs[epoch.ID]; ok {
 		if sameEpoch(existing, epoch) {
 			return existing, nil
@@ -432,6 +559,8 @@ func (s *admissionStore) StartContextEpoch(_ context.Context, epoch session.Cont
 	return epoch, nil
 }
 func (s *admissionStore) FinishContextEpoch(_ context.Context, epoch session.ContextEpoch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if _, ok := s.epochs[epoch.ID]; !ok {
 		return session.ErrNotFound
 	}
@@ -439,6 +568,8 @@ func (s *admissionStore) FinishContextEpoch(_ context.Context, epoch session.Con
 	return nil
 }
 func (s *admissionStore) ListContextEpochs(_ context.Context, sessionID session.ID) ([]session.ContextEpoch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var epochs []session.ContextEpoch
 	for _, epoch := range s.epochs {
 		if epoch.SessionID == sessionID {
@@ -472,16 +603,22 @@ type fakeExecutionStore struct {
 }
 
 func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Context, session.ExecutionStore) error) error {
+	s.mu.Lock()
 	tx := s.clone()
+	s.mu.Unlock()
 	if err := fn(ctx, &fakeExecutionStore{admissionStore: tx, fence: s.fence}); err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.sessions = tx.sessions
 	s.runs = tx.runs
 	s.messages = tx.messages
 	s.finalized = tx.finalized
 	s.parts = tx.parts
 	s.events = tx.events
+	s.eventSeq = tx.eventSeq
+	s.eventOrder = tx.eventOrder
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
@@ -497,13 +634,17 @@ func (s *fakeExecutionStore) valid() bool {
 }
 
 func (s *fakeExecutionStore) SetSessionTitle(ctx context.Context, request session.SessionTitleRequest) (session.SessionTitleResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() || s.runs[s.fence.RunID].SessionID != request.SessionID {
 		return session.SessionTitleResult{}, session.ErrConflict
 	}
-	return s.admissionStore.SetSessionTitle(ctx, request)
+	return s.setSessionTitleLocked(ctx, request)
 }
 
 func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.Run{}, session.ErrConflict
 	}
@@ -515,6 +656,8 @@ func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (s
 }
 
 func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Duration) (session.Run, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.Run{}, session.ErrConflict
 	}
@@ -525,6 +668,8 @@ func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Dura
 }
 
 func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.SettleRunRequest) (session.RunSettlementResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.RunSettlementResult{}, session.ErrConflict
 	}
@@ -541,18 +686,20 @@ func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.Sett
 	if err != nil {
 		return session.RunSettlementResult{}, err
 	}
-	if err := s.FinishRun(ctx, run); err != nil {
+	if err := s.finishRunLocked(ctx, run); err != nil {
 		return session.RunSettlementResult{}, err
 	}
-	record, err := s.AppendEvent(ctx, event)
+	record, err := s.appendEventLocked(ctx, event)
 	return session.RunSettlementResult{Run: run, Event: record}, err
 }
 
 func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.ToolTransitionResult{}, session.ErrConflict
 	}
-	claimed, err := s.admissionStore.ClaimToolCall(ctx, request)
+	claimed, err := s.claimToolCallLocked(ctx, request)
 	if err != nil {
 		return session.ToolTransitionResult{}, err
 	}
@@ -562,6 +709,8 @@ func (s *fakeExecutionStore) ClaimToolCall(ctx context.Context, request session.
 }
 
 func (s *fakeExecutionStore) CreateModelRequest(_ context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() || record.ID == "" || record.RunID != s.fence.RunID || record.State != session.ModelRequestPrepared {
 		return session.ModelRequestRecord{}, session.ErrConflict
 	}
@@ -580,6 +729,8 @@ func (s *fakeExecutionStore) CreateModelRequest(_ context.Context, record sessio
 }
 
 func (s *fakeExecutionStore) UpdateModelRequest(_ context.Context, record session.ModelRequestRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() || record.RunID != s.fence.RunID {
 		return session.ErrConflict
 	}
@@ -608,6 +759,8 @@ func (s *fakeExecutionStore) UpdateModelRequest(_ context.Context, record sessio
 }
 
 func (s *admissionStore) GetModelRequest(_ context.Context, id session.ModelRequestID) (session.ModelRequestRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	record, ok := s.modelRequests[id]
 	if !ok {
 		return session.ModelRequestRecord{}, session.ErrNotFound
@@ -616,6 +769,8 @@ func (s *admissionStore) GetModelRequest(_ context.Context, id session.ModelRequ
 }
 
 func (s *admissionStore) ListModelRequests(_ context.Context, runID session.RunID, cursor session.ModelRequestCursor) (session.ModelRequestBatch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	limit := cursor.Limit
 	if limit <= 0 {
 		limit = 100
@@ -656,6 +811,8 @@ func (s *admissionStore) ListModelRequests(_ context.Context, runID session.RunI
 var _ session.ExecutionStore = (*fakeExecutionStore)(nil)
 
 func (s *fakeExecutionStore) FinalizeAssistantMessage(_ context.Context, id session.MessageID) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	m, ok := s.messages[id]
 	if !ok || !s.valid() || m.RunID != s.fence.RunID || m.SessionID != s.runs[s.fence.RunID].SessionID || m.Role != session.RoleAssistant {
 		return session.ErrConflict
@@ -667,6 +824,8 @@ func (s *fakeExecutionStore) FinalizeAssistantMessage(_ context.Context, id sess
 // --- W5 durable additions: minimal in-memory fakes ---
 
 func (s *admissionStore) EnqueueInbox(_ context.Context, item session.InboxItem, limits session.ContentLimits) (session.InboxItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := session.ValidateEnqueueInbox(item, limits); err != nil {
 		return session.InboxItem{}, err
 	}
@@ -683,6 +842,8 @@ func (s *admissionStore) EnqueueInbox(_ context.Context, item session.InboxItem,
 }
 
 func (s *admissionStore) ListInbox(_ context.Context, sessionID session.ID, states []session.InboxState) ([]session.InboxItem, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	allow := map[session.InboxState]bool{}
 	for _, state := range states {
 		allow[state] = true
@@ -702,6 +863,8 @@ func (s *admissionStore) ListInbox(_ context.Context, sessionID session.ID, stat
 }
 
 func (s *admissionStore) GetTurn(_ context.Context, id session.TurnID) (session.Turn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	turn, ok := s.turns[id]
 	if !ok {
 		return session.Turn{}, session.ErrNotFound
@@ -710,6 +873,8 @@ func (s *admissionStore) GetTurn(_ context.Context, id session.TurnID) (session.
 }
 
 func (s *admissionStore) ListTurns(_ context.Context, runID session.RunID) ([]session.Turn, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var out []session.Turn
 	for _, turn := range s.turns {
 		if turn.RunID == runID {
@@ -721,6 +886,8 @@ func (s *admissionStore) ListTurns(_ context.Context, runID session.RunID) ([]se
 }
 
 func (s *admissionStore) ReadPromotedCheckpoint(_ context.Context, runID session.RunID) (session.Checkpoint, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var best session.Checkpoint
 	found := false
 	for key, checkpoint := range s.checkpoints {
@@ -732,6 +899,8 @@ func (s *admissionStore) ReadPromotedCheckpoint(_ context.Context, runID session
 }
 
 func (s *admissionStore) RetireRunCheckpoints(_ context.Context, runID session.RunID, upToRevision int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	run, ok := s.runs[runID]
 	if !ok || !run.Terminal() {
 		return session.ErrConflict
@@ -745,6 +914,8 @@ func (s *admissionStore) RetireRunCheckpoints(_ context.Context, runID session.R
 }
 
 func (s *fakeExecutionStore) AdmitTurn(ctx context.Context, request session.AdmitTurnRequest) (session.AdmitTurnResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.AdmitTurnResult{}, session.ErrConflict
 	}
@@ -752,17 +923,17 @@ func (s *fakeExecutionStore) AdmitTurn(ctx context.Context, request session.Admi
 		return session.AdmitTurnResult{}, err
 	}
 	for _, message := range request.UserMessages {
-		if _, err := s.AppendMessage(ctx, message); err != nil {
+		if _, err := s.appendMessageLocked(ctx, message); err != nil {
 			return session.AdmitTurnResult{}, err
 		}
 	}
 	for _, part := range request.UserParts {
-		if _, err := s.AppendPart(ctx, part); err != nil {
+		if _, err := s.appendPartLocked(ctx, part); err != nil {
 			return session.AdmitTurnResult{}, err
 		}
 	}
 	if request.AssistantPlaceholder.ID != "" {
-		if _, err := s.AppendMessage(ctx, request.AssistantPlaceholder); err != nil {
+		if _, err := s.appendMessageLocked(ctx, request.AssistantPlaceholder); err != nil {
 			return session.AdmitTurnResult{}, err
 		}
 	}
@@ -785,11 +956,13 @@ func (s *fakeExecutionStore) AdmitTurn(ctx context.Context, request session.Admi
 		item.TurnID = request.Turn.ID
 		s.inbox[id] = item
 	}
-	s.events[request.Event.ID] = request.Event
+	s.putEvent(request.Event)
 	return session.AdmitTurnResult{Turn: request.Turn, Event: request.Event}, nil
 }
 
 func (s *fakeExecutionStore) CompleteTurn(_ context.Context, request session.CompleteTurnRequest) (session.CompleteTurnResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.CompleteTurnResult{}, session.ErrConflict
 	}
@@ -808,11 +981,13 @@ func (s *fakeExecutionStore) CompleteTurn(_ context.Context, request session.Com
 			s.inbox[id] = item
 		}
 	}
-	s.events[request.Event.ID] = request.Event
+	s.putEvent(request.Event)
 	return session.CompleteTurnResult{Turn: candidate, Event: request.Event}, nil
 }
 
 func (s *fakeExecutionStore) InterruptTurn(_ context.Context, request session.InterruptTurnRequest) (session.InterruptTurnResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.InterruptTurnResult{}, session.ErrConflict
 	}
@@ -831,11 +1006,13 @@ func (s *fakeExecutionStore) InterruptTurn(_ context.Context, request session.In
 			s.inbox[id] = item
 		}
 	}
-	s.events[request.Event.ID] = request.Event
+	s.putEvent(request.Event)
 	return session.InterruptTurnResult{Turn: candidate, Event: request.Event}, nil
 }
 
 func (s *fakeExecutionStore) StageCheckpoint(_ context.Context, request session.StageCheckpointRequest) (session.Checkpoint, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.Checkpoint{}, session.ErrConflict
 	}
@@ -854,6 +1031,8 @@ func (s *fakeExecutionStore) StageCheckpoint(_ context.Context, request session.
 }
 
 func (s *fakeExecutionStore) PromotePause(_ context.Context, request session.PromotePauseRequest) (session.PromotePauseResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.PromotePauseResult{}, session.ErrConflict
 	}
@@ -888,11 +1067,13 @@ func (s *fakeExecutionStore) PromotePause(_ context.Context, request session.Pro
 	run.Status = session.RunPaused
 	run.LeaseUntil = time.Time{}
 	s.runs[run.ID] = run
-	s.events[request.Event.ID] = request.Event
+	s.putEvent(request.Event)
 	return session.PromotePauseResult{Run: run, Turn: interruptedTurn, Checkpoint: checkpoint, Event: request.Event}, nil
 }
 
 func (s *fakeExecutionStore) RetireCheckpoints(_ context.Context, upToRevision int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.valid() {
 		return session.ErrConflict
 	}

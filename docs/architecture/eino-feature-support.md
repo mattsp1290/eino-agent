@@ -416,7 +416,14 @@ Status: landed; W1 scaffolding kept green.
 
 ## W5: typed ADK runtime, checkpoints and turn control
 
-Status: phase 1 landed, partially verified; known gaps below are not yet closed.
+Status: phase 1 (single execution engine, checkpoints, turn control) and
+phase 2 (retry/failover invocation semantics, durable model-boundary
+projection, the concurrent tool-settlement-vs-run-finalization race) landed
+and verified per the gate list below. Known gaps below are not yet closed:
+approval is not proven against a real `TypedChatModelAgent`, tool search and
+enhanced tool results are not byte-for-byte parity with the classic engine,
+and the full acceptance-test matrix (multi-turn restart, concurrent-resume,
+checkpoint-failure-mode coverage) has not been written.
 
 - Single execution engine: `runtime/adk_model.go` (`adkModel`), `runtime/adk_execution.go`
   (`adkEngine`, `adkTool`, `adkToolSearch`, `AgentFactory`/`AgentBuildContext`,
@@ -513,16 +520,36 @@ Status: phase 1 landed, partially verified; known gaps below are not yet closed.
   true per-dispatch `InvocationID` (via `runtime.modelRequestIdentity`),
   replacing the prior `run:message:attempt:step` composite. `Attempt`/`Step`
   remain informational.
-- Retry: `runtime.defaultRetryConfig` (`runtime/adk_retry.go`) maps the
-  legacy `WithAttempts`/`attemptsValue` total-attempt count onto
-  `adk.TypedModelRetryConfig`, with `ShouldRetry` refusing any error matched
-  by `compose.IsInterruptRerunError` (upstream's retry/failover wrappers only
+- Retry and failover: `runtime.defaultRetryConfig` (`runtime/adk_retry.go`)
+  maps the legacy `WithAttempts`/`attemptsValue` total-attempt count onto
+  `adk.TypedModelRetryConfig`. `runtime.FailoverPolicy` (`RunPlanSpec.Failover`,
+  like `Agent`/`ToolSearch` deliberately excluded from the sealed
+  fingerprint) maps an ordered list of alternate `model.Selection`s onto
+  `adk.ModelFailoverConfig`; `buildFailoverConfig`'s `GetFailoverModel`
+  resolves each failover target through the same `model.Resolver` every
+  primary dispatch uses (never a cached/pinned client) and dispatches it
+  through a fresh `*adkModel` sharing the turn's engine/execution/approval
+  binding, so a failover attempt is its own audited ledger row exactly like
+  a retry attempt. `ShouldRetry`/`ShouldFailover` both refuse an error
+  matched by `compose.IsInterruptRerunError` (upstream's wrappers only
   recognize graph-level interrupts; retrying over one would join a new
-  attempt onto already-durable paused state). Each retry attempt is its own
-  `adkModel` dispatch with its own ledger row/InvocationID, matching the
-  plan's "every attempt is its own invocation ledger row" requirement.
-  **Not implemented**: `FailoverPolicy`/`ModelFailoverConfig` wiring, and the
-  `attempt_replaced` event are not built in this phase.
+  attempt onto already-durable paused state), an error wrapping
+  `errCommittedDispatchFailed` (this dispatch's assistant message/tool calls
+  were already durably persisted -- retrying past that point has no durable
+  slot left to commit a second physical result against), and an error
+  wrapping `errPartialStreamObserved` (the provider stream had already
+  delivered at least one chunk -- `modelStreamResult.receivedDelta` -- before
+  failing, so usage was already charged and, for `Stream`, live text may
+  already be visible to a watcher; retrying would double-count usage or show
+  a second response spliced after a partial one). Each attempt is its own
+  `adkModel` dispatch with its own ledger row/InvocationID (`Attempt` is
+  pinned to 1 and purely informational; the engine-wide `Step` counter is
+  what actually advances per physical dispatch), matching the plan's "every
+  attempt is its own invocation ledger row" requirement. `adkModel.begin`
+  emits the durable `session.AttemptReplacedEventKind` event (old/new
+  invocation IDs) and an observability `Retry` event
+  (`StreamingOrchestrator.observeRetry`) whenever it supersedes a
+  `recordFailedAttempt`-marked prior attempt.
 - Native MCP approval: `adkApprovalBinding` recognizes a completed
   `schema.MCPToolApprovalRequest` result at the model boundary before ADK's
   ReAct loop can schedule sibling function calls. Unlike the W1 proof (which
@@ -592,21 +619,83 @@ Status: phase 1 landed, partially verified; known gaps below are not yet closed.
   tool-only resume entry point, unchanged from W1-era behavior for a
   `RunInterrupted` run with no checkpoint) now delegates to `ResumeRun` when
   the run is durably `session.RunPaused`.
+- Two engine-ordering races were root-caused and fixed rather than papered
+  over. (1) Concurrent tool-call settlement vs. run finalization: ADK's
+  tools node dispatches every call declared in one assistant message
+  concurrently with no cancellation on a sibling's failure/interruption
+  (`compose.parallelRunToolCall`), and `WithImmediate()` stop tears an agent
+  turn down "without waiting for any safe point" -- an interrupted or
+  panicking tool call's own settlement write (synchronous inside
+  `adkTool.InvokableRun`, in ADK's own tool-node goroutine) could still be
+  landing when `finishTurnLoop` tried to `SettleRun`, which refuses to
+  settle a run with any non-terminal tool call. Fixed with
+  `settleRunRetrying` (bounded retry on `session.ErrConflict` specifically)
+  at every `finishTurnLoop` settlement call site, plus
+  `adkEngine.registerToolBatch`/`awaitToolTurn`/`settleToolTurn`, which
+  serialize sibling tool calls within one assistant message into their
+  declared order and stop every not-yet-started sibling (settled
+  `ToolCallInterrupted`, matching the resume path's
+  `terminalizeUnfinishedTools`/`interruptPendingTool` treatment) once an
+  earlier one fatally panics or is canceled -- restoring an invariant the
+  live path had silently lost relative to resume. (2) `Handle.Interrupt`
+  racing the driving goroutine's own startup: canceling the run's context
+  before `TurnLoop.Run` ever dispatches anything left ADK with nothing "in
+  flight" to report as interrupted, so it could exit with `ExitReason ==
+  nil` (an ordinary empty completion) instead -- `finishTurnLoop`'s default
+  branch now cross-checks `ctx.Err()` directly rather than trusting
+  `ExitReason` alone, and `runFreshTurnLoop` has an equivalent upfront check
+  for the narrower race window before a lease is even taken.
+- Model-boundary durable projection: `adkModel.durableProjection` replaces
+  ADK's in-memory transcript with the durable projection of this run's
+  committed history (`loadProviderHistory`/`history.ProjectAgentic` of prior
+  turns, spliced with this turn's own already-committed assistant/tool
+  messages past `adkEngine.baseMessageCount`, preserving ephemeral
+  extension-injected context that a durable reload can never see) before
+  every physical dispatch, failing closed
+  (`errADKProjectionDiverged`) if the set of tool-call IDs ADK's own input
+  carries disagrees with the durable projection's. This closes the
+  `tool_search_result`/enhanced-tool-result *model-input* shape gap noted
+  above for what the model itself receives on replay/resume; the two
+  documented gaps above are specifically about what ADK's tools node can
+  represent as a *tool result* going the other direction (durable persistence
+  is unaffected either way).
 - Verification actually run for this phase: `go build ./...`, `go vet ./...`,
-  `go vet -tags postgres_integration ./...`, `gofmt`/`goimports` and
-  `./.bin/golangci-lint run ./runtime/... ./transport/...` (0 issues) all
-  pass. `go test ./...` passes for every package except `runtime`, which has
-  22 known, categorized failures (retry-detail/panic-classification ledger
-  assertions written against the classic engine's exact step semantics;
-  tool-search content-kind and enhanced-tool-result gaps above; a few
-  observability-detail mismatches) -- see the follow-up beads/PR description
-  for the full list. `go test ./runtime -race` found and fixed two real races
-  during development (documented above); at least one further race pattern
-  (concurrent tool-call settlement vs. run finalization, reproduced only
-  against the in-memory test fixture store, not the SQLite-backed suite) was
-  found but not resolved before this phase's time budget ran out.
-  `make check` and the PostgreSQL-backed required-suite gate
-  (`make postgres-test`) were **not run** in this phase.
-- Out of scope, not started: `FailoverPolicy`, the `attempt_replaced` event,
-  child agents (typed `AgentTool`/`DeepAgent`), removing the superseded
-  classic `PartKind`s, W6/W7.
+  `go vet -tags postgres_integration ./...`, `gofmt`/`goimports`, and
+  `./.bin/golangci-lint run ./...` (repo-wide, 0 issues) all pass.
+  `go test ./...` passes for every package, `runtime` included (0 known
+  failures). `go test ./runtime -race -count=3` and several additional full
+  `-race` passes (including the two fixture/timing-sensitive tests singled
+  out above, stress-tested individually at `-count=30`-`50`) are clean.
+  `make check` passes (`fmt-check vet test race mod-tidy-check lint
+  windows-compile wit-check`) with one known exception:
+  `external-consumer-check`'s `TestPublicSessionWatchConstructionExecutionAndReopen`
+  times out waiting for its blocking `EventSink` to observe a first event;
+  confirmed via `git stash` against the commit before this phase's work that
+  this failure predates it and is not a regression introduced here -- left
+  open as a genuine, unresolved gap (root cause not yet found: whether the
+  extension-notification worker goroutine that drains a run's persisted
+  events into the configured `EventSink` is starting/draining correctly in
+  this specific external-module harness needs its own investigation).
+  `TESTCONTAINERS_RYUK_DISABLED=true GOMAXPROCS=2 GOFLAGS='-p=1' make
+  postgres-test` and `make postgres-race` both pass ("required suites
+  passed; zero skips"); `TestPostgresRuntime/admission`
+  (`runtime/postgres_admission_integration_test.go`) needed its event-count
+  assertion updated from 2 to 4 events in sequence (`run_started`,
+  `turn_started`, `turn_completed`, `run_finished`) to match the durable
+  turn model a completed run now legitimately records -- also confirmed via
+  `git stash` to be a pre-existing staleness in the test, not a new gap.
+  `POSTGRES_REQUIRED_SUITES` (`Makefile`) already lists the turn/inbox/
+  checkpoint/paused-run store contract suites
+  (`store/contract/{turns,inbox,checkpoints,paused_runs}`); no further
+  suites needed adding.
+- Out of scope, not started: production approval-proof tests against a real
+  `adk.NewTypedChatModelAgent` (generate/stream, approve/deny, reopen from a
+  promoted checkpoint, mixed function-call+approval pausing -- see the
+  approval bullet above), the broader acceptance-test matrix (multi-turn
+  restart with reconstructed history, new-input-racing-idle-settlement,
+  injected `AdmitTurn`/`CompleteTurn` write failures, stop-mode/timeout/
+  recursive-cancel/preempt/idle-exit coverage, duplicate enqueue,
+  checkpoint-failure-mode coverage, stale fence, malformed envelope, version
+  mismatch, unsupported gob state, concurrent-resume-yields-one-owner,
+  unsafe-tool-never-rerun), child agents (typed `AgentTool`/`DeepAgent`),
+  removing the superseded classic `PartKind`s, W6/W7.

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudwego/eino/adk"
 	einoschema "github.com/cloudwego/eino/schema"
 	einoobs "github.com/mattsp1290/eino-obs"
 
@@ -184,6 +185,26 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 func (o *StreamingOrchestrator) runFreshTurnLoop(ctx context.Context, execution *runExecution, entry *liveLoop, checkpoints *adkCheckpointStore, admitted admittedRun, handle *turnLoopHandle) {
 	coordinator := entry.coordinator
 	defer execution.release()
+	// Handle.Interrupt cancels this run's context (and issues an
+	// entry.loop.Stop) the instant it is called, unconditionally, so that it
+	// wins even when it races ahead of this goroutine's own startup --
+	// see turnLoopHandle.Interrupt's doc comment. But TurnLoop.Run(ctx),
+	// given an already-canceled ctx before it ever dispatches anything, has
+	// nothing "in flight" to interrupt and exits with ExitReason == nil
+	// (ordinary empty completion), not an interrupt/cancel error -- which
+	// finishTurnLoop's default branch would otherwise settle as a spurious
+	// RunCompleted with no assistant output. Catch that race here, before
+	// ever handing off to ADK, and settle interrupted directly.
+	if err := ctx.Err(); err != nil {
+		result := Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID, Status: statusForError(err), Interrupted: errors.Is(err, context.Canceled), Error: err}
+		o.observeError(context.WithoutCancel(ctx), admitted.Snapshot, admitted.AssistantMessage.ID, "provider_stream", err)
+		o.settleFreshFailure(ctx, execution, result)
+		o.unregisterLoop(admitted.Run.ID)
+		handle.done <- result
+		close(handle.done)
+		close(handle.pause)
+		return
+	}
 	runCtx := execution.startLease(ctx, o.lease())
 	{
 		decision, err := extension.EvaluateGate(execution.dispatch(), runCtx, RunBeforeExecutePoint, RunGateInput{
@@ -233,8 +254,9 @@ func (o *StreamingOrchestrator) runFreshTurnLoop(ctx context.Context, execution 
 	coordinator.mu.Lock()
 	coordinator.firstTurnEngine = &adkEngine{host: o, execution: execution, plan: coordinator.plan, snapshot: snapshot, turn: admitted.Turn, assistantMessageID: admitted.AssistantMessage.ID, historyOptions: coordinator.historyOptions, baseMessageCount: baseMessageCount}
 	coordinator.mu.Unlock()
-	result := o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause)
-	o.finishObservedRun(observed, result, o.now())
+	o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause, func(result Result) {
+		o.finishObservedRun(observed, result, o.now())
+	})
 }
 
 // settleFreshFailure settles a run that failed before its TurnLoop ever
@@ -624,9 +646,26 @@ func (o *StreamingOrchestrator) lease() time.Duration {
 	return o.leaseValue
 }
 
+// unwrapRetryExhausted returns err's original per-attempt cause when err is
+// (or wraps, e.g. inside ADK's compose.internalError node-path envelope) an
+// *adk.RetryExhaustedError. That type's own Unwrap() deliberately returns
+// the fixed adk.ErrExceedMaxRetries sentinel, not LastErr, so a standard
+// errors.Is/errors.As walk down a retry-exhausted terminal error never
+// reaches the original provider error (e.g. a model.Error carrying a
+// provider error code) -- callers that need to classify/report on the
+// underlying cause (not just "retries were exhausted") must unwrap here
+// first. Returns err unchanged when it is not a RetryExhaustedError.
+func unwrapRetryExhausted(err error) error {
+	var exhausted *adk.RetryExhaustedError
+	if errors.As(err, &exhausted) && exhausted.LastErr != nil {
+		return exhausted.LastErr
+	}
+	return err
+}
+
 func retryable(err error) bool {
 	var providerErr model.Error
-	return errors.As(err, &providerErr) && providerErr.Retryable
+	return errors.As(unwrapRetryExhausted(err), &providerErr) && providerErr.Retryable
 }
 
 func statusForError(err error) session.RunStatus {

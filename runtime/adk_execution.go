@@ -13,6 +13,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/history"
@@ -65,6 +66,15 @@ type adkEngine struct {
 	responseMu         sync.Mutex
 	responseMessageIDs []session.MessageID
 
+	// attemptMu guards lastFailedInvocation/lastFailedAttemptErr: the
+	// InvocationID and error of the most recently failed physical dispatch
+	// not yet superseded by a retry or failover attempt. adkModel.begin
+	// consumes them (emitting attempt_replaced and an observability Retry
+	// event) when the next attempt starts.
+	attemptMu            sync.Mutex
+	lastFailedInvocation string
+	lastFailedAttemptErr error
+
 	// prepareMu guards prepareErrors, the in-memory record of
 	// preparedToolCall.middlewareErr for calls this turn's model adapter
 	// prepared but has not yet handed to ADK's tools node for dispatch (see
@@ -75,6 +85,96 @@ type adkEngine struct {
 	// now owns when each pending call actually dispatches.
 	prepareMu     sync.Mutex
 	prepareErrors map[session.ToolCallID]error
+
+	// toolBatchMu guards toolBatchOrder/toolBatchDone/toolBatchAborted: the
+	// coordination state that serializes sibling tool calls declared in the
+	// same assistant message. ADK's tools node dispatches every call in a
+	// batch concurrently (compose.parallelRunToolCall), with no cancellation
+	// on a sibling's failure -- left alone, a later call whose executor
+	// happens to run fast would complete before an earlier, panicking
+	// sibling is even recovered, even though the resume path's equivalent
+	// (terminalizeUnfinishedTools/interruptPendingTool) never lets a call
+	// after a fatal one execute. registerToolBatch/awaitToolTurn/
+	// settleToolTurn (used by adkTool.InvokableRun) restore that invariant
+	// for a live turn: calls in one batch run in their declared order, and
+	// once one fatally panics every later, not-yet-started sibling is
+	// interrupted instead of executed.
+	toolBatchMu      sync.Mutex
+	toolBatchOrder   map[session.MessageID][]session.ToolCallID
+	toolBatchDone    map[session.ToolCallID]chan struct{}
+	toolBatchAborted map[session.MessageID]bool
+}
+
+// registerToolBatch records the declared call order for a freshly committed
+// assistant message's tool calls (see adkModel.commit). A single-call batch
+// needs no coordination and is not registered; awaitToolTurn treats an
+// unregistered call as ungated.
+func (e *adkEngine) registerToolBatch(messageID session.MessageID, callIDs []session.ToolCallID) {
+	if len(callIDs) < 2 {
+		return
+	}
+	e.toolBatchMu.Lock()
+	defer e.toolBatchMu.Unlock()
+	if e.toolBatchOrder == nil {
+		e.toolBatchOrder = make(map[session.MessageID][]session.ToolCallID)
+		e.toolBatchDone = make(map[session.ToolCallID]chan struct{})
+	}
+	e.toolBatchOrder[messageID] = append([]session.ToolCallID(nil), callIDs...)
+	for _, id := range callIDs {
+		e.toolBatchDone[id] = make(chan struct{})
+	}
+}
+
+// awaitToolTurn blocks callID until every earlier-declared sibling in its
+// batch (if any) has settled via settleToolTurn, then reports whether the
+// batch was aborted by an earlier fatal sibling. An unregistered call (no
+// batch, or the first call in one) returns immediately.
+func (e *adkEngine) awaitToolTurn(ctx context.Context, messageID session.MessageID, callID session.ToolCallID) (aborted bool, err error) {
+	e.toolBatchMu.Lock()
+	order := e.toolBatchOrder[messageID]
+	e.toolBatchMu.Unlock()
+	position := -1
+	for i, id := range order {
+		if id == callID {
+			position = i
+			break
+		}
+	}
+	if position > 0 {
+		e.toolBatchMu.Lock()
+		waitOn := e.toolBatchDone[order[position-1]]
+		e.toolBatchMu.Unlock()
+		if waitOn != nil {
+			select {
+			case <-waitOn:
+			case <-ctx.Done():
+				return false, ctx.Err()
+			}
+		}
+	}
+	e.toolBatchMu.Lock()
+	aborted = e.toolBatchAborted[messageID]
+	e.toolBatchMu.Unlock()
+	return aborted, nil
+}
+
+// settleToolTurn signals callID's completion, unblocking the next sibling in
+// its batch (if any), and marks the whole batch aborted when fatal is true
+// (a panicking executor) so every later, not-yet-started sibling skips
+// execution.
+func (e *adkEngine) settleToolTurn(messageID session.MessageID, callID session.ToolCallID, fatal bool) {
+	e.toolBatchMu.Lock()
+	if fatal {
+		if e.toolBatchAborted == nil {
+			e.toolBatchAborted = make(map[session.MessageID]bool)
+		}
+		e.toolBatchAborted[messageID] = true
+	}
+	done := e.toolBatchDone[callID]
+	e.toolBatchMu.Unlock()
+	if done != nil {
+		close(done)
+	}
 }
 
 func (e *adkEngine) recordPrepareError(id session.ToolCallID, err error) {
@@ -93,6 +193,27 @@ func (e *adkEngine) takePrepareError(id session.ToolCallID) error {
 	e.prepareMu.Lock()
 	defer e.prepareMu.Unlock()
 	return e.prepareErrors[id]
+}
+
+// recordFailedAttempt marks invocationID as replaceable: the next physical
+// dispatch this turn starts (a retry or failover attempt) consumes it via
+// takeFailedAttempt to emit attempt_replaced and an observability Retry
+// event carrying err's classification.
+func (e *adkEngine) recordFailedAttempt(invocationID string, err error) {
+	e.attemptMu.Lock()
+	defer e.attemptMu.Unlock()
+	e.lastFailedInvocation = invocationID
+	e.lastFailedAttemptErr = err
+}
+
+// takeFailedAttempt returns and clears the most recently failed
+// not-yet-superseded invocation (id == "" if none is pending) and its error.
+func (e *adkEngine) takeFailedAttempt() (id string, err error) {
+	e.attemptMu.Lock()
+	defer e.attemptMu.Unlock()
+	id, err = e.lastFailedInvocation, e.lastFailedAttemptErr
+	e.lastFailedInvocation, e.lastFailedAttemptErr = "", nil
+	return id, err
 }
 
 func (e *adkEngine) recordResponseMessage(id session.MessageID) {
@@ -168,6 +289,7 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 		MaxIterations: e.host.toolTurns(),
 		Guard:         newDurableGuard(durable),
 		Retry:         defaultRetryConfig(e.host.attempts()),
+		Failover:      buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
 	}
 	factory := e.plan.AgentFactory()
 	return factory.BuildAgent(ctx, build)
@@ -380,6 +502,25 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	if canonical, err := canonicalToolObject(record.Input); err != nil || string(canonical) != strings.TrimSpace(arguments) {
 		return "", fmt.Errorf("ADK arguments %q diverge from persisted canonical input for %s", arguments, callID)
 	}
+	// ADK's tools node dispatches every call declared in the same assistant
+	// message concurrently with no cancellation on a sibling's failure (see
+	// adkEngine.registerToolBatch's doc comment); wait for this call's turn
+	// in its declared batch order and, if an earlier sibling already fatally
+	// panicked, skip execution entirely and settle this call interrupted --
+	// exactly the resume path's terminalizeUnfinishedTools/
+	// interruptPendingTool treatment of an unstarted call after a fatal one.
+	aborted, err := e.awaitToolTurn(ctx, record.MessageID, callID)
+	if err != nil {
+		return "", err
+	}
+	if aborted {
+		settlement, err := e.execution.interruptPendingTool(ctx, e.snapshot, record)
+		if err != nil {
+			return "", err
+		}
+		e.settleToolTurn(record.MessageID, callID, false)
+		return string(settlement.Output), nil
+	}
 	startedAt := e.host.now()
 	claimed, err := e.execution.persistToolClaim(ctx, session.ClaimToolCallRequest{
 		ID: record.ID, ClaimedBy: e.host.ownerID(), ClaimToken: string(e.host.ids.NewEventID()), StartedAt: startedAt,
@@ -388,12 +529,36 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	if err != nil {
 		return "", err
 	}
+	extension.Notify(e.execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{
+		SessionID: e.snapshot.SessionID, RunID: e.snapshot.RunID, ToolCallID: claimed.Call.ID, ToolName: claimed.Call.Name, Time: claimed.Call.StartedAt,
+	})
 	call.ResultMessageID = claimed.Call.ResultMessageID
 	call.ResultPartID = claimed.Call.ResultPartID
 	prepareErr := e.takePrepareError(record.ID)
 	settled, err := e.execution.executeAndSettleClaimedTool(ctx, e.snapshot, t.tool, call, claimed.Call, prepareErr)
 	if err != nil {
+		e.settleToolTurn(record.MessageID, callID, false)
 		return "", err
+	}
+	// A panicking executor, or one whose own context was canceled, settles
+	// as an ordinary (non-fatal-looking) tool outcome -- see
+	// executeClaimedToolPipeline's recover and dispositionForError's
+	// context.Canceled/DeadlineExceeded mapping to ToolInterrupted -- so it
+	// is durably recorded like any other terminal tool outcome. But feeding
+	// either back to the model as an ordinary function_tool_result and
+	// letting the ReAct loop dispatch again would call the model against a
+	// turn this runtime no longer trusts (a panic's executor state is
+	// unknown; a canceled run should stop, not keep iterating -- left
+	// unchecked, a model that unconditionally re-issues the same tool call
+	// loops until MaxIterations). Fail this node instead, matching the
+	// resume path's equivalent checks (see interrupt.go's
+	// errToolExecutionPanic/context.Canceled handling), and mark this
+	// call's batch aborted so every later, not-yet-started sibling is
+	// interrupted instead of executed.
+	fatal := errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled)
+	e.settleToolTurn(record.MessageID, callID, fatal)
+	if fatal {
+		return "", settled.Outcome.RawError
 	}
 	return string(settled.Settlement.Output), nil
 }
