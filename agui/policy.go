@@ -138,13 +138,13 @@ func Rules() []Rule {
 		},
 		{
 			Family:    EventStateSnapshot,
-			Persist:   DispositionPersist,
-			Replay:    DispositionReplay,
+			Persist:   DispositionOmit,
+			Replay:    DispositionOmit,
 			LiveTail:  DispositionLive,
 			AuditKind: "state_snapshot",
 			Redaction: session.RedactionContent,
 			Gates:     []Gate{GateHostReplaySafeState},
-			Notes:     "State snapshots are durable and replayable only after host policy marks them replay-safe. No durable PartKind backs this yet -- the W2 content contract's 20 block kinds cover model-authored content, not arbitrary host-visible app state -- so persistence remains unimplemented pending a future work package.",
+			Notes:     "State snapshots are live-tail only today: no durable PartKind backs this yet -- the W2 content contract's 20 block kinds cover model-authored content, not arbitrary host-visible app state -- so persistence and replay remain unimplemented pending a future work package. Once a PartKind is added, Persist/Replay should become DispositionPersist/DispositionReplay and this rule should gain a SessionPart, still gated on host replay-safety.",
 		},
 		{
 			Family:    EventStateDelta,
@@ -175,12 +175,12 @@ func Rules() []Rule {
 		},
 		{
 			Family:    EventStep,
-			Persist:   DispositionPersist,
-			Replay:    DispositionReplay,
+			Persist:   DispositionOmit,
+			Replay:    DispositionOmit,
 			LiveTail:  DispositionLive,
 			AuditKind: "step",
 			Redaction: session.RedactionMetadata,
-			Notes:     "Step boundaries are durable for audit, replay annotations, and observability correlation. No durable PartKind backs this yet -- runtime tracks physical dispatch attempts via session.EventRecord (e.g. AttemptReplacedEventKind), not a message part -- so persistence remains unimplemented pending a future work package.",
+			Notes:     "Step boundaries are live-tail only today: Bridge.StepStarted/StepFinished are pure passthroughs to the eino-agui emitter and write no durable part or EventRecord (session.AttemptReplacedEventKind is a separate, unrelated model-dispatch-retry audit trail, not a record of AG-UI step boundaries). No durable PartKind backs step boundaries yet, so persistence, audit, and replay remain unimplemented pending a future work package.",
 		},
 		{
 			Family:    EventCustom,

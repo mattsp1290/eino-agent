@@ -36,7 +36,7 @@ func TestBoundaryProjectsSummaryWithoutRawPromptLeak(t *testing.T) {
 			message("tail", session.RoleUser, now.Add(time.Second)),
 		},
 		Parts: []session.Part{
-			part("old-part", "old", session.PartProviderState, `{"text":"SECRET raw prompt"}`, now),
+			textContentPart(t, "old-part", "old", "SECRET raw prompt", now),
 			part("old-provider-state", "old-assistant", session.PartProviderState, `{"data":"SECRET provider state"}`, now.Add(time.Nanosecond)),
 			boundary.Part,
 			textContentPart(t, "tail-part", "tail", "Continue", now.Add(time.Second)),

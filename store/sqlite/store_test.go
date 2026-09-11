@@ -502,7 +502,7 @@ func TestListMessagesDoesNotDecodePartsOutsideCurrentPage(t *testing.T) {
 		if _, err := execution.AppendMessage(ctx, session.Message{ID: id, SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: at, UpdatedAt: at}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := execution.AppendPart(ctx, session.Part{ID: session.PartID("part-" + string(id)), MessageID: id, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartProviderState, Payload: json.RawMessage(`{"text":"ok"}`), CreatedAt: at, UpdatedAt: at}); err != nil {
+		if _, err := execution.AppendPart(ctx, session.Part{ID: session.PartID("part-" + string(id)), MessageID: id, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartApprovalDecision, Payload: json.RawMessage(`{"text":"ok"}`), CreatedAt: at, UpdatedAt: at}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -543,11 +543,11 @@ func TestListMessagesOrdersNanosecondsBeforeLexicalIDs(t *testing.T) {
 	}{
 		{
 			message: session.Message{ID: "z-user", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleUser, CreatedAt: userAt, UpdatedAt: userAt},
-			part:    session.Part{ID: "z-user-part", MessageID: "z-user", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartProviderState, Payload: json.RawMessage(`{"text":"user"}`), CreatedAt: userAt, UpdatedAt: userAt},
+			part:    session.Part{ID: "z-user-part", MessageID: "z-user", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartApprovalDecision, Payload: json.RawMessage(`{"text":"user"}`), CreatedAt: userAt, UpdatedAt: userAt},
 		},
 		{
 			message: session.Message{ID: "a-assistant", SessionID: run.SessionID, RunID: run.ID, ParentID: "z-user", Role: session.RoleAssistant, CreatedAt: assistantAt, UpdatedAt: assistantAt},
-			part:    session.Part{ID: "a-assistant-part", MessageID: "a-assistant", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartProviderState, Payload: json.RawMessage(`{"text":"assistant"}`), CreatedAt: assistantAt, UpdatedAt: assistantAt},
+			part:    session.Part{ID: "a-assistant-part", MessageID: "a-assistant", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartApprovalDecision, Payload: json.RawMessage(`{"text":"assistant"}`), CreatedAt: assistantAt, UpdatedAt: assistantAt},
 		},
 	} {
 		if _, err := execution.AppendMessage(ctx, record.message); err != nil {
@@ -656,7 +656,7 @@ func TestRunClaimIsSingleWinnerAndFencesStaleExecution(t *testing.T) {
 	if _, err := oldExecution.AppendMessage(ctx, session.Message{ID: "stale-message", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale AppendMessage error = %v", err)
 	}
-	stalePart := session.Part{ID: "stale-part", MessageID: "stale-message", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartProviderState, CreatedAt: now, UpdatedAt: now}
+	stalePart := session.Part{ID: "stale-part", MessageID: "stale-message", SessionID: run.SessionID, RunID: run.ID, Kind: session.PartApprovalDecision, CreatedAt: now, UpdatedAt: now}
 	if _, err := oldExecution.AppendPart(ctx, stalePart); !errors.Is(err, session.ErrConflict) {
 		t.Fatalf("stale AppendPart error = %v", err)
 	}

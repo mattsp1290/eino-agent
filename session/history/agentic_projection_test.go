@@ -295,16 +295,19 @@ func TestProjectAgenticAppliesEpoch(t *testing.T) {
 		Role:   session.RoleUser,
 		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "Continue"}}},
 	}, "tail", "tl")
+	oldSecretParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "SECRET old raw prompt"}}},
+	}, "old", "os")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("old", session.RoleUser),
 			message("summary", session.RoleSystem),
 			message("tail", session.RoleUser),
 		},
-		Parts: append([]session.Part{
-			part("old-secret", "old", session.PartProviderState, 10, `{"text":"SECRET old raw prompt"}`),
+		Parts: append(append(reorderedOrdinal(oldSecretParts, 10),
 			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
-		}, tailParts...),
+		), tailParts...),
 	}
 	projection, err := ProjectAgentic(batch, Options{Epoch: &session.ContextEpoch{
 		SummaryMessageID: "summary",

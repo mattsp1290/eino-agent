@@ -56,7 +56,7 @@ and never replayed.
 | State deltas | Optional `EventRecord` audit. | Do not replay raw deltas; replay starts from snapshot. | Emit live deltas. | Deltas superseded by snapshot. |
 | Messages snapshots | Not stored as raw AG-UI frames. | Reconstruct from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
 | Activity | Optional `EventRecord` audit metadata. | Not replayed as conversation content. | Emit live activity. | Transient activity with no audit value. |
-| Steps | No durable `PartKind` today; runtime tracks physical dispatch attempts via `session.EventRecord` (e.g. `AttemptReplacedEventKind`), not a message part. | Replay as annotations/status where UI supports it, once implemented. | Emit live `STEP_*`. | None. |
+| Steps | Not persisted today: `Bridge.StepStarted`/`StepFinished` are pure passthroughs to the live emitter and write no durable part or `EventRecord`. (`session.AttemptReplacedEventKind` is a separate, unrelated model-dispatch-retry audit trail, not a record of step boundaries.) | Not replayed; may become annotations/status where UI supports it, once a durable representation is implemented. | Emit live `STEP_*`. | None. |
 | Custom events | Optional audit `EventRecord`. | Not replayed unless promoted to a future typed replay contract. | Emit live. | Unknown sensitive payloads by policy. |
 | Errors | `EventRecord` plus terminal run/message status. | Replay terminal status/error summary, not necessarily raw `RUN_ERROR`. | Emit live `RUN_ERROR` or related error event. | Provider/internal details redacted by policy. |
 
@@ -100,6 +100,23 @@ Replay uses this order:
 
 Replay must preserve durable message/part ordering from `store/storetest`.
 Replay must not infer conversation content from `session.EventRecord.Payload`.
+
+`agui.Replay` materializes its message snapshot through
+`history.Load`/`history.Project` -- the classic (non-agentic) projector, not
+`history.ProjectAgentic`. That projector fails closed with
+`history.ErrClassicUnsupported` (surfacing as a `Replay` error) for any
+durable content it cannot represent as a flat `*schema.Message`: the
+`tool_search_result`, `server_tool_call`/`server_tool_result`,
+`mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result`,
+`mcp_tool_approval_request`/`mcp_tool_approval_response` block kinds, and any
+assistant-role media block. The runtime writes all of these kinds today (for
+example `runtime/tool_search.go` writes `tool_search_result` and
+`runtime/adk_approval.go` writes `mcp_tool_approval_response`), so
+`agui.Replay` of a session containing tool-search or MCP-approval activity
+fails today rather than silently flattening or dropping that content. This is
+pre-existing, deliberate fail-closed behavior, not a regression; widening AG-UI
+replay to cover these block kinds through the `eino-agui` bridge is tracked
+for a future work package (W7).
 
 ## Live Tail
 

@@ -21,9 +21,25 @@ func seedPrivateDiscovery(t *testing.T, st session.Store, id session.ID) {
 	for _, role := range []session.Role{session.RoleUser, session.RoleAssistant} {
 		mid := session.MessageID(string(id) + string(role))
 		appendMessage(t, ctx, ex, message(mid, id, r.ID, role))
-		p := part(session.PartID(mid)+"text", mid, id, r.ID, 0)
-		p.Payload = []byte(`{"text":"PRIVATE_TRANSCRIPT"}`)
-		appendPart(t, ctx, ex, p)
+		// Use a real public text kind, encoded through EncodeContentParts,
+		// so the sentinel lands in the display_text column ObservationText
+		// derives from PartUserInputText/PartAssistantGenText -- otherwise
+		// discoveryPrivate's "no PRIVATE_ substring leaks" assertion never
+		// exercises the discovery-vs-display_text boundary it is meant to
+		// guard (ObservationText returns empty for every other part kind).
+		blockKind := session.BlockKindUserInputText
+		if role == session.RoleAssistant {
+			blockKind = session.BlockKindAssistantGenText
+		}
+		content := session.Content{Role: role, Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: blockKind, Text: &session.TextBlock{Text: "PRIVATE_TRANSCRIPT"}},
+		}}
+		textID := session.PartID(mid) + "text"
+		parts, err := session.EncodeContentParts(content, func() session.PartID { return textID }, mid, id, r.ID, time.Now().UTC(), session.DefaultContentLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		appendPart(t, ctx, ex, parts[0])
 	}
 	mid := session.MessageID(string(id) + string(session.RoleAssistant))
 	p := part(session.PartID(id)+"reasoning", mid, id, r.ID, 1)

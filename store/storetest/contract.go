@@ -867,9 +867,13 @@ func message(id session.MessageID, sessionID session.ID, runID session.RunID, ro
 
 // part builds a generic, content-agnostic durable part for ordering and
 // pagination tests that do not exercise content decoding. It uses
-// PartProviderState because that kind is always ignored by every history
-// projection and by DecodeContentParts, so an arbitrary payload never needs
-// to satisfy any decode contract.
+// PartApprovalDecision because that kind is runtime-private: nothing decodes
+// it except adkApprovalBinding's exact part-ID lookup, it is ignored by
+// DecodeContentParts and by both history projections, and — unlike
+// PartProviderState, which loadProviderHistory decodes as a strict, ordered
+// model.ProviderStateItem envelope and which carries a hard per-message
+// item/byte cap (see store/internal/sqlstore/messages.go's
+// ProviderStateHardMaxItems guard) — it has no decode contract and no cap.
 func part(id session.PartID, messageID session.MessageID, sessionID session.ID, runID session.RunID, ordinal int64) session.Part {
 	now := time.Now().UTC()
 	return session.Part{
@@ -877,7 +881,7 @@ func part(id session.PartID, messageID session.MessageID, sessionID session.ID, 
 		MessageID: messageID,
 		SessionID: sessionID,
 		RunID:     runID,
-		Kind:      session.PartProviderState,
+		Kind:      session.PartApprovalDecision,
 		Ordinal:   ordinal,
 		Payload:   []byte(`{"text":"part"}`),
 		CreatedAt: now,

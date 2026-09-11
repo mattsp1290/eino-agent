@@ -43,7 +43,7 @@ func testReplayMessagesParts(t *testing.T, server *testpostgres.Server) {
 			suffix  string
 			ordinal int64
 		}{{"tail", 1}, {"z", 0}, {"a", 0}} {
-			part := session.Part{ID: replayPartID(message.ID, partSpec.suffix), MessageID: message.ID, SessionID: message.SessionID, RunID: run.ID, Kind: session.PartProviderState, Ordinal: partSpec.ordinal, Payload: json.RawMessage(fmt.Sprintf(`{"ordinal":%d}`, partSpec.ordinal)), CreatedAt: item.at, UpdatedAt: item.at}
+			part := session.Part{ID: replayPartID(message.ID, partSpec.suffix), MessageID: message.ID, SessionID: message.SessionID, RunID: run.ID, Kind: session.PartApprovalDecision, Ordinal: partSpec.ordinal, Payload: json.RawMessage(fmt.Sprintf(`{"ordinal":%d}`, partSpec.ordinal)), CreatedAt: item.at, UpdatedAt: item.at}
 			if _, err := execution.AppendPart(f.ctx, part); err != nil {
 				t.Fatalf("append replay part: %v", err)
 			}

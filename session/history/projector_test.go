@@ -135,15 +135,18 @@ func TestProjectEpochExcludesCompactedRawHistory(t *testing.T) {
 func TestProjectEpochWithNoTailIncludesSummaryOnly(t *testing.T) {
 	t.Parallel()
 
+	oldSecretParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "SECRET old raw prompt"}}},
+	}, "old", "os")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("old", session.RoleUser),
 			message("summary", session.RoleSystem),
 		},
-		Parts: []session.Part{
-			part("old-secret", "old", session.PartProviderState, 10, `{"text":"SECRET old raw prompt"}`),
+		Parts: append(reorderedOrdinal(oldSecretParts, 10),
 			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
-		},
+		),
 	}
 	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
 		SummaryMessageID: "summary",
@@ -579,6 +582,55 @@ func TestProjectUnsupportedRichKindRejected(t *testing.T) {
 	}, Options{})
 	if !errors.Is(err, ErrClassicUnsupported) {
 		t.Fatalf("Project error = %v, want ErrClassicUnsupported", err)
+	}
+}
+
+// TestProjectRejectsNonCanonicalTextPayloads restores rejection-path coverage
+// for decodeCanonical/partText after PartText/PartFunctionToolResult's own
+// table was deleted with those kinds in W5 phase 2. PartReasoning (legacy,
+// schema-less shape) and PartCompaction are the two surviving kinds that
+// still route through partText, so this pins decodeCanonical's strictness
+// contract (DisallowUnknownFields, null rejection, bare-scalar rejection,
+// trailing-value rejection) and both kinds' required-field checks.
+func TestProjectRejectsNonCanonicalTextPayloads(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		kind    session.PartKind
+		payload string
+	}{
+		"reasoning bare string":    {session.PartReasoning, `"legacy"`},
+		"reasoning content alias":  {session.PartReasoning, `{"content":"legacy"}`},
+		"reasoning missing text":   {session.PartReasoning, `{}`},
+		"reasoning null":           {session.PartReasoning, `null`},
+		"reasoning trailing value": {session.PartReasoning, `{"text":"ok"} {}`},
+		"reasoning unknown field":  {session.PartReasoning, `{"text":"ok","extra":true}`},
+		"compaction metadata":      {session.PartCompaction, `{"text":"summary"}`},
+		"compaction no epoch":      {session.PartCompaction, `{"text":"s","redacted":true}`},
+		"compaction unknown field": {session.PartCompaction, `{"text":"s","epoch_id":"e","redacted":true,"extra":1}`},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Project(session.ReplayBatch{
+				Messages: []session.Message{message("message", session.RoleAssistant)},
+				Parts:    []session.Part{part("part", "message", test.kind, 0, test.payload)},
+			}, Options{IncludeReasoning: true})
+			if err == nil {
+				t.Fatal("non-canonical payload was accepted")
+			}
+		})
+	}
+}
+
+// TestPartTextRejectsUnsupportedKind pins partText's default branch, which
+// is unreachable through Project (projectMessage's switch only ever calls
+// partText for PartReasoning and PartCompaction) but is still live code
+// guarding partText against a caller mistake.
+func TestPartTextRejectsUnsupportedKind(t *testing.T) {
+	t.Parallel()
+	_, err := partText(part("part", "message", session.PartProviderState, 0, `{"text":"x"}`))
+	if err == nil {
+		t.Fatal("partText accepted an unsupported kind")
 	}
 }
 

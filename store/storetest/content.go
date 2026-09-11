@@ -40,7 +40,69 @@ func contentContract(t *testing.T, factory Factory) {
 		t.Run("provider state part preceding a block part decodes successfully", func(t *testing.T) {
 			testContentProviderStateInterleavedOrdinal(t, factory)
 		})
+		t.Run("compaction and approval_decision parts are accepted by the store", func(t *testing.T) {
+			testContentNonBlockPartKindsAreAccepted(t, factory)
+		})
 	})
+}
+
+// testContentNonBlockPartKindsAreAccepted appends every declared
+// session.PartKind that is not one of the 20 block kinds (already covered by
+// testContentAllBlockKinds) and not response_meta/provider_state (already
+// covered by testContentProviderStateSentinel and the observation tests) --
+// PartCompaction and PartApprovalDecision -- and asserts each is accepted and
+// round-trips through a real store on both dialects. This pins the Go
+// PartKind constant / SQL `parts.kind` CHECK constraint bijection: an
+// omission from either dialect's CHECK list would otherwise leave the whole
+// suite (including make postgres-test) green until the first real compaction
+// boundary or MCP approval pause hit a live store.
+func testContentNonBlockPartKindsAreAccepted(t *testing.T, factory Factory) {
+	subject := setup(t, factory)
+	ctx := context.Background()
+	sessionID := session.ID("content-non-block-kinds")
+	runID := session.RunID("content-non-block-kinds-run")
+
+	s := createSession(t, ctx, subject.Store, sessionID)
+	r := admitRun(t, ctx, subject.Store, run(runID, s.ID, "owner"))
+	execution := executionFor(subject.Store, r)
+
+	cases := []struct {
+		kind    session.PartKind
+		payload json.RawMessage
+	}{
+		{session.PartCompaction, json.RawMessage(`{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`)},
+		{session.PartApprovalDecision, json.RawMessage(`{"decision":"approved"}`)},
+	}
+	for i, tc := range cases {
+		messageID := session.MessageID(fmt.Sprintf("msg-%s", tc.kind))
+		appendMessage(t, ctx, execution, message(messageID, sessionID, runID, session.RoleSystem))
+		appended, err := execution.AppendPart(ctx, session.Part{
+			ID: session.PartID(fmt.Sprintf("part-%s", tc.kind)), MessageID: messageID, SessionID: sessionID, RunID: runID,
+			Kind: tc.kind, Ordinal: int64(i), Payload: tc.payload,
+		})
+		if err != nil {
+			t.Fatalf("AppendPart(kind=%s) = %v, want accepted by the parts.kind CHECK", tc.kind, err)
+		}
+		if appended.Kind != tc.kind {
+			t.Fatalf("appended part kind = %q, want %q", appended.Kind, tc.kind)
+		}
+	}
+
+	batch, err := subject.Store.ListMessages(ctx, sessionID, session.ReplayCursor{Limit: 50})
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	gotKinds := map[session.PartKind]json.RawMessage{}
+	for _, p := range batch.Parts {
+		gotKinds[p.Kind] = p.Payload
+	}
+	for _, tc := range cases {
+		payload, ok := gotKinds[tc.kind]
+		if !ok {
+			t.Fatalf("replayed parts missing kind %s", tc.kind)
+		}
+		contentAssertJSONEqual(t, json.RawMessage(payload), tc.payload)
+	}
 }
 
 func contentMustJSON(t testing.TB, v any) string {

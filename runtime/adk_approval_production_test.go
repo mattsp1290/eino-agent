@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -217,5 +218,77 @@ func TestApprovalOnlyResponseStillPausesViaProductionAgent(t *testing.T) {
 	resumed := <-resumeHandle.Done()
 	if resumed.Status != session.RunCompleted || resumed.Error != nil || calls != 2 {
 		t.Fatalf("resumed result = %+v calls=%d", resumed, calls)
+	}
+}
+
+// TestApprovalDecisionPartRoundTripsThroughRealSQLiteStore proves that
+// adkApprovalBinding's runtime-private session.PartApprovalDecision
+// decision-CAS record (adk_approval.go's pause/commitResponse) round-trips
+// through a real SQLite store, not just the in-memory admissionStore fake
+// every other approval production test uses. This is the store-level
+// complement to storetest's
+// "compaction and approval_decision parts are accepted by the store" case:
+// that case pins the Go PartKind constant against the sqlite/postgres
+// `parts.kind` CHECK constraint with a hand-built part; this test pins that
+// the runtime's actual approval write path produces a part the same CHECK
+// constraint (and the store's insert/replay path generally) accepts.
+func TestApprovalDecisionPartRoundTripsThroughRealSQLiteStore(t *testing.T) {
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "approval-decision.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	defer func() { _ = storePool.Close() }()
+
+	var calls int
+	orch := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		if calls == 1 {
+			return []*einoschema.AgenticMessage{{
+				Role:          einoschema.AgenticRoleTypeAssistant,
+				ContentBlocks: []*einoschema.ContentBlock{{Type: einoschema.ContentBlockTypeMCPToolApprovalRequest, MCPToolApprovalRequest: &einoschema.MCPToolApprovalRequest{ID: "apr-sqlite", Name: "remote_read", ServerLabel: "srv"}}},
+			}}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("finished")}, nil
+	}), WithStore(store))
+
+	handle, err := orch.Start(ctx, Request{SessionID: "approval-sqlite-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunPaused || !result.Interrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	pause, ok := <-handle.AwaitPause()
+	if !ok || len(pause.InterruptContexts) != 1 {
+		t.Fatalf("pause = %+v, ok=%v", pause, ok)
+	}
+	resumeHandle, err := orch.ResumeRun(ctx, result.RunID, ResumeRequest{
+		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun error = %v", err)
+	}
+	resumed := <-resumeHandle.Done()
+	if resumed.Status != session.RunCompleted || resumed.Error != nil || calls != 2 {
+		t.Fatalf("resumed result = %+v calls=%d", resumed, calls)
+	}
+
+	batch, err := store.ListMessages(ctx, "approval-sqlite-session", session.ReplayCursor{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	var approvalDecisionParts int
+	for _, part := range batch.Parts {
+		if part.Kind == session.PartApprovalDecision {
+			approvalDecisionParts++
+			if len(part.Payload) == 0 {
+				t.Fatalf("approval_decision part %s has empty payload", part.ID)
+			}
+		}
+	}
+	if approvalDecisionParts == 0 {
+		t.Fatal("no approval_decision part was durably written to the real SQLite store")
 	}
 }
