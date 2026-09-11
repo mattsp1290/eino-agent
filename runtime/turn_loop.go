@@ -279,7 +279,16 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if err != nil {
 		return nil, err
 	}
-	c.execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
+	// Resume rebuilds the advertised deferred-tool set from the session's
+	// full durable history, paged until exhausted -- not just this turn's
+	// reconstructed snapshot messages -- matching the legacy tool-only
+	// resume path (interrupt.go's resumeRun) and the W4 fix-pass finding
+	// that a single unpaged page silently dropped discoveries beyond it.
+	discovered, err := discoveredToolsFromHistoryPaged(ctx, c.host.store, c.sessionID)
+	if err != nil {
+		return nil, err
+	}
+	c.execution.seedDiscovered(discovered)
 	if target.Ordinal > c.ordinal {
 		c.mu.Lock()
 		c.ordinal = target.Ordinal
@@ -743,9 +752,29 @@ func (o *StreamingOrchestrator) Enqueue(ctx context.Context, sessionID session.I
 	if request.IdempotencyKey == "" {
 		return session.InboxItem{}, fmt.Errorf("%w: idempotency key required", ErrInvalidOrchestrator)
 	}
+	if err := rejectCallerContentBlockIDs(request.Message.Blocks); err != nil {
+		return session.InboxItem{}, err
+	}
 	blocks, err := assignContentBlockIDs(request.Message.Blocks, o.ids)
 	if err != nil {
 		return session.InboxItem{}, err
+	}
+	// Enqueue is a second public submission entry point alongside Start and
+	// must apply the same fence: session.Content.Validate alone permits
+	// BlockKindFunctionToolResult/BlockKindToolSearchResult under RoleUser
+	// (they are valid durable content on a user-role message when this
+	// runtime's own tool settlement path writes them), so a caller could
+	// otherwise hand-author a tool_search_result block and seed
+	// execution.discovered with no claim, no guard evaluation, and no
+	// durable tool-call record behind it (see rejectNonCallerBlocks).
+	if err := rejectNonCallerBlocks(blocks); err != nil {
+		return session.InboxItem{}, err
+	}
+	if len(blocks) == 0 || !hasNonEmptyTextOrMediaBlock(blocks) {
+		return session.InboxItem{}, fmt.Errorf("%w: message requires non-empty text or media content", ErrInvalidOrchestrator)
+	}
+	if err := (session.Content{Role: session.RoleUser, Blocks: blocks}).Validate(o.contentLimits); err != nil {
+		return session.InboxItem{}, fmt.Errorf("%w: %w", ErrInvalidOrchestrator, err)
 	}
 	now := o.now()
 	item := session.InboxItem{
