@@ -71,6 +71,53 @@ func TestDiscoverHandlerToolsBoundsTheProbeContext(t *testing.T) {
 	}
 }
 
+// TestDiscoverHandlerToolsEnforcesDeadlineAgainstAContextIgnoringFactory is
+// round-two W6 review I6's actual enforcement proof (not merely that the
+// probe's context carries a deadline, but that discoverHandlerTools itself
+// returns promptly even when the factory never looks at ctx.Done() at
+// all): a factory that sleeps well past discoveryProbeBudget and ignores
+// ctx entirely must still make discoverHandlerTools return -- with an
+// error, for a knownToolBearingHandlerKinds Kind -- within the budget plus
+// a small scheduling margin, not after the factory eventually wakes up.
+// discoveryProbeBudget is temporarily shrunk (it is a var precisely for
+// this) so the test itself does not need to sleep for the production
+// 5-second budget.
+func TestDiscoverHandlerToolsEnforcesDeadlineAgainstAContextIgnoringFactory(t *testing.T) {
+	original := discoveryProbeBudget
+	discoveryProbeBudget = 50 * time.Millisecond
+	defer func() { discoveryProbeBudget = original }()
+
+	factoryReturned := make(chan struct{})
+	factory := HandlerFactory(func(ctx context.Context, _ HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
+		// Deliberately ignores ctx: sleeps ten times the shrunk budget,
+		// simulating a factory that blocks on e.g. network I/O without
+		// ever checking its own context.
+		time.Sleep(10 * discoveryProbeBudget)
+		close(factoryReturned)
+		return nil, errors.New("factory finally returned, far too late")
+	})
+
+	start := time.Now()
+	_, err := discoverHandlerTools("slow-fs", HandlerKindFilesystem, factory)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, errHandlerDiscoveryFailed) {
+		t.Fatalf("err = %v, want errHandlerDiscoveryFailed", err)
+	}
+	// Generous margin (10x the shrunk budget, still far less than the
+	// factory's own 10x sleep) to absorb scheduler jitter in CI without
+	// weakening the actual assertion: discoverHandlerTools must return
+	// long before the ignored context's factory ever does.
+	if margin := 10 * discoveryProbeBudget; elapsed > margin {
+		t.Fatalf("discoverHandlerTools took %v, want at most %v (the ignoring factory must not be able to block it)", elapsed, margin)
+	}
+	select {
+	case <-factoryReturned:
+		t.Fatal("the ignoring factory already returned by the time the assertion ran -- test budget too generous, tighten it")
+	default:
+	}
+}
+
 // TestHandlerProbeBuildContextNeverTouchesTheFilesystem proves I6's
 // "no filesystem side effects" fix: the writable scratch backends
 // handlerProbeBuildContext supplies are the in-memory probeWritableBackend,

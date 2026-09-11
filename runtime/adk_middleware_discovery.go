@@ -23,8 +23,10 @@ import (
 // call) may run. A third-party factory that blocks -- on network I/O, say
 // -- must not hang plan compilation for every run on that registry; a probe
 // that exceeds this budget is treated as a construction error (see
-// discoverHandlerTools).
-const discoveryProbeBudget = 5 * time.Second
+// discoverHandlerTools). A package-level var, not a const, solely so a test
+// can shrink it (see TestDiscoverHandlerToolsEnforcesDeadlineAgainstAContextIgnoringFactory)
+// instead of a multi-second sleep; production code never reassigns it.
+var discoveryProbeBudget = 5 * time.Second
 
 // HandlerToolSpec is one tool a typed ADK agent-handler middleware
 // contributes, discovered once at plan-compile time (see
@@ -123,6 +125,19 @@ var errHandlerDiscoveryFailed = errors.New("agent handler tool discovery failed"
 // Kind) it degrades to "declares zero tools", matching the documented,
 // bounded limitation below.
 //
+// The deadline is enforced by running the actual probe (runHandlerDiscoveryProbe)
+// in its own goroutine and select-ing on either its result or ctx.Done()
+// (round-two W6 review I6): a factory, BeforeAgent, or Info call that
+// ignores ctx and blocks indefinitely can no longer hang plan compilation
+// itself -- this function still returns within discoveryProbeBudget plus a
+// small scheduling margin. The probe goroutine itself is NOT forcibly
+// killed when the deadline fires (Go has no mechanism to preempt a
+// goroutine that does not check its own context): an abandoned probe keeps
+// running, bounded only to this process's own lifetime, until whatever it
+// is blocked on eventually returns (or never does) -- its result is simply
+// discarded (resultCh is buffered, so the goroutine's send never blocks on
+// a receiver that already gave up).
+//
 // This is a documented, bounded limitation of this discovery mechanism: a
 // third-party handler Kind whose own tool list genuinely depends on data
 // this stub probe cannot supply (a real session/model identity, live
@@ -146,26 +161,56 @@ func discoverHandlerTools(handlerID, kind string, factory HandlerFactory) ([]Han
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), discoveryProbeBudget)
 	defer cancel()
+
+	type probeOutcome struct {
+		specs []HandlerToolSpec
+		stage string
+		err   error
+	}
+	resultCh := make(chan probeOutcome, 1)
+	go func() {
+		specs, stage, err := runHandlerDiscoveryProbe(ctx, factory)
+		resultCh <- probeOutcome{specs: specs, stage: stage, err: err}
+	}()
+	select {
+	case outcome := <-resultCh:
+		if outcome.err != nil {
+			return fail(outcome.stage, outcome.err)
+		}
+		return outcome.specs, nil
+	case <-ctx.Done():
+		return fail("probe deadline exceeded", ctx.Err())
+	}
+}
+
+// runHandlerDiscoveryProbe is discoverHandlerTools' actual probe body --
+// factory construction, one BeforeAgent call, and Info on every tool it
+// contributes -- extracted so discoverHandlerTools can run it in its own
+// goroutine (see that function's doc comment) and enforce
+// discoveryProbeBudget by select, not by trusting the probe itself to
+// respect ctx. Returns (specs, "", nil) on success, or (nil, stage, err) on
+// failure at the named stage.
+func runHandlerDiscoveryProbe(ctx context.Context, factory HandlerFactory) ([]HandlerToolSpec, string, error) {
 	build := handlerProbeBuildContext()
 	mw, err := factory(ctx, build)
 	if err != nil {
-		return fail("factory construction", err)
+		return nil, "factory construction", err
 	}
 	if mw == nil {
-		return fail("factory construction", errors.New("factory returned a nil middleware"))
+		return nil, "factory construction", errors.New("factory returned a nil middleware")
 	}
 	if err := ctx.Err(); err != nil {
-		return fail("factory construction", err)
+		return nil, "factory construction", err
 	}
 	_, runCtx, err := mw.BeforeAgent(ctx, &adk.ChatModelAgentContext{})
 	if err != nil {
-		return fail("BeforeAgent", err)
+		return nil, "BeforeAgent", err
 	}
 	if runCtx == nil {
-		return fail("BeforeAgent", errors.New("BeforeAgent returned a nil run context"))
+		return nil, "BeforeAgent", errors.New("BeforeAgent returned a nil run context")
 	}
 	if err := ctx.Err(); err != nil {
-		return fail("BeforeAgent", err)
+		return nil, "BeforeAgent", err
 	}
 	specs := make([]HandlerToolSpec, 0, len(runCtx.Tools))
 	seen := make(map[string]bool, len(runCtx.Tools))
@@ -182,7 +227,7 @@ func discoverHandlerTools(handlerID, kind string, factory HandlerFactory) ([]Han
 			Name: info.Name, Info: info, SchemaHash: handlerToolSchemaHash(info), WriteLike: isWriteLikeToolName(info.Name),
 		})
 	}
-	return specs, nil
+	return specs, "", nil
 }
 
 func handlerToolSchemaHash(info *einoschema.ToolInfo) string {
