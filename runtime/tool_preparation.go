@@ -81,7 +81,7 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 			Call: session.ToolCall{
 				ID: prepared.call.ID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				RequestPartID: requestPart.ID, ResultMessageID: resultMessageID, ResultPartID: resultPartID,
-				Name: prepared.call.Name, RequestedName: prepared.call.RequestedName, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
+				Name: prepared.call.Name, RequestedName: prepared.call.RequestedName, ProviderCallID: prepared.call.ProviderCallID, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
 				RetrySafe: prepared.tool.RetrySafe, Metadata: cloneStringMap(prepared.tool.Metadata),
 			},
 			RequestPart: requestPart,
@@ -166,18 +166,32 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		if block == nil {
 			continue
 		}
-		callID := session.ToolCallID(block.CallID)
-		if callID == "" {
-			callID = o.ids.NewToolCallID()
-			block.CallID = string(callID)
-		}
+		// providerCallID is whatever the provider itself sent as this
+		// call's CallID (possibly empty). callID is always a fresh,
+		// store-wide-unique mint: some providers (llama.cpp/Ollama/vLLM
+		// OpenAI-compatible endpoints, replayed fixtures) reissue the same
+		// indexed id (e.g. "call_0") across unrelated responses, and
+		// reusing that value verbatim as the durable tool_calls.id (which
+		// is UNIQUE store-wide) fails a later turn with a clean
+		// session.ErrConflict. block.CallID is overwritten unconditionally
+		// (not just when empty) so the assistant message this runtime
+		// persists and hands back to ADK -- and everything keyed off it
+		// (ADK's own tool dispatch, GetToolCall lookups, approval/interrupt
+		// reconciliation) -- uses this durable identity uniformly. The
+		// provider's original id is preserved on the call record
+		// (ProviderCallID) purely so the wire request rebuilt for a later
+		// dispatch can show the provider its own id back (see
+		// publicizeToolCallIDs).
+		providerCallID := block.CallID
+		callID := o.ids.NewToolCallID()
+		block.CallID = string(callID)
 		requestedInput, err := normalizedToolArguments(block.Arguments)
 		if err != nil {
 			return nil, err
 		}
 		if snapshot.isToolSearchCall(block.Name) {
 			call := ToolCall{
-				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				Name: block.Name, RequestedName: block.Name, Pattern: block.Name,
 				Input: cloneJSON(requestedInput), Context: toolContext(snapshot, snapshot.Tools),
 			}
@@ -220,7 +234,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 				denyErr = fmt.Errorf("tool %q is deferred and no tool search is configured", canonicalName)
 			}
 			call := ToolCall{
-				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				Name: canonicalName, RequestedName: requestedName, Pattern: canonicalName,
 				Input: cloneJSON(remapped), Context: toolContext(snapshot, snapshot.Tools),
 			}
@@ -241,7 +255,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			}
 		}
 		call := ToolCall{
-			ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+			ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 			Name: canonicalName, RequestedName: requestedName, Scope: tool.Scope, Pattern: canonicalName,
 			Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools),
 		}

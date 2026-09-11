@@ -181,7 +181,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 			searchCall := ToolCall{
 				ID: call.ID, SessionID: call.SessionID, RunID: call.RunID, MessageID: call.MessageID,
 				ResultMessageID: call.ResultMessageID, ResultPartID: call.ResultPartID,
-				Name: call.Name, RequestedName: call.Name, Pattern: call.Pattern,
+				Name: call.Name, RequestedName: call.Name, ProviderCallID: call.ProviderCallID, Pattern: call.Pattern,
 				Input: cloneJSON(call.Input), Context: toolContext.Clone(),
 			}
 			if _, err := execution.executeToolSearchCall(ctx, snapshot, searchCall, call); err != nil {
@@ -228,6 +228,7 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 			ResultMessageID: claimed.ResultMessageID,
 			ResultPartID:    claimed.ResultPartID,
 			Name:            claimed.Name,
+			ProviderCallID:  claimed.ProviderCallID,
 			Scope:           tool.Scope,
 			Pattern:         claimed.Pattern,
 			Input:           cloneJSON(claimed.Input),

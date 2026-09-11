@@ -285,18 +285,33 @@ type ToolCall struct {
 	// (and any replay of this call) can correlate on the name the model
 	// itself used.
 	RequestedName string
-	Pattern       string
-	Input         json.RawMessage
-	Output        json.RawMessage
-	Status        ToolCallStatus
-	RetrySafe     bool
-	Metadata      map[string]string
-	ClaimedBy     string
-	ClaimToken    string
-	LeaseUntil    time.Time
-	StartedAt     time.Time
-	CompletedAt   time.Time
-	Error         string
+	// ProviderCallID is the tool-call identity exactly as the provider sent
+	// it (block.CallID at dispatch time), or empty when the provider left
+	// its own CallID empty. ID is always a freshly runtime-minted,
+	// store-wide-unique identity (see runtime.prepareToolCalls) -- it is
+	// never reused verbatim from the provider, because some providers
+	// (llama.cpp/Ollama/vLLM-style OpenAI-compatible endpoints, replayed
+	// fixtures) reissue the same indexed id (e.g. "call_0") across
+	// unrelated responses, which would collide against the store's
+	// tool_calls.id uniqueness constraint. ProviderCallID is preserved
+	// separately so the wire request rebuilt for the provider on a later
+	// dispatch (runtime.publicizeToolCallIDs) can still show the provider
+	// its own id for call/result correlation, even though the durable
+	// record and every internal (ADK/ToolCall-store) reference to this
+	// call use ID.
+	ProviderCallID string
+	Pattern        string
+	Input          json.RawMessage
+	Output         json.RawMessage
+	Status         ToolCallStatus
+	RetrySafe      bool
+	Metadata       map[string]string
+	ClaimedBy      string
+	ClaimToken     string
+	LeaseUntil     time.Time
+	StartedAt      time.Time
+	CompletedAt    time.Time
+	Error          string
 }
 
 // ContextEpoch records the history segment used to build provider context.

@@ -355,9 +355,13 @@ func TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused(t *testing.T) {
 	gate := Tool{
 		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"},
 		InterruptPolicy: pausingInterruptPolicy{},
+		// executed is keyed by the tool call's ProviderCallID (the scripted
+		// model's own "call-leaf-N" literal), not call.ID: prepareToolCalls
+		// always mints a fresh, store-unique ID now, so the durable ID no
+		// longer equals the scripted literal this test wants to key on.
 		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 			mu.Lock()
-			executed[string(call.ID)]++
+			executed[call.ProviderCallID]++
 			mu.Unlock()
 			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
 		}),

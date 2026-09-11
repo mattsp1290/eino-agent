@@ -87,7 +87,11 @@ func TestApprovalPausesBeforeSiblingToolExecutionAndResumesViaProductionAgent(t 
 			// interrupted immediately, not left pending forever (which
 			// would also block this run from ever settling, since SettleRun
 			// refuses any non-terminal tool call).
-			siblingCall, err := store.GetToolCall(context.Background(), "call-sibling")
+			// The scripted provider CallID ("call-sibling") is preserved
+			// separately as ProviderCallID; the durable ID is always a fresh
+			// mint now, so discover it from the store instead.
+			siblingCallID := onlyToolCallID(t, store)
+			siblingCall, err := store.GetToolCall(context.Background(), siblingCallID)
 			if err != nil || siblingCall.Name != "echo" || siblingCall.Status != session.ToolCallInterrupted {
 				t.Fatalf("sibling tool call = %+v, err=%v", siblingCall, err)
 			}

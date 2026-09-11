@@ -45,7 +45,8 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 	if result.Status != session.RunCompleted || calls != 2 {
 		t.Fatalf("result = %+v calls=%d", result, calls)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	callID := onlyToolCallID(t, store)
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}
@@ -71,8 +72,12 @@ func TestStreamingOrchestratorExecutesToolCallLoop(t *testing.T) {
 		t.Fatalf("tool call parts = %#v", toolCallParts)
 	}
 	toolCallContent, err := session.DecodeContentParts(session.RoleAssistant, toolCallParts, session.DefaultContentLimits())
+	// prepareToolCalls always overwrites the persisted block's CallID with the
+	// freshly minted durable id (callID here), regardless of the scripted
+	// provider's own "call-1" -- the original provider string survives only
+	// as ProviderCallID on the durable ToolCall record, not in this block.
 	if err != nil || len(toolCallContent.Blocks) != 1 || toolCallContent.Blocks[0].FunctionCall == nil ||
-		toolCallContent.Blocks[0].FunctionCall.CallID != "call-1" || toolCallContent.Blocks[0].FunctionCall.Name != "echo" || toolCallContent.Blocks[0].FunctionCall.Arguments != `{"text":"hi"}` {
+		toolCallContent.Blocks[0].FunctionCall.CallID != string(callID) || toolCallContent.Blocks[0].FunctionCall.Name != "echo" || toolCallContent.Blocks[0].FunctionCall.Arguments != `{"text":"hi"}` {
 		t.Fatalf("tool call parts = %#v decoded=%#v err=%v", toolCallParts, toolCallContent, err)
 	}
 	var toolEvents []session.EventRecord
@@ -159,7 +164,8 @@ func TestToolTransitionTransportPanicIsPostCommitBestEffort(t *testing.T) {
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("result = %+v, want completed despite transport failure", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-transport")
+	callID := onlyToolCallID(t, store)
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil || call.Status != session.ToolCallCompleted {
 		t.Fatalf("durable call = %+v, %v", call, err)
 	}
@@ -269,12 +275,14 @@ func TestStreamingOrchestratorBoundsToolOutput(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	callID := onlyToolCallID(t, store)
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}
-	if string(call.Output) != `{"tool_call_id":"call-1","status":"completed","content":"he","truncated":true,"original_size":5,"inline_size":2,"external":true}` {
-		t.Fatalf("tool output = %s", call.Output)
+	want := `{"tool_call_id":"` + string(callID) + `","status":"completed","content":"he","truncated":true,"original_size":5,"inline_size":2,"external":true}`
+	if string(call.Output) != want {
+		t.Fatalf("tool output = %s, want %s", call.Output, want)
 	}
 }
 
@@ -300,7 +308,8 @@ func TestStreamingOrchestratorContinuesAfterToolFailurePayload(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	callID := onlyToolCallID(t, store)
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}
@@ -347,7 +356,8 @@ func TestStreamingOrchestratorEnforcesToolPermissionPolicy(t *testing.T) {
 	if executed {
 		t.Fatal("tool executor ran despite denial")
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	callID := onlyToolCallID(t, store)
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}
@@ -404,7 +414,8 @@ func TestStreamingOrchestratorMarksCanceledToolInterrupted(t *testing.T) {
 	if result.Status != session.RunInterrupted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	callID := onlyToolCallID(t, store)
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}
@@ -470,7 +481,10 @@ func TestStreamingOrchestratorStrictSettlementSurvivesCancellation(t *testing.T)
 		t.Fatalf("Start error = %v", err)
 	}
 	<-handle.Done()
-	call, err := store.GetToolCall(context.Background(), "call-cancel")
+	// The scripted provider CallID ("call-cancel") is preserved separately as
+	// ProviderCallID; the durable session.ToolCall.ID is always a fresh mint
+	// now, so look it up via the id the executor itself observed.
+	call, err := store.GetToolCall(context.Background(), executedCall.ID)
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}
@@ -526,7 +540,14 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 	if result.Error != nil || result.Status != session.RunCompleted || executed.Load() {
 		t.Fatalf("run result = %+v", result)
 	}
-	call, err := store.GetToolCall(ctx, "call-denied")
+	// The scripted provider CallID ("call-denied") is preserved separately as
+	// ProviderCallID; the durable session.ToolCall.ID is always a fresh mint
+	// now. The settled notice, captured via ToolSettledPoint above, observed
+	// the minted id, so use that to look up the durable row.
+	if len(notices) != 1 {
+		t.Fatalf("settled notices = %#v", notices)
+	}
+	call, err := store.GetToolCall(ctx, notices[0].ToolCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -536,7 +557,7 @@ func TestStreamingOrchestratorPreservesDeniedDispositionAfterFreshResultTransfor
 	if !strings.Contains(modelVisible, `"status":"expected_failure"`) || !strings.Contains(modelVisible, "transformed denial") {
 		t.Fatalf("model-visible denied result = %s", modelVisible)
 	}
-	if len(notices) != 1 || notices[0].Status != session.ToolCallFailed || notices[0].Result.Metadata["permission_status"] != "denied" {
+	if notices[0].Status != session.ToolCallFailed || notices[0].Result.Metadata["permission_status"] != "denied" {
 		t.Fatalf("settled notices = %#v", notices)
 	}
 }

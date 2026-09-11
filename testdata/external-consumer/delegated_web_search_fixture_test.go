@@ -147,7 +147,7 @@ func testDelegatedSearchExecution(t *testing.T) {
 		t.Fatalf("backend calls = %d, want 1", backendCalls.Load())
 	}
 
-	call, err := store.GetToolCall(ctx, "delegated-success-call")
+	call, err := store.GetToolCall(ctx, findFunctionToolCallID(t, ctx, store, "delegated-success"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -368,7 +368,7 @@ func testDelegatedSearchCancellation(t *testing.T) {
 	if result.Status != session.RunInterrupted || !result.Interrupted {
 		t.Fatalf("canceled result = %+v", result)
 	}
-	call, err := store.GetToolCall(ctx, "delegated-cancel-call")
+	call, err := store.GetToolCall(ctx, findFunctionToolCallID(t, ctx, store, "delegated-cancel"))
 	if err != nil || call.Status != session.ToolCallInterrupted {
 		t.Fatalf("canceled durable call = %+v, err = %v", call, err)
 	}
@@ -407,7 +407,7 @@ func testDelegatedSearchPermissionContainment(t *testing.T) {
 			if result.Status != session.RunCompleted || result.Error != nil {
 				t.Fatalf("policy result = %+v", result)
 			}
-			call, err := store.GetToolCall(ctx, callID)
+			call, err := store.GetToolCall(ctx, findFunctionToolCallID(t, ctx, store, session.ID("delegated-permission-"+string(action))))
 			if err != nil || call.Status != session.ToolCallFailed {
 				t.Fatalf("policy durable call = %+v, err = %v", call, err)
 			}
@@ -448,7 +448,7 @@ func testDelegatedSearchFailureRedaction(t *testing.T) {
 	if result.Status != session.RunCompleted || result.Error != nil || calls.Load() != 1 {
 		t.Fatalf("failure-handling result = %+v, calls = %d", result, calls.Load())
 	}
-	call, err := store.GetToolCall(ctx, "delegated-failure-call")
+	call, err := store.GetToolCall(ctx, findFunctionToolCallID(t, ctx, store, "delegated-failure"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1029,4 +1029,45 @@ func cleanupDelegatedMount(mount *composition.Mount) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = mount.Close(ctx)
+}
+
+// findFunctionToolCallID scans sessionID's durable history for the first
+// function_tool_call content block and returns its (runtime-minted)
+// CallID. runtime.prepareToolCalls always mints a fresh, durable,
+// store-unique ToolCall.ID regardless of what the model fixture's scripted
+// CallID was (see session.ToolCall.ProviderCallID's doc comment), so these
+// fixtures' hardcoded "delegated-*-call" strings are never the durable
+// row's primary key -- only the minted id, persisted in the block itself,
+// is.
+func findFunctionToolCallID(t *testing.T, ctx context.Context, store session.Store, sessionID session.ID) session.ToolCallID {
+	t.Helper()
+	cursor := session.ReplayCursor{Limit: 1000}
+	for {
+		batch, err := store.ListMessages(ctx, sessionID, cursor)
+		if err != nil {
+			t.Fatalf("ListMessages: %v", err)
+		}
+		for _, part := range batch.Parts {
+			if part.Kind != session.PartFunctionToolCall {
+				continue
+			}
+			var envelope struct {
+				FunctionCall struct {
+					CallID string `json:"call_id"`
+				} `json:"function_call"`
+			}
+			if err := json.Unmarshal(part.Payload, &envelope); err != nil {
+				t.Fatalf("decode function_tool_call part: %v", err)
+			}
+			if envelope.FunctionCall.CallID != "" {
+				return session.ToolCallID(envelope.FunctionCall.CallID)
+			}
+		}
+		if batch.Next == (session.ReplayCursor{}) {
+			break
+		}
+		cursor = batch.Next
+	}
+	t.Fatal("no function_tool_call content block found")
+	return ""
 }

@@ -454,7 +454,7 @@ func TestOrchestratorResolvesAliasAndCorrelatesResultOnRequestedName(t *testing.
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatalf("GetToolCall: %v", err)
 	}
@@ -523,7 +523,7 @@ func TestOrchestratorDeniesToolThroughAliasOnCanonicalIdentity(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatalf("GetToolCall: %v", err)
 	}
@@ -556,11 +556,14 @@ func TestOrchestratorDeferredSearchHitDiscoveryThenInvocation(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	searchCall, err := store.GetToolCall(context.Background(), "call-1")
+	// The scripted provider CallIDs ("call-1"/"call-2") are preserved
+	// separately as ProviderCallID; the durable IDs are always fresh mints
+	// now, so discover each call by its (distinct) tool name instead.
+	searchCall, err := store.GetToolCall(context.Background(), toolCallIDByName(t, store, "tool_search"))
 	if err != nil || searchCall.Status != session.ToolCallCompleted {
 		t.Fatalf("search call = %+v, err=%v", searchCall, err)
 	}
-	discoveredCall, err := store.GetToolCall(context.Background(), "call-2")
+	discoveredCall, err := store.GetToolCall(context.Background(), toolCallIDByName(t, store, "weather_tool"))
 	if err != nil || discoveredCall.Status != session.ToolCallCompleted || discoveredCall.Name != "weather_tool" {
 		t.Fatalf("discovered call = %+v, err=%v", discoveredCall, err)
 	}
@@ -586,7 +589,7 @@ func TestOrchestratorDeferredSearchMissLeavesNothingDiscovered(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	searchCall, err := store.GetToolCall(context.Background(), "call-1")
+	searchCall, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +630,7 @@ func TestOrchestratorSettlesUndiscoveredDeferredCallAsFailedAndContinues(t *test
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v, want completed (turn continues past an undiscovered-deferred denial)", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatalf("GetToolCall: %v", err)
 	}
@@ -684,7 +687,7 @@ func TestOrchestratorSearchResultReferencesOnlyFrozenRegistryTools(t *testing.T)
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,7 +877,7 @@ func TestOrchestratorSettlesDeferredCallAsFailedWhenNoToolSearchConfigured(t *te
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v, want completed (turn continues past a no-search-configured denial)", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-1")
+	call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatalf("GetToolCall: %v", err)
 	}
@@ -1016,7 +1019,23 @@ func TestOrchestratorDiscoveredToolCarriesToSecondRunInSameSession(t *testing.T)
 	if second.Status != session.RunCompleted || second.Error != nil {
 		t.Fatalf("second run = %+v, want completed (a tool discovered in run 1 must be callable in run 2)", second)
 	}
-	call3, err := store.GetToolCall(context.Background(), "call-3")
+	// The scripted provider CallID ("call-3") is preserved separately as
+	// ProviderCallID; the durable ID is always a fresh mint now. Both runs
+	// call "weather_tool" (once in run 1 as call-2, once in run 2 as
+	// call-3), so toolCallIDByName's single-match assumption doesn't hold
+	// here -- disambiguate by RunID instead, using the second run's RunID.
+	var call3ID session.ToolCallID
+	var matches int
+	for id, call := range store.toolCalls {
+		if call.RunID == second.RunID && call.Name == "weather_tool" {
+			call3ID = id
+			matches++
+		}
+	}
+	if matches != 1 {
+		t.Fatalf("found %d weather_tool calls in run 2, want exactly 1", matches)
+	}
+	call3, err := store.GetToolCall(context.Background(), call3ID)
 	if err != nil || call3.Status != session.ToolCallCompleted || call3.Name != "weather_tool" {
 		t.Fatalf("call-3 = %+v, err=%v", call3, err)
 	}
@@ -1111,6 +1130,16 @@ func TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay(t *
 		t.Fatalf("result = %+v", result)
 	}
 
+	// The scripted provider CallID ("call-enhanced") is preserved separately
+	// as ProviderCallID; the durable session.ToolCall.ID is always a fresh
+	// mint now. turn2Messages is the WIRE-level model.Request the scripted
+	// streamer receives, after adkModel.dispatch's publicizeToolCallIDs has
+	// rewritten every block's CallID from the durable id back to
+	// ProviderCallID -- so it still shows "call-enhanced" verbatim. The
+	// durable store and history.LoadAgentic's replay, by contrast, operate
+	// on the durable identity directly and show the minted id.
+	callID := onlyToolCallID(t, store)
+
 	// (a) same-turn model-visible content, from the next model request.
 	modelVisible := functionResultContentForCall(turn2Messages, "call-enhanced")
 	if len(modelVisible) != 3 {
@@ -1119,7 +1148,7 @@ func TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay(t *
 	mvText0, mvImage1, mvText2 := einoFunctionResultSummary(modelVisible)
 
 	// (b) durable content decoded back out of the store.
-	call, err := store.GetToolCall(context.Background(), "call-enhanced")
+	call, err := store.GetToolCall(context.Background(), callID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1148,7 +1177,7 @@ func TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	replayed := functionResultContentForCall(projection.Messages, "call-enhanced")
+	replayed := functionResultContentForCall(projection.Messages, string(callID))
 	if len(replayed) != 3 {
 		t.Fatalf("replayed content = %#v, want 3 items", replayed)
 	}

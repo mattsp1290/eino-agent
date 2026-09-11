@@ -212,18 +212,32 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
+	// The scripted provider CallID ("call-1") is preserved separately as
+	// ProviderCallID; the observability attributes now carry the freshly
+	// runtime-minted, store-unique durable ToolCall.ID instead. Discover it
+	// from the store rather than assuming the provider literal survived.
+	callID := onlyToolCallID(t, store)
 	observations := observer.Snapshot().Observations
 	assertObservation(t, observations, "tool.registered", "ok", "")
 	assertObservation(t, observations, "tool.materialized", "ok", "")
 	toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
-	if toolSpan.Attributes["tool.call_id"] != "call-1" || toolSpan.Attributes["tool.status"] != "succeeded" {
+	if toolSpan.Attributes["tool.call_id"] != string(callID) || toolSpan.Attributes["tool.status"] != "succeeded" {
 		t.Fatalf("tool span attrs = %#v", toolSpan.Attributes)
 	}
 	settled := assertObservation(t, observations, "tool.settled", "ok", "")
 	if settled.Attributes["tool.status"] != "succeeded" {
 		t.Fatalf("settled attrs = %#v", settled.Attributes)
 	}
+	// The golden fixture encodes the tool call id as the placeholder
+	// "call-1" (the scripted provider CallID at the time the fixture was
+	// captured); substitute the actual minted id before comparing, since the
+	// fixture file is a fixed literal and the durable id is no longer.
 	want := readObservationGolden(t, "../testdata/obs/tool_lifecycle_observations.json")
+	for i := range want {
+		if want[i].ToolCallID == "call-1" {
+			want[i].ToolCallID = string(callID)
+		}
+	}
 	requireGoldenEqual(t, goldenToolObservations(observations), want)
 	if observationContains(observations, "SECRET tool input") || observationContains(observations, "SECRET tool output") {
 		t.Fatalf("observations leaked tool payloads: %#v", observations)
@@ -325,9 +339,20 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)
 	}
+	// An unresolvable tool name fails resolveToolCall before prepareToolCalls
+	// ever durably persists a session.ToolCall row, so there's no store
+	// record to discover the minted id from here (unlike the
+	// admissionStore-backed tests elsewhere in this file). The scripted
+	// provider CallID ("call-missing") is preserved separately as
+	// ProviderCallID and is no longer what observability reports as
+	// tool.call_id -- that's now the freshly runtime-minted id. What this
+	// test actually verifies is payload-leak safety and correlation
+	// consistency, so assert the id is present and matches across the
+	// correlated attributes rather than pinning the provider literal.
 	observations := observer.Snapshot().Observations
 	settled := assertObservation(t, observations, "tool.settled", "error", "")
-	if settled.Attributes["tool.call_id"] != "call-missing" || settled.Attributes["tool.status"] != "failed" {
+	mintedCallID, _ := settled.Attributes["tool.call_id"].(string)
+	if mintedCallID == "" || settled.Attributes["correlation.tool_call_id"] != mintedCallID || settled.Attributes["tool.status"] != "failed" {
 		t.Fatalf("settled attrs = %#v", settled.Attributes)
 	}
 	if settled.Error == nil || settled.Error.Classification != "operational_failure" {

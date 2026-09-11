@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"testing"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -14,6 +15,45 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
+
+// onlyToolCallID returns the single durable tool-call id minted into an
+// admissionStore during a test run. prepareToolCalls always mints a fresh,
+// store-unique ID now (see ProviderCallID on session.ToolCall/runtime.ToolCall),
+// so tests can no longer assume a scripted provider CallID literal (e.g.
+// "call-1") became the durable ID -- they must discover the minted id from
+// the store instead. Fails the test if zero or more than one tool call exists.
+func onlyToolCallID(t *testing.T, store *admissionStore) session.ToolCallID {
+	t.Helper()
+	var id session.ToolCallID
+	var count int
+	for candidate := range store.toolCalls {
+		id = candidate
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("onlyToolCallID: store has %d tool calls, want exactly 1", count)
+	}
+	return id
+}
+
+// toolCallIDByName returns the durable id of the single tool call in the
+// admissionStore whose Name matches, for tests where more than one tool
+// call is created and onlyToolCallID's single-entry assumption doesn't hold.
+func toolCallIDByName(t *testing.T, store *admissionStore, name string) session.ToolCallID {
+	t.Helper()
+	var id session.ToolCallID
+	var count int
+	for candidate, call := range store.toolCalls {
+		if call.Name == name {
+			id = candidate
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("toolCallIDByName(%q): found %d matching tool calls, want exactly 1", name, count)
+	}
+	return id
+}
 
 func newTestOrchestrator(store *admissionStore, streamer model.Streamer, extra ...Option) *StreamingOrchestrator {
 	options := []Option{

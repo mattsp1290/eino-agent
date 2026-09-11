@@ -785,7 +785,14 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if result.Status != session.RunCompleted || result.Error != nil || modelTurns.Load() != 2 {
 		t.Fatalf("result = %+v, model turns = %d", result, modelTurns.Load())
 	}
-	toolCall, err := store.GetToolCall(ctx, "wasm-call")
+	// The scripted streamer's tool call carried CallID "wasm-call", but
+	// runtime.prepareToolCalls always mints a fresh, durable, store-unique
+	// ToolCall.ID regardless of what the provider sent (see
+	// session.ToolCall.ProviderCallID), so the durable row's primary key is
+	// not "wasm-call". Recover the minted id from the persisted
+	// function_tool_call content block itself, which now carries it.
+	toolCallID := findFunctionToolCallID(t, ctx, store, "wasm-session")
+	toolCall, err := store.GetToolCall(ctx, toolCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1067,3 +1074,42 @@ func newBlockingComponent() *blockingComponent {
 	return component
 }
 func (c *blockingComponent) Interrupt() { c.interrupts.Add(1); c.once.Do(func() { close(c.release) }) }
+
+// findFunctionToolCallID scans sessionID's durable history for the first
+// function_tool_call content block and returns its (runtime-minted)
+// CallID -- see session.ToolCall.ProviderCallID's doc comment: the
+// provider's own CallID is preserved separately from the durable, always-
+// unique ToolCall.ID prepareToolCalls mints, and only the minted id is
+// ever persisted in the block itself.
+func findFunctionToolCallID(t *testing.T, ctx context.Context, store session.Store, sessionID session.ID) session.ToolCallID {
+	t.Helper()
+	cursor := session.ReplayCursor{Limit: 1000}
+	for {
+		batch, err := store.ListMessages(ctx, sessionID, cursor)
+		if err != nil {
+			t.Fatalf("ListMessages: %v", err)
+		}
+		for _, part := range batch.Parts {
+			if part.Kind != session.PartFunctionToolCall {
+				continue
+			}
+			var envelope struct {
+				FunctionCall struct {
+					CallID string `json:"call_id"`
+				} `json:"function_call"`
+			}
+			if err := json.Unmarshal(part.Payload, &envelope); err != nil {
+				t.Fatalf("decode function_tool_call part: %v", err)
+			}
+			if envelope.FunctionCall.CallID != "" {
+				return session.ToolCallID(envelope.FunctionCall.CallID)
+			}
+		}
+		if batch.Next == (session.ReplayCursor{}) {
+			break
+		}
+		cursor = batch.Next
+	}
+	t.Fatal("no function_tool_call content block found")
+	return ""
+}

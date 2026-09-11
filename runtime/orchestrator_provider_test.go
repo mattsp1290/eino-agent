@@ -324,7 +324,7 @@ func TestStreamingOrchestratorNormalizesEmptyToolArguments(t *testing.T) {
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-empty-args")
+	call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatalf("GetToolCall error = %v", err)
 	}

@@ -423,6 +423,41 @@ Status: landed; W1 scaffolding kept green.
   settlement (`dispatchFor`'s counters live entirely in-process; wiring a
   real `runtime.BuildToolSettlement` + store settle through this example is
   tracked as follow-up work, not implemented here).
+- Durable tool-call ids are always runtime-minted, never trusted verbatim
+  from the provider. `runtime.prepareToolCalls` used to mint a call's
+  durable `ID` (the `tool_calls` table's UNIQUE-store-wide primary key) via
+  `IDGenerator.NewToolCallID()` only when the model left its `CallID` empty;
+  otherwise it reused the provider's own `CallID` string verbatim as `ID`.
+  Providers that reissue the same indexed id across unrelated responses
+  (`call_0`-style: llama.cpp, Ollama, vLLM OpenAI-compatible endpoints,
+  replayed/deterministic fixtures) therefore collided on a later turn with a
+  clean `session.ErrConflict`. `prepareToolCalls` now *always* mints a fresh
+  `ID`, and the provider's original `CallID` (verbatim, possibly empty) is
+  preserved separately as `ProviderCallID` on both `session.ToolCall` and
+  `runtime.ToolCall` — persisted in the existing free-form JSON tool-call
+  record with no DDL change, exactly like `RequestedName`. The durable
+  content block's `CallID` (what `compose.GetToolCallID` returns, what
+  `store.GetToolCall` is keyed by everywhere it is looked up —
+  `runtime/adk_execution.go`'s `adkTool`/`adkToolSearch InvokableRun`,
+  `runtime/adk_approval.go`'s sibling-orphan reconciliation,
+  `runtime/interrupt.go`'s resume/crash-reconciliation replay, tool search)
+  stays the minted `ID` throughout, unchanged from before this fix except
+  that it is now unconditionally store-unique — this keeps every internal
+  identity comparison (including `adkModel.durableProjection`'s
+  adk-vs-durable id-set reconciliation) exactly as it was. Only the literal
+  wire payload handed to the model provider needs to show the provider back
+  its own id: `runtime.publicizeToolCallIDs` (`runtime/orchestrator.go`)
+  rewrites `function_tool_call`/`function_tool_result`/`tool_search_result`
+  block `CallID`s from the minted `ID` to `ProviderCallID` (falling back to
+  `ID` when the provider supplied none) in a copy of the messages, applied
+  exactly once, in `adkModel.dispatch`, right before building the
+  `ProviderRequest` actually sent over the wire — so both a live turn's
+  continuation and a replayed/resumed turn's next dispatch present the
+  provider its own ids for call/result correlation, while every durable
+  record and internal lookup stays keyed on the minted, always-unique `ID`.
+  AG-UI tool events and observability continue to report the durable `ID`
+  (unchanged). `store/storetest`'s tool-call contract test round-trips
+  `ProviderCallID` through `CreateToolCall`/`GetToolCall`/`SettleToolCall`.
 
 ## W5: typed ADK runtime, checkpoints and turn control
 

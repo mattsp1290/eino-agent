@@ -740,20 +740,117 @@ func canonicalToolObject(raw json.RawMessage) (json.RawMessage, error) {
 	return canonical, nil
 }
 
-// normalizeToolCallIDs assigns a durable call ID to every function_tool_call
-// block in msg that the provider left empty.
-func normalizeToolCallIDs(msg *einoschema.AgenticMessage, ids IDGenerator) {
-	if msg == nil {
-		return
+// publicizeToolCallIDs returns a shallow copy of messages with every
+// function_tool_call/function_tool_result/tool_search_result block's CallID
+// rewritten from its durable, store-wide-unique identity
+// (session.ToolCall.ID, minted by prepareToolCalls) to the provider-facing
+// identity that call was originally dispatched under
+// (session.ToolCall.ProviderCallID).
+//
+// This is the ONLY point in the pipeline where that substitution happens.
+// Everywhere else -- ADK's own tool dispatch via compose.GetToolCallID, this
+// package's store.GetToolCall lookups (adk_execution.go, adk_approval.go),
+// durableProjection's adk/durable id-set reconciliation, tool search -- keys
+// off the durable, always-unique ID uniformly, exactly as it did before this
+// call ID could diverge from what the provider sent. Only the literal wire
+// payload handed to the model provider (adkModel.dispatch's ProviderRequest)
+// must show the provider back the id it minted (or, when the provider left
+// CallID empty, the same durable ID it was assigned, since there is no
+// separate provider id to preserve) so a provider that pairs its own
+// call/result ids by value can still recognize its own history -- including
+// a provider that reissues the same indexed id (e.g. "call_0") across
+// unrelated turns, which is exactly what makes the durable ID unsafe to
+// reuse verbatim (see session.ToolCall.ProviderCallID).
+//
+// messages is never mutated in place: the original objects remain exactly
+// what ADK itself is tracking (durable-ID-keyed), so this package's own
+// bookkeeping (registerToolBatch, durableProjection's sameIDSet check, a
+// later dispatch's own re-projection) is unaffected by the substitution
+// performed here for the wire call alone.
+func publicizeToolCallIDs(ctx context.Context, store session.Store, messages []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
+	resolved := make(map[string]string)
+	resolve := func(durableID string) (string, error) {
+		if durableID == "" {
+			return "", nil
+		}
+		if public, ok := resolved[durableID]; ok {
+			return public, nil
+		}
+		call, err := store.GetToolCall(ctx, session.ToolCallID(durableID))
+		if err != nil {
+			return "", fmt.Errorf("resolve provider-facing tool call id for %s: %w", durableID, err)
+		}
+		public := call.ProviderCallID
+		if public == "" {
+			public = string(call.ID)
+		}
+		resolved[durableID] = public
+		return public, nil
 	}
-	for _, block := range msg.ContentBlocks {
-		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolCall || block.FunctionToolCall == nil {
+	out := make([]*einoschema.AgenticMessage, len(messages))
+	for i, msg := range messages {
+		if msg == nil {
 			continue
 		}
-		if block.FunctionToolCall.CallID == "" {
-			block.FunctionToolCall.CallID = string(ids.NewToolCallID())
+		var rewritten []*einoschema.ContentBlock
+		for blockIndex, block := range msg.ContentBlocks {
+			if block == nil {
+				continue
+			}
+			var durableID string
+			switch block.Type {
+			case einoschema.ContentBlockTypeFunctionToolCall:
+				if block.FunctionToolCall != nil {
+					durableID = block.FunctionToolCall.CallID
+				}
+			case einoschema.ContentBlockTypeFunctionToolResult:
+				if block.FunctionToolResult != nil {
+					durableID = block.FunctionToolResult.CallID
+				}
+			case einoschema.ContentBlockTypeToolSearchResult:
+				if block.ToolSearchFunctionToolResult != nil {
+					durableID = block.ToolSearchFunctionToolResult.CallID
+				}
+			}
+			if durableID == "" {
+				continue
+			}
+			public, err := resolve(durableID)
+			if err != nil {
+				return nil, err
+			}
+			if public == durableID {
+				continue
+			}
+			if rewritten == nil {
+				rewritten = append([]*einoschema.ContentBlock(nil), msg.ContentBlocks...)
+			}
+			cloned := *block
+			switch block.Type {
+			case einoschema.ContentBlockTypeFunctionToolCall:
+				call := *block.FunctionToolCall
+				call.CallID = public
+				cloned.FunctionToolCall = &call
+			case einoschema.ContentBlockTypeFunctionToolResult:
+				result := *block.FunctionToolResult
+				result.CallID = public
+				cloned.FunctionToolResult = &result
+			case einoschema.ContentBlockTypeToolSearchResult:
+				search := *block.ToolSearchFunctionToolResult
+				search.CallID = public
+				cloned.ToolSearchFunctionToolResult = &search
+			}
+			rewritten[blockIndex] = &cloned
 		}
+		if rewritten == nil {
+			out[i] = msg
+			continue
+		}
+		clonedMsg := *msg
+		clonedMsg.ContentBlocks = rewritten
+		out[i] = &clonedMsg
 	}
+	return out, nil
 }
 
 func mustJSON(value any) json.RawMessage {

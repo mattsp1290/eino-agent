@@ -597,13 +597,23 @@ func sortedKeys(set map[string]bool) []string {
 // transport), fully draining the response before returning: no live chunk
 // ever reaches ADK directly (see receiveModelStream's callers here).
 func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, input []*einoschema.AgenticMessage, onDelta func(int64, *einoschema.AgenticMessage)) (result modelStreamResult, err error) {
+	// The wire payload shows the provider its own tool-call ids back
+	// (publicizeToolCallIDs), not the durable, always-unique ids this
+	// package and ADK use internally: input itself is left untouched so
+	// this package's own bookkeeping (registerToolBatch, durableProjection's
+	// sameIDSet check, ADK's own tracked conversation) stays keyed on the
+	// durable id it has always used.
+	wireInput, err := publicizeToolCallIDs(ctx, m.host.store, input)
+	if err != nil {
+		return modelStreamResult{}, err
+	}
 	// d.record.Step, not Attempt, is what actually varies per physical
 	// dispatch under the invocation-per-physical-dispatch ledger model (see
 	// adk_retry.go): Attempt is pinned to 1 for every dispatch, so using it
 	// here would collide every retry/tool-loop dispatch's stream
 	// observation onto the same "attempt-1" correlation ID.
 	observation := m.host.startObservedStream(ctx, m.engine.snapshot, d.messageID, d.record.Step)
-	request := m.dispatchSnapshot().ProviderRequest(d.messageID, m.host.trace, input, m.execution.discoveredSnapshot())
+	request := m.dispatchSnapshot().ProviderRequest(d.messageID, m.host.trace, wireInput, m.execution.discoveredSnapshot())
 	request.System = d.record.System
 	request.IdempotencyKey = string(d.record.ID)
 	// A panic from the provider transport (either the initial
@@ -679,7 +689,6 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 			return nil, fmt.Errorf("%w: %s", errADKUnsupportedBlock, block.Type)
 		}
 	}
-	normalizeToolCallIDs(result, m.host.ids)
 	blockIDs := make([]string, len(result.ContentBlocks))
 	for index := range blockIDs {
 		blockIDs[index] = string(m.host.ids.NewPartID())
@@ -690,16 +699,20 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 	}
 	result = publicMsg
 	calls := functionToolCalls(result)
-	var callIDs []session.ToolCallID
-	if len(calls) != 0 {
-		callIDs = make([]session.ToolCallID, len(calls))
-		for i, call := range calls {
-			callIDs[i] = session.ToolCallID(call.CallID)
-		}
-	}
 	preparedCalls, err := m.host.prepareToolCalls(ctx, m.execution, m.engine.snapshot, dispatch.messageID, calls)
 	if err != nil {
 		return nil, err
+	}
+	// callIDs is read from preparedCalls (prepareToolCalls's own minted
+	// call.ID) after prepareToolCalls returns, never from calls[i].CallID
+	// captured beforehand: prepareToolCalls unconditionally overwrites each
+	// block's CallID with a fresh durable mint (see its own doc comment),
+	// so registerToolBatch below must key on that same durable id -- the
+	// one ADK will actually dispatch with -- not the provider's
+	// pre-mutation value.
+	callIDs := make([]session.ToolCallID, len(preparedCalls))
+	for i := range preparedCalls {
+		callIDs[i] = preparedCalls[i].call.ID
 	}
 	for _, prepared := range preparedCalls {
 		if prepared.middlewareErr != nil {

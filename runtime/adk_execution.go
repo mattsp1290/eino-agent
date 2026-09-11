@@ -609,7 +609,7 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	call := ToolCall{
 		ID: record.ID, SessionID: record.SessionID, RunID: record.RunID, MessageID: record.MessageID,
 		ResultMessageID: record.ResultMessageID, ResultPartID: record.ResultPartID, Name: record.Name, RequestedName: record.RequestedName,
-		Scope: t.tool.Scope, Pattern: record.Pattern, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
+		ProviderCallID: record.ProviderCallID, Scope: t.tool.Scope, Pattern: record.Pattern, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
 	}
 	if t.tool.InterruptPolicy != nil {
 		wasInterrupted, hasState, _ := compose.GetInterruptState[*adkToolInterruptState](ctx)
@@ -774,7 +774,7 @@ func (t *adkToolSearch) InvokableRun(ctx context.Context, arguments string, _ ..
 	}
 	call := ToolCall{
 		ID: record.ID, SessionID: record.SessionID, RunID: record.RunID, MessageID: record.MessageID,
-		Name: record.Name, RequestedName: record.RequestedName, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
+		Name: record.Name, RequestedName: record.RequestedName, ProviderCallID: record.ProviderCallID, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
 	}
 	if _, err := e.execution.executeToolSearchCall(ctx, e.snapshot, call, record); err != nil {
 		fatal = true

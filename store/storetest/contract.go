@@ -510,7 +510,12 @@ func Run(t *testing.T, factory Factory) {
 			ID: "call-1", SessionID: s.ID, RunID: r.ID, MessageID: msg.ID,
 			RequestPartID:   "request-part-1",
 			ResultMessageID: "result-message-1", ResultPartID: "result-part-1",
-			Name: "file_read", Input: json.RawMessage(`{}`), Status: session.ToolCallPending, RetrySafe: true,
+			// ProviderCallID is deliberately distinct from ID here: it
+			// proves the store round-trips the provider-facing identity
+			// (runtime.prepareToolCalls's captured block.CallID) separately
+			// from the durable, store-unique ID a provider's own id must
+			// never collide against (see session.ToolCall.ProviderCallID).
+			Name: "file_read", ProviderCallID: "call-1-provider", Input: json.RawMessage(`{}`), Status: session.ToolCallPending, RetrySafe: true,
 		}
 		createdAt := time.Now().UTC()
 		requestParts, err := session.EncodeContentParts(session.Content{
@@ -534,6 +539,12 @@ func Run(t *testing.T, factory Factory) {
 		}
 		if created.Call.ID != call.ID || created.Event.ID != createRequest.Event.ID || created.Event.ToolTransition != session.ToolTransitionPending {
 			t.Fatalf("create transition result = %#v", created)
+		}
+		if created.Call.ProviderCallID != call.ProviderCallID {
+			t.Fatalf("created call provider call id = %q, want %q", created.Call.ProviderCallID, call.ProviderCallID)
+		}
+		if fetched, err := subject.Store.GetToolCall(ctx, call.ID); err != nil || fetched.ProviderCallID != call.ProviderCallID {
+			t.Fatalf("GetToolCall provider call id = %q, err = %v, want %q", fetched.ProviderCallID, err, call.ProviderCallID)
 		}
 		if _, err := execution.AppendPart(ctx, createRequest.RequestPart); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("generic tool request part write = %v, want ErrConflict", err)
@@ -615,6 +626,9 @@ func Run(t *testing.T, factory Factory) {
 		}
 		if settled.Call.Status != session.ToolCallCompleted || settled.Event.ID != "event-terminal" || settled.Event.ToolTransition != session.ToolTransitionTerminal {
 			t.Fatalf("settle transition result = %#v", settled)
+		}
+		if settled.Call.ProviderCallID != call.ProviderCallID {
+			t.Fatalf("settled call provider call id = %q, want %q", settled.Call.ProviderCallID, call.ProviderCallID)
 		}
 		settleReplay, err := execution.SettleToolCall(ctx, settleRequest)
 		if err != nil {
