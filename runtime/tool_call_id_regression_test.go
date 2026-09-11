@@ -46,17 +46,19 @@ func functionCallAndResultBlocks(messages []*einoschema.AgenticMessage) (calls, 
 
 // TestProviderCallIDReuseAcrossRunsProducesDistinctRowsAndCollisionSafeWire
 // proves reconciliation item 2's "provider reuses call_0 ... across two
-// runs in one session" regression, combined with item 3's duplicate-id
+// runs in one session" regression, combined with item 1's duplicate-id
 // disambiguation: on base 48b9558, prepareToolCalls reused the provider's
 // own CallID verbatim as the durable, store-wide-unique tool_calls.id, so
 // the second run's reuse of "call_0" collided with the first run's row and
 // failed with session.ErrConflict. Fixed, both runs complete with distinct
 // minted rows; the provider still sees its own id back whenever it is
 // unambiguous (the first run's completed call, before the second run's own
-// call exists), and falls back to each call's own durable id once both
-// calls (from different runs, same session, same provider id) coexist in
-// one outgoing request -- see WC-I3 and
-// TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest.
+// call exists), and once both calls (from different runs, same session,
+// same provider id) coexist in one outgoing request, the EARLIEST one in
+// request order (run "one"'s, since it is earlier in session history) keeps
+// "call_0" verbatim -- unchanged from the earlier request that already sent
+// it -- while the later, colliding call falls back to its own durable id.
+// See TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest.
 func TestProviderCallIDReuseAcrossRunsProducesDistinctRowsAndCollisionSafeWire(t *testing.T) {
 	store := newAdmissionStore()
 	var mu sync.Mutex
@@ -109,20 +111,26 @@ func TestProviderCallIDReuseAcrossRunsProducesDistinctRowsAndCollisionSafeWire(t
 	// requests[3]: run "two"'s continuation. History now carries BOTH run
 	// "one"'s and run "two"'s completed calls, both ProviderCallID
 	// "call_0" -- an outright collision within this one outgoing request.
-	// publicizeToolCallIDs falls back to each call's own durable id rather
-	// than sending the ambiguous shared value.
+	// Run "one"'s call is earliest in request order, so it keeps "call_0"
+	// verbatim; run "two"'s call, appearing later, falls back to its own
+	// durable id instead of sending the ambiguous shared value.
 	lastCalls, lastResults := functionCallAndResultBlocks(requests[3].Messages)
 	if len(lastCalls) != 2 || len(lastResults) != 2 {
 		t.Fatalf("requests[3] = %d calls, %d results, want 2 and 2", len(lastCalls), len(lastResults))
 	}
-	if lastCalls[0] == lastCalls[1] || lastCalls[0] == "call_0" || lastCalls[1] == "call_0" {
-		t.Fatalf("requests[3] colliding provider id was not disambiguated: calls=%v", lastCalls)
+	if lastCalls[0] != "call_0" || lastCalls[1] == "call_0" || lastCalls[0] == lastCalls[1] {
+		t.Fatalf("requests[3] colliding provider id was not disambiguated (earliest-keeps): calls=%v", lastCalls)
 	}
-	sortedCalls, sortedResults := append([]string(nil), lastCalls...), append([]string(nil), lastResults...)
-	sort.Strings(sortedCalls)
-	sort.Strings(sortedResults)
-	if sortedCalls[0] != sortedResults[0] || sortedCalls[1] != sortedResults[1] {
+	if lastCalls[0] != lastResults[0] || lastCalls[1] != lastResults[1] {
 		t.Fatalf("requests[3] call ids %v do not pair with result ids %v", lastCalls, lastResults)
+	}
+	// Earliest-keeps prefix property (reconciliation item 1): requests[2]
+	// already sent run "one"'s call under "call_0"; that value must not
+	// change in requests[3] just because a new, colliding "call_0" entered
+	// history -- otherwise a provider's prompt-prefix cache over that
+	// earlier history would go stale.
+	if lastCalls[0] != firstCalls[0] {
+		t.Fatalf("earlier request's wire id changed once a later collision appeared: requests[2]=%v requests[3]=%v", firstCalls, lastCalls)
 	}
 }
 
@@ -133,7 +141,8 @@ func TestProviderCallIDReuseAcrossRunsProducesDistinctRowsAndCollisionSafeWire(t
 // distinct durable rows -- base 48b9558 fails the second with
 // "session store conflict" (the durable id collision) -- and once both
 // calls coexist in one outgoing request, the collision is disambiguated the
-// same way as the cross-run case.
+// same earliest-keeps way as the cross-run case: the first call keeps
+// "call_0", the second falls back to its own durable id.
 func TestProviderCallIDReuseAcrossTurnsWithinOneRunProducesDistinctRowsAndCollisionSafeWire(t *testing.T) {
 	var mu sync.Mutex
 	var requests []model.Request
@@ -184,10 +193,21 @@ func TestProviderCallIDReuseAcrossTurnsWithinOneRunProducesDistinctRowsAndCollis
 		t.Fatalf("requests[1] = %v/%v, want [call_0]/[call_0]", calls1, results1)
 	}
 	// requests[2]: third dispatch, both calls now share "call_0" in one
-	// request -- disambiguated to each call's own durable id.
+	// request. The first call (earliest in request order) keeps "call_0"
+	// verbatim -- unchanged from requests[1] -- and the second falls back to
+	// its own durable id.
 	calls2, results2 := functionCallAndResultBlocks(requests[2].Messages)
-	if len(calls2) != 2 || len(results2) != 2 || calls2[0] == calls2[1] || calls2[0] == "call_0" || calls2[1] == "call_0" {
-		t.Fatalf("requests[2] = %v/%v, want two distinct non-call_0 ids", calls2, results2)
+	if len(calls2) != 2 || len(results2) != 2 || calls2[0] != "call_0" || calls2[1] == "call_0" || calls2[0] == calls2[1] {
+		t.Fatalf("requests[2] = %v/%v, want [call_0, <distinct durable id>] (earliest-keeps)", calls2, results2)
+	}
+	if calls2[0] != results2[0] || calls2[1] != results2[1] {
+		t.Fatalf("requests[2] call ids %v do not pair with result ids %v", calls2, results2)
+	}
+	// Earliest-keeps prefix property: requests[1] already sent the first
+	// call under "call_0"; that value must not change in requests[2] just
+	// because a second, colliding "call_0" entered history.
+	if calls2[0] != calls1[0] {
+		t.Fatalf("earlier request's wire id changed once a later collision appeared: requests[1]=%v requests[2]=%v", calls1, calls2)
 	}
 }
 

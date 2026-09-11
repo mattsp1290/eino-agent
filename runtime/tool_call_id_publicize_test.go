@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cloudwego/eino/adk"
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -119,16 +121,22 @@ func TestPublicizeToolCallIDsDoesNotMutateInput(t *testing.T) {
 }
 
 // TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest proves
-// WC-I3: when two distinct durable ids in the SAME outgoing request would
-// resolve to the same provider-facing id -- whether from two calls in one
-// response, or from two calls in different turns that both reused an
-// indexed provider id -- both keep their own durable id on the wire instead
-// of an ambiguous shared value.
+// reconciliation item 1: when two or more distinct durable ids in the SAME
+// outgoing request would resolve to the same provider-facing id -- whether
+// from two calls in one response, from two calls in different turns that
+// both reused an indexed provider id, or from a provider id that equals
+// another call's durable id -- every call still gets a unique wire id.
+// Processing happens in request order: the earliest call with a given
+// provider id keeps it verbatim, and every later, colliding call falls back
+// to its own durable id, which is reserved store-wide and therefore can
+// never in turn be claimed as anyone else's wire id.
 func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testing.T) {
 	store := newAdmissionStore()
 	seedToolCall(store, session.ToolCall{ID: "tool-call-1", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
 	seedToolCall(store, session.ToolCall{ID: "tool-call-2", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
 	seedToolCall(store, session.ToolCall{ID: "tool-call-3", SessionID: "session-1", ProviderCallID: "call_1", Name: "echo"})
+	seedToolCall(store, session.ToolCall{ID: "tool-call-search", SessionID: "session-1", ProviderCallID: "call_2", Name: "search"})
+	seedToolCall(store, session.ToolCall{ID: "tool-call-echo2", SessionID: "session-1", ProviderCallID: "call_2", Name: "echo"})
 
 	t.Run("two calls in one response", func(t *testing.T) {
 		messages := []*einoschema.AgenticMessage{{
@@ -148,9 +156,12 @@ func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testi
 			out[0].ContentBlocks[1].FunctionToolCall.CallID,
 			out[0].ContentBlocks[2].FunctionToolCall.CallID,
 		}
-		want := []string{"tool-call-1", "tool-call-2", "call_1"}
+		// tool-call-1 is earliest in request order, so it keeps "call_0"
+		// verbatim; tool-call-2 collides with it and falls back to its own
+		// durable id; tool-call-3's "call_1" is unique and still rewrites.
+		want := []string{"call_0", "tool-call-2", "call_1"}
 		if got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
-			t.Fatalf("ids = %v, want %v (colliding pair keeps durable ids, unique one still rewrites)", got, want)
+			t.Fatalf("ids = %v, want %v (earliest keeps the provider id, later collision falls back)", got, want)
 		}
 	})
 
@@ -165,11 +176,110 @@ func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testi
 		if err != nil {
 			t.Fatal(err)
 		}
-		if out[0].ContentBlocks[0].FunctionToolCall.CallID != "tool-call-1" || out[1].ContentBlocks[0].FunctionToolResult.CallID != "tool-call-1" ||
+		// tool-call-1 appears first: it keeps "call_0" on both its call and
+		// result blocks. tool-call-2 collides and falls back to its own
+		// durable id on both its blocks.
+		if out[0].ContentBlocks[0].FunctionToolCall.CallID != "call_0" || out[1].ContentBlocks[0].FunctionToolResult.CallID != "call_0" ||
 			out[2].ContentBlocks[0].FunctionToolCall.CallID != "tool-call-2" || out[3].ContentBlocks[0].FunctionToolResult.CallID != "tool-call-2" {
 			t.Fatalf("cross-turn call_0 collision was not disambiguated: %#v", out)
 		}
 	})
+
+	t.Run("tool_search_result collision", func(t *testing.T) {
+		messages := []*einoschema.AgenticMessage{
+			toolCallBlockMessage("tool-call-search", "search", `{}`),
+			toolSearchResultBlockMessage("tool-call-search"),
+			toolCallBlockMessage("tool-call-echo2", "echo", `{}`),
+			toolResultBlockMessage("tool-call-echo2", "echo"),
+		}
+		out, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := out[0].ContentBlocks[0].FunctionToolCall.CallID
+		search := out[1].ContentBlocks[0].ToolSearchFunctionToolResult.CallID
+		call2 := out[2].ContentBlocks[0].FunctionToolCall.CallID
+		result2 := out[3].ContentBlocks[0].FunctionToolResult.CallID
+		if call != search || call2 != result2 || call == call2 {
+			t.Fatalf("collision not internally consistent: call=%q search=%q call2=%q result2=%q", call, search, call2, result2)
+		}
+		if call != "call_2" || call2 != "tool-call-echo2" {
+			t.Fatalf("ids = call=%q call2=%q, want call_2/tool-call-echo2 (the search call is earliest, so it keeps call_2)", call, call2)
+		}
+	})
+}
+
+// TestPublicizeToolCallIDsFallsBackWhenProviderIDEqualsAnotherCallsDurableID
+// proves LC-I1/OC-S3 (folded into reconciliation item 1's request-order
+// rule): a provider id is refused not only when an earlier call has already
+// sent it, but also when it is some other call's durable id -- durable ids
+// are reserved for their own call from the start of the request, regardless
+// of processing order, so a provider (or gateway) that echoes back an id it
+// saw minted earlier in history can never collide with that call's own
+// fallback.
+func TestPublicizeToolCallIDsFallsBackWhenProviderIDEqualsAnotherCallsDurableID(t *testing.T) {
+	t.Run("LC-I1: a fallback id can collide with a later call's provider id", func(t *testing.T) {
+		store := newAdmissionStore()
+		seedToolCall(store, session.ToolCall{ID: "tool-call-1", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
+		seedToolCall(store, session.ToolCall{ID: "tool-call-2", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
+		seedToolCall(store, session.ToolCall{ID: "tool-call-3", SessionID: "session-1", ProviderCallID: "tool-call-1", Name: "echo"})
+		messages := []*einoschema.AgenticMessage{
+			toolCallBlockMessage("tool-call-1", "echo", `{}`), toolResultBlockMessage("tool-call-1", "echo"),
+			toolCallBlockMessage("tool-call-2", "echo", `{}`), toolResultBlockMessage("tool-call-2", "echo"),
+			toolCallBlockMessage("tool-call-3", "echo", `{}`), toolResultBlockMessage("tool-call-3", "echo"),
+		}
+		out, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPairwiseDistinctWireIDs(t, out)
+		if out[0].ContentBlocks[0].FunctionToolCall.CallID != "call_0" {
+			t.Fatalf("tool-call-1 (earliest) = %q, want call_0", out[0].ContentBlocks[0].FunctionToolCall.CallID)
+		}
+	})
+
+	t.Run("OC-S3: a call's own provider id equals another call's durable id", func(t *testing.T) {
+		store := newAdmissionStore()
+		seedToolCall(store, session.ToolCall{ID: "tool-call-a", SessionID: "session-1", ProviderCallID: "tool-call-b", Name: "echo"})
+		seedToolCall(store, session.ToolCall{ID: "tool-call-b", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
+		seedToolCall(store, session.ToolCall{ID: "tool-call-c", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
+		messages := []*einoschema.AgenticMessage{
+			toolCallBlockMessage("tool-call-a", "echo", `{}`), toolResultBlockMessage("tool-call-a", "echo"),
+			toolCallBlockMessage("tool-call-b", "echo", `{}`), toolResultBlockMessage("tool-call-b", "echo"),
+			toolCallBlockMessage("tool-call-c", "echo", `{}`), toolResultBlockMessage("tool-call-c", "echo"),
+		}
+		out, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPairwiseDistinctWireIDs(t, out)
+		// tool-call-a's provider id ("tool-call-b") is reserved as
+		// tool-call-b's own durable id from the start of the request, so
+		// tool-call-a falls back even though it is processed first.
+		if out[0].ContentBlocks[0].FunctionToolCall.CallID != "tool-call-a" {
+			t.Fatalf("tool-call-a = %q, want tool-call-a (its own durable id, reserved by tool-call-b)", out[0].ContentBlocks[0].FunctionToolCall.CallID)
+		}
+		if out[2].ContentBlocks[0].FunctionToolCall.CallID != "call_0" {
+			t.Fatalf("tool-call-b (earliest claimant of call_0) = %q, want call_0", out[2].ContentBlocks[0].FunctionToolCall.CallID)
+		}
+	})
+}
+
+// assertPairwiseDistinctWireIDs asserts every call/result pair in messages
+// (built as alternating call/result messages, one block each) has matching
+// call/result ids, and that every pair's id is distinct from every other
+// pair's.
+func assertPairwiseDistinctWireIDs(t *testing.T, messages []*einoschema.AgenticMessage) {
+	t.Helper()
+	seen := map[string]bool{}
+	for i := 0; i+1 < len(messages); i += 2 {
+		call := messages[i].ContentBlocks[0].FunctionToolCall.CallID
+		result := messages[i+1].ContentBlocks[0].FunctionToolResult.CallID
+		if call != result || seen[call] {
+			t.Fatalf("pair %d wire ids call=%q result=%q (seen=%v): ambiguous on the wire", i/2, call, result, seen)
+		}
+		seen[call] = true
+	}
 }
 
 // TestPublicizeToolCallIDsFailsClosedOnMissingRow proves WC-S1: a block
@@ -265,4 +375,126 @@ func (s *countingGetToolCallStore) GetToolCall(ctx context.Context, id session.T
 	}
 	s.mu.Unlock()
 	return s.admissionStore.GetToolCall(ctx, id)
+}
+
+// transientOnceOnCompletedToolCallStore returns a transient (non-sentinel)
+// error the first time GetToolCall is asked about a completed tool call,
+// then succeeds on every subsequent read of that same call.
+type transientOnceOnCompletedToolCallStore struct {
+	*admissionStore
+	mu     sync.Mutex
+	failed bool
+}
+
+func (s *transientOnceOnCompletedToolCallStore) GetToolCall(ctx context.Context, id session.ToolCallID) (session.ToolCall, error) {
+	call, err := s.admissionStore.GetToolCall(ctx, id)
+	if err != nil || call.Status != session.ToolCallCompleted {
+		return call, err
+	}
+	s.mu.Lock()
+	already := s.failed
+	s.failed = true
+	s.mu.Unlock()
+	if !already {
+		return session.ToolCall{}, errors.New("transient connection reset")
+	}
+	return call, nil
+}
+
+// TestRunRetriesTransientToolCallIDLookupFailureAndCompletes proves
+// reconciliation item 2: a store.GetToolCall error that is not
+// session.ErrNotFound/session.ErrConflict is NOT wrapped in
+// errToolCallIDUnresolved, so it stays fully retryable under the run's
+// normal WithAttempts policy instead of failing the run outright.
+func TestRunRetriesTransientToolCallIDLookupFailureAndCompletes(t *testing.T) {
+	store := &transientOnceOnCompletedToolCallStore{admissionStore: newAdmissionStore()}
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		last := request.Messages[len(request.Messages)-1]
+		if last != nil && last.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(last) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call_0", "echo", `{}`))}, nil
+	})
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: streamer}),
+		WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{tools: []Tool{{
+			Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
+			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "hi"}, nil }),
+		}}})}),
+		WithAttempts(3),
+	)
+	result := startAndWaitRequest(t, orch, Request{SessionID: "transient-toolcallid-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if result.Status != session.RunCompleted || result.Error != nil {
+		t.Fatalf("result = %+v, want RunCompleted (a transient GetToolCall error must stay retryable, not fail closed)", result)
+	}
+}
+
+// unresolvedToolCallStore returns session.ErrNotFound for a completed tool
+// call once armed, counting how many times that injected failure is
+// actually read.
+type unresolvedToolCallStore struct {
+	*admissionStore
+	armed atomic.Bool
+	reads atomic.Int64
+}
+
+func (s *unresolvedToolCallStore) GetToolCall(ctx context.Context, id session.ToolCallID) (session.ToolCall, error) {
+	call, err := s.admissionStore.GetToolCall(ctx, id)
+	if err == nil && s.armed.Load() && call.Status == session.ToolCallCompleted {
+		s.reads.Add(1)
+		return session.ToolCall{}, session.ErrNotFound
+	}
+	return call, err
+}
+
+// TestRunFailsClosedOnceOnDeterministicToolCallIDLookupFailure proves LC-S1:
+// once a deterministic id-lookup failure (session.ErrNotFound) has struck,
+// it costs exactly one store read and one streamer dispatch -- neither the
+// retry policy (WithAttempts) nor a configured FailoverPolicy spends a
+// second attempt on it, because errToolCallIDUnresolved is refused by both
+// defaultShouldRetry and defaultShouldFailover.
+func TestRunFailsClosedOnceOnDeterministicToolCallIDLookupFailure(t *testing.T) {
+	store := &unresolvedToolCallStore{admissionStore: newAdmissionStore()}
+	var dispatches atomic.Int64
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		dispatches.Add(1)
+		last := request.Messages[len(request.Messages)-1]
+		if last != nil && last.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(last) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call_0", "echo", `{}`))}, nil
+	})
+	plan := mustTestRunPlan(RunPlanSpec{
+		Components: []PlanComponent{{Component: testPlanComponent("test-tools"), Tools: testPlanTools(staticToolRegistry{tools: []Tool{{
+			Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
+			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+				// Arm the injected failure only once this call has actually
+				// settled: the dispatch that created it must not be
+				// affected, only the later continuation dispatch that reads
+				// it back.
+				store.armed.Store(true)
+				return ToolResult{Output: "hi"}, nil
+			}),
+		}}})}},
+		Failover: &FailoverPolicy{Models: []model.Selection{{ProviderID: "fake", ModelID: "failover-model"}}},
+	})
+	orch := mustConfiguredOrchestrator(
+		WithStore(store),
+		WithModelResolver(resolvedModel{streamer: streamer}),
+		WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(staticRunPlanProvider{plan: plan}),
+		WithAttempts(3),
+	)
+	result := startAndWaitRequest(t, orch, Request{SessionID: "unresolved-toolcallid-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if result.Status != session.RunFailed || !errors.Is(result.Error, errToolCallIDUnresolved) {
+		t.Fatalf("result = %+v, want RunFailed with errToolCallIDUnresolved", result)
+	}
+	if got := store.reads.Load(); got != 1 {
+		t.Fatalf("store reads = %d, want exactly 1 (a deterministic failure must not burn the retry/failover budget)", got)
+	}
+	if got := dispatches.Load(); got != 1 {
+		t.Fatalf("streamer dispatches = %d, want exactly 1 (only the tool-call-producing dispatch reached the model)", got)
+	}
 }

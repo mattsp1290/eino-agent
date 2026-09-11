@@ -183,9 +183,9 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		// (ProviderCallID) purely so the wire request rebuilt for a later
 		// dispatch can show the provider its own id back (see
 		// publicizeToolCallIDs).
-		// A provider id that is not valid UTF-8, or that exceeds the bound
-		// every other durable identity string in this codebase is checked
-		// against (session.DiscoveryMaxIdentityBytes), is treated as if the
+		// A provider id that is not valid UTF-8, or that exceeds
+		// session.DiscoveryMaxIdentityBytes (reused here, though this value
+		// is not itself a discovery identity), is treated as if the
 		// provider had left CallID empty rather than persisted as-is:
 		// invalid UTF-8 would otherwise round-trip altered through the SQL
 		// stores' JSON encoding (encoding/json replaces it with U+FFFD), so
@@ -310,9 +310,9 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 // session.ToolCall.ProviderCallID: valid UTF-8 (so it round-trips through
 // the SQL stores' JSON encoding unaltered -- encoding/json otherwise
 // replaces invalid UTF-8 with U+FFFD) and no longer than
-// session.DiscoveryMaxIdentityBytes, the same bound every other durable
-// identity string in this codebase is checked against. An empty id is
-// valid (it means the provider left CallID unset).
+// session.DiscoveryMaxIdentityBytes -- reused as a convenient existing
+// bound, not because a provider call id is itself a discovery identity. An
+// empty id is valid (it means the provider left CallID unset).
 func validProviderCallID(id string) bool {
 	return len(id) <= session.DiscoveryMaxIdentityBytes && utf8.ValidString(id)
 }

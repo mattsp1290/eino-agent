@@ -180,8 +180,13 @@ type ToolCall struct {
 	// ProviderCallID carries the provider's own tool-call id (block.CallID
 	// as received) from prepareToolCalls through to the durable
 	// session.ToolCall record -- see session.ToolCall.ProviderCallID. ID is
-	// always the freshly runtime-minted, store-unique identity; this is the
-	// value that will be shown back to the provider on a later dispatch.
+	// always the freshly runtime-minted, store-unique identity. ID, not
+	// ProviderCallID, is what a later dispatch shows the provider back when
+	// ProviderCallID is empty (the provider omitted its own id, or sent one
+	// that failed validation) or collides with another call's provider-
+	// facing id in the same outgoing request -- see
+	// runtime.publicizeToolCallIDs's doc comment for exactly which case
+	// applies.
 	ProviderCallID string
 	Scope          ToolScope
 	Pattern        string

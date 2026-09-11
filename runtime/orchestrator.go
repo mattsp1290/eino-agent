@@ -42,11 +42,15 @@ type IDGenerator interface {
 	// NewToolCallID mints a durable tool-call identity. Besides its normal
 	// internal use, this exact value can reach the model provider on the
 	// wire: publicizeToolCallIDs sends it verbatim as a call's provider-
-	// facing id whenever the provider itself left CallID empty (see
-	// session.ToolCall.ProviderCallID). An implementation whose minted
-	// format would violate a provider's own id rules (for example Mistral,
-	// which requires exactly 9 alphanumeric characters) can surface that
-	// constraint to such a provider.
+	// facing id when (a) the provider left CallID empty, (b) the provider's
+	// id was not valid UTF-8 or exceeded session.DiscoveryMaxIdentityBytes
+	// (prepareToolCalls/validProviderCallID stores it as absent, the same as
+	// case (a)), or (c) the provider's id collides with another call's
+	// provider-facing id in this same outgoing request (see
+	// publicizeToolCallIDs's "Duplicate provider ids" doc). An
+	// implementation whose minted format would violate a provider's own id
+	// rules (for example Mistral, which requires exactly 9 alphanumeric
+	// characters) can surface that constraint to such a provider.
 	NewToolCallID() session.ToolCallID
 	NewEventID() session.EventID
 	NewEpochID() session.EpochID
@@ -748,16 +752,23 @@ func canonicalToolObject(raw json.RawMessage) (json.RawMessage, error) {
 	return canonical, nil
 }
 
-// errToolCallIDUnresolved wraps a publicizeToolCallIDs failure: a
-// function_tool_call/function_tool_result/tool_search_result block's
-// durable CallID has no tool_calls row (or resolves to a row belonging to a
-// different session), so the rewrite cannot proceed. Through the public API
-// this can only happen from direct store writes or imported history --
+// errToolCallIDUnresolved wraps a publicizeToolCallIDs failure whose id
+// lookup returned a deterministic durable-consistency error -- session.
+// ErrNotFound (a function_tool_call/function_tool_result/tool_search_result
+// block's durable CallID has no tool_calls row) or session.ErrConflict (the
+// row exists but under a conflicting identity), including the
+// cross-session check (the row belongs to a different session) -- so the
+// rewrite cannot proceed. It deliberately does NOT wrap any other
+// store.GetToolCall error (a transient read failure, for example): those
+// are returned unwrapped and stay retryable/failover-eligible under the
+// run's normal policy, exactly like every other store error in begin. Only
+// ErrNotFound/ErrConflict are worth failing closed over: through the public
+// API they can only happen from direct store writes or imported history --
 // rejectNonCallerBlocks refuses caller-authored tool blocks, and context
-// contributions are text-only -- so it is a genuine durable-consistency
-// failure, not a transient one. Failing the dispatch closed is deliberate;
-// defaultShouldRetry/defaultShouldFailover both refuse to retry or fail
-// over an error matching this sentinel (see their doc comments), so a
+// contributions are text-only -- so they are genuinely durable-consistency
+// failures, not transient ones. Failing the dispatch closed for those is
+// deliberate; defaultShouldRetry/defaultShouldFailover both refuse to retry
+// or fail over an error matching this sentinel (see their doc comments), so a
 // deterministic not-found does not burn every retry/failover attempt.
 var errToolCallIDUnresolved = errors.New("tool call id could not be resolved to a provider-facing identity")
 
@@ -798,10 +809,10 @@ func (c *toolCallIDCache) put(id session.ToolCallID, public string) {
 // rewritten from its durable, store-wide-unique identity
 // (session.ToolCall.ID, minted by prepareToolCalls) to the provider-facing
 // identity that call was originally dispatched under
-// (session.ToolCall.ProviderCallID) -- except when two or more distinct
-// durable ids in this same outgoing request would resolve to the same
-// provider-facing id (see below), in which case those calls keep their
-// durable id instead.
+// (session.ToolCall.ProviderCallID) -- except when sending that string would
+// collide with another call's wire id in this same outgoing request (see
+// "Duplicate provider ids" below), in which case that call keeps its durable
+// id instead.
 //
 // This is the ONLY point in the pipeline where that substitution happens,
 // applied exactly once per physical dispatch (adkModel.begin, before any
@@ -809,28 +820,39 @@ func (c *toolCallIDCache) put(id session.ToolCallID, public string) {
 // are the same bytes; see adkModel.begin's doc comment). Everywhere else --
 // ADK's own tool dispatch via compose.GetToolCallID, this package's
 // store.GetToolCall lookups (adk_execution.go, adk_approval.go),
-// durableProjection's adk/durable id-set reconciliation, tool search -- keys
-// off the durable, always-unique ID uniformly, exactly as it did before this
-// call ID could diverge from what the provider sent. Only the literal wire
-// payload handed to the model provider must show the provider back the id
-// it minted (or, when the provider left CallID empty, the same durable ID
+// durableProjection's adk/durable id-set reconciliation, tool search --
+// keys off the durable, always-unique ID uniformly, exactly as it did before
+// this call ID could diverge from what the provider sent. Only the literal
+// wire payload handed to the model provider must show the provider back the
+// id it minted (or, when the provider left CallID empty, the same durable ID
 // it was assigned, since there is no separate provider id to preserve) so a
 // provider that pairs its own call/result ids by value can still recognize
 // its own history -- including a provider that reissues the same indexed id
 // (e.g. "call_0") across unrelated turns, which is exactly what makes the
 // durable ID unsafe to reuse verbatim (see session.ToolCall.ProviderCallID).
 //
-// Duplicate provider ids: a provider id is sent only when it is unique
-// within this outgoing request, across every message (not just the current
-// turn's own calls) -- a provider that reissues the same indexed id across
-// unrelated turns (or, rarer, emits two calls sharing one id in a single
-// response) would otherwise put two ambiguous call/result pairs on the wire
-// under the same id, which a provider that pairs them by value cannot tell
-// apart, and which providers that require unique ids (e.g. Anthropic's
-// Messages API) reject outright. Every call whose provider id collides with
-// another call's in this request is sent with its own durable id instead
-// (unique store-wide, so never itself ambiguous) on both its call block and
-// its result block.
+// Duplicate provider ids: every distinct durable id referenced anywhere in
+// this outgoing request (across every message, not just the current turn's
+// own calls) is processed in request order -- the order its first block
+// appears in messages. A call sends its resolved provider id on the wire
+// only if (a) no earlier call in this same request has already claimed that
+// exact string, and (b) the string is not the durable id of any call
+// referenced in this request (every durable id is reserved for its own call
+// from the start, so no provider id can ever be mistaken for another call's
+// fallback); otherwise the call sends its own durable id -- reserved by rule
+// (b) above, so it can never in turn be claimed as some other call's
+// provider id either. This makes the wire unique by construction -- a
+// provider that reissues the same indexed id
+// across unrelated turns (or, rarer, emits two calls sharing one id in a
+// single response) would otherwise put two ambiguous call/result pairs on
+// the wire under the same id, which a provider that pairs them by value
+// cannot tell apart, and which providers that require unique ids (e.g.
+// Anthropic's Messages API) reject outright. Processing in request order
+// also means the earliest call with a given provider id always keeps it:
+// once a request has sent a call's provider id verbatim, a later request
+// that introduces a colliding call never changes that already-sent value,
+// which keeps provider-side prompt-prefix caches (llama.cpp, vLLM, Ollama)
+// valid as history grows.
 //
 // sessionID fences every resolved session.ToolCall against the turn's own
 // session: GetToolCall is store-global, so without this check a durable id
@@ -865,7 +887,16 @@ func publicizeToolCallIDs(ctx context.Context, store session.Store, sessionID se
 		}
 		call, err := store.GetToolCall(ctx, session.ToolCallID(durableID))
 		if err != nil {
-			return "", fmt.Errorf("%w: resolve provider-facing tool call id for %s: %v", errToolCallIDUnresolved, durableID, err)
+			// Only a deterministic durable-consistency failure -- the row
+			// genuinely does not exist, or exists under a conflicting
+			// identity -- is wrapped in the non-retryable sentinel. Any
+			// other store error (a transient read failure, for example)
+			// stays retryable/failover-eligible under the run's normal
+			// policy: see errToolCallIDUnresolved's doc comment.
+			if errors.Is(err, session.ErrNotFound) || errors.Is(err, session.ErrConflict) {
+				return "", fmt.Errorf("%w: resolve provider-facing tool call id for %s: %w", errToolCallIDUnresolved, durableID, err)
+			}
+			return "", fmt.Errorf("resolve provider-facing tool call id for %s: %w", durableID, err)
 		}
 		if sessionID != "" && call.SessionID != sessionID {
 			return "", fmt.Errorf("%w: tool call %s belongs to session %s, not %s", errToolCallIDUnresolved, durableID, call.SessionID, sessionID)
@@ -902,11 +933,12 @@ func publicizeToolCallIDs(ctx context.Context, store session.Store, sessionID se
 	}
 
 	// First pass: resolve every distinct durable id referenced anywhere in
-	// messages, and track how many durable ids resolve to the same
-	// provider-facing id (owners). This must see the whole request before
-	// any block is rewritten -- a collision can span two calls in different
-	// messages (different turns), not just two calls in the same response.
-	owners := make(map[string]map[string]bool)
+	// messages, in the order its first block appears (request order). This
+	// must see the whole request before any block is rewritten -- a
+	// collision can span two calls in different messages (different turns),
+	// not just two calls in the same response.
+	var durableOrder []string
+	orderSeen := make(map[string]bool)
 	for _, msg := range messages {
 		if msg == nil {
 			continue
@@ -916,27 +948,38 @@ func publicizeToolCallIDs(ctx context.Context, store session.Store, sessionID se
 			if durableID == "" {
 				continue
 			}
-			public, err := resolve(durableID)
-			if err != nil {
+			if _, err := resolve(durableID); err != nil {
 				return nil, err
 			}
-			if owners[public] == nil {
-				owners[public] = make(map[string]bool)
+			if !orderSeen[durableID] {
+				orderSeen[durableID] = true
+				durableOrder = append(durableOrder, durableID)
 			}
-			owners[public][durableID] = true
 		}
 	}
+	// Second pass: assign each distinct durable id its wire value, in
+	// request order. durableOrder (equivalently orderSeen) is also every
+	// durable id's own reservation -- rule (b) above -- since a call is
+	// always entitled to send its own durable id as a fallback.
+	wireFor := make(map[string]string, len(durableOrder))
+	claimed := make(map[string]bool, len(durableOrder))
+	for _, durableID := range durableOrder {
+		candidate := resolved[durableID]
+		if candidate != durableID && (claimed[candidate] || orderSeen[candidate]) {
+			// Either an earlier call in this request already sent this
+			// exact string (rule a), or it is another call's durable id
+			// (rule b): both make it ambiguous on the wire, so fall back to
+			// this call's own durable id, which is unique store-wide.
+			candidate = durableID
+		}
+		wireFor[durableID] = candidate
+		claimed[candidate] = true
+	}
 	publicFor := func(durableID string) string {
-		public, ok := resolved[durableID]
-		if !ok {
-			return durableID
+		if public, ok := wireFor[durableID]; ok {
+			return public
 		}
-		if len(owners[public]) > 1 {
-			// Ambiguous on the wire under the shared provider id: fall back
-			// to the durable id, which is unique store-wide.
-			return durableID
-		}
-		return public
+		return durableID
 	}
 
 	out := make([]*einoschema.AgenticMessage, len(messages))

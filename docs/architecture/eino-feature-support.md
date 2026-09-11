@@ -480,29 +480,42 @@ Status: landed; W1 scaffolding kept green.
     request ledger (`ModelRequestRecord.Messages`/`ContentSHA256`, the
     `ModelRequestedNotice.ContentHash`) and what `adkModel.dispatch` sends
     over the wire. The two can never diverge: there is no second rewrite.
-  - **Duplicate provider ids.** A provider id is put on the wire only when
-    it is unique within that outgoing request, across every message (not
-    just the current turn's own calls) -- a provider that reissues the same
-    indexed id across unrelated turns, or that emits two calls sharing one
-    id in a single response, would otherwise produce two ambiguous
-    call/result pairs under the same id. Every call whose provider id
-    collides with another call's in that request is sent with its own
-    durable id instead (on both its call block and its result block,
-    deterministically), which stays unique store-wide.
+  - **Duplicate provider ids.** Every distinct durable id referenced
+    anywhere in the outgoing request (across every message, not just the
+    current turn's own calls) is processed in request order -- the order
+    its first block appears. A call's provider id goes on the wire only if
+    (a) no earlier call in that same request has already sent that exact
+    string, and (b) the string is not the durable id of any call referenced
+    in the request (every durable id is reserved for its own call from the
+    start, so a provider id can never be mistaken for another call's
+    fallback); otherwise the call sends its own durable id instead (on both
+    its call block and its result block, deterministically), which the same
+    reservation keeps from ever colliding with another call's wire id in
+    turn. Processing in request order also means the earliest call with a
+    given provider id keeps it: once a request has sent a call's provider id
+    verbatim, a later request that introduces a colliding call never changes
+    that already-sent value, which keeps provider-side prompt-prefix caches
+    (llama.cpp, vLLM, Ollama) valid as history grows.
   - **Failing closed.** A tool-call block with no `tool_calls` row (only
     reachable via direct store writes or imported history, since
     `rejectNonCallerBlocks` refuses caller-authored tool blocks and context
-    contributions are text-only) fails the dispatch with
-    `errToolCallIDUnresolved`, a sentinel `defaultShouldRetry`/
-    `defaultShouldFailover` both refuse to retry or fail over -- a
-    deterministic, durable-consistency failure does not burn the run's
-    retry/failover budget.
+    contributions are text-only), or one whose row belongs to a different
+    session, fails the dispatch with `errToolCallIDUnresolved` -- but only
+    when the underlying store lookup itself failed deterministically
+    (`session.ErrNotFound` or `session.ErrConflict`, wrapped with `%w` so
+    the cause stays inspectable); a sentinel `defaultShouldRetry`/
+    `defaultShouldFailover` both refuse to retry or fail over, since a
+    deterministic, durable-consistency failure would only burn the run's
+    retry/failover budget for nothing. Any other store error (a transient
+    read failure, for example) is returned unwrapped and stays fully
+    retryable/failover-eligible under the run's normal policy.
   - **Provider id validation.** `prepareToolCalls` treats a captured
     provider id as absent (falls back to the minted id) unless it is valid
-    UTF-8 and no longer than `session.DiscoveryMaxIdentityBytes` -- the same
-    bound every other durable identity string in this codebase is checked
-    against -- so an invalid or oversized id from a misbehaving provider
-    never round-trips altered through the SQL stores' JSON encoding.
+    UTF-8 and no longer than `session.DiscoveryMaxIdentityBytes` -- reused
+    here as a convenient existing bound, not because a provider call id is
+    itself a discovery identity -- so an invalid or oversized id from a
+    misbehaving provider never round-trips altered through the SQL stores'
+    JSON encoding.
   - **Model-visible body vs. wire id.** The model reads the provider's own
     id on the wire `function_tool_call`/`function_tool_result`/
     `tool_search_result` block's `CallID`. The result's model-visible body

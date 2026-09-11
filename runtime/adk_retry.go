@@ -63,8 +63,16 @@ func defaultShouldRetry(_ context.Context, retryCtx *adk.TypedRetryContext[*eino
 	// A tool-call id that publicizeToolCallIDs could not resolve is a
 	// durable-consistency failure, not a transient one (see
 	// errToolCallIDUnresolved's doc comment): it fails the same way on
-	// every attempt, so retrying it only burns the attempt budget and
-	// writes an extra ledger row/attempt_replaced event per try.
+	// every attempt. publicizeToolCallIDs runs at the very top of begin,
+	// before prepareModelRequest, so an unrefused retry here would not
+	// write an extra ledger row or attempt_replaced event -- it costs
+	// nothing durable. What it does cost is real: one wasted store read per
+	// attempt, the retry policy's exponential backoff between attempts, and
+	// the sentinel itself -- once every attempt is exhausted, ADK's own
+	// "exceeds max retries: last error: ..." wrapping around the final
+	// attempt's error can leave errors.Is(result.Error,
+	// errToolCallIDUnresolved) false by the time the run's caller inspects
+	// it, even though this same deterministic failure caused every attempt.
 	if errors.Is(retryCtx.Err, errToolCallIDUnresolved) {
 		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
 	}

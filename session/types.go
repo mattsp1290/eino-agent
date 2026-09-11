@@ -287,18 +287,22 @@ type ToolCall struct {
 	RequestedName string
 	// ProviderCallID is the tool-call identity exactly as the provider sent
 	// it (block.CallID at dispatch time), or empty when the provider left
-	// its own CallID empty. ID is always a freshly runtime-minted,
-	// store-wide-unique identity (see runtime.prepareToolCalls) -- it is
-	// never reused verbatim from the provider, because some providers
-	// (llama.cpp/Ollama/vLLM-style OpenAI-compatible endpoints, replayed
-	// fixtures) reissue the same indexed id (e.g. "call_0") across
-	// unrelated responses, which would collide against the store's
-	// tool_calls.id uniqueness constraint. ProviderCallID is preserved
-	// separately so the wire request rebuilt for the provider on a later
-	// dispatch (runtime.publicizeToolCallIDs) can still show the provider
-	// its own id for call/result correlation, even though the durable
-	// record and every internal (ADK/ToolCall-store) reference to this
-	// call use ID.
+	// its own CallID empty, or when the id it sent was not valid UTF-8 or
+	// exceeded DiscoveryMaxIdentityBytes (runtime.validProviderCallID treats
+	// either as if CallID had been left empty). ID is always a freshly
+	// runtime-minted, store-wide-unique identity (see
+	// runtime.prepareToolCalls) -- it is never reused verbatim from the
+	// provider, because some providers (llama.cpp/Ollama/vLLM-style
+	// OpenAI-compatible endpoints, replayed fixtures) reissue the same
+	// indexed id (e.g. "call_0") across unrelated responses, which would
+	// collide against the store's tool_calls.id uniqueness constraint.
+	// ProviderCallID is preserved separately so the wire request rebuilt
+	// for the provider on a later dispatch (runtime.publicizeToolCallIDs)
+	// can still show the provider its own id back for call/result
+	// correlation -- unless that id collides with another call's
+	// provider-facing id in the same outgoing request, in which case ID is
+	// sent instead (see publicizeToolCallIDs's doc comment). Every internal
+	// (ADK/ToolCall-store) reference to this call always uses ID.
 	ProviderCallID string
 	Pattern        string
 	Input          json.RawMessage
