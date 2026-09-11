@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -14,16 +15,28 @@ import (
 
 // This file proves round-six reconciliation's four Critical/Important tests
 // (reviews/.../fix-pass-5/reconciliation.md item 4) and item 8's checkpoint-
-// TurnID-seeding guard. All four SQLite tests drive the real
-// Resume -> reconcileCrashedRun -> ResumeRun path with no hand-written
-// checkpoint envelopes: direct store calls only ever construct the
-// PRE-crash durable state (exactly like every earlier round's reconciliation
-// tests -- w5_round3_reconciliation_test.go's dangling-turn tests, and the
-// checkpoint-precedence-reviewer's own C1 probe, already establish this as
-// the accepted way to simulate "what a crashed process left behind" without
-// literally crashing a process); the crash itself is simulated by claiming
-// the run with a near-instantly-expiring lease, then letting real wall-clock
-// time pass, exactly as w5_round3_reconciliation_test.go already does.
+// TurnID-seeding guard. Tests (a) and (d) drive Start/Enqueue/Stop/Resume/
+// ResumeRun end to end through the production orchestrator. Tests (b) and
+// (c) construct the PRE-crash durable state directly -- including a
+// checkpoint envelope shaped exactly as a genuine ADK tool-interrupt pause
+// promotes one (Kind=Runner, HasRunnerState=true, TurnID naming the real
+// admitted turn) -- because the crash window they simulate (mid a SECOND
+// turn, after a first turn already resumed and completed once) is not one a
+// live loop can be stopped inside: direct store writes here only ever
+// construct a shape production itself can write, exactly like every earlier
+// round's reconciliation tests (w5_round3_reconciliation_test.go's
+// dangling-turn tests, and the checkpoint-precedence-reviewer's own C1
+// probe) already establish as the accepted way to simulate "what a crashed
+// process left behind" without literally crashing a process. Their own
+// turn1 completion uses the store's CompleteTurn directly, not
+// turnLoopCoordinator.completeTurn's production path; the coverage that
+// specific method's own round-six change (no longer retiring its promoted
+// checkpoint) needs lives instead in the production-driven
+// TestCompleteTurnLeavesPromotedCheckpointIntactInsideLiveRun
+// (turn_loop_checkpoint_test.go) -- round-seven fix-pass-6 item 3/RT-2. The
+// crash itself is simulated by claiming the run with a near-instantly-
+// expiring lease, then letting real wall-clock time pass, exactly as
+// w5_round3_reconciliation_test.go already does.
 
 // TestResumeRunAfterGracefulStopWithQueuedInputSurvivesCrashAgainstSQLite
 // proves round-six reconciliation item 4(a) (checkpoint-precedence-
@@ -399,6 +412,51 @@ func TestResumeRunAcceptsAfterCrashRightAfterCompleteTurnWithStaleCheckpointAgai
 	}
 }
 
+// TestStopAbandonAgainstLiveLoopReportsErrInvalidOrchestrator proves
+// round-seven fix-pass-6 item 1 (MG-I1/RT-1): StopPolicy.Abandon must never
+// silently degrade to an ordinary stop when this process still has a live
+// loop for runID -- it must report ErrInvalidOrchestrator instead, exactly
+// as docs/consumer-guide.md documents, leaving the live loop's own dispatch
+// completely unaffected (Graceful/Immediate remain the way to stop a live
+// loop; Abandon is reserved for a run genuinely paused with no driver).
+func TestStopAbandonAgainstLiveLoopReportsErrInvalidOrchestrator(t *testing.T) {
+	ctx := context.Background()
+	dispatched := make(chan struct{})
+	release := make(chan struct{})
+	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		close(dispatched)
+		<-release
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	}))
+	defer cleanup()
+
+	sessionID := session.ID("abandon-live-loop-session")
+	handle, err := orch.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	select {
+	case <-dispatched:
+	case <-time.After(3 * time.Second):
+		t.Fatal("run never dispatched")
+	}
+
+	if err := orch.Stop(ctx, handle.RunID(), StopPolicy{Abandon: true, Cause: "operator abandon against a live loop"}); !errors.Is(err, ErrInvalidOrchestrator) {
+		t.Fatalf("Stop(Abandon) against a live loop = %v, want ErrInvalidOrchestrator", err)
+	}
+	// The refusal must not have touched the live dispatch at all: letting
+	// it proceed normally must still complete the run.
+	close(release)
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted || result.Error != nil {
+		t.Fatalf("result after refused abandon = %+v, want the live dispatch to complete normally", result)
+	}
+	run, err := orch.store.GetRun(ctx, result.RunID)
+	if err != nil || run.Status != session.RunCompleted {
+		t.Fatalf("run after refused abandon = %+v, err=%v, want completed", run, err)
+	}
+}
+
 // TestStopAbandonSettlesPausedRunAndFreesSessionForNewStart proves round-six
 // reconciliation item 4(d): the "Stop-with-abandon" operator escape settles
 // a durably paused run terminally interrupted, retires its checkpoints, and
@@ -413,8 +471,14 @@ func TestStopAbandonSettlesPausedRunAndFreesSessionForNewStart(t *testing.T) {
 			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
 		}),
 	}
+	// A monotonic per-dispatch call id: the second run's own tool call must
+	// not collide with the abandoned run's already-committed "call-1" row
+	// (tool_calls ids are unique store-wide, not scoped per run) -- see
+	// round-seven fix-pass-6 item 8/RT S8.
+	var dispatches int
 	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
-		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "gate", `{}`))}, nil
+		dispatches++
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall(fmt.Sprintf("call-%d", dispatches), "gate", `{}`))}, nil
 	}))
 	defer cleanup()
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
@@ -447,12 +511,19 @@ func TestStopAbandonSettlesPausedRunAndFreesSessionForNewStart(t *testing.T) {
 	}
 
 	// A fresh Start on the same session must succeed now: the session is no
-	// longer busy.
+	// longer busy. The streamer immediately requests approval again, so
+	// this second run genuinely pauses rather than completing -- assert
+	// that explicitly rather than discarding the result (round-seven
+	// fix-pass-6 item 8/RT S8: the discarded result was silently
+	// RunFailed, a session store conflict, before the unique call id above).
 	second, err := orch.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage("hello again"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatalf("Start after abandon error = %v", err)
 	}
-	<-second.Done()
+	secondResult := <-second.Done()
+	if secondResult.Status != session.RunPaused || !secondResult.Interrupted {
+		t.Fatalf("second run after abandon = %+v, want paused (a genuine tool-interrupt pause, not a failure)", secondResult)
+	}
 
 	// A second Stop(Abandon) against the now-terminal (not paused) original
 	// run reports the standard ErrInvalidOrchestrator rather than silently

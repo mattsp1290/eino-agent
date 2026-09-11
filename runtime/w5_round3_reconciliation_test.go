@@ -121,6 +121,14 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 	if resumed.Status != session.RunPaused {
 		t.Fatalf("resumed result after injected StartRun failure = %+v, want paused (compensating repause)", resumed)
 	}
+	// Round-seven fix-pass-6 item 4/MG-I5: Handle's contract (types.go)
+	// requires AwaitPause to yield a value whenever Done() reports
+	// session.RunPaused -- resumeStartFailureRepause must honor that
+	// exactly like every other pause path (runReconcileCrashedRun already
+	// does).
+	if _, ok := <-resumeHandle.AwaitPause(); !ok {
+		t.Fatal("AwaitPause closed with no value after injected StartRun failure, want a value (Done() reported RunPaused)")
+	}
 
 	// The run must not be stranded: GetRun shows paused with no live
 	// lease, and a further ResumeRun (against the real, non-failing store)
@@ -281,9 +289,14 @@ func TestResumeReconcilesDanglingAdmittedTurnAfterCrash(t *testing.T) {
 	if result.Status != session.RunInterrupted || !result.Interrupted {
 		t.Fatalf("reconciled result = %+v, want interrupted (no checkpoint to resume from)", result)
 	}
+	// The run above is already terminal (RunInterrupted): round-six
+	// reconciliation item 2 forces any turn ReconcileInterruptedTurn left
+	// TurnInterrupted to TurnFailed in that same terminal SettleRun, since
+	// TurnInterrupted's usual "still resumable" meaning no longer applies
+	// once the run itself can never be resumed (see session.ApplyFailTurn).
 	turn, err := orch.store.GetTurn(ctx, "crash-turn-1")
-	if err != nil || turn.State != session.TurnInterrupted {
-		t.Fatalf("dangling turn after reconciliation = %#v, err=%v, want interrupted", turn, err)
+	if err != nil || turn.State != session.TurnFailed {
+		t.Fatalf("dangling turn after reconciliation = %#v, err=%v, want failed (its run is terminal)", turn, err)
 	}
 	// The item must NOT be requeued (that would let a fresh AdmitTurn mint
 	// a second, duplicate user message from the same content on a later

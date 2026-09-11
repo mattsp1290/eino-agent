@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"testing"
+	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -87,6 +88,107 @@ func TestTurnLoopChecksPointsAndResumesInterruptedTool(t *testing.T) {
 	finalRun, err := store.GetRun(context.Background(), result.RunID)
 	if err != nil || finalRun.Status != session.RunCompleted {
 		t.Fatalf("final run = %+v, err=%v", finalRun, err)
+	}
+}
+
+// TestCompleteTurnLeavesPromotedCheckpointIntactInsideLiveRun proves round-
+// six reconciliation item 2 (round-seven fix-pass-6 item 3/RT-2's own
+// completeTurn coverage gap): turnLoopCoordinator.completeTurn -- driven for
+// real by a genuine ADK tool-interrupt pause, ResumeRun, and a second queued
+// turn under the SAME live loop -- must leave its own now-stale promoted
+// checkpoint in place rather than retiring it immediately (the shipped
+// round-five behavior this branch removed). This is the exact inverse of
+// the deleted TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately: it
+// fails the moment anyone re-adds completeTurn's own retirement, because the
+// checkpoint would already be gone by the time turn2 is mid-dispatch, still
+// inside the same live Run().
+func TestCompleteTurnLeavesPromotedCheckpointIntactInsideLiveRun(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	var executions int
+	gate := Tool{
+		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"},
+		InterruptPolicy: pausingInterruptPolicy{},
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executions++
+			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
+		}),
+	}
+	turn2Dispatched := make(chan struct{})
+	release := make(chan struct{})
+	var calls int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "gate", `{}`))}, nil
+		case 2:
+			return []*einoschema.AgenticMessage{agenticAssistantText("turn1 answered")}, nil
+		default:
+			close(turn2Dispatched)
+			<-release
+			return []*einoschema.AgenticMessage{agenticAssistantText("turn2 answered")}, nil
+		}
+	}))
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
+
+	ctx := context.Background()
+	handle, err := orch.Start(ctx, Request{SessionID: "session-1", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunPaused || !result.Interrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	pause, ok := <-handle.AwaitPause()
+	if !ok || len(pause.InterruptContexts) != 1 {
+		t.Fatalf("pause = %+v, ok=%v", pause, ok)
+	}
+	if _, found, err := store.ReadPromotedCheckpoint(ctx, result.RunID); err != nil || !found {
+		t.Fatalf("promoted checkpoint before resume: found=%v err=%v", found, err)
+	}
+	// Durably queue the second turn's content BEFORE resuming: ResumeRun's
+	// own drainQueuedInbox picks this up and drives it as turn2 under the
+	// SAME fence, once turn1's resumed dispatch completes.
+	if _, err := orch.Enqueue(ctx, "session-1", EnqueueRequest{
+		RunID: result.RunID, IdempotencyKey: "turn2-key", Message: TextUserMessage("second"),
+	}); err != nil {
+		t.Fatalf("Enqueue error = %v", err)
+	}
+
+	resumeHandle, err := orch.ResumeRun(ctx, result.RunID, ResumeRequest{
+		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun error = %v", err)
+	}
+	select {
+	case <-turn2Dispatched:
+	case <-time.After(3 * time.Second):
+		t.Fatal("turn2 never dispatched")
+	}
+	// Turn1 has now completed for real, through turnLoopCoordinator.
+	// completeTurn, inside this still-live Run() (turn2 is mid-dispatch,
+	// blocked on release below): its promoted checkpoint (revision 1,
+	// TurnID=turn1) must still be there -- stale by fact, not retired.
+	if _, found, err := store.ReadPromotedCheckpoint(ctx, result.RunID); err != nil || !found {
+		t.Fatalf("promoted checkpoint after turn1 completes, mid-run: found=%v err=%v, want still present", found, err)
+	}
+	if executions != 1 {
+		t.Fatalf("tool executions = %d, want exactly 1", executions)
+	}
+	close(release)
+
+	final := <-resumeHandle.Done()
+	if final.Status != session.RunCompleted || final.Error != nil {
+		t.Fatalf("final result = %+v, want completed", final)
+	}
+	// The run has now settled terminally: settleCleanRunCompletion retires
+	// the checkpoint at that point, not before.
+	if _, found, err := store.ReadPromotedCheckpoint(ctx, result.RunID); err != nil || found {
+		t.Fatalf("promoted checkpoint after run completion: found=%v err=%v, want retired", found, err)
 	}
 }
 

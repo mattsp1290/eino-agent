@@ -515,8 +515,12 @@ func TestReconcileCrashedRunTerminalizesUnfinishedToolCall(t *testing.T) {
 	if err != nil || finalCall.Status != session.ToolCallInterrupted {
 		t.Fatalf("tool call after reconciliation = %#v, err=%v, want interrupted (terminalized, never re-executed)", finalCall, err)
 	}
+	// The run above is already terminal (RunInterrupted): round-six
+	// reconciliation item 2 forces any turn ReconcileInterruptedTurn left
+	// TurnInterrupted to TurnFailed in that same terminal SettleRun (see
+	// session.ApplyFailTurn).
 	turn, err := orch.store.GetTurn(ctx, "tool-crash-turn")
-	if err != nil || turn.State != session.TurnInterrupted {
-		t.Fatalf("dangling turn after reconciliation = %#v, err=%v, want interrupted", turn, err)
+	if err != nil || turn.State != session.TurnFailed {
+		t.Fatalf("dangling turn after reconciliation = %#v, err=%v, want failed (its run is terminal)", turn, err)
 	}
 }

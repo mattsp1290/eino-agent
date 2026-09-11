@@ -226,9 +226,13 @@ func TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems(t *tes
 	if err != nil || finalTurn.State != session.TurnCompleted {
 		t.Fatalf("reconciled turn after ResumeRun = %#v, err=%v, want completed", finalTurn, err)
 	}
+	// The run above is already terminal (RunCompleted): round-six
+	// reconciliation item 2 forces the never-redriven carrier turn from
+	// TurnInterrupted to TurnFailed in that same terminal SettleRun (see
+	// session.ApplyFailTurn) -- it was never redriven, and now never will be.
 	carrierTurn, err := orch.store.GetTurn(ctx, carrierResult.Turn.ID)
-	if err != nil || carrierTurn.State != session.TurnInterrupted {
-		t.Fatalf("carrier turn after ResumeRun = %#v, err=%v, want still interrupted (never redriven)", carrierTurn, err)
+	if err != nil || carrierTurn.State != session.TurnFailed {
+		t.Fatalf("carrier turn after ResumeRun = %#v, err=%v, want failed (never redriven, its run is terminal)", carrierTurn, err)
 	}
 	completed, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxCompleted})
 	if err != nil || len(completed) != 1 || completed[0].ID != item.ID {
