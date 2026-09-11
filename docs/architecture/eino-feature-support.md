@@ -414,6 +414,199 @@ Status: landed; W1 scaffolding kept green.
   real `runtime.BuildToolSettlement` + store settle through this example is
   tracked as follow-up work, not implemented here).
 
-## W5 through W8
+## W5: typed ADK runtime, checkpoints and turn control
 
-Not started. Each package adds its rows here when it lands.
+Status: phase 1 landed, partially verified; known gaps below are not yet closed.
+
+- Single execution engine: `runtime/adk_model.go` (`adkModel`), `runtime/adk_execution.go`
+  (`adkEngine`, `adkTool`, `adkToolSearch`, `AgentFactory`/`AgentBuildContext`,
+  `DefaultChatModelAgentFactory`, `durableGuard`), `runtime/adk_checkpoint.go`
+  (`adkCheckpointStore`), `runtime/adk_approval.go` (`adkApprovalBinding`) and
+  `runtime/turn_loop.go` (`turnLoopCoordinator`, the TurnLoop host API) replace
+  `executeTurn`/`streamModelAttempts`/`executePreparedTools`/`streamModel`, which
+  are deleted. `Start` now: admits the run's first turn atomically
+  (`admission.go`'s `admitDurable` routes it through `ExecutionStore.AdmitTurn`
+  instead of hand-appending messages/parts/event), builds one `adk.TurnLoop`
+  per run, pushes the pre-admitted first turn via a sentinel item
+  (`firstTurnSentinelID`) synchronously before returning (so a fast-following
+  `Enqueue` from the caller cannot race ahead of it), and stops the loop with
+  `adk.UntilIdleFor` once idle -- not `adk.WithGraceful`/`WithGracefulTimeout`,
+  which are themselves *cancel* modes upstream (they set
+  `CancelAfterChatModel|CancelAfterToolCalls`) and would spuriously interrupt
+  the very turn Start just pushed.
+- `runtime.AgentFactory`/`AgentBuildContext` are frozen on `RunPlan`
+  (`RunPlanSpec.Agent`, deliberately excluded from the sealed fingerprint like
+  `ToolSearch`: construction identity, not durable capability evidence).
+  `adkEngine.buildAgent` hands the factory the mandatory `adkModel` and one
+  `adkTool` per turn tool (plus `adkToolSearch` when `TurnSnapshot.ToolSearch`
+  is configured) and a `durableGuard` `BeforeAgent` handler the factory must
+  install last; the guard rejects any tool in the built agent's effective list
+  that is not one of those adapters.
+- `adkModel.commit` persists exactly the classic engine's per-step facts
+  (`captureAssistantProviderState`, `normalizeToolCallIDs`,
+  `prepareToolCalls`, `persistAssistantTurn`) before returning a result to
+  ADK, so W2/W3/W4 content, provider-state and alias/tool-search machinery is
+  reused unchanged. Two adapter-level findings this package hit:
+  - ADK's own ReAct loop echoes back messages carrying framework-internal
+    `Extra` bookkeeping as input on a later physical dispatch within the same
+    turn; `model.Request.Clone` (used by `auditModelRequest`) rejects *any*
+    non-empty `Extra` anywhere in a message as unauditable transient state, by
+    design. `stripADKInternalExtra` deep-copies and clears every
+    message/block `Extra` before a message ever reaches audit or dispatch.
+  - `adk.NewAgenticToolsNode` panics (nil-pointer dereference in
+    `compose.convTools`) if a registered `tool.BaseTool.Info` returns a nil
+    `*schema.ToolInfo` -- the classic engine's convention for an "unadvertised"
+    `Tool{Info: nil}` (still callable, just omitted from
+    `TurnSnapshot.ProviderRequest`'s model-visible tool list). `adkTool.Info`/
+    `adkToolSearch.Info` therefore synthesize a minimal name-only
+    `*schema.ToolInfo` when `Tool.Info` is nil.
+- `runtime.ToolInterruptPolicy` (`Tool.InterruptPolicy`) lets a tool pause via
+  a durable ADK checkpoint before its first execution attempt: `adkTool`
+  checks it on a still-`ToolCallPending` call (via `compose.GetInterruptState`/
+  `GetResumeContext`) before claiming, raising `compose.StatefulInterrupt`
+  with only the call ID as durable info/state. `runtime.ToolCall.ResumeDecision`
+  carries the host's resume payload once targeted. `TestTurnLoopChecksPointsAndResumesInterruptedTool`
+  (`runtime/turn_loop_checkpoint_test.go`) proves the full cycle against the
+  production adapters: pause (tool never executes, checkpoint promoted,
+  `Handle.AwaitPause` reports the current-generation `InterruptCtx`), durable
+  `RunPaused` status, `ResumeRun` targeting that `InterruptCtx.ID`, and
+  completion with the tool executing exactly once.
+- Checkpoint store: `adkCheckpointStore` implements `adk.CheckPointStore`/
+  `CheckPointDeleter` over the already-landed `session.Checkpoint` store
+  methods (`StageCheckpoint`/`ReadPromotedCheckpoint`/`RetireCheckpoints`/
+  `RetireRunCheckpoints`). `Set` only stages; promotion is the TurnLoop exit
+  protocol's job, after `Wait()` returns with `CheckpointAttempted &&
+  CheckpointErr == nil`. The envelope (`adkCheckpointEnvelope`) carries the
+  pinned Eino version (`EinoPinnedVersion = "v0.9.19"`), a codec version
+  constant, and a fingerprint (`planFingerprint`: the plan's sealed
+  fingerprint plus the concrete `AgentFactory` type), all validated before any
+  upstream gob bytes are trusted or resumed against.
+- TurnLoop exit protocol (`finishTurnLoop`): interrupted/canceled with a
+  promoted checkpoint calls `PromotePause` (run -> paused, no live lease,
+  interrupted turn + inbox items, `run_paused` event); a checkpoint `Set`
+  failure is conservative (no promotion, run left running for lease-expiry
+  recovery, matching the plan's explicit requirement); a between-turn stop
+  with queued input promotes a "queued continuation" pause via a degenerate,
+  content-free admitted turn (`promoteQueuedContinuation`) purely to carry
+  `PromotePause`'s required turn identity -- the queued inbox items
+  themselves stay `queued` untouched, so a resume plans them through
+  `GenInput`, never `GenResume`; a skip-checkpoint stop
+  (`Handle.Interrupt`, which has never promised a resumable pause) settles
+  the run terminally `RunInterrupted`; a clean idle exit settles
+  `RunCompleted` and retires the run's checkpoints. Every exit path stops
+  this process's lease heartbeat before returning (`defer
+  c.execution.stopLease()`), and `execution.release()` (which stops the
+  plan's extension-notification worker) runs *before* the result is sent on
+  `Handle.Done()`/`AwaitPause` -- both were real, `-race`-reproducible bugs
+  during development: a heartbeat left running after settlement raced a
+  receiver's subsequent reads, and sending `Done()` before `release()` (the
+  reverse of the classic engine's `executeLifecycle` defer order) let a
+  receiver observe state while the plan's worker goroutine was still tearing
+  down.
+- `session.ApplyCompleteTurn` (`session/turn.go`) was extended to accept
+  `TurnInterrupted`, not just `TurnAdmitted`/`TurnRunning`, as a valid
+  starting state: a resumed turn's normal completion transitions
+  interrupted -> completed through the same atomic path. Without this, every
+  successful resume failed with `ErrConflict` on its own `CompleteTurn` call.
+- Turn/inbox/invocation identity: `IDGenerator` gained `NewTurnID`/
+  `NewInboxID`/`NewInvocationID`; `session.ModelRequestRecord.ID` is now a
+  true per-dispatch `InvocationID` (via `runtime.modelRequestIdentity`),
+  replacing the prior `run:message:attempt:step` composite. `Attempt`/`Step`
+  remain informational.
+- Retry: `runtime.defaultRetryConfig` (`runtime/adk_retry.go`) maps the
+  legacy `WithAttempts`/`attemptsValue` total-attempt count onto
+  `adk.TypedModelRetryConfig`, with `ShouldRetry` refusing any error matched
+  by `compose.IsInterruptRerunError` (upstream's retry/failover wrappers only
+  recognize graph-level interrupts; retrying over one would join a new
+  attempt onto already-durable paused state). Each retry attempt is its own
+  `adkModel` dispatch with its own ledger row/InvocationID, matching the
+  plan's "every attempt is its own invocation ledger row" requirement.
+  **Not implemented**: `FailoverPolicy`/`ModelFailoverConfig` wiring, and the
+  `attempt_replaced` event are not built in this phase.
+- Native MCP approval: `adkApprovalBinding` recognizes a completed
+  `schema.MCPToolApprovalRequest` result at the model boundary before ADK's
+  ReAct loop can schedule sibling function calls. Unlike the W1 proof (which
+  predates the W2 content contract), the public approval request/response
+  blocks are ordinary `session.BlockKindMCPToolApprovalRequest`/
+  `MCPToolApprovalResponse` content -- `persistAssistantTurn` already
+  understands both kinds, no special-casing needed. A private native
+  continuation record (exact dispatch input + committed transcript, needed to
+  reconstruct the paused call) lives in a `session.PartState` part and is
+  read-then-updated once under the run fence and an in-process mutex on
+  resume -- the same accepted simplification the W1 finding already flagged
+  (a true store-level conditional update was not added; the run fence's CAS
+  in `ClaimRun` already guarantees only one process holds the fence at a
+  time, so this is safe against concurrent resumes, just not a defense
+  against a bug inside one process resuming the same run object twice).
+  **Not proven** against a real `TypedChatModelAgent` end-to-end in this
+  phase (the W1 proof's approval scaffolding was deleted along with the rest
+  of `adk_approval_proof_test.go`; no replacement production test was written
+  given time constraints) -- treat as implemented-but-unverified.
+- Tool search: `adkToolSearch` registers the runtime-implemented
+  `tool_search` pseudo-tool as an ordinary `tool.BaseTool` so ADK's tools node
+  can route a model call to it at all, then delegates to the unchanged
+  `runtime/tool_search.go` (`executeToolSearchCall`). **Known gap**: ADK's
+  tools node always represents *any* registered `tool.InvokableTool`'s result
+  as a generic `function_tool_result` content block; it has no notion of this
+  codebase's dedicated `tool_search_result` block kind. A model that inspects
+  the conversation for a `tool_search_result`-shaped block (as several W4
+  acceptance tests do) will not find one, and in the affected tests ADK's own
+  `MaxIterations` guard eventually fails the run rather than looping forever.
+  Achieving byte-for-byte parity with the classic engine's tool-search
+  representation needs a deeper interception design (recognizing a
+  `tool_search` call at the model boundary, like the approval binding, rather
+  than letting ADK's tools node drive it) and is deferred as follow-up work.
+- Enhanced (multi-part) tool results: **known gap**. `adkTool.InvokableRun`
+  implements only `tool.InvokableTool` (a `string` return), so a settled
+  `ToolResult.Parts`-bearing (enhanced) result cannot be represented as ADK
+  expects one -- `tool.EnhancedInvokableTool` (`*schema.ToolResult`) would be
+  needed. `TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay`
+  fails on this exactly (the model-visible content collapses to one text item
+  instead of three). Deferred as follow-up work.
+- Resume: `ResumeRun` claims the paused run (`ClaimRun`'s CAS on
+  `status='paused'`), validates the checkpoint envelope, resolves the model
+  through `model.Resolver.Resolve` (an earlier version of this code
+  hand-constructed an unresolved `model.Resolved` with a nil `Streamer` and
+  panicked on the first resumed dispatch -- caught by
+  `TestTurnLoopChecksPointsAndResumesInterruptedTool`), and drives a fresh
+  `TurnLoop` whose `GenResume` maps host-supplied targets straight into
+  `adk.ResumeParams`. **Known simplification**: targets are current-generation
+  `InterruptCtx.ID` values only (as exposed via `Handle.AwaitPause`'s
+  `PauseInfo.InterruptContexts`); this package does not yet resolve a stable
+  `InterruptCtx.Address` across multiple pause/resume generations the way the
+  plan's "resolved to the current interrupt ID from the freshly loaded
+  checkpoint at resume time" language ultimately calls for. Using a stale ID
+  is safe (a silent no-op re-pause, per the W1 finding), just not
+  address-portable across generations yet.
+- Host API (`runtime/turn_loop.go`): `Enqueue` persists a durable
+  `session.InboxItem` first (idempotent on key), then pushes its ID into this
+  process's live loop if one is registered (`liveLoopFor`); a loop this
+  process does not own leaves the item durably queued for a later
+  `Start`/`ResumeRun`. `Stop(ctx, runID, StopPolicy)` maps graceful/immediate
+  to `adk.WithGraceful`/`WithImmediate` against the registered loop.
+  `Handle` gained `AwaitPause() <-chan PauseInfo` and
+  `Status(ctx) (session.Run, error)`; `Done()` now fires with the run's
+  Result whether it settled terminally or paused (both channels can deliver
+  for the same event; a caller only needing the terminal/pause distinction
+  reads `Result.Status`). `(*StreamingOrchestrator).Resume` (the legacy
+  tool-only resume entry point, unchanged from W1-era behavior for a
+  `RunInterrupted` run with no checkpoint) now delegates to `ResumeRun` when
+  the run is durably `session.RunPaused`.
+- Verification actually run for this phase: `go build ./...`, `go vet ./...`,
+  `go vet -tags postgres_integration ./...`, `gofmt`/`goimports` and
+  `./.bin/golangci-lint run ./runtime/... ./transport/...` (0 issues) all
+  pass. `go test ./...` passes for every package except `runtime`, which has
+  22 known, categorized failures (retry-detail/panic-classification ledger
+  assertions written against the classic engine's exact step semantics;
+  tool-search content-kind and enhanced-tool-result gaps above; a few
+  observability-detail mismatches) -- see the follow-up beads/PR description
+  for the full list. `go test ./runtime -race` found and fixed two real races
+  during development (documented above); at least one further race pattern
+  (concurrent tool-call settlement vs. run finalization, reproduced only
+  against the in-memory test fixture store, not the SQLite-backed suite) was
+  found but not resolved before this phase's time budget ran out.
+  `make check` and the PostgreSQL-backed required-suite gate
+  (`make postgres-test`) were **not run** in this phase.
+- Out of scope, not started: `FailoverPolicy`, the `attempt_replaced` event,
+  child agents (typed `AgentTool`/`DeepAgent`), removing the superseded
+  classic `PartKind`s, W6/W7.

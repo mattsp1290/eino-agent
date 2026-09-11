@@ -69,6 +69,12 @@ type StreamingOrchestrator struct {
 	modelRequestMaxBytes    int
 	contentLimits           session.ContentLimits
 	streamLimits            StreamLimits
+
+	// loopsMu guards loops, this process's registry of live TurnLoops keyed
+	// by run ID (see runtime/turn_loop.go). It lets Enqueue/Stop/Interrupt
+	// reach a loop this process owns without a durable round trip.
+	loopsMu sync.Mutex
+	loops   map[session.RunID]*liveLoop
 }
 
 // Start admits and asynchronously executes one streaming turn.
@@ -151,17 +157,99 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		Metadata: boundedTurnMetadata(admitted.Snapshot), Time: admitted.Snapshot.CreatedAt,
 	})
 	runCtx, cancel := context.WithCancel(ctx)
-	handle := &streamingHandle{
-		runID:  admitted.Run.ID,
-		cancel: cancel,
-		done:   make(chan Result, 1),
-		onInterrupt: func(reason string) {
-			o.observeInterrupt(context.WithoutCancel(ctx), admitted.Run, admitted.AssistantMessage.ID, reason)
-		},
+	handle := &turnLoopHandle{runID: admitted.Run.ID, host: o, done: make(chan Result, 1), pause: make(chan PauseInfo, 1), cancel: cancel}
+	coordinator := &turnLoopCoordinator{
+		host: o, execution: execution, plan: plan, sessionID: admitted.Session.ID, runID: admitted.Run.ID,
+		config: request.Config, resolved: resolved, historyOptions: historyOptions, epochID: admitted.Run.ContextEpoch,
+		ordinal: admitted.Turn.Ordinal,
 	}
 	ownershipTransferred = true
-	go o.execute(runCtx, execution, admitted, handle.done)
+	checkpoints := newAdkCheckpointStore(o, execution, plan, admitted.Run.ID)
+	entry := o.prepareTurnLoop(coordinator, checkpoints)
+	// Pushed synchronously, before Run: TurnLoop buffers a Push issued
+	// before Run() and processes it in order once Run is called (its
+	// "permissive API"), which is the only way to guarantee this sentinel
+	// is ordered ahead of any Enqueue a caller races immediately after
+	// Start returns -- Run/GenInput itself must stay on the goroutine below
+	// since it blocks for the run's lifetime.
+	entry.loop.Push(firstTurnSentinelID)
+	go o.runFreshTurnLoop(runCtx, execution, entry, checkpoints, admitted, handle)
 	return handle, nil
+}
+
+// runFreshTurnLoop prepares the already-admitted first turn's TurnSnapshot
+// (extension transforms, tool resolution -- the same pipeline every later
+// turn uses) and drives the run's TurnLoop, seeding it with that turn via
+// the sentinel-consuming first GenInput call (see firstTurnSentinelID).
+func (o *StreamingOrchestrator) runFreshTurnLoop(ctx context.Context, execution *runExecution, entry *liveLoop, checkpoints *adkCheckpointStore, admitted admittedRun, handle *turnLoopHandle) {
+	coordinator := entry.coordinator
+	defer execution.release()
+	runCtx := execution.startLease(ctx, o.lease())
+	{
+		decision, err := extension.EvaluateGate(execution.dispatch(), runCtx, RunBeforeExecutePoint, RunGateInput{
+			SessionID: admitted.Run.SessionID, RunID: admitted.Run.ID, ProviderID: admitted.Run.ProviderID, ModelID: admitted.Run.ModelID,
+		})
+		if err != nil || decision.Kind == RunReject {
+			result := Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID, Status: session.RunFailed, Error: err}
+			if err == nil {
+				result.Error = model.Error{Code: decision.Code, Message: decision.Message, Cause: model.ErrProviderRejected}
+			}
+			o.settleFreshFailure(runCtx, execution, result)
+			o.unregisterLoop(admitted.Run.ID)
+			handle.done <- result
+			close(handle.done)
+			close(handle.pause)
+			return
+		}
+	}
+	startedAt := o.now()
+	observed := o.startObservedRun(runCtx, admitted.Run, admitted.AssistantMessage.ID, startedAt)
+	started, err := execution.store.StartRun(runCtx, startedAt)
+	if err != nil {
+		result := Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID, Status: session.RunFailed, Error: err}
+		o.settleFreshFailure(runCtx, execution, result)
+		o.finishObservedRun(observed, result, o.now())
+		o.unregisterLoop(admitted.Run.ID)
+		handle.done <- result
+		close(handle.done)
+		close(handle.pause)
+		return
+	}
+	extension.Notify(execution.dispatch(), runCtx, RunStartedPoint, RunStartedNotice{SessionID: started.SessionID, RunID: started.ID, Time: started.StartedAt})
+	snapshot, err := o.prepareSnapshot(runCtx, execution, admitted.Snapshot)
+	if err != nil {
+		result := Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID, Status: statusForError(err), Error: err}
+		o.settleFreshFailure(runCtx, execution, result)
+		o.finishObservedRun(observed, result, o.now())
+		o.unregisterLoop(admitted.Run.ID)
+		handle.done <- result
+		close(handle.done)
+		close(handle.pause)
+		return
+	}
+	execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
+	coordinator.setEngine(nil)
+	coordinator.mu.Lock()
+	coordinator.firstTurnEngine = &adkEngine{host: o, execution: execution, plan: coordinator.plan, snapshot: snapshot, turn: admitted.Turn, assistantMessageID: admitted.AssistantMessage.ID}
+	coordinator.mu.Unlock()
+	result := o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause)
+	o.finishObservedRun(observed, result, o.now())
+}
+
+// settleFreshFailure settles a run that failed before its TurnLoop ever
+// started (a rejected pre-execute gate or a StartRun failure).
+func (o *StreamingOrchestrator) settleFreshFailure(ctx context.Context, execution *runExecution, result Result) {
+	_ = execution.stopLease()
+	settlement := session.RunSettlement{Status: result.Status, FinishedAt: o.now()}
+	if result.Error != nil {
+		settlement.Error = result.Error.Error()
+	}
+	committed, err := execution.store.SettleRun(context.WithoutCancel(ctx), session.SettleRunRequest{
+		Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: result.MessageID},
+	})
+	if err == nil {
+		execution.publishPersisted(context.WithoutCancel(ctx), committed.Event)
+	}
 }
 
 // Status returns the current active run for a session.
@@ -173,19 +261,6 @@ func (o *StreamingOrchestrator) Status(ctx context.Context, sessionID session.ID
 		return session.Run{}, fmt.Errorf("%w: session id required", ErrInvalidOrchestrator)
 	}
 	return o.store.ActiveRun(ctx, sessionID)
-}
-
-func (o *StreamingOrchestrator) execute(ctx context.Context, execution *runExecution, admitted admittedRun, done chan<- Result) {
-	lifecycle := &runLifecycle{
-		run:         admitted.Run,
-		result:      Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID},
-		metadata:    boundedTurnMetadata(admitted.Snapshot),
-		startedAt:   admitted.Run.CreatedAt,
-		panicPrefix: "provider stream panic",
-	}
-	o.executeLifecycle(ctx, execution, lifecycle, done, func(ctx context.Context) {
-		o.runFresh(ctx, execution, admitted, lifecycle)
-	})
 }
 
 type runLifecycle struct {
@@ -223,45 +298,6 @@ func (o *StreamingOrchestrator) executeLifecycle(ctx context.Context, execution 
 	}()
 	ctx = execution.startLease(ctx, o.lease())
 	body(ctx)
-}
-
-func (o *StreamingOrchestrator) runFresh(ctx context.Context, execution *runExecution, admitted admittedRun, lifecycle *runLifecycle) {
-	run := admitted.Run
-	// runUsage accumulates provider usage across every model stream in the run
-	// (all turns and retry attempts), mirroring the per-stream usage reported to
-	// the observability path. It is surfaced on result.Usage by the finalizer
-	// so settleRun() can carry the run total on the EventRunFinished event.
-	{
-		decision, err := extension.EvaluateGate(execution.dispatch(), ctx, RunBeforeExecutePoint, RunGateInput{SessionID: run.SessionID, RunID: run.ID, ProviderID: run.ProviderID, ModelID: run.ModelID})
-		if err != nil {
-			lifecycle.result.Status = session.RunFailed
-			lifecycle.result.Error = err
-			return
-		}
-		if decision.Kind == RunReject {
-			lifecycle.result.Status = session.RunFailed
-			lifecycle.result.Error = model.Error{Code: decision.Code, Message: decision.Message, Cause: model.ErrProviderRejected}
-			return
-		}
-	}
-	run.StartedAt = o.now()
-	lifecycle.observed = o.startObservedRun(ctx, run, admitted.AssistantMessage.ID, run.StartedAt)
-	started, err := execution.store.StartRun(ctx, run.StartedAt)
-	if err != nil {
-		lifecycle.result.Status = session.RunFailed
-		lifecycle.result.Error = err
-		return
-	}
-	run = started
-	o.sessionObserver.Hint(run.SessionID)
-	extension.Notify(execution.dispatch(), ctx, RunStartedPoint, RunStartedNotice{SessionID: run.SessionID, RunID: run.ID, Time: run.StartedAt})
-	snapshot, err := o.prepareSnapshot(ctx, execution, admitted.Snapshot)
-	if err != nil {
-		lifecycle.result.Status = statusForError(err)
-		lifecycle.result.Error = err
-		return
-	}
-	lifecycle.result = o.executeTurn(ctx, execution, snapshot, admitted.AssistantMessage.ID, &lifecycle.usage)
 }
 
 func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *runExecution, snapshot TurnSnapshot) (TurnSnapshot, error) {
@@ -317,107 +353,6 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	}
 	o.observeToolsResolved(ctx, snapshot, snapshot.Tools)
 	return snapshot, nil
-}
-
-func (o *StreamingOrchestrator) executeTurn(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, usage *model.Usage) Result {
-	// Seed the per-execution tool-search advertised set from the projected
-	// turn messages the model is about to see, not just this execution's own
-	// in-memory history: a fresh run (including a later run in a session
-	// that already discovered tools via tool search in an earlier run) would
-	// otherwise advertise an already-discovered deferred tool as deferred
-	// again, and a model call on it would fail the whole run (see
-	// prepareToolCalls's "not yet discovered" rejection).
-	execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
-	messages := append([]*einoschema.AgenticMessage(nil), snapshot.Messages...)
-	currentMessageID := messageID
-	for turn := 0; ; turn++ {
-		msg, err := o.streamModelAttempts(ctx, execution, snapshot, currentMessageID, messages, turn+1, usage)
-		if err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		blockIDs := make([]string, len(msg.ContentBlocks))
-		for index := range blockIDs {
-			blockIDs[index] = string(o.ids.NewPartID())
-		}
-		capturedState, publicMsg, err := captureAssistantProviderState(snapshot, currentMessageID, msg, blockIDs)
-		if err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		msg = publicMsg
-		normalizeToolCallIDs(msg, o.ids)
-		calls := functionToolCalls(msg)
-		preparedCalls, err := o.prepareToolCalls(ctx, execution, snapshot, currentMessageID, calls)
-		if err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		preparedCalls, err = o.persistAssistantTurn(ctx, execution, snapshot, currentMessageID, msg, blockIDs, capturedState.payloads, preparedCalls)
-		if err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		if len(calls) == 0 {
-			return Result{RunID: snapshot.RunID, MessageID: currentMessageID, Status: session.RunCompleted}
-		}
-		if turn >= o.toolTurns() {
-			return o.executionFailure(ctx, snapshot, currentMessageID, model.Error{Code: "tool_turn_limit_exceeded", Message: "model exceeded tool turn limit", Cause: model.ErrProviderRejected})
-		}
-		if capturedState.state != nil {
-			capturedState.state.MessageIndex = len(messages)
-			snapshot.providerState = append(snapshot.providerState, *capturedState.state)
-		}
-		messages = append(messages, msg)
-		toolMessages, err := o.executePreparedTools(ctx, execution, snapshot, currentMessageID, preparedCalls)
-		if err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		messages = append(messages, toolMessages...)
-		nextMessageID := o.ids.NewMessageID()
-		messageAt, err := execution.nextDurableMessageTime(ctx, snapshot.SessionID, o.now())
-		if err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		if _, err := execution.store.AppendMessage(ctx, session.Message{
-			ID:        nextMessageID,
-			SessionID: snapshot.SessionID,
-			RunID:     snapshot.RunID,
-			ParentID:  messageID,
-			Role:      session.RoleAssistant,
-			Agent:     snapshot.Config.Agent.Name,
-			ModelID:   string(snapshot.Model.Model.ID),
-			CreatedAt: messageAt,
-			UpdatedAt: messageAt,
-		}); err != nil {
-			return o.executionFailure(ctx, snapshot, currentMessageID, err)
-		}
-		currentMessageID = nextMessageID
-	}
-}
-
-func (o *StreamingOrchestrator) streamModelAttempts(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, messageID session.MessageID, messages []*einoschema.AgenticMessage, step int, usage *model.Usage) (*einoschema.AgenticMessage, error) {
-	attempts := o.attempts()
-	var last error
-	for attempt := 1; attempt <= attempts; attempt++ {
-		result := o.streamModel(ctx, execution, snapshot, messageID, messages, attempt, step, usage)
-		if result.err == nil {
-			return result.message, nil
-		}
-		last = result.err
-		if ctx.Err() != nil || result.receivedDelta || !retryable(result.err) || attempt == attempts {
-			break
-		}
-		o.observeRetry(ctx, snapshot, messageID, attempt, attempts, result.err)
-	}
-	return nil, last
-}
-
-func (o *StreamingOrchestrator) executionFailure(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, err error) Result {
-	o.observeError(ctx, snapshot, messageID, "provider_stream", err)
-	if ctx.Err() != nil {
-		return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: ctx.Err()}
-	}
-	if errors.Is(err, context.Canceled) {
-		return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunInterrupted, Interrupted: true, Error: err}
-	}
-	return Result{RunID: snapshot.RunID, MessageID: messageID, Status: session.RunFailed, Error: err}
 }
 
 func (o *StreamingOrchestrator) executeToolOutcome(ctx context.Context, execution *runExecution, tool Tool, call ToolCall) toolOutcome {
@@ -764,6 +699,7 @@ func mustJSON(value any) json.RawMessage {
 
 type streamingHandle struct {
 	runID       session.RunID
+	host        *StreamingOrchestrator
 	cancel      context.CancelFunc
 	done        chan Result
 	once        sync.Once
@@ -780,4 +716,15 @@ func (h *streamingHandle) Interrupt(_ context.Context, reason string) error {
 		h.cancel()
 	})
 	return nil
+}
+
+// AwaitPause is not produced by the legacy tool-only resume path: it never
+// delivers.
+func (h *streamingHandle) AwaitPause() <-chan PauseInfo { return nil }
+
+func (h *streamingHandle) Status(ctx context.Context) (session.Run, error) {
+	if h.host == nil {
+		return session.Run{}, fmt.Errorf("%w: handle has no host", ErrInvalidOrchestrator)
+	}
+	return h.host.store.GetRun(ctx, h.runID)
 }

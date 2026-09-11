@@ -72,7 +72,7 @@ var (
 // as session.Checkpoint.Bytes. The upstream ADK gob payload itself is opaque
 // and only decoded by ADK after this envelope's own fields validate.
 type adkCheckpointEnvelope struct {
-	EinoVersion string
+	EinoVersion  string
 	CodecVersion int
 	Fingerprint  string
 	Payload      []byte

@@ -133,7 +133,11 @@ func ApplyCompleteTurn(current Turn, request CompleteTurnRequest) (Turn, error) 
 		}
 		return Turn{}, ErrConflict
 	}
-	if current.State != TurnAdmitted && current.State != TurnRunning {
+	// TurnInterrupted is a valid starting state (not just TurnAdmitted/
+	// TurnRunning): a durably paused turn resumed via ResumeRun completes
+	// through this same atomic path once its checkpoint-resumed execution
+	// reaches normal completion (see runtime/turn_loop.go's onAgentEvents).
+	if current.State != TurnAdmitted && current.State != TurnRunning && current.State != TurnInterrupted {
 		return Turn{}, ErrConflict
 	}
 	current.State = TurnCompleted

@@ -296,3 +296,9 @@ func (h resumeHandle) Done() <-chan runtime.Result {
 	return ch
 }
 func (h resumeHandle) Interrupt(context.Context, string) error { return nil }
+func (h resumeHandle) AwaitPause() <-chan runtime.PauseInfo {
+	ch := make(chan runtime.PauseInfo)
+	close(ch)
+	return ch
+}
+func (h resumeHandle) Status(context.Context) (session.Run, error) { return session.Run{}, nil }

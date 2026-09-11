@@ -29,6 +29,16 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	if run.Terminal() {
 		return terminalRunHandle(run), nil
 	}
+	// A run durably paused by the ADK TurnLoop exit protocol (see
+	// runtime/turn_loop.go) carries a promoted checkpoint and no live
+	// lease: it must resume through ResumeRun's checkpoint-aware path, not
+	// the legacy tool-only claim/resume below, which has no notion of ADK
+	// checkpoints or turns. An untargeted resume (no Targets) keeps any
+	// still-paused leaf paused rather than dispatching anything, exactly
+	// like ResumeWithParams with an empty target set.
+	if run.Paused() {
+		return o.ResumeRun(ctx, runID, ResumeRequest{})
+	}
 	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
 	if err != nil {
 		return nil, err
@@ -53,6 +63,7 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	runCtx, cancel := context.WithCancel(ctx)
 	handle := &streamingHandle{
 		runID:       runID,
+		host:        o,
 		cancel:      cancel,
 		done:        make(chan Result, 1),
 		onInterrupt: func(reason string) { o.observeInterrupt(context.WithoutCancel(ctx), run, "", reason) },

@@ -117,23 +117,6 @@ func (o *StreamingOrchestrator) startObservedStream(ctx context.Context, snapsho
 	})
 }
 
-func (o *StreamingOrchestrator) observeRetry(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int, attempts int, err error) {
-	if o == nil || o.observer == nil {
-		return
-	}
-	o.observer.Retry(ctx, einoobs.RetryEvent{
-		Correlation:    o.snapshotCorrelation(snapshot, messageID, "retry"),
-		Attempt:        int64(attempt),
-		MaxAttempts:    int64(attempts),
-		Classification: errorClassification(err, "retryable"),
-		Reason:         "provider_retry",
-		Time:           o.now(),
-		Metadata: einoobs.Metadata{
-			"error": safeErrorMessage(err),
-		},
-	})
-}
-
 func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, operation string, err error) {
 	if o == nil || o.observer == nil || err == nil {
 		return
@@ -467,13 +450,6 @@ func observationErrorFromClassification(classification string) error {
 		classification = "error"
 	}
 	return errors.New(classification)
-}
-
-func safeErrorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	return errorClassification(err, "error")
 }
 
 func firstNonEmpty(values ...string) string {

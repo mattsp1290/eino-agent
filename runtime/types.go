@@ -49,8 +49,18 @@ type Request struct {
 // Handle describes an admitted run and its live control surface.
 type Handle interface {
 	RunID() session.RunID
+	// Done reports this Start/ResumeRun call's outcome: either a terminal
+	// Result or a Result whose Status is session.RunPaused. AwaitPause
+	// delivers additional pause-only detail (PauseInfo) for the same event
+	// when the outcome is a pause; it is closed without a value otherwise.
 	Done() <-chan Result
 	Interrupt(ctx context.Context, reason string) error
+	// AwaitPause reports the durably promoted pause this run reaches (see
+	// PauseInfo), or is closed without a value if the run instead settles
+	// terminally.
+	AwaitPause() <-chan PauseInfo
+	// Status returns the run's current durable status.
+	Status(ctx context.Context) (session.Run, error)
 }
 
 // Result is the terminal outcome of a run.

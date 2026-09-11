@@ -9,6 +9,7 @@ import (
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/watch"
 )
@@ -128,12 +129,14 @@ func (m *adkModel) Generate(ctx context.Context, input []*einoschema.AgenticMess
 		}
 		input = continuation
 	}
+	input = stripADKInternalExtra(input)
 	dispatch, err := m.begin(ctx, input)
 	if err != nil {
 		return nil, err
 	}
 	result, dispatchErr := m.dispatch(ctx, dispatch, input, nil)
 	if dispatchErr != nil {
+		m.engine.addUsage(result.usage)
 		_ = m.finish(ctx, dispatch, dispatchErr)
 		return nil, dispatchErr
 	}
@@ -168,6 +171,7 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 		}
 		input = continuation
 	}
+	input = stripADKInternalExtra(input)
 	dispatch, err := m.begin(ctx, input)
 	if err != nil {
 		return nil, err
@@ -190,6 +194,7 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 	})
 	m.host.sessionObserver.FinishAttempt(live)
 	if dispatchErr != nil {
+		m.engine.addUsage(result.usage)
 		_ = m.finish(ctx, dispatch, dispatchErr)
 		return nil, dispatchErr
 	}
@@ -210,21 +215,72 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 	return einoschema.StreamReaderFromArray([]*einoschema.AgenticMessage{committed}), nil
 }
 
+// stripADKInternalExtra deep-copies messages with every message-level and
+// content-block-level Extra map cleared. ADK's own ReAct loop tags messages
+// it reconstructs between iterations (the assistant's own prior tool-call
+// message, echoed back as part of input on the next physical dispatch) with
+// framework-internal Extra bookkeeping; model.Request.Clone (used by the
+// audit path -- see auditModelRequest) rejects ANY non-empty Extra found
+// anywhere in a message as unauditable transient state, by design (W3: "..
+// Request.Clone rejects any Extra so that transient state can never re-enter
+// a request"). That guard is correct for provider-origin state but ADK's own
+// internal markers are neither provider state nor something this package
+// needs to persist, so they are stripped before a message ever reaches
+// audit or dispatch.
+func stripADKInternalExtra(messages []*einoschema.AgenticMessage) []*einoschema.AgenticMessage {
+	if len(messages) == 0 {
+		return messages
+	}
+	out := make([]*einoschema.AgenticMessage, len(messages))
+	for i, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		cloned := *msg
+		cloned.Extra = nil
+		if len(msg.ContentBlocks) != 0 {
+			blocks := make([]*einoschema.ContentBlock, len(msg.ContentBlocks))
+			for j, block := range msg.ContentBlocks {
+				if block == nil {
+					continue
+				}
+				clonedBlock := *block
+				clonedBlock.Extra = nil
+				blocks[j] = &clonedBlock
+			}
+			cloned.ContentBlocks = blocks
+		}
+		out[i] = &cloned
+	}
+	return out
+}
+
 // dispatch performs the one physical provider call this adapter ever makes
 // (both Generate and Stream funnel through the streaming provider
 // transport), fully draining the response before returning: no live chunk
 // ever reaches ADK directly (see receiveModelStream's callers here).
 func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, input []*einoschema.AgenticMessage, onDelta func(int64, *einoschema.AgenticMessage)) (modelStreamResult, error) {
+	observation := m.host.startObservedStream(ctx, m.engine.snapshot, d.messageID, d.record.Attempt)
 	request := m.engine.snapshot.ProviderRequest(d.messageID, m.host.trace, input, m.execution.discoveredSnapshot())
+	request.System = d.record.System
+	request.IdempotencyKey = string(d.record.ID)
 	reader, err := m.engine.snapshot.Model.Streamer.StreamProvider(ctx, request)
 	if err != nil {
+		m.host.errorObservedStream(observation, err, model.Usage{})
 		return modelStreamResult{}, err
 	}
 	var result modelStreamResult
-	receiveModelStream(ctx, reader, m.host.streamLimits, &result, onDelta)
+	receiveModelStream(ctx, reader, m.host.streamLimits, &result, func(index int64, chunk *einoschema.AgenticMessage) {
+		m.host.observeStreamChunk(observation, index)
+		if onDelta != nil {
+			onDelta(index, chunk)
+		}
+	})
 	if result.err != nil {
-		return modelStreamResult{}, result.err
+		m.host.errorObservedStream(observation, result.err, result.usage)
+		return result, result.err
 	}
+	m.host.endObservedStream(observation, result.usage)
 	return result, nil
 }
 
@@ -266,13 +322,25 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 	}
 	result = publicMsg
 	calls := functionToolCalls(result)
+	if len(calls) != 0 {
+		// This turn's ReAct loop will dispatch again after the tools
+		// settle; that next physical dispatch's result is a new logical
+		// assistant message, not a continuation of this one.
+		m.needMessage = true
+	}
 	preparedCalls, err := m.host.prepareToolCalls(ctx, m.execution, m.engine.snapshot, dispatch.messageID, calls)
 	if err != nil {
 		return nil, err
 	}
+	for _, prepared := range preparedCalls {
+		if prepared.middlewareErr != nil {
+			m.engine.recordPrepareError(prepared.call.ID, prepared.middlewareErr)
+		}
+	}
 	if _, err := m.host.persistAssistantTurn(ctx, m.execution, m.engine.snapshot, dispatch.messageID, result, blockIDs, capturedState.payloads, preparedCalls); err != nil {
 		return nil, err
 	}
+	m.engine.recordResponseMessage(dispatch.messageID)
 	if capturedState.state != nil {
 		capturedState.state.MessageIndex = len(dispatch.input)
 		m.engine.appendProviderState(*capturedState.state)

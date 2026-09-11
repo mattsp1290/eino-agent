@@ -48,6 +48,50 @@ type adkEngine struct {
 
 	usageMu sync.Mutex
 	usage   model.Usage
+
+	responseMu         sync.Mutex
+	responseMessageIDs []session.MessageID
+
+	// prepareMu guards prepareErrors, the in-memory record of
+	// preparedToolCall.middlewareErr for calls this turn's model adapter
+	// prepared but has not yet handed to ADK's tools node for dispatch (see
+	// prepareToolCalls's undiscovered-deferred-tool denial): the durable
+	// session.ToolCall row itself carries no such field, so adkTool must
+	// consult this map (by call ID) to reproduce the same denial
+	// executePreparedTools used to apply, since ADK -- not this package --
+	// now owns when each pending call actually dispatches.
+	prepareMu     sync.Mutex
+	prepareErrors map[session.ToolCallID]error
+}
+
+func (e *adkEngine) recordPrepareError(id session.ToolCallID, err error) {
+	if err == nil {
+		return
+	}
+	e.prepareMu.Lock()
+	defer e.prepareMu.Unlock()
+	if e.prepareErrors == nil {
+		e.prepareErrors = make(map[session.ToolCallID]error)
+	}
+	e.prepareErrors[id] = err
+}
+
+func (e *adkEngine) takePrepareError(id session.ToolCallID) error {
+	e.prepareMu.Lock()
+	defer e.prepareMu.Unlock()
+	return e.prepareErrors[id]
+}
+
+func (e *adkEngine) recordResponseMessage(id session.MessageID) {
+	e.responseMu.Lock()
+	defer e.responseMu.Unlock()
+	e.responseMessageIDs = append(e.responseMessageIDs, id)
+}
+
+func (e *adkEngine) responseMessageIDsSnapshot() []session.MessageID {
+	e.responseMu.Lock()
+	defer e.responseMu.Unlock()
+	return append([]session.MessageID(nil), e.responseMessageIDs...)
 }
 
 func (e *adkEngine) claimPlaceholder() (session.MessageID, bool) {
@@ -104,11 +148,17 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 			aliases[t.Name] = compose.ToolAliasConfig{NameAliases: cloneSlice(t.Aliases), ArgumentsAliases: cloneStringSliceMap(t.ArgumentAliases)}
 		}
 	}
+	if e.snapshot.ToolSearch != nil {
+		search := &adkToolSearch{engine: e, name: e.snapshot.ToolSearch.Name}
+		tools = append(tools, search)
+		durable[e.snapshot.ToolSearch.Name] = true
+	}
 	build := AgentBuildContext{
 		Model: inner, Tools: tools, ToolAliases: aliases,
 		Instruction:   "",
 		MaxIterations: e.host.toolTurns(),
 		Guard:         newDurableGuard(durable),
+		Retry:         defaultRetryConfig(e.host.attempts()),
 	}
 	factory := e.plan.AgentFactory()
 	return factory.BuildAgent(ctx, build)
@@ -243,8 +293,20 @@ var _ durableTool = (*adkTool)(nil)
 
 func (t *adkTool) durableToolName() string { return t.tool.Name }
 
+// Info never returns a nil *schema.ToolInfo: ADK's tools node dereferences
+// it unconditionally to build its dispatch table for every registered tool
+// (compose.NewAgenticToolsNode), regardless of the classic engine's
+// "unadvertised" convention for a Tool with no Info (see
+// TurnSnapshot.ProviderRequest, which simply omits such a tool from the
+// model-visible tool list but still expects it callable). A Tool with a nil
+// Info therefore synthesizes a minimal, name-only schema here so it can
+// still be claimed/executed durably; it remains unadvertised to the model
+// via ProviderRequest.
 func (t *adkTool) Info(context.Context) (*einoschema.ToolInfo, error) {
-	return t.tool.Info, nil
+	if t.tool.Info != nil {
+		return t.tool.Info, nil
+	}
+	return &einoschema.ToolInfo{Name: t.tool.Name}, nil
 }
 
 // adkToolInterruptInfo/adkToolInterruptState are the durable-only info/state
@@ -319,11 +381,74 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	}
 	call.ResultMessageID = claimed.Call.ResultMessageID
 	call.ResultPartID = claimed.Call.ResultPartID
-	settled, err := e.execution.executeAndSettleClaimedTool(ctx, e.snapshot, t.tool, call, claimed.Call, nil)
+	prepareErr := e.takePrepareError(record.ID)
+	settled, err := e.execution.executeAndSettleClaimedTool(ctx, e.snapshot, t.tool, call, claimed.Call, prepareErr)
 	if err != nil {
 		return "", err
 	}
 	return string(settled.Settlement.Output), nil
+}
+
+// adkToolSearch is the mandatory adapter for this turn's configured
+// runtime-implemented tool-search tool (TurnSnapshot.ToolSearch). ADK's
+// tools node needs it registered as an ordinary tool.BaseTool to route a
+// model call by name at all, but its execution/settlement is entirely
+// runtime.tool_search.go's own (executeToolSearchCall), not the normal
+// claim/execute/settle pipeline: it carries no execution authority of its
+// own since every tool it can surface is still validated against the
+// frozen registry when actually called.
+type adkToolSearch struct {
+	engine *adkEngine
+	name   string
+}
+
+var _ tool.InvokableTool = (*adkToolSearch)(nil)
+var _ durableTool = (*adkToolSearch)(nil)
+
+func (t *adkToolSearch) durableToolName() string { return t.name }
+
+func (t *adkToolSearch) Info(context.Context) (*einoschema.ToolInfo, error) {
+	return toolSearchToolInfo(t.engine.snapshot.ToolSearch), nil
+}
+
+func (t *adkToolSearch) InvokableRun(ctx context.Context, arguments string, _ ...tool.Option) (string, error) {
+	e := t.engine
+	callID := session.ToolCallID(compose.GetToolCallID(ctx))
+	if callID == "" {
+		return "", errors.New("tool call id missing from ADK context")
+	}
+	record, err := e.host.store.GetToolCall(ctx, callID)
+	if err != nil {
+		return "", fmt.Errorf("persisted tool call %s: %w", callID, err)
+	}
+	if record.RunID != e.snapshot.RunID || record.SessionID != e.snapshot.SessionID {
+		return "", fmt.Errorf("persisted tool call %s belongs to run %s, not %s", callID, record.RunID, e.snapshot.RunID)
+	}
+	switch {
+	case session.TerminalToolCall(record.Status):
+		return string(record.Output), nil
+	case record.Status == session.ToolCallRunning:
+		run := session.Run{ID: e.snapshot.RunID, SessionID: e.snapshot.SessionID, ModelID: string(e.snapshot.Model.Model.ID)}
+		settled, err := e.execution.settleInterruptedRunningTool(ctx, run, Tool{Name: t.name}, record)
+		if err != nil {
+			return "", err
+		}
+		return string(settled.Output), nil
+	case record.Status != session.ToolCallPending:
+		return "", fmt.Errorf("unexpected tool call status %q for %s", record.Status, callID)
+	}
+	call := ToolCall{
+		ID: record.ID, SessionID: record.SessionID, RunID: record.RunID, MessageID: record.MessageID,
+		Name: record.Name, RequestedName: record.RequestedName, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
+	}
+	if _, err := e.execution.executeToolSearchCall(ctx, e.snapshot, call, record); err != nil {
+		return "", err
+	}
+	settled, err := e.host.store.GetToolCall(ctx, callID)
+	if err != nil {
+		return "", err
+	}
+	return string(settled.Output), nil
 }
 
 // ToolInterruptPolicy lets a tool pause via a durable ADK checkpoint before
