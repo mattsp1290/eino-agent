@@ -144,6 +144,39 @@ type HandlerBuildContext struct {
 	// disagreed in length -- exactly what happens mid-turn after tool
 	// calls, or whenever agentsmd/skill inject content into the cycle.
 	sourceMessageID func(msg *einoschema.AgenticMessage) (session.MessageID, bool)
+
+	// baselineMessages returns this cycle's full durable baseline (the same
+	// messages and parallel per-index source IDs sourceMessageID's pointer
+	// map was built from -- adkEngine.baselineMessages/baselineSourceIDs).
+	// summarizationFinalize uses it as a content-based FALLBACK correlation
+	// source when sourceMessageID's pointer lookup misses: an earlier
+	// handler in the chain (host-authored or this package's own) that
+	// clones/replaces message pointers -- e.g. via cloneProtectedMessages,
+	// a perfectly reasonable defensive pattern this package uses internally
+	// too -- would otherwise silently break every pointer-keyed lookup for
+	// the rest of the cycle, making summarization correlate nothing, run
+	// (and bill) its summary generation call, then silently skip compacting
+	// with no error and no event (round-three W6 authority-regression
+	// review, summarization-correctness Important #1). Populated only for
+	// a HandlerKindSummarization entry, the same Kind-gating sourceMessageID
+	// uses.
+	baselineMessages func() ([]*einoschema.AgenticMessage, []session.MessageID)
+
+	// summarizedThisTurn/markSummarized bound summarization to firing at
+	// most once per turn: summarizeAtMostOnceMiddleware (installed by
+	// NewSummarizationHandlerFactory) consults summarizedThisTurn before
+	// every cycle's call into upstream summarization's own
+	// BeforeModelRewriteState, and summarizationFinalize calls
+	// markSummarized right after a successful commitSummaryEpoch. Without
+	// this, upstream re-evaluates its trigger condition on every ReAct
+	// cycle with no per-call override, so a multi-cycle turn that crosses
+	// the threshold once would otherwise re-summarize (and re-bill a
+	// summary generation call) on every later cycle of the SAME turn
+	// (round-three W6 summarization-correctness review, Important #2).
+	// Populated only for a HandlerKindSummarization entry, the same
+	// Kind-gating sourceMessageID/baselineMessages use.
+	summarizedThisTurn func() bool
+	markSummarized     func()
 }
 
 // HandlerFactory builds one typed ADK agent middleware instance for one
@@ -608,11 +641,17 @@ func canonicalToolSearchResultContent(result *einoschema.ToolSearchResult) strin
 // patchtoolcalls digest; a call ID WITH a baseline occurrence may only be
 // authorized-rewritten by reduction). No recipe is ever authorized to
 // rewrite a tool_search_result, so that pass never consults authorized at
-// all. The total occurrence count for a call ID may never exceed its
-// baseline occurrence count plus (when authorized) exactly one more for the
-// single authorized rewrite -- round-two W6 review I3: two identical copies
-// of one settled result must not both pass merely because each individually
-// matches baseline.
+// all. Two identical copies of one settled result must not both pass merely
+// because each individually matches baseline -- round-two W6 review I3 --
+// so baseMatches can never exceed len(baseDigests). And once an authorized
+// rewrite exists for a call ID, EVERY occurrence of it must be that rewrite:
+// an authorized occurrence may never coexist with a surviving, unmodified
+// baseline occurrence of the SAME call in the SAME cycle -- a real rewrite
+// (reduction is the only recipe this applies to; patchtoolcalls is only ever
+// authorized when baseDigests is empty) always normalizes every occurrence
+// uniformly, so seeing both would mean the model was shown the old and the
+// new content for the same call at once, not a legitimate single rewrite
+// (round-three W6 authority-regression review S3).
 func verifySettledToolResults(baseline, input []*einoschema.AgenticMessage, authorized *authorizedRewriteSet) error {
 	if err := verifyOccurrenceKind(toolResultOccurrencesByCallID(baseline), toolResultOccurrencesByCallID(input), authorized); err != nil {
 		return err
@@ -657,6 +696,20 @@ func verifyOccurrenceKind(baselineOccurrences, currentOccurrences map[string][]s
 			return fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
 		}
 		if baseMatches > len(baseDigests) {
+			return fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
+		}
+		if authorizedMatches > 0 && baseMatches > 0 {
+			// Round-three W6 authority-regression review S3: an authorized
+			// rewrite must fully REPLACE every occurrence of this call ID,
+			// never merely ADD a new one alongside the stale baseline
+			// content still present too -- reduction's own real behavior
+			// (the only recipe this can apply to; patchtoolcalls is only
+			// ever authorized when baseDigests is empty, so baseMatches is
+			// always 0 for it) normalizes every occurrence uniformly. Any
+			// occurrence still matching the pre-rewrite baseline digest
+			// once an authorized rewrite for this call ID is also present
+			// means the model would see BOTH the old and the new content
+			// for the same call -- not a legitimate single rewrite.
 			return fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
 		}
 	}

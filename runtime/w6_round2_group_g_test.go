@@ -103,7 +103,8 @@ func TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized(t *testing
 		t.Fatal(err)
 	}
 	var sawReductionRewrite, sawPatchRewrite bool
-	for _, event := range events.Events {
+	reductionEventIndex, patchEventIndex := -1, -1
+	for i, event := range events.Events {
 		if event.Kind != session.AuthorizedToolResultRewriteEventKind {
 			continue
 		}
@@ -121,11 +122,13 @@ func TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized(t *testing
 		switch payload.HandlerID {
 		case "reduction":
 			sawReductionRewrite = true
+			reductionEventIndex = i
 		case "patchtoolcalls":
 			if payload.CallID != "dangling-call" {
 				t.Fatalf("patchtoolcalls rewrite call_id = %q, want dangling-call", payload.CallID)
 			}
 			sawPatchRewrite = true
+			patchEventIndex = i
 		}
 	}
 	if !sawReductionRewrite {
@@ -133,6 +136,17 @@ func TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized(t *testing
 	}
 	if !sawPatchRewrite {
 		t.Fatalf("no AuthorizedToolResultRewriteEventKind event with handler_id \"patchtoolcalls\" among %+v", events.Events)
+	}
+	// Round-three W6 summarization-correctness review item 6/item 15:
+	// the deterministic ORDER itself, not just that both occurred --
+	// reduction is registered at plan Order 0, patchtoolcalls at Order 1
+	// (see handlerComponent above), and the middleware chain runs in that
+	// same Order every turn, so reduction's own authorized rewrite must be
+	// durably audited (ListEvents, which returns events in the order this
+	// runtime committed them) strictly before patchtoolcalls', every run --
+	// not merely "both eventually present" in whatever order.
+	if reductionEventIndex >= patchEventIndex {
+		t.Fatalf("reduction's rewrite event (index %d) did not precede patchtoolcalls' (index %d) -- want the deterministic plan Order (reduction=0, patchtoolcalls=1) reflected in audit order: %+v", reductionEventIndex, patchEventIndex, events.Events)
 	}
 
 	if _, err := store.GetToolCall(context.Background(), session.ToolCallID("dangling-call")); err == nil {

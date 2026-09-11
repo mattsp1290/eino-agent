@@ -178,6 +178,24 @@ type adkEngine struct {
 	// for a HandlerKindSummarization entry -- see adkEngine.buildAgentHandlers.
 	cycleMessageSourceByPointer map[*einoschema.AgenticMessage]session.MessageID
 
+	// summarizeMu guards summarizedThisTurn.
+	summarizeMu sync.Mutex
+	// summarizedThisTurn reports whether this turn has already durably
+	// committed a summarization session.ContextEpoch (set by
+	// summarizationFinalize via HandlerBuildContext.markSummarized right
+	// after a successful commitSummaryEpoch). adkEngine is turn-scoped (a
+	// fresh one per turn), so this never needs resetting mid-turn; it is
+	// consulted by summarizeAtMostOnceMiddleware, the wrapper
+	// NewSummarizationHandlerFactory installs, BEFORE every cycle's call
+	// into upstream summarization's own BeforeModelRewriteState -- upstream
+	// re-evaluates its trigger condition on EVERY ReAct cycle with no way
+	// to disable that itself (TriggerCondition has no per-call override),
+	// so without this a multi-cycle turn that crosses the threshold once
+	// would re-summarize (and re-bill a summary generation call) on every
+	// subsequent cycle of the SAME turn (round-three W6
+	// summarization-correctness review, Important #2).
+	summarizedThisTurn bool
+
 	// handlerTools holds this turn's live tool.BaseTool instances
 	// contributed by host agent-handler middleware (filesystem's
 	// read_file, plantask's task tools, skill's "skill" tool, ...), keyed
@@ -660,6 +678,19 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, authorized *authoriz
 				entryBuild.sourceMessageID = func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
 					id, ok := e.cycleMessageSourceByPointer[msg]
 					return id, ok
+				}
+				entryBuild.baselineMessages = func() ([]*einoschema.AgenticMessage, []session.MessageID) {
+					return e.baselineMessages, e.baselineSourceIDs
+				}
+				entryBuild.summarizedThisTurn = func() bool {
+					e.summarizeMu.Lock()
+					defer e.summarizeMu.Unlock()
+					return e.summarizedThisTurn
+				}
+				entryBuild.markSummarized = func() {
+					e.summarizeMu.Lock()
+					defer e.summarizeMu.Unlock()
+					e.summarizedThisTurn = true
 				}
 			}
 		}

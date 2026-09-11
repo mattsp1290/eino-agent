@@ -43,12 +43,24 @@ func toolResultBlockMessage(callID, name string) *einoschema.AgenticMessage {
 	}
 }
 
-func toolSearchResultBlockMessage(callID string) *einoschema.AgenticMessage {
+// toolSearchResultBlockMessage builds a tool_search_result block with a
+// REAL, non-nil Result carrying discoveredToolName (round-three W6
+// authority-regression review S2: a nil Result -- as this helper originally
+// always built -- makes canonicalToolSearchResultContent digest EVERY
+// message to sha256("null") regardless of callID or content, so a content-
+// comparison bug in verifyOccurrenceKind's tool_search_result pass would go
+// completely undetected by any test built from it; see
+// TestVerifySettledToolResultsSealsToolSearchResultBlocksDetectsContentTampering
+// for the mutation-proof).
+func toolSearchResultBlockMessage(callID, discoveredToolName string) *einoschema.AgenticMessage {
 	return &einoschema.AgenticMessage{
 		Role: einoschema.AgenticRoleTypeUser,
 		ContentBlocks: []*einoschema.ContentBlock{{
-			Type:                         einoschema.ContentBlockTypeToolSearchResult,
-			ToolSearchFunctionToolResult: &einoschema.ToolSearchFunctionToolResult{CallID: callID},
+			Type: einoschema.ContentBlockTypeToolSearchResult,
+			ToolSearchFunctionToolResult: &einoschema.ToolSearchFunctionToolResult{
+				CallID: callID,
+				Result: &einoschema.ToolSearchResult{Tools: []*einoschema.ToolInfo{{Name: discoveredToolName}}},
+			},
 		}},
 	}
 }
@@ -66,7 +78,7 @@ func TestPublicizeToolCallIDsRewritesAllBlockKindsAndFallsBackWhenEmpty(t *testi
 	messages := []*einoschema.AgenticMessage{
 		toolCallBlockMessage("tool-call-1", "echo", `{}`),
 		toolResultBlockMessage("tool-call-1", "echo"),
-		toolSearchResultBlockMessage("tool-call-2"),
+		toolSearchResultBlockMessage("tool-call-2", "hidden_tool"),
 		toolCallBlockMessage("tool-call-2", "search", `{}`),
 	}
 	out, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, nil, messages)
@@ -217,7 +229,7 @@ func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testi
 	t.Run("tool_search_result collision", func(t *testing.T) {
 		messages := []*einoschema.AgenticMessage{
 			toolCallBlockMessage("tool-call-search", "search", `{}`),
-			toolSearchResultBlockMessage("tool-call-search"),
+			toolSearchResultBlockMessage("tool-call-search", "discovered_tool"),
 			toolCallBlockMessage("tool-call-echo2", "echo", `{}`),
 			toolResultBlockMessage("tool-call-echo2", "echo"),
 		}

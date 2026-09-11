@@ -79,7 +79,7 @@ func TestVerifySettledToolResultsSealsToolSearchResultBlocks(t *testing.T) {
 	authorized.record("some-handler", HandlerKindReduction, "search-call", "", "whatever")
 
 	var baseline []*einoschema.AgenticMessage
-	input := []*einoschema.AgenticMessage{toolSearchResultBlockMessage("search-call")}
+	input := []*einoschema.AgenticMessage{toolSearchResultBlockMessage("search-call", "fabricated_tool")}
 
 	err := verifySettledToolResults(baseline, input, authorized)
 	if !errors.Is(err, errUnauthorizedFabricatedToolResult) {
@@ -88,9 +88,66 @@ func TestVerifySettledToolResultsSealsToolSearchResultBlocks(t *testing.T) {
 
 	// A genuine, settled tool_search_result (present identically in
 	// baseline) must still pass.
-	settled := toolSearchResultBlockMessage("settled-search-call")
+	settled := toolSearchResultBlockMessage("settled-search-call", "real_discovered_tool")
 	if err := verifySettledToolResults([]*einoschema.AgenticMessage{settled}, []*einoschema.AgenticMessage{settled}, nil); err != nil {
 		t.Fatalf("verifySettledToolResults on a genuinely settled tool_search_result = %v, want nil", err)
+	}
+}
+
+// TestVerifySettledToolResultsSealsToolSearchResultBlocksDetectsContentTampering
+// is round-three W6 authority-regression review S2's mutation-proof: unlike
+// TestVerifySettledToolResultsSealsToolSearchResultBlocks above (which only
+// proves a MISSING baseline occurrence fails closed), this proves an
+// occurrence whose CONTENT genuinely diverges from its baseline counterpart
+// -- same call ID, real (non-nil) Result, different discovered tool name --
+// is rejected too, exercising verifyOccurrenceKind's actual byte-for-byte
+// content comparison for this block kind, not merely its presence check.
+func TestVerifySettledToolResultsSealsToolSearchResultBlocksDetectsContentTampering(t *testing.T) {
+	settled := toolSearchResultBlockMessage("tampered-search-call", "real_discovered_tool")
+	tampered := toolSearchResultBlockMessage("tampered-search-call", "SWAPPED_TOOL_NAME")
+
+	err := verifySettledToolResults([]*einoschema.AgenticMessage{settled}, []*einoschema.AgenticMessage{tampered}, nil)
+	if !errors.Is(err, errSettledToolResultDiverged) {
+		t.Fatalf("verifySettledToolResults err = %v, want errSettledToolResultDiverged (a tool_search_result whose content diverges from its baseline occurrence must fail closed)", err)
+	}
+}
+
+// TestVerifySettledToolResultsRejectsAuthorizedRewriteCoexistingWithStaleBaseline
+// is round-three W6 authority-regression review S3: the occurrence-count
+// rule previously permitted baseline count PLUS one authorized match, so
+// input = [baseline's own occurrence, the authorized rewrite's occurrence]
+// (2 total for a call ID whose baseline has exactly 1) passed -- even
+// though a real rewrite should REPLACE the baseline occurrence, never
+// coexist with it. The reviewer found three real end-to-end attempts all
+// still failed closed (reduction normalizes every occurrence of a call id
+// in practice, so the stale baseline copy never actually survives
+// alongside a real rewrite) -- this is a gap between the stated and
+// enforced invariant, not a live bypass -- but the invariant itself is now
+// enforced directly here too, defense in depth.
+func TestVerifySettledToolResultsRejectsAuthorizedRewriteCoexistingWithStaleBaseline(t *testing.T) {
+	settled := toolResultBlockMessage("coexist-call", "tool")
+	rewritten := toolResultBlockMessage("coexist-call", "tool")
+	rewritten.ContentBlocks[0].FunctionToolResult.Content[0].Text.Text = "REWRITTEN"
+	rewrittenDigest := canonicalFunctionToolResultContent(rewritten.ContentBlocks[0].FunctionToolResult.Content)
+
+	authorized := newAuthorizedRewriteSet()
+	authorized.record("reduction-handler", HandlerKindReduction, "coexist-call", "", rewrittenDigest)
+
+	baseline := []*einoschema.AgenticMessage{settled}
+	// BOTH the stale, unmodified baseline occurrence AND the authorized
+	// rewrite reach the model in the same request -- not a real, full
+	// replacement.
+	input := []*einoschema.AgenticMessage{settled, rewritten}
+
+	err := verifySettledToolResults(baseline, input, authorized)
+	if !errors.Is(err, errSettledToolResultDiverged) {
+		t.Fatalf("verifySettledToolResults err = %v, want errSettledToolResultDiverged (an authorized rewrite may never coexist with the stale baseline occurrence it was supposed to replace)", err)
+	}
+
+	// Sanity: the authorized rewrite ALONE (the baseline occurrence fully
+	// replaced, not merely supplemented) must still pass.
+	if err := verifySettledToolResults(baseline, []*einoschema.AgenticMessage{rewritten}, authorized); err != nil {
+		t.Fatalf("verifySettledToolResults on a genuine full replacement = %v, want nil", err)
 	}
 }
 

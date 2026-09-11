@@ -259,14 +259,19 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 	// cycle: originalMessages[i] correlates to durable[i].ID by pointer,
 	// exactly what a real cycle with no injected content produces.
 	sourceByPointer := make(map[*einoschema.AgenticMessage]session.MessageID, len(original))
+	baselineSourceIDs := make([]session.MessageID, len(original))
 	for i, msg := range original {
 		sourceByPointer[msg] = durable[i].ID
+		baselineSourceIDs[i] = durable[i].ID
 	}
 	build := HandlerBuildContext{
 		SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: ids, now: now},
 		sourceMessageID: func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
 			id, ok := sourceByPointer[msg]
 			return id, ok
+		},
+		baselineMessages: func() ([]*einoschema.AgenticMessage, []session.MessageID) {
+			return original, baselineSourceIDs
 		},
 	}
 	finalize := summarizationFinalize(build, 1)
@@ -349,14 +354,19 @@ func TestSummarizationFinalizeNeverSplitsAFunctionCallFromItsResult(t *testing.T
 		original[i] = einoschema.UserAgenticMessage("msg")
 	}
 	sourceByPointer := make(map[*einoschema.AgenticMessage]session.MessageID, len(original))
+	baselineSourceIDs := make([]session.MessageID, len(original))
 	for i, msg := range original {
 		sourceByPointer[msg] = durable[i].ID
+		baselineSourceIDs[i] = durable[i].ID
 	}
 	build := HandlerBuildContext{
 		SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: ids, now: now},
 		sourceMessageID: func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
 			id, ok := sourceByPointer[msg]
 			return id, ok
+		},
+		baselineMessages: func() ([]*einoschema.AgenticMessage, []session.MessageID) {
+			return original, baselineSourceIDs
 		},
 	}
 	finalize := summarizationFinalize(build, 2)
