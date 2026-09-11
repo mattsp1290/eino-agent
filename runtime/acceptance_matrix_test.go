@@ -134,6 +134,13 @@ func TestCheckpointVersionMismatchRejectedOnResume(t *testing.T) {
 	if _, err := orch2.ResumeRun(context.Background(), runID, ResumeRequest{}); err == nil || !errors.Is(err, ErrCheckpointFingerprintMismatch) {
 		t.Fatalf("ResumeRun error = %v, want ErrCheckpointFingerprintMismatch", err)
 	}
+	// A rejected resume must leave the run exactly as ResumeRun found it:
+	// this check runs before ClaimRun (see ResumeRun's doc comment), so the
+	// run must never observe a claim/running transition it can't recover
+	// from (see reconciliation.md item 1 / ED-1).
+	if run, err := store.GetRun(context.Background(), runID); err != nil || run.Status != session.RunPaused {
+		t.Fatalf("run after rejected resume = %+v, err=%v, want status=paused", run, err)
+	}
 }
 
 // TestCheckpointFingerprintMismatchRejectedOnResume proves a promoted
@@ -156,6 +163,40 @@ func TestCheckpointFingerprintMismatchRejectedOnResume(t *testing.T) {
 	configureTestTools(orch2, staticToolRegistry{tools: []Tool{pausingToolForCheckpoint("gate", new(int))}})
 	if _, err := orch2.ResumeRun(context.Background(), runID, ResumeRequest{}); err == nil || !errors.Is(err, ErrCheckpointFingerprintMismatch) {
 		t.Fatalf("ResumeRun error = %v, want ErrCheckpointFingerprintMismatch", err)
+	}
+	if run, err := store.GetRun(context.Background(), runID); err != nil || run.Status != session.RunPaused {
+		t.Fatalf("run after rejected resume = %+v, err=%v, want status=paused", run, err)
+	}
+}
+
+// failingResolver always fails Resolve, simulating a model.Resolve failure
+// on ResumeRun (e.g. the provider/model configured at admission time is no
+// longer registered in this binary).
+type failingResolver struct{ err error }
+
+func (f failingResolver) Resolve(context.Context, model.Selection, model.Runtime) (model.Resolved, error) {
+	return model.Resolved{}, f.err
+}
+
+// TestResumeRunModelResolveFailureLeavesRunPaused proves a model.Resolve
+// failure on ResumeRun -- checked before ClaimRun, off the durable GetRun
+// record -- also leaves the run paused rather than stranding it running
+// with no driver (reconciliation.md item 1 / ED-1's third required case).
+func TestResumeRunModelResolveFailureLeavesRunPaused(t *testing.T) {
+	store := newAdmissionStore()
+	_, runID, _ := startPausedRun(t, store, "checkpoint-model-resolve-failure", new(int))
+
+	resolveErr := errors.New("provider no longer registered")
+	orch2 := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		t.Fatal("model dispatched despite a model.Resolve failure")
+		return nil, nil
+	}), WithModelResolver(failingResolver{err: resolveErr}))
+	configureTestTools(orch2, staticToolRegistry{tools: []Tool{pausingToolForCheckpoint("gate", new(int))}})
+	if _, err := orch2.ResumeRun(context.Background(), runID, ResumeRequest{}); !errors.Is(err, resolveErr) {
+		t.Fatalf("ResumeRun error = %v, want %v", err, resolveErr)
+	}
+	if run, err := store.GetRun(context.Background(), runID); err != nil || run.Status != session.RunPaused {
+		t.Fatalf("run after rejected resume = %+v, err=%v, want status=paused", run, err)
 	}
 }
 
