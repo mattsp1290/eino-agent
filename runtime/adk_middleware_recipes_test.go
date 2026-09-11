@@ -13,6 +13,7 @@ import (
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/session/compaction"
 )
 
 // TestHandlerBuildContextExposesNoDurableStoreAuthority is the compile-time-
@@ -296,6 +297,134 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 	}
 	if epoch.SummaryMessageID == "" {
 		t.Fatal("epoch has no SummaryMessageID")
+	}
+}
+
+// TestSummarizationFinalizeNeverSplitsAFunctionCallFromItsResult is
+// round-two W6 review item 11's call/result group-boundary protection proof
+// (moveTailStartToGroupBoundary): [system, user, assistant(tool_call),
+// user(tool_result), assistant(final)] with retainTail=2 -- a NAIVE cut
+// (len(durable)-retainTail=3) would land exactly between the tool_call and
+// its own tool_result, splitting them across the summarized/tail boundary.
+// The real boundary must instead retreat to keep the whole call/result
+// group in the tail.
+func TestSummarizationFinalizeNeverSplitsAFunctionCallFromItsResult(t *testing.T) {
+	store := newAdmissionStore()
+	sessionID := session.ID("group-boundary-session")
+	now := func() time.Time { return time.Unix(2000, 0).UTC() }
+	ids := &sequenceIDs{}
+
+	type fixture struct {
+		role  session.Role
+		block session.ContentBlock
+	}
+	fixtures := []fixture{
+		{session.RoleSystem, session.ContentBlock{ID: "b0", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "system prompt"}}},
+		{session.RoleUser, session.ContentBlock{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "please do the thing"}}},
+		{session.RoleAssistant, session.ContentBlock{ID: "b2", Kind: session.BlockKindFunctionToolCall, FunctionCall: &session.FunctionCallBlock{CallID: "call-1", Name: "thing", Arguments: "{}"}}},
+		{session.RoleUser, session.ContentBlock{ID: "b3", Kind: session.BlockKindFunctionToolResult, FunctionResult: &session.FunctionResultBlock{CallID: "call-1", Name: "thing", Content: []session.ResultContent{{Type: session.ResultContentText, Text: "done"}}}}},
+		{session.RoleAssistant, session.ContentBlock{ID: "b4", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "all set"}}},
+	}
+	var durable []session.Message
+	for i, fx := range fixtures {
+		msg, err := store.AppendMessage(context.Background(), session.Message{ID: session.MessageID("gm" + string(rune('0'+i))), SessionID: sessionID, Role: fx.role, CreatedAt: now(), UpdatedAt: now()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		content := session.Content{Role: fx.role, Blocks: []session.ContentBlock{fx.block}}
+		parts, err := session.EncodeContentParts(content, func() session.PartID { return session.PartID("gp" + string(rune('0'+i))) }, msg.ID, sessionID, "", now(), session.DefaultContentLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, part := range parts {
+			if _, err := store.AppendPart(context.Background(), part); err != nil {
+				t.Fatal(err)
+			}
+		}
+		durable = append(durable, msg)
+	}
+	execution := testFencedExecutionStore(t, store, sessionID)
+	original := make([]*einoschema.AgenticMessage, len(durable))
+	for i := range durable {
+		original[i] = einoschema.UserAgenticMessage("msg")
+	}
+	sourceByPointer := make(map[*einoschema.AgenticMessage]session.MessageID, len(original))
+	for i, msg := range original {
+		sourceByPointer[msg] = durable[i].ID
+	}
+	build := HandlerBuildContext{
+		SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: ids, now: now},
+		sourceMessageID: func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
+			id, ok := sourceByPointer[msg]
+			return id, ok
+		},
+	}
+	finalize := summarizationFinalize(build, 2)
+	summary := agenticAssistantText("compact summary")
+	if _, err := finalize(context.Background(), original, summary); err != nil {
+		t.Fatalf("finalize error = %v", err)
+	}
+	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil || len(epochs) != 1 {
+		t.Fatalf("epochs = %+v, err = %v", epochs, err)
+	}
+	epoch := epochs[0]
+	// durable[2] is the tool_call; durable[3] is its own tool_result. The
+	// group-boundary protection must keep both in the tail, so TailStartID
+	// must be durable[2] (the call), never durable[3] (the result, which
+	// would mean the call itself got summarized away while its own result
+	// survived in the tail -- a broken transcript no provider can replay).
+	if epoch.TailStartID != durable[2].ID {
+		t.Fatalf("epoch.TailStartID = %v, want durable[2] (%v) -- the tool call must never be separated from its own result", epoch.TailStartID, durable[2].ID)
+	}
+}
+
+// TestCommitSummaryEpochIsAtomicAcrossFailure is round-two W6 review item
+// 11's single-transaction-commit protection proof: contextEpochCapability.commitSummaryEpoch
+// wraps StartContextEpoch and the boundary append (AppendMessage/AppendPart/
+// FinishContextEpoch, via compaction.AppendBoundaryTx) in ONE
+// execution.WithinTx transaction. A forced failure in the boundary append
+// step (a deliberately conflicting pre-seeded message at the exact id the
+// boundary would use) must leave NO trace of the epoch at all -- not even
+// the row StartContextEpoch itself would otherwise have committed.
+func TestCommitSummaryEpochIsAtomicAcrossFailure(t *testing.T) {
+	store := newAdmissionStore()
+	sessionID := session.ID("atomic-commit-session")
+	execution := testFencedExecutionStore(t, store, sessionID)
+	ids := &sequenceIDs{}
+	now := func() time.Time { return time.Unix(3000, 0).UTC() }
+	epochCap := contextEpochCapability{sessionID: sessionID, runID: "run-1", store: store, execution: execution, ids: ids, now: now}
+
+	epochID := ids.NewEpochID()
+	boundaryIDs := compaction.BoundaryIDs{MessageID: ids.NewMessageID(), PartID: ids.NewPartID()}
+
+	// Pre-seed a message at the boundary's own predicted id with a
+	// MISMATCHED role: appendMessageLocked returns session.ErrConflict for
+	// an id collision with a different role, deterministically forcing
+	// AppendBoundaryTx's own internal AppendMessage call (which always uses
+	// session.RoleSystem for the boundary message) to fail.
+	if _, err := store.AppendMessage(context.Background(), session.Message{
+		ID: boundaryIDs.MessageID, SessionID: sessionID, Role: session.RoleUser, CreatedAt: now(), UpdatedAt: now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	epoch := session.ContextEpoch{
+		ID: epochID, SessionID: sessionID, SummarizedFromID: "seed-from", SummarizedToID: "seed-to",
+		Trigger: "summarization", Reason: "context_budget", NextAction: session.EpochNextAutoContinue, CreatedAt: now(),
+	}
+	if _, _, err := epochCap.commitSummaryEpoch(context.Background(), epoch, boundaryIDs, "a summary"); err == nil {
+		t.Fatal("commitSummaryEpoch succeeded despite a forced boundary-append conflict")
+	}
+
+	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range epochs {
+		if e.ID == epochID {
+			t.Fatalf("StartContextEpoch's row survived a failed boundary append -- commitSummaryEpoch is not atomic: %+v", e)
+		}
 	}
 }
 

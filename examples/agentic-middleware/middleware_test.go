@@ -30,6 +30,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -560,18 +561,31 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 
 	var mainDispatchCount int
 	var secondDispatchMessageCount int
+	var thirdDispatchMessageCount int
 	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGeneration(request) {
 			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
 		}
 		mainDispatchCount++
-		if mainDispatchCount == 2 {
+		switch mainDispatchCount {
+		case 2:
 			// Turn 2's own main dispatch, AFTER Finalize has already
 			// narrowed history (summarization triggers, and Finalize runs,
 			// BEFORE ADK's own main dispatch for the cycle that triggered
 			// it): record how many messages the provider actually saw, to
-			// compare against the full durable replay below.
+			// compare against the full durable replay below. This alone
+			// does NOT prove the durable epoch read-back works -- Finalize's
+			// own return value narrows THIS cycle's dispatch in memory
+			// regardless of it; see thirdDispatchMessageCount below.
 			secondDispatchMessageCount = len(request.Messages)
+		case 3:
+			// Turn 3's admission-time baseline: a BRAND NEW turn, freshly
+			// admitted from scratch (resolveTurnHistoryOptions re-reading
+			// latestFinishedSummarizationEpoch), with no in-memory Finalize
+			// effect of its own to rely on -- this is the actual proof the
+			// durably committed epoch is read back and narrows a later
+			// turn's own admission, not merely reused in-process.
+			thirdDispatchMessageCount = len(request.Messages)
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, understood")}, nil
 	})
@@ -653,8 +667,23 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	// EXACT equality (round-two W6 review item 11), not merely a length
+	// bound: compaction must never modify a single byte of durable history
+	// that existed before it ran -- it only ever APPENDS the new boundary
+	// message/parts. Every message and part present before turn 2 must
+	// still be present, byte-for-byte identical, at the same prefix
+	// position after it.
 	if len(fullReplay.Messages) <= len(replay.Messages) {
 		t.Fatalf("full replay did not grow across turn 2: before=%d after=%d", len(replay.Messages), len(fullReplay.Messages))
+	}
+	if !reflect.DeepEqual(replay.Messages, fullReplay.Messages[:len(replay.Messages)]) {
+		t.Fatalf("compaction changed a pre-existing message:\nbefore=%+v\nafter =%+v", replay.Messages, fullReplay.Messages[:len(replay.Messages)])
+	}
+	if len(fullReplay.Parts) <= len(replay.Parts) {
+		t.Fatalf("full replay's parts did not grow across turn 2: before=%d after=%d", len(replay.Parts), len(fullReplay.Parts))
+	}
+	if !reflect.DeepEqual(replay.Parts, fullReplay.Parts[:len(replay.Parts)]) {
+		t.Fatalf("compaction changed a pre-existing part:\nbefore=%+v\nafter =%+v", replay.Parts, fullReplay.Parts[:len(replay.Parts)])
 	}
 	owners, err := session.ResolveReplayPartOwners(fullReplay.Parts, fullReplay.PartOwnerMessageIDs)
 	if err != nil {
@@ -674,6 +703,33 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	}
 	if secondDispatchMessageCount >= len(fullReplay.Messages) {
 		t.Fatalf("turn 2's provider-visible message count (%d) did not narrow below the full durable replay (%d)", secondDispatchMessageCount, len(fullReplay.Messages))
+	}
+
+	// Third turn, same session, a real third orch.Start call: round-two W6
+	// review item 11's actual epoch-read-back proof. This turn's own
+	// admission starts completely fresh -- it has no in-memory carryover
+	// from turn 2's own Finalize call -- so its narrowed baseline can only
+	// come from resolveTurnHistoryOptions re-reading the durably committed
+	// epoch (latestFinishedSummarizationEpoch).
+	handle3, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("one more thing"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result3 := awaitDone(t, handle3, 10*time.Second)
+	if result3.Status != session.RunCompleted {
+		t.Fatalf("turn 3 result = %+v, want completed", result3)
+	}
+	if thirdDispatchMessageCount == 0 {
+		t.Fatal("turn 3's main dispatch was never observed")
+	}
+	fullReplayAfterTurn3, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if thirdDispatchMessageCount >= len(fullReplayAfterTurn3.Messages) {
+		t.Fatalf("turn 3's provider-visible message count (%d) did not narrow below the full durable replay (%d) -- the committed epoch was not read back on a fresh admission", thirdDispatchMessageCount, len(fullReplayAfterTurn3.Messages))
 	}
 }
 
