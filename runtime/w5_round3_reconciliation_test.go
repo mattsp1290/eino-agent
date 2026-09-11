@@ -417,6 +417,15 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 	if result.Status != session.RunPaused {
 		t.Fatalf("reconciled result = %+v, want paused (a promoted checkpoint exists to resume from)", result)
 	}
+	// Round-four reconciliation item 5 (CR-I4): a RunPaused result from
+	// Resume() must come from a handle whose AwaitPause actually delivers
+	// (Handle's doc comment: "AwaitPause ... is closed without a value
+	// otherwise" -- implying it DOES deliver for a pause), never a nil
+	// channel that blocks forever.
+	pause, ok := <-handle.AwaitPause()
+	if !ok || pause.RunID != admittedRun.ID || pause.StopCause == "" {
+		t.Fatalf("AwaitPause after reconciled repause = %+v, ok=%v", pause, ok)
+	}
 	turn, err := orch.store.GetTurn(ctx, "crash-turn-2-2")
 	if err != nil || turn.State != session.TurnInterrupted {
 		t.Fatalf("dangling second turn after reconciliation = %#v, err=%v, want interrupted", turn, err)
@@ -460,5 +469,85 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 	// history EXACTLY ONCE, never duplicated by a second admission.
 	if got := countUserMessageText(t, ctx, orch.store, sessionID, "second message"); got != 1 {
 		t.Fatalf("committed 'second message' user messages after resume = %d, want exactly 1 (no duplicate)", got)
+	}
+}
+
+// panicOnReconcileStore wraps a session.Store so ReconcileInterruptedTurn
+// panics -- used by TestReconcileCrashedRunSurvivesPanic to prove round-four
+// reconciliation item 3 (CR-I2): a panic anywhere inside reconcileCrashedRun
+// (the store, extension dispatch, or terminalizeUnfinishedTools) must settle
+// the run RunFailed, never take down the host process.
+type panicOnReconcileStore struct {
+	session.Store
+}
+
+func (s *panicOnReconcileStore) Execution(fence session.RunFence) session.ExecutionStore {
+	return &panicOnReconcileExecution{ExecutionStore: s.Store.Execution(fence)}
+}
+
+type panicOnReconcileExecution struct {
+	session.ExecutionStore
+}
+
+func (e *panicOnReconcileExecution) ReconcileInterruptedTurn(context.Context, session.ReconcileInterruptedTurnRequest) (session.ReconcileInterruptedTurnResult, error) {
+	panic("injected reconcile panic")
+}
+
+func TestReconcileCrashedRunSurvivesPanic(t *testing.T) {
+	ctx := context.Background()
+	sqliteStore, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("openTestSQLite: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+	wrapped := &panicOnReconcileStore{Store: sqliteStore}
+	orch, err := NewStreamingOrchestrator(
+		WithStore(wrapped), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("unused")}, nil
+		})}),
+		WithIDGenerator(&sequenceIDs{}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
+		WithOwnerID("sqlite-owner-panic"), WithQueueSize(2),
+		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
+	)
+	if err != nil {
+		t.Fatalf("NewStreamingOrchestrator: %v", err)
+	}
+	configureTestTools(orch, staticToolRegistry{tools: nil})
+
+	sessionID := session.ID("panic-session-1")
+	newTestSession(t, ctx, orch, sessionID)
+	admittedRun, err := orch.store.AdmitRun(ctx, session.Run{
+		ID: "panic-run-1", SessionID: sessionID, OwnerID: "owner-1", ClaimToken: "claim-1",
+		Agent: "default", ProviderID: "test", ModelID: "test", Status: session.RunPending, CreatedAt: orch.now(),
+		ExtensionPlan: newTestToolPlan(staticToolRegistry{}).Descriptor(),
+	}, time.Nanosecond)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := orch.store.Execution(session.RunFence{RunID: admittedRun.ID, ClaimToken: admittedRun.ClaimToken})
+	if _, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+		Turn: session.Turn{
+			ID: "panic-turn-1", RunID: admittedRun.ID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted,
+			UserMessageIDs: []session.MessageID{"panic-user-msg-1"}, CreatedAt: orch.now(),
+		},
+		UserMessages: []session.Message{{ID: "panic-user-msg-1", SessionID: sessionID, RunID: admittedRun.ID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
+		Event:        session.EventRecord{ID: "panic-turn-1-started", SessionID: sessionID, RunID: admittedRun.ID, TurnID: "panic-turn-1", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
+	}); err != nil {
+		t.Fatalf("admit turn: %v", err)
+	}
+	if _, err := execution.StartRun(ctx, orch.now()); err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	// The lease (1ns) is already expired; nothing was ever settled -- a
+	// dangling turn a crashed process left behind.
+	time.Sleep(2 * time.Millisecond)
+
+	handle, err := orch.Resume(ctx, admittedRun.ID)
+	if err != nil {
+		t.Fatalf("Resume error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunFailed || result.Error == nil {
+		t.Fatalf("result after injected reconciliation panic = %+v, want failed with an error (the process must survive)", result)
 	}
 }

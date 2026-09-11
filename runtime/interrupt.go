@@ -358,20 +358,65 @@ func (o *StreamingOrchestrator) reclaimAndReconcile(ctx context.Context, run ses
 	}
 	execution := newRunExecution(o, plan, claimed)
 	ownershipTransferred = true
-	runCtx, cancel := context.WithCancel(ctx)
-	handle := &streamingHandle{
-		runID:       claimed.ID,
-		host:        o,
-		cancel:      cancel,
-		done:        make(chan Result, 1),
-		onInterrupt: func(reason string) { o.observeInterrupt(context.WithoutCancel(ctx), claimed, "", reason) },
-	}
-	go func() {
-		defer close(handle.done)
-		defer execution.release()
-		handle.done <- o.reconcileCrashedRun(context.WithoutCancel(runCtx), execution, claimed)
-	}()
+	// runCtx is cancelled only by an explicit Interrupt on the returned
+	// handle; reconciliation itself always runs detached from the caller's
+	// ctx (context.WithoutCancel below), matching every other run-driving
+	// goroutine in this package.
+	_, cancel := context.WithCancel(ctx)
+	// turnLoopHandle (not streamingHandle) is used so a RunPaused outcome
+	// -- reachable from this path via repause -- honours the documented
+	// Handle contract: its AwaitPause is a real channel, closed without a
+	// value on every terminal outcome and carrying a PauseInfo on a repause
+	// (round-four reconciliation item 5/CR-I4; see runtime/types.go's
+	// Handle doc comment).
+	handle := &turnLoopHandle{runID: claimed.ID, host: o, done: make(chan Result, 1), pause: make(chan PauseInfo, 1), cancel: cancel}
+	go o.runReconcileCrashedRun(context.WithoutCancel(ctx), execution, claimed, handle)
 	return handle, nil
+}
+
+// runReconcileCrashedRun drives reconcileCrashedRun under the same
+// protections every other run-driving goroutine gets (round-four
+// reconciliation item 3/CR-I2): panic recovery (a panic anywhere in the
+// reconciliation -- the store, extension dispatch, or
+// terminalizeUnfinishedTools -- settles the run RunFailed instead of taking
+// down the host process, matching executeLifecycle's own recover()), an
+// observed-run span (startObservedRun/finishObservedRun), a RunSettledNotice
+// on genuinely terminal settlement (never on the nonterminal repause branch,
+// matching finishTurnLoop's own convention), and a lease heartbeat for the
+// duration of the reconciliation's writes (ListUnfinishedToolCalls plus
+// terminalizeUnfinishedTools can settle an unbounded number of tool calls).
+//
+// reconcileCrashedRun is not driven through the shared executeLifecycle
+// boundary: that helper's own deferred settleRun unconditionally calls
+// SettleRun again, which would double-settle a run this function already
+// settled via RepauseRun or SettleRun itself (RepauseRun leaves the fence
+// unable to write further, so a second SettleRun would fail ErrConflict and
+// overwrite an already-correct RunPaused result with RunFailed).
+func (o *StreamingOrchestrator) runReconcileCrashedRun(ctx context.Context, execution *runExecution, run session.Run, handle *turnLoopHandle) {
+	observed := o.startObservedRun(ctx, run, "", o.now())
+	leaseCtx := execution.startLease(ctx, o.lease())
+	result := func() (result Result) {
+		defer func() {
+			_ = execution.stopLease()
+			if recovered := recover(); recovered != nil {
+				result = Result{RunID: run.ID, Status: session.RunFailed, Error: fmt.Errorf("crash reconciliation panic: %v", recovered)}
+			}
+		}()
+		return o.reconcileCrashedRun(leaseCtx, execution, run)
+	}()
+	o.finishObservedRun(observed, result, o.now())
+	if result.Status == session.RunPaused {
+		handle.pause <- PauseInfo{RunID: run.ID, StopCause: "crash-reconciled"}
+	} else {
+		metadata := boundedTurnMetadata(o.resumeSnapshot(run))
+		extension.Notify(execution.dispatch(), context.WithoutCancel(ctx), RunSettledPoint, RunSettledNotice{
+			SessionID: run.SessionID, Result: result, Metadata: metadata, Error: classifyExtensionError(result.Error),
+		})
+	}
+	close(handle.pause)
+	execution.release()
+	handle.done <- result
+	close(handle.done)
 }
 
 // reconcileCrashedRun performs reclaimAndReconcile's actual reconciliation
