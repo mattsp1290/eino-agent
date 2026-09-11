@@ -1061,22 +1061,32 @@ unwritten (see that bullet for the exact, now-shorter list).
      reconciles it instead: unfinished tool calls are terminalized (an
      unsafe running tool is never rerun, matching the existing
      `terminalizeUnfinishedTools` contract), a turn left dangling by the
-     crash is settled interrupted with its consumed inbox items requeued to
-     `queued` (`ReconcileInterruptedTurn`, a new `session.ExecutionStore`
-     method -- distinct from the existing `InterruptTurn`, which leaves
-     inbox items `interrupted` for the *same*, checkpoint-resumable turn to
-     later complete; here there is no checkpoint runner state describing
-     the abandoned turn, so the items must flow back through `GenInput`
-     into a *new* one), and the run is then either repaused (`RepauseRun`,
-     a new `session.ExecutionStore` method that reverts a claim to `paused`
-     with no live lease and touches no checkpoint -- used here, and also as
-     `ResumeRun`'s own compensating write for a post-claim `StartRun`
-     failure, which previously left the run `running` with no driver and no
-     real recovery path despite that being documented as "recoverable only
-     by lease expiry") if it has ever had a promoted checkpoint, or settled
-     interrupted if it never did (nothing to resume; the requeued items
-     stay durably `queued` for the session's next `Start`). A run with no
-     turns and no checkpoint at all still uses the unchanged legacy path.
+     crash is settled interrupted (`ReconcileInterruptedTurn`, a new
+     `session.ExecutionStore` method -- distinct from the existing
+     `InterruptTurn`, which leaves inbox items `interrupted` for the
+     *same*, checkpoint-resumable turn to later complete), and the run is
+     then either repaused (`RepauseRun`, a new `session.ExecutionStore`
+     method that reverts a claim to `paused` with no live lease -- used
+     here, and also as `ResumeRun`'s own compensating write for a
+     post-claim `StartRun` failure, which previously left the run
+     `running` with no driver and no real recovery path despite that being
+     documented as "recoverable only by lease expiry") if it has ever had
+     a promoted checkpoint, or settled interrupted if it never did
+     (nothing to resume). A run with no turns and no checkpoint at all
+     still uses the unchanged legacy path.
+     **Superseded by phase 7 item 1 (CR-C1) and phase 7's round-five
+     follow-up (TR-I1)**: this phase's `ReconcileInterruptedTurn` requeued
+     the dangling turn's consumed inbox items back to `InboxQueued` on the
+     premise that a fresh `AdmitTurn` would need to re-consume them into a
+     new turn -- see phase 7 item 1 for why that duplicated content in
+     provider history, and what shipped instead (items carried forward as
+     `InboxInterrupted`, never requeued; the same turn later redriven by
+     `TurnID` via `ResumeInterruptedTurn`). `RepauseRun` also no longer
+     unconditionally "touches no checkpoint": when reconciliation found a
+     dangling turn, it now stages and promotes a fresh `Kind=loop`
+     checkpoint recorded for that turn as part of the same repause, so a
+     later `ResumeRun`'s `TurnID`-consistency check (round-five
+     reconciliation item 2/TR-I1) reads a consistent state.
   5. **Docs/test-coverage only**: the `turnLoopCheckpointShape` doc comment
      claimed a checkpoint gob-shape round-trip test that did not exist;
      `TestEmptyLoopCheckpointMatchesUpstreamGobShape` proved a round trip by

@@ -328,14 +328,19 @@ func (o *StreamingOrchestrator) wasADKDriven(ctx context.Context, run session.Ru
 // genuinely still-alive owner still wins ErrSessionBusy -- then
 // conservatively reconciles it: unfinished tool calls are terminalized
 // (never re-executed; matches terminalizeUnfinishedTools' existing
-// unsafe-running-tool-never-reruns contract), any turn left admitted/
-// running by the crash is settled interrupted with its consumed inbox
-// items requeued (ReconcileInterruptedTurn), and the run is then either
-// repaused (if it has ever had a promoted checkpoint, so a later ResumeRun
-// can resume it) or settled interrupted (if it never did, so there is
-// nothing to resume -- the requeued items stay durably `queued` for the
-// session's next Start to pick up via drainQueuedInbox, which is
-// session-scoped, not run-scoped).
+// unsafe-running-tool-never-reruns contract), and any turn left admitted/
+// running by the crash is settled interrupted (ReconcileInterruptedTurn),
+// its already-consumed inbox items carried forward as InboxInterrupted --
+// NEVER requeued to InboxQueued, since they were already durably committed
+// into that turn's own user messages by the AdmitTurn that admitted it; a
+// later ResumeRun redrives the SAME turn by TurnID (ResumeInterruptedTurn),
+// never re-admits its content as a fresh turn. The run is then either
+// repaused (staging and promoting a fresh Kind=loop checkpoint recorded for
+// the just-reconciled turn -- round-five reconciliation item 2/TR-I1 -- if
+// it has ever had a promoted checkpoint, so a later ResumeRun reads a
+// consistent state) or settled interrupted (if it never did, so there is
+// nothing to resume -- the reconciled turn's content is answered only via
+// its own already-committed history, on some later run over this session).
 func (o *StreamingOrchestrator) reclaimAndReconcile(ctx context.Context, run session.Run) (Handle, error) {
 	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
 	if err != nil {
@@ -488,8 +493,12 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 	}
 	// No promoted checkpoint ever existed for this run (it crashed on its
 	// very first turn, before ever pausing): there is nothing a later
-	// ResumeRun could resume, so settle it interrupted. Any inbox items
-	// reconciled above stay durably `queued` for the session's next Start.
+	// ResumeRun could resume, so settle it interrupted. Any turn reconciled
+	// above stays durably `interrupted`, its consumed inbox items carried
+	// forward as `interrupted` -- never requeued to `queued` -- so its
+	// content is answered only via already-committed history, on some
+	// later run over this session (drainQueuedInbox will never see it
+	// again: it is not `queued`).
 	settlement := session.RunSettlement{Status: session.RunInterrupted, FinishedAt: o.now()}
 	committed, err := execution.store.SettleRun(ctx, session.SettleRunRequest{
 		Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID()},

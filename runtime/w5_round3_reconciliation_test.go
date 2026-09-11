@@ -19,9 +19,10 @@ import (
 // compensates with a re-pause instead of stranding the run `running` with
 // no driver; (b) a turn a crashed process left admitted/running is
 // conservatively reconciled -- interrupted, its consumed inbox items
-// requeued -- on the next Resume; (c) a `running` run whose lease expired
-// and which has a promoted checkpoint is recoverable (reclaim -> reconcile
-// -> paused), not stranded behind ErrSessionBusy.
+// carried forward as `interrupted`, never requeued to `queued` -- on the
+// next Resume; (c) a `running` run whose lease expired and which has a
+// promoted checkpoint is recoverable (reclaim -> reconcile -> paused), not
+// stranded behind ErrSessionBusy.
 
 // startRunFailOnceStore fails exactly the first ExecutionStore.StartRun
 // call any fence it hands out makes, then behaves normally.
@@ -219,10 +220,11 @@ func countUserMessageText(t *testing.T, ctx context.Context, store session.Store
 // RD-S5): a turn admitted directly against the store (simulating a process
 // that admitted it, then crashed before ever calling StartRun, driving the
 // TurnLoop, or staging a checkpoint) is conservatively reconciled on the
-// next Resume: interrupted, its consumed inbox item requeued. With no
-// checkpoint ever promoted for this run, there is nothing to resume, so it
-// settles interrupted -- and the requeued item stays durably `queued` for
-// the session's next Start.
+// next Resume: interrupted, its consumed inbox item carried forward as
+// `interrupted` -- never requeued to `queued`. With no checkpoint ever
+// promoted for this run, there is nothing to resume, so it settles
+// interrupted -- the reconciled turn's content is answered only via its
+// own already-committed history, on some later run over this session.
 func TestResumeReconcilesDanglingAdmittedTurnAfterCrash(t *testing.T) {
 	ctx := context.Background()
 	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
