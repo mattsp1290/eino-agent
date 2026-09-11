@@ -346,7 +346,7 @@ func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request s
 		if current.RunID != run.ID || current.SessionID != run.SessionID || current.RunID != e.fence.RunID {
 			return session.ErrConflict
 		}
-		candidate, err := session.ApplyInterruptTurn(current, session.InterruptTurnRequest{TurnID: request.TurnID, Event: request.Event})
+		candidate, err := session.ApplyInterruptTurn(current, session.InterruptTurnRequest(request))
 		if err != nil {
 			return err
 		}

@@ -1064,7 +1064,7 @@ func (s *fakeExecutionStore) ReconcileInterruptedTurn(_ context.Context, request
 	if !ok {
 		return session.ReconcileInterruptedTurnResult{}, session.ErrConflict
 	}
-	candidate, err := session.ApplyInterruptTurn(current, session.InterruptTurnRequest{TurnID: request.TurnID, Event: request.Event})
+	candidate, err := session.ApplyInterruptTurn(current, session.InterruptTurnRequest(request))
 	if err != nil {
 		return session.ReconcileInterruptedTurnResult{}, err
 	}

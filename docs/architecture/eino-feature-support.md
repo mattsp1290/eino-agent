@@ -490,7 +490,17 @@ unwritten (see that bullet for the exact, now-shorter list).
   `atomic.Int64` incremented by `adkModel.begin` once a physical call's
   ledger row is durably committed, checked alongside `guardRan` -- a
   normally-completed turn that recorded zero dispatches fails the same way.
-  Both checks are necessarily post-hoc (they run only after the agent's
+  This is a zero-check, not an every-call check: a *hybrid* factory whose
+  agent routes exactly one call through `build.Model` and every other call
+  through a substituted model in the same turn passes it (`dispatches >
+  0`), while the substituted calls remain unledgered and the turn still
+  settles `RunCompleted` -- narrowing this to verify every dispatch, not
+  just the first, is still **not covered** (see the round-three
+  reconciliation phase-6 bullet, which also names the "every compliant
+  turn must dispatch at least once" constraint this check imposes on
+  `AgentFactory` explicitly, since a workflow-pattern factory that
+  legitimately never dispatches on some turns fails it today). Both checks
+  are necessarily post-hoc (they run only after the agent's
   events iterator has fully drained, so a noncompliant factory's own
   unledgered provider call has already happened by the time either fires);
   this phase did not add construction-time verification of the returned
@@ -986,6 +996,122 @@ unwritten (see that bullet for the exact, now-shorter list).
   Proven by `TestRunFinishedUsageSumsBothTurns` (`runtime/w5_reconciliation_test.go`):
   a two-turn run's `run_finished` usage equals the sum of both turns' own
   durably recorded usage.
+- **Phase 6 (round-three reconciliation)**: the round-three reviewers
+  reproduced two residual windows phase 5's own fixes narrowed but did not
+  fully close, a regression phase 5 itself introduced, a genuine crash-
+  recovery gap, and several documentation/test-coverage gaps.
+  1. **`Enqueue`'s push-after-seal panic, closed completely**: phase 5's
+     `unregisterLoop`-before-seal ordering closed the wide window, but
+     `Enqueue` still called `liveLoopFor` (lock released) and then `Push`
+     (unlocked) as two separate steps -- a preemption in between could still
+     land a `Push` on a loop `TakeLateItems` had already sealed, panicking
+     in the host's own `Enqueue` goroutine. `Enqueue` now pushes through
+     `pushToLoop`, which holds `loopsMu` across the lookup and the `Push`,
+     the same lock `unregisterLoop` takes strictly before the seal.
+  2. **The split-delivery degenerate turn**: `runTurnLoop` pushed
+     `pushIDs` *after* `loop.Run`, racing `tryLoadCheckpoint`'s
+     `buffer.TakeAll()`; a losing push landed in a second `GenInput` call
+     whose item `claimItems` had already admitted, and `genInput` still
+     minted and dispatched a content-free continuation turn -- an extra
+     assistant reply and provider charge for content already committed.
+     Fixed by pushing before `loop.Run` (matching `Start`'s own sentinel
+     push), which merges both deliveries into one `GenInput` batch
+     `claimItems` can dedupe; `genInput` additionally refuses to admit a
+     turn when the dedupe empties a batch of genuine (non-sentinel)
+     duplicates, stopping the loop synchronously instead (via `loop.Stop`
+     called from inside `GenInput`, which the run loop takes as license to
+     discard the turn and push the raw items back to the buffer rather than
+     ever call `PrepareAgent`) so the duplicate surfaces as a between-turn
+     queued-continuation pause, never a second dispatch. This does NOT
+     cover a cross-process duplicate that empties a batch only after
+     `loadInboxItems`' own durable-state filter runs inside `admitTurn`
+     (still absorbed as a degenerate, dispatching continuation turn, which
+     is the correct behaviour for that specific case -- the content really
+     is already committed by another process).
+  3. **A phase-5 regression**: `ResumeRun`'s durable message floor was
+     seeded from `o.now()` alone. That is not a safe floor -- message
+     timestamps are allocated forward in nanosecond steps from a turn's own
+     `now()`, so already-committed messages routinely carry times after it
+     -- and could sort a host's approval response before the assistant
+     message that requested it. Seeded now at
+     `max(o.now(), latestAdmissionMessageTime)`, read unfenced before
+     `ClaimRun` (so the "no non-transactional read inside the approval
+     decision's `WithinTx`" property this seed exists for is unchanged).
+  4. **Crash-recovery reconciliation** (new capability, not a fix to
+     existing behaviour): a run the ADK engine was driving when its process
+     crashed previously had no recovery path at all. `ClaimRun`'s existing
+     lease-expiry reclaim already worked generically at the store layer,
+     but `Resume` routed every non-paused run through the legacy tool-only
+     resume, which has no notion of ADK turns or checkpoints -- it would
+     settle the run interrupted, discarding any promoted checkpoint, and
+     never touch a turn left `admitted`/`running` or its consumed inbox
+     rows. `Resume` now checks whether a run was ever ADK-driven (any turn,
+     or any promoted checkpoint) and, if so, reclaims and conservatively
+     reconciles it instead: unfinished tool calls are terminalized (an
+     unsafe running tool is never rerun, matching the existing
+     `terminalizeUnfinishedTools` contract), a turn left dangling by the
+     crash is settled interrupted with its consumed inbox items requeued to
+     `queued` (`ReconcileInterruptedTurn`, a new `session.ExecutionStore`
+     method -- distinct from the existing `InterruptTurn`, which leaves
+     inbox items `interrupted` for the *same*, checkpoint-resumable turn to
+     later complete; here there is no checkpoint runner state describing
+     the abandoned turn, so the items must flow back through `GenInput`
+     into a *new* one), and the run is then either repaused (`RepauseRun`,
+     a new `session.ExecutionStore` method that reverts a claim to `paused`
+     with no live lease and touches no checkpoint -- used here, and also as
+     `ResumeRun`'s own compensating write for a post-claim `StartRun`
+     failure, which previously left the run `running` with no driver and no
+     real recovery path despite that being documented as "recoverable only
+     by lease expiry") if it has ever had a promoted checkpoint, or settled
+     interrupted if it never did (nothing to resume; the requeued items
+     stay durably `queued` for the session's next `Start`). A run with no
+     turns and no checkpoint at all still uses the unchanged legacy path.
+  5. **Docs/test-coverage only**: the `turnLoopCheckpointShape` doc comment
+     claimed a checkpoint gob-shape round-trip test that did not exist;
+     `TestEmptyLoopCheckpointMatchesUpstreamGobShape` now proves it by
+     decoding `marshalEmptyLoopCheckpoint`'s bytes into a field-identical
+     mirror of eino's private `turnLoopCheckpoint` type. The genuine
+     `TakeLateItems` late-item window (an `Enqueue` reaching `Push` while
+     the loop is registered but already stopped) had zero test coverage
+     despite being listed as closed; `TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation`
+     now forces it deterministically with a store decorator gating
+     `adkCheckpointStore.Delete`'s `ReadPromotedCheckpoint` lookup.
+     `ResumeRun`'s rebuilt `config.Snapshot` still dropped `Agent.Mode` and
+     `Tools.Enabled`/`Tools.Disabled` (both read on every post-resume turn,
+     via `BoundedTurnMetadata.AgentMode` and `NewToolScopeContext`
+     respectively) even after the system-prompt/agent-options fix two
+     phases ago; both now round-trip through two more durable
+     `run.Config` keys. `EnqueueInboxForRun` and `SettleRun`'s queued-inbox
+     refusal were new SQL behaviours pinned by nothing but the runtime
+     fixture the same commit that added them also wrote (so neither ran
+     against PostgreSQL); both now have `store/storetest` contract coverage
+     on the existing `inbox` suite. `settleRunRetrying` no longer burns its
+     full 40x5ms retry budget on the queued-inbox conflict (a structural
+     conflict only a *future* run's drain can clear, unlike the in-flight
+     tool settlement conflict the retry loop exists for) --
+     `session.ErrRunHasQueuedInput` (wrapping `ErrConflict`, so existing
+     `errors.Is(err, session.ErrConflict)` callers are unaffected) lets it
+     divert on the first attempt. The rogue-model check's "every turn must
+     route at least one physical dispatch through `build.Model`" constraint
+     is now stated explicitly on `AgentFactory`'s doc comment (a workflow
+     factory that legitimately never dispatches on some turns would still
+     fail this check today -- narrowing the predicate itself is still **not
+     covered**). `messageHasParts`' doc comment now names how it
+     deliberately differs from `dropUnfinalizedAssistantPlaceholders`'
+     predicate (any `Part` row vs. decoded `ContentBlocks`) instead of
+     letting a reader assume the two agree.
+  Proven by `runtime/w5_round3_test.go`
+  (`TestDuplicateDeliveryOfAlreadyAdmittedItemDoesNotDispatch`,
+  `TestEmptyLoopCheckpointMatchesUpstreamGobShape`,
+  `TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation`,
+  `TestSettleRunRetryingSkipsRetryOnQueuedInput`) and
+  `runtime/w5_round3_reconciliation_test.go`
+  (`TestResumeRunStartFailureRepauses`,
+  `TestResumeReconcilesDanglingAdmittedTurnAfterCrash`,
+  `TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint`), plus
+  the extended `TestResumeRunRestoresSystemPromptAndAgentOptions`
+  (`runtime/w5_round2_test.go`) and the new `store/storetest/w5_durable.go`
+  contract cases.
 - Verification actually run for this phase: `go build ./...`, `go vet ./...`,
   `go vet -tags postgres_integration ./...`, `gofmt`/`goimports`, and
   `./.bin/golangci-lint run ./...` (repo-wide, 0 issues) all pass.
@@ -1048,10 +1174,23 @@ unwritten (see that bullet for the exact, now-shorter list).
   `EINO_AGENT_CONSUMER_POSTGRES=1 TESTCONTAINERS_RYUK_DISABLED=true
   testdata/external-consumer/check.sh`) -- all green; see this phase's
   fix-pass commits for the exact recorded run.
+  **Phase 6 (round-three reconciliation) verification**, same full gate
+  list as phases 4-5 (`gofmt`/`goimports`; `go build ./...`; `go vet ./...`
+  and `go vet -tags postgres_integration ./...`; `./.bin/golangci-lint run
+  ./...` at 0 issues; `go test ./...` for every package; `go test
+  ./runtime -race -count=3`, plus `-race -count=10` over the new phase-6
+  focused tests in `runtime/w5_round3_test.go` and
+  `runtime/w5_round3_reconciliation_test.go`; `make check`;
+  `TESTCONTAINERS_RYUK_DISABLED=true GOMAXPROCS=2 GOFLAGS='-p=1' make
+  postgres-test` and `make postgres-race`; `EINO_AGENT_CONSUMER_POSTGRES=1
+  TESTCONTAINERS_RYUK_DISABLED=true testdata/external-consumer/check.sh`)
+  -- all green; see this phase's fix-pass commits for the exact recorded
+  run.
 - Acceptance-test matrix (`runtime/acceptance_matrix_test.go`,
   `runtime/turn_loop_sqlite_test.go`, `runtime/w5_reconciliation_test.go`,
-  `runtime/w5_round2_test.go`; focused cases clean under `-race -count=10`):
-  checkpoint envelope
+  `runtime/w5_round2_test.go`, `runtime/w5_round3_test.go`,
+  `runtime/w5_round3_reconciliation_test.go`; focused cases clean under
+  `-race -count=10`): checkpoint envelope
   malformed-rejection (empty/non-JSON/missing-required-field), checkpoint
   row version mismatch, plan-fingerprint mismatch, and a `model.Resolve`
   failure all rejected by `ResumeRun` *before* claiming the run's fence, and
@@ -1094,20 +1233,42 @@ unwritten (see that bullet for the exact, now-shorter list).
   completing against a real SQLite store within a bounded timeout (proving
   no non-transactional-read deadlock/hang hazard); and a resumed
   dispatch's `model.Request.System`/agent options equaling the fresh-run
-  values, with `run.Config["system_prompt"]` asserted durable. **Not
-  covered** by this phase, still out of scope: multiple queued inputs with
-  process restart after the first committed turn, stop-mode timeout
-  escalation, recursive cancel, preempt (in particular "a late preempt
-  targets only the captured turn"), idle exit specifically, checkpoint
-  promotion-failure and terminal-delete-failure specifically (only `Set`
-  failure is covered), a stale fence on resume beyond the concurrent-`ResumeRun`
-  case already covered, verifying an `AgentFactory`'s returned agent's
-  tool/model identity at construction time rather than post-hoc (see the
-  `AgentBuildContext` bullet above), and ADK's own gob-encoded payload
-  being unsupported/malformed (this adapter only validates its own
-  envelope wrapper around that opaque payload -- see the checkpoint
-  envelope bullet -- ADK's own gob decode of `envelope.Payload` is not
-  exercised here). "An unsafe running tool is never rerun on resume" is
+  values, with `run.Config["system_prompt"]` asserted durable. **Phase 6
+  additions** (see the phase-6 bullet above for the full mechanism):
+  `TestResumeReconcilesDanglingAdmittedTurnAfterCrash` and
+  `TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint`
+  (`runtime/w5_round3_reconciliation_test.go`) prove multiple queued inputs
+  with a process restart after the first committed turn *is* now covered:
+  a turn (and its consumed inbox items) a crashed process left
+  `admitted`/`running` is conservatively reconciled on the next `Resume`,
+  whether that is the run's first turn (settles interrupted, nothing to
+  resume) or a later one following an earlier successful pause (repauses,
+  genuinely resumable -- proven by a further `ResumeRun` actually
+  completing it). The residual gap phase 5 already named --
+  `loadInboxItems`' durable-state filter (inside `admitTurn`, after
+  `claimItems` has already committed to a nonempty filtered set) can still
+  admit a degenerate, dispatching continuation turn for a cross-process
+  duplicate -- remains genuinely uncovered; item 2's fix closes only the
+  in-process split (see the phase-6 bullet). Reconciling more than one
+  simultaneously-dangling turn for the same run is not exercised (ordinary
+  operation never admits a second turn before the first settles, so this
+  is believed unreachable, not merely untested) and multiple, back-to-back
+  crashes across several resumes are not exercised beyond one. Still out of
+  scope, unchanged from phase 5: stop-mode timeout escalation, recursive
+  cancel, preempt (in particular "a late preempt targets only the captured
+  turn"), idle exit specifically, checkpoint promotion-failure and
+  terminal-delete-failure specifically (only `Set` failure is covered), a
+  stale fence on resume beyond the concurrent-`ResumeRun` case already
+  covered, verifying an `AgentFactory`'s returned agent's tool/model
+  identity at construction time rather than post-hoc (see the
+  `AgentBuildContext` bullet above), narrowing the rogue-model check's
+  zero-dispatch predicate for a legitimately-non-dispatching workflow
+  factory (documented as a constraint instead -- see the phase-6 bullet),
+  and ADK's own gob-encoded payload being unsupported/malformed (this
+  adapter only validates its own envelope wrapper around that opaque
+  payload -- see the checkpoint envelope bullet -- ADK's own gob decode of
+  `envelope.Payload` is not exercised here). "An unsafe running tool is
+  never rerun on resume" is
   covered by the existing
   `TestStreamingOrchestratorResumeDoesNotReexecuteRunningTool`
   (`runtime/orchestrator_resume_test.go`): `adkTool.InvokableRun`'s
