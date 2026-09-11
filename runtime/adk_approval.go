@@ -90,6 +90,37 @@ func (b *adkApprovalBinding) pause(ctx context.Context, m *adkModel, dispatch *a
 	if request == nil {
 		return nil
 	}
+	// A sibling function_tool_call on this same message is permanently
+	// orphaned: ADK's tools node never dispatches it (the model node itself
+	// errors with the StatefulInterrupt raised below before the tools node
+	// ever runs), and a decided resume's continuation is a fresh physical
+	// dispatch, not a resumption of this ReAct iteration -- see
+	// durableProjection's approvalOrphanedToolCallIDs exclusion. Left
+	// pending forever it would (a) never settle, so SettleRun (which
+	// refuses any non-terminal tool call) could never terminally settle
+	// this run, and (b) never execute, matching the documented "sibling
+	// call is never executed or manufactured" contract. Terminalize it now,
+	// the same way the resume path abandons an unstarted call after a fatal
+	// tool outcome (terminalizeUnfinishedTools/interruptPendingTool).
+	for _, block := range committed.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolCall || block.FunctionToolCall == nil {
+			continue
+		}
+		callID := session.ToolCallID(block.FunctionToolCall.CallID)
+		if callID == "" {
+			continue
+		}
+		record, err := m.host.store.GetToolCall(ctx, callID)
+		if err != nil {
+			return err
+		}
+		if record.Status != session.ToolCallPending {
+			continue
+		}
+		if _, err := m.execution.interruptPendingTool(ctx, m.engine.snapshot, record); err != nil {
+			return err
+		}
+	}
 	partID := m.host.ids.NewPartID()
 	now := m.host.now()
 	payload := mustJSON(adkApprovalRecord{Type: adkApprovalPartType, ApprovalRequestID: request.ID, Status: "pending"})
@@ -163,12 +194,16 @@ func (b *adkApprovalBinding) prepare(ctx context.Context, m *adkModel) error {
 // kind and role Start/Enqueue accept from a real caller), so it becomes part
 // of the durable projection like any other committed fact.
 func (b *adkApprovalBinding) commitResponse(ctx context.Context, m *adkModel, approvalRequestID, decision string) error {
-	content := session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{{
+	blocks, err := assignContentBlockIDs([]session.ContentBlock{{
 		Kind: session.BlockKindMCPToolApprovalResponse,
 		MCPApprovalResponse: &session.MCPApprovalResponseBlock{
 			ApprovalRequestID: approvalRequestID, Approve: decision == "approve", Reason: "host decision",
 		},
-	}}}
+	}}, m.host.ids)
+	if err != nil {
+		return err
+	}
+	content := session.Content{Role: session.RoleUser, Blocks: blocks}
 	messageID := m.host.ids.NewMessageID()
 	at, err := m.execution.nextDurableMessageTime(ctx, m.engine.snapshot.SessionID, m.host.now())
 	if err != nil {

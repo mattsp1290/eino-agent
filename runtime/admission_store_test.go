@@ -831,7 +831,11 @@ func (s *admissionStore) EnqueueInbox(_ context.Context, item session.InboxItem,
 	}
 	for _, existing := range s.inbox {
 		if existing.SessionID == item.SessionID && existing.IdempotencyKey == item.IdempotencyKey {
-			if !reflect.DeepEqual(existing.Blocks, item.Blocks) {
+			// See store/internal/sqlstore/inbox.go's matching comment:
+			// ignore block ID so a genuine retry under the same
+			// IdempotencyKey (whose blocks get freshly minted IDs on every
+			// call) matches the original item instead of false-conflicting.
+			if !session.ContentBlocksEqualIgnoringID(existing.Blocks, item.Blocks) {
 				return session.InboxItem{}, session.ErrConflict
 			}
 			return existing, nil

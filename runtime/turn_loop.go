@@ -207,7 +207,17 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, _ *adkTurnLoop, item
 		engine := c.firstTurnEngine
 		c.setEngine(engine)
 		return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
-			Input:     &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages},
+			// EnableStreaming routes every physical model dispatch through
+			// adkModel.Stream, not Generate: only Stream wires a live onDelta
+			// callback into dispatch()'s receive loop (session observer
+			// AppendText + EventMessageDelta), which is what lets a watcher
+			// see partial text while a provider chunk is still in flight, not
+			// only after the whole physical call returns. The classic engine
+			// always streamed every dispatch; this restores that invariant
+			// for the typed engine instead of silently defaulting to
+			// Generate's whole-call-at-once behavior (see
+			// TestPublicSessionWatchConstructionExecutionAndReopen).
+			Input:     &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages, EnableStreaming: true},
 			Consumed:  items[:1],
 			Remaining: items[1:],
 		}, nil
@@ -217,7 +227,7 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, _ *adkTurnLoop, item
 		return nil, err
 	}
 	return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
-		Input:    &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages},
+		Input:    &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages, EnableStreaming: true},
 		Consumed: items,
 	}, nil
 }

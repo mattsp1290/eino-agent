@@ -108,7 +108,18 @@ func LoadAgentic(ctx context.Context, store session.Store, sessionID session.ID,
 func projectAgenticMessage(message session.Message, parts []session.Part, options Options, partIDs map[BlockRef]session.PartID) ([]*einoschema.AgenticMessage, [][]string, error) {
 	richCount, legacyCount := 0, 0
 	for _, part := range parts {
-		if part.Kind == session.PartProviderState {
+		// PartProviderState is private provider continuity data, and
+		// PartState is a private app-visible state marker (runtime's
+		// adkApprovalBinding uses it as a CAS record on the same message as
+		// the public content it guards -- see runtime/adk_approval.go).
+		// Neither participates in the rich-vs-legacy family decision: both
+		// downstream projectors already treat PartState as ignorable by
+		// design (projectLegacyAgenticMessage's explicit case;
+		// DecodeContentParts's "legacy/unrecognized kinds are ignored"
+		// fallthrough, which projectRichAgenticMessage relies on), so
+		// counting it here as "legacy" would wrongly reject an otherwise
+		// all-rich message as mixed-kind.
+		if part.Kind == session.PartProviderState || part.Kind == session.PartState {
 			continue
 		}
 		if isRichContentPart(part) {

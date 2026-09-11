@@ -416,14 +416,18 @@ Status: landed; W1 scaffolding kept green.
 
 ## W5: typed ADK runtime, checkpoints and turn control
 
-Status: phase 1 (single execution engine, checkpoints, turn control) and
-phase 2 (retry/failover invocation semantics, durable model-boundary
-projection, the concurrent tool-settlement-vs-run-finalization race) landed
-and verified per the gate list below. Known gaps below are not yet closed:
-approval is not proven against a real `TypedChatModelAgent`, tool search and
-enhanced tool results are not byte-for-byte parity with the classic engine,
-and the full acceptance-test matrix (multi-turn restart, concurrent-resume,
-checkpoint-failure-mode coverage) has not been written.
+Status: phase 1 (single execution engine, checkpoints, turn control), phase 2
+(retry/failover invocation semantics, durable model-boundary projection, the
+concurrent tool-settlement-vs-run-finalization race), and phase 3 (a real
+live-streaming regression and an idempotency-key bug found and fixed,
+production approval proof against a real `adk.NewTypedChatModelAgent`, and a
+focused acceptance-test matrix) landed and verified per the gate list below,
+including `make check` and the PostgreSQL-backed gates
+(`make postgres-test`/`postgres-race`, and the external-consumer check with
+`EINO_AGENT_CONSUMER_POSTGRES=1`) in full. Known gaps below are not yet
+closed: tool search and enhanced tool results are not byte-for-byte parity
+with the classic engine, and several acceptance-test-matrix scenarios
+remain unwritten (see that bullet for the exact list).
 
 - Single execution engine: `runtime/adk_model.go` (`adkModel`), `runtime/adk_execution.go`
   (`adkEngine`, `adkTool`, `adkToolSearch`, `AgentFactory`/`AgentBuildContext`,
@@ -556,19 +560,61 @@ checkpoint-failure-mode coverage) has not been written.
   predates the W2 content contract), the public approval request/response
   blocks are ordinary `session.BlockKindMCPToolApprovalRequest`/
   `MCPToolApprovalResponse` content -- `persistAssistantTurn` already
-  understands both kinds, no special-casing needed. A private native
-  continuation record (exact dispatch input + committed transcript, needed to
-  reconstruct the paused call) lives in a `session.PartState` part and is
-  read-then-updated once under the run fence and an in-process mutex on
-  resume -- the same accepted simplification the W1 finding already flagged
-  (a true store-level conditional update was not added; the run fence's CAS
-  in `ClaimRun` already guarantees only one process holds the fence at a
-  time, so this is safe against concurrent resumes, just not a defense
-  against a bug inside one process resuming the same run object twice).
-  **Not proven** against a real `TypedChatModelAgent` end-to-end in this
-  phase (the W1 proof's approval scaffolding was deleted along with the rest
-  of `adk_approval_proof_test.go`; no replacement production test was written
-  given time constraints) -- treat as implemented-but-unverified.
+  understands both kinds, no special-casing needed; `adkModel.durableProjection`
+  reconstructs the continuation from committed history like any other fact,
+  so the binding carries no private transcript/input blob at all, only a
+  minimal decision-CAS record (`{Type, ApprovalRequestID, Status, Decision}`)
+  in a `session.PartState` part, read-then-updated once under the run fence
+  and an in-process mutex on resume -- the same accepted simplification the
+  W1 finding already flagged (a true store-level conditional update was not
+  added; the run fence's CAS in `ClaimRun` already guarantees only one
+  process holds the fence at a time, so this is safe against concurrent
+  resumes, just not a defense against a bug inside one process resuming the
+  same run object twice). A sibling function_tool_call on the same message as
+  the approval request is permanently orphaned once the pause fires (ADK's
+  tools node never dispatches it, and a decided resume's continuation is a
+  fresh physical dispatch, not a resumption of that ReAct iteration): `pause`
+  now terminalizes it interrupted immediately (reusing
+  `interruptPendingTool`, the resume path's equivalent treatment of an
+  unstarted call after a fatal outcome) rather than leaving it pending
+  forever, and `durableProjection`'s ADK-vs-durable tool-call-ID
+  divergence check (`approvalOrphanedToolCallIDs`) excludes it from the
+  comparison, since ADK's own resumed input legitimately never mentions it
+  again.
+  **Now proven** against a real `adk.NewTypedChatModelAgent`
+  (`DefaultChatModelAgentFactory`) end-to-end via
+  `TestApprovalPausesBeforeSiblingToolExecutionAndResumesViaProductionAgent`
+  (approve and deny, mixed function-call+approval pausing before any local
+  tool execution, untargeted resume re-pausing at a fresh checkpoint
+  generation, targeted `ResumeRun` completing, a duplicate decision refused)
+  and `TestApprovalOnlyResponseStillPausesViaProductionAgent`
+  (`runtime/adk_approval_production_test.go`), replacing the deleted W1
+  `adk_approval_proof_test.go`/`adk_approval_test.go` assertions. Getting
+  these production tests to pass surfaced and fixed three real bugs no
+  fixture-level test had caught: (1) `session/history/agentic_projection.go`'s
+  rich-vs-legacy content-family dispatcher counted a message's private
+  `PartState` CAS part as "legacy" content, so any durable reload of a
+  message carrying both an approval request and ordinary rich content
+  (`ErrMixedContentKinds`) failed -- fixed by excluding `PartState` from the
+  count, matching how both downstream projectors already treated it as
+  ignorable by design. (2) `adkApprovalBinding.commitResponse` built its
+  committed `MCPToolApprovalResponse` content block without ever assigning
+  it a block ID (`ContentBlock.Validate` rejects an empty ID), so a decided
+  resume's continuation dispatch always failed content validation -- fixed
+  by routing it through `assignContentBlockIDs`, the same helper `Start`/
+  `Enqueue` use. (3) the sibling-call orphaning described above (a run could
+  never terminally settle while an orphaned pending tool call sat
+  unterminalized forever, and `durableProjection`'s own divergence check
+  independently rejected the resumed dispatch before that).
+  `adkModel.Generate` is not reachable through the production entry point at
+  all any more (see the `TypedAgentInput.EnableStreaming` fix below); Stream
+  and Generate share the same approval `prepare`/`pause`/`durableProjection`/
+  `begin`/`commit` call sequence, so this phase's Stream-path production
+  coverage is what Generate would also run, and Generate has no
+  approval-specific logic of its own left to prove independently: the two
+  methods' only differences are the live-delta `onDelta` wiring (Stream
+  only) and the final result assembly, neither of which the approval
+  binding touches).
 - Tool search: `adkToolSearch` registers the runtime-implemented
   `tool_search` pseudo-tool as an ordinary `tool.BaseTool` so ADK's tools node
   can route a model call to it at all, then delegates to the unchanged
@@ -659,6 +705,39 @@ checkpoint-failure-mode coverage) has not been written.
   documented gaps above are specifically about what ADK's tools node can
   represent as a *tool result* going the other direction (durable persistence
   is unaffected either way).
+- Live streaming parity (`TypedAgentInput.EnableStreaming`): this was a real
+  regression, not a pre-existing gap -- `TestPublicSessionWatchConstructionExecutionAndReopen`
+  (`testdata/external-consumer`) passed against the classic engine
+  (eino-v0-9-19 at 96f13fa) but hung/timed out against the new TurnLoop
+  engine. Root cause: `turnLoopCoordinator.genInput`/`genResume`
+  (`runtime/turn_loop.go`) never set `TypedAgentInput.EnableStreaming`, so
+  ADK routed every physical dispatch through `adkModel.Generate` (which
+  passes a `nil` live-delta callback into `dispatch`'s receive loop) instead
+  of `adkModel.Stream` (which wires the session observer/`EventMessageDelta`
+  publishing a watcher needs to see partial text while a provider chunk is
+  still in flight, not only after the whole physical call returns) --
+  unlike the classic engine, which always streamed every dispatch. Fixed by
+  setting `EnableStreaming: true` on both `GenInputResult.Input`
+  construction sites; `adkModel.Generate` is consequently unreachable
+  through the production entry point at all now (ADK selects Stream vs.
+  Generate once per run from that flag for every node in the composed
+  graph, including tool-loop continuations) -- see the approval bullet
+  above for what that means for approval's own Generate coverage.
+- Idempotent retry (`Enqueue`'s `IdempotencyKey`): also a real, independently
+  discovered bug, not specific to the new engine. `Enqueue`
+  (`runtime/turn_loop.go`) mints a fresh block ID for every content block on
+  every call via `assignContentBlockIDs`, including a genuine retry under
+  the same `IdempotencyKey` -- but `EnqueueInbox`'s dedup check (both the
+  SQLite/Postgres-shared `store/internal/sqlstore/inbox.go` and the
+  in-memory test fixture) compared the *full* block slice, IDs included, so
+  a real retry's freshly-minted IDs never matched the original and every
+  retry spiked a false `ErrConflict` instead of returning the original
+  durably-admitted item -- defeating the purpose of an idempotency key.
+  Fixed with `session.ContentBlocksEqualIgnoringID`, a content-only
+  equality helper, used by both the production and fixture dedup checks.
+- Two engine-ordering races were root-caused and fixed rather than papered
+  over, plus the two bugs above -- see `TestGracefulAndImmediateStopReachIdempotentTerminalStates`/
+  `TestDuplicateEnqueueIsIdempotentOnKey` (`runtime/acceptance_matrix_test.go`).
 - Verification actually run for this phase: `go build ./...`, `go vet ./...`,
   `go vet -tags postgres_integration ./...`, `gofmt`/`goimports`, and
   `./.bin/golangci-lint run ./...` (repo-wide, 0 issues) all pass.
@@ -666,36 +745,50 @@ checkpoint-failure-mode coverage) has not been written.
   failures). `go test ./runtime -race -count=3` and several additional full
   `-race` passes (including the two fixture/timing-sensitive tests singled
   out above, stress-tested individually at `-count=30`-`50`) are clean.
-  `make check` passes (`fmt-check vet test race mod-tidy-check lint
-  windows-compile wit-check`) with one known exception:
-  `external-consumer-check`'s `TestPublicSessionWatchConstructionExecutionAndReopen`
-  times out waiting for its blocking `EventSink` to observe a first event;
-  confirmed via `git stash` against the commit before this phase's work that
-  this failure predates it and is not a regression introduced here -- left
-  open as a genuine, unresolved gap (root cause not yet found: whether the
-  extension-notification worker goroutine that drains a run's persisted
-  events into the configured `EventSink` is starting/draining correctly in
-  this specific external-module harness needs its own investigation).
+  `make check` passes in full, including `external-consumer-check`.
   `TESTCONTAINERS_RYUK_DISABLED=true GOMAXPROCS=2 GOFLAGS='-p=1' make
   postgres-test` and `make postgres-race` both pass ("required suites
-  passed; zero skips"); `TestPostgresRuntime/admission`
+  passed; zero skips"); `EINO_AGENT_CONSUMER_POSTGRES=1
+  TESTCONTAINERS_RYUK_DISABLED=true testdata/external-consumer/check.sh`
+  also passes in full. `TestPostgresRuntime/admission`
   (`runtime/postgres_admission_integration_test.go`) needed its event-count
   assertion updated from 2 to 4 events in sequence (`run_started`,
   `turn_started`, `turn_completed`, `run_finished`) to match the durable
-  turn model a completed run now legitimately records -- also confirmed via
-  `git stash` to be a pre-existing staleness in the test, not a new gap.
-  `POSTGRES_REQUIRED_SUITES` (`Makefile`) already lists the turn/inbox/
-  checkpoint/paused-run store contract suites
+  turn model a completed run now legitimately records -- confirmed
+  pre-existing staleness in the test itself, not a new gap (unlike the
+  streaming regression above, this one really did predate this phase's
+  work). `POSTGRES_REQUIRED_SUITES` (`Makefile`) already lists the
+  turn/inbox/checkpoint/paused-run store contract suites
   (`store/contract/{turns,inbox,checkpoints,paused_runs}`); no further
   suites needed adding.
-- Out of scope, not started: production approval-proof tests against a real
-  `adk.NewTypedChatModelAgent` (generate/stream, approve/deny, reopen from a
-  promoted checkpoint, mixed function-call+approval pausing -- see the
-  approval bullet above), the broader acceptance-test matrix (multi-turn
-  restart with reconstructed history, new-input-racing-idle-settlement,
-  injected `AdmitTurn`/`CompleteTurn` write failures, stop-mode/timeout/
-  recursive-cancel/preempt/idle-exit coverage, duplicate enqueue,
-  checkpoint-failure-mode coverage, stale fence, malformed envelope, version
-  mismatch, unsupported gob state, concurrent-resume-yields-one-owner,
-  unsafe-tool-never-rerun), child agents (typed `AgentTool`/`DeepAgent`),
+- Acceptance-test matrix (`runtime/acceptance_matrix_test.go`, focused cases
+  clean under `-race -count=10`): checkpoint envelope malformed-rejection
+  (empty/non-JSON/missing-required-field), checkpoint row version mismatch
+  and plan-fingerprint mismatch both rejected synchronously by `ResumeRun`
+  before seeding a TurnLoop, a checkpoint `Set` failure leaving the run
+  `RunRunning` for lease-expiry recovery rather than promoting or
+  corrupting state, two concurrent `ResumeRun` calls against the same
+  paused run yielding exactly one owner (via `ClaimRun`'s CAS) with no
+  duplicate tool execution, `Enqueue` idempotency-key replay, an injected
+  `CompleteTurn` write failure failing the run without leaving the durable
+  turn looking completed, and graceful vs. immediate `Stop` (graceful lets
+  an in-flight tool call finish without ever canceling its own context;
+  immediate reaches a terminal result without waiting for it). **Not
+  covered** by this phase, still out of scope: multiple queued inputs with
+  process restart after the first committed turn, new-input-racing-idle-
+  terminal-settlement, an injected `AdmitTurn` (as opposed to `CompleteTurn`)
+  write failure, stop-mode timeout escalation, recursive cancel, preempt,
+  idle exit specifically, checkpoint promotion-failure and terminal-delete-
+  failure specifically (only `Set` failure is covered), stale fence, ADK's
+  own gob-encoded payload being unsupported/malformed (this adapter only
+  validates its own envelope wrapper around that opaque payload -- see the
+  checkpoint envelope bullet -- ADK's own gob decode of `envelope.Payload`
+  is not exercised here), and a dedicated new-engine test for "an unsafe
+  running tool is never rerun" (the existing `adkTool.InvokableRun`
+  `case record.Status == session.ToolCallRunning:` path reuses
+  `settleInterruptedRunningTool`, the same helper `orchestrator_resume_test.go`'s
+  "running" case already exercises, but that existing coverage was not
+  independently re-verified against the TurnLoop/`ResumeRun` path
+  specifically in this phase).
+- Out of scope, not started: child agents (typed `AgentTool`/`DeepAgent`),
   removing the superseded classic `PartKind`s, W6/W7.

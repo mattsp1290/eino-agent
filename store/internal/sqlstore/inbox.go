@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"reflect"
 	"time"
 
 	"gorm.io/gorm"
@@ -84,7 +83,15 @@ func (s *Store) EnqueueInbox(ctx context.Context, item session.InboxItem, limits
 			if err != nil {
 				return err
 			}
-			if !reflect.DeepEqual(existing.Blocks, item.Blocks) {
+			// Ignore block ID: Enqueue's caller-facing entry point mints a
+			// fresh ID for every block on every call (see runtime's
+			// assignContentBlockIDs), including a genuine retry of the
+			// identical logical request under the same IdempotencyKey --
+			// comparing full equality (IDs included) would make every real
+			// retry mismatch and spike a false conflict instead of
+			// returning the original durably-admitted item, defeating the
+			// point of an idempotency key.
+			if !session.ContentBlocksEqualIgnoringID(existing.Blocks, item.Blocks) {
 				return session.ErrConflict
 			}
 			result = existing

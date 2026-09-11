@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
 	"time"
 	"unicode/utf8"
 
@@ -337,6 +338,29 @@ type ContentBlock struct {
 	MCPListTools        *MCPListToolsBlock
 	MCPApprovalRequest  *MCPApprovalRequestBlock
 	MCPApprovalResponse *MCPApprovalResponseBlock
+}
+
+// ContentBlocksEqualIgnoringID reports whether a and b carry the same
+// content, ignoring each block's ID. A caller-facing entry point (Start,
+// Enqueue) assigns every block a fresh ID via its own IDGenerator on every
+// call (see runtime's assignContentBlockIDs), including a genuine retry of
+// the identical logical request under the same IdempotencyKey -- comparing
+// with the ID field included would make every such retry mismatch and spike
+// a false ErrConflict instead of the idempotent replay contract requires
+// (returning the original durably-admitted item). Order matters: this is a
+// content-equality check, not a set comparison.
+func ContentBlocksEqualIgnoringID(a, b []ContentBlock) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		left, right := a[i], b[i]
+		left.ID, right.ID = "", ""
+		if !reflect.DeepEqual(left, right) {
+			return false
+		}
+	}
+	return true
 }
 
 // Segment identifies a public sub-range of a Gemini grounding support.

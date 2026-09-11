@@ -466,6 +466,20 @@ func (m *adkModel) durableProjection(ctx context.Context, adkInput []*einoschema
 	}
 	adkIDs := toolCallIDSet(adkInput)
 	durableIDs := toolCallIDSet(projected)
+	// A sibling function_tool_call on the same assistant message as an
+	// MCPToolApprovalRequest is permanently orphaned once the approval pause
+	// fires (adkApprovalBinding.pause): ADK's tools node never dispatches it
+	// (the model node itself errors with a StatefulInterrupt before the
+	// tools node ever runs), and a decided resume's continuation is a fresh
+	// physical dispatch, not a resumption of that same ReAct iteration --
+	// ADK's own resumed input legitimately never mentions it again, even
+	// though this package's commit already durably persisted it (as a
+	// still-pending call) before the pause. Exclude these IDs from the
+	// durable side of the comparison rather than failing every approval
+	// pause with a sibling call closed.
+	for id := range approvalOrphanedToolCallIDs(projected) {
+		delete(durableIDs, id)
+	}
 	if !sameIDSet(adkIDs, durableIDs) {
 		return nil, fmt.Errorf("%w: adk=%v durable=%v", errADKProjectionDiverged, sortedKeys(adkIDs), sortedKeys(durableIDs))
 	}
@@ -521,6 +535,34 @@ func toolCallIDSet(messages []*einoschema.AgenticMessage) map[string]bool {
 		}
 	}
 	return ids
+}
+
+// approvalOrphanedToolCallIDs returns the function_tool_call CallIDs of every
+// sibling call on an assistant message that also carries an
+// MCPToolApprovalRequest block (see durableProjection's caller comment).
+func approvalOrphanedToolCallIDs(messages []*einoschema.AgenticMessage) map[string]bool {
+	orphaned := map[string]bool{}
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		hasApprovalRequest := false
+		for _, block := range msg.ContentBlocks {
+			if block != nil && block.Type == einoschema.ContentBlockTypeMCPToolApprovalRequest {
+				hasApprovalRequest = true
+				break
+			}
+		}
+		if !hasApprovalRequest {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolCall && block.FunctionToolCall != nil && block.FunctionToolCall.CallID != "" {
+				orphaned[block.FunctionToolCall.CallID] = true
+			}
+		}
+	}
+	return orphaned
 }
 
 func sameIDSet(a, b map[string]bool) bool {
