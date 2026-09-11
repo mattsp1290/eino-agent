@@ -1,6 +1,7 @@
 package composition
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -139,13 +140,21 @@ func (r *Registrar) Handler(registration HandlerRegistration) error {
 	return nil
 }
 
+// handlerConfigHash canonicalizes config (decode then re-marshal, so key
+// order never affects the hash) and hashes it. Decoding uses
+// json.Decoder.UseNumber() so an integer above 2^53 round-trips through its
+// exact decimal text instead of json.Unmarshal's default float64 decoding,
+// which would silently lose precision and let two configs differing only
+// in a large integer hash identically (W6 round-1 review suggestion S5).
 func handlerConfigHash(config json.RawMessage) (string, error) {
 	canonical := config
 	if len(canonical) == 0 {
 		canonical = []byte("null")
 	}
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
+	decoder.UseNumber()
 	var decoded any
-	if err := json.Unmarshal(canonical, &decoded); err != nil {
+	if err := decoder.Decode(&decoded); err != nil {
 		return "", err
 	}
 	raw, err := json.Marshal(decoded)

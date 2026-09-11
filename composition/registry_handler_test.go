@@ -78,6 +78,27 @@ func TestHandlerConfigHashIsCanonicalAndDeterministic(t *testing.T) {
 	}
 }
 
+// TestHandlerConfigHashPreservesInt64PrecisionAboveFloat64Range proves S5's
+// fix: decoding with json.Decoder.UseNumber() (instead of json.Unmarshal's
+// default float64 decoding, which loses precision above 2^53) means two
+// configs differing only in a large integer hash differently, not
+// identically.
+func TestHandlerConfigHashPreservesInt64PrecisionAboveFloat64Range(t *testing.T) {
+	// 2^53 + 1 and 2^53 + 2 both round to the same float64 (9007199254740992),
+	// so a naive json.Unmarshal-into-any decode would hash these identically.
+	a, err := handlerConfigHash(json.RawMessage(`{"n":9007199254740993}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := handlerConfigHash(json.RawMessage(`{"n":9007199254740994}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatal("hash collided for two distinct large integers above 2^53")
+	}
+}
+
 // TestMountHandlerAppearsInAcquiredRunPlanAgentHandlers proves the full
 // composition-to-runtime path: a mounted Handler registration is visible on
 // the acquired RunPlan's AgentHandlers, ordered, with its identity (not the
