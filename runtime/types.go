@@ -114,6 +114,10 @@ type Tool struct {
 	// Deferred marks the tool as advertised only through tool search rather
 	// than eagerly bound to every provider request.
 	Deferred bool
+	// InterruptPolicy, when set, lets this tool pause via a durable ADK
+	// checkpoint before its first execution attempt (see
+	// runtime.ToolInterruptPolicy in adk_execution.go).
+	InterruptPolicy ToolInterruptPolicy
 }
 
 // ToolScopeContext is the data-only input used while selecting and scoping
@@ -169,6 +173,10 @@ type ToolCall struct {
 	Approval      ApprovalRequester
 	SessionTitle  SessionTitleWriter `json:"-"`
 	Context       ToolContext
+	// ResumeDecision carries the host-supplied resume payload for a call
+	// whose Tool.InterruptPolicy paused it via a durable ADK checkpoint,
+	// once the targeted resume has delivered it. Empty on every other call.
+	ResumeDecision string
 }
 
 // ToolScope describes the authority scope for a tool.

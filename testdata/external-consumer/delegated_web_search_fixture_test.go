@@ -913,6 +913,9 @@ func (i *delegatedSearchIDs) NewToolCallID() session.ToolCallID {
 }
 func (i *delegatedSearchIDs) NewEventID() session.EventID { return session.EventID(i.next("event")) }
 func (i *delegatedSearchIDs) NewEpochID() session.EpochID { return session.EpochID(i.next("epoch")) }
+func (i *delegatedSearchIDs) NewTurnID() session.TurnID   { return session.TurnID(i.next("turn")) }
+func (i *delegatedSearchIDs) NewInboxID() session.InboxID { return session.InboxID(i.next("inbox")) }
+func (i *delegatedSearchIDs) NewInvocationID() string     { return i.next("invocation") }
 
 func delegatedRuntimeConfig() config.Snapshot {
 	selection := model.Selection{ProviderID: "fixture", ModelID: "scripted"}

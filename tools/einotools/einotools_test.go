@@ -522,3 +522,6 @@ func (s *catalogSequenceIDs) NewToolCallID() session.ToolCallID {
 }
 func (s *catalogSequenceIDs) NewEventID() session.EventID { return session.EventID(s.next("event")) }
 func (s *catalogSequenceIDs) NewEpochID() session.EpochID { return session.EpochID(s.next("epoch")) }
+func (s *catalogSequenceIDs) NewTurnID() session.TurnID   { return session.TurnID(s.next("turn")) }
+func (s *catalogSequenceIDs) NewInboxID() session.InboxID { return session.InboxID(s.next("inbox")) }
+func (s *catalogSequenceIDs) NewInvocationID() string     { return s.next("invocation") }

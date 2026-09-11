@@ -176,7 +176,20 @@ func auditToolSchemas(tools []*einoschema.ToolInfo) ([]AuditedToolSchema, error)
 	return out, nil
 }
 
-func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, attempt, step int) (session.ModelRequestRecord, error) {
+// modelRequestIdentity carries the per-dispatch identity fields for one
+// physical model call: InvocationID is the durable unique identity (unique
+// per run_key); TurnID and AgentPath correlate the dispatch to the durable
+// turn and (sub)agent path that issued it; Attempt/Step remain informational
+// only (see session.ModelRequestRecord).
+type modelRequestIdentity struct {
+	InvocationID string
+	TurnID       session.TurnID
+	AgentPath    string
+	Attempt      int
+	Step         int
+}
+
+func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, execution *runExecution, snapshot TurnSnapshot, request model.Request, audited AuditedModelInput, contentHash string, messageID session.MessageID, identity modelRequestIdentity) (session.ModelRequestRecord, error) {
 	if execution == nil || execution.store == nil {
 		return session.ModelRequestRecord{}, fmt.Errorf("%w: model request ledger requires an execution store", ErrInvalidOrchestrator)
 	}
@@ -207,18 +220,15 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	if execution != nil && execution.plan != nil {
 		planHash = execution.plan.sealed.Fingerprint()
 	}
-	// InvocationID is a temporary stand-in for per-dispatch invocation
-	// identity: it reuses the same (run, message, attempt, step) composite
-	// the legacy request ID used, so it is unique per (run_key, attempt,
-	// step) but not yet a true per-dispatch identity. The W5 ADK engine
-	// (runtime/adk_execution.go, not yet built) replaces this with
-	// IDGenerator.NewInvocationID.
-	invocationID := fmt.Sprintf("%s:%s:%d:%d", snapshot.RunID, messageID, attempt, step)
+	invocationID := identity.InvocationID
+	if invocationID == "" {
+		return session.ModelRequestRecord{}, fmt.Errorf("%w: invocation id required", ErrInvalidOrchestrator)
+	}
 	record := session.ModelRequestRecord{
 		ID:        session.ModelRequestID(invocationID),
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, AssistantMessageID: messageID,
-		InvocationID: invocationID,
-		Attempt:      attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
+		InvocationID: invocationID, TurnID: identity.TurnID, AgentPath: identity.AgentPath,
+		Attempt: identity.Attempt, Step: identity.Step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
 		State: session.ModelRequestPrepared, Messages: messages, System: audited.System, Tools: tools,
 		Controls: controls, SafeCallConfig: safeConfig, ContentSHA256: contentHash, ExtensionPlanHash: planHash,
 		CreatedAt: now, UpdatedAt: now,

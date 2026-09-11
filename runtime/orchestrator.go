@@ -36,6 +36,14 @@ type IDGenerator interface {
 	NewToolCallID() session.ToolCallID
 	NewEventID() session.EventID
 	NewEpochID() session.EpochID
+	// NewTurnID mints a durable identity for one admitted turn.
+	NewTurnID() session.TurnID
+	// NewInboxID mints a durable identity for one queued inbox submission.
+	NewInboxID() session.InboxID
+	// NewInvocationID mints a unique identity for one physical model
+	// dispatch (a fresh generate/stream call, including retries, failover
+	// attempts and child-agent dispatches sharing a run).
+	NewInvocationID() string
 }
 
 // StreamingOrchestrator executes admitted runs against Eino model streams.

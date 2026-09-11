@@ -935,6 +935,9 @@ func (i *wasmTestIDs) NewToolCallID() session.ToolCallID {
 }
 func (i *wasmTestIDs) NewEventID() session.EventID { return session.EventID(i.id("event")) }
 func (i *wasmTestIDs) NewEpochID() session.EpochID { return session.EpochID(i.id("epoch")) }
+func (i *wasmTestIDs) NewTurnID() session.TurnID   { return session.TurnID(i.id("turn")) }
+func (i *wasmTestIDs) NewInboxID() session.InboxID { return session.InboxID(i.id("inbox")) }
+func (i *wasmTestIDs) NewInvocationID() string     { return i.id("invocation") }
 
 func checkedInFixtureConfig(t *testing.T, root, name string) ModuleConfig {
 	t.Helper()

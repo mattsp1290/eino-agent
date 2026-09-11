@@ -486,3 +486,6 @@ func (s *sequenceIDs) NewToolCallID() session.ToolCallID {
 }
 func (s *sequenceIDs) NewEventID() session.EventID { return session.EventID(s.next("event")) }
 func (s *sequenceIDs) NewEpochID() session.EpochID { return session.EpochID(s.next("epoch")) }
+func (s *sequenceIDs) NewTurnID() session.TurnID   { return session.TurnID(s.next("turn")) }
+func (s *sequenceIDs) NewInboxID() session.InboxID { return session.InboxID(s.next("inbox")) }
+func (s *sequenceIDs) NewInvocationID() string     { return s.next("invocation") }

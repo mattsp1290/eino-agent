@@ -194,3 +194,6 @@ func (i *testIDs) NewPartID() session.PartID         { return session.PartID(i.i
 func (i *testIDs) NewToolCallID() session.ToolCallID { return session.ToolCallID(i.id("tool-call")) }
 func (i *testIDs) NewEventID() session.EventID       { return session.EventID(i.id("event")) }
 func (i *testIDs) NewEpochID() session.EpochID       { return session.EpochID(i.id("epoch")) }
+func (i *testIDs) NewTurnID() session.TurnID         { return session.TurnID(i.id("turn")) }
+func (i *testIDs) NewInboxID() session.InboxID       { return session.InboxID(i.id("inbox")) }
+func (i *testIDs) NewInvocationID() string           { return i.id("invocation") }

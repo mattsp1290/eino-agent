@@ -109,6 +109,14 @@ type RunPlanSpec struct {
 	// plan-mismatch error instead of failing deep inside resume with
 	// "tool_search unavailable" (composition-search-reviewer I3).
 	ToolSearch *ToolSearchConfig
+	// Agent is the typed ADK agent factory this run's engine builds through.
+	// Like ToolSearch, it is deliberately NOT part of the sealed durable
+	// ExtensionPlanDescriptor/fingerprint: it is host construction code
+	// identity, not durable capability evidence, and every tool/model it can
+	// ever use is still validated against the frozen plan and mandatory
+	// adapters at build time (see adkEngine.buildAgent). Defaults to
+	// DefaultChatModelAgentFactory when nil.
+	Agent AgentFactory
 }
 
 // RunPlan is the immutable executable state for one run.
@@ -120,6 +128,7 @@ type RunPlan struct {
 	guards     []MountedToolGuard
 	sealed     session.SealedExtensionPlan
 	toolSearch *ToolSearchConfig
+	agent      AgentFactory
 	once       sync.Once
 }
 
@@ -180,6 +189,10 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	plan.guards = compiled.guards
 	plan.sealed = sealed
 	plan.toolSearch = toolSearch
+	plan.agent = spec.Agent
+	if plan.agent == nil {
+		plan.agent = DefaultChatModelAgentFactory{}
+	}
 	return plan, nil
 }
 
@@ -656,6 +669,15 @@ func (p *RunPlan) ResolveTools(ctx context.Context, scope ToolScopeContext) ([]T
 		return nil, nil
 	}
 	return p.tools.ResolveTools(ctx, scope)
+}
+
+// AgentFactory returns the plan's typed ADK agent factory (never nil once
+// NewRunPlan has returned successfully).
+func (p *RunPlan) AgentFactory() AgentFactory {
+	if p == nil || p.agent == nil {
+		return DefaultChatModelAgentFactory{}
+	}
+	return p.agent
 }
 
 // ToolSearch returns the plan's normalized tool-search configuration, or nil

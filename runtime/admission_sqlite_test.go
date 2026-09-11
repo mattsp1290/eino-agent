@@ -219,10 +219,11 @@ func TestAdmissionSQLiteRollsBackAfterUserPartWrite(t *testing.T) {
 }
 
 type reverseAdmissionIDs struct {
-	mu                    sync.Mutex
-	runs, messages, parts int
-	toolCalls, events     int
-	epochs                int
+	mu                          sync.Mutex
+	runs, messages, parts       int
+	toolCalls, events           int
+	epochs                      int
+	turns, inboxes, invocations int
 }
 
 func (s *reverseAdmissionIDs) next(counter *int, prefix string) string {
@@ -261,6 +262,18 @@ func (s *reverseAdmissionIDs) NewEventID() session.EventID {
 
 func (s *reverseAdmissionIDs) NewEpochID() session.EpochID {
 	return session.EpochID(s.next(&s.epochs, "epoch"))
+}
+
+func (s *reverseAdmissionIDs) NewTurnID() session.TurnID {
+	return session.TurnID(s.next(&s.turns, "turn"))
+}
+
+func (s *reverseAdmissionIDs) NewInboxID() session.InboxID {
+	return session.InboxID(s.next(&s.inboxes, "inbox"))
+}
+
+func (s *reverseAdmissionIDs) NewInvocationID() string {
+	return s.next(&s.invocations, "invocation")
 }
 
 var errInjectedSecondAdmissionMessage = errors.New("injected second admission message failure")

@@ -81,7 +81,9 @@ func (o *StreamingOrchestrator) streamModel(ctx context.Context, execution *runE
 	if result.err != nil {
 		return result
 	}
-	state.record, result.err = o.prepareModelRequest(ctx, execution, snapshot, request, audited, contentHash, messageID, attempt, step)
+	state.record, result.err = o.prepareModelRequest(ctx, execution, snapshot, request, audited, contentHash, messageID, modelRequestIdentity{
+		InvocationID: o.ids.NewInvocationID(), Attempt: attempt, Step: step,
+	})
 	if result.err != nil {
 		return result
 	}

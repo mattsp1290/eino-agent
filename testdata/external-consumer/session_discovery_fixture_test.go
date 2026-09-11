@@ -262,6 +262,9 @@ func (discoveryIDs) NewPartID() session.PartID         { return session.PartID(r
 func (discoveryIDs) NewToolCallID() session.ToolCallID { return session.ToolCallID(rand.Text()) }
 func (discoveryIDs) NewEventID() session.EventID       { return session.EventID(rand.Text()) }
 func (discoveryIDs) NewEpochID() session.EpochID       { return session.EpochID(rand.Text()) }
+func (discoveryIDs) NewTurnID() session.TurnID         { return session.TurnID(rand.Text()) }
+func (discoveryIDs) NewInboxID() session.InboxID       { return session.InboxID(rand.Text()) }
+func (discoveryIDs) NewInvocationID() string           { return rand.Text() }
 
 // --- Agentic test message helpers -----------------------------------------
 //
