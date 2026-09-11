@@ -12,6 +12,8 @@ import (
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"go.bytecodealliance.org/cm"
+
 	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -19,7 +21,6 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
-	"go.bytecodealliance.org/cm"
 )
 
 func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
