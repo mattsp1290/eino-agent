@@ -237,7 +237,7 @@ codec, err := model.NewEinoJSONExtraStateCodec(model.EinoJSONExtraStateConfig{
 if err != nil {
     return err
 }
-streamer, err := model.NewEinoStreamerWithProviderState(einoModel, codec)
+streamer, err := model.NewClassicStreamerWithProviderState(einoModel, codec)
 if err != nil {
     return err
 }
@@ -396,15 +396,6 @@ Mount native and Wasm-backed tool definitions through the same
 
 ```go
 loader := wasmext.NewLoader()
-wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
-    Name:           "review_tool",
-    Path:           "extensions/review-tool.wasm",
-    AllowedRoot:    "extensions",
-    ExpectedSHA256: expectedDigest,
-})
-if err != nil {
-    return err
-}
 plans, err := composition.NewRegistry(nil)
 if err != nil {
     return err
@@ -417,10 +408,15 @@ component := extension.Component{
     },
 }
 mount, err := plans.Mount(ctx, component, composition.InstallerFunc(
-    func(_ context.Context, registrar *composition.Registrar) error {
-        return registrar.Tool(composition.ToolRegistration{
-            ID: "review-tool",
-            Scope: extension.GlobalScope(), Definition: wasmDefinition,
+    func(ctx context.Context, registrar *composition.Registrar) error {
+        return loader.RegisterTool(ctx, registrar, composition.ToolRegistration{
+            ID:    "review-tool",
+            Scope: extension.GlobalScope(),
+        }, wasmext.ModuleConfig{
+            Name:           "review_tool",
+            Path:           "extensions/review-tool.wasm",
+            AllowedRoot:    "extensions",
+            ExpectedSHA256: expectedDigest,
         })
     },
 ))

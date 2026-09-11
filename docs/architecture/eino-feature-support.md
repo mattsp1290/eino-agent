@@ -25,16 +25,17 @@ converted schema separately from the remaining fields.
 
 ## W1: durable interception proof
 
-Status: passed. The proof lives in `runtime/adk_proof_test.go`,
-`runtime/adk_approval_proof_test.go`, `runtime/adk_boundary_test.go`,
-`runtime/adk_recovery_test.go`, `runtime/adk_turnloop_test.go`,
-`runtime/adk_approval_test.go` and `runtime/adk_wrapping_test.go`. It uses the
-real upstream `adk.TypedChatModelAgent[*schema.AgenticMessage]`,
-`adk.TypedRunner`, `compose.AgenticToolsNode`, checkpoint protocol,
-`adk.TurnLoop`, retry and failover wrappers, and `adk.NewTypedAgentTool`, with a
-scripted `model.AgenticModel`, SQLite and the existing fenced execution store.
-It is test-only scaffolding: W5 promotes the proven adapters into the runtime
-and deletes the scaffolding while keeping the regression tests.
+Status: passed. The proof was carried by test-only scaffolding
+(`runtime/adk_proof_test.go`, `adk_approval_proof_test.go`,
+`adk_boundary_test.go`, `adk_recovery_test.go`, `adk_turnloop_test.go`,
+`adk_approval_test.go`, `adk_wrapping_test.go`), which used the real upstream
+`adk.TypedChatModelAgent[*schema.AgenticMessage]`, `adk.TypedRunner`,
+`compose.AgenticToolsNode`, checkpoint protocol, `adk.TurnLoop`, retry and
+failover wrappers, and `adk.NewTypedAgentTool`, with a scripted
+`model.AgenticModel`, SQLite and the existing fenced execution store. W5
+deleted this scaffolding after promoting the proven adapters into the
+runtime; the surviving regression coverage lives in
+`runtime/adk_approval_production_test.go` and the W5 acceptance matrix below.
 
 Verified invariants (each is an executable assertion, run with `-race -count=10`):
 
@@ -1398,9 +1399,13 @@ unwritten (see that bullet for the exact, now-shorter list).
   - `completeTurn` no longer retires its own promoted checkpoint on
     completion. A checkpoint recorded for a since-completed turn is stale
     *by fact* (`currentTurn` no longer selects that turn), not absent by an
-    explicit mid-run delete; retirement now happens only at terminal
-    settlement (`settleCleanRunCompletion`, `abandonPausedRun`) or when
-    crash reconciliation itself finds nothing left pending to resume.
+    explicit mid-run delete; retirement now happens at terminal settlement
+    (`settleCleanRunCompletion`, `abandonPausedRun`), and -- on any clean
+    loop exit that loaded a checkpoint -- through upstream's own `Delete`
+    cleanup, which this adapter implements as `RetireCheckpoints` under the
+    still-live fence. `reconcileCrashedRun` (`runtime/interrupt.go`) never
+    retires anything itself: it supersedes a stale revision with a fresh
+    promoted one instead.
   - Crash reconciliation (`reconcileCrashedRun`, `runtime/interrupt.go`) is
     now total: whenever a run's checkpoint machinery has ever been used
     (`hasCheckpoint`), it always repauses into a state `ResumeRun` can
@@ -1422,9 +1427,11 @@ unwritten (see that bullet for the exact, now-shorter list).
     terminally `RunInterrupted`, retires its checkpoints (terminalizing any
     unfinished tool call first, since a genuine tool-interrupt pause's
     durable `ToolCall` row can still be `pending`), and frees the session
-    for a fresh `Start`. It has no effect when this process has a live loop
-    for the run (`Graceful`/`Immediate`, or `Handle.Interrupt`, already
-    cover that case).
+    for a fresh `Start`. `Stop` reports `ErrInvalidOrchestrator` instead of
+    honoring `Abandon` when this process has a live loop for the run
+    (`Graceful`/`Immediate`, or `Handle.Interrupt`, already cover that case;
+    silently downgrading to an ordinary stop would return `nil` while
+    leaving the run nonterminal -- round-seven fix-pass-6 item 1/MG-I1).
   Proven by `runtime/w5_round6_reconciliation_test.go`:
   `TestResumeRunAfterGracefulStopWithQueuedInputSurvivesCrashAgainstSQLite`
   (checkpoint-precedence-reviewer probe D: `Start`+`Enqueue`+graceful
@@ -1442,16 +1449,18 @@ unwritten (see that bullet for the exact, now-shorter list).
   `TestStopAbandonSettlesPausedRunAndFreesSessionForNewStart` (a paused run
   abandoned reaches terminal `RunInterrupted` with checkpoints retired, and
   a fresh `Start` on the same session then succeeds). The round-five test
-  that hand-wrote an envelope naming a turn ahead of when it existed and
-  hand-rolled reconciliation instead of calling `reconcileCrashedRun`
+  that drove real `Start`/`Enqueue`/`ResumeRun`
   (`TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately`,
   `w5_round5_reconciliation_test.go`) is removed -- it asserted the
   now-removed immediate-retirement behavior directly;
-  `TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems` is
-  relabeled a synthetic unit test of `genInput`'s sentinel scan alone (the
-  `UnhandledItems`-plus-sentinel combination it constructs is unreachable
-  through the real reconciliation path, since a real `Kind=loop` checkpoint
-  is only ever staged by `stageLoopCheckpoint`'s always-empty shape); and
+  `TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems`
+  (the round-five test that hand-wrote an envelope naming a turn ahead of
+  when it existed and hand-rolled reconciliation instead of calling
+  `reconcileCrashedRun`) is relabeled a synthetic unit test of `genInput`'s
+  sentinel scan alone (the `UnhandledItems`-plus-sentinel combination it
+  constructs is unreachable through the real reconciliation path, since a
+  real `Kind=loop` checkpoint is only ever staged by `stageLoopCheckpoint`'s
+  always-empty shape); and
   `TestResumeRunRefusesCheckpointForATurnThatHasSinceCompleted` gained a
   `StopPolicy.Abandon` assertion proving the refusal it exercises has a
   documented way out. `adkCheckpointStore.currentTurnID` is now seeded
