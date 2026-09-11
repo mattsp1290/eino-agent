@@ -434,9 +434,18 @@ func (e *adkEngine) sealHandlerTools() {
 			if toolSpec.WriteLike {
 				scope.Permissions = []string{handlerToolPermission(entry.ID, toolSpec.Name)}
 			}
+			var executor ToolExecutor = handlerToolExecutor{engine: e, name: toolSpec.Name}
+			if entry.Kind == HandlerKindToolSearch {
+				// See toolSearchHandlerToolExecutor's doc comment: a
+				// successful call marks the matched tool names discovered
+				// for this run, so a subsequently-called deferred tool the
+				// model just found is actually callable instead of being
+				// denied by the undiscovered-deferred-tool gate.
+				executor = toolSearchHandlerToolExecutor{handlerToolExecutor{engine: e, name: toolSpec.Name}}
+			}
 			e.snapshot.Tools = append(e.snapshot.Tools, Tool{
 				Name: toolSpec.Name, Info: toolSpec.Info, Scope: scope,
-				Executor: handlerToolExecutor{engine: e, name: toolSpec.Name},
+				Executor: executor,
 				// RetentionPolicy{}'s zero value is MaxInlineBytes: 0 (retain
 				// nothing inline -- effectiveToolRetentionPolicy only clamps
 				// a negative/over-budget value, never raises a zero one), so

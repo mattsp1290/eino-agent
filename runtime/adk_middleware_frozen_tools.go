@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/cloudwego/eino/components/tool"
@@ -103,4 +104,75 @@ func mediaResultPart(kind ToolResultPartType, url, base64Data, mimeType string) 
 		return ToolResultPart{}, false
 	}
 	return ToolResultPart{Type: kind, Media: &ToolResultMedia{URL: url, Base64Data: base64Data, MIMEType: mimeType}}, true
+}
+
+// toolSearchHandlerToolExecutor wraps handlerToolExecutor for the
+// dynamictool/toolsearch recipe's own sealed search tool (HandlerKindToolSearch):
+// upstream's toolSearchTool.InvokableRun settles as an ordinary function
+// result and never calls this runtime's own markDiscovered the way the
+// native tool-search path (adkToolSearch/executeToolSearchCall,
+// runtime/tool_search.go) does, so a deferred tool the model just found
+// through it was denied at its next call with "is deferred and no tool
+// search is configured" even though discovery genuinely happened -- see the
+// W6 round-1 review's I4 finding (the exact chain:
+// adk_middleware_frozen_tools.go's plain handlerToolExecutor ->
+// tool_preparation.go's undiscovered-deferred-tool gate ->
+// tool_execution.go settling it "expected_failure").
+//
+// This wrapper closes that gap the bounded way: after a successful call, it
+// parses the matched tool names out of the result and marks them
+// discovered in this run's execution (runExecution.markDiscovered), the
+// SAME in-memory set TurnSnapshot.ProviderRequest and the undiscovered-
+// deferred-tool gate both consult. It is NOT full parity with the native
+// tool-search path: discovery here is recorded only in-memory for the live
+// run, never durably as a tool_search_result content block, so
+// discoveredToolsFromHistory cannot recover it after a resume/restart, and
+// the model is never actually re-advertised the tool the SAME cycle it
+// searched (only the next one) -- both are the same "next cycle, not
+// mid-cycle" limitation the native path already has. See
+// docs/architecture/eino-feature-support.md's W6 section for the preferred,
+// not-yet-built fix (mapping this recipe onto a native ToolSearchRegistration
+// instead).
+type toolSearchHandlerToolExecutor struct {
+	handlerToolExecutor
+}
+
+var _ ToolExecutor = toolSearchHandlerToolExecutor{}
+
+func (h toolSearchHandlerToolExecutor) Execute(ctx context.Context, call ToolCall) (ToolResult, error) {
+	result, err := h.handlerToolExecutor.Execute(ctx, call)
+	if err != nil {
+		return result, err
+	}
+	h.engine.execution.markDiscovered(toolSearchMatchedNames(result)...)
+	return result, nil
+}
+
+// toolSearchMatchedNames extracts matched deferred-tool names from a
+// toolsearch handler tool's result. The default (UseModelToolSearch: false)
+// shape is upstream's own {"matches": [...]} JSON text output; the
+// UseModelToolSearch: true shape is an enhanced result whose text parts
+// carry schema.ToolInfo JSON, best-effort parsed for a "name" field.
+func toolSearchMatchedNames(result ToolResult) []string {
+	if result.Output != "" {
+		var parsed struct {
+			Matches []string `json:"matches"`
+		}
+		if err := json.Unmarshal([]byte(result.Output), &parsed); err == nil && len(parsed.Matches) != 0 {
+			return parsed.Matches
+		}
+	}
+	var names []string
+	for _, part := range result.Parts {
+		if part.Type != ToolResultPartText || part.Text == "" {
+			continue
+		}
+		var info struct {
+			Name string `json:"name"`
+		}
+		if err := json.Unmarshal([]byte(part.Text), &info); err == nil && info.Name != "" {
+			names = append(names, info.Name)
+		}
+	}
+	return names
 }

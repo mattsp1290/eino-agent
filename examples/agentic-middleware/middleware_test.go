@@ -674,29 +674,25 @@ func deferredSearchToolDefinition() tools.Definition {
 	}
 }
 
-// TestToolSearchFindsDeferredTool proves toolsearch's positive path at the
-// level this pass could fully verify: a deferred (Deferred: true)
-// composition tool is not eagerly bound, but is discoverable by name via
-// the "tool_search" meta-tool toolsearch installs (query
-// "select:<name>"), confirming search-based visibility works end to end
-// through a real turn.
+// TestToolSearchFindsDeferredTool proves toolsearch's positive path all the
+// way through: a deferred (Deferred: true) composition tool is not eagerly
+// bound, is discoverable by name via the "tool_search" meta-tool toolsearch
+// installs (query "select:<name>"), and -- item 6's fix -- the discovered
+// tool is then actually CALLABLE in a follow-up dispatch, settling
+// ToolCallCompleted with its real output, not denied by the runtime's
+// undiscovered-deferred-tool gate.
 //
-// Not proven here, and left as a documented open question rather than a
-// silently-dropped scenario: actually calling the found tool
-// (hidden_capability) in a follow-up dispatch settled with
-// ToolDenied/ToolApprovalRequired ("expected_failure") in this harness,
-// even though the identical tools.Definition shape (no explicit
-// Permissions) executes normally for every other composition tool in this
-// package's test suite once it is NOT Deferred (see blockingToolDefinition,
-// bigEchoDefinition). runtime.toolPermissions' fallback
-// ([]string{tool.Name}) plus this harness's nil permissions.Policy should
-// make every tool call permission-check-free uniformly (see
-// executeToolWithPermissions' "if policy == nil" short-circuit); why a
-// deferred tool's resolved call specifically diverges from that was not
-// root-caused within this pass's budget -- it did not reproduce for any
-// eagerly-bound tool, only for one reached via toolsearch's own dynamic
-// resolution path, which is a narrower surface than this package's other
-// (fully proven) recipes.
+// Root cause (see the W6 round-1 review's I4 finding, confirmed against
+// source): upstream's toolsearch middleware settles its own "tool_search"
+// call as an ordinary function result and never calls this runtime's
+// markDiscovered the way the native tool-search path
+// (adkToolSearch/executeToolSearchCall) does, so tool_preparation.go's
+// undiscovered-deferred-tool gate (`tool.Deferred && !discovered[name]`)
+// still fires on the very next call to the tool the model just found --
+// this was never a permissions issue (this harness's nil permissions.Policy
+// gates nothing). toolSearchHandlerToolExecutor
+// (runtime/adk_middleware_frozen_tools.go) closes this by marking the
+// matched names discovered after a successful search call.
 func TestToolSearchFindsDeferredTool(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
@@ -718,15 +714,21 @@ func TestToolSearchFindsDeferredTool(t *testing.T) {
 	defer func() { _ = toolMount.Close(context.Background()) }()
 
 	var searchResult string
+	var calledResult string
 	step := 0
 	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		step++
-		if step == 1 {
+		switch step {
+		case 1:
 			args, _ := json.Marshal(map[string]string{"query": "select:hidden_capability"})
 			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-search", "tool_search", string(args))}, nil
+		case 2:
+			searchResult, _ = toolResultParts(request.Messages)
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-hidden", "hidden_capability", `{}`)}, nil
+		default:
+			calledResult, _ = toolResultParts(request.Messages)
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		}
-		searchResult, _ = toolResultParts(request.Messages)
-		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
 	handle, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(t.TempDir()),
@@ -740,6 +742,21 @@ func TestToolSearchFindsDeferredTool(t *testing.T) {
 	}
 	if !strings.Contains(searchResult, "hidden_capability") {
 		t.Fatalf("searchResult = %q, want tool_search to surface hidden_capability by name", searchResult)
+	}
+	if strings.Contains(calledResult, "expected_failure") || strings.Contains(calledResult, "undiscovered") {
+		t.Fatalf("calledResult = %q, want it NOT denied as undiscovered", calledResult)
+	}
+	// The model-visible/durable envelope is truncated under this harness's
+	// zero-inline-retention config (orthogonal to this test), so ToolCallCompleted
+	// -- not the specific bytes -- is the proof that discovery actually
+	// unblocked the call: an undiscovered-deferred-tool denial settles
+	// ToolCallFailed with an "expected_failure" envelope instead.
+	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if toolCall.Status != session.ToolCallCompleted {
+		t.Fatalf("hidden_capability settled status = %q, want completed", toolCall.Status)
 	}
 }
 
