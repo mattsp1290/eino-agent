@@ -121,6 +121,7 @@ func TestPostgresMigration(t *testing.T) {
 	})
 	t.Run("concurrent", func(t *testing.T) { testConcurrentMigration(t, server) })
 	t.Run("canceled_waiter", func(t *testing.T) { testCanceledMigration(t, server) })
+	t.Run("canceled_waiter_race", func(t *testing.T) { testCanceledMigrationRace(t, server) })
 	t.Run("physical_cleanup", func(t *testing.T) { testPhysicalMigrationCleanup(t, server) })
 }
 

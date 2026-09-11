@@ -60,13 +60,19 @@ SELECT pg_catalog.current_setting('search_path'),
 		return err
 	}
 	if err := setMigrationSettings(acquireCtx, conn); err != nil {
-		return errors.Join(err, discardPGXConnection(conn))
+		return errors.Join(err, l.operation.discard())
 	}
 
 	if err := l.delegate.SessionLock(acquireCtx, conn); err != nil {
 		// Acquisition may have succeeded before the delegate reported an error.
 		// Closing the backend is the only unambiguous cleanup in that case.
-		return errors.Join(err, discardPGXConnection(conn))
+		// Route the discard through l.operation (not a bare
+		// discardPGXConnection(conn) call here): a concurrent abort - from the
+		// acquireTimeout timer above, or from the caller's context being
+		// canceled - can be discarding this same *sql.Conn right now, and two
+		// concurrent discards of one *sql.Conn can panic inside database/sql
+		// (see migration_context.go's discard/dropLocked comment).
+		return errors.Join(err, l.operation.discard())
 	}
 	if _, err := inspectSchema(acquireCtx, conn); err != nil {
 		l.operation.stop()
@@ -103,17 +109,22 @@ func (l *validatingSessionLocker) unlockAndRestore(conn *sql.Conn, original sess
 		// not issue another SQL call with a possibly exhausted context: pgx can
 		// turn a SafeToRetry cancellation into driver.ErrBadConn and release the
 		// native connection before a later Raw callback can discard it.
-		return errors.Join(unlockErr, cleanup.err(), discardPGXConnection(conn))
+		//
+		// Discard through cleanup (not a bare discardPGXConnection(conn) call):
+		// cleanup's own cleanupTimeout timer can be aborting this same *sql.Conn
+		// concurrently, and two concurrent discards of one *sql.Conn can panic
+		// inside database/sql (see migration_context.go's discard/dropLocked).
+		return errors.Join(unlockErr, cleanup.err(), cleanup.discard())
 	}
 	probeErr := probeGooseLock(cleanupCtx, conn)
 	if probeErr != nil {
-		return errors.Join(probeErr, cleanup.err(), discardPGXConnection(conn))
+		return errors.Join(probeErr, cleanup.err(), cleanup.discard())
 	}
 	restoreErr := restoreSettings(cleanupCtx, conn, original)
 	if restoreErr == nil {
 		return nil
 	}
-	return errors.Join(restoreErr, discardPGXConnection(conn))
+	return errors.Join(restoreErr, cleanup.discard())
 }
 
 func setMigrationSettings(ctx context.Context, conn *sql.Conn) error {
@@ -153,7 +164,25 @@ WHERE locktype='advisory' AND granted AND objsubid=1
 	return nil
 }
 
+// discardObserved, when non-nil, is called with true just before this
+// function's body runs and with false just before it returns. It exists so
+// tests can detect two discards of the same *sql.Conn overlapping in time:
+// the ownership race a canceled migration waiter could hit, where
+// validatingSessionLocker.SessionLock's own error path and a concurrent
+// migrationContext abort each called discardPGXConnection - and so
+// conn.Raw - on the same connection at once. That race let database/sql's
+// Conn.grabConn observe Conn.done as false just ahead of a concurrent
+// Conn.close, then resume after that close had already niled Conn's
+// driverConn, handing Conn.Raw a nil driverConn with a nil error and
+// panicking on dc.Mutex.Lock(). migrationContext.discard's mutex now
+// prevents the overlap this hook checks for. Nil in production.
+var discardObserved func(entering bool)
+
 func discardPGXConnection(conn *sql.Conn) error {
+	if discardObserved != nil {
+		discardObserved(true)
+		defer discardObserved(false)
+	}
 	closeCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
 	var closeErr error

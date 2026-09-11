@@ -6,6 +6,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -86,6 +88,63 @@ func testCanceledMigration(t *testing.T, server *testpostgres.Server) {
 	}
 	if err := waiterDB.PingContext(t.Context()); err != nil {
 		t.Fatal("waiter pool unusable", err)
+	}
+}
+
+// testCanceledMigrationRace repeats the canceled-waiter scenario in a tight
+// loop against one shared server and, deterministically rather than by
+// scheduling luck, asserts that no two discards of the same *sql.Conn ever
+// overlap.
+//
+// A canceled waiter's connection can be discarded from two places at once:
+// the parent-context watcher inside its migrationContext
+// (newMigrationContext's context.AfterFunc, firing on the test's cancel())
+// closes and discards the bound *sql.Conn concurrently with
+// validatingSessionLocker.SessionLock's own error path, which discards the
+// same *sql.Conn once the delegate's blocked advisory-lock query unblocks
+// with that same cancellation error. Before routing both discards through
+// migrationContext.discard (which serializes them under m.mu), those two
+// goroutines could both call discardPGXConnection - and so conn.Raw - on the
+// same *sql.Conn at once. database/sql's Conn.grabConn checks Conn.done
+// before taking Conn.closemu for read, and Conn.close sets Conn.done before
+// taking Conn.closemu for write and clearing its driverConn; a grabConn call
+// that reads done as false just ahead of a concurrent close's CAS, then
+// blocks on closemu until that close finishes, resumes with a nil driverConn
+// and a nil error, and Conn.Raw dereferences it unconditionally - panicking
+// with a nil pointer dereference (github.com/mattsp1290/eino-agent issue
+// eino-agent-f3i). That exact nil-pointer window is razor-thin: 100 tight
+// in-process repetitions of the plain scenario reproduced zero panics even
+// on the unfixed code (a full-process -count=200 -race rerun did crash, but
+// only because restarting the container/process each time perturbs
+// scheduling enough to occasionally hit the window). The overlap the two
+// discards themselves make is far wider - discardPGXConnection holds a real
+// network round trip inside conn.Raw - so discardObserved, a test-only hook
+// in migration_lock.go, is used here to detect that overlap directly and
+// deterministically instead of waiting on the narrower downstream panic.
+func testCanceledMigrationRace(t *testing.T, server *testpostgres.Server) {
+	var inFlight atomic.Int32
+	var overlapped atomic.Bool
+	previous := discardObserved
+	discardObserved = func(entering bool) {
+		if entering {
+			if inFlight.Add(1) > 1 {
+				overlapped.Store(true)
+			}
+			return
+		}
+		inFlight.Add(-1)
+	}
+	t.Cleanup(func() { discardObserved = previous })
+
+	const iterations = 100
+	for i := range iterations {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
+			testCanceledMigration(t, server)
+		})
+	}
+	if overlapped.Load() {
+		t.Fatal("two discards of the same canceled waiter connection overlapped: " +
+			"validatingSessionLocker no longer serializes discardPGXConnection through migrationContext.discard")
 	}
 }
 

@@ -102,14 +102,50 @@ func (m *migrationContext) err() error {
 	return errors.Join(context.Cause(m.Context), m.closed)
 }
 
+// discard closes the transport and discards the backend connection bound via
+// bind, exactly like abort's cleanup does, but for callers that need to
+// force a discard themselves (e.g. after the delegate reports an error) while
+// leaving the context and stopFn registration alone.
+//
+// It coordinates with abort through m.mu so the two paths can never both call
+// discardPGXConnection on the same *sql.Conn concurrently: database/sql's
+// Conn.grabConn checks Conn.done before taking Conn.closemu for read, and
+// Conn.close sets done before taking Conn.closemu for write and nils out its
+// driverConn. A grabConn that reads done as false just before a concurrent
+// close's CAS, then blocks on closemu until that close finishes, resumes with
+// a nil driverConn and a nil error — and Conn.Raw dereferences it
+// unconditionally, panicking. Routing every discard of the bound connection
+// through this mutex ensures only one goroutine ever races into that window;
+// the other observes the connection already cleared and does nothing.
+func (m *migrationContext) discard() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.dropLocked()
+}
+
+// closeLocked drops the bound transport/connection for abort and folds any
+// resulting error into m.closed for a later err() call. Callers must hold m.mu.
 func (m *migrationContext) closeLocked() {
-	if m.socket != nil {
-		if err := m.socket.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			m.closed = errors.Join(m.closed, err)
+	m.closed = errors.Join(m.closed, m.dropLocked())
+}
+
+// dropLocked closes the bound socket and discards the backend *sql.Conn
+// exactly once, then clears both fields so any later call - from abort or
+// discard, on either goroutine - is a no-op. Callers must hold m.mu.
+func (m *migrationContext) dropLocked() error {
+	socket, sqlConn := m.socket, m.sqlConn
+	m.socket, m.sqlConn = nil, nil
+	if socket == nil && sqlConn == nil {
+		return nil
+	}
+	var err error
+	if socket != nil {
+		if closeErr := socket.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+			err = closeErr
 		}
 	}
-	if m.sqlConn != nil {
-		m.closed = errors.Join(m.closed, discardPGXConnection(m.sqlConn))
+	if sqlConn != nil {
+		err = errors.Join(err, discardPGXConnection(sqlConn))
 	}
-	m.socket, m.sqlConn = nil, nil
+	return err
 }
