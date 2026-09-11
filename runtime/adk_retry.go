@@ -60,6 +60,14 @@ func defaultShouldRetry(_ context.Context, retryCtx *adk.TypedRetryContext[*eino
 	if errors.Is(retryCtx.Err, errPartialStreamObserved) {
 		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
 	}
+	// A tool-call id that publicizeToolCallIDs could not resolve is a
+	// durable-consistency failure, not a transient one (see
+	// errToolCallIDUnresolved's doc comment): it fails the same way on
+	// every attempt, so retrying it only burns the attempt budget and
+	// writes an extra ledger row/attempt_replaced event per try.
+	if errors.Is(retryCtx.Err, errToolCallIDUnresolved) {
+		return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: false}
+	}
 	return &adk.TypedRetryDecision[*einoschema.AgenticMessage]{Retry: true}
 }
 
@@ -137,6 +145,12 @@ func defaultShouldFailover(_ context.Context, _ *einoschema.AgenticMessage, outp
 		return false
 	}
 	if errors.Is(outputErr, errPartialStreamObserved) {
+		return false
+	}
+	// See defaultShouldRetry's matching check: a tool-call id
+	// publicizeToolCallIDs could not resolve fails closed deterministically,
+	// so failing over to another model would not help.
+	if errors.Is(outputErr, errToolCallIDUnresolved) {
 		return false
 	}
 	return true

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -182,7 +183,24 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		// (ProviderCallID) purely so the wire request rebuilt for a later
 		// dispatch can show the provider its own id back (see
 		// publicizeToolCallIDs).
+		// A provider id that is not valid UTF-8, or that exceeds the bound
+		// every other durable identity string in this codebase is checked
+		// against (session.DiscoveryMaxIdentityBytes), is treated as if the
+		// provider had left CallID empty rather than persisted as-is:
+		// invalid UTF-8 would otherwise round-trip altered through the SQL
+		// stores' JSON encoding (encoding/json replaces it with U+FFFD), so
+		// the wire would silently stop echoing the provider's exact id, and
+		// an unbounded id would sit in the free-form tool-call record with
+		// no size check at all (unlike the durable content block's own
+		// CallID, which session/content.go's validateVariant bounds via the
+		// block's content limits). publicizeToolCallIDs falls back to the
+		// minted durable id whenever ProviderCallID is empty, so an invalid
+		// or oversized id simply means the provider sees its own call
+		// answered under the minted id instead.
 		providerCallID := block.CallID
+		if !validProviderCallID(providerCallID) {
+			providerCallID = ""
+		}
 		callID := o.ids.NewToolCallID()
 		block.CallID = string(callID)
 		requestedInput, err := normalizedToolArguments(block.Arguments)
@@ -205,7 +223,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		// per tools.Definition.Aliases/ArgumentAliases (see adk_tools.go).
 		tool, canonicalName, remapped, requestedName, err := resolveToolCall(snapshot, block.Name, requestedInput)
 		if err != nil {
-			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
+			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
 			return nil, err
 		}
 		if tool.Deferred && !discovered[canonicalName] {
@@ -286,4 +304,15 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		prepared = append(prepared, preparedToolCall{block: block, tool: tool, call: call, middlewareErr: prepareErr})
 	}
 	return prepared, nil
+}
+
+// validProviderCallID reports whether id is safe to persist verbatim as
+// session.ToolCall.ProviderCallID: valid UTF-8 (so it round-trips through
+// the SQL stores' JSON encoding unaltered -- encoding/json otherwise
+// replaces invalid UTF-8 with U+FFFD) and no longer than
+// session.DiscoveryMaxIdentityBytes, the same bound every other durable
+// identity string in this codebase is checked against. An empty id is
+// valid (it means the provider left CallID unset).
+func validProviderCallID(id string) bool {
+	return len(id) <= session.DiscoveryMaxIdentityBytes && utf8.ValidString(id)
 }

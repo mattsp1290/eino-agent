@@ -47,6 +47,12 @@ type adkEngine struct {
 	// historyOptions is used to reload the durable model-input projection
 	// fresh before every physical dispatch (see adkModel.durableProjection).
 	historyOptions history.Options
+
+	// toolCallIDCache caches publicizeToolCallIDs's durable-id ->
+	// provider-facing-id resolutions across every dispatch this turn's
+	// engine sees (the primary adapter and any retry/failover adapter
+	// sharing it via resolvedOverride) -- see toolCallIDCache's doc comment.
+	toolCallIDCache toolCallIDCache
 	// baseMessageCount is len(allMessages) at turn-admission time, BEFORE
 	// contextAssemblePoint's extension transforms ran (prepareSnapshot's
 	// Base, not its output snapshot.Messages): the boundary
