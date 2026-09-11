@@ -292,3 +292,181 @@ func stringSlicesEqual(a, b []string) bool {
 	}
 	return true
 }
+
+// TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused proves the plan's
+// "targeted multi-leaf resume" acceptance item (round-four reconciliation
+// item 7/MR-2/MR-3): with two simultaneously-pending tool interrupts,
+// targeting only one by its InterruptCtx address resumes that leaf and
+// completes its tool call while the OTHER leaf stays paused untouched; a
+// second, separately-targeted ResumeRun then resumes it too.
+func TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused(t *testing.T) {
+	store := newAdmissionStore()
+	executed := map[string]int{}
+	var mu sync.Mutex
+	gate := Tool{
+		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"},
+		InterruptPolicy: pausingInterruptPolicy{},
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			mu.Lock()
+			executed[string(call.ID)]++
+			mu.Unlock()
+			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
+		}),
+	}
+	var calls int
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		if calls == 1 {
+			// Two simultaneously-pending tool calls, both requiring a host
+			// decision -- the multi-leaf shape.
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(
+				agenticToolCall("call-leaf-1", "gate", `{}`),
+				agenticToolCall("call-leaf-2", "gate", `{}`),
+			)}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	}))
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
+
+	handle, err := orch.Start(context.Background(), Request{
+		SessionID: "multi-leaf-session", Message: TextUserMessage("hello"), Config: orchestratorConfig(),
+	})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunPaused || !result.Interrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	pause, ok := <-handle.AwaitPause()
+	if !ok || len(pause.InterruptContexts) != 2 {
+		t.Fatalf("pause = %+v, ok=%v, want exactly 2 simultaneously-pending leaves", pause, ok)
+	}
+
+	// Target only the FIRST leaf.
+	firstTarget := pause.InterruptContexts[0].ID
+	resumeHandle, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{
+		Targets: map[string]any{firstTarget: "approve"},
+	})
+	if err != nil {
+		t.Fatalf("first targeted ResumeRun error = %v", err)
+	}
+	resumed := <-resumeHandle.Done()
+	// The untargeted leaf keeps the run paused; the model must not be
+	// dispatched again for it.
+	if resumed.Status != session.RunPaused || !resumed.Interrupted || calls != 1 {
+		t.Fatalf("resumed result = %+v calls=%d, want still paused, no new dispatch", resumed, calls)
+	}
+	mu.Lock()
+	firstExecutions, secondExecutions := executed["call-leaf-1"], executed["call-leaf-2"]
+	mu.Unlock()
+	if firstExecutions != 1 || secondExecutions != 0 {
+		t.Fatalf("executions after first targeted resume: leaf-1=%d leaf-2=%d, want leaf-1=1 leaf-2=0", firstExecutions, secondExecutions)
+	}
+	repause, ok := <-resumeHandle.AwaitPause()
+	if !ok || len(repause.InterruptContexts) != 1 {
+		t.Fatalf("repause = %+v, ok=%v, want exactly the one still-untargeted leaf", repause, ok)
+	}
+
+	// Now target the SECOND (originally untargeted) leaf, by its
+	// current-generation address from the repause above -- an id from the
+	// first pause generation is stale by then (see PauseInfo's doc
+	// comment); use the fresh one.
+	secondResumeHandle, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{
+		Targets: map[string]any{repause.InterruptContexts[0].ID: "approve"},
+	})
+	if err != nil {
+		t.Fatalf("second targeted ResumeRun error = %v", err)
+	}
+	final := <-secondResumeHandle.Done()
+	if final.Status != session.RunCompleted || final.Error != nil {
+		t.Fatalf("final result = %+v, want completed", final)
+	}
+	mu.Lock()
+	firstExecutions, secondExecutions = executed["call-leaf-1"], executed["call-leaf-2"]
+	mu.Unlock()
+	if firstExecutions != 1 || secondExecutions != 1 {
+		t.Fatalf("executions after second targeted resume: leaf-1=%d leaf-2=%d, want exactly 1 each (never re-executed)", firstExecutions, secondExecutions)
+	}
+}
+
+// TestReconcileCrashedRunTerminalizesUnfinishedToolCall proves crash
+// injection at a tool-settlement boundary (round-four reconciliation item
+// 7/MR-2/MR-3, plan acceptance: "Inject crashes after each tool settlement
+// and checkpoint boundary"): a process that claimed a tool call (durably
+// ToolCallRunning) but crashed before it ever settled is recovered through
+// reconcileCrashedRun's terminalizeUnfinishedTools call, exactly like the
+// legacy resume path does -- the call is terminalized interrupted, never
+// re-executed, in the SAME reconciliation that also settles the dangling
+// turn that requested it.
+func TestReconcileCrashedRunTerminalizesUnfinishedToolCall(t *testing.T) {
+	ctx := context.Background()
+	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("unused")}, nil
+	}))
+	defer cleanup()
+
+	sessionID := session.ID("tool-crash-session")
+	newTestSession(t, ctx, orch, sessionID)
+	admittedRun, err := orch.store.AdmitRun(ctx, session.Run{
+		ID: "tool-crash-run", SessionID: sessionID, OwnerID: "owner-1", ClaimToken: "claim-1",
+		Agent: "default", ProviderID: "test", ModelID: "test", Status: session.RunPending, CreatedAt: orch.now(),
+		ExtensionPlan: newTestToolPlan(staticToolRegistry{}).Descriptor(),
+	}, time.Nanosecond)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := orch.store.Execution(session.RunFence{RunID: admittedRun.ID, ClaimToken: admittedRun.ClaimToken})
+	if _, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+		Turn: session.Turn{
+			ID: "tool-crash-turn", RunID: admittedRun.ID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted,
+			UserMessageIDs: []session.MessageID{"tool-crash-user-msg"}, AssistantMessageID: "tool-crash-assistant", CreatedAt: orch.now(),
+		},
+		UserMessages:         []session.Message{{ID: "tool-crash-user-msg", SessionID: sessionID, RunID: admittedRun.ID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
+		AssistantPlaceholder: session.Message{ID: "tool-crash-assistant", SessionID: sessionID, RunID: admittedRun.ID, Role: session.RoleAssistant, CreatedAt: orch.now(), UpdatedAt: orch.now()},
+		Event:                session.EventRecord{ID: "tool-crash-turn-started", SessionID: sessionID, RunID: admittedRun.ID, TurnID: "tool-crash-turn", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
+	}); err != nil {
+		t.Fatalf("admit turn: %v", err)
+	}
+
+	call := session.ToolCall{
+		ID: "tool-crash-call", SessionID: sessionID, RunID: admittedRun.ID, MessageID: "tool-crash-assistant",
+		ResultMessageID: "tool-crash-result-msg", ResultPartID: "tool-crash-result-part",
+		Name: "echo", Pattern: "echo", Input: []byte(`{"text":"hi"}`), Status: session.ToolCallPending,
+	}
+	created, err := execution.CreateToolCall(ctx, testCreateToolRequest(call, "tool-crash-create-event", orch.now()))
+	if err != nil {
+		t.Fatalf("create tool call: %v", err)
+	}
+	claimedCall := created.Call
+	claimedCall.ClaimedBy = "owner-1"
+	claimedCall.ClaimToken = "tool-crash-claim"
+	claimedCall.StartedAt = orch.now()
+	if _, err := execution.ClaimToolCall(ctx, testClaimToolRequest(claimedCall, "tool-crash-claim-event", time.Millisecond, orch.now())); err != nil {
+		t.Fatalf("claim tool call: %v", err)
+	}
+	if _, err := execution.StartRun(ctx, orch.now()); err != nil {
+		t.Fatalf("start run: %v", err)
+	}
+	// The lease (1ns) and the tool call's own claim lease (1ms) are both
+	// already expired by real wall-clock time; nothing was ever settled --
+	// exactly what a process that crashed mid tool-call leaves behind.
+	time.Sleep(5 * time.Millisecond)
+
+	handle, err := orch.Resume(ctx, admittedRun.ID)
+	if err != nil {
+		t.Fatalf("Resume error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunInterrupted || !result.Interrupted {
+		t.Fatalf("reconciled result = %+v, want interrupted (no checkpoint to resume from)", result)
+	}
+	finalCall, err := orch.store.GetToolCall(ctx, created.Call.ID)
+	if err != nil || finalCall.Status != session.ToolCallInterrupted {
+		t.Fatalf("tool call after reconciliation = %#v, err=%v, want interrupted (terminalized, never re-executed)", finalCall, err)
+	}
+	turn, err := orch.store.GetTurn(ctx, "tool-crash-turn")
+	if err != nil || turn.State != session.TurnInterrupted {
+		t.Fatalf("dangling turn after reconciliation = %#v, err=%v, want interrupted", turn, err)
+	}
+}
