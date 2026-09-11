@@ -6,7 +6,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -59,6 +61,86 @@ func testConcurrentMigration(t *testing.T, server *testpostgres.Server) {
 		}
 	}
 	assertMigrationState(t, observer, schemaCurrent)
+}
+
+// testMigrationCancelBeforeBindAbortsPoolWaitPromptly guards the liveness
+// regression d4f325b introduced: migrationContext.interrupt stopped
+// canceling m.Context at all, so a parent cancellation became invisible to
+// everything that runs before SessionLock ever binds a connection -
+// concretely, goose's own p.db.Conn(m.Context) pool wait. With the pool
+// saturated by a connection this test holds open, and the parent already
+// canceled before migrate starts, migrate must return promptly with
+// context.Canceled; at d4f325b it instead blocked until the held connection
+// was released (here, until the test's own cleanup). See
+// TestMigrationContextInterruptCancelsOnlyWhenUnbound for the matching
+// white-box proof that interrupt only cancels m.Context while unbound, and
+// never once a *sql.Conn is bound.
+func testMigrationCancelBeforeBindAbortsPoolWaitPromptly(t *testing.T, server *testpostgres.Server) {
+	database := server.Database(t)
+	db := database.Open(t)
+	db.SetMaxOpenConns(1)
+	held, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := held.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result := make(chan error, 1)
+	go func() { result <- migrate(ctx, db, migrationFS(t), migrationDelegate(t)) }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled parent with a saturated pool: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("migrate ignored a canceled parent while waiting on a saturated pool " +
+			"(interrupt must cancel m.Context while nothing is bound yet)")
+	}
+}
+
+// testMigrationDiscardAfterInterruptWithNoFurtherIOAvoidsMisleadingError
+// reproduces the ownership-model review's S1 finding directly against a
+// real connection: on a success-shaped stop() after an interrupt where the
+// owner attempted no further I/O in between, pgx has not yet observed the
+// transport failure, so native.IsClosed() is false. discardPGXConnection
+// used to call native.Close over that already-dead socket unconditionally
+// and report "use of closed network connection" - the exact misleading
+// error the code comments claim to avoid - alongside the real cause. bind
+// -> interrupt -> stop, with no query in between, forces exactly that
+// ordering; testCanceledMigration and friends do not, because the owner's
+// own query is what observes the failure there.
+func testMigrationDiscardAfterInterruptWithNoFurtherIOAvoidsMisleadingError(t *testing.T, server *testpostgres.Server) {
+	database := server.Database(t)
+	db := database.Open(t)
+	conn, err := db.Conn(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := conn.Close(); err != nil && !errors.Is(err, sql.ErrConnDone) {
+			t.Error(err)
+		}
+	})
+
+	m := newMigrationContext(t.Context())
+	if err := m.bind(conn); err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("probe interrupt")
+	m.interrupt(cause)
+	stopErr := m.stop()
+	if !errors.Is(stopErr, cause) {
+		t.Fatalf("stop did not report the interrupt cause: %v", stopErr)
+	}
+	if stopErr != nil && strings.Contains(stopErr.Error(), "use of closed network connection") {
+		t.Fatalf("stop reported a misleading transport error alongside the real cause: %v", stopErr)
+	}
 }
 
 func testCanceledMigration(t *testing.T, server *testpostgres.Server) {
@@ -170,8 +252,10 @@ func testCanceledMigrationRace(t *testing.T, server *testpostgres.Server) {
 		t.Fatal("two discards of the same canceled waiter connection overlapped: " +
 			"validatingSessionLocker no longer routes every discard through the owning goroutine")
 	}
-	if got := entries.Load(); got < iterations {
-		t.Fatalf("discardObserved observed %d discards, want >= %d (test is vacuous)", got, iterations)
+	if got := entries.Load(); got != iterations {
+		t.Fatalf("discardObserved observed %d discards, want exactly %d "+
+			"(more would mean a canceled waiter's conn is discarded more than once, "+
+			"fewer would make the overlap assertion above vacuous)", got, iterations)
 	}
 }
 
@@ -263,27 +347,68 @@ func (l gatedSessionLock) SessionLock(ctx context.Context, conn *sql.Conn) error
 // interruptObserved, a test-only hook in migration_context.go, fires inside
 // migrationContext.interrupt immediately after it closes the transport,
 // while interrupt is still holding migrationContext.mu. The hook signals the
-// test and then holds the interrupt path open until released. The test uses
-// that window to release a gated delegate whose lock query is about to run
-// on the same *sql.Conn, so the query is dispatched against an
-// already-closed socket while interrupt is still mid-flight - forcing both
-// goroutines toward database/sql's grabConn/close for the same *sql.Conn at
-// once, instead of waiting for that overlap to happen by scheduling luck.
+// test and then holds the interrupt path open until released. The test then
+// releases both the held interrupt path and a gated delegate whose lock
+// query is about to run on the same *sql.Conn at once, so the query is
+// dispatched against an already-closed socket while interrupt is still
+// mid-flight, and any surviving overlap between the two goroutines'
+// database/sql access is exercised rather than avoided by construction.
+// Releasing both together does not itself force that overlap - the
+// scheduler still decides how the two goroutines interleave - but post-fix
+// there is nothing left to overlap with: interrupt only closes the
+// transport and never touches database/sql.
 //
-// Before the ownership-model fix, the code this hook is grafted onto (abort
-// -> closeLocked -> dropLocked) itself called discardPGXConnection - and so
-// conn.Raw - while holding this exact window open, which is precisely the
-// cross-goroutine grabConn/close race that could panic; a second, corrected
-// review round also found that even a mutex-serialized discard was not
-// enough, because the owner's own statements never took that mutex. After
-// the fix, interrupt only closes the transport, records a cause, and never
-// touches database/sql or cancels the pgx-visible context, so nothing is
-// left to race: the owner's own query fails on its own goroutine (a normal,
-// safe ErrBadConn/self-close), and the owner's own SessionLock error path
-// discards the connection afterward, also on its own goroutine.
+// This test asserts the ownership invariant two different ways, and they
+// are not equally strong:
+//
+//  1. Deterministic, every iteration: discardObserved's hook below captures
+//     the calling goroutine's stack for every discardPGXConnection call and
+//     fails immediately if it was reached from migrationContext.interrupt
+//     or the parent-context watcher's AfterFunc callback, rather than from
+//     migrate's own goroutine. That is a property of who called
+//     discardPGXConnection, not of timing, so it cannot pass by luck -
+//     confirmed by hand-reverting interrupt to discard directly and
+//     watching this assertion fail on iteration 0, both before and after
+//     moving the reverted discard ahead of the interruptObserved hook (see
+//     the fix's commit message for the exact revert used). This is the
+//     runtime counterpart to TestMigrationOwnershipGuard's static check.
+//  2. Probabilistic, across the whole loop: the forced interleaving itself
+//     (owner SQL dispatched the instant interrupt closes the socket) can
+//     still reach database/sql's actual nil-driverConn panic if some other
+//     regression this hook's stack check does not name reintroduces the
+//     race. Measured against interrupt hand-reverted to discard directly
+//     (the pre-fix shape): panics appeared roughly once per 200 iterations
+//     across six runs (15, 81, 126, 224, 226, 529) - about 0.5% per
+//     iteration, far worse under -race. iterations below is sized to give
+//     this secondary signal a real chance without making the suite slow; it
+//     is not, by itself, a reliable detector, and the stack assertion above
+//     is what actually guarantees a reintroduction fails this test.
 func testCanceledMigrationOwnerRace(t *testing.T, server *testpostgres.Server) {
-	const iterations = 40
+	const iterations = 200
 	var hookFired atomic.Int32
+	var released, timedOut atomic.Int32
+
+	// Deterministic half of the check (see doc above): a discard reached
+	// from a non-owner goroutine fails immediately, regardless of whether
+	// this run's forced interleaving happens to panic.
+	var foreignDiscard atomic.Bool
+	var foreignStack atomic.Pointer[string]
+	previousDiscard := discardObserved.Load()
+	dhook := func(conn *sql.Conn, entering bool) {
+		if !entering {
+			return
+		}
+		buf := make([]byte, 16<<10)
+		trace := string(buf[:runtime.Stack(buf, false)])
+		if strings.Contains(trace, "migrationContext).interrupt") ||
+			strings.Contains(trace, "newMigrationContext.func") {
+			foreignDiscard.Store(true)
+			foreignStack.Store(&trace)
+		}
+	}
+	discardObserved.Store(&dhook)
+	t.Cleanup(func() { discardObserved.Store(previousDiscard) })
+
 	for i := range iterations {
 		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			database := server.Database(t)
@@ -295,12 +420,19 @@ func testCanceledMigrationOwnerRace(t *testing.T, server *testpostgres.Server) {
 			proceed := make(chan struct{})
 			socketClosed := make(chan struct{})
 			release := make(chan struct{})
+			var closeSocketClosedOnce sync.Once
 			hook := func() {
-				close(socketClosed)
+				// sync.Once, not a bare close: a future change to interrupt
+				// (or a second bound context inside this window) firing this
+				// hook twice must not turn a test-only double-close into a
+				// panic that looks like a product crash.
+				closeSocketClosedOnce.Do(func() { close(socketClosed) })
 				hookFired.Add(1)
 				select {
 				case <-release:
+					released.Add(1)
 				case <-time.After(250 * time.Millisecond):
+					timedOut.Add(1)
 				}
 			}
 			previous := interruptObserved.Load()
@@ -314,12 +446,12 @@ func testCanceledMigrationOwnerRace(t *testing.T, server *testpostgres.Server) {
 
 			receiveMigration(t, ready) // owner is bound and about to issue its lock query.
 			cancel()
-			receiveMigration(t, socketClosed) // abort has closed the transport and is holding the path open.
+			receiveMigration(t, socketClosed) // interrupt has closed the transport and is holding the path open.
 			close(proceed)                    // release the owner's query against the now-closed socket...
-			close(release)                    // ...at the same time as abort's held path, to force genuine overlap.
+			close(release)                    // ...and interrupt's held path, together, so any surviving overlap is exercised.
 
-			if err := receiveMigration(t, result); err == nil {
-				t.Fatal("canceled waiter with a closed transport unexpectedly succeeded")
+			if err := receiveMigration(t, result); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled waiter with a closed transport: %v", err)
 			}
 			if schemaHistory(t, waiterDB) != "absent" {
 				t.Fatal("canceled waiter wrote history")
@@ -329,8 +461,17 @@ func testCanceledMigrationOwnerRace(t *testing.T, server *testpostgres.Server) {
 			}
 		})
 	}
+	if foreignDiscard.Load() {
+		t.Fatalf("discardPGXConnection ran on a non-owner goroutine - the exact "+
+			"ownership violation behind eino-agent-f3i:\n%s", *foreignStack.Load())
+	}
 	if got := hookFired.Load(); got < iterations {
 		t.Fatalf("interrupt hook observed %d aborts, want >= %d (test is vacuous)", got, iterations)
+	}
+	if got := released.Load(); got < iterations {
+		t.Fatalf("only %d/%d iterations released the interrupt in step with the owner's "+
+			"query (the rest hit the 250ms fallback and proved nothing that iteration); "+
+			"released=%d timedOut=%d", got, iterations, released.Load(), timedOut.Load())
 	}
 }
 
@@ -360,7 +501,19 @@ func (l *failedUnlock) SessionUnlock(ctx context.Context, conn *sql.Conn) error 
 		// transport, so a delegate can no longer rely on ctx.Done() firing
 		// on its own - only a real read/write against the closed socket
 		// unblocks it.
-		return errors.Join(l.err, conn.QueryRowContext(ctx, "SELECT pg_catalog.pg_sleep(30)").Scan(&value))
+		//
+		// pg_sleep(8) - not something much longer - matters for
+		// testPhysicalMigrationCleanup's poll: cleanupTimeout (5s) closes
+		// the transport while this query is still running, but pg_sleep
+		// itself does not read the socket, so PostgreSQL only discovers the
+		// dead connection when the query finishes and tries to write its
+		// result back, around t=8s. Depending on the host/container network
+		// path noticing the closed transport sooner (a plain client FIN can
+		// otherwise sit unnoticed for a long time, with
+		// client_connection_check_interval=0) would make the poll's timing
+		// hold only by accident; 8s guarantees the write-failure path fires
+		// with margin inside the poll's own 5s budget after migrate returns.
+		return errors.Join(l.err, conn.QueryRowContext(ctx, "SELECT pg_catalog.pg_sleep(8)").Scan(&value))
 	}
 	l.cancel()
 	return l.err // Deliberately leave the real session lock held.

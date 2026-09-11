@@ -119,6 +119,12 @@ func TestPostgresMigration(t *testing.T) {
 			t.Fatalf("host settings changed: %q %q", path, quote)
 		}
 	})
+	t.Run("cancel_before_bind_aborts_pool_wait", func(t *testing.T) {
+		testMigrationCancelBeforeBindAbortsPoolWaitPromptly(t, server)
+	})
+	t.Run("discard_after_interrupt_no_io_avoids_misleading_error", func(t *testing.T) {
+		testMigrationDiscardAfterInterruptWithNoFurtherIOAvoidsMisleadingError(t, server)
+	})
 	t.Run("concurrent", func(t *testing.T) { testConcurrentMigration(t, server) })
 	t.Run("canceled_waiter", func(t *testing.T) { testCanceledMigration(t, server) })
 	t.Run("canceled_waiter_race", func(t *testing.T) { testCanceledMigrationRace(t, server) })

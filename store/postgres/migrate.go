@@ -70,10 +70,14 @@ func migrate(ctx context.Context, db *sql.DB, files fs.FS, delegate lock.Session
 	// ApplyVersion enters the validating locker before history initialization.
 	// Up and version/status probes do not provide that ordering in pinned Goose.
 	// Never close this provider: Provider.Close would close the borrowed host pool.
+	//
+	// No operation.err() call here: SessionLock's error defer and
+	// SessionUnlock already stop() (and fold in any interrupt cause) on
+	// every normal path, and the deferred operation.stop() above is the
+	// backstop for the abnormal one. Reading operation.err() as well would
+	// report a cause that stop already reported - see migration_context.go's
+	// take doc.
 	_, err = provider.ApplyVersion(operation.Context, 1, true)
-	if err != nil {
-		err = errors.Join(err, operation.err())
-	}
 	if soleAlreadyApplied(err) {
 		return nil
 	}

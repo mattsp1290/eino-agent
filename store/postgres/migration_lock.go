@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"errors"
+	"net"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +21,19 @@ const (
 // validatingSessionLocker validates the schema after acquiring Goose's
 // session advisory lock and keeps all of the work on the supplied connection.
 // A locker is created for one migration run, so one saved path is sufficient.
+//
+// A delegate's SessionLock/SessionUnlock only learns about an interrupt
+// through an I/O failure. By the time a delegate runs, l.operation (or
+// unlockAndRestore's cleanup) has already bound the connection, and
+// migrationContext.interrupt cancels the pgx-visible context only while
+// unbound (see migration_context.go) - so neither a parent cancellation nor
+// the acquire/cleanup timers ever cancel the context a bound delegate is
+// given. A delegate that selects on ctx.Done() with no query in flight will
+// never wake on interruption; it must attempt real I/O against the
+// connection, as goose's own postgresSessionLocker does (its retry sleep
+// wakes on its own interval, then fails on the next write to the closed
+// transport). testPhysicalMigrationCleanup's expire case blocks on a real
+// query (pg_sleep) rather than ctx.Done() for exactly this reason.
 type validatingSessionLocker struct {
 	delegate  lock.SessionLocker
 	operation *migrationContext
@@ -41,7 +55,13 @@ func (l *validatingSessionLocker) SessionLock(ctx context.Context, conn *sql.Con
 	// borrower. On success l.operation stays bound - and its parent-
 	// cancellation watcher armed - through goose's migration run; only
 	// SessionUnlock (via stop) may discard it after that, on this same
-	// goroutine.
+	// goroutine. An interrupt landing after this function returns nil (for
+	// example right after inspectSchema succeeds) leaves a dead-socket
+	// connection bound: goose runs at least one more statement - its own
+	// ensureVersionTable, or a migration statement - which fails on I/O
+	// against the closed transport before SessionUnlock's stop() discards
+	// the connection. Nothing reaches a pool undiscarded, but that failed
+	// statement is the worst-case latency before the owner notices.
 	defer func() {
 		if err != nil {
 			err = errors.Join(err, l.operation.stop())
@@ -119,31 +139,25 @@ func (l *validatingSessionLocker) unlockAndRestore(conn *sql.Conn, original sess
 	cleanupCtx := cleanup.Context
 	unlockErr := l.delegate.SessionUnlock(cleanupCtx, conn)
 	if unlockErr != nil {
-		// The delegate may have returned without releasing its lock. Do
-		// not issue another SQL call with a possibly exhausted context: pgx
-		// can turn a SafeToRetry cancellation into driver.ErrBadConn and
-		// release the native connection before we discard it ourselves.
-		//
-		// Call discard before err: a concurrent cleanupTimeout interrupt can
-		// still be recording its cause when unlockErr comes back, and
-		// reading err() first could snapshot a stale cleanup.interrupted.
-		// discard runs on this goroutine, the one that owns conn, so it
-		// never races interrupt for access to conn.Raw - see
-		// migration_context.go.
-		discardErr := cleanup.discard()
-		return errors.Join(unlockErr, cleanup.err(), discardErr)
+		// The delegate may have returned without releasing its lock;
+		// discard unconditionally rather than issuing another SQL call, in
+		// case the connection is no longer usable. discard runs on this
+		// goroutine, the one that owns conn, so it never races a concurrent
+		// cleanupTimeout interrupt for access to conn.Raw - see
+		// migration_context.go. discard's own return already folds in any
+		// interrupt cause and transport-close error exactly once (see
+		// take); the deferred cleanup.stop() below is a no-op after this.
+		return errors.Join(unlockErr, cleanup.discard())
 	}
 	probeErr := probeGooseLock(cleanupCtx, conn)
 	if probeErr != nil {
-		discardErr := cleanup.discard()
-		return errors.Join(probeErr, cleanup.err(), discardErr)
+		return errors.Join(probeErr, cleanup.discard())
 	}
 	restoreErr := restoreSettings(cleanupCtx, conn, original)
 	if restoreErr == nil {
 		return nil
 	}
-	discardErr := cleanup.discard()
-	return errors.Join(restoreErr, cleanup.err(), discardErr)
+	return errors.Join(restoreErr, cleanup.discard())
 }
 
 func setMigrationSettings(ctx context.Context, conn *sql.Conn) error {
@@ -193,13 +207,18 @@ WHERE locktype='advisory' AND granted AND objsubid=1
 // After the ownership-model fix (see migration_context.go), a migration
 // lock's discard is only ever called by the goroutine that owns the
 // *sql.Conn being discarded, never from an interrupting goroutine, so two
-// calls for the same connection can no longer overlap in time. Regression
-// tests use this hook to confirm that invariant and to count how many
-// discards actually happened, so a test cannot pass without exercising the
-// path it claims to test. Stored behind an atomic.Pointer so a test can set
-// and clear it without racing a concurrent discard goroutine. Nil in
-// production, where the hook costs one atomic load on a path that only runs
-// for errors and cleanup.
+// calls for the same connection can no longer overlap in time.
+// testCanceledMigrationRace uses this hook to confirm that non-overlap and
+// to count how many discards actually happened, so it cannot pass without
+// exercising the path it claims to test - but non-overlap is weaker than
+// ownership: testCanceledMigrationOwnerRace's runtime.Stack-based check on
+// this same hook is what actually asserts every discard runs on the owning
+// goroutine, which a timing-based overlap check cannot. Stored behind an
+// atomic.Pointer so a test can set and clear it without racing a concurrent
+// discard goroutine; it is a single global slot, so tests that install it
+// must not run under t.Parallel with each other. Nil in production, where
+// the hook costs one atomic load on a path that only runs for errors and
+// cleanup.
 var discardObserved atomic.Pointer[func(conn *sql.Conn, entering bool)]
 
 func discardPGXConnection(conn *sql.Conn) error {
@@ -220,17 +239,17 @@ func discardPGXConnection(conn *sql.Conn) error {
 		if native == nil {
 			return errors.New("postgres session locker has no native connection")
 		}
-		if native.IsClosed() {
+		closeErr = native.Close(closeCtx)
+		if closeErr != nil && errors.Is(closeErr, net.ErrClosed) {
 			// A watcher goroutine may already have closed the raw transport
 			// (see migrationContext.interrupt) before pgx observed the I/O
-			// failure that would normally set this. Calling Close again
-			// would attempt a graceful shutdown message over an
-			// already-dead socket and report a misleading transport error
-			// for what is already a successful discard.
-			nativeClosed = true
-			return driver.ErrBadConn
+			// failure that would normally make IsClosed() true - the common
+			// case on a success-shaped stop() after an interrupt, since the
+			// owner did no further I/O to trip it. Close above then went out
+			// over an already-dead socket: the discard still succeeded, so
+			// do not report that transport error.
+			closeErr = nil
 		}
-		closeErr = native.Close(closeCtx)
 		nativeClosed = native.IsClosed()
 		// Returning ErrBadConn here makes database/sql discard this wrapper. The
 		// underlying pgx connection was closed above for pool-backed drivers.
