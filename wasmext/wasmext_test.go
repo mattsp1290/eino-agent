@@ -519,6 +519,12 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 // compiles against, so wasmtime's own canonical-ABI type check rejects the
 // component at compile/instantiation time -- surfaced here as an ordinary
 // *Error, never a panic or process crash -- before any call is attempted.
+// TestCheckedInOldABIContextSourceRejectedCleanly proves the actual
+// rejection mechanism: the fixture is rejected at Compile because the
+// versioned world export name (eino-agent:extensions/context-source-api@0.2.0)
+// simply isn't found on a v0.1.0-built component -- a lookup-by-name
+// failure, not a canonical-ABI/signature type check -- so the classified
+// error Kind must be ErrorContract specifically, not merely "some *Error".
 func TestCheckedInOldABIContextSourceRejectedCleanly(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
@@ -531,6 +537,9 @@ func TestCheckedInOldABIContextSourceRejectedCleanly(t *testing.T) {
 	var extensionErr *Error
 	if !errors.As(err, &extensionErr) {
 		t.Fatalf("old-ABI rejection was not a clean *Error: %v (%T)", err, err)
+	}
+	if extensionErr.Kind != ErrorContract {
+		t.Fatalf("old-ABI rejection Kind = %v, want %v", extensionErr.Kind, ErrorContract)
 	}
 }
 

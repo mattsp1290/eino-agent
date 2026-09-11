@@ -204,7 +204,12 @@ var _TextRoleUnmarshalCase = cm.CaseUnmarshaler[TextRole](_TextRoleStrings[:])
 //
 // A bounded reference to non-text content (image, audio, video, file):
 // never a raw payload, always a URI a trusted host resolves. uri and
-// mime-type are both required.
+// mime-type are both required. The host validates uri before use: valid
+// UTF-8, bounded length, and an allowed scheme only (currently https --
+// data:/file:/relative are rejected, since they either embed
+// guest-controlled bytes directly or request host-local access a guest
+// has no business making). A uri failing that check is a contract
+// error, not silently dropped or passed through.
 //
 //	record media-reference {
 //		uri: string,
@@ -218,9 +223,16 @@ type MediaReference struct {
 
 // FunctionCallBlock represents the record "eino-agent:extensions/types@0.2.0#function-call-block".
 //
-// A function/tool call the model issued, projected for observation only
+// A function/tool call the model issued, projected for OBSERVATION only
 // -- carries no execution authority; arguments-json is a normalized JSON
-// document.
+// document. Valid only for an extension point that observes an
+// already-durable call (a future tool-middleware content-observation
+// point). A context-source guest's load-context output (which
+// contributes to a turn's own admission-time prefix, treated as already-
+// trusted baseline content by the host's settlement seal) must NEVER
+// emit this case: the host rejects it with a contract error before any
+// message mutation, since accepting it would let a guest fabricate an
+// apparently-settled tool result no durable record ever backed.
 //
 //	record function-call-block {
 //		call-id: string,
@@ -237,7 +249,9 @@ type FunctionCallBlock struct {
 // FunctionResultTextBlock represents the record "eino-agent:extensions/types@0.2.0#function-result-text-block".
 //
 // A settled function/tool result's text projection. Never the raw
-// durable settlement: a bounded, model-visible text view only.
+// durable settlement: a bounded, model-visible text view only. Same
+// OBSERVATION-only direction and the same context-source rejection as
+// function-call-block above, and for the identical reason.
 //
 //	record function-result-text-block {
 //		call-id: string,
@@ -256,14 +270,25 @@ type FunctionResultTextBlock struct {
 // single flat string, so context-source (and any future WASM context/
 // model/tool middleware observing message content) can see and produce
 // media references and call/result projections without flattening them
-// to text. Adding a new case is a breaking change to this variant and
-// requires a new world version (see the eino-agent:extensions package
-// version below); a host on a newer version refuses a guest built
-// against an older one at component-instantiation time (the Component
-// Model's own canonical-ABI type check on the exported function
-// signature already enforces this structurally -- a size/shape
-// mismatch on this variant's cases fails linking, not a crash), never
-// silently misinterpreting an unknown case's payload.
+// to text. Not every case is valid at every extension point -- see each
+// case's own doc comment for which direction (production vs.
+// observation-only) it is valid in.
+//
+// This variant has no per-case version of its own: the
+// eino-agent:extensions package version below IS the version. Adding a
+// case (or otherwise changing this variant's shape) is a breaking change
+// that requires bumping that package version and, correspondingly, the
+// world export name every world in this file re-exports at
+// (e.g. "eino-agent:extensions/context-source-api@0.2.0"). A host on a
+// newer package version therefore rejects a guest built against an
+// older one at COMPILE time, by a plain export-name lookup failure
+// (engine_wasmtime.go's GetExportIndex(nil, exportName) finds nothing
+// and the host fails closed, classified ErrorContract) -- not a
+// canonical-ABI/signature type check, and not at instantiation or call
+// time. Signature compatibility WITHIN one package version (a guest
+// exporting the right name but a subtly different function signature)
+// is not caught by this mechanism at all; it relies on WIT/package-
+// version discipline between host and guest, not a runtime check.
 //
 //	variant content-block {
 //		text(string),

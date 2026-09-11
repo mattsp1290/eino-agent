@@ -19,6 +19,7 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
+	"go.bytecodealliance.org/cm"
 )
 
 func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
@@ -48,6 +49,161 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	})
 	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.AgenticRoleTypeSystem || agenticMessageText(messages[1]) != "context" {
 		t.Fatalf("LoadContext = %#v, %v", messages, err)
+	}
+}
+
+// TestConvertContentBlockCases is the fake-component-free table test I5/I6
+// asked for: every content-block case convertContentBlock/convertMediaReference
+// can be handed, including MIME classification, an empty/oversized/
+// non-UTF8/disallowed-scheme URI, and both OBSERVATION-only cases
+// (function-call, function-result-text) that a context-source guest must
+// never be allowed to produce.
+func TestConvertContentBlockCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		block   wittypes.ContentBlock
+		wantErr bool
+		check   func(t *testing.T, block *einoschema.ContentBlock)
+	}{
+		{
+			name:  "text",
+			block: wittypes.ContentBlockText("hello"),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputText == nil || block.UserInputText.Text != "hello" {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference image",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/pic.png", MIMEType: "image/png"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputImage == nil || block.UserInputImage.URL != "https://example.com/pic.png" || block.UserInputImage.MIMEType != "image/png" {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference audio",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/clip.mp3", MIMEType: "audio/mpeg"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputAudio == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference video",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/clip.mp4", MIMEType: "video/mp4"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputVideo == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference unrecognized MIME becomes an opaque file reference",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/doc.bin", MIMEType: "application/octet-stream"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputFile == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:    "media-reference empty MIME still requires a valid URI, then falls back to file",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/x", MIMEType: ""}),
+			wantErr: false,
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputFile == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:    "media-reference empty URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "", MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference oversized URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/" + strings.Repeat("a", maxMediaReferenceURIBytes), MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference non-UTF8 URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/\xff\xfe", MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference data scheme rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "data:image/png;base64,AAAA", MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference file scheme rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "file:///etc/passwd", MIMEType: "text/plain"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference relative URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "/etc/passwd", MIMEType: "text/plain"}),
+			wantErr: true,
+		},
+		{
+			name:    "function-call rejected (observation-only, not valid for context-source)",
+			block:   wittypes.ContentBlockFunctionCall(wittypes.FunctionCallBlock{CallID: "call-1", Name: "tool", ArgumentsJSON: "{}"}),
+			wantErr: true,
+		},
+		{
+			name:    "function-result-text rejected (observation-only, not valid for context-source)",
+			block:   wittypes.ContentBlockFunctionResultText(wittypes.FunctionResultTextBlock{CallID: "call-1", Text: "result"}),
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			converted, _, err := convertContentBlock(tc.block)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			tc.check(t, converted)
+		})
+	}
+}
+
+// TestLoadContextMetadataRejectsUnauthorizedBlocksBeforeMutation proves the
+// rejection happens through the real loadContextMetadata call path (not
+// just the unit-level convertContentBlock), and before any message is
+// appended: a fake component returning a function-call block must produce
+// zero messages and a contract error, not a partially-built message list.
+func TestLoadContextMetadataRejectsUnauthorizedBlocksBeforeMutation(t *testing.T) {
+	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+		*output.(*[]wittypes.Message) = []wittypes.Message{
+			textOnlyMessage(wittypes.TextRoleSystem, "before"),
+			{Role: wittypes.TextRoleUser, Blocks: cm.ToList([]wittypes.ContentBlock{wittypes.ContentBlockFunctionCall(wittypes.FunctionCallBlock{CallID: "c1", Name: "n", ArgumentsJSON: "{}"})})},
+		}
+		return nil
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("context")), contextSourceContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &loadedContextSource{module: module, component: component}
+	defer func() { _ = source.close() }()
+	messages, err := source.loadBoundedContext(context.Background(), runtime.BoundedTurnMetadata{RunID: "run-1", SessionID: "session-1"})
+	if err == nil {
+		t.Fatalf("expected a rejection, got messages = %#v", messages)
+	}
+	var extensionErr *Error
+	if !errors.As(err, &extensionErr) || extensionErr.Kind != ErrorContract {
+		t.Fatalf("err = %v, want a *Error with Kind == ErrorContract", err)
 	}
 }
 

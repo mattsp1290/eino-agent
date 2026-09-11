@@ -1829,32 +1829,59 @@ below.
   proven `decodeReplacement` variant-decoding pattern) replace the removed
   `decodeTextMessages`, bounding block count and cumulative payload bytes
   against `Limits.MaxOutputBytes`. `wasmext/wrappers.go`'s
-  `loadContextMetadata` maps each WIT case onto the matching
-  `schema.ContentBlock` variant: `text` stays plain text; `media-reference`
-  is classified by its required MIME type (`image/`, `audio/`, `video/`,
-  else treated as an opaque file reference -- `media-reference` carries no
-  separate kind discriminant of its own) into the matching typed
-  `UserInput{Image,Audio,Video,File}` block, never flattened to text;
-  `function-call`/`function-result-text` map onto
-  `FunctionToolCall`/`FunctionToolResult`. All six guest fixtures
+  `loadContextMetadata` (`convertContentBlock`/`convertMediaReference`)
+  maps the two production WIT cases onto the matching `schema.ContentBlock`
+  variant: `text` stays plain text; `media-reference` is classified by its
+  required MIME type (`image/`, `audio/`, `video/`, else treated as an
+  opaque file reference -- `media-reference` carries no separate kind
+  discriminant of its own) into the matching typed
+  `UserInput{Image,Audio,Video,File}` block, never flattened to text, after
+  its `uri` is validated (non-empty, bounded length, valid UTF-8,
+  `https`-only scheme). `function-call`/`function-result-text` are
+  rejected with a contract error before any message mutation -- see the
+  context-source-output-restriction bullet below. All six guest fixtures
   (`examples/wasm-extensions/*/main.go`) were rebuilt via `make
   wasm-fixtures` (both `tinygo` and `wasm-tools` are present locally); the
   `context-source` guest now emits a `content-block` message.
   **Version rejection is structural, proven, and does not crash**: an old
   guest built against the superseded `@0.1.0` world exports a
-  structurally-different function signature, so wasmtime's own
-  canonical-ABI type check on that exported signature rejects the
-  component at compile/instantiation time -- before any call -- as an
-  ordinary `*wasmext.Error`, never a panic. This is a permanent regression
-  test, not a one-off manual check:
+  DIFFERENTLY-VERSIONED world interface name
+  (`eino-agent:extensions/context-source-api@0.1.0`, not this package's
+  `@0.2.0`), so it is rejected at `Compile` by a plain export-name lookup
+  failure -- `wasmext/engine_wasmtime.go`'s
+  `component.GetExportIndex(nil, contract.exportName)` finds no export by
+  that name and fails closed with `"required world export missing"`,
+  classified `ErrorContract` -- before any call, before instantiation, as
+  an ordinary `*wasmext.Error`, never a panic. This is a lookup-by-name
+  failure, not a canonical-ABI/signature type check: a guest that happened
+  to export the SAME versioned name with a subtly incompatible function
+  signature is not a case this mechanism catches at all -- signature
+  compatibility within one package version relies on WIT/package-version
+  discipline between host and guest, not a runtime check. This is a
+  permanent regression test, not a one-off manual check:
   `TestCheckedInOldABIContextSourceRejectedCleanly` loads a checked-in
   `@0.1.0` `context-source.wasm`
   (`examples/wasm-extensions/fixtures/context-source-abi-v0.1-incompatible.wasm`,
   the pre-bump fixture preserved under a new name) against the current host
-  and asserts a clean `*Error`. `TestCheckedInPhaseBComponentsRoundTrip`
-  exercises the new shape end to end through the rebuilt fixture. No
-  classic `PartKind` names existed in this WIT file to rename (the parallel
-  removal work in another worktree does not intersect this package).
+  and asserts a clean `*Error` with `Kind == ErrorContract` specifically.
+  `TestCheckedInPhaseBComponentsRoundTrip` exercises the new shape end to
+  end through the rebuilt fixture. No classic `PartKind` names existed in
+  this WIT file to rename (the parallel removal work in another worktree
+  does not intersect this package).
+  - **Context-source output is restricted to text and media-reference**:
+    `function-call`/`function-result-text` are OBSERVATION-only cases in
+    the shared `content-block` variant (valid for a future tool-middleware
+    content-observation point), never valid for `context-source`'s
+    `load-context` output -- that output becomes part of a turn's own
+    admission-time prefix, which the host's settlement seal
+    (`runtime.verifySettledToolResults`) treats as already-trusted baseline
+    content, so a guest emitting either case there would let it fabricate
+    an apparently-settled tool result no durable record ever backed.
+    `wasmext/wrappers.go`'s `convertContentBlock` rejects both with a
+    contract error before any message mutation. A `media-reference`'s
+    `uri` is validated before use: non-empty, bounded length, valid UTF-8,
+    and an allowed scheme (`https` only -- `data:`/`file:`/relative are
+    rejected).
   - **Bounded limitation**: `testdata/external-consumer` (a separate Go
     module resolving the published module graph, exercised by
     `make external-consumer-check` / `EINO_AGENT_CONSUMER_POSTGRES=1

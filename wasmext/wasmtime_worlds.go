@@ -189,11 +189,19 @@ func componentBoundedEvent(event wittypes.BoundedEvent) C.wasmtime_component_val
 // decodeMessages decodes a component-model `list<message>` result, where
 // each message is a `role` enum plus an ordered `blocks: list<content-block>`
 // (see decodeContentBlock). It replaces the old flat decodeTextMessages: a
-// guest built against the prior text-message shape produces a structurally
-// different exported-function signature, so wasmtime's own canonical-ABI
-// type check rejects it at component-instantiation time, before any call
-// (and therefore before this decoder ever runs) -- see the content-block
-// doc comment in wit/eino-agent-extensions.wit.
+// guest built against the prior (v0.1.0) text-message shape exports a
+// DIFFERENTLY-VERSIONED world interface name
+// ("eino-agent:extensions/context-source-api@0.1.0" vs this package's
+// "...@0.2.0"), so it is rejected at Compile -- engine_wasmtime.go's
+// GetExportIndex(nil, contract.exportName) simply finds no export by that
+// name and fails closed ("required world export missing", classified
+// ErrorContract) -- long before this decoder, or any call, ever runs. This
+// is a lookup-by-name failure, not a canonical-ABI/signature type check:
+// two components sharing the SAME versioned export name but a genuinely
+// incompatible function signature is not a case this mechanism catches --
+// signature compatibility within one package version relies on
+// WIT/package-version discipline, not a runtime check -- see the
+// content-block doc comment in wit/eino-agent-extensions.wit.
 func decodeMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Message, limit int64) error {
 	if value == nil || int(C.wasmext_val_kind(value)) != componentKindList {
 		return errors.New("component returned an unexpected message list")
@@ -269,9 +277,13 @@ func decodeContentBlocks(value *C.wasmtime_component_val_t, limit int64) ([]witt
 // decodeContentBlock decodes one `content-block` variant case, modeled on
 // the proven decodeReplacement pattern: the case name is read from the
 // variant discriminant, and the payload is decoded according to that case's
-// known shape. An unrecognized case name (which the canonical-ABI check
-// above already prevents for a same-version guest) fails closed rather than
-// guessing at an unknown payload's shape.
+// known shape. An unrecognized case name fails closed rather than guessing
+// at an unknown payload's shape -- this is a real, reachable path (not
+// prevented by anything at compile time): a genuinely incompatible guest
+// still compiles successfully whenever it happens to export the same
+// versioned world interface name (see decodeMessages's doc comment for why
+// the differently-versioned v0.1.0 fixture is rejected earlier, at Compile,
+// and never reaches this decoder at all).
 func decodeContentBlock(value *C.wasmtime_component_val_t, limit int64) (wittypes.ContentBlock, int64, error) {
 	var zero wittypes.ContentBlock
 	if value == nil || int(C.wasmext_val_kind(value)) != componentKindVariant {
