@@ -14,7 +14,7 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 type loadedTool struct {
@@ -197,7 +197,7 @@ func (s *loadedContextSource) loadBoundedContext(ctx context.Context, metadata r
 }
 
 func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.AgenticMessage, error) {
-	var output []wittypes.TextMessage
+	var output []wittypes.Message
 	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), func(callCtx context.Context) error {
 		var callErr error
 		output, callErr = s.component.LoadContext(callCtx, turn)
@@ -208,20 +208,92 @@ func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 	messages := make([]*einoschema.AgenticMessage, 0, len(output))
 	var total int64
 	for _, message := range output {
-		total += int64(len(message.Text))
-		if total > s.module.limits.MaxOutputBytes {
-			return nil, extensionError(ErrorSize, s.module.identity, "context-source.load-context", nil)
-		}
-		switch message.Role {
-		case wittypes.TextRoleSystem:
-			messages = append(messages, einoschema.SystemAgenticMessage(message.Text))
-		case wittypes.TextRoleUser:
-			messages = append(messages, einoschema.UserAgenticMessage(message.Text))
-		default:
+		role, err := agenticRoleFromWIT(message.Role)
+		if err != nil {
 			return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
 		}
+		blocks := message.Blocks.Slice()
+		contentBlocks := make([]*einoschema.ContentBlock, 0, len(blocks))
+		for _, block := range blocks {
+			converted, size, err := convertContentBlock(block)
+			if err != nil {
+				return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
+			}
+			total += size
+			if total > s.module.limits.MaxOutputBytes {
+				return nil, extensionError(ErrorSize, s.module.identity, "context-source.load-context", nil)
+			}
+			contentBlocks = append(contentBlocks, converted)
+		}
+		messages = append(messages, &einoschema.AgenticMessage{Role: role, ContentBlocks: contentBlocks})
 	}
 	return messages, nil
+}
+
+// agenticRoleFromWIT maps the WIT text-role enum (system, user) onto
+// AgenticRoleType. context-source guests never speak for the assistant.
+func agenticRoleFromWIT(role wittypes.TextRole) (einoschema.AgenticRoleType, error) {
+	switch role {
+	case wittypes.TextRoleSystem:
+		return einoschema.AgenticRoleTypeSystem, nil
+	case wittypes.TextRoleUser:
+		return einoschema.AgenticRoleTypeUser, nil
+	default:
+		return "", errors.New("component returned an invalid text role")
+	}
+}
+
+// convertContentBlock maps one WIT content-block variant case onto its
+// eino schema.ContentBlock projection: text stays plain text, a
+// media-reference is classified by its required MIME type into the
+// matching typed user-input block (never flattened to text), and the
+// function-call/function-result-text observation cases become their
+// eino equivalents. It returns the approximate byte size consumed so the
+// caller can enforce MaxOutputBytes uniformly across block kinds.
+func convertContentBlock(block wittypes.ContentBlock) (*einoschema.ContentBlock, int64, error) {
+	if text := block.Text(); text != nil {
+		return einoschema.NewContentBlock(&einoschema.UserInputText{Text: *text}), int64(len(*text)), nil
+	}
+	if ref := block.MediaReference(); ref != nil {
+		return convertMediaReference(*ref), int64(len(ref.URI) + len(ref.MIMEType)), nil
+	}
+	if call := block.FunctionCall(); call != nil {
+		converted := einoschema.NewContentBlock(&einoschema.FunctionToolCall{
+			CallID:    call.CallID,
+			Name:      call.Name,
+			Arguments: call.ArgumentsJSON,
+		})
+		return converted, int64(len(call.CallID) + len(call.Name) + len(call.ArgumentsJSON)), nil
+	}
+	if result := block.FunctionResultText(); result != nil {
+		converted := einoschema.NewContentBlock(&einoschema.FunctionToolResult{
+			CallID: result.CallID,
+			Content: []*einoschema.FunctionToolResultContentBlock{{
+				Type: einoschema.FunctionToolResultContentBlockTypeText,
+				Text: &einoschema.UserInputText{Text: result.Text},
+			}},
+		})
+		return converted, int64(len(result.CallID) + len(result.Text)), nil
+	}
+	return nil, 0, errors.New("component returned an invalid content block case")
+}
+
+// convertMediaReference classifies a bounded media-reference by its
+// required MIME type into the matching typed user-input content block; an
+// unrecognized top-level MIME type is treated as an opaque file reference
+// rather than rejected, since media-reference intentionally carries no
+// separate kind discriminant of its own.
+func convertMediaReference(ref wittypes.MediaReference) *einoschema.ContentBlock {
+	switch {
+	case strings.HasPrefix(ref.MIMEType, "image/"):
+		return einoschema.NewContentBlock(&einoschema.UserInputImage{URL: ref.URI, MIMEType: ref.MIMEType})
+	case strings.HasPrefix(ref.MIMEType, "audio/"):
+		return einoschema.NewContentBlock(&einoschema.UserInputAudio{URL: ref.URI, MIMEType: ref.MIMEType})
+	case strings.HasPrefix(ref.MIMEType, "video/"):
+		return einoschema.NewContentBlock(&einoschema.UserInputVideo{URL: ref.URI, MIMEType: ref.MIMEType})
+	default:
+		return einoschema.NewContentBlock(&einoschema.UserInputFile{URL: ref.URI, MIMEType: ref.MIMEType})
+	}
 }
 
 func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedContextSource, error) {

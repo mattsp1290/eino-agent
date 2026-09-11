@@ -28,7 +28,7 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
@@ -508,6 +508,29 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	result, err := middleware.afterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}})
 	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
 		t.Fatalf("middleware result = %#v, %v", result, err)
+	}
+}
+
+// TestCheckedInOldABIContextSourceRejectedCleanly loads a checked-in
+// context-source.wasm built against the superseded eino-agent:extensions
+// @0.1.0 world (flat text-message load-context, before the content-block
+// variant was introduced) against the current @0.2.0 host. The exported
+// function's structural shape no longer matches the world this host
+// compiles against, so wasmtime's own canonical-ABI type check rejects the
+// component at compile/instantiation time -- surfaced here as an ordinary
+// *Error, never a panic or process crash -- before any call is attempted.
+func TestCheckedInOldABIContextSourceRejectedCleanly(t *testing.T) {
+	requireCGO(t)
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+	_, err := openContextSource(context.Background(), checkedInFixtureConfig(t, root, "context-source-abi-v0.1-incompatible.wasm"), loader.engineFactory())
+	if err == nil {
+		t.Fatal("old-ABI (v0.1.0) context-source fixture was accepted instead of rejected")
+	}
+	var extensionErr *Error
+	if !errors.As(err, &extensionErr) {
+		t.Fatalf("old-ABI rejection was not a clean *Error: %v (%T)", err, err)
 	}
 }
 
@@ -1027,9 +1050,15 @@ func (c *fakeComponent) DecidePermissions(ctx context.Context, input wittypes.Pe
 	err = c.invoke(ctx, "permissions-policy.decide", input, &output)
 	return
 }
-func (c *fakeComponent) LoadContext(ctx context.Context, input wittypes.TurnMetadata) (output []wittypes.TextMessage, err error) {
+func (c *fakeComponent) LoadContext(ctx context.Context, input wittypes.TurnMetadata) (output []wittypes.Message, err error) {
 	err = c.invoke(ctx, "context-source.load-context", input, &output)
 	return
+}
+
+// textOnlyMessage builds a wittypes.Message carrying a single text
+// content-block, for tests that only exercise the plain-text projection.
+func textOnlyMessage(role wittypes.TextRole, text string) wittypes.Message {
+	return wittypes.Message{Role: role, Blocks: cm.ToList([]wittypes.ContentBlock{wittypes.ContentBlockText(text)})}
 }
 func (c *fakeComponent) EmitEvent(ctx context.Context, input wittypes.BoundedEvent) error {
 	return c.invoke(ctx, "event-sink.emit", input, nil)

@@ -1,4 +1,4 @@
-package eino-agent:extensions@0.1.0;
+package eino-agent:extensions@0.2.0;
 
 interface types {
   record structured-error {
@@ -66,9 +66,55 @@ interface types {
     user,
   }
 
-  record text-message {
-    role: text-role,
+  /// A bounded reference to non-text content (image, audio, video, file):
+  /// never a raw payload, always a URI a trusted host resolves. uri and
+  /// mime-type are both required.
+  record media-reference {
+    uri: string,
+    mime-type: string,
+  }
+
+  /// A function/tool call the model issued, projected for observation only
+  /// -- carries no execution authority; arguments-json is a normalized JSON
+  /// document.
+  record function-call-block {
+    call-id: string,
+    name: string,
+    arguments-json: string,
+  }
+
+  /// A settled function/tool result's text projection. Never the raw
+  /// durable settlement: a bounded, model-visible text view only.
+  record function-result-text-block {
+    call-id: string,
     text: string,
+  }
+
+  /// content-block is the versioned successor to the removed text-message
+  /// record: a message is now an ordered list of typed blocks instead of a
+  /// single flat string, so context-source (and any future WASM context/
+  /// model/tool middleware observing message content) can see and produce
+  /// media references and call/result projections without flattening them
+  /// to text. Adding a new case is a breaking change to this variant and
+  /// requires a new world version (see the eino-agent:extensions package
+  /// version below); a host on a newer version refuses a guest built
+  /// against an older one at component-instantiation time (the Component
+  /// Model's own canonical-ABI type check on the exported function
+  /// signature already enforces this structurally -- a size/shape
+  /// mismatch on this variant's cases fails linking, not a crash), never
+  /// silently misinterpreting an unknown case's payload.
+  variant content-block {
+    text(string),
+    media-reference(media-reference),
+    function-call(function-call-block),
+    function-result-text(function-result-text-block),
+  }
+
+  /// message replaces text-message: role plus an ordered list of typed
+  /// content-block values instead of one flat text field.
+  record message {
+    role: text-role,
+    blocks: list<content-block>,
   }
 
   record bounded-event {
@@ -109,9 +155,9 @@ interface permissions-policy-api {
 }
 
 interface context-source-api {
-  use types.{structured-error, text-message, turn-metadata};
+  use types.{structured-error, message, turn-metadata};
 
-  load-context: func(turn: turn-metadata) -> result<list<text-message>, structured-error>;
+  load-context: func(turn: turn-metadata) -> result<list<message>, structured-error>;
 }
 
 interface event-sink-api {

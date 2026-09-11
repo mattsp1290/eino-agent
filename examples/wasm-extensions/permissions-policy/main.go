@@ -6,8 +6,8 @@ import (
 	"go.bytecodealliance.org/cm"
 
 	_ "github.com/mattsp1290/eino-agent/examples/wasm-extensions/internal/guestabi"
-	policyapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/permissions-policy-api"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	policyapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/permissions-policy-api"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 	hostlog "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/host/v0.1.0/log"
 )
 

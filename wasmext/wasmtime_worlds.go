@@ -13,7 +13,7 @@ import (
 
 	"go.bytecodealliance.org/cm"
 
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 func (c *wasmtimeComponent) ToolMetadata(ctx context.Context) (wittypes.ToolMetadata, error) {
@@ -74,15 +74,15 @@ func (c *wasmtimeComponent) DecidePermissions(ctx context.Context, request witty
 	return output, err
 }
 
-func (c *wasmtimeComponent) LoadContext(ctx context.Context, turn wittypes.TurnMetadata) ([]wittypes.TextMessage, error) {
+func (c *wasmtimeComponent) LoadContext(ctx context.Context, turn wittypes.TurnMetadata) ([]wittypes.Message, error) {
 	arguments := []C.wasmtime_component_val_t{componentTurnMetadata(turn)}
-	var output []wittypes.TextMessage
+	var output []wittypes.Message
 	err := c.invokeABI(ctx, "load-context", arguments, func(result *C.wasmtime_component_val_t) error {
 		payload, err := componentResult(result)
 		if err != nil {
 			return err
 		}
-		return decodeTextMessages(payload, &output, c.limits.MaxOutputBytes)
+		return decodeMessages(payload, &output, c.limits.MaxOutputBytes)
 	})
 	return output, err
 }
@@ -186,7 +186,15 @@ func componentBoundedEvent(event wittypes.BoundedEvent) C.wasmtime_component_val
 	return record
 }
 
-func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.TextMessage, limit int64) error {
+// decodeMessages decodes a component-model `list<message>` result, where
+// each message is a `role` enum plus an ordered `blocks: list<content-block>`
+// (see decodeContentBlock). It replaces the old flat decodeTextMessages: a
+// guest built against the prior text-message shape produces a structurally
+// different exported-function signature, so wasmtime's own canonical-ABI
+// type check rejects it at component-instantiation time, before any call
+// (and therefore before this decoder ever runs) -- see the content-block
+// doc comment in wit/eino-agent-extensions.wit.
+func decodeMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Message, limit int64) error {
 	if value == nil || int(C.wasmext_val_kind(value)) != componentKindList {
 		return errors.New("component returned an unexpected message list")
 	}
@@ -194,7 +202,7 @@ func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Te
 	if count > 4096 {
 		return errModuleTooLarge
 	}
-	messages := make([]wittypes.TextMessage, 0, count)
+	messages := make([]wittypes.Message, 0, count)
 	var total int64
 	for index := 0; index < count; index++ {
 		item := C.wasmext_list_value(value, C.size_t(index))
@@ -202,7 +210,7 @@ func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Te
 		if err != nil {
 			return err
 		}
-		textValue, err := componentRecordField(item, 1, 2)
+		blocksValue, err := componentRecordField(item, 1, 2)
 		if err != nil {
 			return err
 		}
@@ -210,12 +218,7 @@ func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Te
 		if err != nil {
 			return err
 		}
-		text, err := componentString(textValue, limit-total)
-		if err != nil {
-			return err
-		}
-		total += int64(len(text))
-		message := wittypes.TextMessage{Text: text}
+		message := wittypes.Message{}
 		switch role {
 		case "system":
 			message.Role = wittypes.TextRoleSystem
@@ -224,10 +227,133 @@ func decodeTextMessages(value *C.wasmtime_component_val_t, output *[]wittypes.Te
 		default:
 			return errors.New("component returned an invalid text role")
 		}
+		blocks, consumed, err := decodeContentBlocks(blocksValue, limit-total)
+		if err != nil {
+			return err
+		}
+		total += consumed
+		message.Blocks = cm.ToList(blocks)
 		messages = append(messages, message)
 	}
 	*output = messages
 	return nil
+}
+
+// decodeContentBlocks decodes a `list<content-block>` value, bounding both
+// the number of blocks and the cumulative byte size of their string/JSON
+// payloads against limit (the same MaxOutputBytes budget applied elsewhere
+// in this file), and returns the bytes it consumed so a caller decoding
+// multiple messages can carry the remaining budget forward.
+func decodeContentBlocks(value *C.wasmtime_component_val_t, limit int64) ([]wittypes.ContentBlock, int64, error) {
+	if value == nil || int(C.wasmext_val_kind(value)) != componentKindList {
+		return nil, 0, errors.New("component returned an unexpected content block list")
+	}
+	count := int(C.wasmext_list_size(value))
+	if count > 4096 {
+		return nil, 0, errModuleTooLarge
+	}
+	blocks := make([]wittypes.ContentBlock, 0, count)
+	var total int64
+	for index := 0; index < count; index++ {
+		item := C.wasmext_list_value(value, C.size_t(index))
+		block, consumed, err := decodeContentBlock(item, limit-total)
+		if err != nil {
+			return nil, 0, err
+		}
+		total += consumed
+		blocks = append(blocks, block)
+	}
+	return blocks, total, nil
+}
+
+// decodeContentBlock decodes one `content-block` variant case, modeled on
+// the proven decodeReplacement pattern: the case name is read from the
+// variant discriminant, and the payload is decoded according to that case's
+// known shape. An unrecognized case name (which the canonical-ABI check
+// above already prevents for a same-version guest) fails closed rather than
+// guessing at an unknown payload's shape.
+func decodeContentBlock(value *C.wasmtime_component_val_t, limit int64) (wittypes.ContentBlock, int64, error) {
+	var zero wittypes.ContentBlock
+	if value == nil || int(C.wasmext_val_kind(value)) != componentKindVariant {
+		return zero, 0, errors.New("component returned an unexpected content block")
+	}
+	name := C.GoStringN(C.wasmext_variant_data(value), C.int(C.wasmext_variant_size(value)))
+	payload := C.wasmext_variant_value(value)
+	switch name {
+	case "text":
+		text, err := componentString(payload, limit)
+		if err != nil {
+			return zero, 0, err
+		}
+		return wittypes.ContentBlockText(text), int64(len(text)), nil
+	case "media-reference":
+		uriValue, err := componentRecordField(payload, 0, 2)
+		if err != nil {
+			return zero, 0, err
+		}
+		mimeValue, err := componentRecordField(payload, 1, 2)
+		if err != nil {
+			return zero, 0, err
+		}
+		uri, err := componentString(uriValue, limit)
+		if err != nil {
+			return zero, 0, err
+		}
+		mimeType, err := componentString(mimeValue, limit-int64(len(uri)))
+		if err != nil {
+			return zero, 0, err
+		}
+		ref := wittypes.MediaReference{URI: uri, MIMEType: mimeType}
+		return wittypes.ContentBlockMediaReference(ref), int64(len(uri) + len(mimeType)), nil
+	case "function-call":
+		callIDValue, err := componentRecordField(payload, 0, 3)
+		if err != nil {
+			return zero, 0, err
+		}
+		nameValue, err := componentRecordField(payload, 1, 3)
+		if err != nil {
+			return zero, 0, err
+		}
+		argsValue, err := componentRecordField(payload, 2, 3)
+		if err != nil {
+			return zero, 0, err
+		}
+		callID, err := componentString(callIDValue, limit)
+		if err != nil {
+			return zero, 0, err
+		}
+		fnName, err := componentString(nameValue, limit-int64(len(callID)))
+		if err != nil {
+			return zero, 0, err
+		}
+		argumentsJSON, err := componentString(argsValue, limit-int64(len(callID)+len(fnName)))
+		if err != nil {
+			return zero, 0, err
+		}
+		call := wittypes.FunctionCallBlock{CallID: callID, Name: fnName, ArgumentsJSON: argumentsJSON}
+		return wittypes.ContentBlockFunctionCall(call), int64(len(callID) + len(fnName) + len(argumentsJSON)), nil
+	case "function-result-text":
+		callIDValue, err := componentRecordField(payload, 0, 2)
+		if err != nil {
+			return zero, 0, err
+		}
+		textValue, err := componentRecordField(payload, 1, 2)
+		if err != nil {
+			return zero, 0, err
+		}
+		callID, err := componentString(callIDValue, limit)
+		if err != nil {
+			return zero, 0, err
+		}
+		text, err := componentString(textValue, limit-int64(len(callID)))
+		if err != nil {
+			return zero, 0, err
+		}
+		result := wittypes.FunctionResultTextBlock{CallID: callID, Text: text}
+		return wittypes.ContentBlockFunctionResultText(result), int64(len(callID) + len(text)), nil
+	default:
+		return zero, 0, errors.New("component returned an invalid content block case")
+	}
 }
 
 func decodeReplacement(value *C.wasmtime_component_val_t, output *wittypes.Replacement, limit int64) error {

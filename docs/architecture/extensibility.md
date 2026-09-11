@@ -36,7 +36,7 @@ plan, and clock.
 | Models/providers | `model.Resolver`, normally `model.AdapterResolver` | none | Native only by design |
 | Durable IDs | `runtime.IDGenerator` | none | Native only by design |
 
-The current pre-release WIT package is `eino-agent:extensions@0.1.0`; see
+The current pre-release WIT package is `eino-agent:extensions@0.2.0`; see
 `wit/README.md` for regeneration rules. Generated bindings are committed under
 `wasmext/gen` and reproduced with `make wit`.
 

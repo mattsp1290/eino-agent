@@ -18,7 +18,7 @@ import (
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
@@ -31,9 +31,9 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 		if turn.RunID != "run-1" || turn.MessageCount != 1 || strings.Contains(turn.AgentName, "SECRET") {
 			t.Fatalf("bounded turn = %#v", turn)
 		}
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{
-			{Role: wittypes.TextRoleSystem, Text: "policy"},
-			{Role: wittypes.TextRoleUser, Text: "context"},
+		*output.(*[]wittypes.Message) = []wittypes.Message{
+			textOnlyMessage(wittypes.TextRoleSystem, "policy"),
+			textOnlyMessage(wittypes.TextRoleUser, "context"),
 		}
 		return nil
 	}
@@ -53,9 +53,9 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 
 func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{
-			{Role: wittypes.TextRoleUser, Text: "wasm-user"},
-			{Role: wittypes.TextRoleSystem, Text: "wasm-system"},
+		*output.(*[]wittypes.Message) = []wittypes.Message{
+			textOnlyMessage(wittypes.TextRoleUser, "wasm-user"),
+			textOnlyMessage(wittypes.TextRoleSystem, "wasm-system"),
 		}
 		return nil
 	}}
@@ -321,7 +321,7 @@ func TestRegisteredContextSourcesRetainComponentOwnership(t *testing.T) {
 	for _, instanceID := range []string{"context-one", "context-two"} {
 		instanceID := instanceID
 		component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
-			*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleUser, Text: instanceID}}
+			*output.(*[]wittypes.Message) = []wittypes.Message{textOnlyMessage(wittypes.TextRoleUser, instanceID)}
 			return nil
 		}}
 		module, err := loadModule(context.Background(), fixtureConfig(t, []byte(instanceID)), contextSourceContract, fakeFactory(component))
@@ -388,7 +388,7 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	component := &fakeComponent{call: func(_ context.Context, operation string, _ any, output any) error {
 		switch operation {
 		case "context-source.load-context":
-			*output.(*[]wittypes.TextMessage) = nil
+			*output.(*[]wittypes.Message) = nil
 		case "tool-middleware.before-tool-call", "tool-middleware.after-tool-call":
 			*output.(*wittypes.Replacement) = wittypes.ReplacementUnchanged()
 		}
@@ -553,7 +553,7 @@ func TestRegisteredEventObserverReportsModuleFailure(t *testing.T) {
 func contextSourceFakeComponent() *fakeComponent {
 	return &fakeComponent{call: func(_ context.Context, operation string, _ any, output any) error {
 		if operation == "context-source.load-context" {
-			*output.(*[]wittypes.TextMessage) = nil
+			*output.(*[]wittypes.Message) = nil
 		}
 		return nil
 	}}
@@ -563,7 +563,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	var contextTurn wittypes.TurnMetadata
 	contextComponent := &fakeComponent{call: func(_ context.Context, _ string, input any, output any) error {
 		contextTurn = input.(wittypes.TurnMetadata)
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleUser, Text: "from-wasm"}}
+		*output.(*[]wittypes.Message) = []wittypes.Message{textOnlyMessage(wittypes.TextRoleUser, "from-wasm")}
 		return nil
 	}}
 	contextModule, err := loadModule(context.Background(), fixtureConfig(t, []byte("point-context")), contextSourceContract, fakeFactory(contextComponent))

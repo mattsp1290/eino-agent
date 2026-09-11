@@ -1,7 +1,7 @@
 # Wasm extension guests
 
 These examples implement all six generated Go exports for
-`eino-agent:extensions@0.1.0`. Regenerate the bindings first with `make wit`,
+`eino-agent:extensions@0.2.0`. Regenerate the bindings first with `make wit`,
 then build the checked-in components with the pinned targets:
 
 ```sh
