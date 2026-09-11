@@ -136,12 +136,13 @@ type SkillConfig struct {
 // Every activation (the skill tool's own Backend.Get call, at the moment a
 // skill is actually loaded for use -- see activationRecordingSkillBackend)
 // is durably recorded as a SkillActivatedEventKind event: the skill's name
-// and a content digest of what was actually loaded. This is a durable
-// audit trail, not yet a resume-time enforcement: nothing today re-checks
-// on resume that Get(name) still hashes to the recorded digest, so a
-// SKILL.md edited between pause and resume is not detected and rejected --
-// see docs/architecture/eino-feature-support.md's W6 section for this open
-// limitation.
+// and a content digest of what was actually loaded. ResumeRun enforces this
+// durable record against the CURRENT workspace state before ever claiming
+// the run's fence (verifySkillActivationsUnchanged, scoped to the specific
+// run being resumed -- see that function's doc comment): a SKILL.md edited
+// between pause and resume is detected and rejected with
+// ErrSkillChangedSinceActivation, leaving the run exactly as paused as it
+// was found.
 func NewSkillHandlerFactory(cfg SkillConfig) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		if build.SkillBackend == nil {
@@ -203,12 +204,14 @@ func skillContentDigest(loaded skill.Skill) string {
 
 // ErrSkillChangedSinceActivation reports that ResumeRun's skill
 // verification (verifySkillActivationsUnchanged) found a durably recorded
-// SkillActivatedEventKind activation whose skill is now missing, or whose
-// current content digest no longer matches what was recorded at
-// activation time -- see NewSkillHandlerFactory's doc comment on this
-// closing that recipe's previously-open "not yet a resume-time
-// enforcement" limitation.
-var ErrSkillChangedSinceActivation = errors.New("adk skill content changed since activation")
+// SkillActivatedEventKind activation -- scoped to the specific run being
+// resumed -- whose skill is now missing, or whose current content digest no
+// longer matches what was recorded at activation time. The resumed run is
+// left exactly as paused as it was found (its fence was never claimed): the
+// only escape for a run stuck behind this error is StopPolicy{Abandon:
+// true} (see runtime.StopPolicy's doc comment), which settles the durably
+// paused run without resuming it and frees the session for a new run.
+var ErrSkillChangedSinceActivation = errors.New("adk skill content changed since activation; resume this run with StopPolicy{Abandon: true} to abandon it instead")
 
 // skillActivationRecord is one durably recorded SkillActivatedEventKind
 // payload, decoded from EventRecord.Payload (see recordSkillActivation).
@@ -219,12 +222,14 @@ type skillActivationRecord struct {
 
 // latestSkillActivations pages sessionID's full durable event history (via
 // store.ListEvents, unbounded/unfiltered by Kind at the store layer) and
-// returns the most recently recorded activation per skill name --
+// returns the most recently recorded activation per skill name, SCOPED TO
+// runID (round-two W6 review item 12): a skill activated by a DIFFERENT,
+// unrelated run on the same session must never block resuming this one --
 // SkillActivatedEventKind events are appended in the same order
 // store.ListEvents replays them (ascending by CreatedAt, ID -- see
 // store/internal/sqlstore/events.go's ListEvents), so folding forward and
-// overwriting by name always keeps the latest.
-func latestSkillActivations(ctx context.Context, store session.Store, sessionID session.ID) (map[string]skillActivationRecord, error) {
+// overwriting by name always keeps the latest activation THIS run recorded.
+func latestSkillActivations(ctx context.Context, store session.Store, sessionID session.ID, runID session.RunID) (map[string]skillActivationRecord, error) {
 	activations := make(map[string]skillActivationRecord)
 	cursor := session.EventCursor{Limit: 200}
 	for {
@@ -233,7 +238,7 @@ func latestSkillActivations(ctx context.Context, store session.Store, sessionID 
 			return nil, err
 		}
 		for _, event := range batch.Events {
-			if event.Kind != session.SkillActivatedEventKind {
+			if event.Kind != session.SkillActivatedEventKind || event.RunID != runID {
 				continue
 			}
 			var record skillActivationRecord
@@ -250,28 +255,31 @@ func latestSkillActivations(ctx context.Context, store session.Store, sessionID 
 }
 
 // verifySkillActivationsUnchanged re-reads, from the CURRENT workspace
-// state, every skill this session has ever durably recorded activating
-// (SkillActivatedEventKind), and fails closed with
-// ErrSkillChangedSinceActivation the moment any of them is missing or its
-// content digest no longer matches what was recorded at activation time.
-// It is read-only (a fresh workspaceSkillBackend.Get per recorded skill
-// name) and never mutates durable state, so ResumeRun's caller (which
-// calls this before ever claiming the run's fence) can reject a resume
-// this finds unsafe while leaving the run exactly as paused as it found
-// it -- a changed or missing skill therefore fails resume predictably,
-// not silently, and not by letting the model see stale or divergent skill
-// content it was never actually re-shown.
+// state, every skill runID (the run being resumed -- round-two W6 review
+// item 12) durably recorded activating (SkillActivatedEventKind), and fails
+// closed with ErrSkillChangedSinceActivation the moment any of them is
+// missing or its content digest no longer matches what was recorded at
+// activation time. It is read-only (a fresh workspaceSkillBackend.Get per
+// recorded skill name) and never mutates durable state, so ResumeRun's
+// caller (which calls this before ever claiming the run's fence) can reject
+// a resume this finds unsafe while leaving the run exactly as paused as it
+// found it -- a changed or missing skill therefore fails resume
+// predictably, not silently, and not by letting the model see stale or
+// divergent skill content it was never actually re-shown. An unrelated
+// paused run on the SAME session, whose own activations are unaffected, is
+// never blocked by this check (it is scoped to runID, not the session as a
+// whole).
 //
 // workspaceRoot == "" (no workspace configured for this run) skips
 // verification outright: the skill recipe itself requires a non-nil
 // SkillBackend to construct (see NewSkillHandlerFactory), which in turn
 // requires a non-empty WorkspaceRoot, so no session ever recorded a
 // SkillActivatedEventKind event without one.
-func verifySkillActivationsUnchanged(ctx context.Context, store session.Store, sessionID session.ID, workspaceRoot string) error {
+func verifySkillActivationsUnchanged(ctx context.Context, store session.Store, sessionID session.ID, runID session.RunID, workspaceRoot string) error {
 	if workspaceRoot == "" {
 		return nil
 	}
-	activations, err := latestSkillActivations(ctx, store, sessionID)
+	activations, err := latestSkillActivations(ctx, store, sessionID, runID)
 	if err != nil {
 		return fmt.Errorf("resolving recorded skill activations: %w", err)
 	}

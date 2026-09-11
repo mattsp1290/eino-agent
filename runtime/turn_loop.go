@@ -1892,7 +1892,7 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	// ErrSkillChangedSinceActivation error, before the fence below is ever
 	// claimed -- the run is left exactly as paused as GetRun found it,
 	// never resumed under silently divergent skill content.
-	if err := verifySkillActivationsUnchanged(ctx, o.store, run.SessionID, durable.WorkspaceRoot); err != nil {
+	if err := verifySkillActivationsUnchanged(ctx, o.store, run.SessionID, run.ID, durable.WorkspaceRoot); err != nil {
 		return nil, err
 	}
 

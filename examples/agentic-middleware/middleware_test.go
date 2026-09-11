@@ -1847,3 +1847,156 @@ func TestResumeAfterChangedSkillContentIsRefused(t *testing.T) {
 		t.Fatalf("run status after a refused resume = %q, want still paused (run left untouched)", run.Status)
 	}
 }
+
+// TestSkillVerificationIsScopedToTheResumedRunNotTheWholeSession is
+// round-two W6 review item 12's core proof: skill verification is scoped to
+// the specific run being resumed, not the whole session. Run A activates a
+// skill, pauses, and its SKILL.md is edited -- refusing Run A's own resume.
+// Run A is then abandoned (StopPolicy{Abandon: true}, the documented escape
+// named in ErrSkillChangedSinceActivation's own error text), freeing the
+// session for a genuinely UNRELATED Run B, which never activates any skill
+// at all and also pauses (on an unrelated blocking tool call). Run B's
+// resume must succeed -- a session-wide (unscoped) check would still find
+// Run A's now-permanently-stale "greeter" activation sitting in the
+// session's shared event history and wrongly refuse Run B even though Run
+// B never used that skill; a properly run-scoped check finds nothing for
+// Run B and never even needs to touch the workspace. Both runs share one
+// orchestrator/registry/streamer (sequential, same session), distinguished
+// by a shared phase flag.
+func TestSkillVerificationIsScopedToTheResumedRunNotTheWholeSession(t *testing.T) {
+	root := t.TempDir()
+	skillDir := filepath.Join(root, "greeter")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	originalSkillContent := "---\nname: greeter\ndescription: says hi\n---\nAlways greet the user by name.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(originalSkillContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("resume-skill-scoping-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{Disable: disableAllExcept(runtime.HandlerKindSkill)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+
+	startedA := make(chan struct{})
+	releaseA := make(chan struct{})
+	var toolCallsA int
+	startedB := make(chan struct{})
+	releaseB := make(chan struct{})
+	var toolCallsB int
+	blockerMount, err := registry.Mount(context.Background(), testNativeComponent("blocker-scoping", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			if err := registrar.Tool(composition.ToolRegistration{ID: "blocker", Scope: testScope(sessionID), Definition: blockingToolDefinition(startedA, releaseA, &toolCallsA)}); err != nil {
+				return err
+			}
+			blockerB := blockingToolDefinition(startedB, releaseB, &toolCallsB)
+			blockerB.Name = "blocker2"
+			return registrar.Tool(composition.ToolRegistration{ID: "blocker2", Scope: testScope(sessionID), Definition: blockerB})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = blockerMount.Close(context.Background()) }()
+
+	// runAStep/runBStep are independent: each run's own dispatch sequence
+	// (skill activation, then a blocking tool call) restarts at 1.
+	var runAStep, runBStep int
+	var inRunB bool
+	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if inRunB {
+			runBStep++
+			switch runBStep {
+			case 1:
+				// Run B deliberately NEVER activates any skill at all --
+				// the point of this scenario: a session-wide (unscoped)
+				// check would still find Run A's now-stale "greeter"
+				// activation in the session's shared event history and
+				// wrongly block Run B's resume even though Run B never
+				// used that skill.
+				return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-block-b", "blocker2", `{}`)}, nil
+			default:
+				return []*einoschema.AgenticMessage{agenticAssistantText("run B resumed and done")}, nil
+			}
+		}
+		runAStep++
+		switch runAStep {
+		case 1:
+			args, _ := json.Marshal(map[string]string{"skill": "greeter"})
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-skill-a", "skill", string(args))}, nil
+		case 2:
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-block-a", "blocker", `{}`)}, nil
+		default:
+			return []*einoschema.AgenticMessage{agenticAssistantText("run A resumed and done")}, nil
+		}
+	}))
+
+	// Run A: activates the skill under its original content, pauses.
+	handleA, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-startedA
+	if err := orch.Stop(context.Background(), handleA.RunID(), runtime.StopPolicy{Immediate: true, Cause: "resume-skill-scoping-a"}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseA)
+	resultA := awaitDone(t, handleA, 10*time.Second)
+	if resultA.Status != session.RunPaused {
+		t.Fatalf("Run A result = %+v, want paused", resultA)
+	}
+
+	changedSkillContent := "---\nname: greeter\ndescription: says hi differently now\n---\nGreet the user in French instead.\n"
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte(changedSkillContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orch.ResumeRun(context.Background(), resultA.RunID, runtime.ResumeRequest{}); !errors.Is(err, runtime.ErrSkillChangedSinceActivation) {
+		t.Fatalf("Run A resume error = %v, want errors.Is(err, runtime.ErrSkillChangedSinceActivation)", err)
+	}
+	// The documented escape: abandon Run A, freeing the session.
+	if err := orch.Stop(context.Background(), resultA.RunID, runtime.StopPolicy{Abandon: true, Cause: "stuck behind a changed skill"}); err != nil {
+		t.Fatalf("Stop(Abandon) on Run A error = %v", err)
+	}
+	abandoned, err := store.GetRun(context.Background(), resultA.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if abandoned.Status != session.RunInterrupted {
+		t.Fatalf("Run A status after Stop(Abandon) = %q, want interrupted (terminal)", abandoned.Status)
+	}
+
+	// Run B: a genuinely unrelated run on the SAME session. It activates
+	// the same skill AFTER the edit above, so its own recorded digest
+	// matches current disk content exactly, then pauses on its own
+	// blocking tool call.
+	inRunB = true
+	handleB, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi again"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-startedB
+	if err := orch.Stop(context.Background(), handleB.RunID(), runtime.StopPolicy{Immediate: true, Cause: "resume-skill-scoping-b"}); err != nil {
+		t.Fatal(err)
+	}
+	close(releaseB)
+	resultB := awaitDone(t, handleB, 10*time.Second)
+	if resultB.Status != session.RunPaused {
+		t.Fatalf("Run B result = %+v, want paused", resultB)
+	}
+
+	resumedB, err := orch.ResumeRun(context.Background(), resultB.RunID, runtime.ResumeRequest{})
+	if err != nil {
+		t.Fatalf("Run B resume was refused despite its OWN activation matching current disk content: %v", err)
+	}
+	finalB := awaitDone(t, resumedB, 10*time.Second)
+	if finalB.Status != session.RunCompleted {
+		t.Fatalf("Run B resumed result = %+v, want completed", finalB)
+	}
+}
