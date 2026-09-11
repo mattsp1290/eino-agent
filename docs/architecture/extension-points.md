@@ -253,6 +253,22 @@ end through a real turn (`TestAgentsMDHandlerInjectsContentIntoModelRequest`,
 `TestFilesystemHandlerToolExecutesThroughDurableWrapper`,
 `runtime/adk_middleware_e2e_test.go`).
 
+`examples/agentic-middleware/` proves this same mechanism a second time
+from entirely outside the `runtime` package, through only
+`composition.Registrar.Handler`/`runtime.StreamingOrchestrator`: a `Mount`
+function wires all eight upstream recipes this package ships
+(`runtime.HandlerKindAgentsMD`/`Skill`/`Filesystem`/`PlanTask`/
+`PatchToolCalls`/`Reduction`/`Summarization`/`ToolSearch`), and its test
+suite drives real turns exercising each recipe's positive and failure
+paths, ordering (two authorized content rewrites in one turn), an
+immutable-input proof via a custom `HandlerFactory` that tries to rewrite a
+settled result without authorization, and interrupt/resume including a
+handler `Config` change being refused on resume -- see that package's own
+doc comment and the W6 section of `docs/architecture/eino-feature-support.md`
+for the two scope limits this pass left open (a dangling-call fixture for
+patchtoolcalls, and calling -- as opposed to finding -- a tool discovered
+through toolsearch's own dynamic resolution path).
+
 ## Request ledger and privacy
 
 Every provider attempt is persisted through the current run's

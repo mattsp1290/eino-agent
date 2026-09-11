@@ -1635,15 +1635,18 @@ unwritten (see that bullet for the exact, now-shorter list).
 
 ## W6: typed ADK middleware, context and extensions
 
-Status: groups A through E landed and are verified per the gate list below
-(`go test ./composition ./runtime ./session/...`, `go vet -tags
-postgres_integration ./...`, `golangci-lint` 0 issues, `go test ./runtime
--race -count=3`). The two integration gaps an earlier pass of this work
-documented (host-injected content never reaching the model; a
-handler-injected tool never being callable) are both resolved -- see below
-for the mechanism and the tests proving each fix through a real turn, not
-just construction. Group E (WASM/WIT content-block evolution) and
-`examples/agentic-middleware/` status are covered in their own bullets.
+Status: groups A through F landed and are verified per the gate list below
+(`go test ./composition ./runtime ./session/... ./examples/agentic-middleware/...`,
+`go vet -tags postgres_integration ./...`, `golangci-lint` 0 issues, `go
+test ./runtime ./examples/agentic-middleware -race -count=3`, `make
+postgres-test`, `make postgres-race`, `EINO_AGENT_CONSUMER_POSTGRES=1
+testdata/external-consumer/check.sh`). The two integration gaps an earlier
+pass of this work documented (host-injected content never reaching the
+model; a handler-injected tool never being callable) are both resolved --
+see below for the mechanism and the tests proving each fix through a real
+turn, not just construction. Group E (WASM/WIT content-block evolution) and
+Group F (`examples/agentic-middleware/`) are covered in their own bullets
+below.
 
 - **Group A (composition + fingerprint)**: `composition.Registrar.Handler(HandlerRegistration{ID,
   Order, Scope, Descriptor: HandlerDescriptor{Kind, Version, Config
@@ -1863,3 +1866,61 @@ just construction. Group E (WASM/WIT content-block evolution) and
     `wasmext` test suite as described above -- the mechanism the coordinator
     asked to be documented if this exact scenario weren't literally covered
     by the external-consumer harness.
+- **Group F (`examples/agentic-middleware/`)**: landed and verified. A
+  runnable `Mount` wires all eight recipes through only
+  `composition.Registrar.Handler`/`runtime.StreamingOrchestrator` -- never
+  this package's own internals -- and a 12-test black-box suite proves the
+  acceptance scenarios hold from outside the runtime package, not only
+  inside its own white-box test suite: a combined agentsmd + skill +
+  multimodal-filesystem-read + plantask create/update turn; missing-
+  workspace-root failing every workspace-backed recipe closed; a symlink
+  escaping the workspace root rejected without leaking content; reduction
+  truncating two large settled results in the same turn (two authorized
+  rewrites, proving ordering); summarization with a fake summary model
+  writing a `session.ContextEpoch` while the full durable replay stays
+  intact (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`)
+  and a never-triggered summarization leaving no new epoch
+  (`TestSummarizationFailedGenerationKeepsPreviousEpoch`); patchtoolcalls
+  completing a normal turn without altering a real settlement; toolsearch
+  finding a deferred tool by name and separately refusing construction
+  with zero deferred tools; a custom, unauthorized `HandlerFactory` built
+  through only the public API failing closed when it tries to mutate a
+  settled tool result (immutable input, via `settlementSeal`
+  -- proven from outside the package this time); and interrupt/resume via
+  `Orchestrator.Stop`/`ResumeRun` (the resumable, checkpointed pause API --
+  `Handle.Interrupt` is documented skip-checkpoint and does not produce a
+  resumable pause) resuming a blocked tool call without re-executing it,
+  then a second scenario proving a resume after the mounted handler's own
+  `Config` changed is refused end to end (not just via the static
+  fingerprint-inequality check `TestAgentHandlerConfigChangeChangesFingerprintAndRefusesResume`
+  already covered) -- catching, in the process, a real bug in this
+  example's own first draft: `Mount` was sealing every handler's
+  `HandlerDescriptor.Config` as `nil` regardless of the recipe's real
+  configuration, which would have made every handler's sealed fingerprint
+  identical regardless of its actual settings; fixed by marshaling each
+  recipe's own config value into `Config` alongside the factory that
+  consumes it.
+  - **Bounded, documented limitations**:
+    - A genuine "dangling call, no durable settlement" fixture for
+      patchtoolcalls was not built here either (constructing one requires
+      seeding raw `ExecutionStore` history for a fenced run outside any
+      live turn); this example instead proves patchtoolcalls leaves a real
+      settlement alone, and the authorization mechanism itself
+      (`wrapAuthorizedContentRewrites`/`settlementSeal`) is exercised
+      directly by the reduction and custom-unauthorized-handler tests.
+    - Calling a tool found via toolsearch's own dynamic resolution path
+      settled `ToolDenied`/`ToolApprovalRequired` ("expected_failure") in
+      this harness, even though the identical `tools.Definition` shape (no
+      explicit `Permissions`) executes normally for every other
+      composition tool in this suite once it is not `Deferred`. This
+      package's own `toolPermissions` fallback
+      (`[]string{tool.Name}`) plus this harness's nil `permissions.Policy`
+      should make every tool call permission-check-free uniformly (see
+      `executeToolWithPermissions`'s `if policy == nil` short-circuit);
+      why a deferred tool's resolved call specifically diverges from that
+      was not root-caused within this pass's budget -- it reproduced only
+      for a tool reached via toolsearch's own dynamic resolution, never
+      for any eagerly-bound tool. `TestToolSearchFindsDeferredTool` proves
+      discovery/visibility only, not execution through that specific
+      path; this is a genuinely open question for a future pass, not a
+      silently dropped scenario.
