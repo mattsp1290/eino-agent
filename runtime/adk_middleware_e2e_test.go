@@ -16,32 +16,15 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-// TestAgentsMDHandlerInjectsContentIntoModelRequest is a documented, tracked
-// gap, not a silently dropped one. Group A/B/C's registration/build/audit
-// wiring is fully exercised and correct up through
-// adkEngine.buildAgent -> RunPlan.AgentHandlers -> upstream
-// agentsmd.NewTyped: the handler builds successfully and its
-// BeforeModelRewriteState hook runs. But agentsmd injects its content as a
-// new *message* into ADK's in-memory state.Messages (schema.UserAgenticMessage,
-// tagged via Extra for its own idempotency check), not into
-// ChatModelAgentContext.Instruction -- and this runtime's adkModel.begin
-// rebuilds every physical dispatch's actual input from a fresh durable
-// store reload (durableProjection), which has no knowledge of that
-// in-memory-only message and discards it. An earlier attempt to bridge this
-// by capturing any state.Messages entry with a non-empty Extra map and
-// splicing it back in broke the entire tool-loop test suite ("clone message
-// N contains non-copyable streaming metadata"): ADK's own ReAct loop tags
-// its *own* internally-reconstructed messages (e.g. an echoed-back prior
-// tool-call message) with framework-internal Extra too (see
-// stripADKInternalExtra's doc comment), so "non-empty Extra" is not a safe
-// signal for "handler-injected" and the naive bridge duplicated ordinary
-// tool-loop messages. A correct fix needs a real handler-injection marker
-// (not "any Extra") and safe positional splicing relative to the
-// providerState index math in durableProjection; that is out of this
-// pass's scope. See instructionHolder's doc comment (adk_middleware.go) for
-// the (currently inert, Instruction-string-only) bridge that remains.
+// TestAgentsMDHandlerInjectsContentIntoModelRequest proves the fix for the
+// gap this test used to document: durableBaselineHandler now makes the
+// fresh durable projection the BASELINE state.Messages every host handler
+// transforms (not a value adkModel discards and re-derives afterward), so
+// agentsmd's own BeforeModelRewriteState -- which inserts a tagged user
+// message ahead of the first user message -- is exactly what the ledger
+// adapter dispatches (adkModel.prepareDispatchInput no longer
+// re-projects). See durableBaselineHandler's doc comment.
 func TestAgentsMDHandlerInjectsContentIntoModelRequest(t *testing.T) {
-	t.Skip("known gap: agentsmd injects a message (not ChatModelAgentContext.Instruction), and durableProjection discards ADK's in-memory message mutations -- see this test's doc comment")
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Always answer in haiku."), 0o644); err != nil {
 		t.Fatal(err)
@@ -157,25 +140,17 @@ func TestSettlementSealRejectsHostRewrittenToolResult(t *testing.T) {
 	}
 }
 
-// TestFilesystemHandlerToolExecutesThroughDurableWrapper is a documented,
-// tracked gap, not a silently dropped one: durableGuard/toolWrappingMiddleware
-// correctly accept a filesystem-middleware-injected tool at the ADK dispatch
-// layer (they are structural, defense-in-depth checks), but the call never
-// reaches that layer in this build. prepareToolCalls/resolveToolCall
-// (adk_tools.go) reject any tool name absent from TurnSnapshot.Tools, which
-// is frozen at turn-admission time -- before the agent (and hence any
-// handler's BeforeAgent tool injection) ever runs -- so a model call to
-// "read_file" currently fails the turn with "tool \"read_file\" unavailable"
-// instead of executing. This affects every recipe that injects its own
-// tools at BeforeAgent time (filesystem's ls/read_file/write_file/edit_file/
-// glob/grep, plantask's task tools, skill's "skill" tool); it does not
-// affect agentsmd (no tools), patchtoolcalls/reduction (no new tools),
-// toolsearch (DynamicTools come from the already-frozen deferred tool set),
-// or summarization (no tools). Closing this gap needs a W-level change to
-// how/when TurnSnapshot.Tools is frozen relative to agent construction,
-// which is out of this pass's scope -- see the W6 report for detail.
+// TestFilesystemHandlerToolExecutesThroughDurableWrapper proves the fix for
+// the gap this test used to document: filesystem's read_file tool is now
+// discovered at plan-compile time (discoverHandlerTools) and sealed into
+// the frozen tool universe, so adkEngine.sealHandlerTools synthesizes a
+// durable runtime.Tool for it before the agent is even built --
+// prepareToolCalls/resolveToolCall resolve it like any other frozen tool,
+// durableGuard's dedup logic drops the middleware's own redundant raw copy,
+// and handlerToolExecutor dispatches the actual call to the live tool
+// instance through the full durable claim/permission/execute/settle
+// pipeline. See adkEngine.sealHandlerTools/handlerToolExecutor.
 func TestFilesystemHandlerToolExecutesThroughDurableWrapper(t *testing.T) {
-	t.Skip("known gap: TurnSnapshot.Tools is frozen before BeforeAgent-injected tools exist, so prepareToolCalls rejects them with \"tool unavailable\" -- see this test's doc comment")
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "hello.txt"), []byte("hello from the workspace"), 0o644); err != nil {
 		t.Fatal(err)

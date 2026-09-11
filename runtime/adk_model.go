@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
 	"sync"
 
 	einomodel "github.com/cloudwego/eino/components/model"
@@ -127,16 +126,6 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 	if err != nil {
 		return nil, err
 	}
-	// Bridge a host handler's BeforeAgent Instruction mutation (e.g.
-	// agentsmd/skill content injection) into the rendered system prompt --
-	// see instructionHolder's doc comment for why this is necessary.
-	if extra := m.engine.instruction.get(); extra != "" {
-		if request.System != "" {
-			request.System += "\n\n" + extra
-		} else {
-			request.System = extra
-		}
-	}
 	request, audited, hash, err := auditModelRequest(request, m.host.modelRequestSafeOptions, m.host.modelRequestMaxBytes)
 	if err != nil {
 		return nil, err
@@ -227,7 +216,7 @@ func (m *adkModel) Generate(ctx context.Context, input []*einoschema.AgenticMess
 			return nil, err
 		}
 	}
-	input, err := m.durableProjection(ctx, input)
+	input, err := m.prepareDispatchInput(input)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +270,7 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 			return nil, err
 		}
 	}
-	input, err := m.durableProjection(ctx, input)
+	input, err := m.prepareDispatchInput(input)
 	if err != nil {
 		return nil, err
 	}
@@ -379,13 +368,12 @@ func stripADKInternalExtra(messages []*einoschema.AgenticMessage) []*einoschema.
 	return out
 }
 
-// errADKProjectionDiverged reports that the set of tool-call IDs ADK's
-// in-memory view presented does not match the durable projection's: ADK's
-// own bookkeeping has desynced from what this run has actually committed,
-// and dispatching against either view uncorroborated by the other would risk
-// sending the model state that was never durably recorded (or silently
-// dropping settled tool results). This must fail the dispatch, not degrade.
-var errADKProjectionDiverged = errors.New("adk in-memory tool-call view diverged from the durable projection")
+// errADKProjectionDiverged reports that a fresh durable reload returned
+// fewer messages than this turn was admitted with -- a genuine corruption
+// signal (history should only ever grow within a turn), not a benign
+// content-management restructuring by a host handler (which happens later,
+// downstream of this check -- see buildDurableBaseline).
+var errADKProjectionDiverged = errors.New("adk durable history diverged from this turn's admitted base")
 
 // errCommittedDispatchFailed wraps an error that occurred strictly after
 // adkModel.commit durably persisted this dispatch's assistant message and
@@ -411,26 +399,33 @@ var errCommittedDispatchFailed = errors.New("model output already durably commit
 // matching this sentinel.
 var errPartialStreamObserved = errors.New("dispatch failed after a partial provider stream was already observed")
 
-// durableProjection replaces ADK's in-memory transcript with the durable
-// projection of this run's committed history: prior turns via
-// history.LoadAgentic/ProjectAgentic (loadProviderHistory) plus this turn's
-// own already-committed assistant/tool messages, which loadProviderHistory
-// picks up for free since adkModel.commit and adkTool/adkToolSearch commit
-// every fact to the store before ever returning to ADK -- excluding the
-// current dispatch's own not-yet-finalized placeholder, which
-// loadProviderHistory cannot see because FinalizeAssistantMessage has not
-// run for it yet. This is what makes a tool_search call's result the actual
-// persisted tool_search_result block, and an enhanced tool result the actual
-// persisted multi-part function_tool_result block, exactly as replay would
-// see them: ADK's own generic string-shaped tool.InvokableTool return value
-// (see adkTool.InvokableRun) never reaches the model at all.
+// buildDurableBaseline computes this cycle's durable-projection baseline:
+// prior turns' committed history plus this turn's own already-committed
+// progress (tool results, prior assistant responses) via loadProviderHistory,
+// spliced after the turn's ephemeral admission-time prefix. It is called by
+// durableBaselineHandler.BeforeModelRewriteState (runtime/adk_middleware.go),
+// the mandatory FIRST (outermost) handler in every turn's agent, once per
+// logical model-call cycle -- i.e. once per ReAct iteration, not once per
+// physical retry/failover attempt: ADK invokes every handler's
+// BeforeModelRewriteState exactly once per handler chain, before the
+// internal failover/retry wrapper (see adk/wrappers.go's
+// typedChatModelAgentWrapper.Generate: handlers run, THEN
+// `wrappedEndpoint(ctx, state.Messages, ...)` -- the failover/retry-wrapped
+// call into this adapter -- runs once with that one fixed state.Messages
+// value, however many physical attempts it takes).
 //
-// Before substituting the projection, the set of tool-call IDs ADK's own
-// input carries (from function_tool_call/function_tool_result blocks) is
-// checked against the durable projection's set; any divergence fails closed
-// (errADKProjectionDiverged) rather than silently trusting either view.
-func (m *adkModel) durableProjection(ctx context.Context, adkInput []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
-	full, fullState, err := loadProviderHistory(ctx, m.host.store, session.Session{ID: m.engine.snapshot.SessionID}, m.engine.historyOptions, m.activeModel())
+// Host handlers (agentsmd, skill, reduction, summarization, patchtoolcalls,
+// ...), registered after this one, then transform the baseline on top;
+// adkModel.prepareDispatchInput dispatches exactly what they leave
+// ADK's state.Messages as, without re-projecting -- see its own doc comment
+// for how per-message private provider state survives that transformation,
+// and settlementSeal (adk_middleware.go) for the two invariants that still
+// apply regardless of what a handler does to the baseline: a settled tool
+// call's result may never diverge from its durable Output unless the
+// rewrite was authorized, and a fabricated function_tool_result for a call
+// with no durable settlement is rejected unless authorized.
+func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.AgenticMessage, error) {
+	full, fullState, err := loadProviderHistory(ctx, e.host.store, session.Session{ID: e.snapshot.SessionID}, e.historyOptions, e.snapshot.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -448,8 +443,8 @@ func (m *adkModel) durableProjection(ctx context.Context, adkInput []*einoschema
 	// match (an entry addressing a dropped placeholder is dropped with it --
 	// a placeholder with no committed content has no captured state either).
 	full, fullState = dropUnfinalizedAssistantPlaceholders(full, fullState)
-	if len(full) < m.engine.baseMessageCount {
-		return nil, fmt.Errorf("%w: durable history shrank below this turn's admitted base (%d < %d)", errADKProjectionDiverged, len(full), m.engine.baseMessageCount)
+	if len(full) < e.baseMessageCount {
+		return nil, fmt.Errorf("%w: durable history shrank below this turn's admitted base (%d < %d)", errADKProjectionDiverged, len(full), e.baseMessageCount)
 	}
 	// The turn's own already-transformed snapshot (prepareSnapshot's output,
 	// computed once at turn-admission time) is the correct prefix: it may
@@ -466,41 +461,35 @@ func (m *adkModel) durableProjection(ctx context.Context, adkInput []*einoschema
 	// persisted tool_search_result block and an enhanced tool result the
 	// actual persisted multi-part function_tool_result block, exactly as
 	// replay would see them.
-	prefix := m.engine.snapshot.Messages
-	tail := full[m.engine.baseMessageCount:]
-	projected := make([]*einoschema.AgenticMessage, 0, len(prefix)+len(tail))
-	projected = append(projected, prefix...)
-	projected = append(projected, tail...)
-	offset := len(prefix) - m.engine.baseMessageCount
-	providerState := append([]model.ProviderMessageState(nil), m.engine.snapshot.providerState...)
+	prefix := e.snapshot.Messages
+	tail := full[e.baseMessageCount:]
+	baseline := make([]*einoschema.AgenticMessage, 0, len(prefix)+len(tail))
+	baseline = append(baseline, prefix...)
+	baseline = append(baseline, tail...)
+	offset := len(prefix) - e.baseMessageCount
+	providerState := append([]model.ProviderMessageState(nil), e.snapshot.providerState...)
 	for _, state := range fullState {
-		if state.MessageIndex < m.engine.baseMessageCount {
+		if state.MessageIndex < e.baseMessageCount {
 			continue
 		}
 		state.MessageIndex += offset
 		providerState = append(providerState, state)
 	}
-	adkIDs := toolCallIDSet(adkInput)
-	durableIDs := toolCallIDSet(projected)
-	// A sibling function_tool_call on the same assistant message as an
-	// MCPToolApprovalRequest is permanently orphaned once the approval pause
-	// fires (adkApprovalBinding.pause): ADK's tools node never dispatches it
-	// (the model node itself errors with a StatefulInterrupt before the
-	// tools node ever runs), and a decided resume's continuation is a fresh
-	// physical dispatch, not a resumption of that same ReAct iteration --
-	// ADK's own resumed input legitimately never mentions it again, even
-	// though this package's commit already durably persisted it (as a
-	// still-pending call) before the pause. Exclude these IDs from the
-	// durable side of the comparison rather than failing every approval
-	// pause with a sibling call closed.
-	for id := range approvalOrphanedToolCallIDs(projected) {
-		delete(durableIDs, id)
-	}
-	if !sameIDSet(adkIDs, durableIDs) {
-		return nil, fmt.Errorf("%w: adk=%v durable=%v", errADKProjectionDiverged, sortedKeys(adkIDs), sortedKeys(durableIDs))
-	}
-	m.engine.snapshot.providerState = providerState
-	return stripADKInternalExtra(projected), nil
+	// e.snapshot.providerState keeps its original accumulate-and-carry-
+	// forward role (matching the pre-W6 durableProjection exactly): each
+	// cycle's freshly-reloaded tail contributions are folded on top of
+	// whatever it already held. e.baselineMessages is this cycle's message
+	// list this same providerState was computed against -- see
+	// adkModel.prepareDispatchInput, which trusts it unchanged when a host
+	// handler leaves ADK's state.Messages the same length (the common
+	// case: content edited in place, or new messages only appended) and
+	// drops it when the length differs (a host handler restructured
+	// history -- summarization compacting is the only one of this
+	// package's own recipes that does), rather than risk misapplying it to
+	// the wrong message.
+	e.snapshot.providerState = providerState
+	e.baselineMessages = baseline
+	return baseline, nil
 }
 
 func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage, providerState []model.ProviderMessageState) ([]*einoschema.AgenticMessage, []model.ProviderMessageState) {
@@ -526,80 +515,28 @@ func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage,
 	return kept, keptState
 }
 
-// toolCallIDSet collects every function_tool_call/function_tool_result
-// CallID appearing anywhere in messages.
-func toolCallIDSet(messages []*einoschema.AgenticMessage) map[string]bool {
-	ids := make(map[string]bool)
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		for _, block := range msg.ContentBlocks {
-			if block == nil {
-				continue
-			}
-			switch block.Type {
-			case einoschema.ContentBlockTypeFunctionToolCall:
-				if block.FunctionToolCall != nil && block.FunctionToolCall.CallID != "" {
-					ids[block.FunctionToolCall.CallID] = true
-				}
-			case einoschema.ContentBlockTypeFunctionToolResult:
-				if block.FunctionToolResult != nil && block.FunctionToolResult.CallID != "" {
-					ids[block.FunctionToolResult.CallID] = true
-				}
-			}
-		}
+// prepareDispatchInput is this adapter's counterpart to
+// adkEngine.buildDurableBaseline: it never re-projects input (the ledger
+// adapter is the mandatory innermost dispatch authority -- it audits and
+// dispatches exactly what the handler chain leaves ADK's state.Messages
+// as), and it trusts m.engine.snapshot.providerState (already computed by
+// buildDurableBaseline against m.engine.baselineMessages, this same cycle)
+// exactly when input is the same length as that baseline -- the common
+// case, whether input is the identical slice/pointers or a defensively
+// cloned copy of it (ADK's own retry/failover wrapper may clone before a
+// physical attempt) with content edited in place or new messages appended
+// after the same prefix. When input is shorter (a host handler
+// restructured/compacted history -- summarization is the only one of this
+// package's own recipes that does), the captured provider state can no
+// longer be trusted to address the right message, so it is dropped rather
+// than risked being misapplied -- a bounded, documented degradation, not
+// silent corruption. Finally strips ADK's own internal per-iteration Extra
+// bookkeeping (stripADKInternalExtra).
+func (m *adkModel) prepareDispatchInput(input []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
+	if len(input) < len(m.engine.baselineMessages) {
+		m.engine.snapshot.providerState = nil
 	}
-	return ids
-}
-
-// approvalOrphanedToolCallIDs returns the function_tool_call CallIDs of every
-// sibling call on an assistant message that also carries an
-// MCPToolApprovalRequest block (see durableProjection's caller comment).
-func approvalOrphanedToolCallIDs(messages []*einoschema.AgenticMessage) map[string]bool {
-	orphaned := map[string]bool{}
-	for _, msg := range messages {
-		if msg == nil {
-			continue
-		}
-		hasApprovalRequest := false
-		for _, block := range msg.ContentBlocks {
-			if block != nil && block.Type == einoschema.ContentBlockTypeMCPToolApprovalRequest {
-				hasApprovalRequest = true
-				break
-			}
-		}
-		if !hasApprovalRequest {
-			continue
-		}
-		for _, block := range msg.ContentBlocks {
-			if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolCall && block.FunctionToolCall != nil && block.FunctionToolCall.CallID != "" {
-				orphaned[block.FunctionToolCall.CallID] = true
-			}
-		}
-	}
-	return orphaned
-}
-
-func sameIDSet(a, b map[string]bool) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for id := range a {
-		if !b[id] {
-			return false
-		}
-	}
-	return true
-}
-
-func sortedKeys(set map[string]bool) []string {
-	out := make([]string, 0, len(set))
-	for id := range set {
-		out = append(out, id)
-	}
-	sort.Strings(out)
-	return out
+	return stripADKInternalExtra(input), nil
 }
 
 // dispatch performs the one physical provider call this adapter ever makes

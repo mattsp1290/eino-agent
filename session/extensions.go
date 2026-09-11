@@ -70,6 +70,22 @@ type AgentHandlerPlanIdentity struct {
 	ID, Kind, Version, ConfigHash string
 	Order                         int
 	Scope                         extension.Scope
+	// Tools is the sealed, discovered set of tools this handler contributes
+	// (name + schema hash), frozen into the plan at compile time -- see
+	// runtime.discoverHandlerTools. A tool a handler tries to add at real
+	// per-turn execution time that is not in this sealed set fails the turn
+	// as a construction error (the frozen tool universe never expands at
+	// runtime).
+	Tools []HandlerToolIdentity
+}
+
+// HandlerToolIdentity is the sealed identity of one tool an agent-handler
+// contributes: its model-visible name and a hash of its full schema
+// (parameters, description), so a handler that changes its own tool's
+// schema between runs (an upstream version bump, a config change) changes
+// the sealed plan fingerprint.
+type HandlerToolIdentity struct {
+	Name, SchemaHash string
 }
 
 // ComponentPlan is the complete durable behavior identity owned by one
@@ -138,6 +154,9 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 		component.Guards = append([]GuardPlanIdentity(nil), component.Guards...)
 		component.Restrictions = append([]RestrictionPlanIdentity(nil), component.Restrictions...)
 		component.AgentHandlers = append([]AgentHandlerPlanIdentity(nil), component.AgentHandlers...)
+		for i := range component.AgentHandlers {
+			component.AgentHandlers[i].Tools = append([]HandlerToolIdentity(nil), component.AgentHandlers[i].Tools...)
+		}
 		next.Components[index] = component
 	}
 	return next
@@ -272,6 +291,16 @@ func validateAgentHandlerIdentities(sessionID ID, values []AgentHandlerPlanIdent
 		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
 			return err
 		}
+		seenTools := make(map[string]bool, len(value.Tools))
+		for _, toolIdentity := range value.Tools {
+			if extension.ValidateIdentifier(toolIdentity.Name) != nil || strings.TrimSpace(toolIdentity.SchemaHash) == "" {
+				return errors.New("invalid agent handler tool identity")
+			}
+			if seenTools[toolIdentity.Name] {
+				return errors.New("duplicate agent handler tool identity")
+			}
+			seenTools[toolIdentity.Name] = true
+		}
 	}
 	return nil
 }
@@ -392,6 +421,14 @@ func canonicalExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) (E
 		sort.Slice(component.Restrictions, func(i, j int) bool {
 			return compareRestrictionPlanIdentity(component.Restrictions[i], component.Restrictions[j]) < 0
 		})
+		for i := range component.AgentHandlers {
+			sort.Slice(component.AgentHandlers[i].Tools, func(x, y int) bool {
+				return component.AgentHandlers[i].Tools[x].Name < component.AgentHandlers[i].Tools[y].Name
+			})
+			if len(component.AgentHandlers[i].Tools) == 0 {
+				component.AgentHandlers[i].Tools = nil
+			}
+		}
 		sort.Slice(component.AgentHandlers, func(i, j int) bool {
 			return compareAgentHandlerPlanIdentity(component.AgentHandlers[i], component.AgentHandlers[j]) < 0
 		})

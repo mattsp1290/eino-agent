@@ -23,19 +23,21 @@ import (
 // is scoped to the current run: Model is the same mandatory ledger-audited
 // adapter AgentBuildContext.Model carries (so any model call a handler's
 // middleware makes -- e.g. summarization's own summary-generation call -- is
-// still durably ledgered through the same audit boundary), ToolWrapper turns
-// an arbitrary tool.BaseTool the middleware constructs (e.g. filesystem's
-// ls/read_file/write_file tools) into one durableGuard accepts, and
+// still durably ledgered through the same audit boundary), and
 // FilesystemBackend/SkillBackend are read-only views rooted at the admitted
 // canonical workspace (nil when no workspace root is configured for this
 // run, so a recipe that requires one fails construction closed rather than
-// silently operating unscoped).
+// silently operating unscoped). A tool the middleware built here contributes
+// (e.g. filesystem's ls/read_file/write_file tools) is never dispatched
+// directly: it is discovered once at plan-compile time
+// (discoverHandlerTools) and sealed into the frozen tool universe, and a
+// durable runtime.Tool built from that sealed identity is what actually
+// dispatches to it (see adkEngine.sealHandlerTools/handlerToolExecutor).
 type HandlerBuildContext struct {
 	SessionID     session.ID
 	RunID         session.RunID
 	WorkspaceRoot string
 	Model         einomodel.AgenticModel
-	ToolWrapper   func(tool.BaseTool) tool.BaseTool
 	// FilesystemBackend and SkillBackend are read-only views rooted at the
 	// admitted canonical workspace.
 	FilesystemBackend adkfilesystem.Backend
@@ -65,58 +67,152 @@ type HandlerBuildContext struct {
 	Execution session.ExecutionStore
 	IDs       IDGenerator
 	Now       func() time.Time
+
+	// authorizeRewrite records a function_tool_result content change as
+	// sanctioned content management (see authorizedRewriteSet), so
+	// settlementSeal treats it as a deliberate rewrite instead of an
+	// unauthorized one. It is unexported: only this package's own
+	// content-management recipes (patchtoolcalls, reduction) are wrapped
+	// with it (see wrapAuthorizedContentRewrites); an arbitrary
+	// host-registered HandlerFactory is never given this authority.
+	authorizeRewrite func(callID string)
 }
 
 // HandlerFactory builds one typed ADK agent middleware instance for one
 // turn's agent from a bounded HandlerBuildContext. Registered via
 // composition.Registrar.Handler(HandlerRegistration{Factory: ...}); the
 // closure is never serialized or part of the sealed plan fingerprint (only
-// its HandlerDescriptor{Kind,Version,Config} identity is -- see
-// session.AgentHandlerPlanIdentity). AgentFactory.BuildAgent's caller
-// (adkEngine.buildAgent) invokes every plan-ordered factory fresh for each
-// admitted turn and installs the results into AgentBuildContext.Handlers,
-// ahead of the runtime's mandatory tail handlers (durableGuard,
-// settlementSeal).
+// its HandlerDescriptor{Kind,Version,Config} identity, and its discovered
+// HandlerToolSpec set, are -- see session.AgentHandlerPlanIdentity).
+// AgentFactory.BuildAgent's caller (adkEngine.buildAgent) invokes every
+// plan-ordered factory fresh for each admitted turn and installs the
+// results into AgentBuildContext.Handlers, ahead of the runtime's mandatory
+// tail handlers (durableGuard, settlementSeal).
 type HandlerFactory func(context.Context, HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error)
 
-// errSettledToolResultDiverged reports that a function_tool_result content
-// block about to be sent to the model no longer matches the durably settled
-// ToolCall output for that call ID -- i.e. some host handler's
-// BeforeModelRewriteState mutated a settled, model-visible tool result after
-// this runtime's own durable settlement already committed it. See
-// settlementSeal's doc comment.
-var errSettledToolResultDiverged = errors.New("host handler diverged a settled tool result before it reached the model")
-
-// settlementSeal is one of this runtime's mandatory tail handlers (the other
-// being durableGuard): it is appended to AgentBuildContext.Handlers/
-// TypedChatModelAgentConfig.Handlers after every host-registered handler, so
-// its BeforeModelRewriteState hook -- hooks run in registration order, first
-// registered first called -- observes state.Messages only after every host
-// handler's own BeforeModelRewriteState has already run, i.e. exactly what
-// this turn is about to send to the model.
-//
-// For every function_tool_result content block that still carries a call ID
-// matching a durably settled session.ToolCall row, the block's model-visible
-// content must byte-for-byte match that row's settled Output: a host handler
-// may still legitimately rewrite content for a call this runtime never
-// settled at all (patchtoolcalls' whole purpose -- patching a dangling call
-// with no durable ToolCall row), but it can never rewrite what this runtime
-// already durably committed as the model-visible result of a call it
-// actually executed. A CallID with no matching settled row is left alone.
-type settlementSeal struct {
+// durableBaselineHandler is this runtime's mandatory FIRST (outermost)
+// handler: its BeforeModelRewriteState rewrites state.Messages to the fresh
+// durable projection of this cycle's committed history
+// (adkEngine.buildDurableBaseline), which every host handler registered
+// after it then transforms on top of. Host content-injecting/content-
+// management handlers (agentsmd, skill, reduction, summarization,
+// patchtoolcalls) therefore operate on real durable history, not a value
+// the ledger adapter discards and replaces later -- see
+// adkModel.prepareDispatchInput, which dispatches exactly what the handler
+// chain leaves ADK's state.Messages as, without re-projecting.
+type durableBaselineHandler struct {
 	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
-	store session.Store
+	engine *adkEngine
 }
 
-func newSettlementSeal(store session.Store) *settlementSeal {
-	return &settlementSeal{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, store: store}
+func newDurableBaselineHandler(engine *adkEngine) *durableBaselineHandler {
+	return &durableBaselineHandler{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, engine: engine}
 }
 
-func (s *settlementSeal) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
-	if state == nil {
-		return ctx, state, nil
+func (h *durableBaselineHandler) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
+	baseline, err := h.engine.buildDurableBaseline(ctx)
+	if err != nil {
+		return ctx, nil, err
 	}
-	for _, msg := range state.Messages {
+	// state.Messages must be a deep clone of the engine's own baseline, not
+	// the same message/block pointers: a host handler mutating content in
+	// place (rather than replacing it with a new value) would otherwise
+	// silently corrupt h.engine.baselineMessages too, since Go slices and
+	// the pointers they hold are shared, not copied -- which would corrupt
+	// settlementSeal's own comparison basis (it reads
+	// h.engine.baselineMessages expecting it to still be exactly what this
+	// cycle's durable reload produced, before any handler transformed it).
+	cloned, err := cloneProtectedMessages(baseline)
+	if err != nil {
+		return ctx, nil, err
+	}
+	next := adk.TypedChatModelAgentState[*einoschema.AgenticMessage]{Messages: cloned}
+	if state != nil {
+		next.ToolInfos = state.ToolInfos
+		next.DeferredToolInfos = state.DeferredToolInfos
+	}
+	return ctx, &next, nil
+}
+
+// authorizedRewriteSet is the per-turn record of function_tool_result call
+// IDs a sanctioned content-management recipe (patchtoolcalls, reduction --
+// see wrapAuthorizedContentRewrites) deliberately rewrote in
+// BeforeModelRewriteState. settlementSeal consults it to distinguish an
+// authorized content-management rewrite from an unauthorized one.
+type authorizedRewriteSet struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func newAuthorizedRewriteSet() *authorizedRewriteSet {
+	return &authorizedRewriteSet{seen: make(map[string]bool)}
+}
+
+func (s *authorizedRewriteSet) add(callID string) {
+	if s == nil || callID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seen[callID] = true
+}
+
+func (s *authorizedRewriteSet) contains(callID string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.seen[callID]
+}
+
+// wrapAuthorizedContentRewrites decorates a sanctioned content-management
+// middleware (this package's own patchtoolcalls/reduction recipes only --
+// never an arbitrary host-registered handler) so that every
+// function_tool_result content change it makes in its own
+// BeforeModelRewriteState is recorded into authorize, which settlementSeal
+// consults. It diffs state.Messages' function_tool_result content before
+// and after delegating to inner, by call ID, so it works regardless of
+// inner's own internal mechanism (patchtoolcalls' PatchedToolResultGenerator
+// callback, reduction's Trunc/ClearHandler-driven rewriting, or any other
+// upstream implementation detail).
+func wrapAuthorizedContentRewrites(inner adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], authorize func(callID string)) adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage] {
+	if inner == nil || authorize == nil {
+		return inner
+	}
+	return &authorizedRewriteMiddleware{TypedChatModelAgentMiddleware: inner, authorize: authorize}
+}
+
+type authorizedRewriteMiddleware struct {
+	adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	authorize func(callID string)
+}
+
+func (m *authorizedRewriteMiddleware) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
+	before := snapshotToolResultContent(state)
+	ctx, next, err := m.TypedChatModelAgentMiddleware.BeforeModelRewriteState(ctx, state, mc)
+	if err != nil || next == nil {
+		return ctx, next, err
+	}
+	after := snapshotToolResultContent(next)
+	for callID, content := range after {
+		if before[callID] != content {
+			m.authorize(callID)
+		}
+	}
+	return ctx, next, nil
+}
+
+func snapshotToolResultContent(state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage]) map[string]string {
+	if state == nil {
+		return map[string]string{}
+	}
+	return toolResultContentByCallID(state.Messages)
+}
+
+func toolResultContentByCallID(messages []*einoschema.AgenticMessage) map[string]string {
+	result := make(map[string]string)
+	for _, msg := range messages {
 		if msg == nil {
 			continue
 		}
@@ -128,327 +224,102 @@ func (s *settlementSeal) BeforeModelRewriteState(ctx context.Context, state *adk
 			if callID == "" {
 				continue
 			}
-			record, err := s.store.GetToolCall(ctx, session.ToolCallID(callID))
-			if err != nil {
-				// No durable row for this call ID (a dangling call a
-				// middleware like patchtoolcalls legitimately patched, or a
-				// call this run never settled at all): nothing to seal
-				// against.
-				continue
-			}
-			if !session.TerminalToolCall(record.Status) {
-				continue
-			}
-			// Every durable adkTool.InvokableRun result is a plain string
-			// (this runtime never dispatches EnhancedInvokableTool through
-			// the mandatory tool adapter -- see runtime/adk_execution.go's
-			// adkTool), which ADK always wraps as exactly one text content
-			// block (adk.textToFunctionToolResultBlocks); a settled call's
-			// model-visible content is therefore always that single block
-			// holding the durable Output bytes verbatim.
-			content := block.FunctionToolResult.Content
-			if len(content) != 1 || content[0] == nil || content[0].Type != einoschema.FunctionToolResultContentBlockTypeText ||
-				content[0].Text == nil || content[0].Text.Text != string(record.Output) {
-				return ctx, nil, fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
-			}
+			result[callID] = canonicalFunctionToolResultContent(block.FunctionToolResult.Content)
+		}
+	}
+	return result
+}
+
+func canonicalFunctionToolResultContent(content []*einoschema.FunctionToolResultContentBlock) string {
+	var b []byte
+	for _, part := range content {
+		if part == nil {
+			continue
+		}
+		b = append(b, []byte(part.Type)...)
+		b = append(b, 0)
+		if part.Text != nil {
+			b = append(b, []byte(part.Text.Text)...)
+		}
+		b = append(b, 0)
+	}
+	return string(b)
+}
+
+// errSettledToolResultDiverged reports that a function_tool_result content
+// block about to be sent to the model no longer matches the durably settled
+// ToolCall output for that call ID -- i.e. some host handler mutated a
+// settled, model-visible tool result after this runtime's own durable
+// settlement already committed it, without that rewrite being authorized.
+// See settlementSeal's doc comment.
+var errSettledToolResultDiverged = errors.New("host handler diverged a settled tool result before it reached the model")
+
+// errUnauthorizedFabricatedToolResult reports a function_tool_result block
+// for a call ID with no durable ToolCall row that is also not recorded as
+// an authorized content-management rewrite (see authorizedRewriteSet): a
+// handler fabricated a tool result for a call this run never settled,
+// without going through a sanctioned recipe that records the patch.
+var errUnauthorizedFabricatedToolResult = errors.New("host handler fabricated an unauthorized tool result for an unsettled call")
+
+// settlementSeal is one of this runtime's mandatory tail handlers (the
+// other being durableGuard): it is appended to AgentBuildContext.Handlers/
+// TypedChatModelAgentConfig.Handlers after every host-registered handler, so
+// its BeforeModelRewriteState hook -- hooks run in registration order, first
+// registered first called -- observes state.Messages only after every host
+// handler's own BeforeModelRewriteState has already run, i.e. exactly what
+// this turn is about to send to the model. It enforces exactly two
+// invariants, regardless of what a content-management handler otherwise
+// does to the baseline (see durableBaselineHandler):
+//
+//  1. every function_tool_result content block whose call ID matches a
+//     durably *settled* session.ToolCall row must byte-for-byte match that
+//     row's settled Output, UNLESS the rewrite was recorded as authorized
+//     (reduction's own legitimate clearing/truncation of a settled result --
+//     see wrapAuthorizedContentRewrites);
+//  2. a function_tool_result content block whose call ID has NO durable
+//     settlement is rejected as a fabrication, UNLESS it was recorded as an
+//     authorized patch (patchtoolcalls' own legitimate patching of a
+//     dangling call).
+type settlementSeal struct {
+	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	engine     *adkEngine
+	authorized *authorizedRewriteSet
+}
+
+func newSettlementSeal(engine *adkEngine, authorized *authorizedRewriteSet) *settlementSeal {
+	return &settlementSeal{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, engine: engine, authorized: authorized}
+}
+
+// BeforeModelRewriteState compares against durableBaselineHandler's own
+// reconstruction (e.engine.baselineMessages, computed this same cycle,
+// before any host handler ran) rather than re-deriving expected content
+// from the durable ToolCall row directly: the baseline is exactly what
+// replay would show for this call (a single text block for an ordinary
+// adkTool result, multiple parts for an enhanced/multimodal one -- e.g. a
+// sealed handler tool's multimodal read_file, or a classic W4 enhanced
+// tool result), so comparing against it handles every settled shape
+// uniformly without hardcoding an assumption about how many content blocks
+// a settled result has.
+func (s *settlementSeal) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
+	if state == nil {
+		return ctx, state, nil
+	}
+	baseline := toolResultContentByCallID(s.engine.baselineMessages)
+	current := toolResultContentByCallID(state.Messages)
+	for callID, content := range current {
+		if s.authorized.contains(callID) {
+			continue
+		}
+		baselineContent, settled := baseline[callID]
+		if !settled {
+			// No durable settlement for this call ID in the fresh
+			// baseline: a fabricated result is only acceptable if a
+			// sanctioned recipe recorded it as an authorized patch.
+			return ctx, nil, fmt.Errorf("%w: call %s", errUnauthorizedFabricatedToolResult, callID)
+		}
+		if content != baselineContent {
+			return ctx, nil, fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
 		}
 	}
 	return ctx, state, nil
-}
-
-// instructionHolder carries the agent's cumulative BeforeAgent-produced
-// Instruction (as left by every host handler's BeforeAgent, including
-// content-injecting recipes such as agentsmd/skill) from agent-build time
-// into this turn's per-dispatch system-prompt rendering.
-//
-// This bridge exists because this runtime's adkModel rebuilds every
-// physical dispatch's model.Request.System from its own registered
-// composition.Registrar.Prompt sections (StreamingOrchestrator.
-// renderSystemPrompt), entirely independent of ADK's own
-// ChatModelAgentContext.Instruction/TypedChatModelAgentState mechanism that
-// upstream BeforeAgent handlers use to inject content. Without this bridge,
-// agentsmd (and any other Instruction-mutating handler) would build and
-// return successfully but have literally no effect on what the model ever
-// sees -- durableProjection discards ADK's own instruction-embedded input
-// in favor of a fresh durable reload, and renderSystemPrompt never consults
-// ChatModelAgentContext at all. See adkModel.begin, which appends
-// instructionHolder.get() to its rendered system prompt.
-type instructionHolder struct {
-	mu    sync.Mutex
-	value string
-}
-
-func (h *instructionHolder) set(value string) {
-	if h == nil {
-		return
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.value = value
-}
-
-func (h *instructionHolder) get() string {
-	if h == nil {
-		return ""
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.value
-}
-
-// instructionCaptureHandler is a mandatory tail handler (installed right
-// after every host handler, before durableGuard/settlementSeal) that
-// captures the agent's cumulative BeforeAgent-produced Instruction into
-// holder -- see instructionHolder's doc comment. BeforeAgent hooks run in
-// registration order, each seeing the previous one's already-mutated
-// runCtx, so this handler observes the Instruction only after every host
-// handler's own BeforeAgent has already run.
-type instructionCaptureHandler struct {
-	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
-	holder *instructionHolder
-}
-
-func newInstructionCaptureHandler(holder *instructionHolder) *instructionCaptureHandler {
-	return &instructionCaptureHandler{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, holder: holder}
-}
-
-func (h *instructionCaptureHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
-	if runCtx != nil {
-		h.holder.set(runCtx.Instruction)
-	}
-	return ctx, runCtx, nil
-}
-
-// toolWrappingMiddleware decorates a host-built adk.TypedChatModelAgentMiddleware
-// so that any tool it injects into ChatModelAgentContext.Tools via its own
-// BeforeAgent (e.g. the filesystem middleware's ls/read_file/write_file
-// tools, plantask's task tools, skill's "skill" tool) is wrapped through the
-// mandatory durable adapter (HandlerBuildContext.ToolWrapper) before
-// durableGuard ever sees it -- durableGuard rejects any tool that does not
-// implement the unexported durableTool marker, so an upstream middleware's
-// own tools would otherwise fail every turn that reaches BeforeAgent. Every
-// recipe in this package wraps its upstream-built middleware with this
-// before returning it from its HandlerFactory.
-//
-// KNOWN GAP: this wrapping makes such a tool pass durableGuard's structural
-// check (a defense-in-depth guarantee), but a call to it currently still
-// fails earlier, at prepareToolCalls/resolveToolCall (adk_tools.go): those
-// resolve strictly against TurnSnapshot.Tools, which is frozen at
-// turn-admission time, before the agent (and hence any BeforeAgent tool
-// injection) ever runs. See TestFilesystemHandlerToolExecutesThroughDurableWrapper
-// for the exact reproduction and scope (filesystem/plantask/skill's own
-// tools; agentsmd/patchtoolcalls/reduction/toolsearch/summarization are
-// unaffected). Closing it needs TurnSnapshot.Tools to be extended with
-// discovered handler-injected tool names before prepareToolCalls runs, which
-// is out of this pass's scope.
-type toolWrappingMiddleware struct {
-	adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
-	wrap func(tool.BaseTool) tool.BaseTool
-}
-
-func wrapHandlerTools(inner adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], wrap func(tool.BaseTool) tool.BaseTool) adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage] {
-	if inner == nil || wrap == nil {
-		return inner
-	}
-	return &toolWrappingMiddleware{TypedChatModelAgentMiddleware: inner, wrap: wrap}
-}
-
-func (m *toolWrappingMiddleware) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
-	ctx, runCtx, err := m.TypedChatModelAgentMiddleware.BeforeAgent(ctx, runCtx)
-	if err != nil || runCtx == nil {
-		return ctx, runCtx, err
-	}
-	for i, t := range runCtx.Tools {
-		if t == nil {
-			continue
-		}
-		if _, ok := t.(durableTool); ok {
-			continue
-		}
-		runCtx.Tools[i] = m.wrap(t)
-	}
-	return ctx, runCtx, nil
-}
-
-// newAdkGenericDurableTool wraps an arbitrary tool.BaseTool a host handler's
-// middleware constructs into the narrowest concrete type implementing
-// exactly the run/stream capabilities the underlying tool actually has (so
-// ADK's own tool.BaseTool capability type-assertions in its tools node stay
-// correct -- see adkDurable* below) plus the durableTool marker durableGuard
-// requires, and registers its advertised name into durable (a run's
-// adkEngine-owned allow-set, shared with the turn's durableGuard) so the
-// guard accepts it.
-//
-// This runtime does not route these calls through the session ToolCall
-// ledger/claim/settle pipeline the way runtime.Tool-backed adapters
-// (adkTool) do: that pipeline's identity model is built around the frozen
-// composition-registered tool registry (PlanTool/ToolCall rows), which does
-// not naturally extend to tools an upstream middleware constructs
-// dynamically at agent-build time from its own Config. durableGuard's
-// allow-set check is still enforced (no tool can silently bypass the
-// runtime's mandatory adapters), but calls dispatched this way are not
-// independently durably audited the way ordinary session tools are -- see
-// the W6 docs section for this documented, bounded scope decision.
-func newAdkGenericDurableTool(ctx context.Context, inner tool.BaseTool, durable map[string]bool) tool.BaseTool {
-	info, infoErr := inner.Info(ctx)
-	name := ""
-	if info != nil {
-		name = info.Name
-	}
-	if infoErr != nil || name == "" {
-		return adkFailedDurableTool{inner: inner, err: infoErr}
-	}
-	if durable != nil {
-		durable[name] = true
-	}
-	base := adkDurableBase{inner: inner, name: name}
-	_, enhancedInvokable := inner.(tool.EnhancedInvokableTool)
-	_, enhancedStreamable := inner.(tool.EnhancedStreamableTool)
-	if enhancedInvokable && enhancedStreamable {
-		return adkDurableEnhancedInvokableStreamable{base}
-	}
-	if enhancedInvokable {
-		return adkDurableEnhancedInvokable{base}
-	}
-	if enhancedStreamable {
-		return adkDurableEnhancedStreamable{base}
-	}
-	_, invokable := inner.(tool.InvokableTool)
-	_, streamable := inner.(tool.StreamableTool)
-	if invokable && streamable {
-		return adkDurableInvokableStreamable{base}
-	}
-	if streamable {
-		return adkDurableStreamable{base}
-	}
-	// Default to invokable even when the underlying tool declares neither
-	// capability: this keeps every wrapped tool a durableTool (so
-	// durableGuard never rejects it purely for lacking a marker), and
-	// InvokableRun below fails safely and closed at call time instead.
-	return adkDurableInvokable{base}
-}
-
-type adkDurableBase struct {
-	inner tool.BaseTool
-	name  string
-}
-
-func (t adkDurableBase) Info(ctx context.Context) (*einoschema.ToolInfo, error) {
-	return t.inner.Info(ctx)
-}
-func (t adkDurableBase) durableToolName() string { return t.name }
-
-var _ durableTool = adkDurableBase{}
-
-// adkFailedDurableTool is returned when the underlying tool's own Info call
-// failed or reported no name; it still satisfies durableTool (with an empty
-// name, which durableGuard's allow-set will never contain) so wrapping never
-// panics, and fails closed on every execution attempt.
-type adkFailedDurableTool struct {
-	inner tool.BaseTool
-	err   error
-}
-
-var _ durableTool = adkFailedDurableTool{}
-
-func (t adkFailedDurableTool) Info(ctx context.Context) (*einoschema.ToolInfo, error) {
-	return t.inner.Info(ctx)
-}
-func (t adkFailedDurableTool) durableToolName() string { return "" }
-func (t adkFailedDurableTool) InvokableRun(context.Context, string, ...tool.Option) (string, error) {
-	return "", fmt.Errorf("%w: tool metadata unavailable: %v", errADKUnsupportedBlock, t.err)
-}
-
-type adkDurableInvokable struct{ adkDurableBase }
-
-var _ tool.InvokableTool = adkDurableInvokable{}
-
-func (t adkDurableInvokable) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
-	invokable, ok := t.inner.(tool.InvokableTool)
-	if !ok {
-		return "", fmt.Errorf("%w: tool %q is not invokable", errADKUnsupportedBlock, t.name)
-	}
-	return invokable.InvokableRun(ctx, argumentsInJSON, opts...)
-}
-
-type adkDurableStreamable struct{ adkDurableBase }
-
-var _ tool.StreamableTool = adkDurableStreamable{}
-
-func (t adkDurableStreamable) StreamableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (*einoschema.StreamReader[string], error) {
-	streamable, ok := t.inner.(tool.StreamableTool)
-	if !ok {
-		return nil, fmt.Errorf("%w: tool %q is not streamable", errADKUnsupportedBlock, t.name)
-	}
-	return streamable.StreamableRun(ctx, argumentsInJSON, opts...)
-}
-
-type adkDurableInvokableStreamable struct{ adkDurableBase }
-
-var (
-	_ tool.InvokableTool  = adkDurableInvokableStreamable{}
-	_ tool.StreamableTool = adkDurableInvokableStreamable{}
-)
-
-func (t adkDurableInvokableStreamable) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
-	invokable, ok := t.inner.(tool.InvokableTool)
-	if !ok {
-		return "", fmt.Errorf("%w: tool %q is not invokable", errADKUnsupportedBlock, t.name)
-	}
-	return invokable.InvokableRun(ctx, argumentsInJSON, opts...)
-}
-
-func (t adkDurableInvokableStreamable) StreamableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (*einoschema.StreamReader[string], error) {
-	streamable, ok := t.inner.(tool.StreamableTool)
-	if !ok {
-		return nil, fmt.Errorf("%w: tool %q is not streamable", errADKUnsupportedBlock, t.name)
-	}
-	return streamable.StreamableRun(ctx, argumentsInJSON, opts...)
-}
-
-type adkDurableEnhancedInvokable struct{ adkDurableBase }
-
-var _ tool.EnhancedInvokableTool = adkDurableEnhancedInvokable{}
-
-func (t adkDurableEnhancedInvokable) InvokableRun(ctx context.Context, toolArgument *einoschema.ToolArgument, opts ...tool.Option) (*einoschema.ToolResult, error) {
-	enhanced, ok := t.inner.(tool.EnhancedInvokableTool)
-	if !ok {
-		return nil, fmt.Errorf("%w: tool %q is not enhanced-invokable", errADKUnsupportedBlock, t.name)
-	}
-	return enhanced.InvokableRun(ctx, toolArgument, opts...)
-}
-
-type adkDurableEnhancedStreamable struct{ adkDurableBase }
-
-var _ tool.EnhancedStreamableTool = adkDurableEnhancedStreamable{}
-
-func (t adkDurableEnhancedStreamable) StreamableRun(ctx context.Context, toolArgument *einoschema.ToolArgument, opts ...tool.Option) (*einoschema.StreamReader[*einoschema.ToolResult], error) {
-	enhanced, ok := t.inner.(tool.EnhancedStreamableTool)
-	if !ok {
-		return nil, fmt.Errorf("%w: tool %q is not enhanced-streamable", errADKUnsupportedBlock, t.name)
-	}
-	return enhanced.StreamableRun(ctx, toolArgument, opts...)
-}
-
-type adkDurableEnhancedInvokableStreamable struct{ adkDurableBase }
-
-var (
-	_ tool.EnhancedInvokableTool  = adkDurableEnhancedInvokableStreamable{}
-	_ tool.EnhancedStreamableTool = adkDurableEnhancedInvokableStreamable{}
-)
-
-func (t adkDurableEnhancedInvokableStreamable) InvokableRun(ctx context.Context, toolArgument *einoschema.ToolArgument, opts ...tool.Option) (*einoschema.ToolResult, error) {
-	enhanced, ok := t.inner.(tool.EnhancedInvokableTool)
-	if !ok {
-		return nil, fmt.Errorf("%w: tool %q is not enhanced-invokable", errADKUnsupportedBlock, t.name)
-	}
-	return enhanced.InvokableRun(ctx, toolArgument, opts...)
-}
-
-func (t adkDurableEnhancedInvokableStreamable) StreamableRun(ctx context.Context, toolArgument *einoschema.ToolArgument, opts ...tool.Option) (*einoschema.StreamReader[*einoschema.ToolResult], error) {
-	enhanced, ok := t.inner.(tool.EnhancedStreamableTool)
-	if !ok {
-		return nil, fmt.Errorf("%w: tool %q is not enhanced-streamable", errADKUnsupportedBlock, t.name)
-	}
-	return enhanced.StreamableRun(ctx, toolArgument, opts...)
 }

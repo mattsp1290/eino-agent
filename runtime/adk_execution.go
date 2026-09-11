@@ -131,11 +131,23 @@ type adkEngine struct {
 	// is failed.
 	dispatches atomic.Int64
 
-	// instruction carries the agent's cumulative BeforeAgent-produced
-	// Instruction into this turn's per-dispatch system-prompt rendering --
-	// see instructionHolder's doc comment (runtime/adk_middleware.go) and
-	// adkModel.begin, which appends it to renderSystemPrompt's output.
-	instruction *instructionHolder
+	// baselineMessages is this cycle's stable, baseline-indexed durable
+	// projection, set by durableBaselineHandler (via
+	// adkEngine.buildDurableBaseline) and consumed by
+	// adkModel.prepareDispatchInput and settlementSeal -- see both doc
+	// comments (runtime/adk_middleware.go, runtime/adk_model.go).
+	baselineMessages   []*einoschema.AgenticMessage
+	authorizedRewrites *authorizedRewriteSet
+
+	// handlerTools holds this turn's live tool.BaseTool instances
+	// contributed by host agent-handler middleware (filesystem's
+	// read_file, plantask's task tools, skill's "skill" tool, ...), keyed
+	// by name and collected once when each handler is built (see
+	// adkEngine.buildAgentHandlers). handlerToolExecutor looks a call's
+	// tool up here at dispatch time; a sealed handler tool whose live
+	// instance is missing (a handler that stopped declaring a tool it
+	// previously sealed) fails that call, not the whole turn.
+	handlerTools map[string]tool.BaseTool
 }
 
 // guardRan reports whether this turn's durable guard actually fired. A
@@ -350,6 +362,23 @@ func (e *adkEngine) usageSnapshot() model.Usage {
 // that bypasses claim/settlement.
 func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding) (adk.TypedAgent[*einoschema.AgenticMessage], error) {
 	inner := &adkModel{host: e.host, execution: e.execution, engine: e, approval: approval}
+
+	authorized := newAuthorizedRewriteSet()
+	e.authorizedRewrites = authorized
+
+	// Build host handler middleware instances first (collecting their live
+	// tool instances into e.handlerTools) so sealHandlerTools can splice
+	// their sealed tool identities into e.snapshot.Tools before the main
+	// tool-wrapping loop below runs -- durableGuard's allow-set and
+	// prepareToolCalls/resolveToolCall's frozen registry both derive from
+	// that same e.snapshot.Tools, so a handler tool participates in both
+	// exactly like any composition-registered tool.
+	handlers, err := e.buildAgentHandlers(ctx, inner, authorized)
+	if err != nil {
+		return nil, err
+	}
+	e.sealHandlerTools()
+
 	tools := make([]tool.BaseTool, 0, len(e.snapshot.Tools))
 	durable := make(map[string]bool, len(e.snapshot.Tools))
 	aliases := make(map[string]compose.ToolAliasConfig, len(e.snapshot.Tools))
@@ -367,25 +396,57 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 		durable[e.snapshot.ToolSearch.Name] = true
 	}
 	guard := newDurableGuard(durable)
-	handlers, err := e.buildAgentHandlers(ctx, inner, durable)
-	if err != nil {
-		return nil, err
-	}
-	e.instruction = &instructionHolder{}
 	build := AgentBuildContext{
 		Model: inner, Tools: tools, ToolAliases: aliases,
-		Instruction:        "",
-		MaxIterations:      e.host.toolTurns(),
-		Guard:              guard,
-		SettlementSeal:     newSettlementSeal(e.host.store),
-		InstructionCapture: newInstructionCaptureHandler(e.instruction),
-		Handlers:           handlers,
-		Retry:              defaultRetryConfig(e.host.attempts()),
-		Failover:           buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
+		Instruction:     "",
+		MaxIterations:   e.host.toolTurns(),
+		Guard:           guard,
+		SettlementSeal:  newSettlementSeal(e, authorized),
+		DurableBaseline: newDurableBaselineHandler(e),
+		Handlers:        handlers,
+		Retry:           defaultRetryConfig(e.host.attempts()),
+		Failover:        buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
 	}
 	e.guard = guard
 	factory := e.plan.AgentFactory()
 	return factory.BuildAgent(ctx, build)
+}
+
+// sealHandlerTools appends a durable runtime.Tool entry to e.snapshot.Tools
+// for every tool sealed into this run's plan for a host agent-handler (see
+// HandlerToolSpec/discoverHandlerTools), so it is resolved by
+// prepareToolCalls/resolveToolCall and goes through the full durable
+// claim/permission/execute/settle pipeline via adkTool, exactly like any
+// composition-registered tool. Its Executor (handlerToolExecutor) dispatches
+// to the live tool instance e.buildAgentHandlers collected into
+// e.handlerTools. A write-like tool (see isWriteLikeToolName) is sealed
+// with a Permissions tag so the existing permission policy gates it --
+// disabled unless a permission explicitly grants it, exactly like any other
+// state-changing tool.
+func (e *adkEngine) sealHandlerTools() {
+	root := e.snapshot.Config.Metadata["workspace_root"]
+	workspaceID := e.snapshot.Config.Metadata["workspace_id"]
+	for _, entry := range e.plan.AgentHandlers() {
+		for _, toolSpec := range entry.Tools {
+			scope := ToolScope{WorkspaceID: workspaceID, Root: root}
+			if toolSpec.WriteLike {
+				scope.Permissions = []string{handlerToolPermission(entry.ID, toolSpec.Name)}
+			}
+			e.snapshot.Tools = append(e.snapshot.Tools, Tool{
+				Name: toolSpec.Name, Info: toolSpec.Info, Scope: scope,
+				Executor: handlerToolExecutor{engine: e, name: toolSpec.Name},
+				// RetentionPolicy{}'s zero value is MaxInlineBytes: 0 (retain
+				// nothing inline -- effectiveToolRetentionPolicy only clamps
+				// a negative/over-budget value, never raises a zero one), so
+				// an explicit -1 (unbounded, subject to the same
+				// content-block budget clamp every other tool's output
+				// gets) is required here, unlike a composition-registered
+				// tool whose host is expected to set tools.Definition.Retention
+				// explicitly.
+				Retention: RetentionPolicy{MaxInlineBytes: -1},
+			})
+		}
+	}
 }
 
 // buildAgentHandlers resolves this run's plan-ordered, host-registered
@@ -397,31 +458,27 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 // at the admitted canonical workspace (nil when none is configured, so a
 // recipe requiring one fails construction closed rather than operating
 // unscoped -- see workspaceFilesystemBackend/workspaceSkillBackend).
-func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.AgenticModel, durable map[string]bool) ([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
+func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.AgenticModel, authorized *authorizedRewriteSet) ([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 	plan := e.plan.AgentHandlers()
 	if len(plan) == 0 {
 		return nil, nil
 	}
 	build := HandlerBuildContext{
-		SessionID:     e.snapshot.SessionID,
-		RunID:         e.snapshot.RunID,
-		WorkspaceRoot: e.snapshot.Config.Metadata["workspace_root"],
-		Model:         inner,
-		ToolWrapper: func(t tool.BaseTool) tool.BaseTool {
-			return newAdkGenericDurableTool(ctx, t, durable)
-		},
-		Store:     e.host.store,
-		Execution: e.execution.store,
-		IDs:       e.host.ids,
-		Now:       e.host.now,
+		SessionID:        e.snapshot.SessionID,
+		RunID:            e.snapshot.RunID,
+		WorkspaceRoot:    e.snapshot.Config.Metadata["workspace_root"],
+		Model:            inner,
+		Store:            e.host.store,
+		Execution:        e.execution.store,
+		IDs:              e.host.ids,
+		Now:              e.host.now,
+		authorizeRewrite: authorized.add,
 	}
 	for _, t := range e.snapshot.Tools {
 		if !t.Deferred {
 			continue
 		}
-		wrapped := &adkTool{engine: e, tool: t}
-		durable[t.Name] = true
-		build.DeferredTools = append(build.DeferredTools, wrapped)
+		build.DeferredTools = append(build.DeferredTools, &adkTool{engine: e, tool: t})
 	}
 	if build.WorkspaceRoot != "" {
 		fsBackend, skillBackend, err := newWorkspaceBackends(build.WorkspaceRoot)
@@ -442,6 +499,7 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 		build.ReductionBackend = reductionBackend
 	}
 	handlers := make([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], 0, len(plan))
+	liveTools := make(map[string]tool.BaseTool)
 	for _, entry := range plan {
 		handler, err := entry.Factory(ctx, build)
 		if err != nil {
@@ -451,7 +509,33 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 			return nil, fmt.Errorf("agent handler %q (%s) factory returned nil", entry.ID, entry.Kind)
 		}
 		handlers = append(handlers, handler)
+		// Collect this handler's live tool instances (real backends, real
+		// session/workspace identity) for sealHandlerTools' executors to
+		// dispatch to -- see handlerToolExecutor. This BeforeAgent call is
+		// purely observational (its returned context/runCtx are discarded);
+		// the SAME middleware instance's real BeforeAgent runs again later
+		// as part of actual agent execution (registered in Handlers below),
+		// which is idempotent for every one of this package's own recipes
+		// (each just appends a static tool list).
+		_, runCtx, err := handler.BeforeAgent(ctx, &adk.ChatModelAgentContext{})
+		if err != nil {
+			return nil, fmt.Errorf("agent handler %q (%s) tool discovery: %w", entry.ID, entry.Kind, err)
+		}
+		if runCtx == nil {
+			continue
+		}
+		for _, t := range runCtx.Tools {
+			if t == nil {
+				continue
+			}
+			info, infoErr := t.Info(ctx)
+			if infoErr != nil || info == nil || info.Name == "" {
+				continue
+			}
+			liveTools[info.Name] = t
+		}
 	}
+	e.handlerTools = liveTools
 	return handlers, nil
 }
 
@@ -491,21 +575,29 @@ type AgentBuildContext struct {
 	// handler (see settlementSeal's doc comment); an AgentFactory must
 	// install it last, after Guard, in its Handlers list.
 	SettlementSeal adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
-	// InstructionCapture is the mandatory handler that bridges a host
-	// handler's BeforeAgent Instruction mutation into this turn's rendered
-	// system prompt (see instructionHolder's doc comment). An AgentFactory
-	// must install it right after Handlers, before Guard/SettlementSeal.
-	InstructionCapture adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	// DurableBaseline is the mandatory FIRST (outermost) handler
+	// (durableBaselineHandler): its BeforeModelRewriteState rewrites
+	// state.Messages to the durable projection of committed history for
+	// this cycle, which every host handler then transforms on top of --
+	// see its doc comment (runtime/adk_middleware.go) and
+	// adkEngine.buildDurableBaseline (runtime/adk_model.go). An
+	// AgentFactory must install it before Handlers.
+	DurableBaseline adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
 	// Handlers is the ordered, per-execution snapshot of every
 	// composition.Registrar.Handler factory output for this run's frozen
 	// plan (see RunPlan.AgentHandlers), built fresh for this turn by
 	// adkEngine.buildAgent. An AgentFactory that installs its own Handlers
-	// must place these first, ahead of Guard and any other mandatory tail
-	// handler, so host handlers are the outermost wrapper layer (ADK: first
-	// registered is outermost) and this runtime's own tail handlers
-	// (durableGuard, settlementSeal) stay innermost, directly around the
-	// mandatory Model/Tools adapters. DefaultChatModelAgentFactory does this
-	// automatically.
+	// must place these after DurableBaseline and before Guard/
+	// SettlementSeal, so host handlers are the outermost *wrapper* layer
+	// (ADK: first registered is outermost, for WrapModel/WrapToolCall) and
+	// this runtime's own tail handlers (durableGuard, settlementSeal) stay
+	// innermost, directly around the mandatory Model/Tools adapters --
+	// while, for hook methods (BeforeAgent/BeforeModelRewriteState/...),
+	// which run in the SAME registration order but as an ordered chain
+	// rather than a wrapper nest, DurableBaseline's placement first means
+	// its BeforeModelRewriteState establishes the baseline every host
+	// handler's own BeforeModelRewriteState then transforms.
+	// DefaultChatModelAgentFactory does this automatically.
 	Handlers []adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
 }
 
@@ -555,17 +647,20 @@ func (DefaultChatModelAgentFactory) BuildAgent(ctx context.Context, build AgentB
 		ModelRetryConfig:    build.Retry,
 		ModelFailoverConfig: build.Failover,
 	}
-	// Handler order: first registered is outermost (ADK: [A,B,C] wraps as
-	// A(B(C(model/tool)))). Host handlers (build.Handlers, already in the
-	// plan's registered order) go first so they are outermost; this
-	// runtime's own mandatory tail handlers go last so they stay innermost,
-	// directly around the mandatory Model/Tools adapters this
-	// AgentBuildContext provided -- see AgentBuildContext.Handlers and
+	// Handler order: first registered is outermost for wrappers (ADK:
+	// [A,B,C] wraps as A(B(C(model/tool)))), and first registered is first
+	// called for hooks (BeforeAgent/BeforeModelRewriteState/...) -- see
+	// AgentBuildContext.Handlers's doc comment. DurableBaseline goes first
+	// so its BeforeModelRewriteState establishes the baseline every host
+	// handler transforms; host handlers (build.Handlers) go next so they
+	// are the outermost wrapper layer; this runtime's own mandatory tail
+	// handlers go last so they stay innermost, directly around the
+	// mandatory Model/Tools adapters this AgentBuildContext provided -- see
 	// durableGuard/settlementSeal's doc comments.
-	cfg.Handlers = append(cfg.Handlers, build.Handlers...)
-	if build.InstructionCapture != nil {
-		cfg.Handlers = append(cfg.Handlers, build.InstructionCapture)
+	if build.DurableBaseline != nil {
+		cfg.Handlers = append(cfg.Handlers, build.DurableBaseline)
 	}
+	cfg.Handlers = append(cfg.Handlers, build.Handlers...)
 	if build.Guard != nil {
 		cfg.Handlers = append(cfg.Handlers, build.Guard)
 	}
@@ -607,24 +702,53 @@ func (g *durableGuard) hasRun() bool {
 	return g.ran
 }
 
+// BeforeAgent enforces the frozen tool universe and, as a side effect,
+// deduplicates a host handler's own redundant raw tool copy: a sealed
+// handler tool (see adkEngine.sealHandlerTools) is pre-seeded into
+// runCtx.Tools as a durable adkTool-wrapped entry (from
+// AgentBuildContext.Tools/ToolsConfig.Tools) before any handler's
+// BeforeAgent ever runs; when that SAME handler's own real BeforeAgent runs
+// later (registered as an ordinary Handler, for its other behaviors) it
+// appends its own fresh, non-durable tool object with the same name --
+// which this guard drops rather than rejects, since the sealed durable
+// entry already present is what actually dispatches. Any other non-durable
+// tool, or a durable tool naming an identity outside g.allowed, fails the
+// turn as a construction error: the frozen tool universe never expands at
+// runtime.
 func (g *durableGuard) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
 	g.mu.Lock()
 	g.ran = true
 	g.mu.Unlock()
+	filtered := make([]tool.BaseTool, 0, len(runCtx.Tools))
+	seen := make(map[string]bool, len(runCtx.Tools))
 	for _, t := range runCtx.Tools {
-		dt, ok := t.(durableTool)
-		if !ok {
-			info, _ := t.Info(ctx)
-			name := "<unknown>"
-			if info != nil {
-				name = info.Name
+		if dt, ok := t.(durableTool); ok {
+			name := dt.durableToolName()
+			if !g.allowed[name] {
+				return ctx, nil, fmt.Errorf("%w: tool %q is outside the frozen registry", errADKUnsupportedBlock, name)
 			}
-			return ctx, nil, fmt.Errorf("%w: tool %q is not a durable runtime adapter", errADKUnsupportedBlock, name)
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+			filtered = append(filtered, t)
+			continue
 		}
-		if !g.allowed[dt.durableToolName()] {
-			return ctx, nil, fmt.Errorf("%w: tool %q is outside the frozen registry", errADKUnsupportedBlock, dt.durableToolName())
+		info, _ := t.Info(ctx)
+		name := "<unknown>"
+		if info != nil {
+			name = info.Name
 		}
+		if g.allowed[name] {
+			// The redundant raw copy of an already-sealed handler tool:
+			// the durable entry with this name is already in filtered (or
+			// appears elsewhere in runCtx.Tools and will be added when
+			// this loop reaches it) -- drop this one.
+			continue
+		}
+		return ctx, nil, fmt.Errorf("%w: tool %q is not a durable runtime adapter", errADKUnsupportedBlock, name)
 	}
+	runCtx.Tools = filtered
 	return ctx, runCtx, nil
 }
 

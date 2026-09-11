@@ -89,6 +89,14 @@ type PlanAgentHandler struct {
 	Order                         int
 	Scope                         extension.Scope
 	Factory                       HandlerFactory
+	// Tools is this handler's sealed, discovered tool set (see
+	// discoverHandlerTools), computed once at plan-compile time. At real
+	// per-turn agent build time, adkEngine.buildAgent synthesizes a durable
+	// runtime.Tool for each entry so it is resolved by prepareToolCalls/
+	// resolveToolCall like any other frozen tool; a tool the handler's live
+	// middleware adds at BeforeAgent time that is not in this set fails the
+	// turn as a construction error.
+	Tools []HandlerToolSpec
 }
 
 type PlanComponent struct {
@@ -404,11 +412,16 @@ func (c *compiledRunPlan) compileAgentHandlers(owned PlanComponent, durable *ses
 		if capability.Factory == nil || capability.Kind == "" || capability.Version == "" || capability.ConfigHash == "" {
 			return fmt.Errorf("%w: agent handler behavior required", ErrExtensionPlanMismatch)
 		}
+		capability.Tools = discoverHandlerTools(capability.ID, capability.Factory)
 		c.ownedHandlers = append(c.ownedHandlers, ownedPlanAgentHandler{owner: owned.Component.InstanceID, value: capability})
-		durable.AgentHandlers = append(durable.AgentHandlers, session.AgentHandlerPlanIdentity{
+		identity := session.AgentHandlerPlanIdentity{
 			ID: capability.ID, Kind: capability.Kind, Version: capability.Version, ConfigHash: capability.ConfigHash,
 			Order: capability.Order, Scope: capability.Scope,
-		})
+		}
+		for _, toolSpec := range capability.Tools {
+			identity.Tools = append(identity.Tools, session.HandlerToolIdentity{Name: toolSpec.Name, SchemaHash: toolSpec.SchemaHash})
+		}
+		durable.AgentHandlers = append(durable.AgentHandlers, identity)
 	}
 	return nil
 }

@@ -32,9 +32,6 @@ func newTestWorkspaceHandlerBuildContext(t *testing.T) HandlerBuildContext {
 		SessionID: "session-1", WorkspaceRoot: root,
 		FilesystemBackend: fsBackend, SkillBackend: skillBackend,
 		PlanTaskBackend: planBackend, ReductionBackend: reductionBackend,
-		ToolWrapper: func(t tool.BaseTool) tool.BaseTool {
-			return newAdkGenericDurableTool(context.Background(), t, map[string]bool{})
-		},
 	}
 }
 

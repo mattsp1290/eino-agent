@@ -26,9 +26,16 @@ import (
 // composition.HandlerDescriptor.Kind constant below. Every recipe:
 //   - calls the upstream typed constructor directly (never reimplements its
 //     parser/planner/search logic);
-//   - wraps its result with wrapHandlerTools so any tool it injects into
-//     ChatModelAgentContext.Tools goes through the mandatory durable
-//     adapter before durableGuard sees it;
+//   - any tool it injects into ChatModelAgentContext.Tools is discovered
+//     once at plan-compile time (discoverHandlerTools) and sealed into the
+//     frozen tool universe -- a durable runtime.Tool built from that sealed
+//     identity is what actually dispatches to it, through the full durable
+//     claim/permission/execute/settle pipeline (see
+//     adkEngine.sealHandlerTools/handlerToolExecutor);
+//   - patchtoolcalls/reduction, the two recipes that legitimately rewrite a
+//     function_tool_result's content, are wrapped with
+//     wrapAuthorizedContentRewrites so settlementSeal recognizes their
+//     rewrites as sanctioned content management, not tampering;
 //   - fails construction closed when a required backend/config is missing.
 //
 // Each NewXxxHandlerFactory returns a HandlerFactory suitable for
@@ -88,7 +95,7 @@ func NewAgentsMDHandlerFactory(cfg AgentsMDConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapHandlerTools(mw, build.ToolWrapper), nil
+		return mw, nil
 	}
 }
 
@@ -124,7 +131,7 @@ func NewSkillHandlerFactory(cfg SkillConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapHandlerTools(mw, build.ToolWrapper), nil
+		return mw, nil
 	}
 }
 
@@ -158,7 +165,7 @@ func NewFilesystemHandlerFactory(cfg FilesystemConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapHandlerTools(mw, build.ToolWrapper), nil
+		return mw, nil
 	}
 }
 
@@ -183,7 +190,7 @@ func NewPlanTaskHandlerFactory(PlanTaskConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapHandlerTools(mw, build.ToolWrapper), nil
+		return mw, nil
 	}
 }
 
@@ -205,8 +212,10 @@ const defaultPatchedToolCallText = "This tool call's result is unavailable (its 
 // touches durable state: it can only make model INPUT well-formed for a
 // dangling call this runtime's own history never recorded a settlement for
 // (e.g. after external history editing) -- it cannot fabricate a durable
-// session.ToolCall settlement. It injects no tools, so no ToolWrapper
-// wrapping is needed.
+// session.ToolCall settlement. It injects no tools. Its patch is recorded
+// as an authorized rewrite (see wrapAuthorizedContentRewrites) so
+// settlementSeal treats it as a sanctioned content-management patch of an
+// unsettled call, not a fabrication.
 func NewPatchToolCallsHandlerFactory(cfg PatchToolCallsConfig) HandlerFactory {
 	text := cfg.PatchedText
 	if strings.TrimSpace(text) == "" {
@@ -221,7 +230,7 @@ func NewPatchToolCallsHandlerFactory(cfg PatchToolCallsConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return mw, nil
+		return wrapAuthorizedContentRewrites(mw, build.authorizeRewrite), nil
 	}
 }
 
@@ -266,7 +275,7 @@ func NewReductionHandlerFactoryWithTokenCounter(cfg ReductionConfig, counter Typ
 		if err != nil {
 			return nil, err
 		}
-		return wrapHandlerTools(mw, build.ToolWrapper), nil
+		return wrapAuthorizedContentRewrites(mw, build.authorizeRewrite), nil
 	}
 }
 
@@ -420,6 +429,6 @@ func NewToolSearchHandlerFactory(cfg ToolSearchHandlerConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapHandlerTools(mw, build.ToolWrapper), nil
+		return mw, nil
 	}
 }
