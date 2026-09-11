@@ -3,12 +3,12 @@ module github.com/mattsp1290/eino-agent
 go 1.26.3
 
 require (
-	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260624151131-d2049debabd9
+	github.com/ag-ui-protocol/ag-ui/sdks/community/go v0.0.0-20260909025854-aaa75b54d572
 	github.com/cloudwego/eino v0.9.19
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0
-	github.com/mattsp1290/eino-agui v0.1.1
+	github.com/mattsp1290/eino-agui v0.1.2-0.20260910172717-0e1d33d4f27f
 	github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b
 	github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2
 	github.com/pressly/goose/v3 v3.27.3
@@ -32,6 +32,7 @@ require (
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/platforms v0.2.1 // indirect
 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
+	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/distribution/reference v0.6.0 // indirect
 	github.com/docker/go-connections v0.7.0 // indirect
@@ -123,3 +124,5 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
+
+replace github.com/ag-ui-protocol/ag-ui/sdks/community/go => github.com/mattsp1290/ag-ui/sdks/community/go v0.0.0-20260909025854-aaa75b54d572

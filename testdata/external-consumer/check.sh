@@ -5,6 +5,13 @@ set -euo pipefail
 readonly root_module="github.com/mattsp1290/eino-agent"
 readonly nested_module="${root_module}/wasmext/gen"
 readonly nested_version="v0.1.0"
+# The eino-agui bridge (adopted in W7) requires the AG-UI Go SDK fork below.
+# Go replace directives are not transitive, so every consumer of eino-agent
+# -- including this external-consumer check -- must carry this same root
+# replacement itself; it is not satisfied by eino-agent's own go.mod replace.
+readonly aguisdk_replace_path="github.com/ag-ui-protocol/ag-ui/sdks/community/go"
+readonly aguisdk_replace_target="github.com/mattsp1290/ag-ui/sdks/community/go"
+readonly aguisdk_replace_version="v0.0.0-20260909025854-aaa75b54d572"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly script_dir
 repository_root="$(cd -- "${script_dir}/../.." && pwd -P)"
@@ -107,6 +114,7 @@ fi
 printf 'ROOT_MODULE_REQUESTED=%s@%s\n' "${root_module}" "${required_version}"
 printf 'ROOT_MODULE_SELECTED=%s@%s\n' "${root_module}" "${selected_required_version}"
 "${go_command[@]}" mod edit -require="${root_module}@${selected_required_version}"
+"${go_command[@]}" mod edit -replace="${aguisdk_replace_path}=${aguisdk_replace_target}@${aguisdk_replace_version}"
 
 if [[ "${mode}" == "local" ]]; then
 	"${go_command[@]}" mod edit -replace="${root_module}=${repository_root}"
@@ -122,16 +130,18 @@ if [[ -e "${consumer_dir}/go.work" || -d "${consumer_dir}/vendor" ]]; then
 fi
 
 if [[ "${mode}" == "published" ]]; then
-	if grep -Eq '^[[:space:]]*replace[[:space:](]' go.mod; then
-		printf 'external-consumer: published mode must not contain replacements\n' >&2
+	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 1 ]]; then
+		printf 'external-consumer: published mode requires exactly the ag-ui-protocol host replacement\n' >&2
 		exit 1
 	fi
+	grep -Fqx "replace ${aguisdk_replace_path} => ${aguisdk_replace_target} ${aguisdk_replace_version}" go.mod
 else
-	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 1 ]]; then
-		printf 'external-consumer: local mode requires exactly one root replacement\n' >&2
+	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 2 ]]; then
+		printf 'external-consumer: local mode requires exactly the root and ag-ui-protocol replacements\n' >&2
 		exit 1
 	fi
 	grep -Fqx "replace ${root_module} => ${repository_root}" go.mod
+	grep -Fqx "replace ${aguisdk_replace_path} => ${aguisdk_replace_target} ${aguisdk_replace_version}" go.mod
 fi
 
 "${go_command[@]}" mod tidy
@@ -162,10 +172,11 @@ if [[ "${mode}" == "published" ]]; then
 		printf 'external-consumer: published commit provenance does not match requested pin\n' >&2
 		exit 1
 	fi
-	if grep -Eq '^[[:space:]]*replace[[:space:](]' go.mod; then
-		printf 'external-consumer: tidy introduced a replacement in published mode\n' >&2
+	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 1 ]]; then
+		printf 'external-consumer: tidy changed the expected replacement set in published mode\n' >&2
 		exit 1
 	fi
+	grep -Fqx "replace ${aguisdk_replace_path} => ${aguisdk_replace_target} ${aguisdk_replace_version}" go.mod
 fi
 
 "${go_command[@]}" mod verify

@@ -183,7 +183,7 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 	}
 	b.closeOpen()
 	if payload.Name != "" {
-		b.emit.ToolStart(toolCallID, payload.Name)
+		b.emit.ToolStart(toolCallID, payload.Name, string(event.MessageID))
 	}
 	if payload.Arguments != "" {
 		b.emit.ToolArgs(toolCallID, payload.Arguments.String())
