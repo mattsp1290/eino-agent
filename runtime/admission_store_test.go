@@ -1054,6 +1054,49 @@ func (s *fakeExecutionStore) InterruptTurn(_ context.Context, request session.In
 	return session.InterruptTurnResult{Turn: candidate, Event: request.Event}, nil
 }
 
+func (s *fakeExecutionStore) ReconcileInterruptedTurn(_ context.Context, request session.ReconcileInterruptedTurnRequest) (session.ReconcileInterruptedTurnResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.valid() {
+		return session.ReconcileInterruptedTurnResult{}, session.ErrConflict
+	}
+	current, ok := s.turns[request.TurnID]
+	if !ok {
+		return session.ReconcileInterruptedTurnResult{}, session.ErrConflict
+	}
+	candidate, err := session.ApplyInterruptTurn(current, session.InterruptTurnRequest{TurnID: request.TurnID, Event: request.Event})
+	if err != nil {
+		return session.ReconcileInterruptedTurnResult{}, err
+	}
+	s.turns[candidate.ID] = candidate
+	for id, item := range s.inbox {
+		if item.TurnID == candidate.ID && item.State == session.InboxConsumed {
+			item.State = session.InboxQueued
+			item.TurnID = ""
+			s.inbox[id] = item
+		}
+	}
+	s.putEvent(request.Event)
+	return session.ReconcileInterruptedTurnResult{Turn: candidate, Event: request.Event}, nil
+}
+
+func (s *fakeExecutionStore) RepauseRun(_ context.Context, request session.RepauseRunRequest) (session.RepauseRunResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.valid() {
+		return session.RepauseRunResult{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	if err := session.ValidateRepauseRun(run, request); err != nil {
+		return session.RepauseRunResult{}, err
+	}
+	run.Status = session.RunPaused
+	run.LeaseUntil = time.Time{}
+	s.runs[run.ID] = run
+	s.putEvent(request.Event)
+	return session.RepauseRunResult{Run: run, Event: request.Event}, nil
+}
+
 func (s *fakeExecutionStore) StageCheckpoint(_ context.Context, request session.StageCheckpointRequest) (session.Checkpoint, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

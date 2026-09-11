@@ -39,6 +39,23 @@ func (o *StreamingOrchestrator) Resume(ctx context.Context, runID session.RunID)
 	if run.Paused() {
 		return o.ResumeRun(ctx, runID, ResumeRequest{})
 	}
+	// A running (not paused) run may still be ADK-TurnLoop-driven and have
+	// been abandoned by a crashed process: every fresh Start uses the ADK
+	// engine now, so a run with any admitted turn, or any promoted
+	// checkpoint from an earlier pause/resume cycle, was built by it. The
+	// legacy tool-only resume below has no notion of either -- it
+	// terminalizes unfinished tool calls but never reconciles a dangling
+	// turn's consumed inbox items, and unconditionally settles the run
+	// interrupted, discarding any promoted checkpoint entirely (round-three
+	// reconciliation item 4b/c, SR-4/RD-S5). Route those runs through the
+	// ADK-aware crash reconciliation path instead; only a run with no turns
+	// and no promoted checkpoint at all (never driven by the ADK engine)
+	// falls through to the legacy path.
+	if adkDriven, err := o.wasADKDriven(ctx, run); err != nil {
+		return nil, err
+	} else if adkDriven {
+		return o.reclaimAndReconcile(ctx, run)
+	}
 	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
 	if err != nil {
 		return nil, err
@@ -281,4 +298,140 @@ func errorString(value string) error {
 		return nil
 	}
 	return errors.New(value)
+}
+
+// wasADKDriven reports whether run was ever driven by the ADK TurnLoop
+// engine: it has at least one durable turn (every ADK admission, including
+// a fresh Start's first turn, goes through AdmitTurn), or a promoted
+// checkpoint from an earlier pause/resume cycle. A run with neither was
+// never touched by prepareTurnLoop and is safe for the legacy tool-only
+// resume path below.
+func (o *StreamingOrchestrator) wasADKDriven(ctx context.Context, run session.Run) (bool, error) {
+	turns, err := o.store.ListTurns(ctx, run.ID)
+	if err != nil {
+		return false, err
+	}
+	if len(turns) != 0 {
+		return true, nil
+	}
+	_, found, err := o.store.ReadPromotedCheckpoint(ctx, run.ID)
+	if err != nil {
+		return false, err
+	}
+	return found, nil
+}
+
+// reclaimAndReconcile is the ADK-aware counterpart of the legacy tool-only
+// resume above (round-three reconciliation item 4b/c): it reclaims a
+// running (or pending) run abandoned by a crashed process -- via the same
+// generic ClaimRun lease-expiry reclaim the legacy path already uses, so a
+// genuinely still-alive owner still wins ErrSessionBusy -- then
+// conservatively reconciles it: unfinished tool calls are terminalized
+// (never re-executed; matches terminalizeUnfinishedTools' existing
+// unsafe-running-tool-never-reruns contract), any turn left admitted/
+// running by the crash is settled interrupted with its consumed inbox
+// items requeued (ReconcileInterruptedTurn), and the run is then either
+// repaused (if it has ever had a promoted checkpoint, so a later ResumeRun
+// can resume it) or settled interrupted (if it never did, so there is
+// nothing to resume -- the requeued items stay durably `queued` for the
+// session's next Start to pick up via drainQueuedInbox, which is
+// session-scoped, not run-scoped).
+func (o *StreamingOrchestrator) reclaimAndReconcile(ctx context.Context, run session.Run) (Handle, error) {
+	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
+	if err != nil {
+		return nil, err
+	}
+	ownershipTransferred := false
+	defer func() {
+		if !ownershipTransferred {
+			plan.release()
+		}
+	}()
+	claimed, err := o.store.ClaimRun(ctx, session.RunClaim{
+		RunID: run.ID, OwnerID: o.ownerID(), ClaimToken: string(o.ids.NewEventID()), LeaseDuration: o.lease(),
+	})
+	if err != nil {
+		if errors.Is(err, session.ErrConflict) || errors.Is(err, session.ErrSessionBusy) {
+			return nil, session.ErrSessionBusy
+		}
+		return nil, err
+	}
+	execution := newRunExecution(o, plan, claimed)
+	ownershipTransferred = true
+	runCtx, cancel := context.WithCancel(ctx)
+	handle := &streamingHandle{
+		runID:       claimed.ID,
+		host:        o,
+		cancel:      cancel,
+		done:        make(chan Result, 1),
+		onInterrupt: func(reason string) { o.observeInterrupt(context.WithoutCancel(ctx), claimed, "", reason) },
+	}
+	go func() {
+		defer close(handle.done)
+		defer execution.release()
+		handle.done <- o.reconcileCrashedRun(context.WithoutCancel(runCtx), execution, claimed)
+	}()
+	return handle, nil
+}
+
+// reconcileCrashedRun performs reclaimAndReconcile's actual reconciliation
+// work under the just-taken claim; see that function's doc comment for the
+// full sequence and rationale.
+func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, execution *runExecution, run session.Run) Result {
+	o.observeResume(ctx, run, "reconcile")
+	calls, err := o.store.ListUnfinishedToolCalls(ctx, run.ID)
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	if len(calls) != 0 {
+		if err := execution.terminalizeUnfinishedTools(ctx, o.resumeSnapshot(run), calls); err != nil {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		}
+	}
+	turns, err := o.store.ListTurns(ctx, run.ID)
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	var dangling session.Turn
+	for _, t := range turns {
+		if (t.State == session.TurnAdmitted || t.State == session.TurnRunning) && t.Ordinal >= dangling.Ordinal {
+			dangling = t
+		}
+	}
+	if dangling.ID != "" {
+		event := session.EventRecord{
+			ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, EpochID: run.ContextEpoch,
+			TurnID: dangling.ID, Kind: session.RunPausedEventKind, CreatedAt: o.now(),
+		}
+		if _, err := execution.store.ReconcileInterruptedTurn(ctx, session.ReconcileInterruptedTurnRequest{TurnID: dangling.ID, Event: event}); err != nil {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		}
+	}
+	_, hasCheckpoint, err := o.store.ReadPromotedCheckpoint(ctx, run.ID)
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	if hasCheckpoint {
+		event := session.EventRecord{
+			ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, EpochID: run.ContextEpoch,
+			Kind: session.RunPausedEventKind, CreatedAt: o.now(),
+		}
+		if _, err := execution.store.RepauseRun(ctx, session.RepauseRunRequest{Event: event}); err != nil {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		}
+		return Result{RunID: run.ID, Status: session.RunPaused}
+	}
+	// No promoted checkpoint ever existed for this run (it crashed on its
+	// very first turn, before ever pausing): there is nothing a later
+	// ResumeRun could resume, so settle it interrupted. Any inbox items
+	// reconciled above stay durably `queued` for the session's next Start.
+	settlement := session.RunSettlement{Status: session.RunInterrupted, FinishedAt: o.now()}
+	committed, err := execution.store.SettleRun(ctx, session.SettleRunRequest{
+		Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID()},
+	})
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	execution.publishPersisted(ctx, committed.Event)
+	return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
 }

@@ -2,6 +2,7 @@ package sqlstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -84,6 +85,58 @@ func (e *executionStore) StartRun(ctx context.Context, startedAt time.Time) (ses
 		return err
 	})
 	return result, err
+}
+
+// RepauseRun implements session.ExecutionStore's compensating-write
+// primitive (round-three reconciliation item 4/SR-4a,c): it reverts this
+// fence's claim back to paused with no live lease, touching no checkpoint
+// row at all -- the run's most recently promoted revision (from whenever it
+// was last durably paused) is already the correct one for a later ResumeRun
+// to resume from. Mirrors PromotePause's run-status mutation exactly
+// (status=paused, lease_until cleared) but without PromotePause's
+// checkpoint-promotion and turn/inbox-interruption steps, which
+// ReconcileInterruptedTurn (turns.go) handles separately when there is a
+// dangling turn to reconcile first.
+func (e *executionStore) RepauseRun(ctx context.Context, request session.RepauseRunRequest) (session.RepauseRunResult, error) {
+	var result session.RepauseRunResult
+	err := e.withFence(ctx, func(store *Store, run session.Run) error {
+		if err := session.ValidateRepauseRun(run, request); err != nil {
+			return err
+		}
+		runKey, err := store.key(ctx, "runs", string(run.ID))
+		if err != nil {
+			return err
+		}
+		pausedRun := run
+		pausedRun.Status = session.RunPaused
+		runRaw, err := json.Marshal(pausedRun)
+		if err != nil {
+			return err
+		}
+		runDB := store.dbFor(ctx).Table(store.tableName("runs")).Where("row_key = ? AND claim_token = ? AND status IN ?", runKey, []byte(run.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+			"status": string(session.RunPaused), "lease_until": 0, "record": runRaw,
+		})
+		if err := store.mapErr(runDB.Error); err != nil {
+			return err
+		}
+		if err := rowsAffected(runDB); err != nil {
+			return err
+		}
+		finalRun, err := store.getRun(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		event, err := store.appendCanonicalEvent(ctx, request.Event)
+		if err != nil {
+			return err
+		}
+		result = session.RepauseRunResult{Run: finalRun, Event: event}
+		return nil
+	})
+	if err != nil {
+		return session.RepauseRunResult{}, err
+	}
+	return result, nil
 }
 
 func (e *executionStore) RenewRunLease(ctx context.Context, leaseDuration time.Duration) (session.Run, error) {

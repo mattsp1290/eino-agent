@@ -509,6 +509,11 @@ type ExecutionStore interface {
 	// InterruptTurn atomically settles an admitted turn as interrupted and
 	// its claimed inbox items as interrupted, without touching run status.
 	InterruptTurn(ctx context.Context, request InterruptTurnRequest) (InterruptTurnResult, error)
+	// ReconcileInterruptedTurn atomically settles a turn a crashed process
+	// left admitted/running as interrupted and requeues its consumed inbox
+	// items back to queued (see ReconcileInterruptedTurnRequest), without
+	// touching run status.
+	ReconcileInterruptedTurn(ctx context.Context, request ReconcileInterruptedTurnRequest) (ReconcileInterruptedTurnResult, error)
 	// StageCheckpoint inserts one unpromoted checkpoint revision under the
 	// fence.
 	StageCheckpoint(ctx context.Context, request StageCheckpointRequest) (Checkpoint, error)
@@ -522,6 +527,10 @@ type ExecutionStore interface {
 	// upToRevision for the fenced (running) run. Idempotent; never deletes a
 	// revision above upToRevision.
 	RetireCheckpoints(ctx context.Context, upToRevision int64) error
+	// RepauseRun atomically reverts this fence's claim back to paused, with
+	// no live lease, keeping whatever checkpoint is currently promoted
+	// unchanged (see RepauseRunRequest).
+	RepauseRun(ctx context.Context, request RepauseRunRequest) (RepauseRunResult, error)
 	ModelRequestWriter
 }
 

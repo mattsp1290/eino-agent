@@ -86,6 +86,27 @@ type InterruptTurnResult struct {
 	Event EventRecord
 }
 
+// ReconcileInterruptedTurnRequest atomically reconciles a turn a crashed
+// process left `admitted`/`running` with no checkpoint describing it: it
+// settles the turn interrupted (like InterruptTurn) and, unlike
+// InterruptTurn's live in-process pause path -- which carries the turn's
+// InboxConsumed rows forward as InboxInterrupted for the SAME turn to
+// complete once its checkpoint runner state resumes -- requeues those rows
+// back to InboxQueued instead, since there is no runner state to resume the
+// abandoned turn itself from. A fresh GenInput/AdmitTurn on the next resume
+// then explicitly re-admits them into a NEW turn.
+type ReconcileInterruptedTurnRequest struct {
+	TurnID TurnID
+	Event  EventRecord
+}
+
+// ReconcileInterruptedTurnResult is the canonical turn/event pair committed
+// by a reconciliation.
+type ReconcileInterruptedTurnResult struct {
+	Turn  Turn
+	Event EventRecord
+}
+
 // ValidateAdmitTurn checks the caller-owned shape of an admission request
 // against the currently fenced run, before any store mutation: identities
 // must agree, the turn must be freshly admitted with no terminal fields set,

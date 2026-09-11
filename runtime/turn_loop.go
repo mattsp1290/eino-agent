@@ -1485,25 +1485,21 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		// shape ED-1/item-1's claim-after-validate ordering was about:
 		// every check that could reject this resume has already run above,
 		// before ClaimRun, but this fenced write can still fail after the
-		// claim. Unlike that ordering fix, this is not compensated with a
-		// re-pause: doing so safely would need to re-derive a valid
-		// PromotePause request (turn/checkpoint identity) for a run that
-		// has not been driven at all yet in this attempt, which risks
-		// getting the pause's own invariants wrong under a failure path
-		// this thin. This matches the deliberately conservative posture of
-		// the checkpoint-Set-failure branch in finishTurnLoop: the run is
-		// left durably `running` under this claim with no driver and no
-		// heartbeat, recoverable only by lease expiry (after which a fresh
-		// ClaimRun/reconciliation sweep can retry), not immediately
-		// resumable via another ResumeRun call (which requires
-		// run.Paused()).
+		// claim. Round-three reconciliation item 4a (SR-I4): leaving the
+		// run durably `running` with no driver here is NOT recoverable by
+		// lease expiry -- ClaimRun has already CAS'd the status to
+		// `running`, and lease expiry changes only lease_until, never
+		// status, so activeRun keeps counting this run and every later
+		// Start on the session fails ErrSessionBusy indefinitely; the only
+		// other in-tree path (legacy Resume) has no notion of ADK
+		// checkpoints and would settle the run interrupted, discarding the
+		// promoted checkpoint entirely. Compensate instead: revert the
+		// claim back to paused (RepauseRun), keeping the checkpoint this
+		// resume attempt never touched intact, so a later ResumeRun call
+		// can simply try again.
 		started, err := execution.store.StartRun(runCtx, o.now())
 		if err != nil {
-			o.unregisterLoop(runID)
-			handle.done <- Result{RunID: runID, Status: session.RunFailed, Error: err}
-			close(handle.done)
-			close(handle.pause)
-			execution.release()
+			o.resumeStartFailureRepause(runCtx, execution, runID, claimed.SessionID, claimed.ContextEpoch, handle, err)
 			return
 		}
 		_ = started
@@ -1512,4 +1508,31 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		o.runTurnLoop(leaseCtx, entry, checkpoints, queuedIDs, handle.done, handle.pause, nil)
 	}()
 	return handle, nil
+}
+
+// resumeStartFailureRepause compensates a post-claim StartRun failure on
+// ResumeRun's path (see the goroutine above's doc comment): it reverts the
+// just-taken claim back to paused via RepauseRun, so the run stays
+// resumable instead of wedged `running` with no driver. If the compensating
+// write itself fails, the run is reported RunFailed and left for lease-
+// expiry recovery -- the same conservative posture finishTurnLoop's
+// checkpoint-Set-failure branch already takes when it cannot safely
+// compensate either.
+func (o *StreamingOrchestrator) resumeStartFailureRepause(ctx context.Context, execution *runExecution, runID session.RunID, sessionID session.ID, epochID session.EpochID, handle *turnLoopHandle, cause error) {
+	o.unregisterLoop(runID)
+	repauseCtx := context.WithoutCancel(ctx)
+	event := session.EventRecord{
+		ID: o.ids.NewEventID(), SessionID: sessionID, RunID: runID, EpochID: epochID,
+		Kind: session.RunPausedEventKind, CreatedAt: o.now(),
+	}
+	status := session.RunPaused
+	resultErr := cause
+	if _, repauseErr := execution.store.RepauseRun(repauseCtx, session.RepauseRunRequest{Event: event}); repauseErr != nil {
+		status = session.RunFailed
+		resultErr = errors.Join(cause, repauseErr)
+	}
+	handle.done <- Result{RunID: runID, Status: status, Error: resultErr}
+	close(handle.done)
+	close(handle.pause)
+	execution.release()
 }

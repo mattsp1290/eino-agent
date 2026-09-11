@@ -319,3 +319,65 @@ func (e *executionStore) InterruptTurn(ctx context.Context, request session.Inte
 	}
 	return result, nil
 }
+
+// ReconcileInterruptedTurn implements session.ExecutionStore's crash-
+// recovery reconciliation (round-three reconciliation item 4/SR-4b,
+// RD-S5): like InterruptTurn, it settles an admitted/running turn as
+// interrupted, but requeues the turn's consumed inbox items back to
+// InboxQueued (requeueInboxForTurn) instead of leaving them InboxInterrupted
+// -- there is no checkpoint runner state describing this turn (the process
+// driving it crashed before ever staging one), so nothing will ever resume
+// it directly; a fresh GenInput/AdmitTurn on the run's next resume must be
+// able to re-consume these items into a new turn.
+func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request session.ReconcileInterruptedTurnRequest) (session.ReconcileInterruptedTurnResult, error) {
+	var result session.ReconcileInterruptedTurnResult
+	err := e.withFence(ctx, func(store *Store, run session.Run) error {
+		row, err := store.turnRowByID(ctx, string(request.TurnID))
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				return session.ErrConflict
+			}
+			return err
+		}
+		current, err := decodeTurnRow(row)
+		if err != nil {
+			return err
+		}
+		if current.RunID != run.ID || current.SessionID != run.SessionID || current.RunID != e.fence.RunID {
+			return session.ErrConflict
+		}
+		candidate, err := session.ApplyInterruptTurn(current, session.InterruptTurnRequest{TurnID: request.TurnID, Event: request.Event})
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(candidate)
+		if err != nil {
+			return err
+		}
+		db := store.dbFor(ctx).Table(store.tableName("turns")).Where("row_key = ?", row.RowKey).Updates(map[string]any{
+			"state": string(candidate.State), "record": raw,
+		})
+		if err := store.mapErr(db.Error); err != nil {
+			return err
+		}
+		if err := rowsAffected(db); err != nil {
+			return err
+		}
+		if err := store.requeueInboxForTurn(ctx, row.RowKey, request.Event.CreatedAt); err != nil {
+			return err
+		}
+		// ReconcileInterruptedTurn is itself a typed atomic mutation
+		// method: it is trusted to append its caller's event verbatim (any
+		// kind), unlike the public AppendEvent path.
+		event, err := store.insertEvent(ctx, request.Event, true)
+		if err != nil {
+			return err
+		}
+		result = session.ReconcileInterruptedTurnResult{Turn: candidate, Event: event}
+		return nil
+	})
+	if err != nil {
+		return session.ReconcileInterruptedTurnResult{}, err
+	}
+	return result, nil
+}

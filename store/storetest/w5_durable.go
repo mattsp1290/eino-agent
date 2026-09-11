@@ -234,6 +234,67 @@ func turnsContract(t *testing.T, factory Factory) {
 				t.Fatalf("interrupt turn replay = %#v, %v; want %#v", replay, err, result)
 			}
 		})
+
+		t.Run("reconcile interrupted turn requeues consumed inbox and is idempotent", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-turns-reconcile")
+			r := admitRun(t, ctx, subject.Store, run("run-turns-reconcile", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			enqueued, err := subject.Store.EnqueueInbox(ctx, inboxItem("inbox-reconcile", s.ID, "key-reconcile", "hi", at), session.DefaultContentLimits())
+			if err != nil {
+				t.Fatalf("enqueue inbox: %v", err)
+			}
+			admitted, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-reconcile", r, 1, at),
+				UserMessages: []session.Message{message("turn-reconcile-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-reconcile-started", r, "turn-reconcile", at),
+				InboxIDs:     []session.InboxID{enqueued.ID},
+			})
+			if err != nil {
+				t.Fatalf("admit turn: %v", err)
+			}
+			reconciledAt := at.Add(time.Second)
+			event := session.EventRecord{ID: "turn-reconcile-event", SessionID: s.ID, RunID: r.ID, TurnID: admitted.Turn.ID, Kind: "turn_reconcile_test", Payload: []byte(`{}`), CreatedAt: reconciledAt}
+			result, err := execution.ReconcileInterruptedTurn(ctx, session.ReconcileInterruptedTurnRequest{TurnID: admitted.Turn.ID, Event: event})
+			if err != nil {
+				t.Fatalf("reconcile interrupted turn: %v", err)
+			}
+			if result.Turn.State != session.TurnInterrupted {
+				t.Fatalf("reconciled turn = %#v", result.Turn)
+			}
+			// Unlike InterruptTurn, the consumed item must be back to
+			// InboxQueued (not InboxInterrupted), with its turn linkage
+			// cleared, so a fresh AdmitTurn can re-consume it.
+			items, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued})
+			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID || items[0].TurnID != "" {
+				t.Fatalf("requeued inbox = %#v, %v", items, err)
+			}
+			replay, err := execution.ReconcileInterruptedTurn(ctx, session.ReconcileInterruptedTurnRequest{TurnID: admitted.Turn.ID, Event: event})
+			if err != nil || !reflect.DeepEqual(replay, result) {
+				t.Fatalf("reconcile interrupted turn replay = %#v, %v; want %#v", replay, err, result)
+			}
+			// The idempotent replay must not re-touch the now-InboxQueued
+			// item (it is no longer InboxConsumed under this turn).
+			items, err = subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued})
+			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID {
+				t.Fatalf("requeued inbox after replay = %#v, %v", items, err)
+			}
+			// The requeued item can be admitted fresh by a later turn.
+			if _, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-reconcile-2", r, 2, reconciledAt),
+				UserMessages: []session.Message{message("turn-reconcile-2-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-reconcile-2-started", r, "turn-reconcile-2", reconciledAt),
+				InboxIDs:     []session.InboxID{enqueued.ID},
+			}); err != nil {
+				t.Fatalf("admit second turn over requeued item: %v", err)
+			}
+			items, err = subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxConsumed})
+			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID || items[0].TurnID != "turn-reconcile-2" {
+				t.Fatalf("consumed inbox after second admit = %#v, %v", items, err)
+			}
+		})
 	})
 }
 
@@ -572,6 +633,72 @@ func pausedRunContract(t *testing.T, factory Factory) {
 			}
 			if !claimed.LeaseUntil.After(time.Now().UTC()) {
 				t.Fatalf("claimed run lease not renewed: %v", claimed.LeaseUntil)
+			}
+		})
+
+		// Round-three reconciliation item 4 (SR-4a,c): RepauseRun is the
+		// compensating write a post-claim failure (ResumeRun's StartRun, or
+		// a crash-recovery reclaim with nothing further to drive
+		// automatically) uses to put a claimed run back into a resumable
+		// paused state without touching its already-promoted checkpoint.
+		t.Run("repause run reverts a claim to paused without touching the promoted checkpoint", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-repause")
+			r := admitRun(t, ctx, subject.Store, run("run-repause", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			admitted, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-repause", r, 1, at),
+				UserMessages: []session.Message{message("turn-repause-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-repause-started", r, "turn-repause", at),
+			})
+			if err != nil {
+				t.Fatalf("admit turn: %v", err)
+			}
+			cp := stagedCheckpoint(r, 1, "cp-repause", session.CheckpointKindLoop, []byte("bytes"), at)
+			if _, err := execution.StageCheckpoint(ctx, session.StageCheckpointRequest{Checkpoint: cp}); err != nil {
+				t.Fatalf("stage checkpoint: %v", err)
+			}
+			pauseEvent := runPausedEvent("run-repause-event", r, at.Add(time.Second))
+			if _, err := execution.PromotePause(ctx, session.PromotePauseRequest{Revision: 1, TurnID: admitted.Turn.ID, Event: pauseEvent}); err != nil {
+				t.Fatalf("promote pause: %v", err)
+			}
+			// Reclaim, as ResumeRun's ClaimRun would, then simulate a
+			// post-claim failure that must not strand the run: revert via
+			// RepauseRun instead of leaving it running with no driver.
+			claimed, err := subject.Store.ClaimRun(ctx, session.RunClaim{RunID: r.ID, OwnerID: "resumer", ClaimToken: "resume-token", LeaseDuration: time.Minute})
+			if err != nil {
+				t.Fatalf("claim paused run: %v", err)
+			}
+			resumedExecution := executionFor(subject.Store, claimed)
+			repauseEvent := runPausedEvent("run-repause-compensate-event", claimed, at.Add(2*time.Second))
+			result, err := resumedExecution.RepauseRun(ctx, session.RepauseRunRequest{Event: repauseEvent})
+			if err != nil {
+				t.Fatalf("repause run: %v", err)
+			}
+			if result.Run.Status != session.RunPaused {
+				t.Fatalf("repaused run status = %q", result.Run.Status)
+			}
+			if result.Run.LeaseUntil.After(time.Now().UTC()) {
+				t.Fatalf("repaused run retains a live lease: %v", result.Run.LeaseUntil)
+			}
+			// The already-promoted checkpoint (revision 1) must be
+			// completely untouched: RepauseRun neither promotes nor retires
+			// anything.
+			promoted, found, err := subject.Store.ReadPromotedCheckpoint(ctx, r.ID)
+			if err != nil || !found || promoted.Revision != 1 {
+				t.Fatalf("read promoted checkpoint after repause = %#v, %v, %v", promoted, found, err)
+			}
+			// The claim that was just reverted can no longer write.
+			if _, err := resumedExecution.RenewRunLease(ctx, time.Minute); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("post-repause RenewRunLease = %v, want ErrConflict", err)
+			}
+			// A fresh claim succeeds immediately (paused, no lease wait),
+			// exactly as after any other durable pause.
+			reclaimed, err := subject.Store.ClaimRun(ctx, session.RunClaim{RunID: r.ID, OwnerID: "resumer-2", ClaimToken: "resume-token-2", LeaseDuration: time.Minute})
+			if err != nil || reclaimed.Status != session.RunRunning {
+				t.Fatalf("reclaim after repause = %#v, %v", reclaimed, err)
 			}
 		})
 
