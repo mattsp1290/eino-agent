@@ -109,12 +109,14 @@ func appendContentMessage(t testing.TB, ctx context.Context, execution session.E
 	if err != nil {
 		t.Fatalf("EncodeContentParts(%s): %v", id, err)
 	}
-	// A message whose sole block is a function_tool_result settles against a
-	// synthetic prerequisite request/claim (see appendFunctionToolResultPart)
-	// and creates its own result message as part of that settlement, so the
-	// generic message append below is skipped for that one shape to avoid
-	// double-appending (and mismatching) the same message ID.
-	onlyResultBlock := len(parts) == 1 && parts[0].Kind == session.PartFunctionToolResult
+	// A message whose sole block is a function_tool_result or
+	// tool_search_result settles against a synthetic prerequisite
+	// request/claim (see appendFunctionToolResultPart /
+	// appendToolSearchResultPart) and creates its own result message as
+	// part of that settlement, so the generic message append below is
+	// skipped for those shapes to avoid double-appending (and mismatching)
+	// the same message ID.
+	onlyResultBlock := len(parts) == 1 && (parts[0].Kind == session.PartFunctionToolResult || parts[0].Kind == session.PartToolSearchResult)
 	if !onlyResultBlock {
 		appendMessage(t, ctx, execution, message(id, sessionID, runID, role))
 	}
@@ -124,6 +126,8 @@ func appendContentMessage(t testing.TB, ctx context.Context, execution session.E
 			appendFunctionToolCallPart(t, ctx, execution, id, content.Blocks[i], p)
 		case p.Kind == session.PartFunctionToolResult && i < len(content.Blocks):
 			appendFunctionToolResultPart(t, ctx, execution, id, sessionID, runID, role, content.Blocks[i], p)
+		case p.Kind == session.PartToolSearchResult && i < len(content.Blocks):
+			appendToolSearchResultPart(t, ctx, execution, id, sessionID, runID, role, content.Blocks[i], p)
 		default:
 			appendPart(t, ctx, execution, p)
 		}
@@ -229,6 +233,91 @@ func appendFunctionToolResultPart(t testing.TB, ctx context.Context, execution s
 			t.Fatalf("encode recorded output shape for result part %s: %v", part.ID, err)
 		}
 		settlementOutput = raw
+	}
+	settlement := session.ToolSettlement{
+		ID: callID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted,
+		Output: settlementOutput, CompletedAt: at,
+		ResultMessage: session.Message{ID: resultMessageID, SessionID: sessionID, RunID: runID, ParentID: requestMessageID, Role: role, CreatedAt: at, UpdatedAt: at},
+		ResultPart:    part,
+	}
+	if _, err := execution.SettleToolCall(ctx, session.SettleToolCallRequest{
+		Settlement: settlement, Event: session.ToolTransitionEvent{ID: session.EventID("event-settle-" + string(part.ID)), CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("settle synthetic tool call for result part %s: %v", part.ID, err)
+	}
+}
+
+// appendToolSearchResultPart persists a tool_search_result content-block
+// part through the full CreateToolCall/ClaimToolCall/SettleToolCall
+// lifecycle, mirroring appendFunctionToolResultPart above.
+// session.PartToolSearchResult is a reserved kind on the fenced
+// executionStore.AppendPart (its only legitimate writer is settleToolCall's
+// reserved ResultPart, see store/internal/sqlstore/execution.go and
+// runtime/tool_search.go's buildTerminalToolSearchEnvelope), so a content
+// round-trip fixture exercising this block kind in isolation must go
+// through the same lifecycle rather than a generic AppendPart.
+func appendToolSearchResultPart(t testing.TB, ctx context.Context, execution session.ExecutionStore, resultMessageID session.MessageID, sessionID session.ID, runID session.RunID, role session.Role, block session.ContentBlock, part session.Part) {
+	t.Helper()
+	if block.ToolSearch == nil {
+		t.Fatalf("tool_search_result part %s: block missing ToolSearch payload", part.ID)
+	}
+	callID := session.ToolCallID(block.ToolSearch.CallID)
+	at := part.CreatedAt
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	requestMessageID := session.MessageID(string(resultMessageID) + "-synthetic-request")
+	appendMessage(t, ctx, execution, message(requestMessageID, sessionID, runID, session.RoleAssistant))
+	requestPartID := session.PartID(string(part.ID) + "-synthetic-request")
+	requestParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(requestPartID), Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(callID), Name: block.ToolSearch.Name, Arguments: "{}"},
+		}},
+	}, func() session.PartID { return requestPartID }, requestMessageID, sessionID, runID, at, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("encode synthetic tool request for part %s: %v", part.ID, err)
+	}
+	call := session.ToolCall{
+		ID: callID, SessionID: sessionID, RunID: runID, MessageID: requestMessageID,
+		RequestPartID: requestPartID, ResultMessageID: resultMessageID, ResultPartID: part.ID,
+		// call.Name must equal block.ToolSearch.Name exactly:
+		// validToolSearchResultEnvelope compares them directly (the search
+		// tool is never aliased).
+		Name: block.ToolSearch.Name, Input: json.RawMessage(`{}`), Status: session.ToolCallPending,
+	}
+	if _, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
+		Call: call, RequestPart: requestParts[0], Event: session.ToolTransitionEvent{ID: session.EventID("event-create-" + string(part.ID)), CreatedAt: at},
+	}); err != nil {
+		t.Fatalf("create synthetic tool call for result part %s: %v", part.ID, err)
+	}
+	claimed, err := execution.ClaimToolCall(ctx, session.ClaimToolCallRequest{
+		ID: callID, ClaimedBy: "storetest", ClaimToken: "storetest-" + string(part.ID), StartedAt: at, LeaseDuration: time.Minute,
+		Event: session.ToolTransitionEvent{ID: session.EventID("event-claim-" + string(part.ID)), CreatedAt: at},
+	})
+	if err != nil {
+		t.Fatalf("claim synthetic tool call for result part %s: %v", part.ID, err)
+	}
+	// store/internal/sqlstore's validToolSearchResultEnvelope cross-checks
+	// the durable tool_search_result block's discovered tool names against
+	// settlement.Output's recorded_tool_search_output_shape
+	// (discovered_tool_names), in order.
+	infos, err := block.ToolSearch.ToolInfos()
+	if err != nil {
+		t.Fatalf("decode tool search block tool infos for part %s: %v", part.ID, err)
+	}
+	names := make([]string, len(infos))
+	for i, info := range infos {
+		if info != nil {
+			names[i] = info.Name
+		}
+	}
+	settlementOutput, err := json.Marshal(struct {
+		DiscoveredToolNames []string `json:"discovered_tool_names"`
+	}{DiscoveredToolNames: names})
+	if err != nil {
+		t.Fatalf("encode recorded tool search output shape for part %s: %v", part.ID, err)
 	}
 	settlement := session.ToolSettlement{
 		ID: callID, ClaimedBy: claimed.Call.ClaimedBy, ClaimToken: claimed.Call.ClaimToken, Status: session.ToolCallCompleted,
@@ -432,11 +521,13 @@ func testContentAllBlockKinds(t *testing.T, factory Factory) {
 			if err != nil {
 				t.Fatalf("list messages: %v", err)
 			}
-			// function_tool_result parts settle against a synthetic
-			// prerequisite request (see appendFunctionToolResultPart), which
-			// adds its own message/part to the session; filter down to the
-			// fixture's own message so the content-fidelity comparison below
-			// still targets exactly the one block under test.
+			// function_tool_result and tool_search_result parts settle
+			// against a synthetic prerequisite request (see
+			// appendFunctionToolResultPart / appendToolSearchResultPart),
+			// which adds its own message/part to the session; filter down
+			// to the fixture's own message so the content-fidelity
+			// comparison below still targets exactly the one block under
+			// test.
 			var ownParts []session.Part
 			for _, part := range batch.Parts {
 				if part.MessageID == messageID {

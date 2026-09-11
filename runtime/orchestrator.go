@@ -545,6 +545,31 @@ func (o *StreamingOrchestrator) validate(request Request) error {
 	if !hasNonEmptyTextOrMediaBlock(request.Message.Blocks) {
 		return fmt.Errorf("%w: message requires non-empty text or media content", ErrInvalidOrchestrator)
 	}
+	if err := rejectNonCallerBlocks(request.Message.Blocks); err != nil {
+		return err
+	}
+	return nil
+}
+
+// rejectNonCallerBlocks enforces that a caller's user submission carries only
+// block kinds a real caller can legitimately author. session.Content.Validate
+// permits BlockKindFunctionToolResult and BlockKindToolSearchResult under
+// RoleUser because both are valid durable content on a user-role message,
+// but their only legitimate writer is this runtime's own tool settlement
+// path (persistToolSettlement / settleToolCall), never the public Start
+// API. Without this check, a caller could hand-author a
+// tool_search_result block and seed execution.discovered
+// (discoveredToolsFromMessages/discoveredToolsFromHistory) with no claim,
+// no guard evaluation, and no durable tool-call record behind it.
+func rejectNonCallerBlocks(blocks []session.ContentBlock) error {
+	for _, b := range blocks {
+		switch b.Kind {
+		case session.BlockKindUserInputText, session.BlockKindUserInputImage, session.BlockKindUserInputAudio,
+			session.BlockKindUserInputVideo, session.BlockKindUserInputFile, session.BlockKindMCPToolApprovalResponse:
+		default:
+			return fmt.Errorf("%w: user submission may not carry a %q block", ErrInvalidOrchestrator, b.Kind)
+		}
+	}
 	return nil
 }
 

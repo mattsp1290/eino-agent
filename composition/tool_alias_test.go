@@ -105,6 +105,78 @@ func TestRegistrarToolSearchDefaultsNameAndIsExposedOnPlan(t *testing.T) {
 	}
 }
 
+// TestStrictResumeRejectsRenamedToolSearchRegistration guards
+// composition-search-reviewer I3: the configured tool-search name is sealed
+// into ExtensionPlanDescriptor.ToolSearch (session/extensions.go), so a
+// resume whose tool-search registration was renamed between the original
+// run and the resume must fail with the standard plan-mismatch error
+// instead of surfacing later as "tool_search unavailable" deep inside
+// resume.
+func TestStrictResumeRejectsRenamedToolSearchRegistration(t *testing.T) {
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMount, err := registry.Mount(context.Background(), component("search-rename"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.ToolSearch(ToolSearchRegistration{ID: "search", Scope: extension.GlobalScope(), Name: "tool_search"})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := first.Descriptor()
+	if persisted.ToolSearch != "tool_search" {
+		t.Fatalf("persisted.ToolSearch = %q, want %q", persisted.ToolSearch, "tool_search")
+	}
+	first.Release()
+	if err := firstMount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	secondMount, err := registry.Mount(context.Background(), component("search-rename"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.ToolSearch(ToolSearchRegistration{ID: "search", Scope: extension.GlobalScope(), Name: "find_tools"})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = secondMount.Close(context.Background()) }()
+	assertResumePlanDrift(t, registry, "session-a", persisted)
+}
+
+// TestStrictResumeRejectsRemovedToolSearchRegistration guards the sibling
+// drift case: the tool-search registration is removed entirely between the
+// original run and the resume (persisted.ToolSearch is non-empty but the
+// live plan's is empty), which must also fail as a plan mismatch rather
+// than silently resuming with tool search disabled.
+func TestStrictResumeRejectsRemovedToolSearchRegistration(t *testing.T) {
+	registry, err := NewRegistry(nil, compositionNotice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount, err := registry.Mount(context.Background(), component("search-removed"), InstallerFunc(func(_ context.Context, registrar *Registrar) error {
+		return registrar.ToolSearch(ToolSearchRegistration{ID: "search", Scope: extension.GlobalScope(), Name: "tool_search"})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := registry.AcquireRunPlan(context.Background(), runtime.RunPlanRequest{SessionID: "session-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := plan.Descriptor()
+	if persisted.ToolSearch != "tool_search" {
+		t.Fatalf("persisted.ToolSearch = %q, want %q", persisted.ToolSearch, "tool_search")
+	}
+	plan.Release()
+	if err := mount.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	assertResumePlanDrift(t, registry, "session-a", persisted)
+}
+
 func TestComposedToolSchemaHashChangesWithAliasesAndDeferred(t *testing.T) {
 	base := definition("echo", "v1")
 	withAlias := definition("echo", "v1")

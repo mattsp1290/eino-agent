@@ -541,6 +541,9 @@ func Run(t *testing.T, factory Factory) {
 		if _, err := execution.AppendPart(ctx, session.Part{ID: "generic-result", MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartFunctionToolResult}); !errors.Is(err, session.ErrConflict) {
 			t.Fatalf("generic tool result part write = %v, want ErrConflict", err)
 		}
+		if _, err := execution.AppendPart(ctx, session.Part{ID: "generic-search-result", MessageID: msg.ID, SessionID: s.ID, RunID: r.ID, Kind: session.PartToolSearchResult}); !errors.Is(err, session.ErrConflict) {
+			t.Fatalf("generic tool search result part write = %v, want ErrConflict", err)
+		}
 		unfinishedRun := r
 		unfinishedRun.Status = session.RunFailed
 		unfinishedRun.FinishedAt = time.Now().UTC()

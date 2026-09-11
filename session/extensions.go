@@ -71,7 +71,16 @@ type ComponentPlan struct {
 // capability collections.
 type ExtensionPlanDescriptor struct {
 	Fingerprint string
-	Components  []ComponentPlan
+	// ToolSearch is the configured tool-search tool's model-visible name
+	// for this plan, or empty when tool search is not enabled. Unlike the
+	// rest of runtime.ToolSearchConfig (its description carries no
+	// execution authority), the name is sealed into the fingerprint so
+	// that a resume whose tool-search registration was renamed or removed
+	// between the original run and the resume is rejected with the
+	// standard plan-mismatch error instead of failing deep inside resume
+	// with "tool_search unavailable" (composition-search-reviewer I3).
+	ToolSearch string
+	Components []ComponentPlan
 }
 
 // SealedExtensionPlan is a validated, canonical extension-plan identity. The

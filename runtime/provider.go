@@ -19,6 +19,14 @@ import (
 // discovered; otherwise it is deferred (listed in Controls.DeferredTools).
 // The tool-search tool itself, if configured (s.ToolSearch), is never listed
 // in either list and instead becomes Controls.ToolSearchTool.
+//
+// When s.ToolSearch is nil (no tool-search tool registered for the plan, or
+// a restriction denies its configured name), a Deferred tool has no
+// mechanism by which it could ever be discovered: it is excluded from both
+// Controls.Tools and Controls.DeferredTools rather than advertised with no
+// way to call it. A model call to such a tool settles as the model-visible
+// denial "tool %q is deferred and no tool search is configured" (see
+// runtime/tool_preparation.go).
 func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentcontext.TraceContext, messages []*einoschema.AgenticMessage, discovered map[string]bool) model.Request {
 	var eager, deferred []*einoschema.ToolInfo
 	for _, t := range s.Tools {
@@ -28,9 +36,20 @@ func (s TurnSnapshot) ProviderRequest(messageID session.MessageID, trace agentco
 		if s.ToolSearch != nil && t.Name == s.ToolSearch.Name {
 			continue
 		}
-		if t.Deferred && !discovered[t.Name] {
-			deferred = append(deferred, t.Info)
-			continue
+		if t.Deferred {
+			if s.ToolSearch == nil {
+				// No tool search is configured for this plan (none
+				// registered, or the restriction set denies its name): a
+				// deferred tool has no mechanism by which it could ever be
+				// discovered, so it is excluded from both Controls.Tools
+				// and Controls.DeferredTools rather than advertised with no
+				// way to call it.
+				continue
+			}
+			if !discovered[t.Name] {
+				deferred = append(deferred, t.Info)
+				continue
+			}
 		}
 		eager = append(eager, t.Info)
 	}

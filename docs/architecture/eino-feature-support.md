@@ -310,17 +310,34 @@ Status: landed; W1 scaffolding kept green.
   search name that collides with any owned tool's canonical name or alias —
   without this, the colliding tool would be silently unreachable, since
   `prepareToolCalls` tests `isToolSearchCall` before resolving the call
-  against the tool registry. With that collision impossible, `ToolSearch` is
-  safe to keep out of the sealed durable `ExtensionPlanDescriptor`/
-  fingerprint: the search tool's name/description carry no execution
-  authority, since every tool it can surface is still validated against the
-  frozen registry at claim time. A tool restriction (`Allowed`/`Denied`) is
-  resolved through the plan's alias index before matching, so an entry
-  naming a tool's alias denies/allows the tool exactly as naming its
-  canonical name would (an entry naming neither is inert, not an error —
-  restriction sets may be authored for a wider registry); a restriction
-  denying the search tool's own configured name disables tool search for
-  the plan entirely (`RunPlan.ToolSearch()` returns nil).
+  against the tool registry. `ToolSearch`'s `Description` still carries no
+  execution authority (every tool it can surface is still validated against
+  the frozen registry at claim time) and stays out of the sealed descriptor,
+  but its configured `Name` is sealed into
+  `ExtensionPlanDescriptor.ToolSearch` (empty when no search is configured)
+  before `NewRunPlan` calls `SealExtensionPlanForSession`: without a stable
+  key, `composition.Registry.AcquireResumePlan` re-derives `ToolSearch` from
+  the live registry on every resume, so a renamed or removed registration
+  would otherwise resume successfully with the wrong (or no) search tool and
+  fail much later, deep inside resume, with `tool "tool_search" unavailable`
+  instead of the standard plan-mismatch error. A tool restriction
+  (`Allowed`/`Denied`) is resolved through the plan's alias index before
+  matching, so an entry naming a tool's alias denies/allows the tool exactly
+  as naming its canonical name would (an entry naming neither is inert, not
+  an error — restriction sets may be authored for a wider registry); for the
+  search tool specifically, only an explicit `Denied` entry naming its
+  configured name disables search for the plan entirely
+  (`RunPlan.ToolSearch()` returns nil) — an `Allowed` list is restriction
+  vocabulary for ordinary tools and never implicitly disables search merely
+  by omitting the search name (`planToolDenied`, not `planToolAllowed`, gates
+  this decision). When a plan has no `ToolSearch` (none registered, or
+  denied), a `Deferred` tool has no mechanism by which it could ever be
+  discovered: `TurnSnapshot.ProviderRequest` excludes it from both
+  `Controls.Tools` and `Controls.DeferredTools` rather than advertising it
+  with no way to call it, and a model call to it settles as the terminal,
+  model-visible denial `tool %q is deferred and no tool search is
+  configured` (naming the configured search tool instead, `call %s first`,
+  whenever one is present).
   `TurnSnapshot.ProviderRequest` partitions `snapshot.Tools` into
   `Controls.Tools` (non-deferred, plus any deferred tool already in the
   per-execution `discovered` set) and `Controls.DeferredTools` (the rest),
@@ -358,11 +375,22 @@ Status: landed; W1 scaffolding kept green.
   (`toolsearch.BeforeModelRewriteState`, which rescans the whole
   conversation on every model call rather than trusting a per-run in-memory
   set alone); a deferred tool discovered in run *N* is therefore callable in
-  run *N+1* without rediscovery. A call to a deferred tool not yet in
-  `discovered` settles as a terminal, model-visible denied call ("call
-  `tool_search` first") and the turn continues — exactly like a guard
-  denial — rather than aborting the run; an unknown/hallucinated tool name
-  stays fail-closed (aborts the run), unchanged from before. On `Resume`,
+  run *N+1* without rediscovery. Because discovery is derived from durable
+  `tool_search_result` content, that content's only legitimate writer must
+  be the settlement path: `session.PartToolSearchResult` is a reserved kind
+  on the fenced `executionStore.AppendPart` (alongside the `tool_call`/
+  `tool_result`/`function_tool_call`/`function_tool_result` kinds it is
+  written next to by `settleToolCall`'s reserved `ResultPart`), and
+  `StreamingOrchestrator.validate` rejects any caller-supplied block kind
+  outside the true caller-submittable set (`user_input_*`,
+  `mcp_tool_approval_response`) before admission — a hand-authored
+  `tool_search_result` block in a `Start` submission can never seed
+  `discovered` with no claim, no guard evaluation, and no durable tool-call
+  record behind it. A call to a deferred tool not yet in `discovered`
+  settles as a terminal, model-visible denied call ("call `tool_search`
+  first") and the turn continues — exactly like a guard denial — rather than
+  aborting the run; an unknown/hallucinated tool name stays fail-closed
+  (aborts the run), unchanged from before. On `Resume`,
   `discoveredToolsFromHistoryPaged` rebuilds the advertised set from the
   session's *full* durable history (paged until exhausted, decoded with
   `session.MaxContentLimits()`, with store errors propagated — not a single

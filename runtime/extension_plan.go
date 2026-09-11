@@ -99,13 +99,15 @@ type RunPlanSpec struct {
 	Dispatch   *extension.Plan
 	Components []PlanComponent
 	// ToolSearch configures the runtime tool-search tool for this plan, or
-	// nil when tool search is not enabled. It is deliberately NOT part of
-	// the sealed durable ExtensionPlanDescriptor/fingerprint (unlike
-	// tools/prompts/guards/restrictions): the search tool's own name and
-	// description carry no execution authority by themselves (every
-	// discovered tool it can ever surface is still validated against the
-	// frozen tool registry at claim time), so it is treated as run-time
-	// configuration rather than durable capability identity.
+	// nil when tool search is not enabled. Its Description carries no
+	// execution authority by itself (every discovered tool it can ever
+	// surface is still validated against the frozen tool registry at claim
+	// time) and is not sealed. Its Name is different: NewRunPlan seals the
+	// configured name into ExtensionPlanDescriptor.ToolSearch so that a
+	// resume whose tool-search registration was renamed or removed between
+	// the original run and the resume is rejected by the standard
+	// plan-mismatch error instead of failing deep inside resume with
+	// "tool_search unavailable" (composition-search-reviewer I3).
 	ToolSearch *ToolSearchConfig
 }
 
@@ -135,10 +137,6 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if err != nil {
 		return fail(err)
 	}
-	sealed, err := session.SealExtensionPlanForSession(spec.SessionID, compiled.descriptor)
-	if err != nil {
-		return fail(err)
-	}
 	toolSearch, err := normalizeToolSearchConfig(spec.ToolSearch)
 	if err != nil {
 		return fail(err)
@@ -147,12 +145,33 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 		if err := validateToolSearchNameCollision(toolSearch.Name, compiled); err != nil {
 			return fail(err)
 		}
-		// A restriction that denies the search tool's own name (or whose
-		// allow-list omits it) disables tool search for this plan, exactly
-		// as it would for an ordinary tool -- the collision check above
+		// The configured tool-search name is sealed into the durable
+		// fingerprint here, before sealing below, so that
+		// composition.Registry.AcquireResumePlan's fingerprint comparison
+		// (which re-derives ToolSearch from the live registry) rejects a
+		// resume whose tool-search registration was renamed or removed
+		// between the original run and the resume, instead of that drift
+		// surfacing deep inside resume as "tool_search unavailable"
+		// (composition-search-reviewer I3). It is sealed at its
+		// pre-restriction name deliberately: whether a restriction denies
+		// it is already independently captured by that restriction's own
+		// RestrictionPlanIdentity in the same descriptor.
+		compiled.descriptor.ToolSearch = toolSearch.Name
+	}
+	sealed, err := session.SealExtensionPlanForSession(spec.SessionID, compiled.descriptor)
+	if err != nil {
+		return fail(err)
+	}
+	if toolSearch != nil {
+		// Only an explicit Denied entry disables tool search for this plan;
+		// an Allowed list applies to ordinary tools and never disables the
+		// search tool merely by omitting its name (a restriction authored
+		// purely about tools, e.g. Allowed: ["echo"], must not silently
+		// strand every deferred tool as advertised-but-uncallable -- see
+		// ProviderRequest's doc comment). The collision check above
 		// guarantees the search name is disjoint from every tool name and
 		// alias, so this cannot accidentally disable an unrelated tool.
-		if !planToolAllowed(toolSearch.Name, compiled.restrictions, nil) {
+		if planToolDenied(toolSearch.Name, compiled.restrictions, nil) {
 			toolSearch = nil
 		}
 	}
@@ -596,6 +615,31 @@ func planToolAllowed(name string, restrictions []PlanRestriction, aliasIndex map
 		}
 	}
 	return true
+}
+
+// planToolDenied reports whether name is named by an explicit Denied entry
+// in any restriction, resolved through aliasIndex exactly like
+// planToolAllowed. Unlike planToolAllowed, it ignores every restriction's
+// Allowed list: it answers only "was this name explicitly denied", not "does
+// this name survive every restriction". It exists specifically for the
+// tool-search name, where an Allowed list authored purely about ordinary
+// tools must not implicitly disable search merely by omitting the search
+// name (see NewRunPlan).
+func planToolDenied(name string, restrictions []PlanRestriction, aliasIndex map[string]string) bool {
+	canonicalize := func(entry string) string {
+		if canonical, ok := aliasIndex[entry]; ok {
+			return canonical
+		}
+		return entry
+	}
+	for _, restriction := range restrictions {
+		for _, denied := range restriction.Denied {
+			if canonicalize(denied) == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (p *RunPlan) Descriptor() session.ExtensionPlanDescriptor {

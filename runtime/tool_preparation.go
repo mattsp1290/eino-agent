@@ -209,9 +209,16 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			// normalize/InputDecoder/ToolPrepare/Pattern -- the tool has not
 			// been vetted for use yet -- using the search name as the
 			// permission pattern, mirroring the isSearch branch above.
-			searchName := "tool search"
+			// With no tool search configured for the plan (none registered,
+			// or the restriction set denies its name), a deferred tool is
+			// excluded from both Controls.Tools and Controls.DeferredTools
+			// in TurnSnapshot.ProviderRequest -- it is never advertised at
+			// all -- so there is no search tool to name in the denial.
+			var denyErr error
 			if snapshot.ToolSearch != nil {
-				searchName = snapshot.ToolSearch.Name
+				denyErr = fmt.Errorf("tool %q unavailable: call %s first", canonicalName, snapshot.ToolSearch.Name)
+			} else {
+				denyErr = fmt.Errorf("tool %q is deferred and no tool search is configured", canonicalName)
 			}
 			call := ToolCall{
 				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
@@ -219,7 +226,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 				Input: cloneJSON(remapped), Context: toolContext(snapshot, snapshot.Tools),
 			}
 			block.Arguments = string(remapped)
-			denyErr := undiscoveredToolError{fmt.Errorf("tool %q unavailable: call %s first", canonicalName, searchName)}
+			denyErr = undiscoveredToolError{denyErr}
 			prepared = append(prepared, preparedToolCall{block: block, tool: tool, call: call, middlewareErr: denyErr})
 			continue
 		}

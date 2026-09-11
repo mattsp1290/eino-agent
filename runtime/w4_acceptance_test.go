@@ -788,6 +788,108 @@ func TestNewRunPlanDisablesToolSearchWhenRestrictionDeniesSearchName(t *testing.
 	}
 }
 
+// TestNewRunPlanKeepsToolSearchEnabledWhenAllowedListOmitsSearchName guards
+// SA-I2: an Allowed restriction list authored purely about ordinary tools
+// must not implicitly disable tool search merely because it omits the
+// search tool's own name. Only an explicit Denied entry (see
+// TestNewRunPlanDisablesToolSearchWhenRestrictionDeniesSearchName above)
+// disables search.
+func TestNewRunPlanKeepsToolSearchEnabledWhenAllowedListOmitsSearchName(t *testing.T) {
+	t.Parallel()
+	rules, err := CanonicalizeRestrictionRules([]string{"echo", "weather_tool"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := NewRunPlan(RunPlanSpec{
+		ToolSearch: &ToolSearchConfig{Name: "tool_search"},
+		Components: []PlanComponent{{Component: testPlanComponent("tools"), Tools: []PlanTool{{
+			Name: "echo", RegistrationID: "echo", Scope: extension.GlobalScope(),
+			SchemaHash: "schema", ExecutorHash: "executor",
+			Resolve: func(context.Context, ToolScopeContext) (Tool, error) { return Tool{Name: "echo"}, nil },
+		}, {
+			Name: "weather_tool", RegistrationID: "weather_tool", Scope: extension.GlobalScope(),
+			SchemaHash: "schema-weather", ExecutorHash: "executor-weather", Deferred: true,
+			Resolve: func(context.Context, ToolScopeContext) (Tool, error) {
+				return Tool{Name: "weather_tool", Deferred: true}, nil
+			},
+		}}, Restrictions: []PlanRestriction{{
+			RegistrationID: "restriction", Scope: extension.GlobalScope(), Allowed: rules.Allowed,
+		}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Release()
+	if plan.ToolSearch() == nil || plan.ToolSearch().Name != "tool_search" {
+		t.Fatalf("ToolSearch() = %+v, want non-nil (an Allowed list must not implicitly disable search)", plan.ToolSearch())
+	}
+}
+
+// TestProviderRequestExcludesDeferredToolsWhenNoToolSearchConfigured guards
+// SA-I2: when a plan has no ToolSearch (none registered, or denied by a
+// restriction), a Deferred tool has no mechanism by which it could ever be
+// discovered, so it must be excluded from both Controls.Tools and
+// Controls.DeferredTools entirely rather than advertised with no way to
+// call it.
+func TestProviderRequestExcludesDeferredToolsWhenNoToolSearchConfigured(t *testing.T) {
+	t.Parallel()
+	snapshot := TurnSnapshot{
+		Tools: []Tool{
+			{Name: "eager", Info: &einoschema.ToolInfo{Name: "eager"}},
+			{Name: "deferred_undiscovered", Deferred: true, Info: &einoschema.ToolInfo{Name: "deferred_undiscovered"}},
+		},
+	}
+	request := snapshot.ProviderRequest("msg-1", agentcontext.TraceContext{}, nil, nil)
+	if len(request.Controls.Tools) != 1 || request.Controls.Tools[0].Name != "eager" {
+		t.Fatalf("eager tools = %#v, want only \"eager\"", request.Controls.Tools)
+	}
+	if len(request.Controls.DeferredTools) != 0 {
+		t.Fatalf("deferred tools = %#v, want none advertised with no tool search configured", request.Controls.DeferredTools)
+	}
+	if request.Controls.ToolSearchTool != nil {
+		t.Fatalf("tool search tool = %#v, want nil", request.Controls.ToolSearchTool)
+	}
+}
+
+// TestOrchestratorSettlesDeferredCallAsFailedWhenNoToolSearchConfigured
+// guards SA-I2's model-visible denial: when a plan has no ToolSearch at
+// all, a model call to a deferred tool settles as a terminal, model-visible
+// denial naming no search tool (there is none to name), and the turn
+// continues.
+func TestOrchestratorSettlesDeferredCallAsFailedWhenNoToolSearchConfigured(t *testing.T) {
+	t.Parallel()
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if hasAnyFunctionToolResult(request.Messages) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "weather_tool", `{}`))}, nil
+	}))
+	orch.plans = staticRunPlanProvider{plan: testToolPlanWithSearch(t, []Tool{{
+		Name: "weather_tool", Deferred: true, Info: &einoschema.ToolInfo{Name: "weather_tool"},
+		Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Executor:  orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "{}"}, nil }),
+	}}, nil)}
+	result := startAndWait(t, orch)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed (turn continues past a no-search-configured denial)", result)
+	}
+	call, err := store.GetToolCall(context.Background(), "call-1")
+	if err != nil {
+		t.Fatalf("GetToolCall: %v", err)
+	}
+	if call.Status != session.ToolCallFailed {
+		t.Fatalf("call.Status = %q, want failed (denied)", call.Status)
+	}
+	var output ToolOutput
+	if err := json.Unmarshal(call.Output, &output); err != nil {
+		t.Fatalf("unmarshal call output: %v", err)
+	}
+	if !strings.Contains(output.Content, "is deferred and no tool search is configured") {
+		t.Fatalf("call output content = %q, want the no-search-configured denial", output.Content)
+	}
+}
+
 // --- resume of an interrupted tool_search call (item 6 / CS-C2) ---------
 
 // TestStreamingOrchestratorResumesPendingToolSearchCall guards

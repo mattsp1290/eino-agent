@@ -179,6 +179,66 @@ func TestValidateDefinitionRejectsArgumentAliasReusedAcrossCanonicalKeys(t *test
 	}
 }
 
+// TestValidateDefinitionRejectsArgumentAliasCollidingWithSchemaProperty
+// guards search-and-alias-reviewer I4/SA-I4: an argument alias that names a
+// real declared schema property would silently steal that property's value
+// at remap time (see remapToolArguments), mirroring upstream Eino's
+// compose.applyArgsAliases (eino@v0.9.19 compose/tool_node.go:434-486).
+func TestValidateDefinitionRejectsArgumentAliasCollidingWithSchemaProperty(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+		"path": {Type: einoschema.String},
+		"file": {Type: einoschema.String},
+	})
+	definition.ArgumentAliases = map[string][]string{"path": {"file"}}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+// TestValidateDefinitionRejectsArgumentAliasCanonicalKeyContainingDot
+// guards SA-I4: a canonical argument key containing "." would imply nested
+// field matching, which this port does not support.
+func TestValidateDefinitionRejectsArgumentAliasCanonicalKeyContainingDot(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.ArgumentAliases = map[string][]string{"a.b": {"c"}}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+// TestValidateDefinitionRejectsArgumentAliasEqualToAnotherCanonicalKey
+// guards SA-I4: an alias that is itself another entry's canonical key is a
+// deliberate strengthening over upstream Eino (justified because our
+// remapped input is persisted and permission-checked) -- it must be
+// rejected rather than silently accepted.
+func TestValidateDefinitionRejectsArgumentAliasEqualToAnotherCanonicalKey(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.ArgumentAliases = map[string][]string{"a": {"b"}, "b": {"c"}}
+	if err := ValidateDefinition(definition); !errors.Is(err, ErrInvalidDefinition) {
+		t.Fatalf("err = %v, want ErrInvalidDefinition", err)
+	}
+}
+
+// TestValidateDefinitionAcceptsArgumentAliasDistinctFromSchemaProperties is
+// the positive counterpart to the three rejections above: an argument alias
+// that is distinct from every declared schema property and every other
+// canonical key, with a canonical key containing no ".", must be accepted.
+func TestValidateDefinitionAcceptsArgumentAliasDistinctFromSchemaProperties(t *testing.T) {
+	t.Parallel()
+	definition := testDefinition("echo")
+	definition.Parameters = einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{
+		"path": {Type: einoschema.String},
+	})
+	definition.ArgumentAliases = map[string][]string{"path": {"file", "filename"}}
+	if err := ValidateDefinition(definition); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+}
+
 func TestValidateDefinitionAcceptsDistinctAliasesAndArgumentAliases(t *testing.T) {
 	t.Parallel()
 	definition := testDefinition("echo")
