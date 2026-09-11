@@ -61,12 +61,25 @@ const (
 // currently declares.
 const HandlerVersion1 = "1"
 
+// ErrHandlerConfiguration reports a host-facing agent-handler recipe
+// configuration problem -- a missing required backend, toolsearch's empty
+// deferred-tool registry, or a durable-history correlation summarization
+// could not resolve -- distinct from errADKUnsupportedBlock's narrower "adk
+// adapter cannot durably record this content block" meaning. Every site
+// that previously wrapped only errADKUnsupportedBlock for one of these
+// configuration-shaped failures now wraps BOTH sentinels (never in place of
+// errADKUnsupportedBlock, so any existing errors.Is(err, errADKUnsupportedBlock)
+// check keeps working), so a caller/log line can classify "this recipe was
+// configured wrong" apart from "this adapter hit an unsupported content
+// shape" -- see RW-S7 in the round-two W6 review.
+var ErrHandlerConfiguration = errors.New("agent handler configuration problem")
+
 // errHandlerMissingBackend reports that a recipe's required host-provided
 // backend (filesystem/skill read-only view, plantask/reduction scratch
 // backend, or a durable store) was not available for this run -- e.g.
 // because no workspace root is configured -- and so construction failed
 // closed rather than operating unscoped.
-var errHandlerMissingBackend = fmt.Errorf("%w: required backend unavailable", errADKUnsupportedBlock)
+var errHandlerMissingBackend = fmt.Errorf("%w: %w: required backend unavailable", ErrHandlerConfiguration, errADKUnsupportedBlock)
 
 // --- agentsmd ---------------------------------------------------------
 
@@ -565,7 +578,7 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 			sourceIDs = append(sourceIDs, projection.SourceMessageIDs[i])
 		}
 		if len(sourceIDs) != len(originalMessages) || len(sourceIDs) == 0 {
-			return nil, fmt.Errorf("%w: summarization could not correlate %d in-memory messages with %d durable messages", errADKUnsupportedBlock, len(originalMessages), len(sourceIDs))
+			return nil, fmt.Errorf("%w: %w: summarization could not correlate %d in-memory messages with %d durable messages", ErrHandlerConfiguration, errADKUnsupportedBlock, len(originalMessages), len(sourceIDs))
 		}
 		// A second pass over the FULL, unfiltered durable history (not
 		// epoch-projected) gives role and content-block-kind lookups by
@@ -714,7 +727,7 @@ type ToolSearchHandlerConfig struct {
 func NewToolSearchHandlerFactory(cfg ToolSearchHandlerConfig) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		if len(build.DeferredTools) == 0 {
-			return nil, fmt.Errorf("%w: toolsearch requires at least one deferred tool in the frozen registry", errADKUnsupportedBlock)
+			return nil, fmt.Errorf("%w: %w: toolsearch requires at least one deferred tool in the frozen registry", ErrHandlerConfiguration, errADKUnsupportedBlock)
 		}
 		mw, err := toolsearch.NewTyped[*einoschema.AgenticMessage](ctx, &toolsearch.Config{
 			DynamicTools: build.DeferredTools, UseModelToolSearch: cfg.UseModelToolSearch,

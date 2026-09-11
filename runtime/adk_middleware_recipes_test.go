@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -271,7 +272,37 @@ func TestSummarizationFinalizeFailsClosedOnLengthMismatch(t *testing.T) {
 	now := func() time.Time { return time.Unix(0, 0) }
 	build := HandlerBuildContext{SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: &sequenceIDs{}, now: now}}
 	finalize := summarizationFinalize(build, 0)
-	if _, err := finalize(context.Background(), []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("x")}, agenticAssistantText("summary")); err == nil {
+	_, err := finalize(context.Background(), []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("x")}, agenticAssistantText("summary"))
+	if err == nil {
 		t.Fatal("length mismatch was accepted instead of failing closed")
+	}
+	// RW-S7 in the round-two W6 review: a correlation failure is a
+	// configuration-shaped problem, not merely "adk adapter cannot
+	// durably record this content block" -- both sentinels must classify
+	// it, so neither an existing nor a new errors.Is check breaks.
+	if !errors.Is(err, ErrHandlerConfiguration) {
+		t.Fatalf("err = %v, want errors.Is(err, ErrHandlerConfiguration)", err)
+	}
+	if !errors.Is(err, errADKUnsupportedBlock) {
+		t.Fatalf("err = %v, want errors.Is(err, errADKUnsupportedBlock) preserved", err)
+	}
+}
+
+// TestHandlerConfigurationErrorClassifiesMissingBackendAndNoDeferredTools
+// proves RW-S7's fix for the other two named sites: a missing required
+// backend (errHandlerMissingBackend) and toolsearch's empty deferred-tool
+// registry both classify as ErrHandlerConfiguration, alongside the
+// preexisting errADKUnsupportedBlock classification.
+func TestHandlerConfigurationErrorClassifiesMissingBackendAndNoDeferredTools(t *testing.T) {
+	_, missingBackendErr := NewReductionHandlerFactory(ReductionConfig{})(context.Background(), HandlerBuildContext{})
+	if !errors.Is(missingBackendErr, ErrHandlerConfiguration) || !errors.Is(missingBackendErr, errADKUnsupportedBlock) {
+		t.Fatalf("missing-backend err = %v, want both ErrHandlerConfiguration and errADKUnsupportedBlock", missingBackendErr)
+	}
+
+	build := newTestWorkspaceHandlerBuildContext(t)
+	build.DeferredTools = nil
+	_, noDeferredErr := NewToolSearchHandlerFactory(ToolSearchHandlerConfig{})(context.Background(), build)
+	if !errors.Is(noDeferredErr, ErrHandlerConfiguration) || !errors.Is(noDeferredErr, errADKUnsupportedBlock) {
+		t.Fatalf("no-deferred-tools err = %v, want both ErrHandlerConfiguration and errADKUnsupportedBlock", noDeferredErr)
 	}
 }
