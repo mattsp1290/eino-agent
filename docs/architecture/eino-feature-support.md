@@ -1473,6 +1473,26 @@ unwritten (see that bullet for the exact, now-shorter list).
   race against a real `TurnLoop` was not reproducible even after 120
   iterations in the reviewer's own probe, so racing it in CI would be
   equally flaky and not actually discriminate a regression).
+- **Phase 9 (round-seven reconciliation)**: `Stop{Abandon: true}` refuses
+  with `ErrInvalidOrchestrator` while a loop is live in-process (abandon a
+  run only after it has paused; `TestStopAbandonAgainstLiveLoopReportsErrInvalidOrchestrator`).
+  Terminal settlement now terminalizes turns: `SettleRun` forces every
+  turn still admitted/running/interrupted (including content-free carrier
+  turns) to `TurnFailed` via `session.ApplyFailTurn` in the same fenced
+  transaction, carrying consumed/interrupted inbox rows forward as
+  `interrupted`; `TurnFailed` therefore has a writer, and no turn is left
+  non-terminal under a terminal run (storetest `paused_runs`/turn contract
+  on both stores). `resumeStartFailureRepause` delivers a `PauseInfo` on
+  `AwaitPause` whenever `Done` reports `RunPaused`. Source-visible interface
+  growth for embedders: `runtime.IDGenerator` gained `NewTurnID`,
+  `NewInboxID` and `NewInvocationID`; `runtime.Handle` gained `AwaitPause`
+  and `Status`; `session.Store`/`ExecutionStore` gained the turn, inbox,
+  checkpoint, repause and resume-interrupted-turn operations (see
+  `docs/consumer-guide.md`). Known follow-up, not a W5 defect: provider-
+  supplied tool-call ids are used verbatim as the store-wide unique
+  `tool_calls.id`, so a provider that reuses ids across responses (indexed
+  `call_0`-style ids) fails a later turn with a clean store conflict;
+  tracked as a separate bead.
 - Acceptance-test matrix (`runtime/acceptance_matrix_test.go`,
   `runtime/turn_loop_sqlite_test.go`, `runtime/w5_reconciliation_test.go`,
   `runtime/w5_round2_test.go`, `runtime/w5_round3_test.go`,

@@ -479,8 +479,9 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 		// on its very first turn, before ever pausing): ResumeRun itself
 		// refuses outright with no promoted checkpoint to read, so there is
 		// nothing a later resume could do even in principle. Settle it
-		// interrupted. Any turn reconciled above stays durably `interrupted`,
-		// its consumed inbox items carried forward as `interrupted` -- never
+		// interrupted. Terminal settlement then forces any turn reconciled
+		// above to `failed` (SettleRun terminalizes residual turns), with its
+		// consumed inbox items carried forward as `interrupted` -- never
 		// requeued to `queued` -- so its content is answered only via
 		// already-committed history, on some later run over this session
 		// (drainQueuedInbox will never see it again: it is not `queued`).

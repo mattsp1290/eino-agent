@@ -127,7 +127,12 @@ sizing, and lease tuning are optional. `IDGenerator`'s minted IDs must be
 globally unique, not per-process: a resumed or crash-reconciled run mints new
 rows into a session a different process already wrote, so an implementation
 that restarts a counter per process fails admission with `session.ErrConflict`
-once its IDs collide with an earlier process's.
+once its IDs collide with an earlier process's. Embedders implementing
+`runtime.IDGenerator` must also provide `NewTurnID`, `NewInboxID` and
+`NewInvocationID`; implementers of `session.Store`/`session.ExecutionStore`
+must provide the turn, inbox, checkpoint, repause and resume-interrupted-turn
+operations, and `SettleRun` must terminalize residual turns (see
+`session.ApplyFailTurn`).
 
 ```go
 // sql is database/sql; url is net/url. The SQLite package registers modernc.

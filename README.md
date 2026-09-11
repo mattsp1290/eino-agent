@@ -52,8 +52,9 @@ go run ./examples/minimal-server -addr :8080
 It wires:
 
 - `store/sqlite` as the durable transactional `session.Store`;
-- `runtime.StreamingOrchestrator` for run admission, durable input
-  (`Enqueue`), pause/resume (`Stop`/`ResumeRun`) and interruption;
+- `runtime.StreamingOrchestrator` for run admission and interruption (the
+  example wires `Start` and `Interrupt`; `Enqueue`, `Stop` and `ResumeRun`
+  are documented in `docs/consumer-guide.md`);
 - `stream.Tail` for live AG-UI deltas;
 - `transport.SessionWatchHandler` for coherent bounded session state and current live text;
 - `transport.SSEHandler` for the separate historical event replay/live-tail API;

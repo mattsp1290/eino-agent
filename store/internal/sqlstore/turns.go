@@ -386,11 +386,6 @@ func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request s
 	return result, nil
 }
 
-// ResumeInterruptedTurn implements session.ExecutionStore's redrive of a
-// TurnInterrupted turn (round-four reconciliation item 1/CR-C1): see
-// session.ResumeInterruptedTurnRequest for the full contract. It transitions
-// the turn to TurnRunning and its own InboxInterrupted rows back to
-// InboxConsumed, atomically, under the current run fence.
 // terminalizeResidualTurns forces every turn for the run identified by
 // runKey still TurnAdmitted, TurnRunning, or TurnInterrupted to TurnFailed,
 // carrying any of its own still-InboxConsumed/InboxInterrupted rows forward

@@ -497,6 +497,12 @@ type ExecutionStore interface {
 	WithinTx(ctx context.Context, fn func(context.Context, ExecutionStore) error) error
 	StartRun(ctx context.Context, startedAt time.Time) (Run, error)
 	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
+	// SettleRun applies a run's single terminal settlement under the fence.
+	// It refuses RunCompleted while the session still has queued inbox
+	// input (ErrRunHasQueuedInput) and, in the same transaction, forces
+	// every turn still admitted/running/interrupted to TurnFailed with its
+	// consumed/interrupted inbox rows carried forward as InboxInterrupted
+	// (ApplyFailTurn), so no turn is left non-terminal under a terminal run.
 	SettleRun(ctx context.Context, request SettleRunRequest) (RunSettlementResult, error)
 	SetSessionTitle(ctx context.Context, request SessionTitleRequest) (SessionTitleResult, error)
 	AppendMessage(ctx context.Context, message Message) (Message, error)
