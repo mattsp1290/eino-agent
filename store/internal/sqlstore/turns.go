@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -390,6 +391,52 @@ func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request s
 // session.ResumeInterruptedTurnRequest for the full contract. It transitions
 // the turn to TurnRunning and its own InboxInterrupted rows back to
 // InboxConsumed, atomically, under the current run fence.
+// terminalizeResidualTurns forces every turn for the run identified by
+// runKey still TurnAdmitted, TurnRunning, or TurnInterrupted to TurnFailed,
+// carrying any of its own still-InboxConsumed/InboxInterrupted rows forward
+// as InboxInterrupted -- exactly like ReconcileInterruptedTurn's own inbox
+// step, since the content is already durably committed and must never be
+// requeued. Called only from SettleRun's own fenced transaction (never as a
+// standalone ExecutionStore method), immediately after a run's FIRST
+// terminal settlement: once the run is terminal, no other path
+// (ResumeInterruptedTurn, CompleteTurn, ReconcileInterruptedTurn) can ever
+// reach these turns again, so leaving them TurnInterrupted would falsely
+// suggest they are still resumable -- see TurnFailed's own doc comment.
+func (s *Store) terminalizeResidualTurns(ctx context.Context, runKey int64, at time.Time) error {
+	var rows []turnRow
+	if err := s.turnQuery(ctx).Where("turns.run_key = ? AND turns.state IN ?", runKey,
+		[]string{string(session.TurnAdmitted), string(session.TurnRunning), string(session.TurnInterrupted)}).Find(&rows).Error; err != nil {
+		return s.mapErr(err)
+	}
+	for _, row := range rows {
+		current, err := decodeTurnRow(row)
+		if err != nil {
+			return err
+		}
+		candidate, err := session.ApplyFailTurn(current, at)
+		if err != nil {
+			return err
+		}
+		raw, err := json.Marshal(candidate)
+		if err != nil {
+			return err
+		}
+		db := s.dbFor(ctx).Table(s.tableName("turns")).Where("row_key = ?", row.RowKey).Updates(map[string]any{
+			"state": string(candidate.State), "record": raw,
+		})
+		if err := s.mapErr(db.Error); err != nil {
+			return err
+		}
+		if err := rowsAffected(db); err != nil {
+			return err
+		}
+		if err := s.settleInboxForTurn(ctx, row.RowKey, []session.InboxState{session.InboxConsumed, session.InboxInterrupted}, session.InboxInterrupted, at); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *executionStore) ResumeInterruptedTurn(ctx context.Context, request session.ResumeInterruptedTurnRequest) (session.ResumeInterruptedTurnResult, error) {
 	var result session.ResumeInterruptedTurnResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {

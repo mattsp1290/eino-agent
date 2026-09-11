@@ -355,6 +355,131 @@ func turnsContract(t *testing.T, factory Factory) {
 				t.Fatalf("resume of a completed turn = %v, want ErrConflict", err)
 			}
 		})
+
+		// Round-six reconciliation item 2 (round-seven fix-pass-6 item 2,
+		// MG-I4/RT): a run's own terminal SettleRun must terminalize every
+		// turn it leaves behind still TurnAdmitted, TurnRunning, or
+		// TurnInterrupted -- including a content-free carrier -- so no turn
+		// is ever left implying it might still run again once its run
+		// cannot be resumed. Exercised directly against the shared
+		// sqlstore (both dialects, via this contract).
+		t.Run("settle run terminalizes every turn left admitted, running, or interrupted", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-turns-settle-terminalize")
+			r := admitRun(t, ctx, subject.Store, run("run-turns-settle-terminalize", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+
+			// Turn 1: admitted, completed for real -- must be left
+			// completely untouched by the settlement below.
+			completeInbox, err := subject.Store.EnqueueInbox(ctx, inboxItem("inbox-settle-complete", s.ID, "key-settle-complete", "hi", at), session.DefaultContentLimits())
+			if err != nil {
+				t.Fatalf("enqueue inbox (complete): %v", err)
+			}
+			completedTurn, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-settle-complete", r, 1, at),
+				UserMessages: []session.Message{message("turn-settle-complete-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-settle-complete-started", r, "turn-settle-complete", at),
+				InboxIDs:     []session.InboxID{completeInbox.ID},
+			})
+			if err != nil {
+				t.Fatalf("admit turn (complete): %v", err)
+			}
+			if _, err := execution.CompleteTurn(ctx, session.CompleteTurnRequest{
+				TurnID: completedTurn.Turn.ID, ResponseMessageIDs: []session.MessageID{"turn-settle-complete-assistant"},
+				Event: turnCompletedEvent("turn-settle-complete-finished", r, completedTurn.Turn.ID, at.Add(time.Second)),
+			}); err != nil {
+				t.Fatalf("complete turn: %v", err)
+			}
+
+			// Turn 2: admitted with real content, never redriven, never
+			// settled -- exactly what a graceful stop landing before its
+			// first dispatch leaves behind (MG-I4's reproduction).
+			danglingInbox, err := subject.Store.EnqueueInbox(ctx, inboxItem("inbox-settle-dangling", s.ID, "key-settle-dangling", "hi", at), session.DefaultContentLimits())
+			if err != nil {
+				t.Fatalf("enqueue inbox (dangling): %v", err)
+			}
+			danglingTurn, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-settle-dangling", r, 2, at.Add(2*time.Second)),
+				UserMessages: []session.Message{message("turn-settle-dangling-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-settle-dangling-started", r, "turn-settle-dangling", at.Add(2*time.Second)),
+				InboxIDs:     []session.InboxID{danglingInbox.ID},
+			})
+			if err != nil {
+				t.Fatalf("admit turn (dangling): %v", err)
+			}
+
+			// Turn 3: a content-free carrier, already durably interrupted
+			// (promoteQueuedContinuation's own shape) -- must ALSO be
+			// terminalized, not merely left interrupted.
+			carrierTurn, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:  buildTurn("turn-settle-carrier", r, 3, at.Add(3*time.Second)),
+				Event: turnStartedEvent("turn-settle-carrier-started", r, "turn-settle-carrier", at.Add(3*time.Second)),
+			})
+			if err != nil {
+				t.Fatalf("admit turn (carrier): %v", err)
+			}
+			carrierEvent := session.EventRecord{ID: "turn-settle-carrier-interrupt", SessionID: s.ID, RunID: r.ID, TurnID: carrierTurn.Turn.ID, Kind: session.RunPausedEventKind, CreatedAt: at.Add(4 * time.Second)}
+			if _, err := execution.InterruptTurn(ctx, session.InterruptTurnRequest{TurnID: carrierTurn.Turn.ID, Event: carrierEvent}); err != nil {
+				t.Fatalf("interrupt turn (carrier): %v", err)
+			}
+
+			finishedAt := at.Add(5 * time.Second)
+			settleRequest := session.SettleRunRequest{
+				Settlement: session.RunSettlement{Status: session.RunCompleted, FinishedAt: finishedAt},
+				Event:      session.RunSettlementEvent{ID: "run-settle-terminalize-finished"},
+			}
+			if _, err := execution.SettleRun(ctx, settleRequest); err != nil {
+				t.Fatalf("settle run: %v", err)
+			}
+
+			gotCompleted, err := subject.Store.GetTurn(ctx, completedTurn.Turn.ID)
+			if err != nil || gotCompleted.State != session.TurnCompleted {
+				t.Fatalf("completed turn after settlement = %#v, err=%v, want untouched completed", gotCompleted, err)
+			}
+			gotDangling, err := subject.Store.GetTurn(ctx, danglingTurn.Turn.ID)
+			if err != nil || gotDangling.State != session.TurnFailed || !gotDangling.FinishedAt.Equal(finishedAt.UTC()) {
+				t.Fatalf("dangling turn after settlement = %#v, err=%v, want failed at %s", gotDangling, err, finishedAt)
+			}
+			gotCarrier, err := subject.Store.GetTurn(ctx, carrierTurn.Turn.ID)
+			if err != nil || gotCarrier.State != session.TurnFailed || !gotCarrier.FinishedAt.Equal(finishedAt.UTC()) {
+				t.Fatalf("carrier turn after settlement = %#v, err=%v, want failed at %s", gotCarrier, err, finishedAt)
+			}
+
+			// No turn under this now-terminal run may remain admitted,
+			// running, or interrupted.
+			turns, err := subject.Store.ListTurns(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("list turns: %v", err)
+			}
+			for _, turn := range turns {
+				if turn.State == session.TurnAdmitted || turn.State == session.TurnRunning || turn.State == session.TurnInterrupted {
+					t.Fatalf("turn %+v left non-terminal under a terminal run", turn)
+				}
+			}
+
+			// The dangling turn's own inbox item -- still InboxConsumed --
+			// is carried forward as InboxInterrupted, exactly like
+			// ReconcileInterruptedTurn's own inbox step, never requeued.
+			interrupted, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxInterrupted})
+			if err != nil || len(interrupted) != 1 || interrupted[0].ID != danglingInbox.ID {
+				t.Fatalf("interrupted inbox after settlement = %#v, %v, want exactly the dangling item", interrupted, err)
+			}
+			if queued, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued}); err != nil || len(queued) != 0 {
+				t.Fatalf("queued inbox after settlement = %#v, %v, want none (never requeued)", queued, err)
+			}
+
+			// Idempotent replay of the identical settlement must not error
+			// and must not disturb the now-terminalized turns.
+			if _, err := execution.SettleRun(ctx, settleRequest); err != nil {
+				t.Fatalf("settle run replay: %v", err)
+			}
+			replayDangling, err := subject.Store.GetTurn(ctx, danglingTurn.Turn.ID)
+			if err != nil || replayDangling.State != session.TurnFailed {
+				t.Fatalf("dangling turn after replayed settlement = %#v, err=%v, want still failed", replayDangling, err)
+			}
+		})
 	})
 }
 

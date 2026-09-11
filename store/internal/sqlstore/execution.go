@@ -273,6 +273,16 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 		if err := store.writeRun(ctx, canonicalRun); err != nil {
 			return err
 		}
+		// This run has just gone terminal for the first time (the
+		// current.Terminal() branch above handles every later replay
+		// without reaching here): force any turn still TurnAdmitted,
+		// TurnRunning, or TurnInterrupted to TurnFailed in this SAME fenced
+		// transaction, so no turn is ever left implying it might still run
+		// again once its run cannot be resumed (round-six reconciliation
+		// item 2's own gap -- see terminalizeResidualTurns).
+		if err := store.terminalizeResidualTurns(ctx, runKey, canonicalRun.FinishedAt); err != nil {
+			return err
+		}
 		canonicalEvent, err = store.appendCanonicalEvent(ctx, canonicalEvent)
 		if err != nil {
 			return err

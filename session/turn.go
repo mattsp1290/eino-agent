@@ -23,8 +23,12 @@ const (
 	// TurnInterrupted means InterruptTurn or PromotePause settled the turn
 	// without a normal response.
 	TurnInterrupted TurnState = "interrupted"
-	// TurnFailed is reserved for a future terminal failure path; no store
-	// method in this package writes it.
+	// TurnFailed means the turn's own run settled terminally (SettleRun)
+	// while the turn was still TurnAdmitted, TurnRunning, or TurnInterrupted
+	// (see ApplyFailTurn): unlike TurnInterrupted, which always implies a
+	// turn a later ResumeRun may still redrive, TurnFailed marks a turn its
+	// now-terminal run will never touch again -- no store method transitions
+	// a TurnFailed turn onward.
 	TurnFailed TurnState = "failed"
 )
 
@@ -238,6 +242,35 @@ func ApplyInterruptTurn(current Turn, request InterruptTurnRequest) (Turn, error
 	}
 	current.State = TurnInterrupted
 	current.FinishedAt = request.Event.CreatedAt.UTC()
+	return current, nil
+}
+
+// ApplyFailTurn derives the canonical failed turn from its currently
+// non-terminal durable state (TurnAdmitted, TurnRunning, or TurnInterrupted).
+// It exists for exactly one caller: a run's own terminal settlement
+// (SettleRun), which must never leave a turn behind in a state that implies
+// it might still run again once its run cannot ever be resumed (every
+// mutation path -- ResumeInterruptedTurn, CompleteTurn, ReconcileInterrupted
+// Turn -- fences through a live, nonterminal run). TurnInterrupted's usual
+// meaning ("durably paused, may still resume") no longer applies once the
+// run itself is terminal, so this is TurnFailed's first writer -- see its
+// own doc comment. Applying an identical failure to an already-failed turn
+// is idempotent.
+func ApplyFailTurn(current Turn, at time.Time) (Turn, error) {
+	if current.ID == "" || at.IsZero() {
+		return Turn{}, ErrConflict
+	}
+	if current.State == TurnFailed {
+		if current.FinishedAt.Equal(at.UTC()) {
+			return current, nil
+		}
+		return Turn{}, ErrConflict
+	}
+	if current.State != TurnAdmitted && current.State != TurnRunning && current.State != TurnInterrupted {
+		return Turn{}, ErrConflict
+	}
+	current.State = TurnFailed
+	current.FinishedAt = at.UTC()
 	return current, nil
 }
 

@@ -701,6 +701,31 @@ func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.Sett
 	if err := s.finishRunLocked(ctx, run); err != nil {
 		return session.RunSettlementResult{}, err
 	}
+	// Mirror store/internal/sqlstore's SettleRun (round-six reconciliation
+	// item 2): force any turn still TurnAdmitted, TurnRunning, or
+	// TurnInterrupted to TurnFailed in this same settlement, carrying its
+	// still-consumed/interrupted inbox rows forward as InboxInterrupted --
+	// never requeued -- so this fixture never diverges from the real
+	// stores on what a terminal run leaves behind.
+	for id, turn := range s.turns {
+		if turn.RunID != s.fence.RunID {
+			continue
+		}
+		if turn.State != session.TurnAdmitted && turn.State != session.TurnRunning && turn.State != session.TurnInterrupted {
+			continue
+		}
+		failed, err := session.ApplyFailTurn(turn, run.FinishedAt)
+		if err != nil {
+			return session.RunSettlementResult{}, err
+		}
+		s.turns[id] = failed
+		for itemID, item := range s.inbox {
+			if item.TurnID == failed.ID && (item.State == session.InboxConsumed || item.State == session.InboxInterrupted) {
+				item.State = session.InboxInterrupted
+				s.inbox[itemID] = item
+			}
+		}
+	}
 	record, err := s.appendEventLocked(ctx, event)
 	return session.RunSettlementResult{Run: run, Event: record}, err
 }
