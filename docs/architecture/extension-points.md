@@ -287,25 +287,35 @@ from entirely outside the `runtime` package, through only
 `composition.Registrar.Handler`/`runtime.StreamingOrchestrator`: a `Mount`
 function wires all eight upstream recipes this package ships
 (`runtime.HandlerKindAgentsMD`/`Skill`/`Filesystem`/`PlanTask`/
-`PatchToolCalls`/`Reduction`/`Summarization`/`ToolSearch`), and its test
-suite drives real turns exercising each recipe's positive and failure
-paths, ordering (two authorized content rewrites in one turn -- reduction
-clearing two settled tool results, with `Retention{MaxInlineBytes:-1}` so
-the payload is genuinely inline and only reduction, not this runtime's own
-retention truncation, can be what shortens it), an immutable-input proof
-via a custom `HandlerFactory` that tries to rewrite a settled result
-without authorization, a discovered deferred tool actually being called
-(not just found) after toolsearch surfaces it, and interrupt/resume
-including a handler `Config` change being refused on resume, and (round-two
-W6 review) toolsearch discovery durably replaying on a fresh turn, after
-`ResumeRun`, and after a brand-new orchestrator instance against the same
-store, plus a resumed run refusing to proceed when an activated skill's
-content changed between pause and resume -- see that package's own doc
-comment and the W6 section of `docs/architecture/eino-feature-support.md`
-for this example's one remaining scope limit (a "dangling call, no durable
-settlement" fixture for patchtoolcalls is exercised at the runtime-internal
-level, via seeded store history, rather than duplicated at this black-box
-level).
+`PatchToolCalls`/`Reduction`/`Summarization`/`ToolSearch`), each mounted
+individually and driven through a real turn exercising its own positive
+and failure paths, an immutable-input proof via a custom `HandlerFactory`
+that tries to rewrite a settled result without authorization, a discovered
+deferred tool actually being called (not just found) after toolsearch
+surfaces it, and interrupt/resume including a handler `Config` change
+being refused on resume, and (round-two W6 review) toolsearch discovery
+durably replaying on a fresh turn, after `ResumeRun`, and after a
+brand-new orchestrator instance against the same store, plus a resumed run
+refusing to proceed when an activated skill's content changed between
+pause and resume, scoped to the specific run being resumed rather than the
+whole session. Two DIFFERENT handlers rewriting two different results in
+one turn ("ordering with two rewrites") is proven in `runtime`'s own test
+suite instead
+(`TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized` in
+`runtime/w6_round2_group_g_test.go`: reduction clears a real settled round
+while patchtoolcalls fills a genuinely dangling call in the same turn,
+both authorized and audited); this example package's own
+`TestReductionClearsOlderRoundAsAuthorizedRewrite` exercises only
+reduction's own two-round clearing (one handler, two of its own rewrites),
+not two different handlers.
+See that package's own doc comment and the W6 section of
+`docs/architecture/eino-feature-support.md` for this example's remaining,
+explicitly deferred scope limits: a "dangling call, no durable settlement"
+fixture for patchtoolcalls is exercised at the runtime-internal level, via
+seeded store history, rather than duplicated at this black-box level; and
+no single turn mounts all eight recipes together in one composed
+multi-turn scenario (round-two W6 review item 14, deferred -- each recipe
+is proven individually here, not yet in combination).
 
 ## Request ledger and privacy
 

@@ -583,7 +583,15 @@ type SummarizationConfig struct {
 // contextEpochCapability. On cancellation or a failed summary generation,
 // upstream never calls Finalize at all, so no new epoch is created and the
 // previously active epoch stays in force -- see summarizationFinalize's
-// doc comment for the exact epoch-boundary derivation.
+// doc comment for the exact epoch-boundary derivation. Keeping the
+// previous epoch does NOT mean the turn itself succeeds: upstream's own
+// BeforeModelRewriteState propagates a failed or cancelled summary call's
+// error, failing that cycle -- the turn's own main dispatch never runs for
+// it. A failed summary call fails the turn (session.RunFailed); a
+// cancelled one maps to an interrupted outcome (session.RunInterrupted) --
+// see TestSummarizationFailedGenerationKeepsPreviousEpoch/
+// TestSummarizationCancelledGenerationKeepsPreviousEpoch in
+// examples/agentic-middleware.
 //
 // Trigger configuration (round-two W6 review item 9): at least one of
 // TriggerContextTokens/TriggerContextMessages must be configured --

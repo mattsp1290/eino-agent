@@ -559,12 +559,9 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 // TestCheckedInOldABIContextSourceRejectedCleanly loads a checked-in
 // context-source.wasm built against the superseded eino-agent:extensions
 // @0.1.0 world (flat text-message load-context, before the content-block
-// variant was introduced) against the current @0.2.0 host. The exported
-// function's structural shape no longer matches the world this host
-// compiles against, so wasmtime's own canonical-ABI type check rejects the
-// component at compile/instantiation time -- surfaced here as an ordinary
-// *Error, never a panic or process crash -- before any call is attempted.
-// TestCheckedInOldABIContextSourceRejectedCleanly proves the actual
+// variant was introduced) against the current @0.2.0 host, surfaced here as
+// an ordinary *Error, never a panic or process crash -- before any call is
+// attempted. TestCheckedInOldABIContextSourceRejectedCleanly proves the actual
 // rejection mechanism: the fixture is rejected at Compile because the
 // versioned world export name (eino-agent:extensions/context-source-api@0.2.0)
 // simply isn't found on a v0.1.0-built component -- a lookup-by-name

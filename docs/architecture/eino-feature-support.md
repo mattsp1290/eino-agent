@@ -1991,7 +1991,14 @@ below.
   or cancel the internal summary-generation call specifically
   (`TestSummarizationFailedGenerationKeepsPreviousEpoch`,
   `TestSummarizationCancelledGenerationKeepsPreviousEpoch`) rather than
-  configuring the trigger so high summarization never runs at all.
+  configuring the trigger so high summarization never runs at all. Keeping
+  the previous epoch does NOT mean the turn itself succeeds: upstream's own
+  `BeforeModelRewriteState` propagates a failed or cancelled summary call's
+  error, which fails that whole cycle -- the turn's own main dispatch never
+  even runs for it. A failed summary call fails the turn
+  (`session.RunFailed`); a cancelled one maps to an interrupted outcome
+  (`session.RunInterrupted`, `Result.Interrupted == true`) -- both proven by
+  the same two tests above, not merely asserted in this paragraph.
   Reduction's `MaxLengthForTrunc` truncation and `MaxTokensForClear`
   clearing are BOTH effective, through two different mechanisms with two
   different timings (round-two W6 review item 2). Truncation applies per
@@ -2168,9 +2175,10 @@ below.
     matter; lower severity than the items applied this pass.
   - **RW-S9** (state plainly in `wit/eino-agent-extensions.wit` that the
     package version, not a per-case version, is the variant's only
-    negotiable identity): pure documentation clarity in the WIT file
-    itself, not correctness/security/test honesty; left for a future WIT
-    documentation pass.
+    negotiable identity): APPLIED -- `wit/eino-agent-extensions.wit`'s
+    `content-block` variant doc comment (around line 116) now states this
+    explicitly, including the exact rejection mechanism (export-name lookup
+    at compile time, not a canonical-ABI/signature check).
 - **Group E (WASM/WIT content-block evolution)**: landed and verified.
   `wit/eino-agent-extensions.wit`'s `text-message` record is replaced by a
   `content-block` variant (`text(string)`, `media-reference`,
