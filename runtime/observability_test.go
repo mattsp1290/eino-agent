@@ -244,6 +244,83 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 	}
 }
 
+// TestStreamingOrchestratorRecordsProviderCallIDMetadataOnToolObservations
+// proves OC-S4: a tool call's provider-facing id (session.ToolCall.
+// ProviderCallID) is exported as a bounded, content-free
+// "metadata.provider_call_id" attribute on both the tool_call (start) and
+// tool.settled observations when the provider supplied one, and the key is
+// absent from both when it did not -- eino-obs exports Metadata verbatim as
+// "metadata.<key>" span attributes (see einoobs's session.go), so this
+// pins toolObservationMetadata's contract at the observation boundary, not
+// just the helper function in isolation.
+func TestStreamingOrchestratorRecordsProviderCallIDMetadataOnToolObservations(t *testing.T) {
+	t.Parallel()
+
+	t.Run("provider supplied an id", func(t *testing.T) {
+		t.Parallel()
+		observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+		store := newAdmissionStore()
+		orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+			for _, msg := range request.Messages {
+				if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+				}
+			}
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call_0", "echo", `{}`))}, nil
+		}))
+		orch.observer = observer
+		configureTestTools(orch, staticToolRegistry{tools: []Tool{{
+			Name:     "echo",
+			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil }),
+		}}})
+		result := startAndWait(t, orch)
+		if result.Status != session.RunCompleted {
+			t.Fatalf("result = %+v", result)
+		}
+		observations := observer.Snapshot().Observations
+		toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
+		if toolSpan.Attributes["metadata.provider_call_id"] != "call_0" {
+			t.Fatalf("tool_call metadata.provider_call_id = %#v, want call_0 (attrs=%#v)", toolSpan.Attributes["metadata.provider_call_id"], toolSpan.Attributes)
+		}
+		settled := assertObservation(t, observations, "tool.settled", "ok", "")
+		if settled.Attributes["metadata.provider_call_id"] != "call_0" {
+			t.Fatalf("tool.settled metadata.provider_call_id = %#v, want call_0 (attrs=%#v)", settled.Attributes["metadata.provider_call_id"], settled.Attributes)
+		}
+	})
+
+	t.Run("provider left the id empty", func(t *testing.T) {
+		t.Parallel()
+		observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+		store := newAdmissionStore()
+		orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+			for _, msg := range request.Messages {
+				if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+				}
+			}
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("", "echo", `{}`))}, nil
+		}))
+		orch.observer = observer
+		configureTestTools(orch, staticToolRegistry{tools: []Tool{{
+			Name:     "echo",
+			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil }),
+		}}})
+		result := startAndWait(t, orch)
+		if result.Status != session.RunCompleted {
+			t.Fatalf("result = %+v", result)
+		}
+		observations := observer.Snapshot().Observations
+		toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
+		if _, ok := toolSpan.Attributes["metadata.provider_call_id"]; ok {
+			t.Fatalf("tool_call metadata.provider_call_id present = %#v, want absent (attrs=%#v)", toolSpan.Attributes["metadata.provider_call_id"], toolSpan.Attributes)
+		}
+		settled := assertObservation(t, observations, "tool.settled", "ok", "")
+		if _, ok := settled.Attributes["metadata.provider_call_id"]; ok {
+			t.Fatalf("tool.settled metadata.provider_call_id present = %#v, want absent (attrs=%#v)", settled.Attributes["metadata.provider_call_id"], settled.Attributes)
+		}
+	})
+}
+
 func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *testing.T) {
 	t.Parallel()
 
