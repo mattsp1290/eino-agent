@@ -1937,40 +1937,65 @@ below.
   TaskUpdate, correlating the created task's numeric ID out of its own
   human-readable result message), `TestSkillHandlerInlineActivationThroughDurableWrapper`.
   Summarization's own internal summary-generation call runs through a
-  bounded `adkModel.internalDispatch` ("summarizer") adapter, not the
-  turn's own conversational adapter (round-one review finding C1/C3: it
-  previously did, so the summary text got persisted onto the turn's own
-  assistant message and corrupted the session -- a second turn on the same
-  session failed to admit). The internal-dispatch adapter is still fully
-  ledgered (its own `ModelRequestRecord` row, `AgentPath == "summarizer"`,
-  usage charged, retried/failed over through the same audited path) but
-  never claims the turn's assistant placeholder, never persists as
+  bounded `adkModel.internalDispatch` adapter, not the turn's own
+  conversational adapter (round-one review finding C1/C3: it previously
+  did, so the summary text got persisted onto the turn's own assistant
+  message and corrupted the session -- a second turn on the same session
+  failed to admit). The internal-dispatch adapter is tagged per plan entry
+  with that entry's own registered `HandlerID` (e.g. `AgentPath ==
+  "summarization"` for a handler registered under that ID -- never a
+  shared literal like `"summarizer"`, and never shared across entries),
+  is still fully ledgered (its own `ModelRequestRecord` row, usage
+  charged, retried/failed over through the same audited path) but never
+  claims the turn's assistant placeholder, never persists as
   conversational content, sends no tool controls, and fails closed on
   anything but plain text/reasoning
   (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`
   drives a real second `orch.Start` on the same session and asserts it
-  completes, the summarizer's ledger row carries `AgentPath ==
-  "summarizer"`, and the turn's own assistant message has exactly one
+  completes, the summarizer's ledger row carries the handler's own
+  `AgentPath`, and the turn's own assistant message has exactly one
   `assistant_gen_text` part).
   `summarizationFinalize` maps a completed summary into an atomic
-  `session.ContextEpoch`, correlating in-memory summarized messages to
-  durable messages via `history.LoadAgentic` applied through whatever
-  summarization epoch is already active for the session (so a SECOND
-  summarization on an already-compacted session correlates correctly
-  instead of failing closed forever after the first one), and commits
-  `StartContextEpoch` + the compaction boundary in ONE fenced transaction
-  (`compaction.AppendBoundaryTx`) so a mid-sequence failure can never leave
-  an epoch row with no `SummaryMessageID`. It never creates an epoch whose
-  `SummarizedFromID`/`SummarizedToID`/`TailStartID` overlap, moves the
-  retained tail's start back so a `function_tool_call` is never separated
-  from its `function_tool_result` (`moveTailStartToGroupBoundary`), and
-  always keeps the session's leading system-message prefix out of the
+  `session.ContextEpoch`, correlating upstream's in-memory
+  `originalMessages` to durable messages via a PER-CYCLE, POINTER-KEYED
+  lookup (`adkEngine.cycleMessageSourceByPointer`, rebuilt fresh every
+  cycle by the mandatory durable-baseline handler from that cycle's own
+  durable reload -- round-two W6 review item 8), not by positional index
+  or by `history.LoadAgentic` correlated through the active epoch: a
+  message with no durable id (content a host handler like agentsmd/skill
+  injected this cycle) simply resolves as "no durable id" and is always
+  retained verbatim. Because an earlier handler in the chain (host-authored
+  or this package's own, e.g. via `cloneProtectedMessages`) can legitimately
+  replace message pointers without preserving identity, `summarizationFinalize`
+  also falls back to CONTENT-based correlation (`reflect.DeepEqual` against
+  that cycle's own baseline, walked in order) for anything the pointer
+  lookup misses, and fails the turn closed -- rather than silently
+  compacting on a partial view -- if any durable baseline message still
+  cannot be accounted for either way (round-three W6
+  summarization-correctness review, Important #1). Summarization is also
+  bounded to firing at most once per turn (`summarizeAtMostOnceMiddleware`):
+  upstream re-evaluates its own trigger condition on every ReAct cycle with
+  no per-call override, so without this a multi-cycle turn that crosses the
+  threshold once would re-summarize -- and re-bill a real summary
+  generation call -- on every later cycle of the same turn (round-three W6
+  summarization-correctness review, Important #2). `summarizationFinalize`
+  commits `StartContextEpoch` + the compaction boundary in ONE fenced
+  transaction (`compaction.AppendBoundaryTx`) so a mid-sequence failure can
+  never leave an epoch row with no `SummaryMessageID`. It never creates an
+  epoch whose `SummarizedFromID`/`SummarizedToID`/`TailStartID` overlap,
+  moves the retained tail's start back so a `function_tool_call` is never
+  separated from its `function_tool_result` (`moveTailStartToGroupBoundary`),
+  and always keeps the session's leading system-message prefix out of the
   summarized range. `applyEpoch` (`session/history/projector.go`) likewise
   always preserves a session's leading system messages regardless of the
   active epoch, and no longer treats an empty `TailStartID` (nothing
   retained verbatim) as "nothing produced after this epoch is ever included
   again" -- the projection picks back up after the boundary message for
-  content later turns produce.
+  content later turns produce. A failed or cancelled summary-generation
+  call fails/interrupts the whole turn (upstream's own
+  `BeforeModelRewriteState` propagates the error before the turn's own
+  main dispatch ever runs for that cycle) and never creates a new epoch;
+  any previously committed epoch survives unchanged.
   `resolveTurnHistoryOptions` resolves the most recently finished
   summarization epoch fresh at every turn admission (both a brand-new run
   and a later turn on an existing run), so the provider projection actually
@@ -2149,10 +2174,6 @@ below.
     own eight recipes, whose tool schemas are static per configuration --
     only relevant to a hypothetical third-party handler whose schema is
     genuinely data-dependent.
-  - **HA-S2** (detect handler-tool name collisions at plan compile, not
-    just "last one wins" at seal time): a real but narrow gap; none of
-    this package's own recipes seal a colliding tool name, so it is not
-    exercised today.
   - **HA-S4** (`NewXxxHandlerFactoryFromConfig(json.RawMessage)`
     constructors binding `HandlerDescriptor.Config` to the factory
     closure by construction): a larger API/wiring redesign (new
@@ -2179,6 +2200,12 @@ below.
     `content-block` variant doc comment (around line 116) now states this
     explicitly, including the exact rejection mechanism (export-name lookup
     at compile time, not a canonical-ABI/signature check).
+  - **HA-S2** (detect handler-tool name collisions at plan compile, not
+    just "last one wins" at seal time): APPLIED in the round-two W6
+    review's own item 18/Group H -- `validateHandlerToolNameCollisions`
+    (`runtime/extension_plan.go`) rejects a handler-declared tool name that
+    collides with the native `tool_search` name or any plan tool/alias at
+    `NewRunPlan` compile time.
 - **Group E (WASM/WIT content-block evolution)**: landed and verified.
   `wit/eino-agent-extensions.wit`'s `text-message` record is replaced by a
   `content-block` variant (`text(string)`, `media-reference`,
@@ -2267,18 +2294,33 @@ below.
 - **Group F (`examples/agentic-middleware/`)**: landed and verified. A
   runnable `Mount` wires all eight recipes through only
   `composition.Registrar.Handler`/`runtime.StreamingOrchestrator` -- never
-  this package's own internals -- and a 19-test black-box suite proves the
+  this package's own internals -- and a 22-test black-box suite proves the
   acceptance scenarios hold from outside the runtime package, not only
-  inside its own white-box test suite: a combined agentsmd + skill +
+  inside its own white-box test suite. This includes (round-two W6 review
+  item 14) one composed example,
+  `TestComposedExampleMountsAllEightRecipesInOneRunPlan`, that mounts all
+  eight recipes together in one `RunPlan` and drives a real multi-turn
+  scenario exercising every one of them with concrete, per-recipe
+  assertions -- not a registration-only smoke test. Individually: a
+  combined agentsmd + skill +
   multimodal-filesystem-read + plantask create/update turn; missing-
   workspace-root failing every workspace-backed recipe closed; a symlink
   escaping the workspace root rejected without leaking content; reduction
-  truncating two large settled results in the same turn (two authorized
-  rewrites, proving ordering); summarization with a fake summary model
+  truncating a large settled result before settlement, and separately
+  clearing an older round once a second, more recent round exists (ONE
+  handler, two of its own rewrites in the same turn -- not two DIFFERENT
+  handlers; that scenario, "ordering with two rewrites", is proven in
+  `runtime`'s own test suite instead, via
+  `TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized`, and
+  -- as of the composed example below -- also inside this package itself);
+  summarization with a fake summary model
   writing a `session.ContextEpoch` while the full durable replay stays
-  intact (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`)
-  and a never-triggered summarization leaving no new epoch
-  (`TestSummarizationFailedGenerationKeepsPreviousEpoch`); patchtoolcalls
+  intact (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`),
+  and -- round-three W6 review item 16 -- a genuinely triggered but failed
+  or cancelled summary-generation call leaving a PRIOR, already-committed
+  epoch unchanged and creating no new one
+  (`TestSummarizationFailedGenerationKeepsPreviousEpoch`/
+  `TestSummarizationCancelledGenerationKeepsPreviousEpoch`); patchtoolcalls
   completing a normal turn without altering a real settlement; toolsearch
   finding a deferred tool by name and separately refusing construction
   with zero deferred tools; a custom, unauthorized `HandlerFactory` built
