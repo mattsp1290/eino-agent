@@ -45,12 +45,20 @@ func (e migrationError) Unwrap() error { return e.cause }
 
 // Test fixtures may supply an equivalent failing baseline or locker; every path
 // still uses the production validation and physical-connection cleanup adapter.
-func migrate(ctx context.Context, db *sql.DB, files fs.FS, delegate lock.SessionLocker) error {
+func migrate(ctx context.Context, db *sql.DB, files fs.FS, delegate lock.SessionLocker) (err error) {
 	if db == nil {
 		return fmt.Errorf("postgres migration: nil pool: %w", session.ErrConflict)
 	}
 	operation := newMigrationContext(ctx)
-	defer operation.stop()
+	// Owner-side backstop: SessionLock's error defer and SessionUnlock
+	// already stop (and, if interrupted, discard through) operation on the
+	// normal paths. This only does anything if goose never reached either -
+	// for example a panic recovered elsewhere in the provider - in which
+	// case it is this goroutine's last chance to discard a connection whose
+	// transport an interrupt may have closed.
+	defer func() {
+		err = errors.Join(err, operation.stop())
+	}()
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, files,
 		goose.WithTableName("public.eino_agent_goose_version"),
 		goose.WithDisableGlobalRegistry(true),
