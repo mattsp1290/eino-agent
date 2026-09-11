@@ -64,7 +64,7 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
-	if len(events.Events) != 1 || events.Events[0].Kind != string(EventRunStarted) {
+	if len(events.Events) != 2 || events.Events[0].Kind != session.TurnStartedEventKind || events.Events[1].Kind != string(EventRunStarted) {
 		t.Fatalf("events = %#v", events.Events)
 	}
 	epochs, err := store.ListContextEpochs(context.Background(), "session-1")
@@ -74,8 +74,8 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].Trigger != "turn" || epochs[0].Reason != "run_admission" {
 		t.Fatalf("epochs = %#v", epochs)
 	}
-	if !reflect.DeepEqual(admitted.Event, events.Events[0]) {
-		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[0])
+	if !reflect.DeepEqual(admitted.Event, events.Events[1]) {
+		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[1])
 	}
 	request.Config.Agent.Options["temperature"] = "changed"
 	request.UserMessage.Blocks[0].Text.Text = "changed"
@@ -357,6 +357,8 @@ func testRunAdmission() admissionRequest {
 			ContextEpochID:     "epoch-1",
 			EventID:            "event-1",
 			RunClaimToken:      "claim-run-1",
+			TurnID:             "turn-1",
+			TurnStartedEventID: "turn-started-1",
 		},
 		UserMessage: testUserMessage("hello"),
 		Config: config.Snapshot{

@@ -192,6 +192,8 @@ func TestAdmissionSQLiteRollsBackAfterUserPartWrite(t *testing.T) {
 	secondRequest.IDs.ContextEpochID = "epoch-2"
 	secondRequest.IDs.EventID = "event-2"
 	secondRequest.IDs.RunClaimToken = "claim-run-2"
+	secondRequest.IDs.TurnID = "turn-2"
+	secondRequest.IDs.TurnStartedEventID = "turn-started-2"
 	secondRequest.UserMessage.Blocks[0].Text.Text = "second prompt"
 	_, err = (admitter{Store: &failingAdmissionStore{Store: store}, Clock: func() time.Time { return now }}).admit(ctx, secondRequest)
 	if !errors.Is(err, errInjectedSecondAdmissionMessage) {
@@ -290,7 +292,7 @@ func (s *failingAdmissionStore) WithinTx(ctx context.Context, fn func(context.Co
 
 type failingAdmissionTx struct {
 	session.Store
-	appendMessages int
+	appendEvents int
 }
 
 func (s *failingAdmissionTx) Execution(fence session.RunFence) session.ExecutionStore {
@@ -302,12 +304,20 @@ type failingAdmissionExecution struct {
 	tx *failingAdmissionTx
 }
 
-func (s *failingAdmissionExecution) AppendMessage(ctx context.Context, message session.Message) (session.Message, error) {
-	s.tx.appendMessages++
-	if s.tx.appendMessages == 2 {
-		return session.Message{}, errInjectedSecondAdmissionMessage
+// AppendEvent is the only admission write that still reaches this wrapper
+// through the public ExecutionStore interface: AdmitTurn (turn/message/part
+// admission) is implemented directly on the concrete sqlstore.Store, not
+// through the injected interface, so fault injection targets the run_started
+// event admitDurable appends immediately after AdmitTurn commits -- still
+// proving that a failure partway through admission (after the turn's
+// messages/parts/turn row are durably written) rolls back the whole
+// transaction, including the earlier AdmitTurn writes.
+func (s *failingAdmissionExecution) AppendEvent(ctx context.Context, event session.EventRecord) (session.EventRecord, error) {
+	s.tx.appendEvents++
+	if s.tx.appendEvents == 1 {
+		return session.EventRecord{}, errInjectedSecondAdmissionMessage
 	}
-	return s.ExecutionStore.AppendMessage(ctx, message)
+	return s.ExecutionStore.AppendEvent(ctx, event)
 }
 
 var _ session.Store = (*failingAdmissionStore)(nil)

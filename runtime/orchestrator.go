@@ -116,6 +116,8 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 		ContextEpochID:     o.ids.NewEpochID(),
 		EventID:            o.ids.NewEventID(),
 		RunClaimToken:      string(o.ids.NewEventID()),
+		TurnID:             o.ids.NewTurnID(),
+		TurnStartedEventID: o.ids.NewEventID(),
 	}
 	// history.Options.ContentLimits must track the orchestrator's configured
 	// content bounds so decoding never diverges from the bounds admission

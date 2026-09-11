@@ -28,6 +28,11 @@ type admissionIDs struct {
 	ContextEpochID     session.EpochID
 	EventID            session.EventID
 	RunClaimToken      string
+	// TurnID and TurnStartedEventID identify the run's first admitted turn,
+	// committed atomically with admission (see admitDurable). Distinct from
+	// EventID, which identifies the separate run_started event.
+	TurnID             session.TurnID
+	TurnStartedEventID session.EventID
 }
 
 type admissionRequest struct {
@@ -51,6 +56,9 @@ type admittedRun struct {
 	AssistantMessage session.Message
 	Event            session.EventRecord
 	Snapshot         TurnSnapshot
+	// Turn is the run's first admitted turn (ordinal 1), committed
+	// atomically with the run/session/messages/epoch by admitDurable.
+	Turn session.Turn
 }
 
 type admitter struct {
@@ -141,23 +149,25 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if _, err := executionStore.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
 		return admittedRun{}, err
 	}
-	userMessage, err := executionStore.AppendMessage(ctx, admissionUserMessage(request, sessionRecord.ID, runRecord.ID, userAt))
-	if err != nil {
-		return admittedRun{}, err
-	}
+	userMessage := admissionUserMessage(request, sessionRecord.ID, runRecord.ID, userAt)
 	userParts, err := admissionUserParts(request, sessionRecord.ID, runRecord.ID, userMessage.ID, userAt)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: encode user content: %v", ErrInvalidAdmission, err)
 	}
-	persistedUserParts := make([]session.Part, 0, len(userParts))
-	for _, p := range userParts {
-		persisted, err := executionStore.AppendPart(ctx, p)
-		if err != nil {
-			return admittedRun{}, err
-		}
-		persistedUserParts = append(persistedUserParts, persisted)
+	assistantMessage := admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, assistantAt)
+	turn := session.Turn{
+		ID: request.IDs.TurnID, RunID: runRecord.ID, SessionID: sessionRecord.ID, Ordinal: 1, State: session.TurnAdmitted,
+		UserMessageIDs: []session.MessageID{userMessage.ID}, AssistantMessageID: assistantMessage.ID,
+		EpochID: request.IDs.ContextEpochID, CreatedAt: now,
 	}
-	assistantMessage, err := executionStore.AppendMessage(ctx, admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, assistantAt))
+	turnStartedEvent := session.EventRecord{
+		ID: request.IDs.TurnStartedEventID, SessionID: sessionRecord.ID, RunID: runRecord.ID, MessageID: assistantMessage.ID,
+		EpochID: request.IDs.ContextEpochID, TurnID: turn.ID, Kind: session.TurnStartedEventKind, CreatedAt: now,
+	}
+	admitted, err := executionStore.AdmitTurn(ctx, session.AdmitTurnRequest{
+		Turn: turn, UserMessages: []session.Message{userMessage}, UserParts: userParts,
+		AssistantPlaceholder: assistantMessage, Event: turnStartedEvent,
+	})
 	if err != nil {
 		return admittedRun{}, err
 	}
@@ -166,7 +176,9 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	return buildAdmission(sessionRecord, runRecord, userMessage, persistedUserParts, assistantMessage, committedEvent, snapshot, now), nil
+	result := buildAdmission(sessionRecord, runRecord, userMessage, userParts, assistantMessage, committedEvent, snapshot, now)
+	result.Turn = admitted.Turn
+	return result, nil
 }
 
 func getOrCreateAdmissionSession(ctx context.Context, store session.Store, request admissionRequest, now time.Time) (session.Session, error) {
@@ -298,6 +310,10 @@ func validateAdmissionIdentity(ids admissionIDs) error {
 		return fmt.Errorf("%w: event id required", ErrInvalidAdmission)
 	case ids.RunClaimToken == "":
 		return fmt.Errorf("%w: run claim token required", ErrInvalidAdmission)
+	case ids.TurnID == "":
+		return fmt.Errorf("%w: turn id required", ErrInvalidAdmission)
+	case ids.TurnStartedEventID == "":
+		return fmt.Errorf("%w: turn started event id required", ErrInvalidAdmission)
 	}
 	generated := []string{
 		string(ids.RunID),
@@ -306,6 +322,8 @@ func validateAdmissionIdentity(ids admissionIDs) error {
 		string(ids.ContextEpochID),
 		string(ids.EventID),
 		ids.RunClaimToken,
+		string(ids.TurnID),
+		string(ids.TurnStartedEventID),
 	}
 	for _, id := range ids.UserPartIDs {
 		if id == "" {
