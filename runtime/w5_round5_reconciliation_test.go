@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -31,8 +32,22 @@ func gobEncodeTurnLoopCheckpointShape(t *testing.T, shape turnLoopCheckpointShap
 	return buf.Bytes()
 }
 
-// TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems
-// proves round-five reconciliation item 1 (TR-C1): the reconciled-turn
+// TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems is a
+// synthetic unit test of genInput's sentinel scan alone (round-six
+// reconciliation item 6/CP action item 3): it hand-constructs a promoted
+// Kind=loop checkpoint whose UnhandledItems is non-empty. Production never
+// produces that combination -- the only two ways a promoted checkpoint gets
+// non-empty UnhandledItems are upstream ADK's own Set with real runner state
+// (CheckpointKindRunner, HasRunnerState=true, which pushReconciledSentinel
+// never fires alongside) or this package's own stageLoopCheckpoint
+// (marshalEmptyLoopCheckpoint's always-empty shape, used by both
+// promoteQueuedContinuation and reconcileCrashedRun) -- so it does not
+// exercise reconcileCrashedRun (see the round-six SQLite tests in
+// w5_round6_reconciliation_test.go for that) and is kept here purely to
+// prove genInput's own batch-wide scan still works when a hypothetical
+// future producer of such a checkpoint exists.
+//
+// It proves round-five reconciliation item 1 (TR-C1): the reconciled-turn
 // sentinel genInput pushes for ResumeRun must be recognised anywhere in the
 // GenInput batch, not only at items[0]. Upstream's own tryLoadCheckpoint
 // builds that batch as cp.UnhandledItems ++ newItems
@@ -438,110 +453,27 @@ func TestResumeRunRefusesCheckpointForATurnThatHasSinceCompleted(t *testing.T) {
 	if err != nil || run.Status != session.RunPaused {
 		t.Fatalf("run after refused ResumeRun = %+v, err=%v, want still paused", run, err)
 	}
-}
-
-// TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately proves round-
-// five reconciliation item 2 (TR-I1)'s belt: a checkpoint recorded for a
-// turn is retired IMMEDIATELY once that turn durably completes -- as part
-// of completeTurn's own call -- not left for this Run() call's own eventual
-// clean exit (upstream's Delete cleanup would also retire it, but only once
-// the WHOLE call finally stops). The second turn's own model dispatch is
-// gated so the test can inspect durable state WHILE Run() is still active
-// (Delete has not run yet), isolating completeTurn's own retirement from
-// Delete's: without the belt, the first turn's checkpoint would still be
-// sitting there, promoted, at this exact point.
-func TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately(t *testing.T) {
-	var executions int
-	gate := Tool{
-		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"},
-		InterruptPolicy: pausingInterruptPolicy{},
-		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
-			executions++
-			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
-		}),
+	// Round-six reconciliation item 4: a refused resume must never be a
+	// permanent dead end. Stop-with-abandon is the documented escape --
+	// unlike the earlier crash-reconciliation path (which would clear this
+	// exact state on its own, see w5_round6_reconciliation_test.go), this
+	// test deliberately bypassed reconciliation to isolate ResumeRun's own
+	// defense, so nothing else in this test would ever clear it.
+	if err := orch.Stop(ctx, runID, StopPolicy{Abandon: true, Cause: "operator abandon"}); err != nil {
+		t.Fatalf("Stop(Abandon) error = %v", err)
 	}
-	secondTurnDispatched := make(chan struct{})
-	releaseSecondTurn := make(chan struct{})
-	var calls int
-	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
-		calls++
-		switch calls {
-		case 1:
-			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "gate", `{}`))}, nil
-		case 2:
-			return []*einoschema.AgenticMessage{agenticAssistantText("first turn done")}, nil
-		case 3:
-			// The second turn's OWN dispatch: block here so the test can
-			// inspect durable state while Run() is still active -- the
-			// first turn has already completed (CompleteTurn committed
-			// above, case 2), but Run() has not exited, so upstream's own
-			// Delete cleanup has not run yet either.
-			close(secondTurnDispatched)
-			<-releaseSecondTurn
-			return []*einoschema.AgenticMessage{agenticAssistantText("second turn done")}, nil
-		default:
-			t.Fatal("unexpected extra model dispatch")
-			return nil, nil
-		}
-	}))
-	defer cleanup()
-	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
-
-	sessionID := session.ID("retire-belt-session")
-	handle, err := orch.Start(context.Background(), Request{SessionID: sessionID, Message: TextUserMessage("hello"), Config: orchestratorConfig()})
-	if err != nil {
-		t.Fatalf("Start error = %v", err)
+	abandoned, err := orch.store.GetRun(ctx, runID)
+	if err != nil || abandoned.Status != session.RunInterrupted || !abandoned.Terminal() {
+		t.Fatalf("run after Stop(Abandon) = %+v, err=%v, want terminal interrupted", abandoned, err)
 	}
-	result := <-handle.Done()
-	if result.Status != session.RunPaused || !result.Interrupted {
-		t.Fatalf("result = %+v", result)
+	if _, found, err := orch.store.ReadPromotedCheckpoint(ctx, runID); err != nil || found {
+		t.Fatalf("promoted checkpoint after Stop(Abandon): found=%v err=%v, want retired", found, err)
 	}
-	pause, ok := <-handle.AwaitPause()
-	if !ok || len(pause.InterruptContexts) != 1 {
-		t.Fatalf("pause = %+v, ok=%v", pause, ok)
-	}
-	staged, found, err := orch.store.ReadPromotedCheckpoint(context.Background(), result.RunID)
-	if err != nil || !found {
-		t.Fatalf("promoted checkpoint before resume: found=%v err=%v", found, err)
-	}
-	// A second item, still queued through the pause, so the resumed run
-	// admits a genuinely SECOND turn immediately after the first completes
-	// -- in the SAME Run() call, before it ever exits.
-	if _, err := orch.Enqueue(context.Background(), sessionID, EnqueueRequest{
-		RunID: result.RunID, IdempotencyKey: "retire-belt-key", Message: TextUserMessage("second message"),
-	}); err != nil {
-		t.Fatalf("Enqueue error = %v", err)
-	}
-
-	resumeHandle, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{
-		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
-	})
-	if err != nil {
-		t.Fatalf("ResumeRun error = %v", err)
-	}
-	select {
-	case <-secondTurnDispatched:
-	case <-time.After(5 * time.Second):
-		t.Fatal("second turn's model dispatch never reached")
-	}
-	// The first turn's checkpoint (staged.Revision) must ALREADY be gone --
-	// retired by completeTurn immediately once that turn completed, not
-	// deferred to Run()'s own eventual clean exit, which has not happened
-	// yet (this goroutine is still blocking the second turn's dispatch).
-	_, stillFound, err := orch.store.ReadPromotedCheckpoint(context.Background(), result.RunID)
-	if err != nil {
-		t.Fatalf("ReadPromotedCheckpoint mid-cycle: %v", err)
-	}
-	if stillFound {
-		t.Fatalf("promoted checkpoint (revision %d) still present after its turn completed but before Run() exited, want already retired", staged.Revision)
-	}
-	close(releaseSecondTurn)
-
-	resumed := <-resumeHandle.Done()
-	if resumed.Status != session.RunCompleted || resumed.Error != nil {
-		t.Fatalf("resumed result = %+v", resumed)
-	}
-	if executions != 1 {
-		t.Fatalf("tool executions after resume = %d, want 1", executions)
+	// The session is free again: no active (pending/running/paused) run
+	// remains, exactly the check AdmitRun itself performs before admitting a
+	// fresh Start -- proving a fresh Start would succeed without actually
+	// dispatching one (this test's streamer forbids any model dispatch).
+	if _, err := orch.store.ActiveRun(ctx, sessionID); !errors.Is(err, session.ErrNotFound) {
+		t.Fatalf("ActiveRun after Stop(Abandon) err = %v, want ErrNotFound (session free for a fresh Start)", err)
 	}
 }

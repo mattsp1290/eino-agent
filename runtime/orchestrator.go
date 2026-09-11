@@ -167,6 +167,14 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	ownershipTransferred = true
 	checkpoints := newAdkCheckpointStore(o, execution, plan, admitted.Run.ID)
 	coordinator.checkpoints = checkpoints
+	// Seed currentTurnID synchronously with the already-admitted first turn,
+	// before this run's TurnLoop is even constructed (round-six
+	// reconciliation item 8/CP-S1): setEngine otherwise only keeps it in
+	// sync starting from the first GenInput call (which consumes
+	// firstTurnSentinelID), leaving a window where an upstream Set racing
+	// ahead of that first call would see an empty currentTurnID and hard-
+	// fail staging, turning a resumable pause into a non-pause.
+	checkpoints.setCurrentTurnID(admitted.Turn.ID)
 	entry := o.prepareTurnLoop(coordinator, checkpoints)
 	// Pushed synchronously, before Run: TurnLoop buffers a Push issued
 	// before Run() and processes it in order once Run is called (its

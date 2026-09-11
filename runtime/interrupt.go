@@ -427,6 +427,13 @@ func (o *StreamingOrchestrator) runReconcileCrashedRun(ctx context.Context, exec
 // reconcileCrashedRun performs reclaimAndReconcile's actual reconciliation
 // work under the just-taken claim; see that function's doc comment for the
 // full sequence and rationale.
+//
+// Round-six reconciliation items 1-3 replace round-five's delete-on-complete
+// plus a separate "dangling" selector with ONE coherent rule, shared with
+// ResumeRun's own consistency check (turn_loop.go's currentTurn): after this
+// function returns, a subsequent ResumeRun must ALWAYS accept -- it must
+// never repause into a state ResumeRun refuses (item 3, "reconciliation is
+// total").
 func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, execution *runExecution, run session.Run) Result {
 	o.observeResume(ctx, run, "reconcile")
 	calls, err := o.store.ListUnfinishedToolCalls(ctx, run.ID)
@@ -442,6 +449,12 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
+	// Settle any turn a crash left actively dispatching (admitted/running,
+	// never reached a durable pause or completion) as interrupted, exactly
+	// like a genuine ADK-level tool-interrupt pause would have -- see
+	// ReconcileInterruptedTurnRequest's doc comment. This never touches a
+	// turn already TurnInterrupted (a genuine earlier pause, or an earlier
+	// reconciliation's own carrier) or TurnCompleted.
 	var dangling session.Turn
 	for _, t := range turns {
 		if (t.State == session.TurnAdmitted || t.State == session.TurnRunning) && t.Ordinal >= dangling.Ordinal {
@@ -457,48 +470,94 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
 	}
-	_, hasCheckpoint, err := o.store.ReadPromotedCheckpoint(ctx, run.ID)
+	promoted, hasCheckpoint, err := o.store.ReadPromotedCheckpoint(ctx, run.ID)
 	if err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}
-	if hasCheckpoint {
-		event := session.EventRecord{
-			ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, EpochID: run.ContextEpoch,
-			Kind: session.RunPausedEventKind, CreatedAt: o.now(),
-		}
-		request := session.RepauseRunRequest{Event: event}
-		if dangling.ID != "" {
-			// Round-five reconciliation item 2 (TR-I1): the previously
-			// promoted revision may belong to an older, already-superseded
-			// turn -- or to no turn ResumeRun's own TurnID-consistency
-			// check would now accept at all. Stage a fresh, correctly
-			// turn-identified Kind=loop checkpoint for the JUST-reconciled
-			// turn and promote it instead, so a later ResumeRun reads a
-			// consistent state. dangling is already durably TurnInterrupted
-			// by this point (ReconcileInterruptedTurn above), so
-			// PromotePause's own turn-interrupt precondition (admitted/
-			// running) no longer holds -- RepauseRun's PromoteRevision is
-			// what promotes it here instead.
-			checkpoints := newAdkCheckpointStore(o, execution, execution.plan, run.ID)
-			checkpoints.setCurrentTurnID(dangling.ID)
-			if err := checkpoints.stageLoopCheckpoint(ctx); err != nil {
-				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
-			}
-			request.PromoteRevision = checkpoints.lastStaged
-		}
-		if _, err := execution.store.RepauseRun(ctx, request); err != nil {
+	if !hasCheckpoint {
+		// This run's checkpoint machinery was never used at all (it crashed
+		// on its very first turn, before ever pausing): ResumeRun itself
+		// refuses outright with no promoted checkpoint to read, so there is
+		// nothing a later resume could do even in principle. Settle it
+		// interrupted. Any turn reconciled above stays durably `interrupted`,
+		// its consumed inbox items carried forward as `interrupted` -- never
+		// requeued to `queued` -- so its content is answered only via
+		// already-committed history, on some later run over this session
+		// (drainQueuedInbox will never see it again: it is not `queued`).
+		return o.settleReconciledRunInterrupted(ctx, execution, run)
+	}
+	// hasCheckpoint: this run has been through the checkpoint machinery
+	// before (a genuine ADK-level pause, an earlier between-turn queued-
+	// continuation pause, or an earlier reconciliation's own carrier). It is
+	// unconditionally resumable from here (item 3): a promoted revision
+	// recorded for a turn that has SINCE COMPLETED is stale BY FACT, not
+	// absent (item 2 -- completeTurn no longer retires it on completion), so
+	// its mere existence is not proof anything is still pending.
+	turns, err = o.store.ListTurns(ctx, run.ID) // re-fetch: dangling, if any, is now durably interrupted
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	current := currentTurn(turns)
+	if current.ID == "" {
+		// Nothing is currently in flight (every turn already durably
+		// completed -- e.g. a crash right after CompleteTurn, before this
+		// run's own eventual idle settlement ever ran) but the promoted
+		// checkpoint is stale. Reconciliation must never leave hasCheckpoint
+		// true with no turn a fresh checkpoint can be staged for (a
+		// checkpoint envelope's TurnID can never be empty -- see
+		// decodeCheckpointEnvelope), so mint a fresh, content-free carrier
+		// turn purely to hold a valid, resumable pause -- mirroring
+		// promoteQueuedContinuation's between-turn shape -- and immediately
+		// settle it interrupted the same way a genuine dangling turn above
+		// would be. A later ResumeRun then finds nothing left to redrive or
+		// drain and completes the run on its own.
+		carrier, err := admitCarrierTurn(ctx, o, execution, run, maxOrdinal(turns)+1)
+		if err != nil {
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
-		return Result{RunID: run.ID, Status: session.RunPaused}
+		event := session.EventRecord{
+			ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, EpochID: run.ContextEpoch,
+			TurnID: carrier.ID, Kind: session.RunPausedEventKind, CreatedAt: o.now(),
+		}
+		if _, err := execution.store.ReconcileInterruptedTurn(ctx, session.ReconcileInterruptedTurnRequest{TurnID: carrier.ID, Event: event}); err != nil {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		}
+		carrier.State = session.TurnInterrupted
+		current = carrier
 	}
-	// No promoted checkpoint ever existed for this run (it crashed on its
-	// very first turn, before ever pausing): there is nothing a later
-	// ResumeRun could resume, so settle it interrupted. Any turn reconciled
-	// above stays durably `interrupted`, its consumed inbox items carried
-	// forward as `interrupted` -- never requeued to `queued` -- so its
-	// content is answered only via already-committed history, on some
-	// later run over this session (drainQueuedInbox will never see it
-	// again: it is not `queued`).
+	event := session.EventRecord{
+		ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, EpochID: run.ContextEpoch,
+		Kind: session.RunPausedEventKind, CreatedAt: o.now(),
+	}
+	request := session.RepauseRunRequest{Event: event}
+	if envelope, decErr := decodeCheckpointEnvelope(promoted.Bytes); decErr != nil || envelope.TurnID != current.ID {
+		// The existing promoted revision belongs to a different (or no
+		// longer resolvable) turn than currentTurn now selects -- stage a
+		// fresh, correctly turn-identified Kind=loop checkpoint for
+		// `current` and promote it instead, so a later ResumeRun reads a
+		// consistent state (round-six reconciliation items 1-3): current is
+		// already durably TurnInterrupted by this point, so PromotePause's
+		// own turn-interrupt precondition (admitted/running) no longer
+		// holds -- RepauseRun's PromoteRevision is what promotes it here.
+		checkpoints := newAdkCheckpointStore(o, execution, execution.plan, run.ID)
+		checkpoints.setCurrentTurnID(current.ID)
+		if err := checkpoints.stageLoopCheckpoint(ctx); err != nil {
+			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+		}
+		request.PromoteRevision = checkpoints.lastStaged
+	}
+	if _, err := execution.store.RepauseRun(ctx, request); err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	return Result{RunID: run.ID, Status: session.RunPaused}
+}
+
+// settleReconciledRunInterrupted terminally settles run RunInterrupted from
+// within reconcileCrashedRun, used both when the run's checkpoint machinery
+// was never used at all and (via abandonment's own terminal path elsewhere)
+// nowhere else -- kept as a small helper purely to keep reconcileCrashedRun
+// itself readable.
+func (o *StreamingOrchestrator) settleReconciledRunInterrupted(ctx context.Context, execution *runExecution, run session.Run) Result {
 	settlement := session.RunSettlement{Status: session.RunInterrupted, FinishedAt: o.now()}
 	committed, err := execution.store.SettleRun(ctx, session.SettleRunRequest{
 		Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID()},
@@ -508,4 +567,48 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 	}
 	execution.publishPersisted(ctx, committed.Event)
 	return Result{RunID: run.ID, Status: session.RunInterrupted, Interrupted: true}
+}
+
+// maxOrdinal returns the highest Ordinal among turns, or 0 if turns is empty.
+func maxOrdinal(turns []session.Turn) int64 {
+	var max int64
+	for _, t := range turns {
+		if t.Ordinal > max {
+			max = t.Ordinal
+		}
+	}
+	return max
+}
+
+// admitCarrierTurn mints a fresh, content-free turn purely to carry a
+// resumable pause -- the same degenerate shape promoteQueuedContinuation
+// admits via the live coordinator's admitTurn(ctx, nil) (turn_loop.go), used
+// here by crash reconciliation (which has no live coordinator to call that
+// method on) when the run's checkpoint machinery has been used before but
+// nothing is currently in flight (currentTurn(turns).ID == ""): see
+// reconcileCrashedRun's own doc comment for why this must never be skipped.
+func admitCarrierTurn(ctx context.Context, o *StreamingOrchestrator, execution *runExecution, run session.Run, ordinal int64) (session.Turn, error) {
+	at := o.now()
+	assistantID := o.ids.NewMessageID()
+	turnID := o.ids.NewTurnID()
+	turn := session.Turn{
+		ID: turnID, RunID: run.ID, SessionID: run.SessionID, Ordinal: ordinal, State: session.TurnAdmitted,
+		AssistantMessageID: assistantID, EpochID: run.ContextEpoch, CreatedAt: at,
+	}
+	event := session.EventRecord{
+		ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, MessageID: assistantID,
+		EpochID: run.ContextEpoch, TurnID: turnID, Kind: session.TurnStartedEventKind, CreatedAt: at,
+	}
+	assistantMessage := session.Message{
+		ID: assistantID, SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant,
+		Agent: run.Agent, ModelID: run.ModelID, CreatedAt: at, UpdatedAt: at,
+	}
+	result, err := execution.store.AdmitTurn(ctx, session.AdmitTurnRequest{
+		Turn: turn, AssistantPlaceholder: assistantMessage, Event: event,
+	})
+	if err != nil {
+		return session.Turn{}, err
+	}
+	execution.publishPersisted(ctx, result.Event)
+	return result.Turn, nil
 }
