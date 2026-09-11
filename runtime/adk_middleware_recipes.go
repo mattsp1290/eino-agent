@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -182,6 +183,99 @@ func skillContentDigest(loaded skill.Skill) string {
 	}
 	sum := sha256.Sum256(append(front, []byte(loaded.Content)...))
 	return hex.EncodeToString(sum[:])
+}
+
+// ErrSkillChangedSinceActivation reports that ResumeRun's skill
+// verification (verifySkillActivationsUnchanged) found a durably recorded
+// SkillActivatedEventKind activation whose skill is now missing, or whose
+// current content digest no longer matches what was recorded at
+// activation time -- see NewSkillHandlerFactory's doc comment on this
+// closing that recipe's previously-open "not yet a resume-time
+// enforcement" limitation.
+var ErrSkillChangedSinceActivation = errors.New("adk skill content changed since activation")
+
+// skillActivationRecord is one durably recorded SkillActivatedEventKind
+// payload, decoded from EventRecord.Payload (see recordSkillActivation).
+type skillActivationRecord struct {
+	Name          string `json:"name"`
+	ContentDigest string `json:"content_digest"`
+}
+
+// latestSkillActivations pages sessionID's full durable event history (via
+// store.ListEvents, unbounded/unfiltered by Kind at the store layer) and
+// returns the most recently recorded activation per skill name --
+// SkillActivatedEventKind events are appended in the same order
+// store.ListEvents replays them (ascending by CreatedAt, ID -- see
+// store/internal/sqlstore/events.go's ListEvents), so folding forward and
+// overwriting by name always keeps the latest.
+func latestSkillActivations(ctx context.Context, store session.Store, sessionID session.ID) (map[string]skillActivationRecord, error) {
+	activations := make(map[string]skillActivationRecord)
+	cursor := session.EventCursor{Limit: 200}
+	for {
+		batch, err := store.ListEvents(ctx, sessionID, cursor)
+		if err != nil {
+			return nil, err
+		}
+		for _, event := range batch.Events {
+			if event.Kind != session.SkillActivatedEventKind {
+				continue
+			}
+			var record skillActivationRecord
+			if err := json.Unmarshal(event.Payload, &record); err != nil || record.Name == "" {
+				continue
+			}
+			activations[record.Name] = record
+		}
+		if batch.Next == (session.EventCursor{}) {
+			return activations, nil
+		}
+		cursor = batch.Next
+	}
+}
+
+// verifySkillActivationsUnchanged re-reads, from the CURRENT workspace
+// state, every skill this session has ever durably recorded activating
+// (SkillActivatedEventKind), and fails closed with
+// ErrSkillChangedSinceActivation the moment any of them is missing or its
+// content digest no longer matches what was recorded at activation time.
+// It is read-only (a fresh workspaceSkillBackend.Get per recorded skill
+// name) and never mutates durable state, so ResumeRun's caller (which
+// calls this before ever claiming the run's fence) can reject a resume
+// this finds unsafe while leaving the run exactly as paused as it found
+// it -- a changed or missing skill therefore fails resume predictably,
+// not silently, and not by letting the model see stale or divergent skill
+// content it was never actually re-shown.
+//
+// workspaceRoot == "" (no workspace configured for this run) skips
+// verification outright: the skill recipe itself requires a non-nil
+// SkillBackend to construct (see NewSkillHandlerFactory), which in turn
+// requires a non-empty WorkspaceRoot, so no session ever recorded a
+// SkillActivatedEventKind event without one.
+func verifySkillActivationsUnchanged(ctx context.Context, store session.Store, sessionID session.ID, workspaceRoot string) error {
+	if workspaceRoot == "" {
+		return nil
+	}
+	activations, err := latestSkillActivations(ctx, store, sessionID)
+	if err != nil {
+		return fmt.Errorf("resolving recorded skill activations: %w", err)
+	}
+	if len(activations) == 0 {
+		return nil
+	}
+	_, skillBackend, err := newWorkspaceBackends(workspaceRoot)
+	if err != nil {
+		return fmt.Errorf("%w: resolving workspace for skill verification: %v", ErrSkillChangedSinceActivation, err)
+	}
+	for name, recorded := range activations {
+		current, err := skillBackend.Get(ctx, name)
+		if err != nil {
+			return fmt.Errorf("%w: skill %q recorded active at digest %s is no longer available: %v", ErrSkillChangedSinceActivation, name, recorded.ContentDigest, err)
+		}
+		if digest := skillContentDigest(current); digest != recorded.ContentDigest {
+			return fmt.Errorf("%w: skill %q content digest changed from %s to %s since it was activated", ErrSkillChangedSinceActivation, name, recorded.ContentDigest, digest)
+		}
+	}
+	return nil
 }
 
 // --- filesystem -----------------------------------------------------------

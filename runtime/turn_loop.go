@@ -1866,6 +1866,17 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	if err != nil {
 		return nil, err
 	}
+	// Round-two W6 review item 3: re-read every skill this session has
+	// ever durably recorded activating (SkillActivatedEventKind) from the
+	// CURRENT workspace state and compare its content digest against what
+	// was recorded at activation time. A changed or missing SKILL.md
+	// between pause and resume fails this resume closed, with a clear
+	// ErrSkillChangedSinceActivation error, before the fence below is ever
+	// claimed -- the run is left exactly as paused as GetRun found it,
+	// never resumed under silently divergent skill content.
+	if err := verifySkillActivationsUnchanged(ctx, o.store, run.SessionID, durable.WorkspaceRoot); err != nil {
+		return nil, err
+	}
 
 	// Only now take the fence: every check above that could reject this
 	// resume has already run against the still-paused run.

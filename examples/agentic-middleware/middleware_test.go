@@ -1504,3 +1504,119 @@ func TestResumeAfterHandlerConfigChangeIsRefused(t *testing.T) {
 		t.Fatal("resume after a changed handler Config was accepted, want it refused")
 	}
 }
+
+// resumeSkillFixture sets up a paused run whose turn already durably
+// activated a skill (SkillActivatedEventKind, via NewSkillHandlerFactory's
+// activationRecordingSkillBackend) before it paused mid-turn on a blocking
+// tool call -- the shared setup for the two ResumeRun-skill-verification
+// tests below (item 3 of the round-two W6 review). skillDir is the
+// on-disk directory the caller may mutate between pause and resume to
+// exercise the negative case.
+func resumeSkillFixture(t *testing.T) (orch *runtime.StreamingOrchestrator, store *sqlite.Store, runID session.RunID, skillDir string) {
+	t.Helper()
+	root := t.TempDir()
+	skillDir = filepath.Join(root, "greeter")
+	if err := os.MkdirAll(skillDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: greeter\ndescription: says hi\n---\nAlways greet the user by name.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store = newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("resume-skill-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		Disable: disableAllExcept(runtime.HandlerKindSkill),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mount.Close(context.Background()) })
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var toolCalls int
+	blockerMount, err := registry.Mount(context.Background(), testNativeComponent("blocker", sessionID),
+		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
+			return registrar.Tool(composition.ToolRegistration{ID: "blocker", Scope: testScope(sessionID), Definition: blockingToolDefinition(started, release, &toolCalls)})
+		}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = blockerMount.Close(context.Background()) })
+
+	step := 0
+	orch = newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		step++
+		switch step {
+		case 1:
+			args, _ := json.Marshal(map[string]string{"skill": "greeter"})
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-skill-resume", "skill", string(args))}, nil
+		case 2:
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call-block-resume", "blocker", `{}`)}, nil
+		default:
+			return []*einoschema.AgenticMessage{agenticAssistantText("resumed and done")}, nil
+		}
+	}))
+	handle, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	if err := orch.Stop(context.Background(), handle.RunID(), runtime.StopPolicy{Immediate: true, Cause: "resume-skill-example"}); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunPaused {
+		t.Fatalf("result = %+v, want paused", result)
+	}
+	return orch, store, result.RunID, skillDir
+}
+
+// TestResumeAfterUnchangedSkillContentSucceeds proves the positive half of
+// item 3's skill resume verification: a paused run whose turn already
+// activated a skill (durably recorded via SkillActivatedEventKind) resumes
+// normally when that skill's on-disk content is untouched between pause
+// and resume -- verifySkillActivationsUnchanged's fresh digest re-read
+// matches the recorded one, so ResumeRun's new pre-claim check never
+// rejects an ordinary resume.
+func TestResumeAfterUnchangedSkillContentSucceeds(t *testing.T) {
+	orch, _, runID, _ := resumeSkillFixture(t)
+	resumed, err := orch.ResumeRun(context.Background(), runID, runtime.ResumeRequest{})
+	if err != nil {
+		t.Fatalf("resume with unchanged skill content was refused: %v", err)
+	}
+	result := awaitDone(t, resumed, 10*time.Second)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("resumed result = %+v, want completed", result)
+	}
+}
+
+// TestResumeAfterChangedSkillContentIsRefused proves the negative half of
+// item 3: editing the activated skill's SKILL.md between pause and resume
+// is detected and rejected predictably, with a clear
+// runtime.ErrSkillChangedSinceActivation error, and the run is left
+// exactly as paused as it was before the rejected ResumeRun call -- never
+// silently resumed under skill content the model was never actually shown
+// this way.
+func TestResumeAfterChangedSkillContentIsRefused(t *testing.T) {
+	orch, store, runID, skillDir := resumeSkillFixture(t)
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: greeter\ndescription: says hi differently now\n---\nGreet the user in French instead.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := orch.ResumeRun(context.Background(), runID, runtime.ResumeRequest{}); err == nil {
+		t.Fatal("resume after changed skill content was accepted, want it refused")
+	} else if !errors.Is(err, runtime.ErrSkillChangedSinceActivation) {
+		t.Fatalf("resume error = %v, want errors.Is(err, runtime.ErrSkillChangedSinceActivation)", err)
+	}
+	run, err := store.GetRun(context.Background(), runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run.Status != session.RunPaused {
+		t.Fatalf("run status after a refused resume = %q, want still paused (run left untouched)", run.Status)
+	}
+}
