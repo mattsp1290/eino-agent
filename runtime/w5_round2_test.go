@@ -14,7 +14,7 @@ import (
 	"github.com/cloudwego/eino/compose"
 	einoschema "github.com/cloudwego/eino/schema"
 
-	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -598,7 +598,47 @@ func TestResumeRunRestoresSystemPromptAndAgentOptions(t *testing.T) {
 		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
 	defer cleanup()
-	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
+
+	// Round-four reconciliation item 6 (MR-1): rather than asserting against
+	// a TurnSnapshot the test builds itself (which only proves
+	// boundedTurnMetadata/NewToolScopeContext project the fields they are
+	// handed, never in doubt), record the REAL BoundedTurnMetadata and
+	// ToolScopeContext ResumeRun's own rebuilt cfg produces for a prepared
+	// turn: a TurnPreparePoint hook observes every prepared turn's metadata,
+	// and the "gate" tool's own Resolve records the ToolScopeContext
+	// sealedPlanTools.ResolveTools calls it with -- both fire once per
+	// prepared turn (pre- and post-resume), through the exact same
+	// staticRunPlanProvider-held *RunPlan Start and ResumeRun share.
+	registry := newTestExtensionRegistry(nil)
+	var metaMu sync.Mutex
+	var metadataSeen []BoundedTurnMetadata
+	observeComponent := extension.Component{InstanceID: "audited-turn-prepare", Artifact: extension.Artifact{Name: "audited-turn-prepare", Version: "1", Hash: "artifact", ConfigHash: "config", SourceKind: extension.SourceNative}}
+	if _, err := registry.Mount(context.Background(), observeComponent, extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
+		return extension.OnHook(registrar, TurnPreparePoint, extension.Registration{ID: "observe", Scope: extension.GlobalScope()}, func(_ context.Context, metadata BoundedTurnMetadata) error {
+			metaMu.Lock()
+			metadataSeen = append(metadataSeen, cloneBoundedTurnMetadata(metadata))
+			metaMu.Unlock()
+			return nil
+		})
+	})); err != nil {
+		t.Fatalf("mount turn-prepare observer: %v", err)
+	}
+	dispatch, err := registry.Snapshot(extension.GlobalScope())
+	if err != nil {
+		t.Fatalf("dispatch snapshot: %v", err)
+	}
+	var scopeMu sync.Mutex
+	var scopesSeen []ToolScopeContext
+	gateCapability := testPlanTool("gate")
+	gateCapability.Resolve = func(_ context.Context, scope ToolScopeContext) (Tool, error) {
+		scopeMu.Lock()
+		scopesSeen = append(scopesSeen, scope.Clone())
+		scopeMu.Unlock()
+		return cloneToolChecked(gate)
+	}
+	spec := testDispatchPlanSpec(dispatch)
+	spec.Components = append(spec.Components, PlanComponent{Component: testPlanComponent("test-tools"), Tools: []PlanTool{gateCapability}})
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(spec)}
 
 	cfg := orchestratorConfig()
 	cfg.Agent.SystemPrompt = "AUDITED-SYSTEM-PROMPT"
@@ -664,19 +704,39 @@ func TestResumeRunRestoresSystemPromptAndAgentOptions(t *testing.T) {
 		t.Fatalf("decoded tool scope = enabled=%#v disabled=%#v, want enabled=%#v disabled=%#v",
 			durable.ToolsEnabled, durable.ToolsDisabled, cfg.Tools.Enabled, cfg.Tools.Disabled)
 	}
-	resumedSnapshot := TurnSnapshot{
-		SessionID: finalRun.SessionID,
-		Config: config.Snapshot{
-			Agent: config.Agent{Name: finalRun.Agent, Mode: durable.AgentMode},
-			Tools: config.ToolConfig{Enabled: durable.ToolsEnabled, Disabled: durable.ToolsDisabled},
-		},
+	// The assertions above prove admissionConfig -> decodeResumeRunConfig
+	// round-trips, which was never in doubt; they cannot observe ResumeRun's
+	// OWN rebuilt cfg. Assert against what a prepared turn REALLY got
+	// instead (round-four reconciliation item 6/MR-1): ResolveTools runs
+	// once per prepared turn off the snapshot ResumeRun itself rebuilt, and
+	// TurnPreparePoint fires with that same snapshot's BoundedTurnMetadata,
+	// so the LAST recorded value of each is the post-resume turn's real one
+	// -- compared whole-struct against the pre-resume (first) value and
+	// against cfg. Reverting Mode/Tools restoration in ResumeRun's rebuilt
+	// cfg (runtime/turn_loop.go) makes this fail.
+	metaMu.Lock()
+	if len(metadataSeen) < 2 {
+		metaMu.Unlock()
+		t.Fatalf("TurnPreparePoint firings = %d, want at least 2 (pre- and post-resume)", len(metadataSeen))
 	}
-	if got := boundedTurnMetadata(resumedSnapshot).AgentMode; got != cfg.Agent.Mode {
-		t.Fatalf("resumed BoundedTurnMetadata.AgentMode = %q, want %q", got, cfg.Agent.Mode)
+	firstMeta, lastMeta := metadataSeen[0], metadataSeen[len(metadataSeen)-1]
+	metaMu.Unlock()
+	if lastMeta.AgentMode != firstMeta.AgentMode || lastMeta.AgentMode != cfg.Agent.Mode {
+		t.Fatalf("post-resume prepared AgentMode = %q, pre-resume = %q, want both to equal %q", lastMeta.AgentMode, firstMeta.AgentMode, cfg.Agent.Mode)
 	}
-	scope := NewToolScopeContext(resumedSnapshot)
-	if !reflect.DeepEqual(scope.EnabledTools, cfg.Tools.Enabled) || !reflect.DeepEqual(scope.DisabledTools, cfg.Tools.Disabled) {
-		t.Fatalf("resumed ToolScopeContext = enabled=%#v disabled=%#v, want enabled=%#v disabled=%#v",
-			scope.EnabledTools, scope.DisabledTools, cfg.Tools.Enabled, cfg.Tools.Disabled)
+
+	scopeMu.Lock()
+	if len(scopesSeen) < 2 {
+		scopeMu.Unlock()
+		t.Fatalf("gate tool ResolveTools firings = %d, want at least 2 (pre- and post-resume)", len(scopesSeen))
+	}
+	firstScope, lastScope := scopesSeen[0], scopesSeen[len(scopesSeen)-1]
+	scopeMu.Unlock()
+	if !reflect.DeepEqual(lastScope, firstScope) {
+		t.Fatalf("post-resume ToolScopeContext = %#v, pre-resume = %#v; must be identical", lastScope, firstScope)
+	}
+	if !reflect.DeepEqual(lastScope.EnabledTools, cfg.Tools.Enabled) || !reflect.DeepEqual(lastScope.DisabledTools, cfg.Tools.Disabled) {
+		t.Fatalf("post-resume ToolScopeContext = enabled=%#v disabled=%#v, want enabled=%#v disabled=%#v",
+			lastScope.EnabledTools, lastScope.DisabledTools, cfg.Tools.Enabled, cfg.Tools.Disabled)
 	}
 }
