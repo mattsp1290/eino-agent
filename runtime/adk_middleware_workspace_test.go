@@ -103,6 +103,110 @@ func TestWorkspaceFilesystemBackendRejectsSymlinkEscape(t *testing.T) {
 	}
 }
 
+// TestWorkspaceFilesystemBackendGrepRejectsSymlinkEscape proves C4/I1's fix:
+// filepath.WalkDir reports a symlink as a non-directory entry without
+// following it, but the pre-fix GrepRaw called os.ReadFile(path) directly,
+// which DOES follow it -- letting a checked-in symlink inside an untrusted
+// workspace leak arbitrary host file content through grep. The walked path
+// must now be re-resolved through the same containment check every other
+// read goes through, and an escaping entry must be silently skipped, not
+// grepped.
+func TestWorkspaceFilesystemBackendGrepRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("TOPSECRET-line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "leak.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlink unsupported in this environment: %v", err)
+	}
+	backend, _, err := newWorkspaceBackends(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matches, err := backend.GrepRaw(context.Background(), &adkfilesystem.GrepRequest{Pattern: "TOPSECRET"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("GrepRaw followed the symlink escape: matches = %+v", matches)
+	}
+}
+
+// TestWorkspaceFilesystemBackendGlobRejectsSymlinkEscape is GlobInfo's
+// counterpart to the Grep test above: an escaping symlink entry must not
+// even surface as metadata.
+func TestWorkspaceFilesystemBackendGlobRejectsSymlinkEscape(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "leak.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlink unsupported in this environment: %v", err)
+	}
+	backend, _, err := newWorkspaceBackends(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	globbed, err := backend.GlobInfo(context.Background(), &adkfilesystem.GlobInfoRequest{Pattern: "*.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(globbed) != 0 {
+		t.Fatalf("GlobInfo surfaced the symlink escape: globbed = %+v", globbed)
+	}
+}
+
+// TestWritableWorkspaceBackendRejectsSymlinkedRoot proves I3's fix: a
+// pre-existing symlink at the scratch subdirectory's own location (e.g. a
+// checked-in ".eino-agent" symlinked to somewhere outside the workspace)
+// must be rejected at construction, not silently followed by MkdirAll --
+// which would let plantask/reduction state be written outside the
+// workspace, potentially overwriting arbitrary host files.
+func TestWritableWorkspaceBackendRejectsSymlinkedRoot(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	link := filepath.Join(root, ".eino-agent")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unsupported in this environment: %v", err)
+	}
+	if _, err := newWritableWorkspaceBackend(root, filepath.Join(".eino-agent", "plantask")); err == nil {
+		t.Fatal("writable backend construction under a symlinked ancestor succeeded instead of being rejected")
+	}
+	if entries, _ := os.ReadDir(outside); len(entries) != 0 {
+		t.Fatalf("construction wrote into the symlink target outside the workspace: %+v", entries)
+	}
+}
+
+// TestWritableWorkspaceBackendRejectsSymlinkedIntermediateDirectoryOnWrite
+// proves resolveWorkspacePath's not-yet-existing-path ancestor check: a
+// symlinked intermediate directory created AFTER the backend itself was
+// constructed (so the backend's own root is legitimately contained) must
+// still be rejected when a Write targets a new file underneath it.
+func TestWritableWorkspaceBackendRejectsSymlinkedIntermediateDirectoryOnWrite(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	backend, err := newWritableWorkspaceBackend(root, "scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "scratch", "link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlink unsupported in this environment: %v", err)
+	}
+	if err := backend.Write(context.Background(), &adkfilesystem.WriteRequest{FilePath: "link/new.txt", Content: "x"}); err == nil {
+		t.Fatal("write through a symlinked intermediate directory succeeded instead of being rejected")
+	}
+	if _, statErr := os.Stat(filepath.Join(outside, "new.txt")); statErr == nil {
+		t.Fatal("write escaped through the symlinked intermediate directory")
+	}
+}
+
 func TestWorkspaceFilesystemBackendMultiModalRead(t *testing.T) {
 	root := t.TempDir()
 	png := []byte{0x89, 'P', 'N', 'G', 1, 2, 3, 4}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -12,6 +13,34 @@ import (
 
 	"github.com/mattsp1290/eino-agent/session"
 )
+
+// TestHandlerBuildContextExposesNoDurableStoreAuthority is the compile-time-
+// backed regression trip-wire for C1: HandlerBuildContext is handed
+// identically to every registered HandlerFactory, host-provided ones
+// included, so no EXPORTED field on it may carry session.Store or
+// session.ExecutionStore -- either would let an arbitrary host handler
+// fabricate a durable ToolCall settlement (ClaimToolCall/SettleToolCall) or
+// read checkpoint/provider-private state (ReadPromotedCheckpoint,
+// ListMessages' provider_state parts). This is primarily enforced by the Go
+// compiler already (the struct literally has no such field, so
+// `build.Store`/`build.Execution` do not compile -- see git history for the
+// pre-fix version, which did), but this test also checks by FIELD TYPE, not
+// name, so it still catches a differently-named field re-introducing the
+// same capability.
+func TestHandlerBuildContextExposesNoDurableStoreAuthority(t *testing.T) {
+	storeType := reflect.TypeOf((*session.Store)(nil)).Elem()
+	executionType := reflect.TypeOf((*session.ExecutionStore)(nil)).Elem()
+	typ := reflect.TypeOf(HandlerBuildContext{})
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		if field.Type == storeType || field.Type == executionType {
+			t.Fatalf("HandlerBuildContext exports field %q of type %s: a host-registered HandlerFactory could reach durable claim/settle authority or checkpoint bytes through it", field.Name, field.Type)
+		}
+	}
+}
 
 func newTestWorkspaceHandlerBuildContext(t *testing.T) HandlerBuildContext {
 	t.Helper()
