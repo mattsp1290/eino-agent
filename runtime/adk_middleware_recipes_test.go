@@ -177,7 +177,7 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 		// summarizationFinalize's placeholder filter (assistant role, no
 		// owned parts) relies on this to tell a genuine assistant message
 		// apart from AdmitTurn's own not-yet-finalized placeholder row.
-		if _, err := store.AppendPart(context.Background(), session.Part{ID: session.PartID("p" + string(rune('0'+i))), MessageID: msg.ID, SessionID: sessionID, Kind: session.PartText, CreatedAt: now(), UpdatedAt: now()}); err != nil {
+		if _, err := store.AppendPart(context.Background(), session.Part{ID: session.PartID("p" + string(rune('0'+i))), MessageID: msg.ID, SessionID: sessionID, Kind: session.PartApprovalDecision, CreatedAt: now(), UpdatedAt: now()}); err != nil {
 			t.Fatal(err)
 		}
 		durable = append(durable, msg)
