@@ -15,6 +15,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/session"
+	"github.com/mattsp1290/eino-agent/session/history"
 )
 
 func init() {
@@ -41,6 +42,18 @@ type adkEngine struct {
 	// placeholder; the model adapter claims it for the first physical
 	// dispatch of the turn.
 	assistantMessageID session.MessageID
+	// historyOptions is used to reload the durable model-input projection
+	// fresh before every physical dispatch (see adkModel.durableProjection).
+	historyOptions history.Options
+	// baseMessageCount is len(allMessages) at turn-admission time, BEFORE
+	// contextAssemblePoint's extension transforms ran (prepareSnapshot's
+	// Base, not its output snapshot.Messages): the boundary
+	// adkModel.durableProjection uses to tell "this turn's own progress
+	// since admission" (everything a fresh durable reload finds past this
+	// index) apart from the already-transformed, frozen prefix
+	// (snapshot.Messages itself, which may carry ephemeral extension
+	// content a durable reload can never see).
+	baseMessageCount int
 
 	stepMu          sync.Mutex
 	step            int
@@ -121,10 +134,6 @@ func (e *adkEngine) usageSnapshot() model.Usage {
 	e.usageMu.Lock()
 	defer e.usageMu.Unlock()
 	return e.usage
-}
-
-func (e *adkEngine) appendProviderState(s model.ProviderMessageState) {
-	e.snapshot.providerState = append(e.snapshot.providerState, s)
 }
 
 // buildAgent constructs this turn's mandatory adapters and hands them, along

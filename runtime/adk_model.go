@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	einomodel "github.com/cloudwego/eino/components/model"
@@ -123,13 +124,14 @@ func (m *adkModel) finish(ctx context.Context, dispatch *adkDispatch, err error)
 // Generate implements einomodel.AgenticModel.
 func (m *adkModel) Generate(ctx context.Context, input []*einoschema.AgenticMessage, opts ...einomodel.Option) (*einoschema.AgenticMessage, error) {
 	if m.approval != nil {
-		continuation, err := m.approval.prepare(ctx, m, input)
-		if err != nil {
+		if err := m.approval.prepare(ctx, m); err != nil {
 			return nil, err
 		}
-		input = continuation
 	}
-	input = stripADKInternalExtra(input)
+	input, err := m.durableProjection(ctx, input)
+	if err != nil {
+		return nil, err
+	}
 	dispatch, err := m.begin(ctx, input)
 	if err != nil {
 		return nil, err
@@ -165,13 +167,14 @@ func (m *adkModel) Generate(ctx context.Context, input []*einoschema.AgenticMess
 // chunk.
 func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessage, opts ...einomodel.Option) (*einoschema.StreamReader[*einoschema.AgenticMessage], error) {
 	if m.approval != nil {
-		continuation, err := m.approval.prepare(ctx, m, input)
-		if err != nil {
+		if err := m.approval.prepare(ctx, m); err != nil {
 			return nil, err
 		}
-		input = continuation
 	}
-	input = stripADKInternalExtra(input)
+	input, err := m.durableProjection(ctx, input)
+	if err != nil {
+		return nil, err
+	}
 	dispatch, err := m.begin(ctx, input)
 	if err != nil {
 		return nil, err
@@ -252,6 +255,163 @@ func stripADKInternalExtra(messages []*einoschema.AgenticMessage) []*einoschema.
 		}
 		out[i] = &cloned
 	}
+	return out
+}
+
+// errADKProjectionDiverged reports that the set of tool-call IDs ADK's
+// in-memory view presented does not match the durable projection's: ADK's
+// own bookkeeping has desynced from what this run has actually committed,
+// and dispatching against either view uncorroborated by the other would risk
+// sending the model state that was never durably recorded (or silently
+// dropping settled tool results). This must fail the dispatch, not degrade.
+var errADKProjectionDiverged = errors.New("adk in-memory tool-call view diverged from the durable projection")
+
+// durableProjection replaces ADK's in-memory transcript with the durable
+// projection of this run's committed history: prior turns via
+// history.LoadAgentic/ProjectAgentic (loadProviderHistory) plus this turn's
+// own already-committed assistant/tool messages, which loadProviderHistory
+// picks up for free since adkModel.commit and adkTool/adkToolSearch commit
+// every fact to the store before ever returning to ADK -- excluding the
+// current dispatch's own not-yet-finalized placeholder, which
+// loadProviderHistory cannot see because FinalizeAssistantMessage has not
+// run for it yet. This is what makes a tool_search call's result the actual
+// persisted tool_search_result block, and an enhanced tool result the actual
+// persisted multi-part function_tool_result block, exactly as replay would
+// see them: ADK's own generic string-shaped tool.InvokableTool return value
+// (see adkTool.InvokableRun) never reaches the model at all.
+//
+// Before substituting the projection, the set of tool-call IDs ADK's own
+// input carries (from function_tool_call/function_tool_result blocks) is
+// checked against the durable projection's set; any divergence fails closed
+// (errADKProjectionDiverged) rather than silently trusting either view.
+func (m *adkModel) durableProjection(ctx context.Context, adkInput []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
+	full, fullState, err := loadProviderHistory(ctx, m.host.store, session.Session{ID: m.engine.snapshot.SessionID}, m.engine.historyOptions, m.engine.snapshot.Model)
+	if err != nil {
+		return nil, err
+	}
+	// history.LoadAgentic/ProjectAgentic has no notion of "unfinalized": the
+	// only reason the classic engine never saw its own not-yet-committed
+	// assistant placeholder is that it always loaded history before minting
+	// one. This engine reloads mid-turn, after AdmitTurn has already created
+	// this turn's placeholder row (and, on a later physical dispatch within
+	// the same turn, after currentMessageID may have minted another for a
+	// still-in-flight response) -- both exist as real rows with zero parts
+	// until adkModel.commit finalizes them. A committed assistant message
+	// always carries at least one content block (the model always returns
+	// something); an assistant message with none can therefore only be such
+	// a placeholder, and is dropped. providerState entries are reindexed to
+	// match (an entry addressing a dropped placeholder is dropped with it --
+	// a placeholder with no committed content has no captured state either).
+	full, fullState = dropUnfinalizedAssistantPlaceholders(full, fullState)
+	if len(full) < m.engine.baseMessageCount {
+		return nil, fmt.Errorf("%w: durable history shrank below this turn's admitted base (%d < %d)", errADKProjectionDiverged, len(full), m.engine.baseMessageCount)
+	}
+	// The turn's own already-transformed snapshot (prepareSnapshot's output,
+	// computed once at turn-admission time) is the correct prefix: it may
+	// carry ephemeral extension-injected content (contextAssemblePoint,
+	// e.g. a system prompt or RAG content) that this package never persists
+	// durably, by design, so a bare store reload can never see it -- and it
+	// is exactly what ADK's own input was originally seeded with, so
+	// splicing here (instead of re-deriving the whole array from scratch)
+	// preserves the extension's chosen positions relative to that prefix
+	// exactly as the classic engine did. Only the tail -- durable content
+	// committed since admission (this turn's own tool-loop progress:
+	// assistant responses, tool/tool-search results) -- comes from the fresh
+	// reload, which is what makes a tool_search call's result the actual
+	// persisted tool_search_result block and an enhanced tool result the
+	// actual persisted multi-part function_tool_result block, exactly as
+	// replay would see them.
+	prefix := m.engine.snapshot.Messages
+	tail := full[m.engine.baseMessageCount:]
+	projected := make([]*einoschema.AgenticMessage, 0, len(prefix)+len(tail))
+	projected = append(projected, prefix...)
+	projected = append(projected, tail...)
+	offset := len(prefix) - m.engine.baseMessageCount
+	providerState := append([]model.ProviderMessageState(nil), m.engine.snapshot.providerState...)
+	for _, state := range fullState {
+		if state.MessageIndex < m.engine.baseMessageCount {
+			continue
+		}
+		state.MessageIndex += offset
+		providerState = append(providerState, state)
+	}
+	adkIDs := toolCallIDSet(adkInput)
+	durableIDs := toolCallIDSet(projected)
+	if !sameIDSet(adkIDs, durableIDs) {
+		return nil, fmt.Errorf("%w: adk=%v durable=%v", errADKProjectionDiverged, sortedKeys(adkIDs), sortedKeys(durableIDs))
+	}
+	m.engine.snapshot.providerState = providerState
+	return stripADKInternalExtra(projected), nil
+}
+
+func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage, providerState []model.ProviderMessageState) ([]*einoschema.AgenticMessage, []model.ProviderMessageState) {
+	remap := make(map[int]int, len(messages))
+	kept := make([]*einoschema.AgenticMessage, 0, len(messages))
+	for oldIndex, msg := range messages {
+		if msg != nil && msg.Role == einoschema.AgenticRoleTypeAssistant && len(msg.ContentBlocks) == 0 {
+			continue
+		}
+		remap[oldIndex] = len(kept)
+		kept = append(kept, msg)
+	}
+	if len(kept) == len(messages) {
+		return messages, providerState
+	}
+	keptState := make([]model.ProviderMessageState, 0, len(providerState))
+	for _, state := range providerState {
+		if newIndex, ok := remap[state.MessageIndex]; ok {
+			state.MessageIndex = newIndex
+			keptState = append(keptState, state)
+		}
+	}
+	return kept, keptState
+}
+
+// toolCallIDSet collects every function_tool_call/function_tool_result
+// CallID appearing anywhere in messages.
+func toolCallIDSet(messages []*einoschema.AgenticMessage) map[string]bool {
+	ids := make(map[string]bool)
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil {
+				continue
+			}
+			switch block.Type {
+			case einoschema.ContentBlockTypeFunctionToolCall:
+				if block.FunctionToolCall != nil && block.FunctionToolCall.CallID != "" {
+					ids[block.FunctionToolCall.CallID] = true
+				}
+			case einoschema.ContentBlockTypeFunctionToolResult:
+				if block.FunctionToolResult != nil && block.FunctionToolResult.CallID != "" {
+					ids[block.FunctionToolResult.CallID] = true
+				}
+			}
+		}
+	}
+	return ids
+}
+
+func sameIDSet(a, b map[string]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for id := range a {
+		if !b[id] {
+			return false
+		}
+	}
+	return true
+}
+
+func sortedKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -341,9 +501,10 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 		return nil, err
 	}
 	m.engine.recordResponseMessage(dispatch.messageID)
-	if capturedState.state != nil {
-		capturedState.state.MessageIndex = len(dispatch.input)
-		m.engine.appendProviderState(*capturedState.state)
-	}
+	// engine.snapshot.providerState is not updated incrementally here: every
+	// dispatch's durableProjection recomputes it fresh from the store (the
+	// PartProviderState parts persistAssistantTurn just wrote above,
+	// included), so doing it here too would double-count the same captured
+	// state once this message is picked up by the next dispatch's reload.
 	return result, nil
 }

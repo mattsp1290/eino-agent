@@ -27,13 +27,14 @@ func init() {
 // inner ReAct loop can schedule any sibling local function calls, and raises
 // a durable ADK pause carrying only bounded record IDs.
 //
-// The public approval request block is committed as an ordinary part of the
-// assistant message by adkModel.commit (persistAssistantTurn already
-// understands the block kind; no special-casing is required there). This
-// binding additionally records a private native continuation -- the exact
-// dispatch input and committed transcript needed to reconstruct the paused
-// call -- as a session.PartState part on that same message, then raises
-// adk.TypedStatefulInterrupt via compose.StatefulInterrupt.
+// Both the public approval request block (committed by adkModel.commit; no
+// special-casing needed since persistAssistantTurn already understands the
+// block kind) and, on a decided resume, the public response block are
+// ordinary durable content. This binding therefore needs no private native
+// continuation blob: adkModel.durableProjection reconstructs the model's
+// next input from committed history, so once the response message is
+// committed here it is simply part of that projection like any other fact,
+// exactly as replay would see it.
 type adkApprovalBinding struct {
 	mu sync.Mutex
 }
@@ -54,20 +55,17 @@ type adkApprovalState struct {
 }
 
 // adkApprovalPartType marks a session.PartState payload as this binding's
-// private native-continuation record.
+// decision-CAS record.
 const adkApprovalPartType = "eino_agent_mcp_approval"
 
-// adkApprovalRecord is the durable private continuation record: the exact
-// dispatch input and committed transcript needed to reconstruct the paused
-// call, plus the decision CAS state. It is never exposed as public content;
-// the public fact is the committed mcp_tool_approval_request block itself.
+// adkApprovalRecord is the durable CAS record guarding a one-time decision.
+// It is never exposed as public content; the public facts are the committed
+// mcp_tool_approval_request/response blocks themselves.
 type adkApprovalRecord struct {
-	Type              string          `json:"type"`
-	ApprovalRequestID string          `json:"approval_request_id"`
-	Status            string          `json:"status"`
-	Decision          string          `json:"decision,omitempty"`
-	Transcript        json.RawMessage `json:"transcript"`
-	Input             json.RawMessage `json:"input"`
+	Type              string `json:"type"`
+	ApprovalRequestID string `json:"approval_request_id"`
+	Status            string `json:"status"`
+	Decision          string `json:"decision,omitempty"`
 }
 
 func approvalRequestBlock(msg *einoschema.AgenticMessage) *einoschema.MCPToolApprovalRequest {
@@ -82,27 +80,19 @@ func approvalRequestBlock(msg *einoschema.AgenticMessage) *einoschema.MCPToolApp
 	return nil
 }
 
-// pause commits the private native-continuation record and raises the
-// durable interrupt for a completed approval-bearing result. Sibling
-// function calls (a mixed function-call/approval result) are already
-// persisted as pending records by commit, but ADK's tools node never runs
-// them: this method returns an error instead of the committed message.
+// pause commits the decision-CAS record and raises the durable interrupt for
+// a completed approval-bearing result. Sibling function calls (a mixed
+// function-call/approval result) are already persisted as pending records by
+// commit, but ADK's tools node never runs them: this method returns an error
+// instead of the committed message.
 func (b *adkApprovalBinding) pause(ctx context.Context, m *adkModel, dispatch *adkDispatch, committed *einoschema.AgenticMessage) error {
 	request := approvalRequestBlock(committed)
 	if request == nil {
 		return nil
 	}
-	transcript, err := json.Marshal(committed)
-	if err != nil {
-		return err
-	}
-	input, err := json.Marshal(dispatch.input)
-	if err != nil {
-		return err
-	}
 	partID := m.host.ids.NewPartID()
 	now := m.host.now()
-	payload := mustJSON(adkApprovalRecord{Type: adkApprovalPartType, ApprovalRequestID: request.ID, Status: "pending", Transcript: transcript, Input: input})
+	payload := mustJSON(adkApprovalRecord{Type: adkApprovalPartType, ApprovalRequestID: request.ID, Status: "pending"})
 	if _, err := m.execution.store.AppendPart(ctx, session.Part{
 		ID: partID, MessageID: dispatch.messageID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
 		Kind: session.PartState, Ordinal: 1000, Payload: payload, CreatedAt: now, UpdatedAt: now,
@@ -117,56 +107,88 @@ func (b *adkApprovalBinding) pause(ctx context.Context, m *adkModel, dispatch *a
 // prepare runs before any ledger row exists on a re-executed model node. An
 // untargeted leaf re-raises the same interrupt (matching upstream's
 // ResumeWithParams contract: a leaf not in Targets must re-interrupt to
-// preserve its state); a targeted leaf CASes the durable record once (under
-// the run fence and this binding's mutex -- see the accepted simplification
-// noted in docs/architecture/eino-feature-support.md's W5 section) and
-// returns the exact native continuation: the original dispatch input, the
-// committed transcript, and the matching user-role MCPToolApprovalResponse.
-func (b *adkApprovalBinding) prepare(ctx context.Context, m *adkModel, input []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
+// preserve its state); a targeted leaf CASes the durable decision record
+// once (under the run fence and this binding's mutex -- the run fence's own
+// CAS in ClaimRun already guarantees only one process holds it at a time,
+// so a plain read-then-update here is safe against concurrent resumes, just
+// not a store-level conditional write) and commits the durable, public
+// user-role MCPToolApprovalResponse bound to the exact request ID. It
+// returns no continuation: the caller (adkModel.Generate/Stream) always
+// reloads the durable projection afterward, which now includes this
+// response like any other committed fact.
+func (b *adkApprovalBinding) prepare(ctx context.Context, m *adkModel) error {
 	wasInterrupted, hasState, state := compose.GetInterruptState[*adkApprovalState](ctx)
 	if !wasInterrupted || !hasState || state == nil {
-		return input, nil
+		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	isTarget, hasData, decision := compose.GetResumeContext[string](ctx)
 	if !isTarget || !hasData {
-		return nil, compose.StatefulInterrupt(ctx, &adkApprovalInfo{ApprovalRequestID: state.ApprovalRequestID, MessageID: state.MessageID}, state)
+		return compose.StatefulInterrupt(ctx, &adkApprovalInfo{ApprovalRequestID: state.ApprovalRequestID, MessageID: state.MessageID}, state)
 	}
 	if decision != "approve" && decision != "deny" {
-		return nil, fmt.Errorf("invalid approval decision %q", decision)
+		return fmt.Errorf("invalid approval decision %q", decision)
 	}
 	record, part, err := b.load(ctx, m, session.MessageID(state.MessageID), session.PartID(state.PartID))
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if record.ApprovalRequestID != state.ApprovalRequestID {
-		return nil, errors.New("approval record does not match interrupt state")
+		return errors.New("approval record does not match interrupt state")
 	}
 	if record.Status != "pending" {
-		return nil, fmt.Errorf("approval %s already decided: %s", state.ApprovalRequestID, record.Decision)
+		return fmt.Errorf("approval %s already decided: %s", state.ApprovalRequestID, record.Decision)
 	}
 	record.Status = "decided"
 	record.Decision = decision
 	part.Payload = mustJSON(record)
 	part.UpdatedAt = m.host.now()
 	if err := m.execution.store.UpdatePart(ctx, part); err != nil {
-		return nil, err
+		return err
 	}
-	var transcript einoschema.AgenticMessage
-	if err := json.Unmarshal(record.Transcript, &transcript); err != nil {
-		return nil, err
+	if err := b.commitResponse(ctx, m, state.ApprovalRequestID, decision); err != nil {
+		return err
 	}
-	var original []*einoschema.AgenticMessage
-	if err := json.Unmarshal(record.Input, &original); err != nil {
-		return nil, err
-	}
-	response := &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeUser, ContentBlocks: []*einoschema.ContentBlock{
-		einoschema.NewContentBlock(&einoschema.MCPToolApprovalResponse{ApprovalRequestID: state.ApprovalRequestID, Approve: decision == "approve", Reason: "host decision"}),
-	}}
-	continuation := append(append([]*einoschema.AgenticMessage{}, original...), &transcript, response)
+	// The resumed dispatch is a new logical assistant message: the
+	// approval-bearing message already consumed the turn's placeholder (or
+	// an earlier continuation message already claimed one), so the next
+	// commit must mint a fresh one rather than reuse it.
 	m.needMessage = true
-	return continuation, nil
+	return nil
+}
+
+// commitResponse durably records the host's decision as an ordinary,
+// caller-shaped user-role MCPToolApprovalResponse message (the same block
+// kind and role Start/Enqueue accept from a real caller), so it becomes part
+// of the durable projection like any other committed fact.
+func (b *adkApprovalBinding) commitResponse(ctx context.Context, m *adkModel, approvalRequestID, decision string) error {
+	content := session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{{
+		Kind: session.BlockKindMCPToolApprovalResponse,
+		MCPApprovalResponse: &session.MCPApprovalResponseBlock{
+			ApprovalRequestID: approvalRequestID, Approve: decision == "approve", Reason: "host decision",
+		},
+	}}}
+	messageID := m.host.ids.NewMessageID()
+	at, err := m.execution.nextDurableMessageTime(ctx, m.engine.snapshot.SessionID, m.host.now())
+	if err != nil {
+		return err
+	}
+	parts, err := session.EncodeContentParts(content, func() session.PartID { return m.host.ids.NewPartID() }, messageID, m.engine.snapshot.SessionID, m.engine.snapshot.RunID, at, m.host.contentLimits)
+	if err != nil {
+		return err
+	}
+	if _, err := m.execution.store.AppendMessage(ctx, session.Message{
+		ID: messageID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, Role: session.RoleUser, CreatedAt: at, UpdatedAt: at,
+	}); err != nil {
+		return err
+	}
+	for _, p := range parts {
+		if _, err := m.execution.store.AppendPart(ctx, p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *adkApprovalBinding) load(ctx context.Context, m *adkModel, messageID session.MessageID, partID session.PartID) (adkApprovalRecord, session.Part, error) {

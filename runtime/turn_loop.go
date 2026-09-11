@@ -134,15 +134,9 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	var userMessages []session.Message
 	var userParts []session.Part
 	var userMessageIDs []session.MessageID
-	var newAgentic []*einoschema.AgenticMessage
 	for _, item := range items {
 		msgID := c.host.ids.NewMessageID()
 		content := session.Content{Role: session.RoleUser, Blocks: item.Blocks}
-		agenticMsg, err := session.ContentToAgenticMessage(content)
-		if err != nil {
-			return nil, err
-		}
-		newAgentic = append(newAgentic, agenticMsg)
 		parts, err := session.EncodeContentParts(content, func() session.PartID { return c.host.ids.NewPartID() }, msgID, c.sessionID, c.runID, at, c.host.contentLimits)
 		if err != nil {
 			return nil, err
@@ -178,11 +172,17 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 		return nil, err
 	}
 	c.execution.publishPersisted(ctx, result.Event)
+	// AdmitTurn has already durably committed this turn's user message(s),
+	// so reloading now already includes them -- no need to reconstruct and
+	// append them again from the inbox items. dropUnfinalizedAssistantPlaceholders
+	// removes the still-empty assistant placeholder row AdmitTurn also just
+	// created (real, but content-free until adkModel.commit finalizes it),
+	// the same way adkModel.durableProjection does for every later dispatch.
 	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, c.historyOptions, c.resolved)
 	if err != nil {
 		return nil, err
 	}
-	allMessages := append(append([]*einoschema.AgenticMessage(nil), priorMessages...), newAgentic...)
+	allMessages, priorProviderState := dropUnfinalizedAssistantPlaceholders(priorMessages, priorProviderState)
 	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, allMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
@@ -193,7 +193,7 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 		return nil, err
 	}
 	c.execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
-	engine := &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: result.Turn, assistantMessageID: assistantID}
+	engine := &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: result.Turn, assistantMessageID: assistantID, historyOptions: c.historyOptions, baseMessageCount: len(allMessages)}
 	c.setEngine(engine)
 	return engine, nil
 }
@@ -270,6 +270,12 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if err != nil {
 		return nil, err
 	}
+	// The interrupted turn's own assistant placeholder (or a later
+	// tool-turn continuation message minted before the interruption) may
+	// still be an unfinalized, content-free row; keep this in sync with
+	// adkModel.durableProjection's later filtering so baseMessageCount below
+	// stays consistent with what a fresh reload will show.
+	priorMessages, priorProviderState = dropUnfinalizedAssistantPlaceholders(priorMessages, priorProviderState)
 	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, priorMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
@@ -294,7 +300,7 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 		c.ordinal = target.Ordinal
 		c.mu.Unlock()
 	}
-	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID}, nil
+	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: c.historyOptions, baseMessageCount: len(priorMessages)}, nil
 }
 
 func (c *turnLoopCoordinator) prepareAgent(ctx context.Context, _ *adkTurnLoop, _ []session.InboxID) (adk.TypedAgent[*einoschema.AgenticMessage], error) {

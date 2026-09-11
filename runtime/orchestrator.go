@@ -216,6 +216,7 @@ func (o *StreamingOrchestrator) runFreshTurnLoop(ctx context.Context, execution 
 		return
 	}
 	extension.Notify(execution.dispatch(), runCtx, RunStartedPoint, RunStartedNotice{SessionID: started.SessionID, RunID: started.ID, Time: started.StartedAt})
+	baseMessageCount := len(admitted.Snapshot.Messages)
 	snapshot, err := o.prepareSnapshot(runCtx, execution, admitted.Snapshot)
 	if err != nil {
 		result := Result{RunID: admitted.Run.ID, MessageID: admitted.AssistantMessage.ID, Status: statusForError(err), Error: err}
@@ -230,7 +231,7 @@ func (o *StreamingOrchestrator) runFreshTurnLoop(ctx context.Context, execution 
 	execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
 	coordinator.setEngine(nil)
 	coordinator.mu.Lock()
-	coordinator.firstTurnEngine = &adkEngine{host: o, execution: execution, plan: coordinator.plan, snapshot: snapshot, turn: admitted.Turn, assistantMessageID: admitted.AssistantMessage.ID}
+	coordinator.firstTurnEngine = &adkEngine{host: o, execution: execution, plan: coordinator.plan, snapshot: snapshot, turn: admitted.Turn, assistantMessageID: admitted.AssistantMessage.ID, historyOptions: coordinator.historyOptions, baseMessageCount: baseMessageCount}
 	coordinator.mu.Unlock()
 	result := o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause)
 	o.finishObservedRun(observed, result, o.now())
