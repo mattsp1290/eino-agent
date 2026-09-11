@@ -68,6 +68,13 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 		}),
 	}
 	var calls int
+	// orch and failingOrch (below) are two independent StreamingOrchestrator
+	// instances sharing this same underlying sqlite store. A plain
+	// &sequenceIDs{} per instance restarts its counter at 1, risking a
+	// durable id collision between the two (see the doc comment on
+	// namespacedSequenceIDs in w5_round4_acceptance_test.go, and the same
+	// hazard fixed for TestResumeRunDedupesCheckpointRestoredAndDrainedItem
+	// in w5_round2_test.go); give each instance a distinct namespace.
 	orch, err := NewStreamingOrchestrator(
 		WithStore(sqliteStore), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			calls++
@@ -76,7 +83,7 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 			}
 			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		})}),
-		WithIDGenerator(&sequenceIDs{}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
+		WithIDGenerator(&namespacedSequenceIDs{namespace: "a"}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
 		WithOwnerID("sqlite-owner-repause"), WithQueueSize(2),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	)
@@ -102,7 +109,7 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 		WithStore(&startRunFailOnceStore{Store: sqliteStore}), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		})}),
-		WithIDGenerator(&sequenceIDs{}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 1, 0, time.UTC) }),
+		WithIDGenerator(&namespacedSequenceIDs{namespace: "b"}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 1, 0, time.UTC) }),
 		WithOwnerID("sqlite-owner-repause"), WithQueueSize(2),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	)

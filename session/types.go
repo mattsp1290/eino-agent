@@ -285,18 +285,39 @@ type ToolCall struct {
 	// (and any replay of this call) can correlate on the name the model
 	// itself used.
 	RequestedName string
-	Pattern       string
-	Input         json.RawMessage
-	Output        json.RawMessage
-	Status        ToolCallStatus
-	RetrySafe     bool
-	Metadata      map[string]string
-	ClaimedBy     string
-	ClaimToken    string
-	LeaseUntil    time.Time
-	StartedAt     time.Time
-	CompletedAt   time.Time
-	Error         string
+	// ProviderCallID is the tool-call identity exactly as the provider sent
+	// it (block.CallID at dispatch time), or empty when the provider left
+	// its own CallID empty, or when the id it sent was not valid UTF-8 or
+	// exceeded DiscoveryMaxIdentityBytes (runtime.validProviderCallID treats
+	// either as if CallID had been left empty). ID is always a freshly
+	// runtime-minted, store-wide-unique identity (see
+	// runtime.prepareToolCalls) -- it is never reused verbatim from the
+	// provider, because some providers (llama.cpp/Ollama/vLLM-style
+	// OpenAI-compatible endpoints, replayed fixtures) reissue the same
+	// indexed id (e.g. "call_0") across unrelated responses, which would
+	// collide against the store's tool_calls.id uniqueness constraint.
+	// ProviderCallID is preserved separately so the wire request rebuilt
+	// for the provider on a later dispatch (runtime.publicizeToolCallIDs)
+	// can still show the provider its own id back for call/result
+	// correlation -- unless sending it would be ambiguous in that outgoing
+	// request (an earlier call already sends that exact string, or the
+	// string equals the durable id of any call in the request), in which
+	// case ID is sent instead (see publicizeToolCallIDs's doc comment).
+	// Every internal (ADK/ToolCall-store) reference to this call always
+	// uses ID.
+	ProviderCallID string
+	Pattern        string
+	Input          json.RawMessage
+	Output         json.RawMessage
+	Status         ToolCallStatus
+	RetrySafe      bool
+	Metadata       map[string]string
+	ClaimedBy      string
+	ClaimToken     string
+	LeaseUntil     time.Time
+	StartedAt      time.Time
+	CompletedAt    time.Time
+	Error          string
 }
 
 // ContextEpoch records the history segment used to build provider context.
@@ -454,6 +475,18 @@ type Store interface {
 	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
 	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
 	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
+	// ListUnfinishedToolCalls returns runID's pending and running tool
+	// calls in declared order: by the creation order of each call's
+	// request assistant message, then by the call's block position (part
+	// ordinal) within that message -- never by ToolCallID, whose lexical
+	// order is an IDGenerator implementation artifact with no relationship
+	// to the order the model actually declared the calls in.
+	// runtime.StreamingOrchestrator.resumeRun (the legacy non-ADK resume
+	// path) executes calls in exactly this order, and
+	// runtime.runExecution.terminalizeUnfinishedTools (crash
+	// reconciliation) settles them in exactly this order, so an
+	// implementation that returns any other order (message id order,
+	// tool-call creation order, or an unspecified order) breaks both.
 	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
 	// EnqueueInbox durably admits one idempotent submission for a session.
 	// Replaying the same IdempotencyKey with the same payload returns the

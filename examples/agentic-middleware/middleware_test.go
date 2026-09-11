@@ -296,6 +296,11 @@ func TestReductionTruncatesSettledToolResultBeforeSettlement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	// The scripted provider CallID ("call-1") is preserved separately as
+	// ProviderCallID; the durable ID is always a fresh mint now, so capture
+	// it from the tool's own execution context instead of assuming the
+	// literal survives to the durable store.
+	var bigechoCallID session.ToolCallID
 	// Retention is explicit (MaxInlineBytes:-1), not the zero-value
 	// default: the payload must be genuinely inline so only reduction's own
 	// truncation -- not this runtime's own retention-policy truncation --
@@ -307,7 +312,8 @@ func TestReductionTruncatesSettledToolResultBeforeSettlement(t *testing.T) {
 			return registrar.Tool(composition.ToolRegistration{ID: "bigecho", Scope: testScope(sessionID), Definition: tools.Definition{
 				Name: "bigecho", Description: "returns a large payload for reduction to truncate",
 				Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
-				Execute: tools.TypedExecutor[map[string]any, map[string]any](func(context.Context, tools.TypedExecution[map[string]any]) (map[string]any, error) {
+				Execute: tools.TypedExecutor[map[string]any, map[string]any](func(_ context.Context, execution tools.TypedExecution[map[string]any]) (map[string]any, error) {
+					bigechoCallID = execution.Call.ID
 					return map[string]any{"text": original}, nil
 				}),
 				Retention: runtime.RetentionPolicy{MaxInlineBytes: -1},
@@ -350,7 +356,10 @@ func TestReductionTruncatesSettledToolResultBeforeSettlement(t *testing.T) {
 	}
 	// The durable settlement itself -- not just the model-visible copy --
 	// and replay must both already be the truncated form.
-	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-1"))
+	if bigechoCallID == "" {
+		t.Fatal("bigecho tool never executed, no durable call id captured")
+	}
+	toolCall, err := store.GetToolCall(context.Background(), bigechoCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -797,11 +806,20 @@ func TestPatchToolCallsMountsAndCompletesNormalTurnWithoutAlteringSettlement(t *
 
 // deferredSearchToolDefinition is registered Deferred: true, so it is only
 // advertised via toolsearch's own tool_search, not eagerly bound.
-func deferredSearchToolDefinition() tools.Definition {
+// deferredSearchToolDefinition's calledID, when non-nil, is set to the
+// durable tool-call id of the most recent execution: the scripted provider
+// CallID a test script uses (e.g. "call-hidden") is preserved separately as
+// ProviderCallID now -- the durable ID is always a fresh mint -- so a
+// caller that needs to look the settled call back up in the store must
+// capture it from here rather than assume the scripted literal survives.
+func deferredSearchToolDefinition(calledID *session.ToolCallID) tools.Definition {
 	return tools.Definition{
 		Name: "hidden_capability", Description: "only discoverable via deferred tool search",
 		Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
-		Execute: tools.TypedExecutor[map[string]any, map[string]any](func(context.Context, tools.TypedExecution[map[string]any]) (map[string]any, error) {
+		Execute: tools.TypedExecutor[map[string]any, map[string]any](func(_ context.Context, execution tools.TypedExecution[map[string]any]) (map[string]any, error) {
+			if calledID != nil {
+				*calledID = execution.Call.ID
+			}
 			return map[string]any{"text": "found it"}, nil
 		}),
 		Deferred: true,
@@ -851,9 +869,10 @@ func TestToolSearchFindsDeferredTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	var hiddenCallID session.ToolCallID
 	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
 		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition(&hiddenCallID)})
 		}))
 	if err != nil {
 		t.Fatal(err)
@@ -902,7 +921,10 @@ func TestToolSearchFindsDeferredTool(t *testing.T) {
 	// -- not the specific bytes -- is the proof that discovery actually
 	// unblocked the call: an undiscovered-deferred-tool denial settles
 	// ToolCallFailed with an "expected_failure" envelope instead.
-	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden"))
+	if hiddenCallID == "" {
+		t.Fatal("hidden_capability tool never executed, no durable call id captured")
+	}
+	toolCall, err := store.GetToolCall(context.Background(), hiddenCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -931,9 +953,10 @@ func TestToolSearchDiscoveryReplaysOnNextTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	var hiddenCallID session.ToolCallID
 	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
 		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition(&hiddenCallID)})
 		}))
 	if err != nil {
 		t.Fatal(err)
@@ -991,7 +1014,10 @@ func TestToolSearchDiscoveryReplaysOnNextTurn(t *testing.T) {
 	if strings.Contains(turn2Result, "expected_failure") || strings.Contains(turn2Result, "undiscovered") {
 		t.Fatalf("turn2Result = %q, want hidden_capability NOT denied as undiscovered in a fresh turn", turn2Result)
 	}
-	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden-t2"))
+	if hiddenCallID == "" {
+		t.Fatal("hidden_capability tool never executed, no durable call id captured")
+	}
+	toolCall, err := store.GetToolCall(context.Background(), hiddenCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1021,9 +1047,10 @@ func TestToolSearchDiscoveryReplaysAfterResumeRun(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	var hiddenCallID session.ToolCallID
 	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
 		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition(&hiddenCallID)})
 		}))
 	if err != nil {
 		t.Fatal(err)
@@ -1089,7 +1116,10 @@ func TestToolSearchDiscoveryReplaysAfterResumeRun(t *testing.T) {
 	if strings.Contains(calledResult, "expected_failure") || strings.Contains(calledResult, "undiscovered") {
 		t.Fatalf("calledResult = %q, want hidden_capability NOT denied as undiscovered after resume", calledResult)
 	}
-	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden-resume"))
+	if hiddenCallID == "" {
+		t.Fatal("hidden_capability tool never executed, no durable call id captured")
+	}
+	toolCall, err := store.GetToolCall(context.Background(), hiddenCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1118,9 +1148,10 @@ func TestToolSearchDiscoveryReplaysAfterProcessRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
+	var hiddenCallID session.ToolCallID
 	toolMount, err := registry.Mount(context.Background(), testNativeComponent("hidden", sessionID),
 		composition.InstallerFunc(func(_ context.Context, registrar *composition.Registrar) error {
-			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition()})
+			return registrar.Tool(composition.ToolRegistration{ID: "hidden_capability", Scope: testScope(sessionID), Definition: deferredSearchToolDefinition(&hiddenCallID)})
 		}))
 	if err != nil {
 		t.Fatal(err)
@@ -1181,7 +1212,10 @@ func TestToolSearchDiscoveryReplaysAfterProcessRestart(t *testing.T) {
 	if strings.Contains(restartResult, "expected_failure") || strings.Contains(restartResult, "undiscovered") {
 		t.Fatalf("restartResult = %q, want hidden_capability NOT denied as undiscovered after a process restart", restartResult)
 	}
-	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-hidden-restart"))
+	if hiddenCallID == "" {
+		t.Fatal("hidden_capability tool never executed, no durable call id captured")
+	}
+	toolCall, err := store.GetToolCall(context.Background(), hiddenCallID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -99,7 +99,16 @@ func (m *adkModel) dispatchSnapshot() TurnSnapshot {
 type adkDispatch struct {
 	messageID session.MessageID
 	record    session.ModelRequestRecord
-	input     []*einoschema.AgenticMessage
+	// input is the durable-id-keyed projection begin received (this
+	// package's own internal identity, ADK's own tracked conversation).
+	input []*einoschema.AgenticMessage
+	// wireInput is input with every function_tool_call/function_tool_result/
+	// tool_search_result CallID rewritten to its provider-facing identity
+	// (see publicizeToolCallIDs). It is computed exactly once, at the top
+	// of begin, and is both what the request ledger audits/hashes and what
+	// dispatch sends -- so the audited row and the physical wire payload
+	// are always the same bytes (see begin's doc comment).
+	wireInput []*einoschema.AgenticMessage
 }
 
 // currentMessageID claims the turn's assistant placeholder for exactly one
@@ -146,15 +155,29 @@ func (m *adkModel) currentMessageID(ctx context.Context) (session.MessageID, err
 	return nextID, nil
 }
 
+// begin computes this dispatch's wire-shaped request (durable tool-call ids
+// rewritten to their provider-facing identity, via publicizeToolCallIDs) and
+// audits/ledgers exactly that request -- before nextStep/currentMessageID so
+// a store read failure resolving a provider id neither consumes a step nor
+// appends an assistant placeholder row. dispatch then sends d.wireInput
+// unchanged: publicizeToolCallIDs runs exactly once per physical dispatch,
+// so the ledger's Messages/ContentSHA256/ModelRequestedNotice and the bytes
+// the provider actually receives can never diverge (see adk_model.go's W4
+// doc references and docs/architecture/eino-feature-support.md's W4
+// section).
 func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage) (*adkDispatch, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	wireInput, err := publicizeToolCallIDs(ctx, m.host.store, m.engine.snapshot.SessionID, &m.engine.toolCallIDCache, m.engine.authorizedRewrites, input)
+	if err != nil {
+		return nil, err
+	}
 	step := m.engine.nextStep()
 	messageID, err := m.currentMessageID(ctx)
 	if err != nil {
 		return nil, err
 	}
-	request := m.dispatchSnapshot().ProviderRequest(messageID, m.host.trace, input, m.execution.discoveredSnapshot())
+	request := m.dispatchSnapshot().ProviderRequest(messageID, m.host.trace, wireInput, m.execution.discoveredSnapshot())
 	agentPath := m.engine.agentPath
 	if m.internalDispatch != "" {
 		// An internal-dispatch call (e.g. summarization's own
@@ -241,7 +264,7 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 	// agent never routed a physical call through this adapter at all (see
 	// adkEngine.dispatches's doc comment).
 	m.engine.dispatches.Add(1)
-	return &adkDispatch{messageID: messageID, record: record, input: input}, nil
+	return &adkDispatch{messageID: messageID, record: record, input: input, wireInput: wireInput}, nil
 }
 
 // finish updates this dispatch's ledger row and notifies ModelCompletedPoint.
@@ -293,7 +316,7 @@ func (m *adkModel) Generate(ctx context.Context, input []*einoschema.AgenticMess
 	if err != nil {
 		return nil, err
 	}
-	result, dispatchErr := m.dispatch(ctx, dispatch, input, nil)
+	result, dispatchErr := m.dispatch(ctx, dispatch, nil)
 	if dispatchErr != nil {
 		m.engine.addUsage(result.usage)
 		if result.receivedDelta {
@@ -351,7 +374,7 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 		SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, MessageID: dispatch.messageID,
 		RequestID: dispatch.record.ID, Attempt: dispatch.record.Attempt, Step: dispatch.record.Step,
 	})
-	result, dispatchErr := m.dispatch(ctx, dispatch, input, func(_ int64, chunk *einoschema.AgenticMessage) {
+	result, dispatchErr := m.dispatch(ctx, dispatch, func(_ int64, chunk *einoschema.AgenticMessage) {
 		content, reasoning := deltaText(chunk)
 		if content != "" {
 			m.host.sessionObserver.AppendText(live, content)
@@ -628,14 +651,22 @@ func (m *adkModel) prepareDispatchInput(input []*einoschema.AgenticMessage) ([]*
 // (both Generate and Stream funnel through the streaming provider
 // transport), fully draining the response before returning: no live chunk
 // ever reaches ADK directly (see receiveModelStream's callers here).
-func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, input []*einoschema.AgenticMessage, onDelta func(int64, *einoschema.AgenticMessage)) (result modelStreamResult, err error) {
+func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, onDelta func(int64, *einoschema.AgenticMessage)) (result modelStreamResult, err error) {
+	// d.wireInput already shows the provider its own tool-call ids back
+	// (begin computed it via publicizeToolCallIDs, exactly once for this
+	// dispatch -- see begin's doc comment): sending it unchanged here is
+	// what keeps the ledgered/audited request and the physical wire
+	// payload identical. d.input (durable-id-keyed) is left untouched so
+	// this package's own bookkeeping (registerToolBatch, ADK's own tracked
+	// conversation via compose.GetToolCallID) stays keyed on the durable id
+	// it has always used.
 	// d.record.Step, not Attempt, is what actually varies per physical
 	// dispatch under the invocation-per-physical-dispatch ledger model (see
 	// adk_retry.go): Attempt is pinned to 1 for every dispatch, so using it
 	// here would collide every retry/tool-loop dispatch's stream
 	// observation onto the same "attempt-1" correlation ID.
 	observation := m.host.startObservedStream(ctx, m.engine.snapshot, d.messageID, d.record.Step)
-	request := m.dispatchSnapshot().ProviderRequest(d.messageID, m.host.trace, input, m.execution.discoveredSnapshot())
+	request := m.dispatchSnapshot().ProviderRequest(d.messageID, m.host.trace, d.wireInput, m.execution.discoveredSnapshot())
 	request.System = d.record.System
 	request.IdempotencyKey = string(d.record.ID)
 	// A panic from the provider transport (either the initial
@@ -714,7 +745,6 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 			return nil, fmt.Errorf("%w: %s", errADKUnsupportedBlock, block.Type)
 		}
 	}
-	normalizeToolCallIDs(result, m.host.ids)
 	blockIDs := make([]string, len(result.ContentBlocks))
 	for index := range blockIDs {
 		blockIDs[index] = string(m.host.ids.NewPartID())
@@ -725,16 +755,20 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 	}
 	result = publicMsg
 	calls := functionToolCalls(result)
-	var callIDs []session.ToolCallID
-	if len(calls) != 0 {
-		callIDs = make([]session.ToolCallID, len(calls))
-		for i, call := range calls {
-			callIDs[i] = session.ToolCallID(call.CallID)
-		}
-	}
 	preparedCalls, err := m.host.prepareToolCalls(ctx, m.execution, m.engine.snapshot, dispatch.messageID, calls)
 	if err != nil {
 		return nil, err
+	}
+	// callIDs is read from preparedCalls (prepareToolCalls's own minted
+	// call.ID) after prepareToolCalls returns, never from calls[i].CallID
+	// captured beforehand: prepareToolCalls unconditionally overwrites each
+	// block's CallID with a fresh durable mint (see its own doc comment),
+	// so registerToolBatch below must key on that same durable id -- the
+	// one ADK will actually dispatch with -- not the provider's
+	// pre-mutation value.
+	callIDs := make([]session.ToolCallID, len(preparedCalls))
+	for i := range preparedCalls {
+		callIDs[i] = preparedCalls[i].call.ID
 	}
 	for _, prepared := range preparedCalls {
 		if prepared.middlewareErr != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 
@@ -81,7 +82,7 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 			Call: session.ToolCall{
 				ID: prepared.call.ID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				RequestPartID: requestPart.ID, ResultMessageID: resultMessageID, ResultPartID: resultPartID,
-				Name: prepared.call.Name, RequestedName: prepared.call.RequestedName, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
+				Name: prepared.call.Name, RequestedName: prepared.call.RequestedName, ProviderCallID: prepared.call.ProviderCallID, Pattern: prepared.call.Pattern, Input: cloneJSON(prepared.call.Input), Status: session.ToolCallPending,
 				RetrySafe: prepared.tool.RetrySafe, Metadata: cloneStringMap(prepared.tool.Metadata),
 			},
 			RequestPart: requestPart,
@@ -166,18 +167,49 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		if block == nil {
 			continue
 		}
-		callID := session.ToolCallID(block.CallID)
-		if callID == "" {
-			callID = o.ids.NewToolCallID()
-			block.CallID = string(callID)
+		// providerCallID is whatever the provider itself sent as this
+		// call's CallID (possibly empty). callID is always a fresh,
+		// store-wide-unique mint: some providers (llama.cpp/Ollama/vLLM
+		// OpenAI-compatible endpoints, replayed fixtures) reissue the same
+		// indexed id (e.g. "call_0") across unrelated responses, and
+		// reusing that value verbatim as the durable tool_calls.id (which
+		// is UNIQUE store-wide) fails a later turn with a clean
+		// session.ErrConflict. block.CallID is overwritten unconditionally
+		// (not just when empty) so the assistant message this runtime
+		// persists and hands back to ADK -- and everything keyed off it
+		// (ADK's own tool dispatch, GetToolCall lookups, approval/interrupt
+		// reconciliation) -- uses this durable identity uniformly. The
+		// provider's original id is preserved on the call record
+		// (ProviderCallID) purely so the wire request rebuilt for a later
+		// dispatch can show the provider its own id back (see
+		// publicizeToolCallIDs).
+		// A provider id that is not valid UTF-8, or that exceeds
+		// session.DiscoveryMaxIdentityBytes (reused here, though this value
+		// is not itself a discovery identity), is treated as if the
+		// provider had left CallID empty rather than persisted as-is:
+		// invalid UTF-8 would otherwise round-trip altered through the SQL
+		// stores' JSON encoding (encoding/json replaces it with U+FFFD), so
+		// the wire would silently stop echoing the provider's exact id, and
+		// an unbounded id would sit in the free-form tool-call record with
+		// no size check at all (unlike the durable content block's own
+		// CallID, which session/content.go's validateVariant bounds via the
+		// block's content limits). publicizeToolCallIDs falls back to the
+		// minted durable id whenever ProviderCallID is empty, so an invalid
+		// or oversized id simply means the provider sees its own call
+		// answered under the minted id instead.
+		providerCallID := block.CallID
+		if !validProviderCallID(providerCallID) {
+			providerCallID = ""
 		}
+		callID := o.ids.NewToolCallID()
+		block.CallID = string(callID)
 		requestedInput, err := normalizedToolArguments(block.Arguments)
 		if err != nil {
 			return nil, err
 		}
 		if snapshot.isToolSearchCall(block.Name) {
 			call := ToolCall{
-				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				Name: block.Name, RequestedName: block.Name, Pattern: block.Name,
 				Input: cloneJSON(requestedInput), Context: toolContext(snapshot, snapshot.Tools),
 			}
@@ -191,7 +223,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		// per tools.Definition.Aliases/ArgumentAliases (see adk_tools.go).
 		tool, canonicalName, remapped, requestedName, err := resolveToolCall(snapshot, block.Name, requestedInput)
 		if err != nil {
-			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
+			o.observeToolSettled(ctx, snapshot, Tool{Name: block.Name}, ToolCall{ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID, Name: block.Name}, session.ToolCallFailed, 0, err, nil)
 			return nil, err
 		}
 		if tool.Deferred && !discovered[canonicalName] {
@@ -220,7 +252,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 				denyErr = fmt.Errorf("tool %q is deferred and no tool search is configured", canonicalName)
 			}
 			call := ToolCall{
-				ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+				ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 				Name: canonicalName, RequestedName: requestedName, Pattern: canonicalName,
 				Input: cloneJSON(remapped), Context: toolContext(snapshot, snapshot.Tools),
 			}
@@ -241,7 +273,7 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 			}
 		}
 		call := ToolCall{
-			ID: callID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
+			ID: callID, ProviderCallID: providerCallID, SessionID: snapshot.SessionID, RunID: snapshot.RunID, MessageID: messageID,
 			Name: canonicalName, RequestedName: requestedName, Scope: tool.Scope, Pattern: canonicalName,
 			Input: cloneJSON(input), Context: toolContext(snapshot, snapshot.Tools),
 		}
@@ -272,4 +304,15 @@ func (o *StreamingOrchestrator) prepareToolCalls(ctx context.Context, execution 
 		prepared = append(prepared, preparedToolCall{block: block, tool: tool, call: call, middlewareErr: prepareErr})
 	}
 	return prepared, nil
+}
+
+// validProviderCallID reports whether id is safe to persist verbatim as
+// session.ToolCall.ProviderCallID: valid UTF-8 (so it round-trips through
+// the SQL stores' JSON encoding unaltered -- encoding/json otherwise
+// replaces invalid UTF-8 with U+FFFD) and no longer than
+// session.DiscoveryMaxIdentityBytes -- reused as a convenient existing
+// bound, not because a provider call id is itself a discovery identity. An
+// empty id is valid (it means the provider left CallID unset).
+func validProviderCallID(id string) bool {
+	return len(id) <= session.DiscoveryMaxIdentityBytes && utf8.ValidString(id)
 }

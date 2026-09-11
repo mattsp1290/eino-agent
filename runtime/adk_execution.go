@@ -50,6 +50,12 @@ type adkEngine struct {
 	// historyOptions is used to reload the durable model-input projection
 	// fresh before every physical dispatch (see adkModel.durableProjection).
 	historyOptions history.Options
+
+	// toolCallIDCache caches publicizeToolCallIDs's durable-id ->
+	// provider-facing-id resolutions across every dispatch this turn's
+	// engine sees (the primary adapter and any retry/failover adapter
+	// sharing it via resolvedOverride) -- see toolCallIDCache's doc comment.
+	toolCallIDCache toolCallIDCache
 	// baseMessageCount is len(allMessages) at turn-admission time, BEFORE
 	// contextAssemblePoint's extension transforms ran (prepareSnapshot's
 	// Base, not its output snapshot.Messages): the boundary
@@ -966,7 +972,7 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	call := ToolCall{
 		ID: record.ID, SessionID: record.SessionID, RunID: record.RunID, MessageID: record.MessageID,
 		ResultMessageID: record.ResultMessageID, ResultPartID: record.ResultPartID, Name: record.Name, RequestedName: record.RequestedName,
-		Scope: t.tool.Scope, Pattern: record.Pattern, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
+		ProviderCallID: record.ProviderCallID, Scope: t.tool.Scope, Pattern: record.Pattern, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
 	}
 	if t.tool.InterruptPolicy != nil {
 		wasInterrupted, hasState, _ := compose.GetInterruptState[*adkToolInterruptState](ctx)
@@ -1143,7 +1149,7 @@ func (t *adkToolSearch) InvokableRun(ctx context.Context, arguments string, _ ..
 	}
 	call := ToolCall{
 		ID: record.ID, SessionID: record.SessionID, RunID: record.RunID, MessageID: record.MessageID,
-		Name: record.Name, RequestedName: record.RequestedName, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
+		Name: record.Name, RequestedName: record.RequestedName, ProviderCallID: record.ProviderCallID, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
 	}
 	if _, err := e.execution.executeToolSearchCall(ctx, e.snapshot, call, record); err != nil {
 		fatal = true

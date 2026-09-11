@@ -177,8 +177,14 @@ func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	configureTestTools(orchestrator, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+	// The scripted provider CallID ("call-once") is preserved separately as
+	// ProviderCallID; the durable session.ToolCall.ID is always a fresh mint
+	// now, so capture the runtime-minted id the executor actually observed
+	// rather than assuming the provider literal became the durable key.
+	var executedCall ToolCall
+	configureTestTools(orchestrator, staticToolRegistry{tools: []Tool{{Name: "echo", Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
 		toolExecutions++
+		executedCall = call
 		return ToolResult{Output: "ok"}, nil
 	})}}})
 
@@ -186,7 +192,7 @@ func TestLedgerRetriesOnlyFailedProviderStepAfterSettledTool(t *testing.T) {
 	if result.Error != nil || result.Status != session.RunCompleted || providerCalls != 3 || toolExecutions != 1 {
 		t.Fatalf("result=%#v provider calls=%d tool executions=%d", result, providerCalls, toolExecutions)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-once")
+	call, err := store.GetToolCall(context.Background(), executedCall.ID)
 	if err != nil || call.Status != session.ToolCallCompleted {
 		t.Fatalf("tool call=%#v error=%v", call, err)
 	}

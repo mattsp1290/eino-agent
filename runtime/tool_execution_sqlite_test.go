@@ -61,6 +61,15 @@ func TestSettleInterruptedToolTreatsSQLNullOutputAsAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The scripted provider CallID ("call-1") is preserved separately as
+	// ProviderCallID; prepareToolCalls always mints a fresh, store-unique
+	// ID now and overwrites block.CallID with it in place (msg's function
+	// call block already reflects the mint by the time persistAssistantTurn
+	// runs below), so use the minted id from prepared going forward.
+	if len(prepared) != 1 {
+		t.Fatalf("prepared = %#v, want exactly 1 tool call", prepared)
+	}
+	mintedID := prepared[0].call.ID
 	blockIDs := make([]string, len(msg.ContentBlocks))
 	for index := range blockIDs {
 		blockIDs[index] = string(host.ids.NewPartID())
@@ -69,10 +78,10 @@ func TestSettleInterruptedToolTreatsSQLNullOutputAsAbsent(t *testing.T) {
 		t.Fatal(err)
 	}
 	startedAt := host.now()
-	if _, err := execution.persistToolClaim(ctx, session.ClaimToolCallRequest{ID: "call-1", ClaimedBy: host.ownerID(), ClaimToken: "tool-claim", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolTransitionEnvelope(host, snapshot, startedAt)}); err != nil {
+	if _, err := execution.persistToolClaim(ctx, session.ClaimToolCallRequest{ID: mintedID, ClaimedBy: host.ownerID(), ClaimToken: "tool-claim", StartedAt: startedAt, LeaseDuration: time.Minute, Event: toolTransitionEnvelope(host, snapshot, startedAt)}); err != nil {
 		t.Fatal(err)
 	}
-	running, err := store.GetToolCall(ctx, "call-1")
+	running, err := store.GetToolCall(ctx, mintedID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +96,7 @@ func TestSettleInterruptedToolTreatsSQLNullOutputAsAbsent(t *testing.T) {
 	if err := json.Unmarshal(settlement.Output, &output); err != nil || output.Status != "interrupted" || output.Content != "tool execution interrupted" {
 		t.Fatalf("settlement output = %s (%v)", settlement.Output, err)
 	}
-	stored, err := store.GetToolCall(ctx, "call-1")
+	stored, err := store.GetToolCall(ctx, mintedID)
 	if err != nil || stored.Status != session.ToolCallInterrupted || string(stored.Output) != string(settlement.Output) {
 		t.Fatalf("stored = %+v (%v)", stored, err)
 	}

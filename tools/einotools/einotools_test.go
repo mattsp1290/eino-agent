@@ -172,7 +172,14 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	if permissionRequest.Permission != "workspace.read" || permissionRequest.Pattern != "hello.txt" || permissionRequest.ToolName != "file_read" {
 		t.Fatalf("permission request = %+v", permissionRequest)
 	}
-	call, err := store.GetToolCall(ctx, "catalog-call")
+	// The scripted streamer's tool call carried CallID "catalog-call", but
+	// runtime.prepareToolCalls always mints a fresh, durable, store-unique
+	// ToolCall.ID regardless of what the provider sent (see
+	// session.ToolCall.ProviderCallID) -- so the durable row's primary key
+	// is not "catalog-call". permissionRequest.ToolCallID (captured above,
+	// from the SAME dispatched call) is the minted id to look the row up
+	// by.
+	call, err := store.GetToolCall(ctx, session.ToolCallID(permissionRequest.ToolCallID))
 	if err != nil {
 		t.Fatal(err)
 	}

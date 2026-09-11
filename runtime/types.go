@@ -177,12 +177,24 @@ type ToolCall struct {
 	// RequestedName is the model-facing tool name as the model actually
 	// called it (equal to Name unless the model used a registered alias).
 	RequestedName string
-	Scope         ToolScope
-	Pattern       string
-	Input         json.RawMessage
-	Approval      ApprovalRequester
-	SessionTitle  SessionTitleWriter `json:"-"`
-	Context       ToolContext
+	// ProviderCallID carries the provider's own tool-call id (block.CallID
+	// as received) from prepareToolCalls through to the durable
+	// session.ToolCall record -- see session.ToolCall.ProviderCallID. ID is
+	// always the freshly runtime-minted, store-unique identity. ID, not
+	// ProviderCallID, is what a later dispatch shows the provider back when
+	// ProviderCallID is empty (the provider omitted its own id, or sent one
+	// that failed validation) or when sending it would be ambiguous in
+	// that outgoing request (an earlier call already sends that exact
+	// string, or it equals the durable id of any call in the request) --
+	// see runtime.publicizeToolCallIDs's doc comment for exactly which
+	// case applies.
+	ProviderCallID string
+	Scope          ToolScope
+	Pattern        string
+	Input          json.RawMessage
+	Approval       ApprovalRequester
+	SessionTitle   SessionTitleWriter `json:"-"`
+	Context        ToolContext
 	// ResumeDecision carries the host-supplied resume payload for a call
 	// whose Tool.InterruptPolicy paused it via a durable ADK checkpoint,
 	// once the targeted resume has delivered it. Empty on every other call.

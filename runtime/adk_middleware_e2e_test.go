@@ -542,7 +542,10 @@ func TestReductionTruncatesToolResultBeforeSettlement(t *testing.T) {
 
 	// The DURABLE settlement itself must already be the truncated form:
 	// this is a pre-settlement transform, not an after-the-fact rewrite.
-	toolCall, err := store.GetToolCall(context.Background(), session.ToolCallID("call-1"))
+	// The scripted provider CallID ("call-1") is preserved separately as
+	// ProviderCallID; the durable ID is always a fresh mint now, so
+	// discover it from the store instead.
+	toolCall, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1113,5 +1116,117 @@ func TestSettlementSealRejectsMediaSwapOnSettledMultimodalResult(t *testing.T) {
 	result := <-handle.Done()
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v, want failed (a swapped image payload on a settled multimodal result should have been caught)", result)
+	}
+}
+
+// TestSettlementSealVerifiesDurableIDsAcrossProviderReusedCallID proves the
+// settlement seal (verifySettledToolResults, run from prepareDispatchInput
+// against ADK's own durable-id-keyed state -- BEFORE begin's
+// publicizeToolCallIDs wire rewrite, see prepareDispatchInput's and begin's
+// doc comments) is immune to a provider reusing the same literal wire id
+// (a "call_0"-style reissue, e.g. llama.cpp/vLLM/Ollama) across two
+// genuinely distinct calls in one run: the seal never observes the wire's
+// provider ids at all, only the durable ones minted by prepareToolCalls, so
+// a reused wire id can never be mistaken for a diverged or fabricated
+// settlement. This also proves publicizeToolCallIDs' own duplicate-id
+// dedup (see its doc comment's "Duplicate provider ids" section): the
+// second call's provider id collides with the first call's already-claimed
+// wire id, so it falls back to sending its own durable id instead -- the
+// two settled results never collide on the wire, and both settle correctly
+// and distinctly in the durable store.
+func TestSettlementSealVerifiesDurableIDsAcrossProviderReusedCallID(t *testing.T) {
+	store := newAdmissionStore()
+	var executedIDs []session.ToolCallID
+	echo := Tool{
+		Name: "echo", Info: &einoschema.ToolInfo{Name: "echo", Desc: "echo"},
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executedIDs = append(executedIDs, call.ID)
+			return ToolResult{Output: "result-" + string(call.ID)}, nil
+		}),
+	}
+	var calls int
+	var thirdDispatchByCallID map[string]string
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			// The provider mints "call_0" for the first call.
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call_0", "echo", `{}`)}, nil
+		case 2:
+			// The first call's settled result must already be on the wire
+			// under the provider's own id -- it is the only (and thus
+			// earliest) claimant of "call_0" in this request.
+			firstByCallID := functionToolResultTextByCallID(request.Messages)
+			if _, ok := firstByCallID["call_0"]; !ok {
+				t.Errorf("round 2 request has no function_tool_result under wire id %q; got %+v", "call_0", firstByCallID)
+			}
+			// The provider reuses the exact same literal id for a second,
+			// genuinely different call -- exactly the collision this fix
+			// exists to make store-safe.
+			return []*einoschema.AgenticMessage{agenticToolCallChunk(0, "call_0", "echo", `{}`)}, nil
+		default:
+			thirdDispatchByCallID = functionToolResultTextByCallID(request.Messages)
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+		}
+	}))
+	handlerComponent := PlanComponent{
+		Component: testPlanComponent("call-id-reuse-component"),
+		Tools:     testPlanTools(staticToolRegistry{tools: []Tool{echo}}),
+	}
+	orch.plans = staticRunPlanProvider{plan: mustTestRunPlan(RunPlanSpec{Components: []PlanComponent{handlerComponent}})}
+	handle, err := orch.Start(context.Background(), Request{SessionID: "call-id-reuse-session", Message: TextUserMessage("hi"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed (the settlement seal must not reject a provider-reused wire id)", result)
+	}
+	if len(executedIDs) != 2 {
+		t.Fatalf("echo executed %d times, want exactly 2", len(executedIDs))
+	}
+	firstID, secondID := string(executedIDs[0]), string(executedIDs[1])
+	if firstID == secondID {
+		t.Fatalf("both calls minted the same durable id %q, want distinct", firstID)
+	}
+	if thirdDispatchByCallID == nil {
+		t.Fatal("round 3 dispatch never observed")
+	}
+	// The first call keeps "call_0" on the wire (sole claimant); the
+	// second call's provider id collided, so it falls back to its own
+	// durable id instead -- see publicizeToolCallIDs's "Duplicate provider
+	// ids" doc section.
+	firstContent, ok := thirdDispatchByCallID["call_0"]
+	if !ok {
+		t.Fatalf("round 3 request has no function_tool_result under wire id %q; got %+v", "call_0", thirdDispatchByCallID)
+	}
+	if !strings.Contains(firstContent, firstID) {
+		t.Fatalf("first call's wire content = %q, want it to reference its own durable id %q", firstContent, firstID)
+	}
+	secondContent, ok := thirdDispatchByCallID[secondID]
+	if !ok {
+		t.Fatalf("round 3 request has no function_tool_result under the second call's own durable id %q (want the collision fallback); got %+v", secondID, thirdDispatchByCallID)
+	}
+	if !strings.Contains(secondContent, secondID) {
+		t.Fatalf("second call's wire content = %q, want it to reference its own durable id %q", secondContent, secondID)
+	}
+	// Both settlements are durably correct and distinct in the store too --
+	// keyed by durable id, never confused by the shared wire id.
+	firstCall, err := store.GetToolCall(context.Background(), executedIDs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCall, err := store.GetToolCall(context.Background(), executedIDs[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCall.Status != session.ToolCallCompleted || secondCall.Status != session.ToolCallCompleted {
+		t.Fatalf("settled statuses = %q, %q, want both completed", firstCall.Status, secondCall.Status)
+	}
+	if !strings.Contains(string(firstCall.Output), firstID) {
+		t.Fatalf("first call's durable output = %s, want it to reference its own durable id %q", firstCall.Output, firstID)
+	}
+	if !strings.Contains(string(secondCall.Output), secondID) {
+		t.Fatalf("second call's durable output = %s, want it to reference its own durable id %q", secondCall.Output, secondID)
 	}
 }

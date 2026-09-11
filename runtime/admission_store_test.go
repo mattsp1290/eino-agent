@@ -39,9 +39,26 @@ type admissionStore struct {
 	// come back from ListEvents in Go's randomized map iteration order.
 	// Every write goes through putEvent, which is the only place these are
 	// mutated.
-	eventSeq          int64
-	eventOrder        map[session.EventID]int64
-	toolCalls         map[session.ToolCallID]session.ToolCall
+	eventSeq   int64
+	eventOrder map[session.EventID]int64
+	toolCalls  map[session.ToolCallID]session.ToolCall
+	// toolCallSeq/toolCallSeqNext record each tool call's creation order.
+	// ListUnfinishedToolCalls uses this only as a final tiebreaker (see its
+	// doc comment): the primary sort key is (message insertion order,
+	// request-part ordinal), tracked by messageSeq/parts below, so the
+	// fixture matches the real stores' declared order directly instead of
+	// relying on creation order happening to equal declared order. (No
+	// runtime test currently asserts the order resumeRun/
+	// terminalizeUnfinishedTools consume calls in -- the store contract in
+	// store/storetest pins the order itself.)
+	toolCallSeq     map[session.ToolCallID]int64
+	toolCallSeqNext int64
+	// messageSeq/messageSeqNext record each message's insertion order (via
+	// appendMessageLocked, the only place these are mutated), so
+	// ListUnfinishedToolCalls can sort by (message, block position) --
+	// declared order -- instead of creation order.
+	messageSeq        map[session.MessageID]int64
+	messageSeqNext    int64
 	epochs            map[session.EpochID]session.ContextEpoch
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
 	turns             map[session.TurnID]session.Turn
@@ -70,6 +87,8 @@ func newAdmissionStore() *admissionStore {
 		events:        map[session.EventID]session.EventRecord{},
 		eventOrder:    map[session.EventID]int64{},
 		toolCalls:     map[session.ToolCallID]session.ToolCall{},
+		toolCallSeq:   map[session.ToolCallID]int64{},
+		messageSeq:    map[session.MessageID]int64{},
 		epochs:        map[session.EpochID]session.ContextEpoch{},
 		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
 		turns:         map[session.TurnID]session.Turn{},
@@ -103,6 +122,10 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.eventSeq = tx.eventSeq
 	s.eventOrder = tx.eventOrder
 	s.toolCalls = tx.toolCalls
+	s.toolCallSeq = tx.toolCallSeq
+	s.toolCallSeqNext = tx.toolCallSeqNext
+	s.messageSeq = tx.messageSeq
+	s.messageSeqNext = tx.messageSeqNext
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
 	s.turns = tx.turns
@@ -124,6 +147,10 @@ func (s *admissionStore) clone() *admissionStore {
 		eventSeq:          s.eventSeq,
 		eventOrder:        cloneMap(s.eventOrder),
 		toolCalls:         cloneMap(s.toolCalls),
+		toolCallSeq:       cloneMap(s.toolCallSeq),
+		toolCallSeqNext:   s.toolCallSeqNext,
+		messageSeq:        cloneMap(s.messageSeq),
+		messageSeqNext:    s.messageSeqNext,
 		epochs:            cloneMap(s.epochs),
 		modelRequests:     cloneMap(s.modelRequests),
 		turns:             cloneMap(s.turns),
@@ -302,6 +329,11 @@ func (s *admissionStore) appendMessageLocked(_ context.Context, message session.
 		return existing, nil
 	}
 	s.messages[message.ID] = message
+	if s.messageSeq == nil {
+		s.messageSeq = map[session.MessageID]int64{}
+	}
+	s.messageSeq[message.ID] = s.messageSeqNext
+	s.messageSeqNext++
 	return message, nil
 }
 
@@ -468,6 +500,11 @@ func (s *admissionStore) createToolCallLocked(_ context.Context, request session
 		return session.ToolTransitionResult{}, err
 	}
 	s.toolCalls[call.ID] = call
+	if s.toolCallSeq == nil {
+		s.toolCallSeq = map[session.ToolCallID]int64{}
+	}
+	s.toolCallSeq[call.ID] = s.toolCallSeqNext
+	s.toolCallSeqNext++
 	s.putEvent(event)
 	return session.ToolTransitionResult{Call: call, Event: event}, nil
 }
@@ -489,6 +526,23 @@ func (s *admissionStore) ListUnfinishedToolCalls(_ context.Context, runID sessio
 			calls = append(calls, call)
 		}
 	}
+	// Declared order (see session.Store.ListUnfinishedToolCalls's doc
+	// comment): sort by (message insertion order, request-part ordinal)
+	// directly, rather than relying on this fixture's creation order
+	// (toolCallSeq) happening to equal declared order. toolCallSeq is kept
+	// only as the final tiebreaker, for a call whose RequestPartID part
+	// isn't in s.parts.
+	sort.Slice(calls, func(i, j int) bool {
+		mi, mj := s.messageSeq[calls[i].MessageID], s.messageSeq[calls[j].MessageID]
+		if mi != mj {
+			return mi < mj
+		}
+		pi, pj := s.parts[calls[i].RequestPartID].Ordinal, s.parts[calls[j].RequestPartID].Ordinal
+		if pi != pj {
+			return pi < pj
+		}
+		return s.toolCallSeq[calls[i].ID] < s.toolCallSeq[calls[j].ID]
+	})
 	return calls, nil
 }
 func (s *admissionStore) ClaimToolCall(ctx context.Context, request session.ClaimToolCallRequest) (session.ToolTransitionResult, error) {
@@ -620,6 +674,10 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 	s.eventSeq = tx.eventSeq
 	s.eventOrder = tx.eventOrder
 	s.toolCalls = tx.toolCalls
+	s.toolCallSeq = tx.toolCallSeq
+	s.toolCallSeqNext = tx.toolCallSeqNext
+	s.messageSeq = tx.messageSeq
+	s.messageSeqNext = tx.messageSeqNext
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
 	s.turns = tx.turns
