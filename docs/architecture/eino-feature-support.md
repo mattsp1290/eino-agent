@@ -367,7 +367,8 @@ Status: landed; W1 scaffolding kept green.
   the run — a guard that wants to hard-stop a specific tool should deny that
   *discovered* tool's own calls instead, which still goes through the
   ordinary guard-checked execution pipeline.
-  `executeTurn` seeds `execution.discovered` from every
+  `admitTurn` (`runtime/turn_loop.go`) and `prepareFreshTurn`
+  (`runtime/orchestrator.go`) seed `execution.discovered` from every
   `tool_search_result` block in the turn's own projected messages
   (`discoveredToolsFromMessages`, scanning `snapshot.Messages`) at the start
   of every turn — fresh run or a later run in the same session — mirroring

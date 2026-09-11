@@ -116,6 +116,26 @@ func reconstructedUserAndAssistantText(t *testing.T, ctx context.Context, store 
 	return out
 }
 
+// agenticMessagesText extracts the user_input_text/assistant_gen_text
+// content of msgs, in order -- the same shape reconstructedUserAndAssistantText
+// extracts from durable rows, but read directly off the provider-visible
+// []*einoschema.AgenticMessage a model.Request actually carries (round-five
+// reconciliation item 5/FR-S2).
+func agenticMessagesText(msgs []*einoschema.AgenticMessage) []string {
+	var out []string
+	for _, msg := range msgs {
+		for _, block := range msg.ContentBlocks {
+			switch {
+			case block.Type == einoschema.ContentBlockTypeUserInputText && block.UserInputText != nil:
+				out = append(out, block.UserInputText.Text)
+			case block.Type == einoschema.ContentBlockTypeAssistantGenText && block.AssistantGenText != nil:
+				out = append(out, block.AssistantGenText.Text)
+			}
+		}
+	}
+	return out
+}
+
 // TestProcessRestartRecoversMultipleQueuedInputsAfterFirstCommittedTurn
 // proves the plan's acceptance bullet exactly (round-four reconciliation
 // item 7/MR-2/MR-3, plan 05-adk-runtime-and-recovery.md "Acceptance"):
@@ -221,8 +241,13 @@ func TestProcessRestartRecoversMultipleQueuedInputsAfterFirstCommittedTurn(t *te
 	}
 	defer func() { _ = poolB.Close() }()
 
+	var resumedRequests []model.Request
+	var reqMu sync.Mutex
 	orchB, err := NewStreamingOrchestrator(
-		WithStore(storeB), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		WithStore(storeB), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, req model.Request) ([]*einoschema.AgenticMessage, error) {
+			reqMu.Lock()
+			resumedRequests = append(resumedRequests, req)
+			reqMu.Unlock()
 			return []*einoschema.AgenticMessage{agenticAssistantText("reply-2")}, nil
 		})}),
 		WithIDGenerator(&namespacedSequenceIDs{namespace: "b"}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 1, 0, 0, time.UTC) }),
@@ -249,6 +274,26 @@ func TestProcessRestartRecoversMultipleQueuedInputsAfterFirstCommittedTurn(t *te
 	wantText := []string{"first message", "reply-1", "second message", "third message", "reply-2"}
 	if got := reconstructedUserAndAssistantText(t, ctx, orchB.store, sessionID); !stringSlicesEqual(got, wantText) {
 		t.Fatalf("reconstructed history = %#v, want %#v", got, wantText)
+	}
+	// The durable rows above prove what got COMMITTED, not what the
+	// post-restart turn's provider INPUT actually carried (round-five
+	// reconciliation item 5/FR-S2): admitTurn's model input must be
+	// reconstructed from committed prior-turn history plus the newly
+	// admitted turn's own messages, never just the newly admitted ones.
+	// Exactly one dispatch (the second turn's), carrying at least turn 1's
+	// user message, its assistant reply, and both new submissions.
+	reqMu.Lock()
+	gotRequests := append([]model.Request(nil), resumedRequests...)
+	reqMu.Unlock()
+	if len(gotRequests) != 1 {
+		t.Fatalf("post-restart model dispatches = %d, want exactly 1", len(gotRequests))
+	}
+	if got := len(gotRequests[0].Messages); got < 4 {
+		t.Fatalf("post-restart model input = %d messages, want turn 1's committed history (user + assistant) plus both new submissions (>= 4)", got)
+	}
+	gotInputText := agenticMessagesText(gotRequests[0].Messages)
+	if !stringSlicesEqual(gotInputText, wantText[:len(wantText)-1]) {
+		t.Fatalf("post-restart model input text = %#v, want %#v (turn 1's committed history reconstructed, plus both new submissions -- reply-2 is this dispatch's own output, not its input)", gotInputText, wantText[:len(wantText)-1])
 	}
 
 	// Exactly-once inbox completion.
@@ -295,12 +340,16 @@ func stringSlicesEqual(a, b []string) bool {
 
 // TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused proves the plan's
 // "targeted multi-leaf resume" acceptance item (round-four reconciliation
-// item 7/MR-2/MR-3): with two simultaneously-pending tool interrupts,
+// item 7/MR-2/MR-3) against the real SQLite store (round-five reconciliation
+// item 5/FR-S4: the plan's matrix bullet reads "Real ADK runner/TurnLoop
+// with SQLite and PostgreSQL"; the pause/promote/resume checkpoint
+// machinery is already covered by the single-leaf SQLite tests, but the
+// multi-leaf TARGETING logic itself was previously proven only against the
+// in-memory fixture): with two simultaneously-pending tool interrupts,
 // targeting only one by its InterruptCtx address resumes that leaf and
 // completes its tool call while the OTHER leaf stays paused untouched; a
 // second, separately-targeted ResumeRun then resumes it too.
 func TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused(t *testing.T) {
-	store := newAdmissionStore()
 	executed := map[string]int{}
 	var mu sync.Mutex
 	gate := Tool{
@@ -314,7 +363,7 @@ func TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused(t *testing.T) {
 		}),
 	}
 	var calls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls++
 		if calls == 1 {
 			// Two simultaneously-pending tool calls, both requiring a host
@@ -326,6 +375,7 @@ func TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused(t *testing.T) {
 		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
+	defer cleanup()
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
 
 	handle, err := orch.Start(context.Background(), Request{

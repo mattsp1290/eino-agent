@@ -266,7 +266,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 // captureAssistantProviderState splits provider-private material out of the
 // finalized assistant message before it can ever be persisted or handed to
 // an extension. blockIDs is pre-minted, one entry per message.ContentBlocks
-// index (see orchestrator.go's executeTurn), so the same durable block
+// index (see adk_model.go's adkModel.commit), so the same durable block
 // identity a block-bound codec captures against is the one
 // session.ContentFromAgenticMessage later assigns to the corresponding
 // durable content block.

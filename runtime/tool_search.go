@@ -323,7 +323,8 @@ func (e *runExecution) executeToolSearchCall(ctx context.Context, snapshot TurnS
 // model is about to see (snapshot.Messages, built via
 // session/history.ProjectAgentic -- see runtime/provider_state.go): every
 // ContentBlockTypeToolSearchResult block contributes the names of the tools
-// its ToolSearchFunctionToolResult.Result carries. executeTurn seeds
+// its ToolSearchFunctionToolResult.Result carries. admitTurn
+// (runtime/turn_loop.go) and prepareFreshTurn (runtime/orchestrator.go) seed
 // execution.discovered from this at the start of every turn (fresh or a
 // later run in the same session), mirroring upstream Eino's client-side
 // forward selection (adk/middlewares/dynamictool/toolsearch/toolsearch.go's

@@ -203,12 +203,24 @@ func TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop(t *testing.T) {
 	}
 	loop := adk.NewTurnLoop(cfg)
 	loop.Run(context.Background())
+	// A renamed field in turnLoopCheckpointShape restores UnhandledItems as
+	// its zero value (empty) through gob, so GenInput is never called and
+	// Run would otherwise block forever waiting for input that never
+	// arrives -- reproduced: without this Stop, the test hangs until the
+	// package's 10-minute default timeout and panics with a goroutine dump
+	// instead of reporting the assertion below (round-five reconciliation
+	// item 5/FR-S1, TR-S1). Stop once idle so the real assertion always
+	// runs and reports the rename in milliseconds.
+	loop.Stop(adk.UntilIdleFor(50 * time.Millisecond))
 	loop.Wait()
 
 	mu.Lock()
 	defer mu.Unlock()
 	if prepareAgentCalled {
 		t.Fatal("PrepareAgent was called; GenInput's synchronous Stop should have prevented dispatch")
+	}
+	if len(gotItems) == 0 {
+		t.Fatal("GenInput was never called: turnLoopCheckpointShape no longer decodes through eino's own unmarshalTurnLoopCheckpoint (renamed/retyped field?)")
 	}
 	want := []session.InboxID{"shape-item-a", "shape-item-b"}
 	if !reflect.DeepEqual(gotItems, want) {

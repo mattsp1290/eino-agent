@@ -17,7 +17,7 @@ import (
 // session.ContentFromAgenticMessage) and persists it as rich content parts,
 // any captured provider-state payloads, and one tool-call record per
 // prepared call, atomically. blockIDs is pre-minted, parallel to
-// msg.ContentBlocks (see orchestrator.go's executeTurn and
+// msg.ContentBlocks (see adk_model.go's adkModel.commit and
 // captureAssistantProviderState): the same durable block identity a
 // block-bound provider-state item is captured against is the identity
 // assigned to the corresponding durable content block here, so replay can

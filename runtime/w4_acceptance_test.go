@@ -971,7 +971,7 @@ func TestStreamingOrchestratorResumesPendingToolSearchCall(t *testing.T) {
 // TestOrchestratorDiscoveredToolCarriesToSecondRunInSameSession guards
 // composition-search-reviewer C1: a deferred tool discovered via tool
 // search in run 1 must remain callable in a LATER run in the same session
-// without the model re-discovering it. executeTurn seeds
+// without the model re-discovering it. admitTurn/prepareFreshTurn seed
 // execution.discovered from the projected turn messages
 // (discoveredToolsFromMessages) at the start of every turn, not just this
 // execution's own in-memory history, so a fresh run's advertised set
