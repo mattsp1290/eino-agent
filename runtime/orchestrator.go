@@ -279,7 +279,11 @@ func (o *StreamingOrchestrator) runFreshTurnLoop(ctx context.Context, execution 
 	execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
 	coordinator.setEngine(nil)
 	coordinator.mu.Lock()
-	coordinator.firstTurnEngine = &adkEngine{host: o, execution: execution, plan: coordinator.plan, snapshot: snapshot, turn: admitted.Turn, assistantMessageID: admitted.AssistantMessage.ID, historyOptions: coordinator.historyOptions, baseMessageCount: baseMessageCount}
+	// admitted.HistoryOptions (not coordinator.historyOptions, which stays
+	// the unresolved host template so later turns on this run re-resolve
+	// fresh -- see resolveTurnHistoryOptions) is what admitted.Snapshot's
+	// projection and baseMessageCount were actually computed against.
+	coordinator.firstTurnEngine = &adkEngine{host: o, execution: execution, plan: coordinator.plan, snapshot: snapshot, turn: admitted.Turn, assistantMessageID: admitted.AssistantMessage.ID, historyOptions: admitted.HistoryOptions, baseMessageCount: baseMessageCount}
 	coordinator.mu.Unlock()
 	o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause, func(result Result) {
 		o.finishObservedRun(observed, result, o.now())

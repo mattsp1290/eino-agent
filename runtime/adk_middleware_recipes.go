@@ -18,7 +18,6 @@ import (
 
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/session/compaction"
-	"github.com/mattsp1290/eino-agent/session/history"
 )
 
 // This file provides tested wiring recipes for the upstream typed ADK
@@ -230,7 +229,7 @@ func NewPatchToolCallsHandlerFactory(cfg PatchToolCallsConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapAuthorizedContentRewrites(mw, build.authorizeRewrite), nil
+		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindPatchToolCalls, build.authorizeRewrite), nil
 	}
 }
 
@@ -280,7 +279,7 @@ func NewReductionHandlerFactoryWithTokenCounter(cfg ReductionConfig, counter Typ
 		if err != nil {
 			return nil, err
 		}
-		return wrapAuthorizedContentRewrites(mw, build.authorizeRewrite), nil
+		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindReduction, build.authorizeRewrite), nil
 	}
 }
 
@@ -302,18 +301,22 @@ type SummarizationConfig struct {
 }
 
 // NewSummarizationHandlerFactory generates a conversation summary via
-// upstream summarization.NewTyped, using build.Model (the same
-// ledger-audited adapter as this turn's primary dispatch -- summarization's
-// own summary-generation call is therefore fully durably audited) and maps
-// the completed summary into an atomic session.ContextEpoch (Finalize below)
-// via compaction.AppendBoundary. On cancellation or a failed summary
-// generation, upstream never calls Finalize at all, so no new epoch is
-// created and the previously active epoch stays in force -- see
-// summarizationFinalize's doc comment for the exact epoch-boundary
-// derivation and its one documented limitation.
+// upstream summarization.NewTyped, using build.Model -- for this recipe
+// ONLY, adkEngine.buildAgentHandlers hands it a bounded internal-dispatch
+// adapter (AgentPath "summarizer") instead of the turn's own conversational
+// adapter (see adkModel.internalDispatch): the summary-generation call is
+// still fully durably audited (its own ledger row, retried/failed over
+// through the same path, usage charged) but can never claim the turn's
+// assistant placeholder or persist as if the assistant said it to the user
+// -- and maps the completed summary into an atomic session.ContextEpoch
+// (Finalize below) via the narrow contextEpochCapability. On cancellation
+// or a failed summary generation, upstream never calls Finalize at all, so
+// no new epoch is created and the previously active epoch stays in force --
+// see summarizationFinalize's doc comment for the exact epoch-boundary
+// derivation.
 func NewSummarizationHandlerFactory(cfg SummarizationConfig) HandlerFactory {
 	return func(ctx context.Context, build HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
-		if build.Model == nil || build.Store == nil || build.Execution == nil || build.IDs == nil || build.Now == nil {
+		if build.Model == nil || !build.epochs.ready() {
 			return nil, fmt.Errorf("%w: summarization requires a durable store and model adapter", errHandlerMissingBackend)
 		}
 		typedCfg := &summarization.TypedConfig[*einoschema.AgenticMessage]{
@@ -331,21 +334,39 @@ func NewSummarizationHandlerFactory(cfg SummarizationConfig) HandlerFactory {
 	}
 }
 
+// errSummarizationTailUnsplittable reports that summarizationFinalize could
+// not find any group boundary at or before the requested retain-tail cut
+// point without splitting a function call from one of its results (see
+// moveTailStartToGroupBoundary): every durable message from the session's
+// start through the one immediately preceding the tail would have to be
+// summarized away, including the very first message, which would leave
+// nothing for SummarizedFromID/SummarizedToID to cover distinctly from the
+// tail.
+var errSummarizationTailUnsplittable = fmt.Errorf("%w: summarization tail cannot be trimmed without separating a function call from its result", errADKUnsupportedBlock)
+
 // summarizationFinalize maps a completed summary into a new atomic
 // session.ContextEpoch. It correlates upstream's in-memory originalMessages
 // with this session's durable message history by position: it loads the
-// full durable history (history.LoadBatch), filters it to conversational
-// roles (system/user/assistant -- the same roles the agentic projection
-// carries), and requires that filtered list to be exactly as long as
-// originalMessages. This holds for the expected case (summarizing the
-// session's complete, uninterrupted conversational history) but is a
-// documented, checked assumption, not a guarantee for every possible
-// upstream Trigger/GenModelInput configuration: a mismatch fails Finalize
-// closed (an error, which fails the run) rather than fabricating an
-// incorrect boundary.
+// full durable history (via the epochs capability's read-only reload),
+// filters it to conversational roles (system/user/assistant -- the same
+// roles the agentic projection carries), and requires that filtered list to
+// be exactly as long as originalMessages. This holds for the expected case
+// (summarizing the session's complete, uninterrupted conversational
+// history) but is a documented, checked assumption, not a guarantee for
+// every possible upstream Trigger/GenModelInput configuration: a mismatch
+// fails Finalize closed (an error, which fails the run) rather than
+// fabricating an incorrect boundary. Because summarization's own internal
+// call now runs through a bounded internal-dispatch adapter that never
+// persists a trailing assistant message (see adkModel.internalDispatch),
+// this correlation no longer needs the "drop one trailing entry" workaround
+// a prior revision required.
 func summarizationFinalize(build HandlerBuildContext, retainTail int) summarization.TypedFinalizeFunc[*einoschema.AgenticMessage] {
 	return func(ctx context.Context, originalMessages []*einoschema.AgenticMessage, summary *einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
-		batch, err := history.LoadBatch(ctx, build.Store, build.SessionID)
+		summaryText := summaryAgenticMessageText(summary)
+		if strings.TrimSpace(summaryText) == "" {
+			return nil, fmt.Errorf("%w: summary text is empty", errADKUnsupportedBlock)
+		}
+		batch, err := build.epochs.loadConversationalHistory(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -363,6 +384,14 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 		for _, id := range batch.PartOwnerMessageIDs {
 			owned[id] = true
 		}
+		owners, err := session.ResolveReplayPartOwners(batch.Parts, batch.PartOwnerMessageIDs)
+		if err != nil {
+			return nil, err
+		}
+		partsByMessage := make(map[session.MessageID][]session.Part, len(batch.Parts))
+		for i, part := range batch.Parts {
+			partsByMessage[owners[i]] = append(partsByMessage[owners[i]], part)
+		}
 		var durable []session.Message
 		for _, msg := range batch.Messages {
 			switch msg.Role {
@@ -374,53 +403,90 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 				}
 			}
 		}
-		// build.Model is the SAME ledger-audited adapter the main turn
-		// dispatches through (by design -- HandlerBuildContext.Model's doc
-		// comment: "any model call a handler's middleware makes... is still
-		// durably ledgered"), so upstream's OWN internal summary-generation
-		// call (made through build.Model before Finalize is ever invoked)
-		// already durably committed a new trailing assistant message by the
-		// time this reload runs -- one this session's real conversation
-		// never had and originalMessages (computed before that internal
-		// call) never included. Drop exactly that one trailing entry before
-		// requiring exact correlation, rather than accepting the more
-		// general "off by one" as fine.
-		if len(durable) == len(originalMessages)+1 && len(durable) > 0 && durable[len(durable)-1].Role == session.RoleAssistant {
-			durable = durable[:len(durable)-1]
-		}
 		if len(durable) != len(originalMessages) || len(durable) == 0 {
 			return nil, fmt.Errorf("%w: summarization could not correlate %d in-memory messages with %d durable messages", errADKUnsupportedBlock, len(originalMessages), len(durable))
 		}
 		if retainTail < 0 {
 			retainTail = 0
 		}
-		if retainTail > len(durable) {
-			retainTail = len(durable)
+		if retainTail >= len(durable) {
+			// Nothing to compact: the requested tail already covers the
+			// whole conversation. Do not start a new epoch (it would have
+			// SummarizedFromID == SummarizedToID == TailStartID, an
+			// overlapping, meaningless range) -- leave history untouched.
+			return originalMessages, nil
 		}
 		tailStart := len(durable) - retainTail
-		summarizedTo := tailStart - 1
-		if summarizedTo < 0 {
-			summarizedTo = 0
+		tailStart = moveTailStartToGroupBoundary(durable, partsByMessage, tailStart)
+		if tailStart <= 0 {
+			return nil, errSummarizationTailUnsplittable
+		}
+		// Always keep the session's leading system-message prefix out of
+		// the summarized range: system instructions are host-injected
+		// context, not conversational history to compact away.
+		systemPrefixLen := 0
+		for systemPrefixLen < tailStart && durable[systemPrefixLen].Role == session.RoleSystem {
+			systemPrefixLen++
+		}
+		summarizedFrom := systemPrefixLen
+		if summarizedFrom >= tailStart {
+			// The entire pre-tail range is a system prefix: there is
+			// nothing conversational left to summarize.
+			return originalMessages, nil
 		}
 		epoch := session.ContextEpoch{
-			ID: build.IDs.NewEpochID(), SessionID: build.SessionID,
-			SummarizedFromID: durable[0].ID, SummarizedToID: durable[summarizedTo].ID,
-			Trigger: "summarization", Reason: "context_budget", NextAction: session.EpochNextAutoContinue, CreatedAt: build.Now(),
+			ID: build.epochs.ids.NewEpochID(), SessionID: build.SessionID,
+			SummarizedFromID: durable[summarizedFrom].ID, SummarizedToID: durable[tailStart-1].ID,
+			Trigger: "summarization", Reason: "context_budget", NextAction: session.EpochNextAutoContinue, CreatedAt: build.epochs.now(),
 		}
 		if tailStart < len(durable) {
+			// tailStart == len(durable) means no tail is retained at all
+			// (retainTail == 0): TailStartID stays empty, matching
+			// applyEpoch's contract (a zero TailStartID plus a non-empty
+			// SummaryMessageID projects the summary alone, with no tail).
 			epoch.TailStartID = durable[tailStart].ID
 		}
-		started, err := build.Execution.StartContextEpoch(ctx, epoch)
-		if err != nil {
+		ids := compaction.BoundaryIDs{MessageID: build.epochs.ids.NewMessageID(), PartID: build.epochs.ids.NewPartID()}
+		if _, _, err := build.epochs.commitSummaryEpoch(ctx, epoch, ids, summaryText); err != nil {
 			return nil, err
 		}
-		ids := compaction.BoundaryIDs{MessageID: build.IDs.NewMessageID(), PartID: build.IDs.NewPartID()}
-		if _, err := compaction.AppendBoundary(ctx, build.Execution, started, ids, build.RunID, build.Now(), summaryAgenticMessageText(summary)); err != nil {
-			return nil, err
-		}
+		systemPrefix := append([]*einoschema.AgenticMessage(nil), originalMessages[:systemPrefixLen]...)
 		tail := append([]*einoschema.AgenticMessage(nil), originalMessages[tailStart:]...)
-		return append([]*einoschema.AgenticMessage{summary}, tail...), nil
+		result := append(systemPrefix, summary)
+		return append(result, tail...), nil
 	}
+}
+
+// moveTailStartToGroupBoundary walks tailStart backward, never forward,
+// until the boundary no longer separates an assistant message's
+// function_tool_call from one of its function_tool_result messages: a
+// result message (identified by owning a PartFunctionToolResult part)
+// cannot become the tail's first entry unless its originating call is also
+// in the tail, and a call-bearing assistant message cannot be the last
+// entry excluded from the tail while any of its results are retained.
+// Since each check only ever moves tailStart strictly backward and it is
+// bounded below by 0, this always terminates.
+func moveTailStartToGroupBoundary(durable []session.Message, partsByMessage map[session.MessageID][]session.Part, tailStart int) int {
+	hasKind := func(id session.MessageID, kind session.PartKind) bool {
+		for _, part := range partsByMessage[id] {
+			if part.Kind == kind {
+				return true
+			}
+		}
+		return false
+	}
+	for tailStart > 0 {
+		if tailStart < len(durable) && hasKind(durable[tailStart].ID, session.PartFunctionToolResult) {
+			tailStart--
+			continue
+		}
+		if hasKind(durable[tailStart-1].ID, session.PartFunctionToolCall) {
+			tailStart--
+			continue
+		}
+		break
+	}
+	return tailStart
 }
 
 func summaryAgenticMessageText(msg *einoschema.AgenticMessage) string {

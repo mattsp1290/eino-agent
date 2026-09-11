@@ -45,6 +45,27 @@ type adkModel struct {
 	// adapter (same ledger, same durable projection, same turn identity).
 	resolvedOverride *model.Resolved
 
+	// internalDispatch, when non-empty, marks this adapter instance as a
+	// bounded internal-dispatch role (currently only "summarizer", handed to
+	// the summarization recipe -- see adkEngine.buildAgentHandlers) instead
+	// of the turn's own conversational model adapter. Every physical call
+	// through an internal-dispatch instance is still durably ledgered
+	// exactly like an ordinary dispatch -- its own ModelRequestRecord row
+	// (AgentPath == internalDispatch), retried/failed over through the same
+	// audited path, usage charged -- but currentMessageID never claims or
+	// mints a real assistant message for it (it only ever reads the turn's
+	// already-admitted placeholder ID for ledger correlation, never writes
+	// to it), begin() strips tool controls and the rendered system prompt
+	// from its request, prepareDispatchInput never resets the turn's shared
+	// snapshot.providerState because of its shorter input, and commit
+	// (commitInternal) never persists the result as conversational content
+	// and fails closed if the result carries anything but plain text/
+	// reasoning. A dedicated adkEngine.dispatches count and usage charge
+	// still apply: it is a real, audited provider call, just never one that
+	// becomes something the user or the next turn sees as "the assistant
+	// said this".
+	internalDispatch string
+
 	mu          sync.Mutex
 	messageID   session.MessageID
 	needMessage bool
@@ -87,6 +108,18 @@ type adkDispatch struct {
 // committed step, or a child agent) mints and persists its own assistant
 // message, parented to the turn's placeholder.
 func (m *adkModel) currentMessageID(ctx context.Context) (session.MessageID, error) {
+	if m.internalDispatch != "" {
+		// An internal-dispatch adapter never claims or mints a real
+		// assistant message: it reads the turn's already-admitted
+		// placeholder ID purely so its ledger row (ModelRequestRecord.
+		// AssistantMessageID) correlates to a real durable message row for
+		// audit purposes, without ever writing to it -- see
+		// adkModel.internalDispatch's doc comment. It deliberately does not
+		// call e.engine.claimPlaceholder(), which would consume the SAME
+		// shared placeholderUsed flag the turn's own conversational adapter
+		// still needs.
+		return m.engine.assistantMessageID, nil
+	}
 	if m.messageID == "" && !m.needMessage {
 		if id, ok := m.engine.claimPlaceholder(); ok {
 			m.messageID = id
@@ -122,16 +155,29 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 		return nil, err
 	}
 	request := m.dispatchSnapshot().ProviderRequest(messageID, m.host.trace, input, m.execution.discoveredSnapshot())
-	request.System, err = m.host.renderSystemPrompt(ctx, m.engine.plan, m.engine.snapshot, 1, step)
-	if err != nil {
-		return nil, err
+	agentPath := m.engine.agentPath
+	if m.internalDispatch != "" {
+		// An internal-dispatch call (e.g. summarization's own
+		// summary-generation request) carries no tool controls and no
+		// rendered turn system prompt: it is not a conversational turn step,
+		// so the model must never be offered this turn's tools to call, and
+		// the request's AgentPath records the internal role rather than the
+		// turn's own agent path -- see adkModel.internalDispatch's doc
+		// comment.
+		request.Controls = model.RequestControls{}
+		agentPath = m.internalDispatch
+	} else {
+		request.System, err = m.host.renderSystemPrompt(ctx, m.engine.plan, m.engine.snapshot, 1, step)
+		if err != nil {
+			return nil, err
+		}
 	}
 	request, audited, hash, err := auditModelRequest(request, m.host.modelRequestSafeOptions, m.host.modelRequestMaxBytes)
 	if err != nil {
 		return nil, err
 	}
 	record, err := m.host.prepareModelRequest(ctx, m.execution, m.engine.snapshot, request, audited, hash, messageID, modelRequestIdentity{
-		InvocationID: m.host.ids.NewInvocationID(), TurnID: m.engine.turn.ID, AgentPath: m.engine.agentPath, Attempt: 1, Step: step,
+		InvocationID: m.host.ids.NewInvocationID(), TurnID: m.engine.turn.ID, AgentPath: agentPath, Attempt: 1, Step: step,
 	})
 	if err != nil {
 		return nil, err
@@ -151,6 +197,29 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 		Attempt: record.Attempt, Step: record.Step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
 		RequestRecordID: record.ID, MessageCount: len(input), ToolCount: len(request.Controls.Tools) + len(request.Controls.DeferredTools), ContentHash: hash,
 	})
+	// Durably record every authorized content-management rewrite queued
+	// since the last drain (patchtoolcalls/reduction, via
+	// wrapAuthorizedContentRewrites -- see authorizedRewriteRecord), each as
+	// its own event correlated to this dispatch's messageID/turn/agent path.
+	// A durable write failure here fails this dispatch rather than silently
+	// losing the audit trail for a rewrite the seal already let through.
+	for _, rewrite := range m.engine.authorizedRewrites.drainPending() {
+		event := session.EventRecord{
+			ID: m.host.ids.NewEventID(), SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
+			MessageID: messageID, EpochID: m.engine.snapshot.EpochID, TurnID: m.engine.turn.ID, AgentPath: agentPath,
+			Kind: session.AuthorizedToolResultRewriteEventKind, Correlation: rewrite.CallID,
+			Payload: mustJSON(map[string]string{
+				"handler_id": rewrite.HandlerID, "kind": rewrite.Kind, "call_id": rewrite.CallID,
+				"before_digest": rewrite.BeforeDigest, "after_digest": rewrite.AfterDigest,
+			}),
+			CreatedAt: m.host.now(),
+		}
+		committed, err := m.execution.store.AppendEvent(ctx, event)
+		if err != nil {
+			return nil, err
+		}
+		m.execution.publishPersisted(ctx, committed)
+	}
 	if replaced, replacedErr := m.engine.takeFailedAttempt(); replaced != "" && replaced != record.InvocationID {
 		event := session.EventRecord{
 			ID: m.host.ids.NewEventID(), SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
@@ -425,6 +494,14 @@ var errPartialStreamObserved = errors.New("dispatch failed after a partial provi
 // rewrite was authorized, and a fabricated function_tool_result for a call
 // with no durable settlement is rejected unless authorized.
 func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.AgenticMessage, error) {
+	// e.historyOptions is resolved ONCE, at this turn's admission (see
+	// resolveTurnHistoryOptions), not re-resolved per cycle: baseMessageCount
+	// and every cycle's reload within one turn must agree on the SAME epoch
+	// view, or the admission-time prefix/fresh-reload-tail splice below goes
+	// out of sync. A summarization epoch this turn's own recipe commits mid-
+	// turn therefore narrows the provider projection starting the NEXT turn
+	// admitted on this session, not later cycles of this same turn -- see
+	// resolveTurnHistoryOptions's doc comment.
 	full, fullState, err := loadProviderHistory(ctx, e.host.store, session.Session{ID: e.snapshot.SessionID}, e.historyOptions, e.snapshot.Model)
 	if err != nil {
 		return nil, err
@@ -533,8 +610,16 @@ func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage,
 // silent corruption. Finally strips ADK's own internal per-iteration Extra
 // bookkeeping (stripADKInternalExtra).
 func (m *adkModel) prepareDispatchInput(input []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
-	if len(input) < len(m.engine.baselineMessages) {
+	// An internal-dispatch call's input (e.g. summarization's own,
+	// deliberately shorter, in-progress summary request) must never trigger
+	// this reset: it is not the turn's own conversational dispatch, so its
+	// length relative to m.engine.baselineMessages says nothing about
+	// whether the TURN's history was restructured.
+	if m.internalDispatch == "" && len(input) < len(m.engine.baselineMessages) {
 		m.engine.snapshot.providerState = nil
+	}
+	if err := verifySettledToolResults(m.engine.baselineMessages, input, m.engine.authorizedRewrites); err != nil {
+		return nil, err
 	}
 	return stripADKInternalExtra(input), nil
 }
@@ -602,6 +687,9 @@ func (m *adkModel) dispatch(ctx context.Context, d *adkDispatch, input []*einosc
 func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *einoschema.AgenticMessage) (*einoschema.AgenticMessage, error) {
 	if result == nil {
 		return nil, errors.New("nil agentic result")
+	}
+	if m.internalDispatch != "" {
+		return m.commitInternal(result)
 	}
 	for _, block := range result.ContentBlocks {
 		if block == nil {
@@ -673,5 +761,30 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 	// PartProviderState parts persistAssistantTurn just wrote above,
 	// included), so doing it here too would double-count the same captured
 	// state once this message is picked up by the next dispatch's reload.
+	return result, nil
+}
+
+// commitInternal is the internal-dispatch counterpart to commit: it never
+// persists result as conversational content (no captureAssistantProviderState,
+// no prepareToolCalls, no persistAssistantTurn, no claiming/finalizing the
+// turn's placeholder, no recordResponseMessage) -- the physical call is
+// already durably ledgered via begin/finish exactly like an ordinary
+// dispatch, but the RESULT itself exists durably only as whatever the
+// caller does with it (e.g. summarization's Finalize turning it into a
+// compaction boundary), never as something the turn's conversation shows as
+// "the assistant said this". It fails closed if the result carries
+// anything but plain generated text or reasoning: an internal-dispatch role
+// must never originate a tool call, media, or an approval request.
+func (m *adkModel) commitInternal(result *einoschema.AgenticMessage) (*einoschema.AgenticMessage, error) {
+	for _, block := range result.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeAssistantGenText, einoschema.ContentBlockTypeReasoning:
+		default:
+			return nil, fmt.Errorf("%w: internal dispatch %q may not emit %s", errADKUnsupportedBlock, m.internalDispatch, block.Type)
+		}
+	}
 	return result, nil
 }

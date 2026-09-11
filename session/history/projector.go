@@ -429,8 +429,21 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 		byID[message.ID] = message
 	}
 	messages := make([]session.Message, 0, len(batch.Messages))
+	// An active epoch only ever narrows the conversational body (replacing
+	// the summarized range with its summary, retaining the tail); it never
+	// drops the session's leading system-message prefix -- host-injected
+	// system instructions are not conversational history to compact away.
+	for _, message := range batch.Messages {
+		if message.Role != session.RoleSystem {
+			break
+		}
+		if !include[message.ID] {
+			messages = append(messages, message)
+			include[message.ID] = true
+		}
+	}
 	if epoch.SummaryMessageID != "" {
-		if summary, ok := byID[epoch.SummaryMessageID]; ok {
+		if summary, ok := byID[epoch.SummaryMessageID]; ok && !include[summary.ID] {
 			messages = append(messages, summary)
 			include[summary.ID] = true
 		}

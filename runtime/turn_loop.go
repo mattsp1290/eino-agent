@@ -341,7 +341,17 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	// removes the still-empty assistant placeholder row AdmitTurn also just
 	// created (real, but content-free until adkModel.commit finalizes it),
 	// the same way adkModel.durableProjection does for every later dispatch.
-	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, c.historyOptions, c.resolved)
+	// Resolve fresh for THIS turn admission, from c.historyOptions' pristine
+	// (never-mutated) host template: a summarization epoch committed by an
+	// earlier turn on this same run must narrow this new turn's admission,
+	// while c.historyOptions itself stays unresolved so the NEXT turn after
+	// this one re-resolves independently too -- see
+	// resolveTurnHistoryOptions's doc comment.
+	turnHistoryOptions, err := resolveTurnHistoryOptions(ctx, c.host.store, c.sessionID, c.historyOptions)
+	if err != nil {
+		return nil, err
+	}
+	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -356,7 +366,7 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 		return nil, err
 	}
 	c.execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
-	engine := &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: result.Turn, assistantMessageID: assistantID, historyOptions: c.historyOptions, baseMessageCount: len(allMessages)}
+	engine := &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: result.Turn, assistantMessageID: assistantID, historyOptions: turnHistoryOptions, baseMessageCount: len(allMessages)}
 	c.setEngine(engine)
 	return engine, nil
 }
@@ -579,7 +589,11 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if target.ID == "" {
 		return nil, fmt.Errorf("%w: no interrupted turn found to resume for run %s", ErrInvalidOrchestrator, c.runID)
 	}
-	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, c.historyOptions, c.resolved)
+	turnHistoryOptions, err := resolveTurnHistoryOptions(ctx, c.host.store, c.sessionID, c.historyOptions)
+	if err != nil {
+		return nil, err
+	}
+	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -637,7 +651,7 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if err != nil {
 		return nil, err
 	}
-	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: c.historyOptions, baseMessageCount: len(priorMessages), placeholderUsed: placeholderUsed}, nil
+	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: turnHistoryOptions, baseMessageCount: len(priorMessages), placeholderUsed: placeholderUsed}, nil
 }
 
 // resumeReconciledTurn rebuilds the adkEngine for the run's most recently

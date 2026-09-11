@@ -468,12 +468,20 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 		RunID:            e.snapshot.RunID,
 		WorkspaceRoot:    e.snapshot.Config.Metadata["workspace_root"],
 		Model:            inner,
-		Store:            e.host.store,
-		Execution:        e.execution.store,
-		IDs:              e.host.ids,
-		Now:              e.host.now,
-		authorizeRewrite: authorized.add,
+		authorizeRewrite: authorized.record,
+		epochs: contextEpochCapability{
+			sessionID: e.snapshot.SessionID, runID: e.snapshot.RunID,
+			store: e.host.store, execution: e.execution.store, ids: e.host.ids, now: e.host.now,
+		},
 	}
+	// summaryModel is the bounded internal-dispatch adapter handed to ONLY
+	// the summarization recipe below (never the turn's own inner adapter):
+	// every physical call it makes is still durably ledgered (its own
+	// ModelRequestRecord row, agent path "summarizer", usage charged,
+	// retried/failed over through the same audited path) but it can never
+	// claim the turn's assistant placeholder, persist assistant content, or
+	// create a tool call -- see adkModel.internalDispatch and commitInternal.
+	summaryModel := &adkModel{host: e.host, execution: e.execution, engine: e, internalDispatch: "summarizer"}
 	for _, t := range e.snapshot.Tools {
 		if !t.Deferred {
 			continue
@@ -501,7 +509,17 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 	handlers := make([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], 0, len(plan))
 	liveTools := make(map[string]tool.BaseTool)
 	for _, entry := range plan {
-		handler, err := entry.Factory(ctx, build)
+		entryBuild := build
+		entryBuild.HandlerID = entry.ID
+		if entry.Kind == HandlerKindSummarization {
+			// summarization's own internal summary-generation call must
+			// never route through the turn's real adapter (inner): that
+			// would let it claim the turn's assistant placeholder and
+			// persist the summary as if the assistant said it to the user
+			// -- see adkModel.internalDispatch's doc comment.
+			entryBuild.Model = summaryModel
+		}
+		handler, err := entry.Factory(ctx, entryBuild)
 		if err != nil {
 			return nil, fmt.Errorf("build agent handler %q (%s): %w", entry.ID, entry.Kind, err)
 		}

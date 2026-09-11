@@ -183,7 +183,7 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 		durable = append(durable, msg)
 	}
 	execution := testFencedExecutionStore(t, store, sessionID)
-	build := HandlerBuildContext{SessionID: sessionID, Store: store, Execution: execution, IDs: ids, Now: now}
+	build := HandlerBuildContext{SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: ids, now: now}}
 	finalize := summarizationFinalize(build, 1)
 
 	original := make([]*einoschema.AgenticMessage, len(durable))
@@ -196,8 +196,12 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("finalize error = %v", err)
 	}
-	if len(result) != 2 { // summary + 1 retained tail message
-		t.Fatalf("finalize result length = %d, want 2", len(result))
+	// The leading system message is always preserved ahead of the summary
+	// (see moveTailStartToGroupBoundary/summarizationFinalize's system
+	// prefix handling): system prefix (1) + summary (1) + 1 retained tail
+	// message.
+	if len(result) != 3 {
+		t.Fatalf("finalize result length = %d, want 3", len(result))
 	}
 
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
@@ -205,7 +209,9 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 		t.Fatalf("epochs = %+v, err = %v", epochs, err)
 	}
 	epoch := epochs[0]
-	if epoch.SummarizedFromID != durable[0].ID || epoch.TailStartID != durable[len(durable)-1].ID {
+	// durable[0] is the leading system message, excluded from the
+	// summarized range; the summarized range starts at durable[1].
+	if epoch.SummarizedFromID != durable[1].ID || epoch.TailStartID != durable[len(durable)-1].ID {
 		t.Fatalf("epoch boundaries = %+v", epoch)
 	}
 	if epoch.SummaryMessageID == "" {
@@ -217,7 +223,8 @@ func TestSummarizationFinalizeFailsClosedOnLengthMismatch(t *testing.T) {
 	store := newAdmissionStore()
 	sessionID := session.ID("mismatch-session")
 	execution := testFencedExecutionStore(t, store, sessionID)
-	build := HandlerBuildContext{SessionID: sessionID, Store: store, Execution: execution, IDs: &sequenceIDs{}, Now: func() time.Time { return time.Unix(0, 0) }}
+	now := func() time.Time { return time.Unix(0, 0) }
+	build := HandlerBuildContext{SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: &sequenceIDs{}, now: now}}
 	finalize := summarizationFinalize(build, 0)
 	if _, err := finalize(context.Background(), []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("x")}, agenticAssistantText("summary")); err == nil {
 		t.Fatal("length mismatch was accepted instead of failing closed")
