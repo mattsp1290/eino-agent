@@ -89,7 +89,34 @@ type HandlerBuildContext struct {
 	// content-management recipes (patchtoolcalls, reduction) are wrapped
 	// with it (see wrapAuthorizedContentRewrites); an arbitrary
 	// host-registered HandlerFactory is never given this authority.
+	//
+	// adkEngine.buildAgentHandlers only ever populates this (and
+	// baselineToolResultDigests below) for a plan entry whose OWN declared
+	// Kind is HandlerKindReduction or HandlerKindPatchToolCalls -- a host
+	// wrapping NewReductionHandlerFactory/NewPatchToolCallsHandlerFactory
+	// under any other Kind gets a nil authorizeRewrite, so
+	// wrapAuthorizedContentRewrites returns the wrapped middleware
+	// unmodified (no authorization is ever recorded for it) and any content
+	// rewrite it makes is rejected by settlementSeal as unauthorized (see
+	// the round-two W6 review's I7 finding).
 	authorizeRewrite func(handlerID, kind, callID, beforeDigest, afterDigest string)
+
+	// baselineToolResultDigests looks up this cycle's durable baseline
+	// function_tool_result occurrences for a call ID (the same map
+	// verifySettledToolResults itself consults), so
+	// wrapAuthorizedContentRewrites can bind a content-management recipe's
+	// authorization to a durable fact instead of trusting the recipe's own
+	// claim: reduction may only be authorized when the call ID it is
+	// rewriting already has a settled baseline occurrence, and only when
+	// the content it is replacing (not just the content it produces) is
+	// byte-for-byte one of those baseline occurrences -- never some other
+	// handler's earlier, already-divergent substitution laundered through
+	// reduction's own rewrite. patchtoolcalls is the mirror image: it may
+	// only be authorized when the call ID has NO baseline occurrence at all
+	// (a genuinely dangling call). Populated in lockstep with
+	// authorizeRewrite (see that field's doc comment); nil whenever
+	// authorizeRewrite is nil.
+	baselineToolResultDigests func(callID string) []string
 
 	// epochs is the narrow, unexported durable capability this package's OWN
 	// summarization recipe uses (see contextEpochCapability's doc comment).
@@ -274,19 +301,44 @@ func (s *authorizedRewriteSet) authorizedRewrite(callID string) (digest string, 
 	return entry.Digest, entry.Kind, ok
 }
 
-// kindMayRewriteSettledContent reports whether a sanctioned
-// content-management recipe of the given Kind (see wrapAuthorizedContentRewrites)
-// is ever legitimately authorized to change a call ID's content when the
-// baseline already carries real, durably settled content for that call ID.
-// Only reduction is: its whole purpose is clearing/truncating already
-// SETTLED results (settlementSeal's invariant 1). patchtoolcalls' purpose
-// is strictly the opposite -- filling in a placeholder for a call with NO
-// durable settlement at all (invariant 2) -- so an authorization it
-// produced must never be honored for a call ID the baseline already shows
-// settled, regardless of what upstream's own dangling-detection did or did
-// not catch; see verifySettledToolResults.
-func kindMayRewriteSettledContent(kind string) bool {
-	return kind == HandlerKindReduction
+// authorityBindsToBaseline reports whether an authorized content-management
+// rewrite of the given Kind (see wrapAuthorizedContentRewrites) is bound to
+// a durable fact for callID, given that call's baseline function_tool_result
+// (or tool_search_result) occurrence digests: reduction's whole purpose is
+// clearing/truncating already SETTLED results (settlementSeal's invariant
+// 1), so it is only ever bound when the baseline carries at least one
+// occurrence. patchtoolcalls' purpose is strictly the opposite -- filling in
+// a placeholder for a call with NO durable settlement at all (invariant 2)
+// -- so it is only ever bound when the baseline carries none. Any other
+// kind (including the empty string, and tool_search_result's own
+// verification pass, which never carries a kind at all) is never bound: no
+// recipe is ever authorized to rewrite/fabricate a tool_search_result, and
+// an unrecognized kind must fail closed rather than default to permissive.
+// This is the single source of truth both wrapAuthorizedContentRewrites
+// (binding the authorization itself to callID's ACTUAL prior content, not
+// merely to the fact a baseline occurrence exists) and
+// verifySettledToolResults (the real dispatch-time authority) consult, so
+// the two can never disagree about which kind may rewrite what -- see the
+// round-two W6 review's I1 finding.
+func authorityBindsToBaseline(kind string, baseDigests []string) bool {
+	switch kind {
+	case HandlerKindReduction:
+		return len(baseDigests) > 0
+	case HandlerKindPatchToolCalls:
+		return len(baseDigests) == 0
+	default:
+		return false
+	}
+}
+
+// containsDigest reports whether digest appears anywhere in list.
+func containsDigest(list []string, digest string) bool {
+	for _, d := range list {
+		if d == digest {
+			return true
+		}
+	}
+	return false
 }
 
 // resetCycle clears every authorization: called once per ReAct cycle by
@@ -328,18 +380,19 @@ func (s *authorizedRewriteSet) drainPending() []authorizedRewriteRecord {
 // (patchtoolcalls' PatchedToolResultGenerator callback, reduction's
 // Trunc/ClearHandler-driven rewriting, or any other upstream implementation
 // detail).
-func wrapAuthorizedContentRewrites(inner adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], handlerID, kind string, authorize func(handlerID, kindArg, callID, beforeDigest, afterDigest string)) adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage] {
+func wrapAuthorizedContentRewrites(inner adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], handlerID, kind string, baselineDigests func(callID string) []string, authorize func(handlerID, kindArg, callID, beforeDigest, afterDigest string)) adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage] {
 	if inner == nil || authorize == nil {
 		return inner
 	}
-	return &authorizedRewriteMiddleware{TypedChatModelAgentMiddleware: inner, handlerID: handlerID, kind: kind, authorize: authorize}
+	return &authorizedRewriteMiddleware{TypedChatModelAgentMiddleware: inner, handlerID: handlerID, kind: kind, baselineDigests: baselineDigests, authorize: authorize}
 }
 
 type authorizedRewriteMiddleware struct {
 	adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
-	handlerID string
-	kind      string
-	authorize func(handlerID, kind, callID, beforeDigest, afterDigest string)
+	handlerID       string
+	kind            string
+	baselineDigests func(callID string) []string
+	authorize       func(handlerID, kind, callID, beforeDigest, afterDigest string)
 }
 
 func (m *authorizedRewriteMiddleware) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
@@ -350,9 +403,31 @@ func (m *authorizedRewriteMiddleware) BeforeModelRewriteState(ctx context.Contex
 	}
 	after := snapshotToolResultContent(next)
 	for callID, content := range after {
-		if before[callID] != content {
-			m.authorize(m.handlerID, m.kind, callID, before[callID], content)
+		if before[callID] == content {
+			continue
 		}
+		// Bind this authorization to a durable fact (round-two W6 review
+		// I1): reduction may only be authorized when callID's PRIOR
+		// content (before[callID], not the content it is producing) is
+		// itself byte-for-byte one of the durable baseline's own settled
+		// occurrences for that call -- never a value some earlier handler
+		// in this cycle's chain already substituted. patchtoolcalls may
+		// only be authorized when the baseline carries no occurrence for
+		// callID at all (a genuinely dangling call). A recipe wrapped
+		// under any other Kind, or whose prior content does not match this
+		// binding, is never authorized here -- its rewrite reaches
+		// settlementSeal unauthorized and is rejected there.
+		var baseDigests []string
+		if m.baselineDigests != nil {
+			baseDigests = m.baselineDigests(callID)
+		}
+		if !authorityBindsToBaseline(m.kind, baseDigests) {
+			continue
+		}
+		if m.kind == HandlerKindReduction && !containsDigest(baseDigests, before[callID]) {
+			continue
+		}
+		m.authorize(m.handlerID, m.kind, callID, before[callID], content)
 	}
 	return ctx, next, nil
 }
@@ -433,6 +508,50 @@ func canonicalFunctionToolResultContent(content []*einoschema.FunctionToolResult
 	return hex.EncodeToString(sum[:])
 }
 
+// toolSearchResultOccurrencesByCallID is toolResultOccurrencesByCallID's
+// counterpart for ContentBlockTypeToolSearchResult blocks (round-two W6
+// review I2): tool_search_result blocks were previously invisible to
+// verifySettledToolResults entirely (toolResultOccurrencesByCallID only
+// ever looked at ContentBlockTypeFunctionToolResult), so a tampered,
+// fabricated, or duplicated tool_search_result block passed unseen. Every
+// occurrence, not just the last, exactly like toolResultOccurrencesByCallID.
+func toolSearchResultOccurrencesByCallID(messages []*einoschema.AgenticMessage) map[string][]string {
+	result := make(map[string][]string)
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil || block.Type != einoschema.ContentBlockTypeToolSearchResult || block.ToolSearchFunctionToolResult == nil {
+				continue
+			}
+			callID := block.ToolSearchFunctionToolResult.CallID
+			if callID == "" {
+				continue
+			}
+			result[callID] = append(result[callID], canonicalToolSearchResultContent(block.ToolSearchFunctionToolResult.Result))
+		}
+	}
+	return result
+}
+
+// canonicalToolSearchResultContent returns a sha256 digest of result's full
+// canonical JSON encoding (result.Tools, the ToolInfo list a tool-search
+// call durably discovered) -- nil-safe, matching
+// canonicalFunctionToolResultContent's own unencodable-input handling.
+func canonicalToolSearchResultContent(result *einoschema.ToolSearchResult) string {
+	var tools []*einoschema.ToolInfo
+	if result != nil {
+		tools = result.Tools
+	}
+	raw, err := json.Marshal(tools)
+	if err != nil {
+		raw = []byte("\x00unencodable:" + err.Error())
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
 // verifySettledToolResults is the mandatory-dispatch-authority enforcement
 // of settlementSeal's two invariants (see that type's doc comment),
 // extracted so it can be called from adkModel.prepareDispatchInput -- the
@@ -445,46 +564,67 @@ func canonicalFunctionToolResultContent(content []*einoschema.FunctionToolResult
 // doc comment for why that hook is kept too, as an early, non-authoritative
 // check).
 //
-// For every function_tool_result occurrence in input (by call ID, every
-// occurrence, not just one per call ID): it must either byte-for-byte match
-// one of that call ID's occurrences in baseline (the fresh durable
-// projection this cycle started from), or match the exact digest this
-// cycle's authorized set recorded for that call ID. A call ID with no
-// baseline occurrence at all is rejected unless every one of its
-// occurrences matches the authorized digest (patchtoolcalls' legitimate
-// patch of a dangling, unsettled call).
+// Both function_tool_result and tool_search_result blocks are sealed
+// identically (round-two W6 review I2), via verifyOccurrenceKind: every
+// occurrence in input (by call ID, every occurrence, not just one per call
+// ID) must either byte-for-byte match one of that call ID's occurrences in
+// baseline (the fresh durable projection this cycle started from), or --
+// function_tool_result only -- match the exact digest this cycle's
+// authorized set recorded for that call ID, bound to a durable fact via
+// authorityBindsToBaseline (a call ID with no baseline occurrence at all is
+// rejected unless every one of its occurrences matches an authorized
+// patchtoolcalls digest; a call ID WITH a baseline occurrence may only be
+// authorized-rewritten by reduction). No recipe is ever authorized to
+// rewrite a tool_search_result, so that pass never consults authorized at
+// all. The total occurrence count for a call ID may never exceed its
+// baseline occurrence count plus (when authorized) exactly one more for the
+// single authorized rewrite -- round-two W6 review I3: two identical copies
+// of one settled result must not both pass merely because each individually
+// matches baseline.
 func verifySettledToolResults(baseline, input []*einoschema.AgenticMessage, authorized *authorizedRewriteSet) error {
-	baselineOccurrences := toolResultOccurrencesByCallID(baseline)
-	currentOccurrences := toolResultOccurrencesByCallID(input)
+	if err := verifyOccurrenceKind(toolResultOccurrencesByCallID(baseline), toolResultOccurrencesByCallID(input), authorized); err != nil {
+		return err
+	}
+	return verifyOccurrenceKind(toolSearchResultOccurrencesByCallID(baseline), toolSearchResultOccurrencesByCallID(input), nil)
+}
+
+// verifyOccurrenceKind is the shared enforcement verifySettledToolResults
+// applies to both the function_tool_result and tool_search_result occurrence
+// maps -- see that function's doc comment. authorized is nil for the
+// tool_search_result pass (authorizedRewriteSet.authorizedRewrite is nil-safe
+// and always reports unauthorized), so that block kind can never be
+// rewritten by any recipe, only ever match its durable baseline exactly.
+func verifyOccurrenceKind(baselineOccurrences, currentOccurrences map[string][]string, authorized *authorizedRewriteSet) error {
 	for callID, occurrences := range currentOccurrences {
 		baseDigests := baselineOccurrences[callID]
 		authorizedDigest, authorizedKind, isAuthorized := authorized.authorizedRewrite(callID)
-		// A patchtoolcalls-kind authorization never covers a call ID the
-		// baseline already shows real settled content for -- see
-		// kindMayRewriteSettledContent's doc comment. Treat it as
-		// unauthorized here so such a rewrite falls through to the
-		// ordinary settled/fabricated rejection below, exactly as if no
-		// recipe had ever recorded it.
-		if isAuthorized && len(baseDigests) > 0 && !kindMayRewriteSettledContent(authorizedKind) {
-			isAuthorized = false
+		if isAuthorized {
+			isAuthorized = authorityBindsToBaseline(authorizedKind, baseDigests)
 		}
+		baseMatches := 0
+		authorizedMatches := 0
 		for _, digest := range occurrences {
-			if digest == authorizedDigest && isAuthorized {
-				continue
-			}
-			matchesBaseline := false
-			for _, base := range baseDigests {
-				if digest == base {
-					matchesBaseline = true
-					break
+			switch {
+			case isAuthorized && digest == authorizedDigest:
+				authorizedMatches++
+			case containsDigest(baseDigests, digest):
+				baseMatches++
+			default:
+				if len(baseDigests) == 0 {
+					return fmt.Errorf("%w: call %s", errUnauthorizedFabricatedToolResult, callID)
 				}
+				return fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
 			}
-			if matchesBaseline {
-				continue
-			}
-			if len(baseDigests) == 0 {
-				return fmt.Errorf("%w: call %s", errUnauthorizedFabricatedToolResult, callID)
-			}
+		}
+		if authorizedMatches > 1 {
+			// wrapAuthorizedContentRewrites only ever authorizes a single
+			// post-rewrite content value per call ID per cycle (it diffs
+			// the LAST occurrence -- see snapshotToolResultContent's doc
+			// comment); a second occurrence claiming that same authorized
+			// digest is a duplicate, not a second legitimate rewrite.
+			return fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
+		}
+		if baseMatches > len(baseDigests) {
 			return fmt.Errorf("%w: call %s", errSettledToolResultDiverged, callID)
 		}
 	}

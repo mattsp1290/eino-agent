@@ -261,7 +261,7 @@ func TestPatchToolCallsCannotPatchACallWithARealSettlement(t *testing.T) {
 				if err != nil {
 					return nil, err
 				}
-				return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindPatchToolCalls, build.authorizeRewrite), nil
+				return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindPatchToolCalls, build.baselineToolResultDigests, build.authorizeRewrite), nil
 			},
 		}},
 	}

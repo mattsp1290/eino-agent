@@ -530,7 +530,8 @@ func requestIsSummaryGeneration(request model.Request) bool {
 // same scripted streamer serving the whole turn, including upstream's own
 // internal summary-generation call, distinguished via
 // requestIsSummaryGeneration): a session.ContextEpoch row is durably
-// written with agent path "summarizer" on its own ledger row, the summary
+// written with agent path "summarization" (this handler's own registered
+// ID -- see adkEngine.buildAgentHandlers) on its own ledger row, the summary
 // is never persisted as the turn's own assistant answer (exactly one
 // assistant_gen_text part on the turn's message), the full message replay
 // is never shortened (nothing is deleted), and a SECOND, later turn on the
@@ -593,20 +594,22 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	}
 
 	// The summarization recipe's own internal call is durably ledgered with
-	// agent path "summarizer" -- never the turn's own (empty) agent path --
-	// and never claims/persists onto the turn's own assistant message.
+	// agent path "summarization" (its own registered HandlerID, tagging
+	// every entry's bounded internal-dispatch adapter -- round-two W6
+	// review I7) -- never the turn's own (empty) agent path -- and never
+	// claims/persists onto the turn's own assistant message.
 	requests, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
 	}
 	var sawSummarizerAgentPath bool
 	for _, record := range requests.Records {
-		if record.AgentPath == "summarizer" {
+		if record.AgentPath == "summarization" {
 			sawSummarizerAgentPath = true
 		}
 	}
 	if !sawSummarizerAgentPath {
-		t.Fatalf("no model request ledger row has AgentPath == \"summarizer\": %+v", requests.Records)
+		t.Fatalf("no model request ledger row has AgentPath == \"summarization\": %+v", requests.Records)
 	}
 
 	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})

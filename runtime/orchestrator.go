@@ -918,22 +918,29 @@ func publicizeToolCallIDs(ctx context.Context, store session.Store, sessionID se
 		call, err := store.GetToolCall(ctx, session.ToolCallID(durableID))
 		if err != nil {
 			// A missing row is expected, not corrupt history, for exactly
-			// one case: patchtoolcalls (or another sanctioned
-			// content-management recipe -- see wrapAuthorizedContentRewrites)
-			// has authorized THIS cycle's content for a call ID with no
-			// durable ToolCall row at all, by design -- patchtoolcalls
-			// patches a genuinely dangling call without ever fabricating a
-			// settlement row (see NewPatchToolCallsHandlerFactory's doc
-			// comment; verifySettledToolResults/settlementSeal already
-			// gates which recipe may authorize what, so this function only
-			// needs to know a rewrite was authorized, not which kind).
-			// There is no provider id to preserve for a call that was
-			// never durably admitted, so the wire simply shows the durable
-			// id back, exactly like an empty ProviderCallID -- and this
-			// resolution is deliberately NOT cached, since it depends on
-			// this cycle's authorization, not a stable durable row.
+			// one case: patchtoolcalls has authorized THIS cycle's content
+			// for a call ID with no durable ToolCall row at all, by design
+			// -- patchtoolcalls patches a genuinely dangling call without
+			// ever fabricating a settlement row (see
+			// NewPatchToolCallsHandlerFactory's doc comment). This fallback
+			// is deliberately restricted to a patchtoolcalls-kind
+			// authorization (round-two W6 review I1): reduction is never
+			// legitimately authorized to rewrite a call with NO baseline
+			// occurrence at all (authorityBindsToBaseline requires the
+			// OPPOSITE -- a baseline occurrence must already exist for
+			// reduction), so a reduction-kind authorization reaching this
+			// branch means the call ID has no durable ToolCall row AND is
+			// not one reduction may legitimately touch -- almost certainly
+			// a fabricated call with no settlement at all, which must fail
+			// closed exactly like an unauthorized one, not be waved onto
+			// the wire under its own durable id. There is no provider id to
+			// preserve for a call that was never durably admitted, so a
+			// genuinely authorized patchtoolcalls fill sends the wire the
+			// durable id back, exactly like an empty ProviderCallID -- and
+			// this resolution is deliberately NOT cached, since it depends
+			// on this cycle's authorization, not a stable durable row.
 			if errors.Is(err, session.ErrNotFound) {
-				if _, _, ok := authorized.authorizedRewrite(durableID); ok {
+				if _, kind, ok := authorized.authorizedRewrite(durableID); ok && kind == HandlerKindPatchToolCalls {
 					resolved[durableID] = durableID
 					return durableID, nil
 				}

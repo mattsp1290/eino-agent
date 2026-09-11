@@ -430,7 +430,7 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 	// prepareToolCalls/resolveToolCall's frozen registry both derive from
 	// that same e.snapshot.Tools, so a handler tool participates in both
 	// exactly like any composition-registered tool.
-	handlers, err := e.buildAgentHandlers(ctx, inner, authorized)
+	handlers, err := e.buildAgentHandlers(ctx, authorized)
 	if err != nil {
 		return nil, err
 	}
@@ -523,37 +523,45 @@ func (e *adkEngine) sealHandlerTools() {
 // buildAgentHandlers resolves this run's plan-ordered, host-registered
 // typed-ADK middleware factories (composition.Registrar.Handler) into
 // concrete instances for this turn. Each factory receives a
-// HandlerBuildContext bounded to this turn: model, a durable tool wrapper
-// (durableToolName is derived from the underlying tool's own advertised
-// name -- see adkGenericDurableTool), and a read-only workspace view rooted
-// at the admitted canonical workspace (nil when none is configured, so a
-// recipe requiring one fails construction closed rather than operating
-// unscoped -- see workspaceFilesystemBackend/workspaceSkillBackend).
-func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.AgenticModel, authorized *authorizedRewriteSet) ([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
+// HandlerBuildContext bounded to this turn: a bounded internal-dispatch
+// model adapter (never the turn's own real conversational adapter -- see
+// below), a durable tool wrapper (durableToolName is derived from the
+// underlying tool's own advertised name -- see adkGenericDurableTool), and a
+// read-only workspace view rooted at the admitted canonical workspace (nil
+// when none is configured, so a recipe requiring one fails construction
+// closed rather than operating unscoped -- see
+// workspaceFilesystemBackend/workspaceSkillBackend).
+//
+// Capabilities never ride on the shared HandlerBuildContext every entry
+// receives (round-two W6 review I7): entryBuild.Model is ALWAYS a bounded
+// internal-dispatch adapter (adkModel.internalDispatch) tagged with that
+// entry's own HandlerID as agent path -- never the turn's real,
+// placeholder-claiming/assistant-persisting adapter, regardless of which
+// Kind constructed the entry, so no registered HandlerFactory (this
+// package's own recipes included) can ever reach the turn's real model
+// through HandlerBuildContext. entryBuild.authorizeRewrite/
+// baselineToolResultDigests (rewrite authorization) and entryBuild.epochs
+// (the durable epoch-write capability) are populated ONLY for an entry
+// whose own declared Kind is exactly the Kind that capability belongs to
+// (HandlerKindReduction/HandlerKindPatchToolCalls for the former,
+// HandlerKindSummarization for the latter) -- a host wrapping one of this
+// package's own NewReductionHandlerFactory/NewPatchToolCallsHandlerFactory/
+// NewSummarizationHandlerFactory constructors under any OTHER Kind gets
+// none of them: reduction/patchtoolcalls silently loses rewrite authority
+// (wrapAuthorizedContentRewrites returns its inner middleware unwrapped, so
+// settlementSeal rejects any rewrite it attempts as unauthorized) and
+// summarization fails construction closed (its own precondition check
+// requires build.epochs.ready()).
+func (e *adkEngine) buildAgentHandlers(ctx context.Context, authorized *authorizedRewriteSet) ([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 	plan := e.plan.AgentHandlers()
 	if len(plan) == 0 {
 		return nil, nil
 	}
 	build := HandlerBuildContext{
-		SessionID:        e.snapshot.SessionID,
-		RunID:            e.snapshot.RunID,
-		WorkspaceRoot:    e.snapshot.Config.Metadata["workspace_root"],
-		Model:            inner,
-		authorizeRewrite: authorized.record,
-		epochs: contextEpochCapability{
-			sessionID: e.snapshot.SessionID, runID: e.snapshot.RunID,
-			store: e.host.store, execution: e.execution.store, ids: e.host.ids, now: e.host.now,
-			contentLimits: e.host.contentLimits,
-		},
+		SessionID:     e.snapshot.SessionID,
+		RunID:         e.snapshot.RunID,
+		WorkspaceRoot: e.snapshot.Config.Metadata["workspace_root"],
 	}
-	// summaryModel is the bounded internal-dispatch adapter handed to ONLY
-	// the summarization recipe below (never the turn's own inner adapter):
-	// every physical call it makes is still durably ledgered (its own
-	// ModelRequestRecord row, agent path "summarizer", usage charged,
-	// retried/failed over through the same audited path) but it can never
-	// claim the turn's assistant placeholder, persist assistant content, or
-	// create a tool call -- see adkModel.internalDispatch and commitInternal.
-	summaryModel := &adkModel{host: e.host, execution: e.execution, engine: e, internalDispatch: "summarizer"}
 	for _, t := range e.snapshot.Tools {
 		if !t.Deferred {
 			continue
@@ -595,13 +603,30 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 	for _, entry := range plan {
 		entryBuild := build
 		entryBuild.HandlerID = entry.ID
-		if entry.Kind == HandlerKindSummarization {
-			// summarization's own internal summary-generation call must
-			// never route through the turn's real adapter (inner): that
-			// would let it claim the turn's assistant placeholder and
-			// persist the summary as if the assistant said it to the user
-			// -- see adkModel.internalDispatch's doc comment.
-			entryBuild.Model = summaryModel
+		// Every entry gets its OWN bounded internal-dispatch adapter,
+		// tagged with its own HandlerID -- never the turn's real
+		// conversational adapter, and never shared across entries (each
+		// entry's physical calls are audited under its own agent path) --
+		// see this method's doc comment and adkModel.internalDispatch.
+		entryBuild.Model = &adkModel{host: e.host, execution: e.execution, engine: e, internalDispatch: entry.ID}
+		switch entry.Kind {
+		case HandlerKindReduction, HandlerKindPatchToolCalls:
+			entryBuild.authorizeRewrite = authorized.record
+			entryBuild.baselineToolResultDigests = func(callID string) []string {
+				return toolResultOccurrencesByCallID(e.baselineMessages)[callID]
+			}
+		case HandlerKindSummarization, HandlerKindSkill:
+			// summarization requires this to write its completed summary
+			// into a durable session.ContextEpoch (build.epochs.ready() is
+			// its own construction-time precondition); skill uses it only
+			// optionally, to durably record each activation
+			// (activationRecordingSkillBackend) -- a host wrapping either
+			// constructor under a different Kind gets neither.
+			entryBuild.epochs = contextEpochCapability{
+				sessionID: e.snapshot.SessionID, runID: e.snapshot.RunID,
+				store: e.host.store, execution: e.execution.store, ids: e.host.ids, now: e.host.now,
+				contentLimits: e.host.contentLimits,
+			}
 		}
 		handler, err := entry.Factory(ctx, entryBuild)
 		if err != nil {

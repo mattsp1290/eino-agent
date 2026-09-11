@@ -386,7 +386,7 @@ func NewPatchToolCallsHandlerFactory(cfg PatchToolCallsConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindPatchToolCalls, build.authorizeRewrite), nil
+		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindPatchToolCalls, build.baselineToolResultDigests, build.authorizeRewrite), nil
 	}
 }
 
@@ -463,7 +463,7 @@ func NewReductionHandlerFactoryWithTokenCounter(cfg ReductionConfig, counter Typ
 		if err != nil {
 			return nil, err
 		}
-		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindReduction, build.authorizeRewrite), nil
+		return wrapAuthorizedContentRewrites(mw, build.HandlerID, HandlerKindReduction, build.baselineToolResultDigests, build.authorizeRewrite), nil
 	}
 }
 
