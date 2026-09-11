@@ -199,12 +199,24 @@ type authorizedRewriteRecord struct {
 // BeforeModelRewriteState re-runs (and re-diffs) every cycle too.
 type authorizedRewriteSet struct {
 	mu      sync.Mutex
-	digests map[string]string
+	digests map[string]authorizedRewriteEntry
 	pending []authorizedRewriteRecord
 }
 
+// authorizedRewriteEntry is one callID's currently authorized post-rewrite
+// content, keyed to the recipe Kind that produced it -- kept alongside the
+// digest (not just the digest alone) so verifySettledToolResults can apply
+// kindMayRewriteSettledContent's per-recipe scope check: an authorization
+// alone is necessary but not sufficient, since patchtoolcalls is only ever
+// meant to patch a genuinely dangling (baseline-unsettled) call, never one
+// with real durably settled content already in the baseline.
+type authorizedRewriteEntry struct {
+	Kind   string
+	Digest string
+}
+
 func newAuthorizedRewriteSet() *authorizedRewriteSet {
-	return &authorizedRewriteSet{digests: make(map[string]string)}
+	return &authorizedRewriteSet{digests: make(map[string]authorizedRewriteEntry)}
 }
 
 // record authorizes callID's current content (identified by afterDigest) for
@@ -216,20 +228,35 @@ func (s *authorizedRewriteSet) record(handlerID, kind, callID, beforeDigest, aft
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.digests[callID] = afterDigest
+	s.digests[callID] = authorizedRewriteEntry{Kind: kind, Digest: afterDigest}
 	s.pending = append(s.pending, authorizedRewriteRecord{HandlerID: handlerID, Kind: kind, CallID: callID, BeforeDigest: beforeDigest, AfterDigest: afterDigest})
 }
 
-// authorizedDigest reports the exact content digest authorized for callID
-// this cycle, if any.
-func (s *authorizedRewriteSet) authorizedDigest(callID string) (string, bool) {
+// authorizedRewrite reports the exact content digest authorized for callID
+// this cycle, and which recipe Kind authorized it, if any.
+func (s *authorizedRewriteSet) authorizedRewrite(callID string) (digest string, kind string, ok bool) {
 	if s == nil {
-		return "", false
+		return "", "", false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	digest, ok := s.digests[callID]
-	return digest, ok
+	entry, ok := s.digests[callID]
+	return entry.Digest, entry.Kind, ok
+}
+
+// kindMayRewriteSettledContent reports whether a sanctioned
+// content-management recipe of the given Kind (see wrapAuthorizedContentRewrites)
+// is ever legitimately authorized to change a call ID's content when the
+// baseline already carries real, durably settled content for that call ID.
+// Only reduction is: its whole purpose is clearing/truncating already
+// SETTLED results (settlementSeal's invariant 1). patchtoolcalls' purpose
+// is strictly the opposite -- filling in a placeholder for a call with NO
+// durable settlement at all (invariant 2) -- so an authorization it
+// produced must never be honored for a call ID the baseline already shows
+// settled, regardless of what upstream's own dangling-detection did or did
+// not catch; see verifySettledToolResults.
+func kindMayRewriteSettledContent(kind string) bool {
+	return kind == HandlerKindReduction
 }
 
 // resetCycle clears every authorization: called once per ReAct cycle by
@@ -242,7 +269,7 @@ func (s *authorizedRewriteSet) resetCycle() {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.digests = make(map[string]string)
+	s.digests = make(map[string]authorizedRewriteEntry)
 }
 
 // drainPending returns and clears every authorization queued for durable
@@ -401,7 +428,16 @@ func verifySettledToolResults(baseline, input []*einoschema.AgenticMessage, auth
 	currentOccurrences := toolResultOccurrencesByCallID(input)
 	for callID, occurrences := range currentOccurrences {
 		baseDigests := baselineOccurrences[callID]
-		authorizedDigest, isAuthorized := authorized.authorizedDigest(callID)
+		authorizedDigest, authorizedKind, isAuthorized := authorized.authorizedRewrite(callID)
+		// A patchtoolcalls-kind authorization never covers a call ID the
+		// baseline already shows real settled content for -- see
+		// kindMayRewriteSettledContent's doc comment. Treat it as
+		// unauthorized here so such a rewrite falls through to the
+		// ordinary settled/fabricated rejection below, exactly as if no
+		// recipe had ever recorded it.
+		if isAuthorized && len(baseDigests) > 0 && !kindMayRewriteSettledContent(authorizedKind) {
+			isAuthorized = false
+		}
 		for _, digest := range occurrences {
 			if digest == authorizedDigest && isAuthorized {
 				continue
