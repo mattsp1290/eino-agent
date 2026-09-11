@@ -6,15 +6,25 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"os"
+	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/adk"
 	adkfilesystem "github.com/cloudwego/eino/adk/filesystem"
+	"github.com/cloudwego/eino/adk/middlewares/plantask"
 	"github.com/cloudwego/eino/adk/middlewares/skill"
 	"github.com/cloudwego/eino/components/tool"
 	einoschema "github.com/cloudwego/eino/schema"
 )
+
+// discoveryProbeBudget bounds how long one handler factory's compile-time
+// tool-discovery probe (factory construction plus its first BeforeAgent
+// call) may run. A third-party factory that blocks -- on network I/O, say
+// -- must not hang plan compilation for every run on that registry; a probe
+// that exceeds this budget is treated as a construction error (see
+// discoverHandlerTools).
+const discoveryProbeBudget = 5 * time.Second
 
 // HandlerToolSpec is one tool a typed ADK agent-handler middleware
 // contributes, discovered once at plan-compile time (see
@@ -57,17 +67,42 @@ func isWriteLikeToolName(name string) bool {
 	return false
 }
 
-// discoverHandlerTools probes factory once, in a bounded, workspace- and
-// session-independent construction context (stub backends and one stub
-// deferred tool, no real store/model/IDs), purely to enumerate the tools
-// its middleware contributes via BeforeAgent. This is sufficient because
-// every one of this package's own eight recipes' tool lists are static per
-// configuration (e.g. filesystem always registers ls/read_file/write_file/
-// edit_file/glob/grep once Backend is non-nil, regardless of what is
-// actually in that backend); a factory or BeforeAgent call that errors
-// during probing (e.g. summarization, which legitimately requires a real
-// Model/Store and injects no tools anyway) is treated as "declares zero
-// tools", not a plan-compile failure.
+// knownToolBearingHandlerKinds are this package's own recipe Kinds whose
+// tool list is always non-empty once their required backend is available
+// (filesystem always registers ls/read_file/..., plantask always registers
+// its task tools, skill always registers "skill", toolsearch always
+// registers its search tool) -- so a probe failure for one of these is a
+// real misconfiguration, not a recipe (like summarization) that legitimately
+// has no tools to discover in the first place. discoverHandlerTools fails
+// plan compilation closed for these Kinds instead of silently sealing zero
+// tools (see S2 in the W6 round-1 review).
+var knownToolBearingHandlerKinds = map[string]bool{
+	HandlerKindFilesystem: true, HandlerKindPlanTask: true, HandlerKindSkill: true, HandlerKindToolSearch: true,
+}
+
+// errHandlerDiscoveryFailed reports that compile-time tool discovery
+// (discoverHandlerTools) failed for a handler Kind this package knows is
+// always tool-bearing once configured correctly.
+var errHandlerDiscoveryFailed = errors.New("agent handler tool discovery failed")
+
+// discoverHandlerTools probes factory once, in a bounded (discoveryProbeBudget
+// deadline), workspace- and session-independent construction context (stub
+// backends and one stub deferred tool, no real store/model/IDs, no
+// filesystem side effects -- see handlerProbeBuildContext), purely to
+// enumerate the tools its middleware contributes via BeforeAgent. This is
+// sufficient because every one of this package's own eight recipes' tool
+// lists are static per configuration (e.g. filesystem always registers
+// ls/read_file/write_file/edit_file/glob/grep once Backend is non-nil,
+// regardless of what is actually in that backend).
+//
+// A factory or BeforeAgent call that errors or exceeds the deadline during
+// probing fails plan compilation closed for a knownToolBearingHandlerKinds
+// Kind (a misconfigured filesystem/plantask/skill/toolsearch recipe would
+// otherwise be silently sealed with no tools and only fail at turn time --
+// see S2 in the W6 round-1 review); for every other Kind (this package's
+// own agentsmd/patchtoolcalls/reduction/summarization, and any third-party
+// Kind) it degrades to "declares zero tools", matching the documented,
+// bounded limitation below.
 //
 // This is a documented, bounded limitation of this discovery mechanism: a
 // third-party handler Kind whose own tool list genuinely depends on data
@@ -79,20 +114,39 @@ func isWriteLikeToolName(name string) bool {
 // HandlerRegistration.Tools field (bypassing probing entirely) is the
 // documented escape hatch for such a handler; it was not needed for this
 // package's own eight recipes and was not added this pass.
-func discoverHandlerTools(handlerID string, factory HandlerFactory) []HandlerToolSpec {
+func discoverHandlerTools(handlerID, kind string, factory HandlerFactory) ([]HandlerToolSpec, error) {
 	if factory == nil {
-		return nil
+		return nil, nil
 	}
-	ctx := context.Background()
-	build, cleanup := handlerProbeBuildContext()
-	defer cleanup()
+	strict := knownToolBearingHandlerKinds[kind]
+	fail := func(stage string, err error) ([]HandlerToolSpec, error) {
+		if strict {
+			return nil, fmt.Errorf("%w: handler %q (%s) %s: %v", errHandlerDiscoveryFailed, handlerID, kind, stage, err)
+		}
+		return nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), discoveryProbeBudget)
+	defer cancel()
+	build := handlerProbeBuildContext()
 	mw, err := factory(ctx, build)
-	if err != nil || mw == nil {
-		return nil
+	if err != nil {
+		return fail("factory construction", err)
+	}
+	if mw == nil {
+		return fail("factory construction", errors.New("factory returned a nil middleware"))
+	}
+	if err := ctx.Err(); err != nil {
+		return fail("factory construction", err)
 	}
 	_, runCtx, err := mw.BeforeAgent(ctx, &adk.ChatModelAgentContext{})
-	if err != nil || runCtx == nil {
-		return nil
+	if err != nil {
+		return fail("BeforeAgent", err)
+	}
+	if runCtx == nil {
+		return fail("BeforeAgent", errors.New("BeforeAgent returned a nil run context"))
+	}
+	if err := ctx.Err(); err != nil {
+		return fail("BeforeAgent", err)
 	}
 	specs := make([]HandlerToolSpec, 0, len(runCtx.Tools))
 	seen := make(map[string]bool, len(runCtx.Tools))
@@ -109,8 +163,7 @@ func discoverHandlerTools(handlerID string, factory HandlerFactory) []HandlerToo
 			Name: info.Name, Info: info, SchemaHash: handlerToolSchemaHash(info), WriteLike: isWriteLikeToolName(info.Name),
 		})
 	}
-	_ = handlerID // reserved for a future per-handler probe scoping/log tag
-	return specs
+	return specs, nil
 }
 
 func handlerToolSchemaHash(info *einoschema.ToolInfo) string {
@@ -125,32 +178,36 @@ func handlerToolSchemaHash(info *einoschema.ToolInfo) string {
 const probeStubToolName = "__handler_probe_stub__"
 
 // handlerProbeBuildContext builds the bounded, stub-backed
-// HandlerBuildContext discoverHandlerTools uses; cleanup removes the
-// temporary scratch directory the writable-backend stubs need (plantask/
-// reduction backends require a real directory to construct against, even
-// though probing never writes through them).
-func handlerProbeBuildContext() (HandlerBuildContext, func()) {
-	root, err := os.MkdirTemp("", "eino-agent-handler-probe-*")
-	cleanup := func() {
-		if root != "" {
-			_ = os.RemoveAll(root)
-		}
-	}
-	build := HandlerBuildContext{
+// HandlerBuildContext discoverHandlerTools uses. Every backend is in-memory
+// (stubFilesystemBackend/stubSkillBackend/probeWritableBackend): probing
+// never touches the real filesystem, no temp directory is created or
+// removed.
+func handlerProbeBuildContext() HandlerBuildContext {
+	return HandlerBuildContext{
 		FilesystemBackend: stubFilesystemBackend{},
 		SkillBackend:      stubSkillBackend{},
 		DeferredTools:     []tool.BaseTool{probeStubTool{}},
+		PlanTaskBackend:   newProbeWritableBackend(),
+		ReductionBackend:  newProbeWritableBackend(),
 	}
-	if err == nil {
-		if planTaskBackend, backendErr := newWritableWorkspaceBackend(root, "plantask"); backendErr == nil {
-			build.PlanTaskBackend = planTaskBackend
-		}
-		if reductionBackend, backendErr := newWritableWorkspaceBackend(root, "reduction"); backendErr == nil {
-			build.ReductionBackend = reductionBackend
-		}
-	}
-	return build, cleanup
 }
+
+// probeWritableBackend is compile-time discovery's in-memory stand-in for
+// writableWorkspaceBackend: it satisfies writableTaskBackend (plantask.Backend's
+// full surface, and reduction.Backend's Write-only subset) purely in
+// memory, via upstream's own adk/filesystem.InMemoryBackend plus a no-op
+// Delete (InMemoryBackend has no Delete method of its own).
+type probeWritableBackend struct {
+	*adkfilesystem.InMemoryBackend
+}
+
+func newProbeWritableBackend() probeWritableBackend {
+	return probeWritableBackend{InMemoryBackend: adkfilesystem.NewInMemoryBackend()}
+}
+
+func (probeWritableBackend) Delete(context.Context, *plantask.DeleteRequest) error { return nil }
+
+var _ writableTaskBackend = probeWritableBackend{}
 
 // probeStubTool is the single stub deferred tool handlerProbeBuildContext
 // supplies so toolsearch's own "requires at least one deferred tool"

@@ -13,6 +13,21 @@ import (
 	"github.com/mattsp1290/eino-agent/internal/workspace"
 )
 
+// writableTaskBackend is the interface both writableWorkspaceBackend (a
+// real turn's actual scratch backend) and probeWritableBackend
+// (compile-time discovery's in-memory stand-in -- see
+// handlerProbeBuildContext) satisfy: plantask.Backend's full surface
+// (LsInfo/Read/Write/Delete) and, structurally, reduction.Backend's smaller
+// one (Write only), so a HandlerBuildContext.PlanTaskBackend/
+// ReductionBackend value passes through to either upstream Config.Backend
+// field without a concrete-type dependency.
+type writableTaskBackend interface {
+	LsInfo(ctx context.Context, req *adkfilesystem.LsInfoRequest) ([]adkfilesystem.FileInfo, error)
+	Read(ctx context.Context, req *adkfilesystem.ReadRequest) (*adkfilesystem.FileContent, error)
+	Write(ctx context.Context, req *adkfilesystem.WriteRequest) error
+	Delete(ctx context.Context, req *plantask.DeleteRequest) error
+}
+
 // writableWorkspaceBackend is a private, writable scratch area used by
 // recipes that need their own persistent state (plantask's task list,
 // reduction's offloaded tool-output files) -- unlike

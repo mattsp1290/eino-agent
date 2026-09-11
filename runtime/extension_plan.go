@@ -412,7 +412,11 @@ func (c *compiledRunPlan) compileAgentHandlers(owned PlanComponent, durable *ses
 		if capability.Factory == nil || capability.Kind == "" || capability.Version == "" || capability.ConfigHash == "" {
 			return fmt.Errorf("%w: agent handler behavior required", ErrExtensionPlanMismatch)
 		}
-		capability.Tools = discoverHandlerTools(capability.ID, capability.Factory)
+		tools, err := discoverHandlerTools(capability.ID, capability.Kind, capability.Factory)
+		if err != nil {
+			return err
+		}
+		capability.Tools = tools
 		c.ownedHandlers = append(c.ownedHandlers, ownedPlanAgentHandler{owner: owned.Component.InstanceID, value: capability})
 		identity := session.AgentHandlerPlanIdentity{
 			ID: capability.ID, Kind: capability.Kind, Version: capability.Version, ConfigHash: capability.ConfigHash,

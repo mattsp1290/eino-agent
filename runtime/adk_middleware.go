@@ -59,13 +59,15 @@ type HandlerBuildContext struct {
 	// admitted canonical workspace.
 	FilesystemBackend adkfilesystem.Backend
 	SkillBackend      skill.Backend
-	// PlanTaskBackend and ReductionBackend are writable, workspace-private
-	// scratch backends (not part of the read-only content view above): each
-	// is rooted at its own subdirectory under the admitted workspace,
-	// scoped to that one recipe's own state, never the workspace's real
-	// content.
-	PlanTaskBackend  *writableWorkspaceBackend
-	ReductionBackend *writableWorkspaceBackend
+	// PlanTaskBackend and ReductionBackend are writable, per-session scratch
+	// backends (not part of the read-only content view above): a real turn
+	// gets one rooted at its own subdirectory under the admitted workspace,
+	// scoped to that one session's recipe state, never the workspace's real
+	// content (writableWorkspaceBackend); compile-time tool discovery
+	// (discoverHandlerTools) gets an in-memory stand-in instead, so probing
+	// never touches the filesystem -- see writableTaskBackend.
+	PlanTaskBackend  writableTaskBackend
+	ReductionBackend writableTaskBackend
 	// DeferredTools are this turn's frozen, already-durably-wrapped deferred
 	// tools (session composition tools registered with Deferred: true),
 	// ready to hand to dynamictool/toolsearch.Config.DynamicTools.
