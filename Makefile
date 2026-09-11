@@ -108,6 +108,7 @@ POSTGRES_MIGRATION_SUITE := github.com/mattsp1290/eino-agent/store/postgres:Test
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_MIGRATION_SUITE) $(addprefix $(POSTGRES_MIGRATION_SUITE)/,lifecycle rejection rollback host_context concurrent canceled_waiter physical_cleanup)
 POSTGRES_STORE_SUITE := github.com/mattsp1290/eino-agent/store/postgres:TestPostgresStore
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_STORE_SUITE) $(addprefix $(POSTGRES_STORE_SUITE)/,contract discovery)
+POSTGRES_REQUIRED_SUITES += $(addprefix $(POSTGRES_STORE_SUITE)/contract/,turns inbox checkpoints paused_runs)
 POSTGRES_STORE_CONTENT_SUITE := $(POSTGRES_STORE_SUITE)/contract/durable_rich_content
 POSTGRES_REQUIRED_SUITES += $(POSTGRES_STORE_CONTENT_SUITE) $(addprefix $(POSTGRES_STORE_CONTENT_SUITE)/,every_block_kind_round_trips_through_the_store mixed_message_preserves_ordinals_kinds_and_response_meta observation_snapshot_shows_only_text-kind_parts provider_state_sentinel_never_leaks_into_public_content)
 POSTGRES_STORE_CONTENT_KIND_SUITE := $(POSTGRES_STORE_CONTENT_SUITE)/every_block_kind_round_trips_through_the_store

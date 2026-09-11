@@ -71,7 +71,7 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 		t.Fatalf("finalize wide assistant: %v", err)
 	}
 
-	model := session.ModelRequestRecord{ID: session.ModelRequestID(ids.request), SessionID: message.SessionID, RunID: run.ID, AssistantMessageID: message.ID, Attempt: 7, Step: 9, ProviderID: "wide-provider", ModelID: "wide-model", State: session.ModelRequestPrepared, Messages: json.RawMessage(`[{"role":"assistant","content":"wide lifecycle content"}]`), System: "wide system", Tools: json.RawMessage(`[{"name":"wide-tool"}]`), SafeCallConfig: json.RawMessage(`{"mode":"wide"}`), ContentSHA256: "wide-content-hash", ExtensionPlanHash: "wide-plan-hash", CreatedAt: created, UpdatedAt: created}
+	model := session.ModelRequestRecord{ID: session.ModelRequestID(ids.request), SessionID: message.SessionID, RunID: run.ID, AssistantMessageID: message.ID, InvocationID: "wide-invocation", Attempt: 7, Step: 9, ProviderID: "wide-provider", ModelID: "wide-model", State: session.ModelRequestPrepared, Messages: json.RawMessage(`[{"role":"assistant","content":"wide lifecycle content"}]`), System: "wide system", Tools: json.RawMessage(`[{"name":"wide-tool"}]`), SafeCallConfig: json.RawMessage(`{"mode":"wide"}`), ContentSHA256: "wide-content-hash", ExtensionPlanHash: "wide-plan-hash", CreatedAt: created, UpdatedAt: created}
 	if got, err := execution.CreateModelRequest(f.ctx, model); err != nil || got.ID != model.ID || got.AssistantMessageID != model.AssistantMessageID || !reflect.DeepEqual(got.Messages, model.Messages) {
 		t.Fatalf("create wide model request: id length=%d err=%v", len(got.ID), err)
 	}
@@ -198,5 +198,16 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 	if !errors.Is(err, session.ErrDiscoveryTooLarge) || !reflect.DeepEqual(page, session.SessionDiscoveryPage{}) {
 		t.Fatalf("1025-byte discovery: sessions=%d cursor length=%d err=%v", len(page.Sessions), len(page.NextCursor), err)
 	}
+	// Populate the new W5 durable tables directly (rather than threading them
+	// through this test's tightly scripted message/event counts) so their
+	// indexes are exercised by assertPGIndexFootprints below.
+	mustExec(t, f.db, `INSERT INTO public.turns(id,run_key,session_key,ordinal,state,record,created_at)
+  SELECT 'wide-turn', r.row_key, s.row_key, 1, 'admitted', '{}'::bytea, $1
+  FROM public.runs r, public.sessions s WHERE r.id=$2 AND s.id=$3`, pgTime, []byte(ids.run), []byte(ids.session))
+	mustExec(t, f.db, `INSERT INTO public.inbox(id,session_key,turn_key,idempotency_key,state,record,created_at,updated_at)
+  SELECT 'wide-inbox', s.row_key, t.row_key, 'wide-inbox-key', 'consumed', '{}'::bytea, $1, $1
+  FROM public.sessions s, public.turns t WHERE s.id=$2 AND t.id='wide-turn'`, pgTime, []byte(ids.session))
+	mustExec(t, f.db, `INSERT INTO public.checkpoints(run_key,revision,promoted,bytes,record,created_at)
+  SELECT r.row_key, 1, 0, 'bytes'::bytea, '{}'::bytea, $1 FROM public.runs r WHERE r.id=$2`, pgTime, []byte(ids.run))
 	assertPGIndexFootprints(t, f.db)
 }

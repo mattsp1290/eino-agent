@@ -254,7 +254,7 @@ func postgresToolResultEnvelope(call session.ToolCall, output json.RawMessage, a
 }
 
 func fencingModelRequest(run session.Run, id session.ModelRequestID, at time.Time, state session.ModelRequestState) session.ModelRequestRecord {
-	return session.ModelRequestRecord{ID: id, SessionID: run.SessionID, RunID: run.ID, Attempt: 0, Step: 0, State: state, Messages: json.RawMessage(`[]`), CreatedAt: at, UpdatedAt: at}
+	return session.ModelRequestRecord{ID: id, SessionID: run.SessionID, RunID: run.ID, InvocationID: "invocation-" + string(id), Attempt: 0, Step: 0, State: state, Messages: json.RawMessage(`[]`), CreatedAt: at, UpdatedAt: at}
 }
 
 func testDelayedWriter(t *testing.T, server *testpostgres.Server) {

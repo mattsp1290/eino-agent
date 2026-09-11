@@ -809,7 +809,7 @@ func TestNewRejectsExactDDLDrift(t *testing.T) {
 		"column affinity":   {"record BLOB NOT NULL", "record TEXT NOT NULL"},
 		"nullability":       {"updated_at TEXT NOT NULL", "updated_at TEXT"},
 		"foreign key":       {"session_key INTEGER NOT NULL REFERENCES sessions(row_key)", "session_key INTEGER NOT NULL CHECK (session_key > 0)"},
-		"partial predicate": {"WHERE status IN ('pending', 'running')", "WHERE status = 'running'"},
+		"partial predicate": {"WHERE status IN ('pending', 'running', 'paused')", "WHERE status = 'running'"},
 		"check constraint":  {"updated_at TEXT NOT NULL", "updated_at TEXT NOT NULL CHECK (updated_at <> '')"},
 		"collation":         {"created_at TEXT NOT NULL COLLATE BINARY", "created_at TEXT NOT NULL COLLATE NOCASE"},
 		"generated column":  {"updated_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(updated_at) = 'text')", "updated_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(updated_at) = 'text'), normalized_id BLOB GENERATED ALWAYS AS (id) VIRTUAL"},
@@ -905,7 +905,7 @@ func TestModelRequestLedgerLifecycleAndPagination(t *testing.T) {
 	}
 	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
 	for index := 1; index <= 2; index++ {
-		record := session.ModelRequestRecord{ID: session.ModelRequestID(fmt.Sprintf("request-%d", index)), SessionID: "ledger-session", RunID: "ledger-run", AssistantMessageID: "assistant", Attempt: index, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now.Add(time.Duration(index) * time.Second), UpdatedAt: now}
+		record := session.ModelRequestRecord{ID: session.ModelRequestID(fmt.Sprintf("request-%d", index)), SessionID: "ledger-session", RunID: "ledger-run", AssistantMessageID: "assistant", InvocationID: fmt.Sprintf("invocation-%d", index), Attempt: index, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now.Add(time.Duration(index) * time.Second), UpdatedAt: now}
 		created, err := execution.CreateModelRequest(ctx, record)
 		if err != nil {
 			t.Fatal(err)

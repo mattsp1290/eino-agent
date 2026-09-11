@@ -109,8 +109,11 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 		"parts":                 {"parts_message_key_idx:message_key", "parts_run_key_idx:run_key", "sqlite_autoindex_parts_1:id", "parts_replay_idx:session_key,message_key,ordinal,id", "parts_observation_idx:session_key,message_key,kind,ordinal,id,run_key,text_valid"},
 		"tool_calls":            {"tool_calls_request_message_key_idx:request_message_key", "tool_calls_request_part_key_idx:request_part_key", "sqlite_autoindex_tool_calls_1:id", "tools_unfinished_idx:run_key,status", "tools_observation_idx:session_key,run_key,id"},
 		"context_epochs":        {"sqlite_autoindex_context_epochs_1:id", "context_epochs_session_created_idx:session_key,created_at,id"},
-		"model_requests":        {"model_requests_session_key_idx:session_key", "sqlite_autoindex_model_requests_1:id", "model_requests_run_attempt_step_idx:run_key,attempt,step", "model_requests_run_created_idx:run_key,created_at,id"},
+		"model_requests":        {"model_requests_session_key_idx:session_key", "sqlite_autoindex_model_requests_1:id", "model_requests_run_invocation_unique_idx:run_key,invocation_id", "model_requests_run_created_idx:run_key,created_at,id"},
 		"events":                {"events_run_key_idx:run_key", "events_tool_key_idx:tool_key", "sqlite_autoindex_events_1:id", "events_replay_idx:session_key,created_at,id", "events_tool_transition_unique_idx:tool_key,tool_transition", "events_run_finished_unique_idx:run_key,kind"},
+		"turns":                 {"sqlite_autoindex_turns_1:id", "turns_run_ordinal_unique_idx:run_key,ordinal", "turns_run_key_idx:run_key", "turns_session_key_idx:session_key"},
+		"inbox":                 {"sqlite_autoindex_inbox_1:id", "inbox_session_idempotency_unique_idx:session_key,idempotency_key", "inbox_session_state_idx:session_key,state", "inbox_turn_key_idx:turn_key"},
+		"checkpoints":           {"checkpoints_run_revision_unique_idx:run_key,revision", "checkpoints_run_promoted_idx:run_key,promoted,revision"},
 	}
 	var wantTables []string
 	for table := range indexes {
@@ -147,13 +150,13 @@ func TestBaselineSchemaTablesAndIndexes(t *testing.T) {
 				valueBytes := baselineRowIDBytes // implicit rowid
 				for _, col := range cols {
 					switch col {
-					case "id", "session_id", "workspace_id":
+					case "id", "session_id", "workspace_id", "invocation_id", "idempotency_key":
 						valueBytes += baselineOversizeIdentityBytes
 					case "created_at":
 						valueBytes += baselineTimestampBytes
-					case "status", "role", "kind", "tool_transition":
+					case "status", "role", "kind", "tool_transition", "state":
 						valueBytes += baselineMaxEnumBytes
-					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "ordinal", "attempt", "step", "finalized", "text_valid":
+					case "session_key", "run_key", "message_key", "tool_key", "request_message_key", "request_part_key", "ordinal", "attempt", "step", "finalized", "text_valid", "turn_key", "revision", "promoted":
 						valueBytes += baselineRowIDBytes
 					default:
 						t.Fatalf("%s indexes private or unbounded projection %s", name, col)
@@ -182,6 +185,9 @@ func populateBaseline(t *testing.T, db *sql.DB) {
 	insertBaselineTool(t, db, 6, "t1", 1, 3, 4, 5, "pending")
 	insertBaselineModelRequest(t, db, "q1", 1, 3, "future-assistant", 0, 0)
 	insertBaselineEvent(t, db, "e1", 1, 3, 6, "tool_pending", "pending")
+	insertBaselineTurn(t, db, 8, "tn1", 3, 1, 1, "admitted")
+	insertBaselineInbox(t, db, 9, "ib1", 1, 8, "consumed")
+	insertBaselineCheckpoint(t, db, 10, 3, 1, 0)
 }
 
 func expectBaselineError(t *testing.T, db *sql.DB, fragment, query string, args ...any) {
@@ -234,6 +240,9 @@ func TestBaselineSchemaForeignKeys(t *testing.T) {
 		"context_epochs": {"session_key:sessions"},
 		"model_requests": {"run_key:runs", "session_key:sessions"},
 		"events":         {"run_key:runs", "session_key:sessions", "tool_key:tool_calls"},
+		"turns":          {"run_key:runs", "session_key:sessions"},
+		"inbox":          {"session_key:sessions", "turn_key:turns"},
+		"checkpoints":    {"run_key:runs"},
 	}
 	for table, want := range owners {
 		if got := baselineStrings(t, db, `SELECT "from" || ':' || "table" FROM pragma_foreign_key_list(?) WHERE "to"='row_key' ORDER BY "from"`, table); !reflect.DeepEqual(got, want) {
@@ -246,7 +255,7 @@ func TestBaselineSchemaForeignKeys(t *testing.T) {
 			}
 			assertBaselineIndexedLookup(t, db, table, col)
 			expectBaselineError(t, db, "FOREIGN KEY constraint failed", "UPDATE "+table+" SET "+col+"=999")
-			if col != "tool_key" {
+			if col != "tool_key" && col != "turn_key" {
 				expectBaselineError(t, db, "NOT NULL constraint failed", "UPDATE "+table+" SET "+col+"=NULL")
 			}
 		}
@@ -282,13 +291,22 @@ func TestBaselineSchemaChecksAndUniqueness(t *testing.T) {
 		`UPDATE events SET kind='text'`, `UPDATE events SET tool_transition=NULL`,
 		`UPDATE events SET tool_key=NULL`, `UPDATE observation_revisions SET revision=-1`,
 		`UPDATE observation_store SET incarnation='a000000000000000000000000000000g'`,
+		`UPDATE turns SET state='unknown'`, `UPDATE turns SET ordinal=0`,
+		`UPDATE inbox SET state='unknown'`, `UPDATE inbox SET state='queued' WHERE row_key=9`,
+		`UPDATE checkpoints SET revision=0`, `UPDATE checkpoints SET promoted=2`,
 	} {
 		expectBaselineError(t, db, "CHECK constraint failed", query)
 	}
-	insertBaselineRun(t, db, 8, "r2", 1, "completed")
-	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE runs SET status='running' WHERE row_key=8`)
+	insertBaselineRun(t, db, 11, "r2", 1, "completed")
+	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE runs SET status='running' WHERE row_key=11`)
 	insertBaselineModelRequest(t, db, "q2", 1, 3, "future", 1, 0)
-	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE model_requests SET attempt=0 WHERE id=?`, []byte("q2"))
+	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE model_requests SET invocation_id=? WHERE id=?`, []byte("q1-invocation"), []byte("q2"))
+	insertBaselineTurn(t, db, 12, "tn2", 3, 1, 2, "admitted")
+	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE turns SET ordinal=1 WHERE row_key=12`)
+	insertBaselineCheckpoint(t, db, 13, 3, 2, 0)
+	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE checkpoints SET revision=1 WHERE row_key=13`)
+	insertBaselineInbox(t, db, 14, "ib2", 1, nil, "queued")
+	expectBaselineError(t, db, "UNIQUE constraint failed", `UPDATE inbox SET idempotency_key=? WHERE row_key=14`, []byte("ib1-key"))
 	for _, transition := range []string{"pending", "running", "terminal"} {
 		if transition != "pending" {
 			insertBaselineEvent(t, db, transition, 1, 3, 6, "tool_transition", transition)
@@ -376,7 +394,19 @@ func insertBaselineTool(t *testing.T, db *sql.DB, key int, id string, sessionKey
 }
 func insertBaselineModelRequest(t *testing.T, db *sql.DB, id string, sessionKey, runKey int, assistant string, attempt, step int) {
 	t.Helper()
-	execBaseline(t, db, `INSERT INTO model_requests(id,session_key,run_key,assistant_message_id,attempt,step,state,record,created_at) VALUES(?,?,?,?,?,?,?,?,?)`, []byte(id), sessionKey, runKey, []byte(assistant), attempt, step, "prepared", []byte("{}"), baselineTime)
+	execBaseline(t, db, `INSERT INTO model_requests(id,session_key,run_key,assistant_message_id,invocation_id,attempt,step,state,record,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, []byte(id), sessionKey, runKey, []byte(assistant), []byte(id+"-invocation"), attempt, step, "prepared", []byte("{}"), baselineTime)
+}
+func insertBaselineTurn(t *testing.T, db *sql.DB, key int, id string, runKey, sessionKey, ordinal int, state string) {
+	t.Helper()
+	execBaseline(t, db, `INSERT INTO turns(row_key,id,run_key,session_key,ordinal,state,record,created_at) VALUES(?,?,?,?,?,?,?,?)`, key, []byte(id), runKey, sessionKey, ordinal, state, []byte("{}"), baselineTime)
+}
+func insertBaselineInbox(t *testing.T, db *sql.DB, key int, id string, sessionKey int, turnKey any, state string) {
+	t.Helper()
+	execBaseline(t, db, `INSERT INTO inbox(row_key,id,session_key,turn_key,idempotency_key,state,record,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`, key, []byte(id), sessionKey, turnKey, []byte(id+"-key"), state, []byte("{}"), baselineTime, baselineTime)
+}
+func insertBaselineCheckpoint(t *testing.T, db *sql.DB, key, runKey, revision, promoted int) {
+	t.Helper()
+	execBaseline(t, db, `INSERT INTO checkpoints(row_key,run_key,revision,promoted,bytes,record,created_at) VALUES(?,?,?,?,?,?,?)`, key, runKey, revision, promoted, []byte("bytes"), []byte("{}"), baselineTime)
 }
 func insertBaselineEvent(t *testing.T, db *sql.DB, id string, sessionKey, runKey int, tool any, kind string, transition any) {
 	t.Helper()

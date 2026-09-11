@@ -94,7 +94,7 @@ func testReplayEventsModels(t *testing.T, server *testpostgres.Server) {
 		if _, err := execution.AppendEvent(f.ctx, session.EventRecord{ID: session.EventID("event-" + item.id), SessionID: run.SessionID, RunID: run.ID, Kind: "replay_order", Payload: json.RawMessage(`{"ok":true}`), CreatedAt: item.at}); err != nil {
 			t.Fatalf("append replay event: %v", err)
 		}
-		record := session.ModelRequestRecord{ID: session.ModelRequestID("model-" + item.id), SessionID: run.SessionID, RunID: run.ID, AssistantMessageID: session.MessageID("assistant-" + item.id), Attempt: index, State: session.ModelRequestPrepared, Messages: json.RawMessage(`{"messages":[]}`), CreatedAt: item.at, UpdatedAt: item.at}
+		record := session.ModelRequestRecord{ID: session.ModelRequestID("model-" + item.id), SessionID: run.SessionID, RunID: run.ID, AssistantMessageID: session.MessageID("assistant-" + item.id), InvocationID: "invocation-" + item.id, Attempt: index, State: session.ModelRequestPrepared, Messages: json.RawMessage(`{"messages":[]}`), CreatedAt: item.at, UpdatedAt: item.at}
 		if _, err := execution.CreateModelRequest(f.ctx, record); err != nil {
 			t.Fatalf("append replay model request: %v", err)
 		}

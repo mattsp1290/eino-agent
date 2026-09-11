@@ -85,6 +85,7 @@ type modelRequestRow struct {
 	SessionKey         int64  `gorm:"column:session_key"`
 	RunKey             int64  `gorm:"column:run_key"`
 	AssistantMessageID []byte `gorm:"column:assistant_message_id"`
+	InvocationID       []byte `gorm:"column:invocation_id"`
 	State              string `gorm:"column:state"`
 	Attempt            int    `gorm:"column:attempt"`
 	Step               int    `gorm:"column:step"`
@@ -149,5 +150,5 @@ func (s *Store) contextEpochQuery(ctx context.Context) *gorm.DB {
 }
 func (s *Store) modelRequestQuery(ctx context.Context) *gorm.DB {
 	size := s.dialect.ByteLength("model_requests.record")
-	return s.dbFor(ctx).Table(s.tableName("model_requests")).Select("model_requests.row_key, model_requests.id, model_requests.session_key, model_requests.run_key, model_requests.assistant_message_id, model_requests.state, model_requests.attempt, model_requests.step, model_requests.created_at, sessions.id AS session_id, runs.id AS run_id, "+size+" AS record_bytes, CASE WHEN "+size+" <= ? THEN model_requests.record END AS record", maxModelRequestRecordBytes).Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = model_requests.session_key").Joins("JOIN " + s.tableName("runs") + " ON runs.row_key = model_requests.run_key AND runs.session_key = model_requests.session_key")
+	return s.dbFor(ctx).Table(s.tableName("model_requests")).Select("model_requests.row_key, model_requests.id, model_requests.session_key, model_requests.run_key, model_requests.assistant_message_id, model_requests.invocation_id, model_requests.state, model_requests.attempt, model_requests.step, model_requests.created_at, sessions.id AS session_id, runs.id AS run_id, "+size+" AS record_bytes, CASE WHEN "+size+" <= ? THEN model_requests.record END AS record", maxModelRequestRecordBytes).Joins("JOIN " + s.tableName("sessions") + " ON sessions.row_key = model_requests.session_key").Joins("JOIN " + s.tableName("runs") + " ON runs.row_key = model_requests.run_key AND runs.session_key = model_requests.session_key")
 }

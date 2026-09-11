@@ -27,7 +27,7 @@ CREATE TABLE runs (
   row_key INTEGER PRIMARY KEY,
   id BLOB NOT NULL UNIQUE CHECK (typeof(id) = 'blob'),
   session_key INTEGER NOT NULL REFERENCES sessions(row_key),
-  status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'interrupted', 'failed', 'completed')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'paused', 'interrupted', 'failed', 'completed')),
   provider_id BLOB NOT NULL CHECK (typeof(provider_id) = 'blob'),
   model_id BLOB NOT NULL CHECK (typeof(model_id) = 'blob'),
   owner_id BLOB NOT NULL CHECK (typeof(owner_id) = 'blob'),
@@ -37,7 +37,7 @@ CREATE TABLE runs (
   created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text')
 );
 CREATE INDEX runs_session_status_idx ON runs(session_key, status);
-CREATE UNIQUE INDEX runs_session_active_unique_idx ON runs(session_key) WHERE status IN ('pending', 'running');
+CREATE UNIQUE INDEX runs_session_active_unique_idx ON runs(session_key) WHERE status IN ('pending', 'running', 'paused');
 
 CREATE TABLE messages (
   row_key INTEGER PRIMARY KEY,
@@ -104,15 +104,58 @@ CREATE TABLE model_requests (
   session_key INTEGER NOT NULL REFERENCES sessions(row_key),
   run_key INTEGER NOT NULL REFERENCES runs(row_key),
   assistant_message_id BLOB NOT NULL CHECK (typeof(assistant_message_id) = 'blob'),
+  invocation_id BLOB NOT NULL CHECK (typeof(invocation_id) = 'blob'),
   state TEXT NOT NULL CHECK (state IN ('prepared', 'dispatch_started', 'completed', 'failed')),
   attempt INTEGER NOT NULL CHECK (typeof(attempt) = 'integer'),
   step INTEGER NOT NULL CHECK (typeof(step) = 'integer'),
   record BLOB NOT NULL CHECK (typeof(record) = 'blob'),
   created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text')
 );
-CREATE UNIQUE INDEX model_requests_run_attempt_step_idx ON model_requests(run_key, attempt, step);
+CREATE UNIQUE INDEX model_requests_run_invocation_unique_idx ON model_requests(run_key, invocation_id);
 CREATE INDEX model_requests_run_created_idx ON model_requests(run_key, created_at, id);
 CREATE INDEX model_requests_session_key_idx ON model_requests(session_key);
+
+CREATE TABLE turns (
+  row_key INTEGER PRIMARY KEY,
+  id BLOB NOT NULL UNIQUE CHECK (typeof(id) = 'blob'),
+  run_key INTEGER NOT NULL REFERENCES runs(row_key),
+  session_key INTEGER NOT NULL REFERENCES sessions(row_key),
+  ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer' AND ordinal > 0),
+  state TEXT NOT NULL CHECK (state IN ('admitted', 'running', 'completed', 'interrupted', 'failed')),
+  record BLOB NOT NULL CHECK (typeof(record) = 'blob'),
+  created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text')
+);
+CREATE UNIQUE INDEX turns_run_ordinal_unique_idx ON turns(run_key, ordinal);
+CREATE INDEX turns_run_key_idx ON turns(run_key);
+CREATE INDEX turns_session_key_idx ON turns(session_key);
+
+CREATE TABLE inbox (
+  row_key INTEGER PRIMARY KEY,
+  id BLOB NOT NULL UNIQUE CHECK (typeof(id) = 'blob'),
+  session_key INTEGER NOT NULL REFERENCES sessions(row_key),
+  turn_key INTEGER REFERENCES turns(row_key),
+  idempotency_key BLOB NOT NULL CHECK (typeof(idempotency_key) = 'blob'),
+  state TEXT NOT NULL CHECK (state IN ('queued', 'consumed', 'completed', 'interrupted')),
+  record BLOB NOT NULL CHECK (typeof(record) = 'blob'),
+  created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text'),
+  updated_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(updated_at) = 'text'),
+  CHECK (state <> 'queued' OR turn_key IS NULL)
+);
+CREATE UNIQUE INDEX inbox_session_idempotency_unique_idx ON inbox(session_key, idempotency_key);
+CREATE INDEX inbox_session_state_idx ON inbox(session_key, state);
+CREATE INDEX inbox_turn_key_idx ON inbox(turn_key);
+
+CREATE TABLE checkpoints (
+  row_key INTEGER PRIMARY KEY,
+  run_key INTEGER NOT NULL REFERENCES runs(row_key),
+  revision INTEGER NOT NULL CHECK (typeof(revision) = 'integer' AND revision > 0),
+  promoted INTEGER NOT NULL CHECK (promoted IN (0,1)),
+  bytes BLOB NOT NULL CHECK (typeof(bytes) = 'blob'),
+  record BLOB NOT NULL CHECK (typeof(record) = 'blob'),
+  created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text')
+);
+CREATE UNIQUE INDEX checkpoints_run_revision_unique_idx ON checkpoints(run_key, revision);
+CREATE INDEX checkpoints_run_promoted_idx ON checkpoints(run_key, promoted, revision);
 
 CREATE TABLE events (
   row_key INTEGER PRIMARY KEY,

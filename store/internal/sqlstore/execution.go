@@ -238,8 +238,18 @@ func (e *executionStore) UpdatePart(ctx context.Context, record session.Part) er
 	})
 }
 
+// canonicalOnlyEventKinds are event kinds that only a typed atomic mutation
+// method may persist. Arbitrary AppendEvent callers cannot manufacture a run,
+// turn, or tool lifecycle event of these kinds.
+var canonicalOnlyEventKinds = map[string]bool{
+	session.RunSettlementEventKind: true,
+	session.TurnStartedEventKind:   true,
+	session.TurnCompletedEventKind: true,
+	session.RunPausedEventKind:     true,
+}
+
 func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
-	if record.RunID != e.fence.RunID || record.Kind == session.RunSettlementEventKind || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
+	if record.RunID != e.fence.RunID || canonicalOnlyEventKinds[record.Kind] || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
 		return session.EventRecord{}, session.ErrConflict
 	}
 	var result session.EventRecord

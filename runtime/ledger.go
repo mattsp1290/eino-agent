@@ -207,10 +207,18 @@ func (o *StreamingOrchestrator) prepareModelRequest(ctx context.Context, executi
 	if execution != nil && execution.plan != nil {
 		planHash = execution.plan.sealed.Fingerprint()
 	}
+	// InvocationID is a temporary stand-in for per-dispatch invocation
+	// identity: it reuses the same (run, message, attempt, step) composite
+	// the legacy request ID used, so it is unique per (run_key, attempt,
+	// step) but not yet a true per-dispatch identity. The W5 ADK engine
+	// (runtime/adk_execution.go, not yet built) replaces this with
+	// IDGenerator.NewInvocationID.
+	invocationID := fmt.Sprintf("%s:%s:%d:%d", snapshot.RunID, messageID, attempt, step)
 	record := session.ModelRequestRecord{
-		ID:        session.ModelRequestID(fmt.Sprintf("%s:%s:%d:%d", snapshot.RunID, messageID, attempt, step)),
+		ID:        session.ModelRequestID(invocationID),
 		SessionID: snapshot.SessionID, RunID: snapshot.RunID, AssistantMessageID: messageID,
-		Attempt: attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
+		InvocationID: invocationID,
+		Attempt:      attempt, Step: step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),
 		State: session.ModelRequestPrepared, Messages: messages, System: audited.System, Tools: tools,
 		Controls: controls, SafeCallConfig: safeConfig, ContentSHA256: contentHash, ExtensionPlanHash: planHash,
 		CreatedAt: now, UpdatedAt: now,

@@ -25,6 +25,12 @@ type ToolCallID string
 // EpochID identifies a context epoch, including compacted epochs.
 type EpochID string
 
+// TurnID identifies one durable turn admitted inside a run.
+type TurnID string
+
+// InboxID identifies one durable queued inbox item.
+type InboxID string
+
 var (
 	// ErrSessionBusy reports that a session already has a nonterminal owner run.
 	ErrSessionBusy = errors.New("session has active run")
@@ -61,6 +67,11 @@ const (
 	RunFailed RunStatus = "failed"
 	// RunCompleted means execution reached a normal terminal state.
 	RunCompleted RunStatus = "completed"
+	// RunPaused means execution durably suspended after a promoted
+	// checkpoint. Paused runs are nonterminal but hold no live fence: the
+	// session remains reserved (see runs_session_active_unique_idx) until a
+	// resume claims the run and moves it back to running.
+	RunPaused RunStatus = "paused"
 )
 
 // Run records one admitted execution attempt before provider streaming starts.
@@ -103,6 +114,13 @@ type RunClaim struct {
 // Terminal reports whether the run no longer owns execution.
 func (r Run) Terminal() bool {
 	return r.Status == RunInterrupted || r.Status == RunFailed || r.Status == RunCompleted
+}
+
+// Paused reports whether the run is durably suspended awaiting resume. A
+// paused run is nonterminal but has no live fence: only ClaimRun can move it
+// back to running.
+func (r Run) Paused() bool {
+	return r.Status == RunPaused
 }
 
 // Role is the durable role of a message in replayable history.
@@ -338,17 +356,24 @@ type EventRecord struct {
 	// typed tool mutation methods may persist records with this field set.
 	ToolTransition ToolTransitionPhase
 	EpochID        EpochID
-	ProviderID     string
-	ModelID        string
-	ParentID       string
-	Kind           string
-	Correlation    string
-	Usage          Usage
-	Error          EventError
-	Redaction      RedactionClass
-	Payload        json.RawMessage
-	LiveOnly       bool
-	CreatedAt      time.Time
+	// TurnID correlates an event to the durable turn that produced it, when
+	// applicable. It is a record-JSON-only correlation field: no column or
+	// index backs it.
+	TurnID TurnID
+	// AgentPath is the joined RunPath of the (sub)agent that produced this
+	// event, when applicable. Record-JSON-only, like TurnID.
+	AgentPath   string
+	ProviderID  string
+	ModelID     string
+	ParentID    string
+	Kind        string
+	Correlation string
+	Usage       Usage
+	Error       EventError
+	Redaction   RedactionClass
+	Payload     json.RawMessage
+	LiveOnly    bool
+	CreatedAt   time.Time
 }
 
 // Usage records provider usage data in a store-level event projection.
@@ -422,6 +447,21 @@ type Store interface {
 	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
 	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
 	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
+	// EnqueueInbox durably admits one idempotent submission for a session.
+	// Replaying the same IdempotencyKey with the same payload returns the
+	// existing row; a different payload under the same key is ErrConflict.
+	EnqueueInbox(ctx context.Context, item InboxItem, limits ContentLimits) (InboxItem, error)
+	ListInbox(ctx context.Context, sessionID ID, states []InboxState) ([]InboxItem, error)
+	GetTurn(ctx context.Context, id TurnID) (Turn, error)
+	ListTurns(ctx context.Context, runID RunID) ([]Turn, error)
+	// ReadPromotedCheckpoint reads the latest promoted checkpoint revision for
+	// a run without a fence: promotion is the durability boundary, not the
+	// live claim.
+	ReadPromotedCheckpoint(ctx context.Context, runID RunID) (Checkpoint, bool, error)
+	// RetireRunCheckpoints deletes promoted or staged revisions at or below
+	// upToRevision for a terminal run, where no fence is available. It is
+	// idempotent and never deletes a revision above upToRevision.
+	RetireRunCheckpoints(ctx context.Context, runID RunID, upToRevision int64) error
 }
 
 // ExecutionStore is the run-fenced mutation capability used after admission or
@@ -442,6 +482,30 @@ type ExecutionStore interface {
 	SettleToolCall(ctx context.Context, request SettleToolCallRequest) (ToolTransitionResult, error)
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
+	// AdmitTurn atomically admits the next-ordinal turn for the fenced run:
+	// it appends the user messages/parts and assistant placeholder, creates
+	// the turn row, claims the given queued inbox items into it (queued ->
+	// consumed), and appends the canonical turn_started event.
+	AdmitTurn(ctx context.Context, request AdmitTurnRequest) (AdmitTurnResult, error)
+	// CompleteTurn atomically settles an admitted turn as completed and its
+	// claimed inbox items as completed, without touching run status.
+	CompleteTurn(ctx context.Context, request CompleteTurnRequest) (CompleteTurnResult, error)
+	// InterruptTurn atomically settles an admitted turn as interrupted and
+	// its claimed inbox items as interrupted, without touching run status.
+	InterruptTurn(ctx context.Context, request InterruptTurnRequest) (InterruptTurnResult, error)
+	// StageCheckpoint inserts one unpromoted checkpoint revision under the
+	// fence.
+	StageCheckpoint(ctx context.Context, request StageCheckpointRequest) (Checkpoint, error)
+	// PromotePause atomically promotes a staged checkpoint revision into the
+	// durable pause boundary: it marks the revision promoted, interrupts the
+	// given turn and inbox items, sets the run paused with no live lease, and
+	// appends the run_paused event. After it commits, this fence can no
+	// longer write (loadRunFence rejects paused runs).
+	PromotePause(ctx context.Context, request PromotePauseRequest) (PromotePauseResult, error)
+	// RetireCheckpoints deletes staged or promoted revisions at or below
+	// upToRevision for the fenced (running) run. Idempotent; never deletes a
+	// revision above upToRevision.
+	RetireCheckpoints(ctx context.Context, upToRevision int64) error
 	ModelRequestWriter
 }
 

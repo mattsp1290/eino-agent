@@ -59,6 +59,7 @@ func testReplayProviderBytes(t *testing.T, server *testpostgres.Server) {
 		SessionID:          sessionID,
 		RunID:              runID,
 		AssistantMessageID: message.ID,
+		InvocationID:       "invocation-\x00-要求",
 		Attempt:            1,
 		Step:               2,
 		ProviderID:         "provider-\x00-提供者",

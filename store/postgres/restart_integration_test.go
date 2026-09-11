@@ -105,7 +105,7 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 	}
 	call = created.Call
 	request := session.ModelRequestRecord{
-		ID: "restart-model-request", SessionID: sessionID, RunID: runID, AssistantMessageID: assistant.ID,
+		ID: "restart-model-request", SessionID: sessionID, RunID: runID, AssistantMessageID: assistant.ID, InvocationID: "restart-invocation",
 		Attempt: 0, Step: 1, ProviderID: run.ProviderID, ModelID: run.ModelID, State: session.ModelRequestPrepared,
 		Messages: json.RawMessage(`[{"role":"user","content":"restart history"}]`), System: "restart system",
 		Tools: json.RawMessage(`[{"name":"echo"}]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{"mode":"safe"}`),

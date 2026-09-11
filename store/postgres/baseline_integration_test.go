@@ -139,9 +139,28 @@ var pgIndexes = map[string][]pgIndex{
 	"model_requests": {
 		{name: "model_requests_pkey", columns: "row_key", unique: true},
 		{name: "model_requests_id_key", columns: "id", unique: true},
-		{name: "model_requests_run_attempt_step_idx", columns: "run_key,attempt,step", unique: true},
+		{name: "model_requests_run_invocation_unique_idx", columns: "run_key,invocation_id", unique: true},
 		{name: "model_requests_run_created_idx", columns: "run_key,created_at,id"},
 		{name: "model_requests_session_key_idx", columns: "session_key"},
+	},
+	"turns": {
+		{name: "turns_pkey", columns: "row_key", unique: true},
+		{name: "turns_id_key", columns: "id", unique: true},
+		{name: "turns_run_ordinal_unique_idx", columns: "run_key,ordinal", unique: true},
+		{name: "turns_run_key_idx", columns: "run_key"},
+		{name: "turns_session_key_idx", columns: "session_key"},
+	},
+	"inbox": {
+		{name: "inbox_pkey", columns: "row_key", unique: true},
+		{name: "inbox_id_key", columns: "id", unique: true},
+		{name: "inbox_session_idempotency_unique_idx", columns: "session_key,idempotency_key", unique: true},
+		{name: "inbox_session_state_idx", columns: "session_key,state"},
+		{name: "inbox_turn_key_idx", columns: "turn_key"},
+	},
+	"checkpoints": {
+		{name: "checkpoints_pkey", columns: "row_key", unique: true},
+		{name: "checkpoints_run_revision_unique_idx", columns: "run_key,revision", unique: true},
+		{name: "checkpoints_run_promoted_idx", columns: "run_key,promoted,revision"},
 	},
 	"events": {
 		{name: "events_pkey", columns: "row_key", unique: true},
@@ -158,7 +177,10 @@ var pgOwners = map[string][]string{
 	"parts":          {"message_key:messages", "run_key:runs", "session_key:sessions"},
 	"tool_calls":     {"request_message_key:messages", "request_part_key:parts", "run_key:runs", "session_key:sessions"},
 	"context_epochs": {"session_key:sessions"}, "model_requests": {"run_key:runs", "session_key:sessions"},
-	"events": {"run_key:runs", "session_key:sessions", "tool_key:tool_calls"},
+	"events":      {"run_key:runs", "session_key:sessions", "tool_key:tool_calls"},
+	"turns":       {"run_key:runs", "session_key:sessions"},
+	"inbox":       {"session_key:sessions", "turn_key:turns"},
+	"checkpoints": {"run_key:runs"},
 }
 
 func testCatalog(t *testing.T, server *testpostgres.Server) {
@@ -213,6 +235,9 @@ func populatePG(t *testing.T, db *sql.DB) {
 	insertPGTool(t, db, 6, "t1", 1, 3, 4, 5, "pending")
 	insertPGModelRequest(t, db, "q1", 1, 3, "future-assistant", 0, 0)
 	insertPGEvent(t, db, "e1", 1, 3, 6, "tool_pending", "pending")
+	insertPGTurn(t, db, 8, "tn1", 3, 1, 1, "admitted")
+	insertPGInbox(t, db, 9, "ib1", 1, 8, "consumed")
+	insertPGCheckpoint(t, db, 10, 3, 1, 0)
 }
 func testConstraints(t *testing.T, server *testpostgres.Server) {
 	db := server.Database(t).Open(t)
@@ -222,18 +247,24 @@ func testConstraints(t *testing.T, server *testpostgres.Server) {
 		for _, owner := range owners {
 			col := strings.Split(owner, ":")[0]
 			expectPGError(t, db, "23503", "UPDATE public."+table+" SET "+col+"=999")
-			if col != "tool_key" {
+			if col != "tool_key" && col != "turn_key" {
 				expectPGError(t, db, "23502", "UPDATE public."+table+" SET "+col+"=NULL")
 			}
 		}
 	}
-	for _, q := range []string{`UPDATE public.messages SET finalized=2`, `UPDATE public.parts SET text_valid=2`, `UPDATE public.runs SET status='unknown'`, `UPDATE public.events SET tool_transition=NULL`, `UPDATE public.observation_revisions SET revision=-1`} {
+	for _, q := range []string{`UPDATE public.messages SET finalized=2`, `UPDATE public.parts SET text_valid=2`, `UPDATE public.runs SET status='unknown'`, `UPDATE public.events SET tool_transition=NULL`, `UPDATE public.observation_revisions SET revision=-1`, `UPDATE public.turns SET state='unknown'`, `UPDATE public.turns SET ordinal=0`, `UPDATE public.inbox SET state='unknown'`, `UPDATE public.inbox SET state='queued' WHERE row_key=9`, `UPDATE public.checkpoints SET revision=0`, `UPDATE public.checkpoints SET promoted=2`} {
 		expectPGError(t, db, "23514", q)
 	}
-	insertPGRun(t, db, 8, "r2", 1, "completed")
-	expectPGError(t, db, "23505", `UPDATE public.runs SET status='running' WHERE row_key=8`)
+	insertPGRun(t, db, 11, "r2", 1, "completed")
+	expectPGError(t, db, "23505", `UPDATE public.runs SET status='running' WHERE row_key=11`)
 	insertPGModelRequest(t, db, "q2", 1, 3, "future", 1, 0)
-	expectPGError(t, db, "23505", `UPDATE public.model_requests SET attempt=0 WHERE id=$1`, []byte("q2"))
+	expectPGError(t, db, "23505", `UPDATE public.model_requests SET invocation_id=$1 WHERE id=$2`, []byte("q1-invocation"), []byte("q2"))
+	insertPGTurn(t, db, 12, "tn2", 3, 1, 2, "admitted")
+	expectPGError(t, db, "23505", `UPDATE public.turns SET ordinal=1 WHERE row_key=12`)
+	insertPGCheckpoint(t, db, 13, 3, 2, 0)
+	expectPGError(t, db, "23505", `UPDATE public.checkpoints SET revision=1 WHERE row_key=13`)
+	insertPGInbox(t, db, 14, "ib2", 1, nil, "queued")
+	expectPGError(t, db, "23505", `UPDATE public.inbox SET idempotency_key=$1 WHERE row_key=14`, []byte("ib1-key"))
 	for _, transition := range []string{"pending", "running", "terminal"} {
 		if transition != "pending" {
 			insertPGEvent(t, db, transition, 1, 3, 6, "tool_transition", transition)
@@ -316,7 +347,19 @@ func insertPGTool(t *testing.T, db *sql.DB, key int, id string, sessionKey, runK
 }
 func insertPGModelRequest(t *testing.T, db *sql.DB, id string, sessionKey, runKey int, assistant string, attempt, step int) {
 	t.Helper()
-	mustExec(t, db, `INSERT INTO public.model_requests(id,session_key,run_key,assistant_message_id,attempt,step,state,record,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, []byte(id), sessionKey, runKey, []byte(assistant), attempt, step, "prepared", []byte("{}"), pgTime)
+	mustExec(t, db, `INSERT INTO public.model_requests(id,session_key,run_key,assistant_message_id,invocation_id,attempt,step,state,record,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, []byte(id), sessionKey, runKey, []byte(assistant), []byte(id+"-invocation"), attempt, step, "prepared", []byte("{}"), pgTime)
+}
+func insertPGTurn(t *testing.T, db *sql.DB, key int, id string, runKey, sessionKey, ordinal int, state string) {
+	t.Helper()
+	mustExec(t, db, `INSERT INTO public.turns(row_key,id,run_key,session_key,ordinal,state,record,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, key, []byte(id), runKey, sessionKey, ordinal, state, []byte("{}"), pgTime)
+}
+func insertPGInbox(t *testing.T, db *sql.DB, key int, id string, sessionKey int, turnKey any, state string) {
+	t.Helper()
+	mustExec(t, db, `INSERT INTO public.inbox(row_key,id,session_key,turn_key,idempotency_key,state,record,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, key, []byte(id), sessionKey, turnKey, []byte(id+"-key"), state, []byte("{}"), pgTime, pgTime)
+}
+func insertPGCheckpoint(t *testing.T, db *sql.DB, key, runKey, revision, promoted int) {
+	t.Helper()
+	mustExec(t, db, `INSERT INTO public.checkpoints(row_key,run_key,revision,promoted,bytes,record,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, key, runKey, revision, promoted, []byte("bytes"), []byte("{}"), pgTime)
 }
 func insertPGEvent(t *testing.T, db *sql.DB, id string, sessionKey, runKey int, tool any, kind string, transition any) {
 	t.Helper()

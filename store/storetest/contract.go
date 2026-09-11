@@ -31,6 +31,10 @@ func Run(t *testing.T, factory Factory) {
 	observationContract(t, factory)
 	boundedObservationContract(t, factory)
 	contentContract(t, factory)
+	turnsContract(t, factory)
+	inboxContract(t, factory)
+	checkpointContract(t, factory)
+	pausedRunContract(t, factory)
 
 	t.Run("atomic run ownership", func(t *testing.T) {
 		subject := setup(t, factory)
@@ -928,7 +932,8 @@ func modelRequest(id session.ModelRequestID, sessionID session.ID, runID session
 	now := time.Now().UTC().Add(time.Duration(attempt) * time.Second)
 	return session.ModelRequestRecord{
 		ID: id, SessionID: sessionID, RunID: runID, AssistantMessageID: "assistant-model-request",
-		Attempt: attempt, Step: 1, State: session.ModelRequestPrepared,
+		InvocationID: "invocation-" + string(id),
+		Attempt:      attempt, Step: 1, State: session.ModelRequestPrepared,
 		Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`),
 		ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
 	}

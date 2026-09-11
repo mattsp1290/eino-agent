@@ -22,6 +22,9 @@ type admissionStore struct {
 	toolCalls         map[session.ToolCallID]session.ToolCall
 	epochs            map[session.EpochID]session.ContextEpoch
 	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
+	turns             map[session.TurnID]session.Turn
+	inbox             map[session.InboxID]session.InboxItem
+	checkpoints       map[fakeCheckpointKey]session.Checkpoint
 	appendEventErr    error
 	appendPartErrAt   int
 	appendPartCalls   int
@@ -46,7 +49,17 @@ func newAdmissionStore() *admissionStore {
 		toolCalls:     map[session.ToolCallID]session.ToolCall{},
 		epochs:        map[session.EpochID]session.ContextEpoch{},
 		modelRequests: map[session.ModelRequestID]session.ModelRequestRecord{},
+		turns:         map[session.TurnID]session.Turn{},
+		inbox:         map[session.InboxID]session.InboxItem{},
+		checkpoints:   map[fakeCheckpointKey]session.Checkpoint{},
 	}
+}
+
+// fakeCheckpointKey is the in-memory identity for a staged checkpoint
+// revision in admissionStore.checkpoints.
+type fakeCheckpointKey struct {
+	RunID    session.RunID
+	Revision int64
 }
 
 func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, session.Store) error) error {
@@ -63,6 +76,9 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
+	s.turns = tx.turns
+	s.inbox = tx.inbox
+	s.checkpoints = tx.checkpoints
 	return nil
 }
 
@@ -77,6 +93,9 @@ func (s *admissionStore) clone() *admissionStore {
 		toolCalls:         cloneMap(s.toolCalls),
 		epochs:            cloneMap(s.epochs),
 		modelRequests:     cloneMap(s.modelRequests),
+		turns:             cloneMap(s.turns),
+		inbox:             cloneMap(s.inbox),
+		checkpoints:       cloneMap(s.checkpoints),
 		appendEventErr:    s.appendEventErr,
 		appendPartErrAt:   s.appendPartErrAt,
 		appendPartCalls:   s.appendPartCalls,
@@ -466,6 +485,9 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 	s.toolCalls = tx.toolCalls
 	s.epochs = tx.epochs
 	s.modelRequests = tx.modelRequests
+	s.turns = tx.turns
+	s.inbox = tx.inbox
+	s.checkpoints = tx.checkpoints
 	return nil
 }
 
@@ -639,5 +661,245 @@ func (s *fakeExecutionStore) FinalizeAssistantMessage(_ context.Context, id sess
 		return session.ErrConflict
 	}
 	s.finalized[id] = true
+	return nil
+}
+
+// --- W5 durable additions: minimal in-memory fakes ---
+
+func (s *admissionStore) EnqueueInbox(_ context.Context, item session.InboxItem, limits session.ContentLimits) (session.InboxItem, error) {
+	if err := session.ValidateEnqueueInbox(item, limits); err != nil {
+		return session.InboxItem{}, err
+	}
+	for _, existing := range s.inbox {
+		if existing.SessionID == item.SessionID && existing.IdempotencyKey == item.IdempotencyKey {
+			if !reflect.DeepEqual(existing.Blocks, item.Blocks) {
+				return session.InboxItem{}, session.ErrConflict
+			}
+			return existing, nil
+		}
+	}
+	s.inbox[item.ID] = item
+	return item, nil
+}
+
+func (s *admissionStore) ListInbox(_ context.Context, sessionID session.ID, states []session.InboxState) ([]session.InboxItem, error) {
+	allow := map[session.InboxState]bool{}
+	for _, state := range states {
+		allow[state] = true
+	}
+	var out []session.InboxItem
+	for _, item := range s.inbox {
+		if item.SessionID != sessionID {
+			continue
+		}
+		if len(states) > 0 && !allow[item.State] {
+			continue
+		}
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.Before(out[j].CreatedAt) })
+	return out, nil
+}
+
+func (s *admissionStore) GetTurn(_ context.Context, id session.TurnID) (session.Turn, error) {
+	turn, ok := s.turns[id]
+	if !ok {
+		return session.Turn{}, session.ErrNotFound
+	}
+	return turn, nil
+}
+
+func (s *admissionStore) ListTurns(_ context.Context, runID session.RunID) ([]session.Turn, error) {
+	var out []session.Turn
+	for _, turn := range s.turns {
+		if turn.RunID == runID {
+			out = append(out, turn)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Ordinal < out[j].Ordinal })
+	return out, nil
+}
+
+func (s *admissionStore) ReadPromotedCheckpoint(_ context.Context, runID session.RunID) (session.Checkpoint, bool, error) {
+	var best session.Checkpoint
+	found := false
+	for key, checkpoint := range s.checkpoints {
+		if key.RunID == runID && checkpoint.Promoted && (!found || checkpoint.Revision > best.Revision) {
+			best, found = checkpoint, true
+		}
+	}
+	return best, found, nil
+}
+
+func (s *admissionStore) RetireRunCheckpoints(_ context.Context, runID session.RunID, upToRevision int64) error {
+	run, ok := s.runs[runID]
+	if !ok || !run.Terminal() {
+		return session.ErrConflict
+	}
+	for key := range s.checkpoints {
+		if key.RunID == runID && key.Revision <= upToRevision {
+			delete(s.checkpoints, key)
+		}
+	}
+	return nil
+}
+
+func (s *fakeExecutionStore) AdmitTurn(ctx context.Context, request session.AdmitTurnRequest) (session.AdmitTurnResult, error) {
+	if !s.valid() {
+		return session.AdmitTurnResult{}, session.ErrConflict
+	}
+	if err := session.ValidateAdmitTurn(s.runs[s.fence.RunID], request); err != nil {
+		return session.AdmitTurnResult{}, err
+	}
+	for _, message := range request.UserMessages {
+		if _, err := s.AppendMessage(ctx, message); err != nil {
+			return session.AdmitTurnResult{}, err
+		}
+	}
+	for _, part := range request.UserParts {
+		if _, err := s.AppendPart(ctx, part); err != nil {
+			return session.AdmitTurnResult{}, err
+		}
+	}
+	if request.AssistantPlaceholder.ID != "" {
+		if _, err := s.AppendMessage(ctx, request.AssistantPlaceholder); err != nil {
+			return session.AdmitTurnResult{}, err
+		}
+	}
+	if existing, ok := s.turns[request.Turn.ID]; ok && !reflect.DeepEqual(existing, request.Turn) {
+		return session.AdmitTurnResult{}, session.ErrConflict
+	}
+	s.turns[request.Turn.ID] = request.Turn
+	for _, id := range request.InboxIDs {
+		item, ok := s.inbox[id]
+		if !ok {
+			return session.AdmitTurnResult{}, session.ErrConflict
+		}
+		if item.State == session.InboxConsumed && item.TurnID == request.Turn.ID {
+			continue
+		}
+		if item.State != session.InboxQueued {
+			return session.AdmitTurnResult{}, session.ErrConflict
+		}
+		item.State = session.InboxConsumed
+		item.TurnID = request.Turn.ID
+		s.inbox[id] = item
+	}
+	s.events[request.Event.ID] = request.Event
+	return session.AdmitTurnResult{Turn: request.Turn, Event: request.Event}, nil
+}
+
+func (s *fakeExecutionStore) CompleteTurn(_ context.Context, request session.CompleteTurnRequest) (session.CompleteTurnResult, error) {
+	if !s.valid() {
+		return session.CompleteTurnResult{}, session.ErrConflict
+	}
+	current, ok := s.turns[request.TurnID]
+	if !ok {
+		return session.CompleteTurnResult{}, session.ErrConflict
+	}
+	candidate, err := session.ApplyCompleteTurn(current, request)
+	if err != nil {
+		return session.CompleteTurnResult{}, err
+	}
+	s.turns[candidate.ID] = candidate
+	for id, item := range s.inbox {
+		if item.TurnID == candidate.ID && item.State == session.InboxConsumed {
+			item.State = session.InboxCompleted
+			s.inbox[id] = item
+		}
+	}
+	s.events[request.Event.ID] = request.Event
+	return session.CompleteTurnResult{Turn: candidate, Event: request.Event}, nil
+}
+
+func (s *fakeExecutionStore) InterruptTurn(_ context.Context, request session.InterruptTurnRequest) (session.InterruptTurnResult, error) {
+	if !s.valid() {
+		return session.InterruptTurnResult{}, session.ErrConflict
+	}
+	current, ok := s.turns[request.TurnID]
+	if !ok {
+		return session.InterruptTurnResult{}, session.ErrConflict
+	}
+	candidate, err := session.ApplyInterruptTurn(current, request)
+	if err != nil {
+		return session.InterruptTurnResult{}, err
+	}
+	s.turns[candidate.ID] = candidate
+	for id, item := range s.inbox {
+		if item.TurnID == candidate.ID && item.State == session.InboxConsumed {
+			item.State = session.InboxInterrupted
+			s.inbox[id] = item
+		}
+	}
+	s.events[request.Event.ID] = request.Event
+	return session.InterruptTurnResult{Turn: candidate, Event: request.Event}, nil
+}
+
+func (s *fakeExecutionStore) StageCheckpoint(_ context.Context, request session.StageCheckpointRequest) (session.Checkpoint, error) {
+	if !s.valid() {
+		return session.Checkpoint{}, session.ErrConflict
+	}
+	if _, err := session.ValidateStageCheckpoint(s.runs[s.fence.RunID], request); err != nil {
+		return session.Checkpoint{}, err
+	}
+	key := fakeCheckpointKey{RunID: request.Checkpoint.RunID, Revision: request.Checkpoint.Revision}
+	if existing, ok := s.checkpoints[key]; ok {
+		if !reflect.DeepEqual(existing, request.Checkpoint) {
+			return session.Checkpoint{}, session.ErrConflict
+		}
+		return existing, nil
+	}
+	s.checkpoints[key] = request.Checkpoint
+	return request.Checkpoint, nil
+}
+
+func (s *fakeExecutionStore) PromotePause(_ context.Context, request session.PromotePauseRequest) (session.PromotePauseResult, error) {
+	if !s.valid() {
+		return session.PromotePauseResult{}, session.ErrConflict
+	}
+	run := s.runs[s.fence.RunID]
+	if err := session.ValidatePromotePause(run, request); err != nil {
+		return session.PromotePauseResult{}, err
+	}
+	key := fakeCheckpointKey{RunID: run.ID, Revision: request.Revision}
+	checkpoint, ok := s.checkpoints[key]
+	if !ok {
+		return session.PromotePauseResult{}, session.ErrConflict
+	}
+	checkpoint.Promoted = true
+	s.checkpoints[key] = checkpoint
+	turn, ok := s.turns[request.TurnID]
+	if !ok {
+		return session.PromotePauseResult{}, session.ErrConflict
+	}
+	interruptedTurn, err := session.ApplyInterruptTurn(turn, session.InterruptTurnRequest{TurnID: request.TurnID, Event: request.Event})
+	if err != nil {
+		return session.PromotePauseResult{}, err
+	}
+	s.turns[interruptedTurn.ID] = interruptedTurn
+	for _, id := range request.InboxIDs {
+		item, ok := s.inbox[id]
+		if !ok {
+			continue
+		}
+		item.State = session.InboxInterrupted
+		s.inbox[id] = item
+	}
+	run.Status = session.RunPaused
+	run.LeaseUntil = time.Time{}
+	s.runs[run.ID] = run
+	s.events[request.Event.ID] = request.Event
+	return session.PromotePauseResult{Run: run, Turn: interruptedTurn, Checkpoint: checkpoint, Event: request.Event}, nil
+}
+
+func (s *fakeExecutionStore) RetireCheckpoints(_ context.Context, upToRevision int64) error {
+	if !s.valid() {
+		return session.ErrConflict
+	}
+	for key := range s.checkpoints {
+		if key.RunID == s.fence.RunID && key.Revision <= upToRevision {
+			delete(s.checkpoints, key)
+		}
+	}
 	return nil
 }

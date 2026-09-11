@@ -133,6 +133,12 @@ func testLargeIdentityIndexes(t *testing.T, server *testpostgres.Server) {
 	if got := queryStrings(t, db, `SELECT id FROM public.sessions WHERE workspace_id=$1 ORDER BY created_at,id`, []byte("ordering\x00")); !reflect.DeepEqual(got, []string{"z", "a", "a\x00z", "next-year"}) {
 		t.Fatalf("time/byte ordering: %q", got)
 	}
+	// Populate the new W5 durable tables directly so their indexes are
+	// exercised by assertPGIndexFootprints below; this function's own loop
+	// only threads the pre-existing table set through incompressible IDs.
+	mustExec(t, db, `INSERT INTO public.turns(id,run_key,session_key,ordinal,state,record,created_at) VALUES('large-turn',1,1,1,'admitted','{}'::bytea,$1)`, pgTime)
+	mustExec(t, db, `INSERT INTO public.inbox(id,session_key,turn_key,idempotency_key,state,record,created_at,updated_at) VALUES('large-inbox',1,(SELECT row_key FROM public.turns WHERE id='large-turn'),'large-inbox-key','consumed','{}'::bytea,$1,$1)`, pgTime)
+	mustExec(t, db, `INSERT INTO public.checkpoints(run_key,revision,promoted,bytes,record,created_at) VALUES(1,1,0,'bytes'::bytea,'{}'::bytea,$1)`, pgTime)
 	assertPGIndexFootprints(t, db)
 	assertPGDiscoveryPlans(t, db)
 }

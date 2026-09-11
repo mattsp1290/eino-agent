@@ -185,7 +185,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		ids[m.RunID] = true
 	}
 	var active sql.NullString
-	if err := s.queryRow(ctx, "SELECT "+s.boundedColumn("id")+" FROM "+s.tableName("runs")+" WHERE session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND status IN ('pending','running') LIMIT 1", b.bytes/6, []byte(out.Watermark.SessionID)).Scan(&active); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err := s.queryRow(ctx, "SELECT "+s.boundedColumn("id")+" FROM "+s.tableName("runs")+" WHERE session_key = (SELECT row_key FROM "+s.tableName("sessions")+" WHERE id = ?) AND status IN ('pending','running','paused') LIMIT 1", b.bytes/6, []byte(out.Watermark.SessionID)).Scan(&active); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	} else if err == nil {
 		if !active.Valid {
@@ -215,7 +215,7 @@ func (s *Store) observationRuns(ctx context.Context, out *session.ObservationSna
 		r.Status = session.RunStatus(status.String)
 		r.ProviderID = provider.String
 		r.ModelID = model.String
-		if !r.Terminal() && r.Status != session.RunPending && r.Status != session.RunRunning {
+		if !r.Terminal() && r.Status != session.RunPending && r.Status != session.RunRunning && r.Status != session.RunPaused {
 			return session.ErrObservationInvalid
 		}
 		if !r.Terminal() {

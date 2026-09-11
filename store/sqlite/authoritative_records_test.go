@@ -12,7 +12,7 @@ func TestLedgerReadsValidateAuthoritativeOwners(t *testing.T) {
 	t.Run("model_request", func(t *testing.T) {
 		st, execution, call, now := setupToolTransitionTest(t)
 		defer func() { _ = st.db.Close() }()
-		record := session.ModelRequestRecord{ID: "request", SessionID: call.SessionID, RunID: call.RunID, AssistantMessageID: "reserved-assistant", State: session.ModelRequestPrepared, Attempt: 1, Step: 1, CreatedAt: now}
+		record := session.ModelRequestRecord{ID: "request", SessionID: call.SessionID, RunID: call.RunID, AssistantMessageID: "reserved-assistant", InvocationID: "request-invocation", State: session.ModelRequestPrepared, Attempt: 1, Step: 1, CreatedAt: now}
 		if _, err := execution.CreateModelRequest(t.Context(), record); err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +53,7 @@ func TestLedgerReadsValidateAuthoritativeOwners(t *testing.T) {
 	t.Run("oversized_model_request", func(t *testing.T) {
 		st, execution, call, now := setupToolTransitionTest(t)
 		defer func() { _ = st.db.Close() }()
-		record := session.ModelRequestRecord{ID: "request", SessionID: call.SessionID, RunID: call.RunID, State: session.ModelRequestPrepared, Attempt: 1, Step: 1, CreatedAt: now}
+		record := session.ModelRequestRecord{ID: "request", SessionID: call.SessionID, RunID: call.RunID, InvocationID: "request-invocation", State: session.ModelRequestPrepared, Attempt: 1, Step: 1, CreatedAt: now}
 		if _, err := execution.CreateModelRequest(t.Context(), record); err != nil {
 			t.Fatal(err)
 		}

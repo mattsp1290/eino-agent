@@ -14,7 +14,7 @@ import (
 const maxModelRequestRecordBytes = 4 << 20
 
 func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequestRecord) (session.ModelRequestRecord, error) {
-	if record.ID == "" || record.RunID == "" || record.State != session.ModelRequestPrepared {
+	if record.ID == "" || record.RunID == "" || record.InvocationID == "" || record.State != session.ModelRequestPrepared {
 		return session.ModelRequestRecord{}, session.ErrConflict
 	}
 	sessionKey, runKey, err := s.modelRequestOwnerKeys(ctx, record.SessionID, record.RunID)
@@ -50,8 +50,8 @@ func (s *Store) createModelRequest(ctx context.Context, record session.ModelRequ
 	}
 	created := db.Table(s.tableName("model_requests")).Clauses(clause.OnConflict{DoNothing: true}).Create(map[string]any{
 		"id": publicID(record.ID), "session_key": sessionKey, "run_key": runKey,
-		"assistant_message_id": publicID(record.AssistantMessageID), "state": string(record.State),
-		"attempt": record.Attempt, "step": record.Step, "record": raw,
+		"assistant_message_id": publicID(record.AssistantMessageID), "invocation_id": []byte(record.InvocationID),
+		"state": string(record.State), "attempt": record.Attempt, "step": record.Step, "record": raw,
 		"created_at": TimeText(record.CreatedAt),
 	})
 	if err := s.mapErr(created.Error); err != nil {
@@ -135,6 +135,7 @@ func modelRequestRecordFromRow(row modelRequestRow, id string) (session.ModelReq
 
 func modelRequestRowMatches(row modelRequestRow, record session.ModelRequestRecord) bool {
 	return string(row.ID) == string(record.ID) && string(row.SessionID) == string(record.SessionID) && string(row.RunID) == string(record.RunID) && string(row.AssistantMessageID) == string(record.AssistantMessageID) &&
+		string(row.InvocationID) == record.InvocationID &&
 		row.State == string(record.State) && row.Attempt == record.Attempt && row.Step == record.Step &&
 		TimeText(record.CreatedAt) == row.CreatedAt
 }
