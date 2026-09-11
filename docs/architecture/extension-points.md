@@ -198,36 +198,60 @@ bytes, is what gets sealed -- the factory closure itself is never
 serialized, matching `RunPlanSpec.Agent`/`ToolSearch`'s existing "host
 construction identity, not durable capability evidence" treatment.
 
+`discoverHandlerTools` also probes each factory once at plan-compile time
+(a bounded, stub-backed `HandlerBuildContext` -- no real session, model, or
+workspace content) to enumerate the tools it contributes; the discovered
+`{Name, SchemaHash}` set is sealed onto the same `AgentHandlerPlanIdentity`
+(`Tools []HandlerToolIdentity`) and, at real per-turn build time,
+`adkEngine.sealHandlerTools` synthesizes a durable `runtime.Tool` per sealed
+entry and splices it into `TurnSnapshot.Tools` *before* the agent is built
+-- so a handler's own tool belongs to the same frozen tool universe as any
+composition-registered one, resolved by `prepareToolCalls`/
+`resolveToolCall` and dispatched through the full durable claim/permission/
+execute/settle pipeline (`handlerToolExecutor`) rather than ADK's own
+generic tool-node call. A tool a handler's middleware injects at real
+`BeforeAgent` time that was *not* sealed at compile time fails that turn as
+a construction error.
+
 `runtime.RunPlan.AgentHandlers()` exposes the sealed, ordered list with live
-`Factory` values attached; `adkEngine.buildAgent` invokes every factory
-fresh for each admitted turn with a bounded `runtime.HandlerBuildContext`
-(session/run identity, the mandatory ledger-audited model adapter, a
-durable tool-wrapper closure, read-only workspace-scoped filesystem/skill
+`Factory` and discovered `Tools` attached; `adkEngine.buildAgent` invokes
+every factory fresh for each admitted turn with a bounded
+`runtime.HandlerBuildContext` (session/run identity, the mandatory
+ledger-audited model adapter, read-only workspace-scoped filesystem/skill
 backend views, private writable scratch backends for plantask/reduction,
 this turn's frozen deferred tools, and the durable store/ID
 generator/clock a recipe like summarization needs to write its own durable
 state) and installs the results into `AgentBuildContext.Handlers`, ahead of
-this runtime's own mandatory tail handlers
-(`instructionCaptureHandler`, `durableGuard`, `settlementSeal` --
-`runtime/adk_middleware.go`). Ordering follows ADK's own
-first-registered-is-outermost handler-wrapping rule: host handlers (in
-`Order`, then `ID`, then owning component, then scope order) are outermost;
-this runtime's own tail handlers stay innermost, directly around the
-mandatory `Model`/`Tools` adapters, so no host handler can substitute them.
-`settlementSeal` additionally compares every settled tool's model-visible
-content against its durably recorded `Output` right before dispatch and
-fails the run on divergence.
+this runtime's own mandatory tail handlers (`durableGuard`, `settlementSeal`
+-- `runtime/adk_middleware.go`), after `durableBaselineHandler`
+(`AgentBuildContext.DurableBaseline`), which is installed *first*.
+`durableBaselineHandler.BeforeModelRewriteState` rewrites the agent's
+in-memory `state.Messages` to a deep clone of the fresh durable projection
+of this cycle's committed history -- the durable projection is the
+*baseline* every host handler then transforms, not a value discarded and
+re-derived afterward; the ledger-audited model adapter dispatches exactly
+what the handler chain leaves that baseline as, with no re-projection.
+Ordering otherwise follows ADK's own first-registered-is-outermost
+handler-wrapping rule for `Wrap*` methods (host handlers, in `Order`/`ID`/
+component/scope order, are outermost; this runtime's own tail handlers stay
+innermost, directly around the mandatory `Model`/`Tools` adapters, so no
+host handler can substitute them) and first-registered-is-first-called for
+hook methods (`BeforeAgent`/`BeforeModelRewriteState`/...), which is why
+`durableBaselineHandler` -- installed first -- establishes the baseline
+before any host handler's own hook runs. `settlementSeal` compares every
+settled tool's model-visible content against `durableBaselineHandler`'s own
+reconstruction for that call ID and fails the run on divergence, or on a
+fabricated result for a call with no durable settlement, unless the
+rewrite was recorded as authorized by a sanctioned content-management
+recipe (patchtoolcalls, reduction -- `wrapAuthorizedContentRewrites`).
 
-Two integration gaps are open, both documented with a skipped test and a
-doc comment at their root cause in `runtime/adk_middleware*.go`: a handler
-that injects model input as a *message* (not `ChatModelAgentContext.
-Instruction`) has no effect, because this runtime's ledger-audited model
-adapter always rebuilds the physical dispatch input from a fresh durable
-store reload; and a tool a handler injects at `BeforeAgent` time cannot
-currently be *called* (it passes `durableGuard`'s structural check but is
-rejected earlier, at `prepareToolCalls`, which resolves only against the
-tool registry frozen at turn-admission time, before any `BeforeAgent`
-injection runs).
+Both integration gaps an earlier pass of this design left open --
+host-injected content never reaching the model, and a handler-injected tool
+never being callable -- are resolved by `durableBaselineHandler` and the
+frozen-tool-universe sealing above, respectively; each fix is proven end to
+end through a real turn (`TestAgentsMDHandlerInjectsContentIntoModelRequest`,
+`TestFilesystemHandlerToolExecutesThroughDurableWrapper`,
+`runtime/adk_middleware_e2e_test.go`).
 
 ## Request ledger and privacy
 

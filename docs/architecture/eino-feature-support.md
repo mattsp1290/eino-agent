@@ -1635,144 +1635,173 @@ unwritten (see that bullet for the exact, now-shorter list).
 
 ## W6: typed ADK middleware, context and extensions
 
-Status: partial. Groups A, B and D landed and are verified per the gate list
-below (`go test ./composition ./runtime ./session/...`, `go vet
--tags postgres_integration ./...`, `golangci-lint` 0 issues, `go test
-./runtime -race -count=3`). Group C's eight recipes build correctly against
-their upstream typed constructors and are construction-tested, but two of
-their runtime integration points are genuine, documented gaps (below), not
-silently dropped. `examples/agentic-middleware/` was not created this pass
-(see the gaps below for why an "all green" example is not yet honest to
-build) and Group E (WASM/WIT content-block evolution) was not started this
-pass; both are open follow-up work.
+Status: groups A, B, C and D landed and are verified per the gate list below
+(`go test ./composition ./runtime ./session/...`, `go vet -tags
+postgres_integration ./...`, `golangci-lint` 0 issues, `go test ./runtime
+-race -count=3`). The two integration gaps an earlier pass of this work
+documented (host-injected content never reaching the model; a
+handler-injected tool never being callable) are both resolved -- see below
+for the mechanism and the tests proving each fix through a real turn, not
+just construction. Group E (WASM/WIT content-block evolution) and
+`examples/agentic-middleware/` status are covered in their own bullets.
 
 - **Group A (composition + fingerprint)**: `composition.Registrar.Handler(HandlerRegistration{ID,
   Order, Scope, Descriptor: HandlerDescriptor{Kind, Version, Config
   json.RawMessage}, Factory runtime.HandlerFactory})` registers one typed
-  ADK agent-handler factory per component, alongside the existing Tool/
-  Prompt/Guard/Restriction/ToolSearch registrations. `handlerConfigHash`
-  canonicalizes `Config` (decode-then-remarshal, so `encoding/json`'s
-  automatic map-key sorting makes the hash independent of input key order)
-  before sealing it. The compiled identity --
+  ADK agent-handler factory per component. `handlerConfigHash` canonicalizes
+  `Config` (decode-then-remarshal, so key order never affects it) before
+  sealing it. `discoverHandlerTools` additionally probes each factory once
+  at plan-compile time, in a bounded stub-backed `HandlerBuildContext`, to
+  enumerate the tools it contributes; the discovered `{Name, SchemaHash}`
+  set is sealed alongside the handler's own identity as
   `session.AgentHandlerPlanIdentity{ID, Kind, Version, ConfigHash, Order,
-  Scope}` on `session.ComponentPlan.AgentHandlers` -- is sealed into
-  `ExtensionPlanDescriptor` and therefore the run's fingerprint (golden
-  updated in `session/extensions_test.go`); the factory closure itself is
-  never serialized. `runtime.RunPlan.AgentHandlers()` exposes the sealed,
-  ordered (`Order`, then `ID`, then owning component instance, then scope)
-  list with live `Factory` values attached, for `adkEngine.buildAgent` to
-  invoke fresh per admitted turn. A changed `Config` changes the sealed
-  fingerprint (`TestAgentHandlerConfigChangeChangesFingerprintAndRefusesResume`,
-  `runtime/adk_middleware_e2e_test.go`), which the existing (unmodified)
-  `AcquireResumePlan`/`VerifyExtensionPlanForSession` fingerprint-mismatch
-  path already refuses on resume for every capability kind, AgentHandlers
-  included by construction.
+  Scope, Tools []HandlerToolIdentity}` on `session.ComponentPlan.AgentHandlers`
+  -- part of `ExtensionPlanDescriptor` and therefore the run's fingerprint
+  (golden updated in `session/extensions_test.go`). Neither the factory
+  closure nor the discovered `Info`/schema bytes themselves are sealed, only
+  the hash. `runtime.RunPlan.AgentHandlers()` exposes the sealed, ordered
+  list (with live `Factory` and discovered `Tools []HandlerToolSpec`
+  attached) for `adkEngine.buildAgent` to invoke fresh per admitted turn. A
+  changed `Config` changes the sealed fingerprint
+  (`TestAgentHandlerConfigChangeChangesFingerprintAndRefusesResume`), which
+  the existing `AcquireResumePlan`/`VerifyExtensionPlanForSession`
+  fingerprint-mismatch path already refuses on resume for every capability
+  kind, `AgentHandlers` included by construction.
 - **Group B (`runtime/adk_middleware.go`)**: `AgentBuildContext` gains
-  `Handlers` (the per-execution snapshot of every plan-ordered handler
-  factory's built instance), `SettlementSeal` and `InstructionCapture`.
-  `adkEngine.buildAgent`/`buildAgentHandlers` install, in ADK's own
-  first-registered-is-outermost handler order: host handlers (in plan
-  order) first, then `instructionCaptureHandler`, then the existing
-  `durableGuard` (integrated, not duplicated, from W5), then
-  `settlementSeal` last (innermost, directly around the mandatory
-  Model/Tools adapters). `settlementSeal.BeforeModelRewriteState` --
-  appended last, so it observes `state.Messages` only after every host
-  handler's own `BeforeModelRewriteState` has run -- compares every
-  `function_tool_result` block whose call ID matches a durably *settled*
-  `session.ToolCall` row against that row's `Output` byte-for-byte, and
-  fails the run on divergence
-  (`TestSettlementSealRejectsHostRewrittenToolResult`); a call ID with no
-  settled row (patchtoolcalls' legitimate dangling-call patch) is left
-  alone. The ledger model adapter (`adkModel`) remains the sole audit
-  authority structurally -- `AgentBuildContext.Model` is always the mandatory
-  adapter, and W5's existing dispatch-count check
+  `DurableBaseline`, `Handlers` (the per-execution snapshot of every
+  plan-ordered handler factory's built instance) and `SettlementSeal`.
+  `adkEngine.buildAgent` installs, in ADK's own handler order (first
+  registered is outermost for `Wrap*` methods, first registered is first
+  called for hooks): `durableBaselineHandler` first, host handlers next,
+  then the existing `durableGuard` (integrated, not duplicated, from W5),
+  then `settlementSeal` last. `durableBaselineHandler.BeforeModelRewriteState`
+  rewrites `state.Messages` to a deep clone of
+  `adkEngine.buildDurableBaseline`'s fresh durable projection for this
+  cycle -- the durable projection is the **baseline every host handler
+  transforms**, not a value discarded and re-derived afterward.
+  `adkModel.prepareDispatchInput` (adk_model.go) dispatches exactly what the
+  handler chain leaves `state.Messages` as, with no re-projection; it trusts
+  the baseline-computed `providerState` (reasoning signatures, citations)
+  unchanged when the final input is at least as long as the baseline
+  (content edited in place or appended -- robust to ADK's retry/failover
+  wrapper defensively cloning the message slice) and drops it, never
+  misapplying it, when a handler shortens history (summarization
+  compacting). `settlementSeal.BeforeModelRewriteState` -- appended last, so
+  it observes `state.Messages` only after every host handler's own
+  `BeforeModelRewriteState` has run -- compares every `function_tool_result`
+  block's content against `adkEngine.baselineMessages`' own reconstruction
+  for that call ID (handling single- and multi-part/enhanced settled
+  results uniformly) and enforces two invariants: a settled call's result
+  may never diverge from that reconstruction
+  (`TestSettlementSealRejectsHostRewrittenToolResult`), and a
+  `function_tool_result` with no durable settlement in the baseline is
+  rejected as fabricated
+  (`TestSettlementSealRejectsUnauthorizedFabricatedToolResult`) -- both
+  unless the callID was recorded as an authorized rewrite.
+  `authorizedRewriteSet` + `wrapAuthorizedContentRewrites` (diffing a
+  wrapped middleware's own `function_tool_result` content before/after its
+  `BeforeModelRewriteState`) give patchtoolcalls' legitimate dangling-call
+  patches and reduction's legitimate settled-result truncation/clearing
+  that authorization
+  (`TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite`); no
+  other recipe gets it. The ledger model adapter (`adkModel`) remains the
+  sole audit authority structurally -- `AgentBuildContext.Model` is always
+  the mandatory adapter, and W5's existing dispatch-count check
   (`adkEngine.dispatches`/`onAgentEvents`) already detects a factory that
   substitutes its own model -- so no separate "auditSeal" handler was
-  needed. `toolWrappingMiddleware` + `newAdkGenericDurableTool` (six
-  capability-narrow wrapper types: invokable/streamable/both, each in a
-  standard and an enhanced variant) let a host handler's own
-  BeforeAgent-injected tools pass `durableGuard`'s structural check.
-  `instructionCaptureHandler`/`instructionHolder` bridge a handler's
-  `BeforeAgent` `Instruction` mutation into the per-dispatch rendered system
-  prompt (`adkModel.begin`); this bridge exists and is safe but is
-  currently inert, since no shipped Group C recipe uses
-  `ChatModelAgentContext.Instruction` (see the agentsmd gap below).
+  needed. A handler-injected tool belongs to the frozen tool universe (see
+  Group C); `durableGuard.BeforeAgent` deduplicates a handler's own
+  redundant raw copy of an already-sealed tool (its real `BeforeAgent`
+  still runs and re-appends it) rather than rejecting it, and still fails
+  any other non-durable or unsealed tool as a construction error.
 - **Group C (`runtime/adk_middleware_recipes.go`,
-  `adk_middleware_workspace.go`, `adk_middleware_scratch.go`)**: typed
+  `adk_middleware_workspace.go`, `adk_middleware_scratch.go`,
+  `adk_middleware_discovery.go`, `adk_middleware_frozen_tools.go`)**: typed
   wiring recipes for all eight upstream middlewares (`agentsmd`, `skill`,
   `filesystem`, `plantask`, `patchtoolcalls`, `reduction`, `summarization`,
   `dynamictool/toolsearch`), each calling the upstream `NewTyped`
   constructor directly and failing construction closed when a required
-  backend/config is absent (construction-level positive/negative tests in
-  `runtime/adk_middleware_recipes_test.go` for all eight).
-  `workspaceFilesystemBackend`/`workspaceSkillBackend` are read-only views
-  rooted at the admitted canonical workspace
-  (`internal/workspace.CanonicalRoot`), rejecting `..`-relative and
-  symlink path escape (`TestWorkspaceFilesystemBackendRejectsPathEscape`,
+  backend/config is absent. `workspaceFilesystemBackend`/
+  `workspaceSkillBackend` are read-only views rooted at the admitted
+  canonical workspace (`internal/workspace.CanonicalRoot`), rejecting
+  `..`-relative and symlink path escape
+  (`TestWorkspaceFilesystemBackendRejectsPathEscape`,
   `TestWorkspaceFilesystemBackendRejectsSymlinkEscape`) and supporting
-  multimodal image/PDF reads as media parts
-  (`TestWorkspaceFilesystemBackendMultiModalRead`).
+  multimodal image/PDF reads as media parts, proven end to end through a
+  real tool call
+  (`TestFilesystemHandlerMultiModalReadReturnsMediaPart`).
   `writableWorkspaceBackend` is a private, workspace-contained scratch area
-  for plantask/reduction's own state (round-trip tested). Summarization's
-  `Finalize` maps a completed summary into an atomic `session.ContextEpoch`
-  via `session.Store.StartContextEpoch` + `compaction.AppendBoundary`,
-  correlating in-memory summarized messages to durable `session.MessageID`s
-  by position (a documented, checked assumption -- a length mismatch fails
-  Finalize closed rather than fabricating a boundary:
-  `TestSummarizationFinalizeMapsSummaryIntoContextEpoch`,
-  `TestSummarizationFinalizeFailsClosedOnLengthMismatch`); cancelled/failed
-  summary generation never calls `Finalize` (upstream's own contract), so
-  the previous epoch stays active with no code needed for that half of the
-  acceptance criterion.
+  for plantask/reduction's own state. A handler's tools are discovered once
+  at plan-compile time (`discoverHandlerTools`, Group A) and, at real
+  per-turn build time, `adkEngine.sealHandlerTools` splices a durable
+  `runtime.Tool` per sealed entry into `TurnSnapshot.Tools` *before* the
+  agent is built, so `prepareToolCalls`/`resolveToolCall` resolve it like
+  any other frozen tool; `handlerToolExecutor` dispatches the call through
+  the full durable claim/permission/execute/settle pipeline to the live
+  tool instance `adkEngine.buildAgentHandlers` collected, supporting both
+  `InvokableTool` and `EnhancedInvokableTool`. A write-like tool name
+  (`write`/`edit`/`execute`/`shell`/`delete`) is sealed with a
+  `Permissions` tag, gated exactly like any other state-changing tool --
+  disabled unless a permission grants it. Proven end to end:
+  `TestFilesystemHandlerToolExecutesThroughDurableWrapper`,
+  `TestPlanTaskHandlerCreateAndUpdateThroughDurableWrapper` (TaskCreate then
+  TaskUpdate, correlating the created task's numeric ID out of its own
+  human-readable result message), `TestSkillHandlerInlineActivationThroughDurableWrapper`.
+  Summarization's `Finalize` maps a completed summary into an atomic
+  `session.ContextEpoch` via `session.Store.StartContextEpoch` +
+  `compaction.AppendBoundary`, correlating in-memory summarized messages to
+  durable `session.MessageID`s: an assistant message with zero owned durable
+  parts is an unfinalized placeholder and excluded (matching
+  `dropUnfinalizedAssistantPlaceholders`'s own test), and because
+  `HandlerBuildContext.Model` is deliberately the same ledger-audited
+  adapter the main turn dispatches through, upstream's own internal
+  summary-generation call durably commits one trailing assistant message
+  *before* `Finalize` ever runs -- exactly one such trailing entry is
+  dropped before requiring exact correlation, which then fails Finalize
+  closed (not fabricating a boundary) on any other mismatch
+  (`TestSummarizationFinalizeMapsSummaryIntoContextEpoch`,
+  `TestSummarizationFinalizeFailsClosedOnLengthMismatch`,
+  `TestSummarizationHandlerTriggersAndWritesContextEpoch` -- the last one
+  end to end through a real turn). Cancelled/failed summary generation
+  never calls `Finalize` (upstream's own contract, not this package's code),
+  so the previous epoch stays active for free.
 - **Group D**: verified no-op. `runtime/extension_{context,model,tool,lifecycle}.go`
   and `wasmext/*.go` already carry only `*schema.AgenticMessage` (landed in
-  W3), not classic `schema.Message`; grepping for `schema\.Message\b` in
-  those files (excluding tests) returns nothing.
-- **Two documented gaps** (found writing end-to-end tests; each has a
-  `t.Skip`ped test naming it and a doc comment at its root cause):
-  1. **agentsmd's injected content never reaches the model.** agentsmd
-     injects a *message* into ADK's in-memory `state.Messages`
-     (`schema.UserAgenticMessage`, tagged via `Extra` for its own
-     idempotency check), not into `ChatModelAgentContext.Instruction`. This
-     runtime's `adkModel.begin` rebuilds every physical dispatch's actual
-     input from a fresh durable store reload (`durableProjection`), which
-     has no knowledge of that in-memory-only message and discards it. A
-     first attempt to bridge this generically (capture any
-     `state.Messages` entry with a non-empty `Extra` map, in a mandatory
-     tail handler, and splice it back into the projection) broke the
-     entire tool-loop test suite ("clone message N contains non-copyable
-     streaming metadata"): ADK's own ReAct loop tags its *own*
-     internally-reconstructed messages (an echoed-back prior tool-call
-     message) with framework-internal `Extra` too, so "non-empty `Extra`"
-     is not a safe "handler-injected" signal and the naive bridge
-     duplicated ordinary tool-loop messages. That attempt was reverted;
-     `TestAgentsMDHandlerInjectsContentIntoModelRequest` is skipped with
-     this explanation. A correct fix needs a real handler-injection marker
-     (not "any `Extra`") and index-safe splicing relative to the
-     `providerState` reindexing math in `durableProjection`.
-  2. **A handler-injected tool cannot be called.** `durableGuard`/
-     `toolWrappingMiddleware` correctly accept a tool a handler's
-     middleware injects at `BeforeAgent` time (filesystem's
-     ls/read_file/write_file/edit_file/glob/grep, plantask's task tools,
-     skill's "skill" tool) -- a structural, defense-in-depth guarantee,
-     verified. But a model call to such a tool still fails earlier, at
-     `prepareToolCalls`/`resolveToolCall` (`adk_tools.go`): those resolve
-     strictly against `TurnSnapshot.Tools`, frozen at turn-admission time,
-     before the agent (and hence any `BeforeAgent` tool injection) ever
-     runs, so the call fails the turn with `tool "read_file" unavailable`
-     instead of executing.
-     `TestFilesystemHandlerToolExecutesThroughDurableWrapper` is skipped
-     with this explanation. `agentsmd`/`patchtoolcalls`/`reduction`/
-     `toolsearch`/`summarization` are unaffected (no new tools, or tools
-     already frozen in the plan via `Deferred: true`). Closing this needs
-     `TurnSnapshot.Tools` to be extended with discovered handler-injected
-     tool names before `prepareToolCalls` runs -- a genuine W-level change
-     to when the tool registry freezes relative to agent construction, out
-     of this pass's scope.
-- **Not started this pass**: `examples/agentic-middleware/` (the two gaps
-  above block several of the plan's acceptance scenarios -- multimodal
-  filesystem read via an actual tool call, plantask update, skill
-  activation -- from genuinely completing, so a "runs and passes" example
-  covering the full acceptance list was not honest to build yet); Group E
-  (WIT `text-message` -> versioned `content-block` variant, regenerated
-  bindings, rebuilt WASM fixtures, updated external-consumer exercise).
+  W3), not classic `schema.Message`.
+- **Both previously-documented gaps are resolved.** Root causes and fixes,
+  each proven by an end-to-end test that used to be `t.Skip`ped and now
+  passes unskipped:
+  1. Host content reaching the model: durably fixed by making the durable
+     projection the baseline (see Group B's `durableBaselineHandler`
+     bullet) instead of a value `adkModel` discarded and rebuilt from
+     scratch after every handler ran.
+     `TestAgentsMDHandlerInjectsContentIntoModelRequest` now passes.
+  2. Handler-injected tools: durably fixed by sealing a handler's
+     discovered tools into the frozen tool universe at plan-compile time
+     (see Group C). `TestFilesystemHandlerToolExecutesThroughDurableWrapper`
+     now passes.
+- **Known bounded limitations, not silently dropped**:
+  - `discoverHandlerTools`' compile-time probe uses stub backends/a stub
+    deferred tool and no real session/model identity; this is sufficient
+    for all eight of this package's own recipes (their tool lists are
+    static per configuration) but is a documented limitation for a
+    hypothetical third-party handler Kind whose own tool list genuinely
+    depends on data the bounded probe cannot supply -- such a handler would
+    be sealed with fewer tools than it might produce at real execution
+    time. A static `HandlerRegistration.Tools` declaration (bypassing
+    probing) is the documented escape hatch; it was not added this pass.
+  - A full "real dangling call, durably unsettled history" fixture for
+    patchtoolcalls (seeding raw history with an unanswered
+    `function_tool_call`) was not built -- fixture-engineering complexity,
+    not a silently skipped scenario. The authorization mechanism it depends
+    on (`authorizedRewriteSet`/`wrapAuthorizedContentRewrites`,
+    `settlementSeal`'s fabrication check) is directly tested via
+    `TestSettlementSealRejectsUnauthorizedFabricatedToolResult` and
+    `TestReductionHandlerTruncatesLargeToolResultAsAuthorizedRewrite`.
+  - Failover to an alternate model reuses the primary model's
+    `buildDurableBaseline`-computed `providerState` rather than
+    recomputing it against the failover provider's own projection (the
+    pre-W6 `durableProjection` recomputed per physical attempt, using
+    `activeModel()`); a bounded, accepted simplification given
+    `BeforeModelRewriteState` now runs once per logical cycle, before the
+    internal failover/retry wrapper, not once per physical attempt.
