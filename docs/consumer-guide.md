@@ -172,7 +172,22 @@ handle, err := orchestrator.Start(ctx, runtime.Request{
 ```
 
 The returned `runtime.Handle` is the live control surface for that admitted
-run. Use `Done()` for terminal status and `Interrupt()` for cancellation.
+run. `Done()` reports this call's outcome, which is either terminal **or a
+nonterminal `session.RunPaused`** — a tool or approval interrupt, or a stop
+with input still queued. When it is a pause, `AwaitPause()` delivers the
+matching `runtime.PauseInfo` (its `InterruptContexts` carry the
+current-generation addresses a targeted resume uses); on a terminal outcome
+that channel is closed without a value. `Interrupt()` is an explicit
+*terminal* interruption, not a resumable pause.
+
+A paused run holds no lease and is resumed with
+`orchestrator.ResumeRun(ctx, runID, runtime.ResumeRequest{Targets: …})`,
+which may be called from a different process after a restart. Additional
+user input for a live or paused run goes through
+`orchestrator.Enqueue(ctx, sessionID, runtime.EnqueueRequest{...})` — durable
+and idempotent on `IdempotencyKey`; an item accepted while no loop is live
+stays queued for the next `Start`/`ResumeRun`. `orchestrator.Stop(ctx, runID,
+runtime.StopPolicy{Graceful: true})` requests a checkpointed stop.
 
 ## Durable Provider-Private State
 
@@ -772,10 +787,13 @@ tool results. Display text itself can contain sensitive user content. Hosts
 must authorize the exact session and escape text appropriately.
 
 Host shutdown remains explicit: stop admitting requests, interrupt and await
-owned handles, deactivate and close mounts with bounded contexts, close any
-Wasm loaders, close subscriptions/service and any legacy tail, then close the
-store after all users drain. Service.Close(ctx) owns only observation and can
-be called again after a timeout. StreamingOrchestrator has no public Close.
+owned handles (and, for runs you intend to keep, `Stop` + `ResumeRun` rather
+than `Interrupt`, which settles terminally), noting that durably paused runs
+survive shutdown and are resumed by run ID, deactivate and close mounts with
+bounded contexts, close any Wasm loaders, close subscriptions/service and any
+legacy tail, then close the store after all users drain. Service.Close(ctx)
+owns only observation and can be called again after a timeout.
+StreamingOrchestrator has no public Close.
 
 The external-consumer fixture exercises SQLite, mounted native tools, real
 scripted streaming, blocked sinks, detach, overflow recovery, interruption,

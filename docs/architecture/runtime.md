@@ -389,4 +389,7 @@ change. The authoritative point catalog and model and tool pipeline diagrams are
 
 The model-request ledger assigns one `(attempt, step)` record per
 adapter invocation. Here, a step is a provider request plus its resulting tool
-batch; it does not add a user-visible turn abstraction.
+batch. Since W5 the runtime *does* own a coarser, user-visible durable turn
+abstraction above it — `session.Turn`, one per admitted submission batch,
+with a per-run ordinal and `turn_started`/`turn_completed` durable events;
+see [`docs/architecture/eino-feature-support.md`](eino-feature-support.md).
