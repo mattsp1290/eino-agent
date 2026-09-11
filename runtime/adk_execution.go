@@ -157,6 +157,26 @@ type adkEngine struct {
 	// comments (runtime/adk_middleware.go, runtime/adk_model.go).
 	baselineMessages   []*einoschema.AgenticMessage
 	authorizedRewrites *authorizedRewriteSet
+	// baselineSourceIDs is baselineMessages' durable-message-ID parallel
+	// (one entry per baselineMessages index, "" for no durable backing),
+	// also set by buildDurableBaseline -- see that method's doc comment.
+	// durableBaselineHandler turns this into cycleMessageSourceByPointer,
+	// keyed on the CLONED pointers it actually hands ADK/host handlers as
+	// state.Messages (round-two W6 review item 8).
+	baselineSourceIDs []session.MessageID
+	// cycleMessageSourceByPointer is this cycle's pointer-keyed durable
+	// message ID lookup, rebuilt fresh every cycle by
+	// durableBaselineHandler.BeforeModelRewriteState (the mandatory FIRST
+	// handler) from baselineSourceIDs, keyed on the cloned *AgenticMessage
+	// pointers it hands to state.Messages. A host handler further down the
+	// chain that leaves a message's pointer untouched (edits content in
+	// place, or simply passes it through) keeps it resolvable here; a
+	// handler that INSERTS a new message (e.g. agentsmd's own content
+	// injection) gives it a pointer this map never contains, correctly
+	// resolving as "no durable id" downstream (summarizationFinalize).
+	// Consumed only via HandlerBuildContext.sourceMessageID, populated only
+	// for a HandlerKindSummarization entry -- see adkEngine.buildAgentHandlers.
+	cycleMessageSourceByPointer map[*einoschema.AgenticMessage]session.MessageID
 
 	// handlerTools holds this turn's live tool.BaseTool instances
 	// contributed by host agent-handler middleware (filesystem's
@@ -635,6 +655,12 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, authorized *authoriz
 				sessionID: e.snapshot.SessionID, runID: e.snapshot.RunID,
 				store: e.host.store, execution: e.execution.store, ids: e.host.ids, now: e.host.now,
 				contentLimits: e.host.contentLimits,
+			}
+			if entry.Kind == HandlerKindSummarization {
+				entryBuild.sourceMessageID = func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
+					id, ok := e.cycleMessageSourceByPointer[msg]
+					return id, ok
+				}
 			}
 		}
 		handler, err := entry.Factory(ctx, entryBuild)

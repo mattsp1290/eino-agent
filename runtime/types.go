@@ -88,16 +88,29 @@ type Orchestrator interface {
 
 // TurnSnapshot is the immutable state used for one provider request.
 type TurnSnapshot struct {
-	RunID         session.RunID
-	SessionID     session.ID
-	EpochID       session.EpochID
-	Config        config.Snapshot
-	Model         model.Resolved
-	Messages      []*einoschema.AgenticMessage
-	providerState []model.ProviderMessageState
-	Tools         []Tool
-	SystemPrompt  string
-	CreatedAt     time.Time
+	RunID     session.RunID
+	SessionID session.ID
+	EpochID   session.EpochID
+	Config    config.Snapshot
+	Model     model.Resolved
+	Messages  []*einoschema.AgenticMessage
+	// MessageSourceIDs is Messages' durable-message-ID parallel, one entry
+	// per Messages index ("" for an entry with no durable backing, e.g.
+	// content an extension transform injected -- see
+	// contextAssemblePoint/materializeContextAssemblyWithMapping). Shorter
+	// than Messages, or nil, degrades safely to "no durable id for any
+	// message beyond what is present" (see paddedMessageSourceIDs) rather
+	// than panicking; a construction path that never populates it (e.g. a
+	// direct FreezeTurnSnapshot call outside this package's own admission/
+	// resume paths) simply means summarization can correlate nothing for
+	// this snapshot's own prefix, not a hard failure -- see
+	// adkEngine.buildDurableBaseline and summarizationFinalize (round-two
+	// W6 review item 8).
+	MessageSourceIDs []session.MessageID
+	providerState    []model.ProviderMessageState
+	Tools            []Tool
+	SystemPrompt     string
+	CreatedAt        time.Time
 	// ToolSearch configures the runtime-implemented tool-search tool for
 	// this turn's plan, or nil when not enabled (see runtime/tool_search.go
 	// and RunPlan.ToolSearch).

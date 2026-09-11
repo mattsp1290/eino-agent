@@ -383,6 +383,22 @@ func (o *StreamingOrchestrator) prepareSnapshot(ctx context.Context, execution *
 	if err != nil {
 		return TurnSnapshot{}, err
 	}
+	// Remap MessageSourceIDs (round-two W6 review item 8) through the SAME
+	// BaseToFinal mapping providerState's MessageIndex remap below already
+	// uses: materializeContextAssemblyWithMapping always places Base as one
+	// contiguous block, wrapped by extension-contributed prelude/suffix
+	// messages that have no durable backing at all -- so every Base index
+	// keeps its own durable id at its new Final position, and every
+	// prelude/suffix position simply has none (the zero value, "").
+	baseSourceIDs := paddedMessageSourceIDs(snapshot.MessageSourceIDs, len(snapshot.Messages))
+	finalSourceIDs := make([]session.MessageID, len(materialized.Messages))
+	for baseIndex, finalIndex := range materialized.BaseToFinal {
+		if baseIndex >= len(baseSourceIDs) || finalIndex < 0 || finalIndex >= len(finalSourceIDs) {
+			continue
+		}
+		finalSourceIDs[finalIndex] = baseSourceIDs[baseIndex]
+	}
+	snapshot.MessageSourceIDs = finalSourceIDs
 	snapshot.Messages = materialized.Messages
 	states, err := cloneRuntimeProviderState(snapshot.providerState)
 	if err != nil {

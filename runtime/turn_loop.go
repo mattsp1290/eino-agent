@@ -351,15 +351,16 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	if err != nil {
 		return nil, err
 	}
-	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
+	priorMessages, priorSourceIDs, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
 	if err != nil {
 		return nil, err
 	}
-	allMessages, priorProviderState := dropUnfinalizedAssistantPlaceholders(priorMessages, priorProviderState)
+	allMessages, allSourceIDs, priorProviderState := dropUnfinalizedAssistantPlaceholders(priorMessages, priorSourceIDs, priorProviderState)
 	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, allMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
 	}
+	base.MessageSourceIDs = allSourceIDs
 	base.providerState = priorProviderState
 	snapshot, err := c.host.prepareSnapshot(ctx, c.execution, base)
 	if err != nil {
@@ -593,7 +594,7 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if err != nil {
 		return nil, err
 	}
-	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
+	priorMessages, priorSourceIDs, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -602,11 +603,12 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	// still be an unfinalized, content-free row; keep this in sync with
 	// adkModel.durableProjection's later filtering so baseMessageCount below
 	// stays consistent with what a fresh reload will show.
-	priorMessages, priorProviderState = dropUnfinalizedAssistantPlaceholders(priorMessages, priorProviderState)
+	priorMessages, priorSourceIDs, priorProviderState = dropUnfinalizedAssistantPlaceholders(priorMessages, priorSourceIDs, priorProviderState)
 	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, priorMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
 	}
+	base.MessageSourceIDs = priorSourceIDs
 	base.providerState = priorProviderState
 	snapshot, err := c.host.prepareSnapshot(ctx, c.execution, base)
 	if err != nil {

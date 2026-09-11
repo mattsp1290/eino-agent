@@ -132,7 +132,7 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	historyMessages, providerState, err := loadProviderHistory(ctx, store, sessionRecord, resolvedHistory, request.Model)
+	historyMessages, historySourceIDs, providerState, err := loadProviderHistory(ctx, store, sessionRecord, resolvedHistory, request.Model)
 	if err != nil {
 		return admittedRun{}, err
 	}
@@ -144,10 +144,19 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	providerMessages := make([]*einoschema.AgenticMessage, 0, len(historyMessages)+1)
 	providerMessages = append(providerMessages, historyMessages...)
 	providerMessages = append(providerMessages, admittedUserMessage)
+	// providerMessageSourceIDs is providerMessages' durable-id parallel
+	// (round-two W6 review item 8): historySourceIDs for the reloaded
+	// prefix, plus request.IDs.UserMessageID for the freshly admitted user
+	// message this same admission is about to durably commit (below, as
+	// userMessage) -- both are genuinely durable, so both carry real ids.
+	providerMessageSourceIDs := make([]session.MessageID, 0, len(historyMessages)+1)
+	providerMessageSourceIDs = append(providerMessageSourceIDs, paddedMessageSourceIDs(historySourceIDs, len(historyMessages))...)
+	providerMessageSourceIDs = append(providerMessageSourceIDs, request.IDs.UserMessageID)
 	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
 	}
+	snapshot.MessageSourceIDs = providerMessageSourceIDs
 	latestMessageAt, err := latestAdmissionMessageTime(ctx, store, sessionRecord.ID)
 	if err != nil {
 		return admittedRun{}, err

@@ -66,14 +66,14 @@ func orderedBlockIDs(parts []session.Part, owners []session.MessageID, owner ses
 	return ids, nil
 }
 
-func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord session.Session, options history.Options, resolved model.Resolved) ([]*einoschema.AgenticMessage, []model.ProviderMessageState, error) {
+func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord session.Session, options history.Options, resolved model.Resolved) ([]*einoschema.AgenticMessage, []session.MessageID, []model.ProviderMessageState, error) {
 	batch, err := history.LoadBatch(ctx, store, sessionRecord.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	projection, err := history.ProjectAgentic(batch, options)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	active := make(map[session.MessageID]bool, len(projection.SourceMessageIDs))
 	assistantIndexes := make(map[session.MessageID][]int)
@@ -94,7 +94,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 	groups := make(map[session.MessageID][]ownedPart)
 	partOwners, err := session.ResolveReplayPartOwners(batch.Parts, batch.PartOwnerMessageIDs)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for index, part := range batch.Parts {
 		if part.Kind != session.PartProviderState {
@@ -102,18 +102,18 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		}
 		owner := partOwners[index]
 		if part.MessageID != owner {
-			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+			return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		if active[owner] {
 			groups[owner] = append(groups[owner], ownedPart{part: part, owner: owner})
 		}
 	}
 	if len(groups) == 0 {
-		return projection.Messages, nil, nil
+		return projection.Messages, projection.SourceMessageIDs, nil, nil
 	}
 	streamer, ok := resolved.Streamer.(contractStreamer)
 	if !ok || streamer == nil {
-		return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+		return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 	}
 	// blockBound is true only for the native model.AgenticProviderStateStreamer
 	// boundary, where a codec resolves ProviderStateItem.BlockID against a
@@ -127,7 +127,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 	_, blockBound := resolved.Streamer.(model.AgenticProviderStateStreamer)
 	contract, err := safeProviderStateContract(streamer)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	owners := make([]session.MessageID, 0, len(groups))
 	for owner := range groups {
@@ -141,19 +141,19 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		indexes := assistantIndexes[owner]
 		if !exists || len(indexes) != 1 || message.ID == "" || message.Role != session.RoleAssistant ||
 			message.SessionID != sessionRecord.ID || message.RunID == "" || message.ModelID == "" {
-			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+			return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		run, cached := runs[message.RunID]
 		if !cached {
 			run, err = store.GetRun(ctx, message.RunID)
 			if err != nil {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 			}
 			runs[message.RunID] = run
 		}
 		if run.ID != message.RunID || run.SessionID != sessionRecord.ID || run.ProviderID == "" || run.ModelID == "" ||
 			run.ModelID != message.ModelID {
-			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+			return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		// storedBlockIDs is every durable content-block identity the
 		// message actually stored (including, e.g., a reasoning block even
@@ -165,7 +165,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		// (a real mismatch, failed closed).
 		storedBlockIDs, err := orderedBlockIDs(batch.Parts, partOwners, owner)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		// dispatchedBlockIDs is parallel to the message the projection
 		// actually emits (projection.Messages[indexes[0]].ContentBlocks),
@@ -174,7 +174,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		// right position in the dispatched message.
 		dispatchedBlockIDs := projection.BlockIDs[indexes[0]]
 		if len(dispatchedBlockIDs) != len(projection.Messages[indexes[0]].ContentBlocks) {
-			return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+			return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 		}
 		knownBlockIDs := make(map[string]bool, len(storedBlockIDs))
 		for _, id := range storedBlockIDs {
@@ -199,37 +199,37 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 			part := value.part
 			if part.ID == "" || seenPartIDs[part.ID] || part.MessageID != owner || part.SessionID != sessionRecord.ID || part.Ordinal < 0 ||
 				part.RunID != message.RunID || (itemIndex > 0 && part.Ordinal <= previousOrdinal) {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 			}
 			seenPartIDs[part.ID] = true
 			previousOrdinal = part.Ordinal
 			storedBytes += len(part.Payload)
 			if len(part.Payload) > contract.Limits.MaxEnvelopeBytes || storedBytes > contract.Limits.MaxStoredMessageBytes {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateTooLarge)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateTooLarge)
 			}
 			envelope, decodeErr := session.DecodeProviderStatePayload(part.Payload)
 			if decodeErr != nil {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
 			}
 			if envelope.ItemIndex != itemIndex {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
 			}
 			if envelope.Version != contract.Version {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateVersion)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateVersion)
 			}
 			if envelope.ProviderID != run.ProviderID || envelope.SourceModelID != message.ModelID ||
 				envelope.CodecID != contract.CodecID || envelope.CompatibilityKey != contract.CompatibilityKey ||
 				envelope.ProviderID != string(resolved.Provider.ID) {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 			}
 			if err := model.ValidateProviderStateIdentity(envelope.ProviderID, envelope.SourceModelID); err != nil {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
 			}
 			if blockBound && envelope.BlockID != "" {
 				if !knownBlockIDs[envelope.BlockID] {
 					// The item names a block ID that never existed on this
 					// stored message: a real mismatch, fail closed.
-					return nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
+					return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateMismatch)
 				}
 				if !dispatchedBlockIDSet[envelope.BlockID] {
 					// The block existed but the projection excluded it from
@@ -249,9 +249,9 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		}
 		if err := model.ValidateProviderStateItems(items, contract.Limits); err != nil {
 			if errors.Is(err, model.ErrProviderStateTooLarge) {
-				return nil, nil, runtimeProviderStateError(model.ErrProviderStateTooLarge)
+				return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateTooLarge)
 			}
-			return nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
+			return nil, nil, nil, runtimeProviderStateError(model.ErrProviderStateInvalid)
 		}
 		states = append(states, model.ProviderMessageState{
 			MessageIndex: indexes[0], MessageID: string(owner), SourceSessionID: string(sessionRecord.ID), SourceRunID: string(message.RunID),
@@ -260,7 +260,7 @@ func loadProviderHistory(ctx context.Context, store session.Store, sessionRecord
 		})
 	}
 	sort.Slice(states, func(i, j int) bool { return states[i].MessageIndex < states[j].MessageIndex })
-	return projection.Messages, states, nil
+	return projection.Messages, projection.SourceMessageIDs, states, nil
 }
 
 // captureAssistantProviderState splits provider-private material out of the

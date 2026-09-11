@@ -664,6 +664,76 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	}
 }
 
+// TestSummarizationWithAgentsMDMountedCorrelatesCorrectly is round-two W6
+// review item 8's RA I1 scenario, through the real pipeline: agentsmd
+// injects a message into state.Messages EVERY cycle (upstream's own
+// typedInsertBeforeFirstUser, before the first User message -- not
+// necessarily at either end of the conversation), which has no durable id
+// at all. Positional correlation (the pre-fix mechanism) breaks the moment
+// the in-memory message count agentsmd hands ADK diverges from a freshly
+// re-derived durable-only projection's own count. The pointer-keyed fix
+// must still trigger summarization successfully, durably commit a
+// ContextEpoch, and leave the full replay intact.
+func TestSummarizationWithAgentsMDMountedCorrelatesCorrectly(t *testing.T) {
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("summarization-agentsmd-session")
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Always answer politely."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		AgentsMDFiles:            []string{"AGENTS.md"},
+		SummarizationTriggerMsgs: 1,
+		Disable:                  disableAllExcept(runtime.HandlerKindAgentsMD, runtime.HandlerKindSummarization),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if requestIsSummaryGeneration(request) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("ok, understood")}, nil
+	})
+	orch := newTestOrchestrator(t, store, registry, streamer)
+
+	handle, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hello there"), Config: testConfig(root),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed (agentsmd mounted must not break summarization's correlation)", result)
+	}
+
+	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found bool
+	for _, epoch := range epochs {
+		if epoch.Trigger == "summarization" && epoch.SummaryMessageID != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no summarization ContextEpoch row found among %+v -- agentsmd mounted must not silently prevent summarization from ever committing", epochs)
+	}
+
+	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Messages) < 2 {
+		t.Fatalf("full replay = %d messages, want the original turn's messages still present (nothing deleted)", len(replay.Messages))
+	}
+}
+
 // TestSummarizationFailedGenerationKeepsPreviousEpoch proves the "failed
 // generation" half of the epoch-preservation contract with a streamer that
 // actually triggers summarization (SummarizationTriggerMsgs: 1) and then

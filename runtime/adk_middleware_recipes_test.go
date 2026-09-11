@@ -229,13 +229,27 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 		durable = append(durable, msg)
 	}
 	execution := testFencedExecutionStore(t, store, sessionID)
-	build := HandlerBuildContext{SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: ids, now: now}}
-	finalize := summarizationFinalize(build, 1)
 
 	original := make([]*einoschema.AgenticMessage, len(durable))
 	for i := range durable {
 		original[i] = einoschema.UserAgenticMessage("msg")
 	}
+	// sourceByPointer simulates what durableBaselineHandler records each
+	// cycle: originalMessages[i] correlates to durable[i].ID by pointer,
+	// exactly what a real cycle with no injected content produces.
+	sourceByPointer := make(map[*einoschema.AgenticMessage]session.MessageID, len(original))
+	for i, msg := range original {
+		sourceByPointer[msg] = durable[i].ID
+	}
+	build := HandlerBuildContext{
+		SessionID: sessionID, epochs: contextEpochCapability{sessionID: sessionID, store: store, execution: execution, ids: ids, now: now},
+		sourceMessageID: func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
+			id, ok := sourceByPointer[msg]
+			return id, ok
+		},
+	}
+	finalize := summarizationFinalize(build, 1)
+
 	summary := agenticAssistantText("compact summary of the conversation")
 
 	result, err := finalize(context.Background(), original, summary)
@@ -265,6 +279,13 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 	}
 }
 
+// TestSummarizationFinalizeFailsClosedOnLengthMismatch is now (round-two W6
+// review item 8) actually proving the no-source-correlation-capability
+// case: a HandlerBuildContext with no sourceMessageID at all (the shape a
+// non-summarization-Kind entry, or a bare unit test, would see) must fail
+// Finalize closed rather than guess a correlation -- the positional
+// "length mismatch" this test originally proved no longer exists as a
+// failure mode, since correlation is per-message now, not positional.
 func TestSummarizationFinalizeFailsClosedOnLengthMismatch(t *testing.T) {
 	store := newAdmissionStore()
 	sessionID := session.ID("mismatch-session")
@@ -274,7 +295,7 @@ func TestSummarizationFinalizeFailsClosedOnLengthMismatch(t *testing.T) {
 	finalize := summarizationFinalize(build, 0)
 	_, err := finalize(context.Background(), []*einoschema.AgenticMessage{einoschema.UserAgenticMessage("x")}, agenticAssistantText("summary"))
 	if err == nil {
-		t.Fatal("length mismatch was accepted instead of failing closed")
+		t.Fatal("missing source correlation was accepted instead of failing closed")
 	}
 	// RW-S7 in the round-two W6 review: a correlation failure is a
 	// configuration-shaped problem, not merely "adk adapter cannot

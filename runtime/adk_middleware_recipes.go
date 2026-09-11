@@ -607,61 +607,52 @@ var errSummarizationTailUnsplittable = fmt.Errorf("%w: summarization tail cannot
 
 // summarizationFinalize maps a completed summary into a new atomic
 // session.ContextEpoch. It correlates upstream's in-memory originalMessages
-// with this session's durable message history by loading the SAME
-// epoch-projected agentic view ADK's own current-turn input was built from
-// (build.epochs.loadCurrentAgenticProjection, applying whatever
-// summarization epoch is already active for this session -- possibly none,
-// possibly one from an earlier summarization on this same session): its
-// SourceMessageIDs correlates 1:1, in order, with originalMessages. This
-// holds for the expected case (summarizing the session's complete,
-// uninterrupted conversational history, whether or not it has already been
-// summarized once before) but is a documented, checked assumption, not a
-// guarantee for every possible upstream Trigger/GenModelInput configuration:
-// a mismatch fails Finalize closed (an error, which fails the run) rather
-// than fabricating an incorrect boundary. Because summarization's own
-// internal call now runs through a bounded internal-dispatch adapter that
-// never persists a trailing assistant message (see adkModel.internalDispatch),
-// this correlation no longer needs the "drop one trailing entry" workaround
-// a prior revision required.
+// with this session's durable message history via build.sourceMessageID --
+// a pointer-keyed lookup the current cycle's durable baseline handler
+// records fresh every cycle (round-two W6 review item 8), NOT by
+// re-deriving a separately-ordered projection and assuming it correlates
+// positionally 1:1 with originalMessages. A message with no durable id
+// (agentsmd/skill injected content, or anything else a host handler added
+// that this run never durably committed) is simply never resolved here and
+// is always retained -- present in originalMessages, but never counted
+// toward or included in the summarized range. This is what makes
+// summarization correct mid-turn after tool calls (this cycle's own new
+// tool-loop progress resolves through the same map, since
+// adkEngine.buildDurableBaseline threads its durable ids through exactly
+// like the turn-admission prefix does) and with agentsmd/skill mounted
+// (their injected messages simply resolve to "no durable id" instead of
+// silently shifting every later index and failing Finalize closed).
 func summarizationFinalize(build HandlerBuildContext, retainTail int) summarization.TypedFinalizeFunc[*einoschema.AgenticMessage] {
 	return func(ctx context.Context, originalMessages []*einoschema.AgenticMessage, summary *einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
 		summaryText := summaryAgenticMessageText(summary)
 		if strings.TrimSpace(summaryText) == "" {
 			return nil, fmt.Errorf("%w: summary text is empty", errADKUnsupportedBlock)
 		}
-		activeEpoch, err := build.epochs.activeEpoch(ctx)
-		if err != nil {
-			return nil, err
+		if build.sourceMessageID == nil {
+			return nil, fmt.Errorf("%w: %w: summarization requires per-cycle durable source correlation (sourceMessageID)", ErrHandlerConfiguration, errADKUnsupportedBlock)
 		}
-		projection, err := build.epochs.loadCurrentAgenticProjection(ctx, activeEpoch)
-		if err != nil {
-			return nil, err
-		}
-		// history.LoadAgentic has no notion of "unfinalized": unlike
-		// adkEngine.buildDurableBaseline (which explicitly drops the turn's
-		// own not-yet-committed assistant placeholder via
-		// dropUnfinalizedAssistantPlaceholders before ADK ever sees it),
-		// projectLegacyAgenticMessage happily projects a zero-part
-		// assistant message as an empty AgenticMessage. ADK's own
-		// originalMessages never includes that placeholder, so it must be
-		// filtered out here the same way, in lockstep with SourceMessageIDs,
-		// or the correlation below is off by one for every turn's first
-		// summarization trigger.
-		sourceIDs := make([]session.MessageID, 0, len(projection.SourceMessageIDs))
-		for i, msg := range projection.Messages {
-			if msg != nil && msg.Role == einoschema.AgenticRoleTypeAssistant && len(msg.ContentBlocks) == 0 {
-				continue
+		// Resolve every originalMessages entry to its durable id, if any;
+		// durableOriginalIndices records, in order, which original indices
+		// have one -- possibly with gaps where injected content sits
+		// between durable messages (e.g. agentsmd inserts its own message
+		// before the first user message, not necessarily at either end).
+		sourceIDs := make([]session.MessageID, len(originalMessages))
+		durableOriginalIndices := make([]int, 0, len(originalMessages))
+		for i, msg := range originalMessages {
+			if id, ok := build.sourceMessageID(msg); ok && id != "" {
+				sourceIDs[i] = id
+				durableOriginalIndices = append(durableOriginalIndices, i)
 			}
-			sourceIDs = append(sourceIDs, projection.SourceMessageIDs[i])
 		}
-		if len(sourceIDs) != len(originalMessages) || len(sourceIDs) == 0 {
-			return nil, fmt.Errorf("%w: %w: summarization could not correlate %d in-memory messages with %d durable messages", ErrHandlerConfiguration, errADKUnsupportedBlock, len(originalMessages), len(sourceIDs))
+		if len(durableOriginalIndices) == 0 {
+			// Nothing durable at all this cycle (a degenerate case -- every
+			// message present is injected/ephemeral context). Nothing to
+			// summarize; leave history untouched.
+			return originalMessages, nil
 		}
 		// A second pass over the FULL, unfiltered durable history (not
 		// epoch-projected) gives role and content-block-kind lookups by
-		// message ID for the tail-boundary logic below; every ID in
-		// projection.SourceMessageIDs is necessarily present in it (the
-		// epoch-projected view is a subset of the full durable history).
+		// message ID for the tail-boundary logic below.
 		batch, err := build.epochs.loadConversationalHistory(ctx)
 		if err != nil {
 			return nil, err
@@ -678,22 +669,27 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 		for i, part := range batch.Parts {
 			partsByMessage[owners[i]] = append(partsByMessage[owners[i]], part)
 		}
-		durable := make([]session.Message, len(sourceIDs))
-		for i, id := range sourceIDs {
-			msg, ok := byID[id]
+		// durable is the durable subsequence backing originalMessages, in
+		// order -- possibly non-contiguous in originalMessages' own index
+		// space (see durableOriginalIndices), but always contiguous and
+		// correctly ordered as a CONVERSATION, since it is built purely
+		// from resolved durable ids.
+		durable := make([]session.Message, len(durableOriginalIndices))
+		for k, origIndex := range durableOriginalIndices {
+			msg, ok := byID[sourceIDs[origIndex]]
 			if !ok {
-				return nil, fmt.Errorf("%w: summarization correlated durable message %s not found in full history reload", errADKUnsupportedBlock, id)
+				return nil, fmt.Errorf("%w: summarization correlated durable message %s not found in full history reload", errADKUnsupportedBlock, sourceIDs[origIndex])
 			}
-			durable[i] = msg
+			durable[k] = msg
 		}
 		if retainTail < 0 {
 			retainTail = 0
 		}
 		if retainTail >= len(durable) {
 			// Nothing to compact: the requested tail already covers the
-			// whole conversation. Do not start a new epoch (it would have
-			// SummarizedFromID == SummarizedToID == TailStartID, an
-			// overlapping, meaningless range) -- leave history untouched.
+			// whole durable conversation. Do not start a new epoch (it
+			// would have SummarizedFromID == SummarizedToID == TailStartID,
+			// an overlapping, meaningless range) -- leave history untouched.
 			return originalMessages, nil
 		}
 		tailStart := len(durable) - retainTail
@@ -726,14 +722,36 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 			// SummaryMessageID projects the summary alone, with no tail).
 			epoch.TailStartID = durable[tailStart].ID
 		}
-		ids := compaction.BoundaryIDs{MessageID: build.epochs.ids.NewMessageID(), PartID: build.epochs.ids.NewPartID()}
-		if _, _, err := build.epochs.commitSummaryEpoch(ctx, epoch, ids, summaryText); err != nil {
+		boundaryIDs := compaction.BoundaryIDs{MessageID: build.epochs.ids.NewMessageID(), PartID: build.epochs.ids.NewPartID()}
+		if _, _, err := build.epochs.commitSummaryEpoch(ctx, epoch, boundaryIDs, summaryText); err != nil {
 			return nil, err
 		}
-		systemPrefix := append([]*einoschema.AgenticMessage(nil), originalMessages[:systemPrefixLen]...)
-		tail := append([]*einoschema.AgenticMessage(nil), originalMessages[tailStart:]...)
-		result := append(systemPrefix, summary)
-		return append(result, tail...), nil
+		// Reassemble originalMessages by ORIGINAL index: every non-durable
+		// message is always retained verbatim, wherever it falls; a
+		// durable message whose durable position is within
+		// [systemPrefixLen, tailStart) is replaced by exactly one copy of
+		// summary (emitted the first time such a position is reached, so
+		// a non-contiguous durable range still collapses to a single
+		// summary message, not one per gap); every other durable message
+		// (before systemPrefixLen, or at/after tailStart) is retained
+		// verbatim.
+		summarizedPositions := make(map[int]bool, tailStart-systemPrefixLen)
+		for k := systemPrefixLen; k < tailStart; k++ {
+			summarizedPositions[durableOriginalIndices[k]] = true
+		}
+		result := make([]*einoschema.AgenticMessage, 0, len(originalMessages))
+		summaryEmitted := false
+		for i, msg := range originalMessages {
+			if summarizedPositions[i] {
+				if !summaryEmitted {
+					result = append(result, summary)
+					summaryEmitted = true
+				}
+				continue
+			}
+			result = append(result, msg)
+		}
+		return result, nil
 	}
 }
 

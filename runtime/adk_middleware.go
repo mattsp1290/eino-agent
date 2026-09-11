@@ -130,6 +130,20 @@ type HandlerBuildContext struct {
 	// beyond this must be one of this package's own recipes, given its own
 	// narrow, purpose-built capability the same way.
 	epochs contextEpochCapability
+
+	// sourceMessageID resolves an *AgenticMessage this cycle's durable
+	// baseline handler is tracking to the durable session.MessageID it
+	// projected from (adkEngine.cycleMessageSourceByPointer), or reports ok
+	// == false for a message with no durable backing (content a later
+	// handler injected -- e.g. agentsmd/skill -- that this run never
+	// durably committed). Populated only for a HandlerKindSummarization
+	// entry (see adkEngine.buildAgentHandlers), the same Kind-gating
+	// authorizeRewrite/epochs use: replacing summarizationFinalize's old
+	// positional correlation (round-two W6 review item 8), which broke
+	// whenever originalMessages and a freshly re-derived projection
+	// disagreed in length -- exactly what happens mid-turn after tool
+	// calls, or whenever agentsmd/skill inject content into the cycle.
+	sourceMessageID func(msg *einoschema.AgenticMessage) (session.MessageID, bool)
 }
 
 // HandlerFactory builds one typed ADK agent middleware instance for one
@@ -217,6 +231,24 @@ func (h *durableBaselineHandler) BeforeModelRewriteState(ctx context.Context, st
 	if err != nil {
 		return ctx, nil, err
 	}
+	// Rebuild the per-cycle pointer-keyed durable-source lookup fresh, on
+	// the CLONED pointers just minted above -- these, not baseline's own
+	// pre-clone pointers, are what ADK and every host handler after this
+	// one actually operate on (see cycleMessageSourceByPointer's doc
+	// comment; round-two W6 review item 8). A message with no known
+	// durable id (baselineSourceIDs[i] == "") is simply absent from the
+	// map, never a zero-value entry, so a plain map lookup's ok result
+	// alone distinguishes "known durable id" from "no durable id".
+	sourceByPointer := make(map[*einoschema.AgenticMessage]session.MessageID, len(cloned))
+	for i, msg := range cloned {
+		if i >= len(h.engine.baselineSourceIDs) {
+			break
+		}
+		if id := h.engine.baselineSourceIDs[i]; id != "" {
+			sourceByPointer[msg] = id
+		}
+	}
+	h.engine.cycleMessageSourceByPointer = sourceByPointer
 	next := adk.TypedChatModelAgentState[*einoschema.AgenticMessage]{Messages: cloned}
 	if state != nil {
 		next.ToolInfos = state.ToolInfos

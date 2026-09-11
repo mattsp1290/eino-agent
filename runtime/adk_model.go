@@ -525,7 +525,7 @@ func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.Age
 	// turn therefore narrows the provider projection starting the NEXT turn
 	// admitted on this session, not later cycles of this same turn -- see
 	// resolveTurnHistoryOptions's doc comment.
-	full, fullState, err := loadProviderHistory(ctx, e.host.store, session.Session{ID: e.snapshot.SessionID}, e.historyOptions, e.snapshot.Model)
+	full, fullSourceIDs, fullState, err := loadProviderHistory(ctx, e.host.store, session.Session{ID: e.snapshot.SessionID}, e.historyOptions, e.snapshot.Model)
 	if err != nil {
 		return nil, err
 	}
@@ -542,7 +542,7 @@ func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.Age
 	// a placeholder, and is dropped. providerState entries are reindexed to
 	// match (an entry addressing a dropped placeholder is dropped with it --
 	// a placeholder with no committed content has no captured state either).
-	full, fullState = dropUnfinalizedAssistantPlaceholders(full, fullState)
+	full, fullSourceIDs, fullState = dropUnfinalizedAssistantPlaceholders(full, fullSourceIDs, fullState)
 	if len(full) < e.baseMessageCount {
 		return nil, fmt.Errorf("%w: durable history shrank below this turn's admitted base (%d < %d)", errADKProjectionDiverged, len(full), e.baseMessageCount)
 	}
@@ -566,6 +566,20 @@ func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.Age
 	baseline := make([]*einoschema.AgenticMessage, 0, len(prefix)+len(tail))
 	baseline = append(baseline, prefix...)
 	baseline = append(baseline, tail...)
+	// baselineSourceIDs is baseline's own durable-message-ID parallel (round-
+	// two W6 review item 8): the prefix portion's ids came from
+	// e.snapshot.MessageSourceIDs (computed once at turn admission/resume,
+	// remapped through prepareSnapshot's extension-transform BaseToFinal
+	// mapping -- see prepareSnapshot), zero-padded defensively if shorter
+	// than prefix (a call site that never populated it degrades to "no
+	// durable id for any prefix message" rather than panicking); the tail
+	// portion's ids come directly from this same fresh reload, in lockstep
+	// with tail itself. durableBaselineHandler turns this into a
+	// pointer-keyed map against the CLONED messages it actually hands ADK,
+	// consumed by summarizationFinalize -- see that handler's doc comment.
+	baselineSourceIDs := make([]session.MessageID, 0, len(prefix)+len(tail))
+	baselineSourceIDs = append(baselineSourceIDs, paddedMessageSourceIDs(e.snapshot.MessageSourceIDs, len(prefix))...)
+	baselineSourceIDs = append(baselineSourceIDs, fullSourceIDs[e.baseMessageCount:]...)
 	offset := len(prefix) - e.baseMessageCount
 	providerState := append([]model.ProviderMessageState(nil), e.snapshot.providerState...)
 	for _, state := range fullState {
@@ -589,21 +603,36 @@ func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.Age
 	// the wrong message.
 	e.snapshot.providerState = providerState
 	e.baselineMessages = baseline
+	e.baselineSourceIDs = baselineSourceIDs
 	return baseline, nil
 }
 
-func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage, providerState []model.ProviderMessageState) ([]*einoschema.AgenticMessage, []model.ProviderMessageState) {
+// paddedMessageSourceIDs returns ids truncated or zero-padded to exactly n
+// entries: a defensive normalization so a TurnSnapshot whose
+// MessageSourceIDs is nil, short, or (in principle) long relative to its
+// own Messages never causes an index panic here -- a missing entry simply
+// means "no durable id for this message" (see buildDurableBaseline).
+func paddedMessageSourceIDs(ids []session.MessageID, n int) []session.MessageID {
+	out := make([]session.MessageID, n)
+	copy(out, ids)
+	return out
+}
+
+func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage, sourceIDs []session.MessageID, providerState []model.ProviderMessageState) ([]*einoschema.AgenticMessage, []session.MessageID, []model.ProviderMessageState) {
 	remap := make(map[int]int, len(messages))
 	kept := make([]*einoschema.AgenticMessage, 0, len(messages))
+	keptSourceIDs := make([]session.MessageID, 0, len(messages))
+	paddedSourceIDs := paddedMessageSourceIDs(sourceIDs, len(messages))
 	for oldIndex, msg := range messages {
 		if msg != nil && msg.Role == einoschema.AgenticRoleTypeAssistant && len(msg.ContentBlocks) == 0 {
 			continue
 		}
 		remap[oldIndex] = len(kept)
 		kept = append(kept, msg)
+		keptSourceIDs = append(keptSourceIDs, paddedSourceIDs[oldIndex])
 	}
 	if len(kept) == len(messages) {
-		return messages, providerState
+		return messages, paddedSourceIDs, providerState
 	}
 	keptState := make([]model.ProviderMessageState, 0, len(providerState))
 	for _, state := range providerState {
@@ -612,7 +641,7 @@ func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage,
 			keptState = append(keptState, state)
 		}
 	}
-	return kept, keptState
+	return kept, keptSourceIDs, keptState
 }
 
 // prepareDispatchInput is this adapter's counterpart to

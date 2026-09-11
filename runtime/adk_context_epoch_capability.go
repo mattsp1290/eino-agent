@@ -69,31 +69,6 @@ func (c contextEpochCapability) loadConversationalHistory(ctx context.Context) (
 	return history.LoadBatch(ctx, c.store, c.sessionID)
 }
 
-// activeEpoch returns the currently active summarization epoch for this
-// session (see latestFinishedSummarizationEpoch), or nil if none.
-func (c contextEpochCapability) activeEpoch(ctx context.Context) (*session.ContextEpoch, error) {
-	if !c.ready() {
-		return nil, fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
-	}
-	return latestFinishedSummarizationEpoch(ctx, c.store, c.sessionID)
-}
-
-// loadCurrentAgenticProjection reloads this session's durable history
-// projected through activeEpoch exactly the way ADK's own current turn
-// input was built (see adkEngine.buildDurableBaseline), so its
-// SourceMessageIDs correlates 1:1, in order, with what ADK's Finalize hands
-// back as originalMessages -- including when a PRIOR summarization epoch is
-// already active (a second summarization on the same session must
-// correlate against the ALREADY-COMPACTED view, not raw unfiltered
-// history, or the correlation check always mismatches once more than one
-// epoch has ever been created for a session).
-func (c contextEpochCapability) loadCurrentAgenticProjection(ctx context.Context, activeEpoch *session.ContextEpoch) (history.AgenticProjection, error) {
-	if !c.ready() {
-		return history.AgenticProjection{}, fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
-	}
-	return history.LoadAgentic(ctx, c.store, c.sessionID, history.Options{Epoch: activeEpoch, ContentLimits: c.contentLimits})
-}
-
 // commitSummaryEpoch durably starts epoch and appends its replayable
 // summary boundary in ONE fenced transaction: StartContextEpoch and the
 // boundary append (AppendMessage + AppendPart + FinishContextEpoch) commit
