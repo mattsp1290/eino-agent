@@ -123,7 +123,11 @@ A typical server wires these pieces once at startup through
 implementations. A successful construction requires a Store, ModelResolver,
 RunPlanProvider, and IDGenerator. A successful start also requires a non-empty
 request `SessionID`. EventSink, permissions policy, owner ID override, queue
-sizing, and lease tuning are optional.
+sizing, and lease tuning are optional. `IDGenerator`'s minted IDs must be
+globally unique, not per-process: a resumed or crash-reconciled run mints new
+rows into a session a different process already wrote, so an implementation
+that restarts a counter per process fails admission with `session.ErrConflict`
+once its IDs collide with an earlier process's.
 
 ```go
 // sql is database/sql; url is net/url. The SQLite package registers modernc.
@@ -165,7 +169,7 @@ and an immutable `config.Snapshot`:
 ```go
 handle, err := orchestrator.Start(ctx, runtime.Request{
     SessionID: session.ID("tenant-123/thread-456"),
-    Message:   runtime.UserMessage{Content: submittedText},
+    Message:   runtime.TextUserMessage(submittedText),
     Config:    snapshot,
     Metadata:  map[string]string{"workspace_id": "workspace-1"},
 })
@@ -186,8 +190,27 @@ which may be called from a different process after a restart. Additional
 user input for a live or paused run goes through
 `orchestrator.Enqueue(ctx, sessionID, runtime.EnqueueRequest{...})` — durable
 and idempotent on `IdempotencyKey`; an item accepted while no loop is live
-stays queued for the next `Start`/`ResumeRun`. `orchestrator.Stop(ctx, runID,
-runtime.StopPolicy{Graceful: true})` requests a checkpointed stop.
+stays queued for the next `Start`/`ResumeRun`. `Enqueue` never acknowledges
+input nothing will consume: against a run that has already settled it returns
+`runtime.ErrInvalidOrchestrator` ("run … already settled"), checked atomically
+against the terminal CAS, so a caller that loses the race to idle shutdown is
+told rather than silently dropped. `Handle.Status(ctx)` reports the run's
+current durable status at any time, including after the process that started
+it is gone. `orchestrator.Stop(ctx, runID, runtime.StopPolicy{Graceful: true})`
+requests a checkpointed stop.
+
+`ResumeRun` refuses a paused run whose promoted checkpoint disagrees with the
+run's current turn (a defensive assertion that a coherent crash-reconciliation
+pass should never actually trip — see the W5 section of
+[eino-feature-support.md](architecture/eino-feature-support.md)) rather than
+strand it running with no driver; the run is left exactly as paused as before
+the call. There is one documented way forward for a paused run a host does not
+intend to resume: `orchestrator.Stop(ctx, runID, runtime.StopPolicy{Abandon:
+true})` ("Stop-with-abandon") settles it terminally as `session.RunInterrupted`
+and retires its checkpoints, freeing the session for a fresh `Start`. It
+applies only when this process has no live loop for the run (a genuinely
+paused run, not one it is actively driving) and reports
+`runtime.ErrInvalidOrchestrator` otherwise.
 
 ## Durable Provider-Private State
 

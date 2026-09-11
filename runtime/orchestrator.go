@@ -29,7 +29,12 @@ var (
 )
 
 // IDGenerator creates durable identifiers for records owned by the
-// orchestrator.
+// orchestrator. Every minted ID must be unique across the whole durable
+// store, including across processes and process restarts: a resumed or
+// crash-reconciled run mints new rows into a session a different process
+// already wrote (see runtime/interrupt.go's reconcileCrashedRun), and a
+// colliding ID fails admission with session.ErrConflict. An implementation
+// that restarts a counter per process does not satisfy this contract.
 type IDGenerator interface {
 	NewRunID() session.RunID
 	NewMessageID() session.MessageID

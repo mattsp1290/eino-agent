@@ -1087,7 +1087,12 @@ unwritten (see that bullet for the exact, now-shorter list).
      dangling turn, it now stages and promotes a fresh `Kind=loop`
      checkpoint recorded for that turn as part of the same repause, so a
      later `ResumeRun`'s `TurnID`-consistency check (round-five
-     reconciliation item 2/TR-I1) reads a consistent state.
+     reconciliation item 2/TR-I1) reads a consistent state. **Further
+     superseded by phase 8 (round-six reconciliation)**: "dangling turn" and
+     "the run's newest non-completed turn" were two different selectors
+     that could disagree; phase 8 unifies them into one `currentTurn`
+     selector used everywhere a "what turn is this checkpoint for" decision
+     is made -- see the phase-8 bullet below for the full mechanism.
   5. **Docs/test-coverage only**: the `turnLoopCheckpointShape` doc comment
      claimed a checkpoint gob-shape round-trip test that did not exist;
      `TestEmptyLoopCheckpointMatchesUpstreamGobShape` proved a round trip by
@@ -1343,6 +1348,122 @@ unwritten (see that bullet for the exact, now-shorter list).
   TESTCONTAINERS_RYUK_DISABLED=true testdata/external-consumer/check.sh`)
   -- all green; see this phase's fix-pass commits for the exact recorded
   run.
+- **Phase 8 (round-five and round-six reconciliation)**: round five
+  (`reviews/w5-engine-2026-09-11-013808-482da09897eb/fix-pass-4/reconciliation.md`)
+  gave the checkpoint envelope a required `TurnID`
+  (`decodeCheckpointEnvelope` rejects one without it -- no codec-version
+  bump needed, the envelope had never shipped), made `genInput` scan the
+  *whole* GenInput batch for `reconciledTurnSentinelID` rather than only
+  `items[0]` (upstream's `tryLoadCheckpoint` builds that batch as
+  `cp.UnhandledItems ++ newItems`, and a promoted checkpoint carrying its
+  own `UnhandledItems` -- the between-turn-stop-with-queued-input shape --
+  puts those ids ahead of the sentinel), and gave `RepauseRun` a
+  `PromoteRevision` parameter. It also made `completeTurn` retire its own
+  promoted checkpoint immediately on completion and made `ResumeRun` refuse
+  a promoted checkpoint whose `TurnID` disagreed with the run's "newest
+  non-completed turn". Round six
+  (`reviews/w5-engine-2026-09-11-013808-482da09897eb/fix-pass-5/reconciliation.md`)
+  found that pairing unsound: crash reconciliation's own "dangling turn"
+  selector (highest-ordinal `admitted`/`running` turn) and `ResumeRun`'s
+  "newest non-completed turn" selector are not the same predicate --
+  `TurnInterrupted` satisfies the second and not the first -- so a run
+  holding a lower-ordinal dangling turn behind a higher-ordinal
+  already-interrupted carrier (exactly what a graceful `Stop` with queued
+  input produces) made reconciliation stage a checkpoint `ResumeRun` then
+  refused, permanently (checkpoint-precedence-reviewer Critical 1).
+  Separately, `completeTurn`'s immediate retirement destroyed the
+  "this run is resumable" signal reconciliation's `hasCheckpoint` gate
+  depended on: once a resumed run's turn completed, its promoted checkpoint
+  was gone, so a crash on any *later* turn of that same run read as "never
+  paused" and settled the run terminally interrupted with the later turn's
+  content stranded (checkpoint-precedence-reviewer Critical 2). And because
+  the retirement is best-effort (its own error deliberately swallowed) and
+  runs in a window after `CompleteTurn` commits, a crash landing in that
+  exact window left a promoted checkpoint recorded for a now-completed turn
+  with no dangling turn to reconcile; reconciliation repaused over it
+  unchanged, and `ResumeRun`'s own consistency check then refused it
+  forever, with `Resume` routing straight back into the same refusal and
+  `Start` failing `ErrSessionBusy` because the run stayed nonterminal --
+  bricking the whole session with no operator escape at all
+  (branch-approval-reviewer Critical 1). Round six replaces the pairing
+  with one coherent design instead of patching each symptom separately:
+  - `currentTurn(turns)` (`runtime/turn_loop.go`) is now the single
+    selector shared by crash reconciliation, `RepauseRun`/`PromoteRevision`
+    staging, and `ResumeRun`'s checkpoint-`TurnID` consistency check: the
+    newest turn whose state is not `completed`/`failed` --
+    `admitted`/`running`/`interrupted` all qualify. `ResumeRun` keeps its
+    consistency check as a defensive assertion (a genuinely inconsistent
+    state it can still catch), but the round-six tests prove it can no
+    longer fire after reconciliation has run.
+  - `completeTurn` no longer retires its own promoted checkpoint on
+    completion. A checkpoint recorded for a since-completed turn is stale
+    *by fact* (`currentTurn` no longer selects that turn), not absent by an
+    explicit mid-run delete; retirement now happens only at terminal
+    settlement (`settleCleanRunCompletion`, `abandonPausedRun`) or when
+    crash reconciliation itself finds nothing left pending to resume.
+  - Crash reconciliation (`reconcileCrashedRun`, `runtime/interrupt.go`) is
+    now total: whenever a run's checkpoint machinery has ever been used
+    (`hasCheckpoint`), it always repauses into a state `ResumeRun` can
+    accept, never settles terminal underneath a still-resumable run. When
+    nothing is currently in flight (`currentTurn(turns).ID == ""` -- e.g. a
+    crash right after `CompleteTurn`, mirroring branch-approval-reviewer's
+    C1 shape), it mints a fresh, content-free carrier turn purely to hold a
+    valid pause (the same degenerate shape `promoteQueuedContinuation`
+    already used between turns), so a checkpoint envelope -- whose `TurnID`
+    can never be empty -- always has a real turn to name; `ResumeRun` then
+    finds nothing left to redrive or drain and completes the run on its
+    own. A run whose checkpoint machinery was never used at all (no
+    promoted checkpoint ever existed, `hasCheckpoint` false) still settles
+    interrupted with nothing to resume, unchanged from phase 6.
+  - `StopPolicy.Abandon` ("Stop-with-abandon", `runtime/turn_loop.go`) is
+    new: a documented operator escape for a durably paused run this process
+    has no live loop for (whether refused by `ResumeRun`'s defensive check
+    or simply one nobody intends to resume) -- it settles the run
+    terminally `RunInterrupted`, retires its checkpoints (terminalizing any
+    unfinished tool call first, since a genuine tool-interrupt pause's
+    durable `ToolCall` row can still be `pending`), and frees the session
+    for a fresh `Start`. It has no effect when this process has a live loop
+    for the run (`Graceful`/`Immediate`, or `Handle.Interrupt`, already
+    cover that case).
+  Proven by `runtime/w5_round6_reconciliation_test.go`:
+  `TestResumeRunAfterGracefulStopWithQueuedInputSurvivesCrashAgainstSQLite`
+  (checkpoint-precedence-reviewer probe D: `Start`+`Enqueue`+graceful
+  `Stop`, crash, `Resume` repauses, `ResumeRun` completes with the queued
+  item consumed exactly once),
+  `TestResumeRunRepausesAndRedrivesOnlyInFlightTurnAfterCrashAgainstSQLite`
+  (probes A/B: a genuine tool-interrupt pause resumed and completed, a
+  second turn admitted then crashed, `Resume` repauses -- not terminal --
+  and `ResumeRun` redrives only the in-flight second turn, the first
+  turn's completion untouched),
+  `TestResumeRunAcceptsAfterCrashRightAfterCompleteTurnWithStaleCheckpointAgainstSQLite`
+  (branch-approval-reviewer's C1 probe: crash immediately after
+  `CompleteTurn`, `Resume` repauses via a fresh carrier turn, `ResumeRun`
+  accepts and completes the run), and
+  `TestStopAbandonSettlesPausedRunAndFreesSessionForNewStart` (a paused run
+  abandoned reaches terminal `RunInterrupted` with checkpoints retired, and
+  a fresh `Start` on the same session then succeeds). The round-five test
+  that hand-wrote an envelope naming a turn ahead of when it existed and
+  hand-rolled reconciliation instead of calling `reconcileCrashedRun`
+  (`TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately`,
+  `w5_round5_reconciliation_test.go`) is removed -- it asserted the
+  now-removed immediate-retirement behavior directly;
+  `TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems` is
+  relabeled a synthetic unit test of `genInput`'s sentinel scan alone (the
+  `UnhandledItems`-plus-sentinel combination it constructs is unreachable
+  through the real reconciliation path, since a real `Kind=loop` checkpoint
+  is only ever staged by `stageLoopCheckpoint`'s always-empty shape); and
+  `TestResumeRunRefusesCheckpointForATurnThatHasSinceCompleted` gained a
+  `StopPolicy.Abandon` assertion proving the refusal it exercises has a
+  documented way out. `adkCheckpointStore.currentTurnID` is now seeded
+  synchronously by both `Start` (`orchestrator.go`) and `ResumeRun`
+  (`turn_loop.go`), before their `TurnLoop` is even constructed, so `stage`
+  can never observe an empty `currentTurnID` ahead of the first
+  `GenInput`/`GenResume` call (branch-approval-reviewer S3);
+  `TestAdkCheckpointStoreStageSucceedsOnceSeededWithNoPriorGenInput`
+  (`w5_round6_reconciliation_test.go`) proves it deterministically (a live
+  race against a real `TurnLoop` was not reproducible even after 120
+  iterations in the reviewer's own probe, so racing it in CI would be
+  equally flaky and not actually discriminate a regression).
 - Acceptance-test matrix (`runtime/acceptance_matrix_test.go`,
   `runtime/turn_loop_sqlite_test.go`, `runtime/w5_reconciliation_test.go`,
   `runtime/w5_round2_test.go`, `runtime/w5_round3_test.go`,
