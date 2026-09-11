@@ -479,7 +479,18 @@ unwritten (see that bullet for the exact, now-shorter list).
   `ErrInvalidOrchestrator` construction error if it never did, once the
   agent has finished running for the turn (checked only after the
   interrupted/no-engine case is ruled out, so a legitimate cancellation
-  is never misreported as a construction failure). This catches a factory
+  is never misreported as a construction failure). **The guard is the
+  stronger, structurally-binding constraint, not the dispatch check below
+  (round-four reconciliation, MR suggestion)**: `AgentBuildContext.Guard`
+  is typed `adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]`,
+  installed by appending to `TypedChatModelAgentConfig.Handlers` -- so only
+  a `TypedChatModelAgent` has anywhere to install it at all. A factory
+  returning a pure workflow/sequential agent with no `TypedChatModelAgent`
+  child therefore fails this guard check before the dispatch check below is
+  ever consulted, and a workflow-pattern factory is consequently
+  unsupported in this phase: every compliant turn must wrap at least one
+  `TypedChatModelAgent` built from `build.Model`, and that agent must
+  actually run and dispatch. This catches a factory
   that never wires `AgentBuildContext.Guard` in at all, but **not** one
   that installs the guard and separately substitutes its own model instead
   of `build.Model`: `durableGuard.BeforeAgent` only inspects the agent's
@@ -1068,9 +1079,13 @@ unwritten (see that bullet for the exact, now-shorter list).
      turns and no checkpoint at all still uses the unchanged legacy path.
   5. **Docs/test-coverage only**: the `turnLoopCheckpointShape` doc comment
      claimed a checkpoint gob-shape round-trip test that did not exist;
-     `TestEmptyLoopCheckpointMatchesUpstreamGobShape` now proves it by
+     `TestEmptyLoopCheckpointMatchesUpstreamGobShape` proved a round trip by
      decoding `marshalEmptyLoopCheckpoint`'s bytes into a field-identical
-     mirror of eino's private `turnLoopCheckpoint` type. The genuine
+     mirror of eino's private `turnLoopCheckpoint` type declared in the same
+     test file -- not a test that could catch a one-field rename in
+     `turnLoopCheckpointShape` itself, since nothing referenced any real
+     upstream type or code path (round-four reconciliation item 4/CR-I3
+     found this and replaced it; see the phase-7 bullet below). The genuine
      `TakeLateItems` late-item window (an `Enqueue` reaching `Push` while
      the loop is registered but already stopped) had zero test coverage
      despite being listed as closed; `TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation`
@@ -1102,7 +1117,9 @@ unwritten (see that bullet for the exact, now-shorter list).
      letting a reader assume the two agree.
   Proven by `runtime/w5_round3_test.go`
   (`TestDuplicateDeliveryOfAlreadyAdmittedItemDoesNotDispatch`,
-  `TestEmptyLoopCheckpointMatchesUpstreamGobShape`,
+  `TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop` -- the round-four
+  replacement for this phase's original `TestEmptyLoopCheckpointMatchesUpstreamGobShape`,
+  see the phase-7 bullet below --
   `TestEnqueueDuringLateItemWindowSurvivesAsQueuedContinuation`,
   `TestSettleRunRetryingSkipsRetryOnQueuedInput`) and
   `runtime/w5_round3_reconciliation_test.go`
@@ -1112,6 +1129,135 @@ unwritten (see that bullet for the exact, now-shorter list).
   the extended `TestResumeRunRestoresSystemPromptAndAgentOptions`
   (`runtime/w5_round2_test.go`) and the new `store/storetest/w5_durable.go`
   contract cases.
+- **Phase 7 (round-four reconciliation)**: a fourth dual-review pass
+  against phase 6's own fixes -- `reviews/w5-engine-2026-09-11-013808-482da09897eb/fix-pass-3/reconciliation.md`,
+  items 1-9, all accepted -- found one Critical defect phase 6's own new
+  crash-recovery path introduced, plus important-severity gaps in the
+  duplicate-delivery guard, the reconciliation goroutine's protections, the
+  checkpoint gob-shape test's honesty, the reconcile path's `Handle`
+  contract, and unmet "done when" criteria on two round-three tests.
+  1. **Crash reconciliation no longer duplicates history (Critical,
+     CR-C1)**: `ReconcileInterruptedTurn` requeued a crashed turn's
+     consumed inbox items back to `InboxQueued` on the premise that a fresh
+     `AdmitTurn` would need to re-consume them into a new turn. That premise
+     was wrong -- `AdmitTurn` already durably commits the turn's user
+     messages atomically with the inbox consumption, so requeuing let the
+     next admission mint a *second* user message from the same content,
+     duplicating it in provider history on every crash recovery of a turn
+     that carried content. `ReconcileInterruptedTurn` now settles those
+     items `InboxInterrupted` instead, exactly like `InterruptTurn` --
+     never requeued. A new fenced `ExecutionStore` op, `ResumeInterruptedTurn`
+     (with a `store/storetest` contract case on both stores), later resumes
+     the SAME turn under the SAME `TurnID`: it moves the turn to
+     `TurnRunning` and its inbox rows back to `InboxConsumed`, so
+     `CompleteTurn` (which already accepted `TurnRunning`) settles it
+     completed with the item completed exactly once. A later crash
+     mid-redrive leaves the turn `TurnRunning`, which
+     `reconcileCrashedRun`'s existing dangling-turn detection
+     (`TurnAdmitted || TurnRunning`) already recognizes, so the cycle is
+     safely repeatable. On the runtime side, `ResumeRun` decodes the
+     promoted checkpoint's own payload
+     (`decodeLoopCheckpointHasRunnerState`) before ever calling `loop.Run`
+     to determine whether this resume will reach `GenInput` or `GenResume`;
+     when it has no real ADK runner state and the run has a pending
+     crash-reconciled turn with real content, it pushes a new
+     `reconciledTurnSentinelID` so `genInput` resumes that exact turn
+     (`resumeReconciledTurn`) instead of admitting a fresh one. A crash with
+     no promoted checkpoint at all settles the run interrupted with the
+     user's text left in history exactly once, unanswered by that
+     particular run (the conservative outcome: nothing automatically
+     produces a reply to it).
+  2. **The duplicate-delivery guard now actually removes the spurious
+     dispatch (Important, CR-I1)**: the guard stopped the loop and pushed
+     raw items back, but a stale id restored into a *fresh* coordinator
+     (across a checkpoint or a process restart) was not recognized by that
+     coordinator's in-process `admittedItems` dedup, so `admitTurn` still
+     ran and minted a content-free turn that dispatched the model again --
+     deferring, not removing, the dispatch the guard exists to prevent.
+     `genInput` now also checks durable inbox state before calling
+     `admitTurn`, and `finishTurnLoop` filters `UnhandledItems`/late items
+     against durable state (`queuedAmong`) before deciding to pause: when
+     nothing is genuinely queued, it settles the run normally
+     (`settleCleanRunCompletion`, shared with the default clean-exit path)
+     instead of promoting a pointless pause-carrier turn.
+  3. **`reconcileCrashedRun` has the same protections every other run
+     driver has (Important, CR-I2)**: it ran in a bare goroutine with no
+     panic recovery, no observed-run span, no `RunSettledNotice` on
+     terminal settlement, and no lease heartbeat across its writes.
+     `reclaimAndReconcile` now drives it through `runReconcileCrashedRun`:
+     a deferred `recover()` converts a panic into `RunFailed` instead of
+     taking down the host process, `startObservedRun`/`finishObservedRun`
+     bracket the work, a lease heartbeat covers the writes, and
+     `RunSettledPoint` is notified on every genuinely terminal outcome
+     (never the nonterminal repause). It is deliberately not routed through
+     the shared `executeLifecycle` helper, whose own deferred `settleRun`
+     would double-settle a run this function already settled itself.
+  4. **The checkpoint gob-shape test now decodes through a real
+     `adk.TurnLoop` (Important, CR-I3)**: the round-three test (and this
+     doc, both corrected here) claimed
+     `TestEmptyLoopCheckpointMatchesUpstreamGobShape` "fails loudly on an
+     upstream rename." It could not -- it decoded `turnLoopCheckpointShape`'s
+     own bytes into a hand-written duplicate declared in the same test
+     file, and a one-field rename still passed.
+     `TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop`
+     (`runtime/w5_round3_test.go`) replaces it: it gob-encodes a non-zero
+     shape, stages it behind a minimal `adk.CheckPointStore`, and drives a
+     real `adk.NewTurnLoop` through `Run` -- eino's own
+     `unmarshalTurnLoopCheckpoint` + `tryLoadCheckpoint` -- asserting
+     `GenInput` receives exactly the encoded `UnhandledItems`.
+  5. **`Resume`'s reconcile path honours the `Handle` contract (Important,
+     CR-I4)**: its `streamingHandle.AwaitPause()` returned a `nil` channel
+     that never delivers or closes, violating `Handle`'s documented
+     contract now that a `RunPaused` result is reachable from it. The
+     handle is now a `turnLoopHandle` (the same implementation `Start`/
+     `ResumeRun` use), whose real pause channel is closed without a value
+     on a terminal outcome and carries `PauseInfo{RunID, StopCause:
+     "crash-reconciled"}` on a repause.
+  6. **The resumed-config test now observes `ResumeRun`'s real snapshot
+     (Important, MR-1)**: reverting `ResumeRun`'s `Agent.Mode`/
+     `Tools.Enabled`/`Tools.Disabled` restoration left `go test ./runtime`
+     green, because `TestResumeRunRestoresSystemPromptAndAgentOptions`
+     asserted against a `TurnSnapshot` it built itself rather than
+     `ResumeRun`'s own rebuilt config. It now records the REAL
+     `BoundedTurnMetadata` (via a `TurnPreparePoint` hook) and the REAL
+     `ToolScopeContext` (via the "gate" tool capability's own `Resolve`)
+     a prepared turn gets, pre- and post-resume, and compares the last
+     recorded value against the first and against the audited config.
+  7. **The plan's full process-restart acceptance bullet is now driven for
+     real (MR-2/MR-3)**: see the phase-7 acceptance-test-matrix additions
+     below.
+  8. **The durable guard, not the dispatch count, is the actually-binding
+     constraint on a workflow-pattern `AgentFactory` (docs only)**: see the
+     `AgentBuildContext` bullet above, corrected here -- `Guard` is an
+     `adk.TypedChatModelAgentMiddleware`, installable only inside a
+     `TypedChatModelAgent`, so a factory returning a pure workflow/
+     sequential agent with no such child fails `onAgentEvents`' guard check
+     before the dispatch check is ever consulted; narrowing the dispatch
+     predicate (as previously suggested) would not have lifted this.
+  9. **Docs corrected to match**: this section and the acceptance-matrix
+     phase-6 paragraph no longer claim the duplicate-delivery guard
+     "surfaces as a between-turn queued-continuation pause, never a second
+     dispatch" (item 2 shows the dispatch was deferred, not removed, before
+     this phase's fix), no longer claim the phase-6 tests alone proved the
+     process-restart acceptance bullet (item 7), and the gob-shape test's
+     doc comment states plainly what it now proves (item 4) instead of a
+     claim the previous version could not support.
+  Proven by `runtime/w5_round3_reconciliation_test.go`
+  (`TestReconcileCrashedRunSurvivesPanic`, the extended
+  `TestResumeReconcilesDanglingAdmittedTurnAfterCrash` and
+  `TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint`, both now
+  admitting real `UserParts` and asserting the user's text appears exactly
+  once in committed history), the extended
+  `TestDuplicateDeliveryOfAlreadyAdmittedItemDoesNotDispatch` and the new
+  `TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop`
+  (`runtime/w5_round3_test.go`), the extended
+  `TestResumeRunRestoresSystemPromptAndAgentOptions`
+  (`runtime/w5_round2_test.go`), the new
+  `runtime/w5_round4_acceptance_test.go`
+  (`TestProcessRestartRecoversMultipleQueuedInputsAfterFirstCommittedTurn`,
+  `TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused`,
+  `TestReconcileCrashedRunTerminalizesUnfinishedToolCall`), and the new
+  `store/storetest/w5_durable.go` `ResumeInterruptedTurn` contract case.
 - Verification actually run for this phase: `go build ./...`, `go vet ./...`,
   `go vet -tags postgres_integration ./...`, `gofmt`/`goimports`, and
   `./.bin/golangci-lint run ./...` (repo-wide, 0 issues) all pass.
@@ -1189,7 +1335,8 @@ unwritten (see that bullet for the exact, now-shorter list).
 - Acceptance-test matrix (`runtime/acceptance_matrix_test.go`,
   `runtime/turn_loop_sqlite_test.go`, `runtime/w5_reconciliation_test.go`,
   `runtime/w5_round2_test.go`, `runtime/w5_round3_test.go`,
-  `runtime/w5_round3_reconciliation_test.go`; focused cases clean under
+  `runtime/w5_round3_reconciliation_test.go`,
+  `runtime/w5_round4_acceptance_test.go`; focused cases clean under
   `-race -count=10`): checkpoint envelope
   malformed-rejection (empty/non-JSON/missing-required-field), checkpoint
   row version mismatch, plan-fingerprint mismatch, and a `model.Resolve`
@@ -1237,19 +1384,44 @@ unwritten (see that bullet for the exact, now-shorter list).
   additions** (see the phase-6 bullet above for the full mechanism):
   `TestResumeReconcilesDanglingAdmittedTurnAfterCrash` and
   `TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint`
-  (`runtime/w5_round3_reconciliation_test.go`) prove multiple queued inputs
-  with a process restart after the first committed turn *is* now covered:
-  a turn (and its consumed inbox items) a crashed process left
-  `admitted`/`running` is conservatively reconciled on the next `Resume`,
-  whether that is the run's first turn (settles interrupted, nothing to
-  resume) or a later one following an earlier successful pause (repauses,
-  genuinely resumable -- proven by a further `ResumeRun` actually
-  completing it). The residual gap phase 5 already named --
-  `loadInboxItems`' durable-state filter (inside `admitTurn`, after
+  (`runtime/w5_round3_reconciliation_test.go`) prove conservative
+  reconciliation of a turn (and its consumed inbox items) a crashed process
+  left `admitted`/`running`, whether that is the run's first turn (settles
+  interrupted, nothing to resume) or a later one following an earlier
+  successful pause (repauses, genuinely resumable -- proven by a further
+  `ResumeRun` actually completing it). **This pair alone did not cover the
+  plan's full acceptance bullet** (round-four reconciliation MR-2/MR-3):
+  both hand-build the crashed state directly via `AdmitTurn`/`StageCheckpoint`/
+  `PromotePause`, with one queued item and no turn genuinely driven to
+  completion by the engine -- see the phase-7 bullet below for the test
+  that actually closes it. **Phase 7 (round-four reconciliation) additions**
+  (see the phase-7 bullet below for the full mechanism):
+  `TestProcessRestartRecoversMultipleQueuedInputsAfterFirstCommittedTurn`
+  (`runtime/w5_round4_acceptance_test.go`) drives the plan's acceptance
+  bullet for real -- a real `Start` completes turn 1, two more messages are
+  enqueued and land as a genuine between-turn queued-continuation pause, the
+  first orchestrator's SQLite pool is closed and a second pool reopened over
+  the same file, and a brand-new orchestrator instance resumes and completes
+  the run -- asserting correct reconstructed history, exactly-once inbox
+  completion, no duplicate `run_started`, and exactly one `run_finished`.
+  `TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused` proves a targeted
+  resume of one of two simultaneously-pending tool interrupts leaves the
+  other paused untouched (no new dispatch), then resumes it too by its
+  current-generation address.
+  `TestReconcileCrashedRunTerminalizesUnfinishedToolCall` injects a crash at
+  a tool-settlement boundary (a durably-claimed, never-settled tool call)
+  recovered through `reconcileCrashedRun`'s `terminalizeUnfinishedTools`
+  call in the same reconciliation that settles the dangling turn that
+  requested it; checkpoint-boundary crash injection is covered by the
+  phase-6 dangling-turn tests above (a crash before any checkpoint for the
+  dangling turn was ever staged, and a crash after an earlier checkpoint was
+  promoted but before a new one was). The residual gap phase 5 already named
+  -- `loadInboxItems`' durable-state filter (inside `admitTurn`, after
   `claimItems` has already committed to a nonempty filtered set) can still
   admit a degenerate, dispatching continuation turn for a cross-process
   duplicate -- remains genuinely uncovered; item 2's fix closes only the
-  in-process split (see the phase-6 bullet). Reconciling more than one
+  in-process split (see the phase-6 bullet) and the checkpoint-restored
+  case (see the phase-7 bullet). Reconciling more than one
   simultaneously-dangling turn for the same run is not exercised (ordinary
   operation never admits a second turn before the first settles, so this
   is believed unreachable, not merely untested) and multiple, back-to-back
@@ -1264,6 +1436,13 @@ unwritten (see that bullet for the exact, now-shorter list).
   `AgentBuildContext` bullet above), narrowing the rogue-model check's
   zero-dispatch predicate for a legitimately-non-dispatching workflow
   factory (documented as a constraint instead -- see the phase-6 bullet),
+  explicit `release()`-count and goroutine-cleanup assertions on every exit
+  path (no test does this -- `grep -rn 'goleak\|NumGoroutine\|releaseCount'
+  runtime/` returns nothing), and the two ADK stop safe points
+  (`CancelAfterChatModel`/`CancelAfterToolCalls`) exercised separately
+  rather than only as the combined pair `runtime.StopPolicy{Graceful: true}`
+  always requests (the public API has no per-safe-point control to test
+  against, only graceful-vs-immediate, which is covered),
   and ADK's own gob-encoded payload being unsupported/malformed (this
   adapter only validates its own envelope wrapper around that opaque
   payload -- see the checkpoint envelope bullet -- ADK's own gob decode of
