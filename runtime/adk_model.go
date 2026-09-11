@@ -127,6 +127,16 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 	if err != nil {
 		return nil, err
 	}
+	// Bridge a host handler's BeforeAgent Instruction mutation (e.g.
+	// agentsmd/skill content injection) into the rendered system prompt --
+	// see instructionHolder's doc comment for why this is necessary.
+	if extra := m.engine.instruction.get(); extra != "" {
+		if request.System != "" {
+			request.System += "\n\n" + extra
+		} else {
+			request.System = extra
+		}
+	}
 	request, audited, hash, err := auditModelRequest(request, m.host.modelRequestSafeOptions, m.host.modelRequestMaxBytes)
 	if err != nil {
 		return nil, err

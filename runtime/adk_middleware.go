@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/cloudwego/eino/adk"
@@ -155,6 +156,69 @@ func (s *settlementSeal) BeforeModelRewriteState(ctx context.Context, state *adk
 	return ctx, state, nil
 }
 
+// instructionHolder carries the agent's cumulative BeforeAgent-produced
+// Instruction (as left by every host handler's BeforeAgent, including
+// content-injecting recipes such as agentsmd/skill) from agent-build time
+// into this turn's per-dispatch system-prompt rendering.
+//
+// This bridge exists because this runtime's adkModel rebuilds every
+// physical dispatch's model.Request.System from its own registered
+// composition.Registrar.Prompt sections (StreamingOrchestrator.
+// renderSystemPrompt), entirely independent of ADK's own
+// ChatModelAgentContext.Instruction/TypedChatModelAgentState mechanism that
+// upstream BeforeAgent handlers use to inject content. Without this bridge,
+// agentsmd (and any other Instruction-mutating handler) would build and
+// return successfully but have literally no effect on what the model ever
+// sees -- durableProjection discards ADK's own instruction-embedded input
+// in favor of a fresh durable reload, and renderSystemPrompt never consults
+// ChatModelAgentContext at all. See adkModel.begin, which appends
+// instructionHolder.get() to its rendered system prompt.
+type instructionHolder struct {
+	mu    sync.Mutex
+	value string
+}
+
+func (h *instructionHolder) set(value string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.value = value
+}
+
+func (h *instructionHolder) get() string {
+	if h == nil {
+		return ""
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.value
+}
+
+// instructionCaptureHandler is a mandatory tail handler (installed right
+// after every host handler, before durableGuard/settlementSeal) that
+// captures the agent's cumulative BeforeAgent-produced Instruction into
+// holder -- see instructionHolder's doc comment. BeforeAgent hooks run in
+// registration order, each seeing the previous one's already-mutated
+// runCtx, so this handler observes the Instruction only after every host
+// handler's own BeforeAgent has already run.
+type instructionCaptureHandler struct {
+	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	holder *instructionHolder
+}
+
+func newInstructionCaptureHandler(holder *instructionHolder) *instructionCaptureHandler {
+	return &instructionCaptureHandler{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, holder: holder}
+}
+
+func (h *instructionCaptureHandler) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+	if runCtx != nil {
+		h.holder.set(runCtx.Instruction)
+	}
+	return ctx, runCtx, nil
+}
+
 // toolWrappingMiddleware decorates a host-built adk.TypedChatModelAgentMiddleware
 // so that any tool it injects into ChatModelAgentContext.Tools via its own
 // BeforeAgent (e.g. the filesystem middleware's ls/read_file/write_file
@@ -165,6 +229,18 @@ func (s *settlementSeal) BeforeModelRewriteState(ctx context.Context, state *adk
 // own tools would otherwise fail every turn that reaches BeforeAgent. Every
 // recipe in this package wraps its upstream-built middleware with this
 // before returning it from its HandlerFactory.
+//
+// KNOWN GAP: this wrapping makes such a tool pass durableGuard's structural
+// check (a defense-in-depth guarantee), but a call to it currently still
+// fails earlier, at prepareToolCalls/resolveToolCall (adk_tools.go): those
+// resolve strictly against TurnSnapshot.Tools, which is frozen at
+// turn-admission time, before the agent (and hence any BeforeAgent tool
+// injection) ever runs. See TestFilesystemHandlerToolExecutesThroughDurableWrapper
+// for the exact reproduction and scope (filesystem/plantask/skill's own
+// tools; agentsmd/patchtoolcalls/reduction/toolsearch/summarization are
+// unaffected). Closing it needs TurnSnapshot.Tools to be extended with
+// discovered handler-injected tool names before prepareToolCalls runs, which
+// is out of this pass's scope.
 type toolWrappingMiddleware struct {
 	adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
 	wrap func(tool.BaseTool) tool.BaseTool

@@ -130,6 +130,12 @@ type adkEngine struct {
 	// (unledgered) provider call has already happened by the time the turn
 	// is failed.
 	dispatches atomic.Int64
+
+	// instruction carries the agent's cumulative BeforeAgent-produced
+	// Instruction into this turn's per-dispatch system-prompt rendering --
+	// see instructionHolder's doc comment (runtime/adk_middleware.go) and
+	// adkModel.begin, which appends it to renderSystemPrompt's output.
+	instruction *instructionHolder
 }
 
 // guardRan reports whether this turn's durable guard actually fired. A
@@ -365,15 +371,17 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 	if err != nil {
 		return nil, err
 	}
+	e.instruction = &instructionHolder{}
 	build := AgentBuildContext{
 		Model: inner, Tools: tools, ToolAliases: aliases,
-		Instruction:    "",
-		MaxIterations:  e.host.toolTurns(),
-		Guard:          guard,
-		SettlementSeal: newSettlementSeal(e.host.store),
-		Handlers:       handlers,
-		Retry:          defaultRetryConfig(e.host.attempts()),
-		Failover:       buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
+		Instruction:        "",
+		MaxIterations:      e.host.toolTurns(),
+		Guard:              guard,
+		SettlementSeal:     newSettlementSeal(e.host.store),
+		InstructionCapture: newInstructionCaptureHandler(e.instruction),
+		Handlers:           handlers,
+		Retry:              defaultRetryConfig(e.host.attempts()),
+		Failover:           buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
 	}
 	e.guard = guard
 	factory := e.plan.AgentFactory()
@@ -483,6 +491,11 @@ type AgentBuildContext struct {
 	// handler (see settlementSeal's doc comment); an AgentFactory must
 	// install it last, after Guard, in its Handlers list.
 	SettlementSeal adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	// InstructionCapture is the mandatory handler that bridges a host
+	// handler's BeforeAgent Instruction mutation into this turn's rendered
+	// system prompt (see instructionHolder's doc comment). An AgentFactory
+	// must install it right after Handlers, before Guard/SettlementSeal.
+	InstructionCapture adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
 	// Handlers is the ordered, per-execution snapshot of every
 	// composition.Registrar.Handler factory output for this run's frozen
 	// plan (see RunPlan.AgentHandlers), built fresh for this turn by
@@ -550,6 +563,9 @@ func (DefaultChatModelAgentFactory) BuildAgent(ctx context.Context, build AgentB
 	// AgentBuildContext provided -- see AgentBuildContext.Handlers and
 	// durableGuard/settlementSeal's doc comments.
 	cfg.Handlers = append(cfg.Handlers, build.Handlers...)
+	if build.InstructionCapture != nil {
+		cfg.Handlers = append(cfg.Handlers, build.InstructionCapture)
+	}
 	if build.Guard != nil {
 		cfg.Handlers = append(cfg.Handlers, build.Guard)
 	}

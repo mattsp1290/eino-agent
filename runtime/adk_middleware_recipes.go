@@ -179,7 +179,7 @@ func NewPlanTaskHandlerFactory(PlanTaskConfig) HandlerFactory {
 		if build.PlanTaskBackend == nil {
 			return nil, fmt.Errorf("%w: plantask requires a workspace root", errHandlerMissingBackend)
 		}
-		mw, err := plantask.NewTyped[*einoschema.AgenticMessage](ctx, &plantask.Config{Backend: build.PlanTaskBackend})
+		mw, err := plantask.NewTyped[*einoschema.AgenticMessage](ctx, &plantask.Config{Backend: build.PlanTaskBackend, BaseDir: "."})
 		if err != nil {
 			return nil, err
 		}
