@@ -176,6 +176,59 @@ multimodal, tool-call-bearing, reasoning, response-metadata, and `Extra` shapes
 fail before provider dispatch. Contributions cannot interleave with durable
 history in the first release.
 
+## Typed ADK agent handlers (W6)
+
+`composition.Registrar.Handler(HandlerRegistration{ID, Order, Scope,
+Descriptor: HandlerDescriptor{Kind, Version, Config json.RawMessage},
+Factory runtime.HandlerFactory})` is a distinct registration category from
+the generic hook/transform/gate/around/notification "handler" concept
+described above (`extension.HandlerKind`, `session.RegistrationIdentity` on
+`ComponentPlan.Handlers`): it registers one factory for a typed ADK
+`adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]`, the interface-based
+per-run agent customization point Eino's `adk` package itself defines
+(`BeforeAgent`, `BeforeModelRewriteState`/`AfterModelRewriteState`,
+`WrapModel`, `WrapInvokableToolCall`/etc., `AfterAgent`). Its sealed identity
+lives in its own nested collection, `session.ComponentPlan.AgentHandlers
+[]AgentHandlerPlanIdentity{ID, Kind, Version, ConfigHash, Order, Scope}`,
+alongside (not merged into) the existing `Handlers`/`Tools`/`Prompts`/
+`Guards`/`Restrictions` collections; it participates in the plan fingerprint
+the same way every other capability collection does. `Config`'s canonical
+hash (decode-then-remarshal, so key order never affects it), not its raw
+bytes, is what gets sealed -- the factory closure itself is never
+serialized, matching `RunPlanSpec.Agent`/`ToolSearch`'s existing "host
+construction identity, not durable capability evidence" treatment.
+
+`runtime.RunPlan.AgentHandlers()` exposes the sealed, ordered list with live
+`Factory` values attached; `adkEngine.buildAgent` invokes every factory
+fresh for each admitted turn with a bounded `runtime.HandlerBuildContext`
+(session/run identity, the mandatory ledger-audited model adapter, a
+durable tool-wrapper closure, read-only workspace-scoped filesystem/skill
+backend views, private writable scratch backends for plantask/reduction,
+this turn's frozen deferred tools, and the durable store/ID
+generator/clock a recipe like summarization needs to write its own durable
+state) and installs the results into `AgentBuildContext.Handlers`, ahead of
+this runtime's own mandatory tail handlers
+(`instructionCaptureHandler`, `durableGuard`, `settlementSeal` --
+`runtime/adk_middleware.go`). Ordering follows ADK's own
+first-registered-is-outermost handler-wrapping rule: host handlers (in
+`Order`, then `ID`, then owning component, then scope order) are outermost;
+this runtime's own tail handlers stay innermost, directly around the
+mandatory `Model`/`Tools` adapters, so no host handler can substitute them.
+`settlementSeal` additionally compares every settled tool's model-visible
+content against its durably recorded `Output` right before dispatch and
+fails the run on divergence.
+
+Two integration gaps are open, both documented with a skipped test and a
+doc comment at their root cause in `runtime/adk_middleware*.go`: a handler
+that injects model input as a *message* (not `ChatModelAgentContext.
+Instruction`) has no effect, because this runtime's ledger-audited model
+adapter always rebuilds the physical dispatch input from a fresh durable
+store reload; and a tool a handler injects at `BeforeAgent` time cannot
+currently be *called* (it passes `durableGuard`'s structural check but is
+rejected earlier, at `prepareToolCalls`, which resolves only against the
+tool registry frozen at turn-admission time, before any `BeforeAgent`
+injection runs).
+
 ## Request ledger and privacy
 
 Every provider attempt is persisted through the current run's

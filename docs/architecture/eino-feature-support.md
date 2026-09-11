@@ -1628,7 +1628,151 @@ unwritten (see that bullet for the exact, now-shorter list).
   `settleInterruptedRunningTool` helper that test exercises, so no
   dedicated new-engine-specific test was added.
 - Out of scope, not started: child agents (typed `AgentTool`/`DeepAgent`),
-  W6/W7. The superseded classic `PartKind`s were removed in W5 phase 2 (see
+  W7. The superseded classic `PartKind`s were removed in W5 phase 2 (see
   the W2 section's "superseded part kinds" note); a WIT/bindings reference
   to those kinds' string values was not found in `wit/eino-agent-extensions.wit`
   or `wasmext/gen`, so no W6 follow-up was required for this removal.
+
+## W6: typed ADK middleware, context and extensions
+
+Status: partial. Groups A, B and D landed and are verified per the gate list
+below (`go test ./composition ./runtime ./session/...`, `go vet
+-tags postgres_integration ./...`, `golangci-lint` 0 issues, `go test
+./runtime -race -count=3`). Group C's eight recipes build correctly against
+their upstream typed constructors and are construction-tested, but two of
+their runtime integration points are genuine, documented gaps (below), not
+silently dropped. `examples/agentic-middleware/` was not created this pass
+(see the gaps below for why an "all green" example is not yet honest to
+build) and Group E (WASM/WIT content-block evolution) was not started this
+pass; both are open follow-up work.
+
+- **Group A (composition + fingerprint)**: `composition.Registrar.Handler(HandlerRegistration{ID,
+  Order, Scope, Descriptor: HandlerDescriptor{Kind, Version, Config
+  json.RawMessage}, Factory runtime.HandlerFactory})` registers one typed
+  ADK agent-handler factory per component, alongside the existing Tool/
+  Prompt/Guard/Restriction/ToolSearch registrations. `handlerConfigHash`
+  canonicalizes `Config` (decode-then-remarshal, so `encoding/json`'s
+  automatic map-key sorting makes the hash independent of input key order)
+  before sealing it. The compiled identity --
+  `session.AgentHandlerPlanIdentity{ID, Kind, Version, ConfigHash, Order,
+  Scope}` on `session.ComponentPlan.AgentHandlers` -- is sealed into
+  `ExtensionPlanDescriptor` and therefore the run's fingerprint (golden
+  updated in `session/extensions_test.go`); the factory closure itself is
+  never serialized. `runtime.RunPlan.AgentHandlers()` exposes the sealed,
+  ordered (`Order`, then `ID`, then owning component instance, then scope)
+  list with live `Factory` values attached, for `adkEngine.buildAgent` to
+  invoke fresh per admitted turn. A changed `Config` changes the sealed
+  fingerprint (`TestAgentHandlerConfigChangeChangesFingerprintAndRefusesResume`,
+  `runtime/adk_middleware_e2e_test.go`), which the existing (unmodified)
+  `AcquireResumePlan`/`VerifyExtensionPlanForSession` fingerprint-mismatch
+  path already refuses on resume for every capability kind, AgentHandlers
+  included by construction.
+- **Group B (`runtime/adk_middleware.go`)**: `AgentBuildContext` gains
+  `Handlers` (the per-execution snapshot of every plan-ordered handler
+  factory's built instance), `SettlementSeal` and `InstructionCapture`.
+  `adkEngine.buildAgent`/`buildAgentHandlers` install, in ADK's own
+  first-registered-is-outermost handler order: host handlers (in plan
+  order) first, then `instructionCaptureHandler`, then the existing
+  `durableGuard` (integrated, not duplicated, from W5), then
+  `settlementSeal` last (innermost, directly around the mandatory
+  Model/Tools adapters). `settlementSeal.BeforeModelRewriteState` --
+  appended last, so it observes `state.Messages` only after every host
+  handler's own `BeforeModelRewriteState` has run -- compares every
+  `function_tool_result` block whose call ID matches a durably *settled*
+  `session.ToolCall` row against that row's `Output` byte-for-byte, and
+  fails the run on divergence
+  (`TestSettlementSealRejectsHostRewrittenToolResult`); a call ID with no
+  settled row (patchtoolcalls' legitimate dangling-call patch) is left
+  alone. The ledger model adapter (`adkModel`) remains the sole audit
+  authority structurally -- `AgentBuildContext.Model` is always the mandatory
+  adapter, and W5's existing dispatch-count check
+  (`adkEngine.dispatches`/`onAgentEvents`) already detects a factory that
+  substitutes its own model -- so no separate "auditSeal" handler was
+  needed. `toolWrappingMiddleware` + `newAdkGenericDurableTool` (six
+  capability-narrow wrapper types: invokable/streamable/both, each in a
+  standard and an enhanced variant) let a host handler's own
+  BeforeAgent-injected tools pass `durableGuard`'s structural check.
+  `instructionCaptureHandler`/`instructionHolder` bridge a handler's
+  `BeforeAgent` `Instruction` mutation into the per-dispatch rendered system
+  prompt (`adkModel.begin`); this bridge exists and is safe but is
+  currently inert, since no shipped Group C recipe uses
+  `ChatModelAgentContext.Instruction` (see the agentsmd gap below).
+- **Group C (`runtime/adk_middleware_recipes.go`,
+  `adk_middleware_workspace.go`, `adk_middleware_scratch.go`)**: typed
+  wiring recipes for all eight upstream middlewares (`agentsmd`, `skill`,
+  `filesystem`, `plantask`, `patchtoolcalls`, `reduction`, `summarization`,
+  `dynamictool/toolsearch`), each calling the upstream `NewTyped`
+  constructor directly and failing construction closed when a required
+  backend/config is absent (construction-level positive/negative tests in
+  `runtime/adk_middleware_recipes_test.go` for all eight).
+  `workspaceFilesystemBackend`/`workspaceSkillBackend` are read-only views
+  rooted at the admitted canonical workspace
+  (`internal/workspace.CanonicalRoot`), rejecting `..`-relative and
+  symlink path escape (`TestWorkspaceFilesystemBackendRejectsPathEscape`,
+  `TestWorkspaceFilesystemBackendRejectsSymlinkEscape`) and supporting
+  multimodal image/PDF reads as media parts
+  (`TestWorkspaceFilesystemBackendMultiModalRead`).
+  `writableWorkspaceBackend` is a private, workspace-contained scratch area
+  for plantask/reduction's own state (round-trip tested). Summarization's
+  `Finalize` maps a completed summary into an atomic `session.ContextEpoch`
+  via `session.Store.StartContextEpoch` + `compaction.AppendBoundary`,
+  correlating in-memory summarized messages to durable `session.MessageID`s
+  by position (a documented, checked assumption -- a length mismatch fails
+  Finalize closed rather than fabricating a boundary:
+  `TestSummarizationFinalizeMapsSummaryIntoContextEpoch`,
+  `TestSummarizationFinalizeFailsClosedOnLengthMismatch`); cancelled/failed
+  summary generation never calls `Finalize` (upstream's own contract), so
+  the previous epoch stays active with no code needed for that half of the
+  acceptance criterion.
+- **Group D**: verified no-op. `runtime/extension_{context,model,tool,lifecycle}.go`
+  and `wasmext/*.go` already carry only `*schema.AgenticMessage` (landed in
+  W3), not classic `schema.Message`; grepping for `schema\.Message\b` in
+  those files (excluding tests) returns nothing.
+- **Two documented gaps** (found writing end-to-end tests; each has a
+  `t.Skip`ped test naming it and a doc comment at its root cause):
+  1. **agentsmd's injected content never reaches the model.** agentsmd
+     injects a *message* into ADK's in-memory `state.Messages`
+     (`schema.UserAgenticMessage`, tagged via `Extra` for its own
+     idempotency check), not into `ChatModelAgentContext.Instruction`. This
+     runtime's `adkModel.begin` rebuilds every physical dispatch's actual
+     input from a fresh durable store reload (`durableProjection`), which
+     has no knowledge of that in-memory-only message and discards it. A
+     first attempt to bridge this generically (capture any
+     `state.Messages` entry with a non-empty `Extra` map, in a mandatory
+     tail handler, and splice it back into the projection) broke the
+     entire tool-loop test suite ("clone message N contains non-copyable
+     streaming metadata"): ADK's own ReAct loop tags its *own*
+     internally-reconstructed messages (an echoed-back prior tool-call
+     message) with framework-internal `Extra` too, so "non-empty `Extra`"
+     is not a safe "handler-injected" signal and the naive bridge
+     duplicated ordinary tool-loop messages. That attempt was reverted;
+     `TestAgentsMDHandlerInjectsContentIntoModelRequest` is skipped with
+     this explanation. A correct fix needs a real handler-injection marker
+     (not "any `Extra`") and index-safe splicing relative to the
+     `providerState` reindexing math in `durableProjection`.
+  2. **A handler-injected tool cannot be called.** `durableGuard`/
+     `toolWrappingMiddleware` correctly accept a tool a handler's
+     middleware injects at `BeforeAgent` time (filesystem's
+     ls/read_file/write_file/edit_file/glob/grep, plantask's task tools,
+     skill's "skill" tool) -- a structural, defense-in-depth guarantee,
+     verified. But a model call to such a tool still fails earlier, at
+     `prepareToolCalls`/`resolveToolCall` (`adk_tools.go`): those resolve
+     strictly against `TurnSnapshot.Tools`, frozen at turn-admission time,
+     before the agent (and hence any `BeforeAgent` tool injection) ever
+     runs, so the call fails the turn with `tool "read_file" unavailable`
+     instead of executing.
+     `TestFilesystemHandlerToolExecutesThroughDurableWrapper` is skipped
+     with this explanation. `agentsmd`/`patchtoolcalls`/`reduction`/
+     `toolsearch`/`summarization` are unaffected (no new tools, or tools
+     already frozen in the plan via `Deferred: true`). Closing this needs
+     `TurnSnapshot.Tools` to be extended with discovered handler-injected
+     tool names before `prepareToolCalls` runs -- a genuine W-level change
+     to when the tool registry freezes relative to agent construction, out
+     of this pass's scope.
+- **Not started this pass**: `examples/agentic-middleware/` (the two gaps
+  above block several of the plan's acceptance scenarios -- multimodal
+  filesystem read via an actual tool call, plantask update, skill
+  activation -- from genuinely completing, so a "runs and passes" example
+  covering the full acceptance list was not honest to build yet); Group E
+  (WIT `text-message` -> versioned `content-block` variant, regenerated
+  bindings, rebuilt WASM fixtures, updated external-consumer exercise).
