@@ -49,15 +49,42 @@ func defaultScratchRootDir() (string, error) {
 // call (see the Go 1.24+ os.Root documentation), closing the dangling-
 // symlink escape a plain filepath.EvalSymlinks-based check cannot (round-
 // two W6 review I4).
+//
+// The per-session directory itself is created and opened THROUGH a parent
+// *os.Root rooted at scratchRoot, never via a plain os.MkdirAll(dir, ...) +
+// os.OpenRoot(dir) on the fully-joined path: that earlier version's
+// os.MkdirAll on the joined path would happily create through, and
+// os.OpenRoot would happily root itself AT, a symlink an attacker planted
+// at exactly the per-session subdirectory name -- since containment was
+// never established until AFTER that open, the "no escape" guarantee this
+// function's own doc comment promises never actually applied to opening the
+// root itself (round-three W6 authority-regression review S4, confirmed by
+// probe). Routing both the directory's creation (parent.MkdirAll) and its
+// opening (parent.OpenRoot) through the PARENT root closes this: os.Root's
+// own methods refuse to follow a symlink that would resolve outside
+// scratchRoot for either operation, so a pre-planted symlink at the
+// per-session directory name is rejected instead of silently followed.
+// scratchRoot itself (never attacker-influenced -- it is this process's own
+// configured or default cache directory, not derived from any session-
+// controlled input) is still created with a plain os.MkdirAll, since it is
+// the trust anchor nothing else can sandbox it against.
 func sessionScratchRoot(scratchRoot string, sessionID session.ID) (*os.Root, error) {
 	if scratchRoot == "" {
 		return nil, fmt.Errorf("%w: scratch root required", errScratchPathEscape)
 	}
-	dir := filepath.Join(scratchRoot, sessionScratchDirName(sessionID))
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(scratchRoot, 0o700); err != nil {
 		return nil, err
 	}
-	return os.OpenRoot(dir)
+	parent, err := os.OpenRoot(scratchRoot)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = parent.Close() }()
+	name := sessionScratchDirName(sessionID)
+	if err := parent.MkdirAll(name, 0o700); err != nil {
+		return nil, err
+	}
+	return parent.OpenRoot(name)
 }
 
 // scratchRootBackend is a writable writableTaskBackend (plantask's full

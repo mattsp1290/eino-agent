@@ -89,6 +89,61 @@ func TestScratchRootBackendRejectsDanglingSymlinkDelete(t *testing.T) {
 	}
 }
 
+// TestSessionScratchRootRejectsSymlinkPlantedAtSessionDirName is round-three
+// W6 authority-regression review S4: unlike the two tests above (a symlink
+// planted INSIDE an already-open, already-contained scratch root), this
+// plants a symlink pointing OUTSIDE scratchRoot at the exact path
+// sessionScratchRoot itself is about to create/open --
+// filepath.Join(scratchRoot, sessionScratchDirName(sessionID)) -- BEFORE
+// sessionScratchRoot is ever called. The pre-fix implementation
+// (os.MkdirAll(dir, ...) + os.OpenRoot(dir) on the fully-joined path) would
+// happily create through, and root itself AT, that symlink's target: every
+// containment guarantee scratchRootBackend advertises only ever applied
+// AFTER the root was already opened at the wrong place. A write through the
+// returned root must stay inside scratchRoot; the outside target must never
+// be touched.
+func TestSessionScratchRootRejectsSymlinkPlantedAtSessionDirName(t *testing.T) {
+	scratchDir := t.TempDir()
+	outside := t.TempDir()
+	sessionID := session.ID("symlink-at-session-dir-session")
+	if err := os.MkdirAll(scratchDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	plantedLink := filepath.Join(scratchDir, sessionScratchDirName(sessionID))
+	if err := os.Symlink(outside, plantedLink); err != nil {
+		t.Skipf("symlink unsupported in this environment: %v", err)
+	}
+
+	root, err := sessionScratchRoot(scratchDir, sessionID)
+	if err == nil {
+		// os.Root.MkdirAll for a name that already exists as a symlink to a
+		// directory is one acceptable failure mode; if it instead succeeded
+		// (some platform's os.Root implementation may tolerate an
+		// already-existing directory-like entry), every subsequent write
+		// through the returned root must still land inside scratchRoot, not
+		// inside `outside`.
+		backend, backendErr := newScratchRootBackend(root, "reduction")
+		if backendErr != nil {
+			t.Fatal(backendErr)
+		}
+		if writeErr := backend.Write(context.Background(), &adkfilesystem.WriteRequest{FilePath: "escape.txt", Content: "PWNED"}); writeErr == nil {
+			// newScratchRootBackend(root, "reduction") scopes writes under
+			// a "reduction" subdirectory of whatever root actually opened
+			// at, so a successful escape lands at outside/reduction/escape.txt,
+			// not outside/escape.txt directly.
+			if _, statErr := os.Stat(filepath.Join(outside, "reduction", "escape.txt")); statErr == nil {
+				t.Fatal("sessionScratchRoot followed a symlink planted at the per-session directory name -- a write escaped scratchRoot entirely")
+			}
+		}
+		return
+	}
+	// The expected, fail-closed outcome: sessionScratchRoot refuses to
+	// create/open through the planted symlink at all.
+	if _, statErr := os.Lstat(filepath.Join(outside, "escape.txt")); statErr == nil {
+		t.Fatal("a file was created outside scratchRoot despite sessionScratchRoot itself returning an error")
+	}
+}
+
 // TestScratchRootBackendsAreSessionIsolated is RA I6: a session may read
 // only its own offloads. Two sessions' scratch backends, opened against
 // the SAME shared scratchRoot directory, must not see each other's files.
