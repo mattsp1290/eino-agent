@@ -27,6 +27,7 @@ package agenticmiddleware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -354,14 +355,46 @@ func TestReductionTruncatesLargeSettledToolResultTwiceInOneTurn(t *testing.T) {
 	}
 }
 
+// summaryGenerationMarker is upstream summarization's own fixed
+// user-instruction text (adk/middlewares/summarization/prompt.go's
+// userSummaryInstruction), used here to tell its internal summary-
+// generation call apart from this turn's own main dispatch in a scripted
+// streamer, without depending on any runtime-internal plumbing.
+const summaryGenerationMarker = "CRITICAL: Respond with TEXT ONLY"
+
+// requestIsSummaryGeneration reports whether request carries upstream
+// summarization's own fixed user-instruction marker text anywhere in its
+// messages.
+func requestIsSummaryGeneration(request model.Request) bool {
+	for _, msg := range request.Messages {
+		if msg == nil {
+			continue
+		}
+		for _, block := range msg.ContentBlocks {
+			if block == nil || block.UserInputText == nil {
+				continue
+			}
+			if strings.Contains(block.UserInputText.Text, summaryGenerationMarker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection
-// proves summarization's positive path with a fake summary model (the same
-// scripted streamer serving the whole turn, including upstream's own
-// internal summary-generation call): a session.ContextEpoch row is
-// durably written, the full message replay is never shortened (nothing is
-// deleted), and a second, later turn's model-visible history is narrower
-// than the full replay -- proving only the active provider projection
-// changes.
+// proves summarization's full positive path with a fake summary model (the
+// same scripted streamer serving the whole turn, including upstream's own
+// internal summary-generation call, distinguished via
+// requestIsSummaryGeneration): a session.ContextEpoch row is durably
+// written with agent path "summarizer" on its own ledger row, the summary
+// is never persisted as the turn's own assistant answer (exactly one
+// assistant_gen_text part on the turn's message), the full message replay
+// is never shortened (nothing is deleted), and a SECOND, later turn on the
+// same session -- a real second orch.Start call, not a re-derivation --
+// both completes (proving the prior "session content is invalid" admission
+// bug is fixed) and sees a narrower model-visible history than the full
+// durable replay, proving only the active provider projection changes.
 func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
@@ -375,9 +408,22 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
 
-	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
-		return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
-	}))
+	var secondDispatchMessageCount int
+	var sawSecondDispatch bool
+	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if requestIsSummaryGeneration(request) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
+		}
+		if sawSecondDispatch {
+			// The turn-2 main dispatch: record how many messages the
+			// provider actually saw, to compare against the full durable
+			// replay below.
+			secondDispatchMessageCount = len(request.Messages)
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("ok, understood")}, nil
+	})
+	orch := newTestOrchestrator(t, store, registry, streamer)
+
 	handle, err := orch.Start(context.Background(), runtime.Request{
 		SessionID: sessionID, Message: runtime.TextUserMessage("hello there"), Config: testConfig(""),
 	})
@@ -386,7 +432,7 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	}
 	result := awaitDone(t, handle, 10*time.Second)
 	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v, want completed", result)
+		t.Fatalf("turn 1 result = %+v, want completed", result)
 	}
 
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
@@ -403,6 +449,23 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 		t.Fatalf("no summarization ContextEpoch row found among %+v", epochs)
 	}
 
+	// The summarization recipe's own internal call is durably ledgered with
+	// agent path "summarizer" -- never the turn's own (empty) agent path --
+	// and never claims/persists onto the turn's own assistant message.
+	requests, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawSummarizerAgentPath bool
+	for _, record := range requests.Records {
+		if record.AgentPath == "summarizer" {
+			sawSummarizerAgentPath = true
+		}
+	}
+	if !sawSummarizerAgentPath {
+		t.Fatalf("no model request ledger row has AgentPath == \"summarizer\": %+v", requests.Records)
+	}
+
 	replay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
 	if err != nil {
 		t.Fatal(err)
@@ -410,40 +473,75 @@ func TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection(t *
 	if len(replay.Messages) < 2 {
 		t.Fatalf("full replay = %d messages, want the original turn's messages still present (nothing deleted)", len(replay.Messages))
 	}
-	// "Only the active provider projection changes, full replay stays
-	// unchanged" (the other half of this scenario) is proven at the
-	// mechanism level by durableBaselineHandler/buildDurableBaseline and
-	// summarizationFinalize's own epoch-boundary derivation -- see
-	// runtime's TestSummarizationHandlerTriggersAndWritesContextEpoch and
-	// TestSummarizationFinalizeMapsSummaryIntoContextEpoch -- rather than
-	// re-derived here via a second live turn on the same session, which
-	// this package's own store/summarization interaction does not
-	// currently support cleanly (a second AdmitTurn against a session
-	// whose most recent epoch has not yet been read back into a message
-	// count runtime.buildDurableBaseline expects triggers a store-level
-	// content decode error in this harness's minimal setup); a real
-	// caller's second turn goes through the same runtime.buildDurableBaseline
-	// path proven by those tests.
+	owners, err := session.ResolveReplayPartOwners(replay.Parts, replay.PartOwnerMessageIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turnAssistantGenTextParts int
+	for i, part := range replay.Parts {
+		if owners[i] == result.MessageID && part.Kind == session.PartAssistantGenText {
+			turnAssistantGenTextParts++
+		}
+	}
+	if turnAssistantGenTextParts != 1 {
+		t.Fatalf("turn's own assistant message has %d assistant_gen_text parts, want exactly 1 (the summary must never be persisted onto it)", turnAssistantGenTextParts)
+	}
+
+	// Second turn, same session: a real second orch.Start call. This must
+	// complete -- the summarization recipe's internal-dispatch adapter no
+	// longer corrupts the turn's assistant message, so admission's durable
+	// history reload succeeds instead of failing with a content decode
+	// error.
+	sawSecondDispatch = true
+	handle2, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("please continue"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result2 := awaitDone(t, handle2, 10*time.Second)
+	if result2.Status != session.RunCompleted {
+		t.Fatalf("turn 2 result = %+v, want completed", result2)
+	}
+	if secondDispatchMessageCount == 0 {
+		t.Fatal("turn 2's main dispatch was never observed")
+	}
+	fullReplay, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fullReplay.Messages) <= len(replay.Messages) {
+		t.Fatalf("full replay did not grow across turn 2: before=%d after=%d", len(replay.Messages), len(fullReplay.Messages))
+	}
+	if secondDispatchMessageCount >= len(fullReplay.Messages) {
+		t.Fatalf("turn 2's provider-visible message count (%d) did not narrow below the full durable replay (%d)", secondDispatchMessageCount, len(fullReplay.Messages))
+	}
 }
 
-// failingSummaryModelPositiveTurn is a scripted streamer that fails every
-// call whose request contains a system/user-instruction marker unique to
-// upstream summarization's own internal generation call, simulating a
-// failed (or cancelled) summary generation; the main turn's own dispatch
-// still completes normally.
+// TestSummarizationFailedGenerationKeepsPreviousEpoch proves the "failed
+// generation" half of the epoch-preservation contract with a streamer that
+// actually triggers summarization (SummarizationTriggerMsgs: 1) and then
+// fails specifically the internal summary-generation call (identified via
+// requestIsSummaryGeneration, upstream's own fixed marker text) while the
+// turn's own main dispatch still succeeds: upstream never calls Finalize
+// when its own model call fails, so no session.ContextEpoch row is ever
+// created for this run, and the turn still completes.
 func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 	store := newTestStore(t)
 	registry := newTestRegistry(t)
 	sessionID := session.ID("summarization-failure-session")
 	mount, err := Mount(context.Background(), registry, sessionID, Config{
-		SummarizationTriggerMsgs: 1 << 30, // never trigger, so no epoch is ever created; this proves the "no epoch" half directly
+		SummarizationTriggerMsgs: 1,
 		Disable:                  disableAllExcept(runtime.HandlerKindSummarization),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = mount.Close(context.Background()) }()
-	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if requestIsSummaryGeneration(request) {
+			return nil, errors.New("simulated summary generation failure")
+		}
 		return []*einoschema.AgenticMessage{agenticAssistantText("ok, no summary needed")}, nil
 	}))
 	handle, err := orch.Start(context.Background(), runtime.Request{
@@ -454,7 +552,7 @@ func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 	}
 	result := awaitDone(t, handle, 10*time.Second)
 	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v, want completed", result)
+		t.Fatalf("result = %+v, want completed even though the summary generation call failed", result)
 	}
 	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
 	if err != nil {
@@ -462,7 +560,52 @@ func TestSummarizationFailedGenerationKeepsPreviousEpoch(t *testing.T) {
 	}
 	for _, epoch := range epochs {
 		if epoch.Trigger == "summarization" {
-			t.Fatalf("a summarization epoch was created even though the trigger never fired / generation never ran: %+v", epoch)
+			t.Fatalf("a summarization epoch was created even though generation failed: %+v", epoch)
+		}
+	}
+}
+
+// TestSummarizationCancelledGenerationKeepsPreviousEpoch is the cancelled-
+// context counterpart to TestSummarizationFailedGenerationKeepsPreviousEpoch:
+// the summary generation call's own context is cancelled instead of
+// returning an ordinary error, and the same invariant holds -- no
+// session.ContextEpoch row is created, and the turn's own main dispatch
+// still completes.
+func TestSummarizationCancelledGenerationKeepsPreviousEpoch(t *testing.T) {
+	store := newTestStore(t)
+	registry := newTestRegistry(t)
+	sessionID := session.ID("summarization-cancel-session")
+	mount, err := Mount(context.Background(), registry, sessionID, Config{
+		SummarizationTriggerMsgs: 1,
+		Disable:                  disableAllExcept(runtime.HandlerKindSummarization),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = mount.Close(context.Background()) }()
+	orch := newTestOrchestrator(t, store, registry, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		if requestIsSummaryGeneration(request) {
+			return nil, context.Canceled
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("ok, no summary needed")}, nil
+	}))
+	handle, err := orch.Start(context.Background(), runtime.Request{
+		SessionID: sessionID, Message: runtime.TextUserMessage("hi"), Config: testConfig(""),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := awaitDone(t, handle, 10*time.Second)
+	if result.Status != session.RunCompleted {
+		t.Fatalf("result = %+v, want completed even though the summary generation call was cancelled", result)
+	}
+	epochs, err := store.ListContextEpochs(context.Background(), sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, epoch := range epochs {
+		if epoch.Trigger == "summarization" {
+			t.Fatalf("a summarization epoch was created even though generation was cancelled: %+v", epoch)
 		}
 	}
 }

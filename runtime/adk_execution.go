@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -472,6 +474,7 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 		epochs: contextEpochCapability{
 			sessionID: e.snapshot.SessionID, runID: e.snapshot.RunID,
 			store: e.host.store, execution: e.execution.store, ids: e.host.ids, now: e.host.now,
+			contentLimits: e.host.contentLimits,
 		},
 	}
 	// summaryModel is the bounded internal-dispatch adapter handed to ONLY
@@ -495,16 +498,28 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 		}
 		build.FilesystemBackend = fsBackend
 		build.SkillBackend = skillBackend
-		planTaskBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "plantask"))
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		// plantask/reduction scratch state is rooted per-session (never a
+		// workspace-wide directory two sessions on the same workspace would
+		// otherwise share, colliding task IDs and offload files across
+		// sessions -- see sessionScratchDirName), and constructed lazily,
+		// only for the recipe kinds this plan actually mounts: a workspace
+		// where only agentsmd/filesystem/skill are mounted never gets a
+		// ".eino-agent/sessions/..." directory written into it at all.
+		sessionDir := sessionScratchDirName(e.snapshot.SessionID)
+		if planHasHandlerKind(plan, HandlerKindPlanTask) {
+			planTaskBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "sessions", sessionDir, "plantask"))
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+			}
+			build.PlanTaskBackend = planTaskBackend
 		}
-		build.PlanTaskBackend = planTaskBackend
-		reductionBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "reduction"))
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		if planHasHandlerKind(plan, HandlerKindReduction) {
+			reductionBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "sessions", sessionDir, "reduction"))
+			if err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+			}
+			build.ReductionBackend = reductionBackend
 		}
-		build.ReductionBackend = reductionBackend
 	}
 	handlers := make([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], 0, len(plan))
 	liveTools := make(map[string]tool.BaseTool)
@@ -555,6 +570,27 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.Agen
 	}
 	e.handlerTools = liveTools
 	return handlers, nil
+}
+
+// planHasHandlerKind reports whether plan contains at least one handler
+// registration of the given Kind.
+func planHasHandlerKind(plan []PlanAgentHandler, kind string) bool {
+	for _, entry := range plan {
+		if entry.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// sessionScratchDirName derives a filesystem-safe directory name from a
+// session ID: session IDs are opaque, host-supplied strings that may
+// contain path separators or ".." segments, so this never embeds the raw
+// ID into a path -- it hashes it instead, giving a deterministic,
+// traversal-proof directory name per session.
+func sessionScratchDirName(sessionID session.ID) string {
+	sum := sha256.Sum256([]byte(sessionID))
+	return hex.EncodeToString(sum[:])
 }
 
 func cloneStringSliceMap(src map[string][]string) map[string][]string {

@@ -448,10 +448,26 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 			include[summary.ID] = true
 		}
 	}
+	// tailAnchor is where the verbatim tail begins: TailStartID when the
+	// epoch retained one, or the boundary/summary message's own ID when it
+	// did not (retainTail == 0). In the latter case nothing existing at
+	// epoch-creation time is retained verbatim, but every message produced
+	// AFTER the boundary (a later turn's own conversation, continuing past
+	// the compaction point) must still flow through -- an empty TailStartID
+	// must never mean "nothing after this epoch is ever included again".
+	tailAnchor := epoch.TailStartID
+	if tailAnchor == "" {
+		tailAnchor = epoch.SummaryMessageID
+	}
 	tailStarted := false
 	for _, message := range batch.Messages {
-		if message.ID == epoch.TailStartID {
+		if message.ID == tailAnchor {
 			tailStarted = true
+			if tailAnchor == epoch.SummaryMessageID {
+				// Already included above; the tail begins with whatever
+				// comes after it, not the boundary message itself again.
+				continue
+			}
 		}
 		if tailStarted && !include[message.ID] {
 			messages = append(messages, message)

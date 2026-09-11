@@ -346,18 +346,20 @@ var errSummarizationTailUnsplittable = fmt.Errorf("%w: summarization tail cannot
 
 // summarizationFinalize maps a completed summary into a new atomic
 // session.ContextEpoch. It correlates upstream's in-memory originalMessages
-// with this session's durable message history by position: it loads the
-// full durable history (via the epochs capability's read-only reload),
-// filters it to conversational roles (system/user/assistant -- the same
-// roles the agentic projection carries), and requires that filtered list to
-// be exactly as long as originalMessages. This holds for the expected case
-// (summarizing the session's complete, uninterrupted conversational
-// history) but is a documented, checked assumption, not a guarantee for
-// every possible upstream Trigger/GenModelInput configuration: a mismatch
-// fails Finalize closed (an error, which fails the run) rather than
-// fabricating an incorrect boundary. Because summarization's own internal
-// call now runs through a bounded internal-dispatch adapter that never
-// persists a trailing assistant message (see adkModel.internalDispatch),
+// with this session's durable message history by loading the SAME
+// epoch-projected agentic view ADK's own current-turn input was built from
+// (build.epochs.loadCurrentAgenticProjection, applying whatever
+// summarization epoch is already active for this session -- possibly none,
+// possibly one from an earlier summarization on this same session): its
+// SourceMessageIDs correlates 1:1, in order, with originalMessages. This
+// holds for the expected case (summarizing the session's complete,
+// uninterrupted conversational history, whether or not it has already been
+// summarized once before) but is a documented, checked assumption, not a
+// guarantee for every possible upstream Trigger/GenModelInput configuration:
+// a mismatch fails Finalize closed (an error, which fails the run) rather
+// than fabricating an incorrect boundary. Because summarization's own
+// internal call now runs through a bounded internal-dispatch adapter that
+// never persists a trailing assistant message (see adkModel.internalDispatch),
 // this correlation no longer needs the "drop one trailing entry" workaround
 // a prior revision required.
 func summarizationFinalize(build HandlerBuildContext, retainTail int) summarization.TypedFinalizeFunc[*einoschema.AgenticMessage] {
@@ -366,23 +368,46 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 		if strings.TrimSpace(summaryText) == "" {
 			return nil, fmt.Errorf("%w: summary text is empty", errADKUnsupportedBlock)
 		}
+		activeEpoch, err := build.epochs.activeEpoch(ctx)
+		if err != nil {
+			return nil, err
+		}
+		projection, err := build.epochs.loadCurrentAgenticProjection(ctx, activeEpoch)
+		if err != nil {
+			return nil, err
+		}
+		// history.LoadAgentic has no notion of "unfinalized": unlike
+		// adkEngine.buildDurableBaseline (which explicitly drops the turn's
+		// own not-yet-committed assistant placeholder via
+		// dropUnfinalizedAssistantPlaceholders before ADK ever sees it),
+		// projectLegacyAgenticMessage happily projects a zero-part
+		// assistant message as an empty AgenticMessage. ADK's own
+		// originalMessages never includes that placeholder, so it must be
+		// filtered out here the same way, in lockstep with SourceMessageIDs,
+		// or the correlation below is off by one for every turn's first
+		// summarization trigger.
+		sourceIDs := make([]session.MessageID, 0, len(projection.SourceMessageIDs))
+		for i, msg := range projection.Messages {
+			if msg != nil && msg.Role == einoschema.AgenticRoleTypeAssistant && len(msg.ContentBlocks) == 0 {
+				continue
+			}
+			sourceIDs = append(sourceIDs, projection.SourceMessageIDs[i])
+		}
+		if len(sourceIDs) != len(originalMessages) || len(sourceIDs) == 0 {
+			return nil, fmt.Errorf("%w: summarization could not correlate %d in-memory messages with %d durable messages", errADKUnsupportedBlock, len(originalMessages), len(sourceIDs))
+		}
+		// A second pass over the FULL, unfiltered durable history (not
+		// epoch-projected) gives role and content-block-kind lookups by
+		// message ID for the tail-boundary logic below; every ID in
+		// projection.SourceMessageIDs is necessarily present in it (the
+		// epoch-projected view is a subset of the full durable history).
 		batch, err := build.epochs.loadConversationalHistory(ctx)
 		if err != nil {
 			return nil, err
 		}
-		// An assistant-role message with zero owned parts is an unfinalized
-		// placeholder (AdmitTurn creates the turn's own placeholder row
-		// before this middleware ever runs, exactly like
-		// adkEngine.buildDurableBaseline's dropUnfinalizedAssistantPlaceholders,
-		// which uses the same "assistant role, no content" test on the
-		// projected message) -- ADK's own in-memory originalMessages never
-		// includes it either, so it must be excluded here too or the
-		// correlation-by-count below always fails by one. System/user
-		// messages are never placeholders and are always included
-		// regardless of part count.
-		owned := make(map[session.MessageID]bool, len(batch.PartOwnerMessageIDs))
-		for _, id := range batch.PartOwnerMessageIDs {
-			owned[id] = true
+		byID := make(map[session.MessageID]session.Message, len(batch.Messages))
+		for _, msg := range batch.Messages {
+			byID[msg.ID] = msg
 		}
 		owners, err := session.ResolveReplayPartOwners(batch.Parts, batch.PartOwnerMessageIDs)
 		if err != nil {
@@ -392,19 +417,13 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 		for i, part := range batch.Parts {
 			partsByMessage[owners[i]] = append(partsByMessage[owners[i]], part)
 		}
-		var durable []session.Message
-		for _, msg := range batch.Messages {
-			switch msg.Role {
-			case session.RoleSystem, session.RoleUser:
-				durable = append(durable, msg)
-			case session.RoleAssistant:
-				if owned[msg.ID] {
-					durable = append(durable, msg)
-				}
+		durable := make([]session.Message, len(sourceIDs))
+		for i, id := range sourceIDs {
+			msg, ok := byID[id]
+			if !ok {
+				return nil, fmt.Errorf("%w: summarization correlated durable message %s not found in full history reload", errADKUnsupportedBlock, id)
 			}
-		}
-		if len(durable) != len(originalMessages) || len(durable) == 0 {
-			return nil, fmt.Errorf("%w: summarization could not correlate %d in-memory messages with %d durable messages", errADKUnsupportedBlock, len(originalMessages), len(durable))
+			durable[i] = msg
 		}
 		if retainTail < 0 {
 			retainTail = 0

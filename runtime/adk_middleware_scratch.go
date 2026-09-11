@@ -30,18 +30,31 @@ type writableWorkspaceBackend struct {
 }
 
 // newWritableWorkspaceBackend canonicalizes workspaceRoot, creates
-// subdir under it if missing, and returns a backend rooted there.
+// subdir under it if missing, and returns a backend rooted there. subdir
+// itself (or an ancestor of it, e.g. a symlinked ".eino-agent") must resolve
+// to somewhere actually contained in the canonical workspace root: without
+// this check, a symlinked intermediate directory already present in an
+// untrusted workspace would let os.MkdirAll silently create/populate
+// directories outside the workspace, and every subsequent Read/Write
+// through this backend would operate there instead -- letting a
+// scratch/offload backend overwrite arbitrary host files.
 func newWritableWorkspaceBackend(workspaceRoot, subdir string) (*writableWorkspaceBackend, error) {
 	canonical, err := workspace.CanonicalRoot(workspaceRoot)
 	if err != nil {
 		return nil, err
 	}
 	root := filepath.Join(canonical, subdir)
+	if err := requireAncestorContained(canonical, root); err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return nil, err
 	}
 	resolvedRoot, err := workspace.CanonicalRoot(root)
 	if err != nil {
+		return nil, err
+	}
+	if err := requireContained(canonical, resolvedRoot); err != nil {
 		return nil, err
 	}
 	return &writableWorkspaceBackend{root: resolvedRoot}, nil

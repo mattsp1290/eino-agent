@@ -47,7 +47,13 @@ func newWorkspaceBackends(root string) (adkfilesystem.Backend, skill.Backend, er
 // resolveWorkspacePath resolves requested (relative or absolute) against
 // root and rejects any result that is not contained in root, including
 // after resolving symlinks -- a symlink placed inside the workspace that
-// points outside it is rejected, not followed.
+// points outside it is rejected, not followed. When joined does not exist
+// yet (e.g. a Write target that has not been created), EvalSymlinks fails
+// outright and cannot check the eventual path; instead, the deepest
+// existing ancestor directory is resolved and required to be contained, so
+// a symlinked intermediate directory (e.g. a workspace-relative
+// ".eino-agent" symlinked to somewhere outside root) cannot be used to
+// smuggle a not-yet-existing file's containment check.
 func resolveWorkspacePath(root, requested string) (string, error) {
 	clean := filepath.Clean(requested)
 	if requested == "" {
@@ -67,7 +73,34 @@ func resolveWorkspacePath(root, requested string) (string, error) {
 		}
 		return resolved, nil
 	}
+	if err := requireAncestorContained(root, joined); err != nil {
+		return "", err
+	}
 	return joined, nil
+}
+
+// requireAncestorContained walks upward from path (which itself does not
+// exist, or filepath.EvalSymlinks would have succeeded) to the deepest
+// existing ancestor directory, resolves ITS symlinks, and requires that
+// resolved ancestor to be contained in root. It stops (without error) once
+// it reaches root itself or the filesystem root, matching
+// resolveWorkspacePath's existing-path behavior of trusting root as the
+// already-canonicalized boundary.
+func requireAncestorContained(root, path string) error {
+	dir := filepath.Dir(path)
+	for {
+		resolved, err := filepath.EvalSymlinks(dir)
+		if err == nil {
+			return requireContained(root, resolved)
+		}
+		if dir == root || dir == filepath.Dir(dir) {
+			// Reached the canonical root (already trusted) or the
+			// filesystem root without finding an existing ancestor to
+			// resolve: nothing further to check.
+			return nil
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 func requireContained(root, path string) error {
@@ -243,7 +276,20 @@ func (b *workspaceFilesystemBackend) GrepRaw(_ context.Context, req *adkfilesyst
 		if globExpr != nil && !globExpr.MatchString(filepath.ToSlash(path)) && !globExpr.MatchString(filepath.Base(path)) {
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		// filepath.WalkDir reports a symlink (to a file OR a directory) as a
+		// non-directory entry without following it, but os.ReadFile below
+		// DOES follow symlinks -- so a checked-in symlink inside the
+		// workspace pointing outside it (e.g. leak.txt -> ~/.ssh/id_rsa)
+		// would otherwise let grep read arbitrary host files. Re-resolve
+		// every walked path (symlink or not -- cheap, and uniform) through
+		// the same containment check every other read goes through, and
+		// silently skip an escaping entry rather than failing the whole
+		// walk.
+		safe, err := resolveWorkspacePath(b.root, path)
+		if err != nil {
+			return nil
+		}
+		data, err := os.ReadFile(safe)
 		if err != nil {
 			return nil
 		}
@@ -292,6 +338,12 @@ func (b *workspaceFilesystemBackend) GlobInfo(_ context.Context, req *adkfilesys
 		}
 		rel := workspaceRelative(resolvedBase, path)
 		if !expr.MatchString(rel) && !expr.MatchString(filepath.Base(path)) {
+			return nil
+		}
+		// See GrepRaw's identical containment re-check: a symlinked entry
+		// must not surface metadata (or, through Read/MultiModalRead called
+		// later with this Path) content from outside the workspace.
+		if _, err := resolveWorkspacePath(b.root, path); err != nil {
 			return nil
 		}
 		info, err := entry.Info()

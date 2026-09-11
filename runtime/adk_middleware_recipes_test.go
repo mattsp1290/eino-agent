@@ -173,12 +173,28 @@ func TestSummarizationFinalizeMapsSummaryIntoContextEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// A real durably-committed message always owns at least one part;
-		// summarizationFinalize's placeholder filter (assistant role, no
-		// owned parts) relies on this to tell a genuine assistant message
-		// apart from AdmitTurn's own not-yet-finalized placeholder row.
-		if _, err := store.AppendPart(context.Background(), session.Part{ID: session.PartID("p" + string(rune('0'+i))), MessageID: msg.ID, SessionID: sessionID, Kind: session.PartApprovalDecision, CreatedAt: now(), UpdatedAt: now()}); err != nil {
+		// A real durably-committed message always owns at least one
+		// DECODABLE content part: summarizationFinalize now correlates via
+		// history.LoadAgentic's own projection (matching what ADK's real
+		// in-memory input is built from), which -- unlike the prior
+		// PartApprovalDecision-only fixture -- only counts a message as
+		// "real" (non-placeholder) content if it actually decodes to a
+		// non-empty AgenticMessage.
+		blockKind := session.BlockKindUserInputText
+		if role == session.RoleAssistant {
+			blockKind = session.BlockKindAssistantGenText
+		}
+		content := session.Content{Role: role, Blocks: []session.ContentBlock{{
+			ID: "b" + string(rune('0'+i)), Kind: blockKind, Text: &session.TextBlock{Text: "content " + string(rune('0'+i))},
+		}}}
+		parts, err := session.EncodeContentParts(content, func() session.PartID { return session.PartID("p" + string(rune('0'+i))) }, msg.ID, sessionID, "", now(), session.DefaultContentLimits())
+		if err != nil {
 			t.Fatal(err)
+		}
+		for _, part := range parts {
+			if _, err := store.AppendPart(context.Background(), part); err != nil {
+				t.Fatal(err)
+			}
 		}
 		durable = append(durable, msg)
 	}

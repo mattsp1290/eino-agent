@@ -37,12 +37,13 @@ import (
 // AppendMessage/AppendPart access outside that one atomic boundary-commit
 // path.
 type contextEpochCapability struct {
-	sessionID session.ID
-	runID     session.RunID
-	store     session.Store
-	execution session.ExecutionStore
-	ids       IDGenerator
-	now       func() time.Time
+	sessionID     session.ID
+	runID         session.RunID
+	store         session.Store
+	execution     session.ExecutionStore
+	ids           IDGenerator
+	now           func() time.Time
+	contentLimits session.ContentLimits
 }
 
 // ready reports whether this capability was actually populated for this
@@ -55,13 +56,38 @@ func (c contextEpochCapability) ready() bool {
 }
 
 // loadConversationalHistory reloads this session's full durable
-// message/part history, for Finalize's index correlation only -- see
-// summarizationFinalize.
+// message/part history (NOT epoch-filtered), for Finalize's role/part-kind
+// lookups by message ID only -- see summarizationFinalize.
 func (c contextEpochCapability) loadConversationalHistory(ctx context.Context) (session.ReplayBatch, error) {
 	if !c.ready() {
 		return session.ReplayBatch{}, fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
 	}
 	return history.LoadBatch(ctx, c.store, c.sessionID)
+}
+
+// activeEpoch returns the currently active summarization epoch for this
+// session (see latestFinishedSummarizationEpoch), or nil if none.
+func (c contextEpochCapability) activeEpoch(ctx context.Context) (*session.ContextEpoch, error) {
+	if !c.ready() {
+		return nil, fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
+	}
+	return latestFinishedSummarizationEpoch(ctx, c.store, c.sessionID)
+}
+
+// loadCurrentAgenticProjection reloads this session's durable history
+// projected through activeEpoch exactly the way ADK's own current turn
+// input was built (see adkEngine.buildDurableBaseline), so its
+// SourceMessageIDs correlates 1:1, in order, with what ADK's Finalize hands
+// back as originalMessages -- including when a PRIOR summarization epoch is
+// already active (a second summarization on the same session must
+// correlate against the ALREADY-COMPACTED view, not raw unfiltered
+// history, or the correlation check always mismatches once more than one
+// epoch has ever been created for a session).
+func (c contextEpochCapability) loadCurrentAgenticProjection(ctx context.Context, activeEpoch *session.ContextEpoch) (history.AgenticProjection, error) {
+	if !c.ready() {
+		return history.AgenticProjection{}, fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
+	}
+	return history.LoadAgentic(ctx, c.store, c.sessionID, history.Options{Epoch: activeEpoch, ContentLimits: c.contentLimits})
 }
 
 // commitSummaryEpoch durably starts epoch and appends its replayable
