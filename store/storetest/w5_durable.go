@@ -484,6 +484,57 @@ func pausedRunContract(t *testing.T, factory Factory) {
 			}
 		})
 
+		// Item 7 (TL-6)'s unmet second half: the fixture in
+		// runtime/admission_store_test.go was aligned to
+		// store/internal/sqlstore's interruptInboxItems (an unknown inbox ID,
+		// or one in a state that is neither queued nor consumed, is a
+		// protocol error), but nothing pinned that behaviour against the
+		// real stores -- so the fixture could silently drift from them again
+		// with no test catching it (exactly the divergence class that let
+		// round-one Critical 1 ship green).
+		t.Run("promote pause rejects an inbox id with no durable row", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-pause-unknown-inbox")
+			r := admitRun(t, ctx, subject.Store, run("run-pause-unknown-inbox", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			admitted, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-pause-unknown-inbox", r, 1, at),
+				UserMessages: []session.Message{message("turn-pause-unknown-inbox-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-pause-unknown-inbox-started", r, "turn-pause-unknown-inbox", at),
+			})
+			if err != nil {
+				t.Fatalf("admit turn: %v", err)
+			}
+			cp := stagedCheckpoint(r, 1, "cp-pause-unknown-inbox", session.CheckpointKindLoop, []byte("pause-bytes"), at)
+			if _, err := execution.StageCheckpoint(ctx, session.StageCheckpointRequest{Checkpoint: cp}); err != nil {
+				t.Fatalf("stage checkpoint: %v", err)
+			}
+			pausedAt := at.Add(time.Second)
+			_, err = execution.PromotePause(ctx, session.PromotePauseRequest{
+				Revision: 1, TurnID: admitted.Turn.ID,
+				InboxIDs: []session.InboxID{"no-such-inbox-row"},
+				Event:    runPausedEvent("run-pause-unknown-inbox-event", r, pausedAt),
+			})
+			if !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("promote pause with unknown inbox id = %v, want ErrConflict", err)
+			}
+			// The whole transaction must have rolled back: the run must not
+			// have been left paused (or the checkpoint promoted, or the turn
+			// interrupted) by a promotion that failed on its inbox step.
+			got, err := subject.Store.GetRun(ctx, r.ID)
+			if err != nil {
+				t.Fatalf("get run after rolled-back promote: %v", err)
+			}
+			if got.Status == session.RunPaused {
+				t.Fatalf("run after rolled-back promote = %#v, want not paused", got)
+			}
+			if _, found, err := subject.Store.ReadPromotedCheckpoint(ctx, r.ID); err != nil || found {
+				t.Fatalf("promoted checkpoint after rolled-back promote: found=%v err=%v, want not found", found, err)
+			}
+		})
+
 		t.Run("claim run on a paused run succeeds immediately without waiting for lease expiry", func(t *testing.T) {
 			subject := setup(t, factory)
 			ctx := context.Background()

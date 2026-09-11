@@ -202,6 +202,13 @@ func TestTurnLoopSecondEnqueuedItemSurvivesPauseAndResumeAgainstSQLite(t *testin
 		if turn.State != session.TurnCompleted {
 			t.Fatalf("turn %+v not completed", turn)
 		}
+		// reconciliation.md item 1 (PR-C1/IG-3/IG-6)'s "done when": the
+		// second turn must admit the enqueued item exactly once, not twice
+		// (once from ADK's checkpoint-restored UnhandledItems, once from
+		// ResumeRun's drainQueuedInbox -- see genInput's claimItems dedup).
+		if turn.Ordinal == 2 && len(turn.UserMessageIDs) != 1 {
+			t.Fatalf("second turn UserMessageIDs = %d, want exactly 1 (deduped)", len(turn.UserMessageIDs))
+		}
 	}
 	items, err = orch.store.ListInbox(context.Background(), "sqlite-second-item-session", nil)
 	if err != nil {
@@ -219,6 +226,30 @@ func TestTurnLoopSecondEnqueuedItemSurvivesPauseAndResumeAgainstSQLite(t *testin
 	}
 	if !found {
 		t.Fatalf("second item %q missing after resume", item.ID)
+	}
+	// The session's durable messages must contain the enqueued text exactly
+	// once -- not twice (one per accidental double-admission).
+	batch, err := orch.store.ListMessages(context.Background(), "sqlite-second-item-session", session.ReplayCursor{Limit: 1000})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	var occurrences int
+	for _, part := range batch.Parts {
+		if part.Kind != session.PartUserInputText {
+			continue
+		}
+		decoded, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.DefaultContentLimits())
+		if err != nil {
+			t.Fatalf("decode text part payload: %v", err)
+		}
+		for _, block := range decoded.Blocks {
+			if block.Text != nil && block.Text.Text == "second message" {
+				occurrences++
+			}
+		}
+	}
+	if occurrences != 1 {
+		t.Fatalf("durable occurrences of the enqueued text = %d, want exactly 1", occurrences)
 	}
 }
 

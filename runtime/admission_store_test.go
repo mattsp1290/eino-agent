@@ -678,7 +678,19 @@ func (s *fakeExecutionStore) SettleRun(ctx context.Context, request session.Sett
 			return session.RunSettlementResult{}, session.ErrConflict
 		}
 	}
-	run, err := session.ApplyRunSettlement(s.runs[s.fence.RunID], request.Settlement)
+	current := s.runs[s.fence.RunID]
+	// Mirror store/internal/sqlstore's SettleRun: a RunCompleted settlement
+	// must never finalize while the session has any durably queued inbox
+	// item (see runtime's Enqueue/EnqueueInboxForRun and the terminal-
+	// settlement race rule).
+	if request.Settlement.Status == session.RunCompleted {
+		for _, item := range s.inbox {
+			if item.SessionID == current.SessionID && item.State == session.InboxQueued {
+				return session.RunSettlementResult{}, session.ErrConflict
+			}
+		}
+	}
+	run, err := session.ApplyRunSettlement(current, request.Settlement)
 	if err != nil {
 		return session.RunSettlementResult{}, err
 	}
@@ -826,8 +838,36 @@ func (s *fakeExecutionStore) FinalizeAssistantMessage(_ context.Context, id sess
 func (s *admissionStore) EnqueueInbox(_ context.Context, item session.InboxItem, limits session.ContentLimits) (session.InboxItem, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	result, _, err := s.enqueueInboxLocked(item, limits)
+	return result, err
+}
+
+// EnqueueInboxForRun mirrors store/internal/sqlstore's EnqueueInboxForRun:
+// checked (under s.mu, this fixture's single lock, the in-memory analogue of
+// the real store's session-row lock) against runID's current terminal
+// status before persisting.
+func (s *admissionStore) EnqueueInboxForRun(_ context.Context, runID session.RunID, item session.InboxItem, limits session.ContentLimits) (session.InboxItem, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if err := session.ValidateEnqueueInbox(item, limits); err != nil {
-		return session.InboxItem{}, err
+		return session.InboxItem{}, false, err
+	}
+	run, ok := s.runs[runID]
+	if !ok {
+		return session.InboxItem{}, false, session.ErrRunClosed
+	}
+	if run.SessionID != item.SessionID {
+		return session.InboxItem{}, false, session.ErrConflict
+	}
+	if run.Terminal() {
+		return session.InboxItem{}, false, session.ErrRunClosed
+	}
+	return s.enqueueInboxLocked(item, limits)
+}
+
+func (s *admissionStore) enqueueInboxLocked(item session.InboxItem, limits session.ContentLimits) (session.InboxItem, bool, error) {
+	if err := session.ValidateEnqueueInbox(item, limits); err != nil {
+		return session.InboxItem{}, false, err
 	}
 	for _, existing := range s.inbox {
 		if existing.SessionID == item.SessionID && existing.IdempotencyKey == item.IdempotencyKey {
@@ -836,13 +876,13 @@ func (s *admissionStore) EnqueueInbox(_ context.Context, item session.InboxItem,
 			// IdempotencyKey (whose blocks get freshly minted IDs on every
 			// call) matches the original item instead of false-conflicting.
 			if !session.ContentBlocksEqualIgnoringID(existing.Blocks, item.Blocks) {
-				return session.InboxItem{}, session.ErrConflict
+				return session.InboxItem{}, false, session.ErrConflict
 			}
-			return existing, nil
+			return existing, false, nil
 		}
 	}
 	s.inbox[item.ID] = item
-	return item, nil
+	return item, true, nil
 }
 
 func (s *admissionStore) ListInbox(_ context.Context, sessionID session.ID, states []session.InboxState) ([]session.InboxItem, error) {
