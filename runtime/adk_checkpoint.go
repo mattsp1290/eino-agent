@@ -96,9 +96,11 @@ type adkCheckpointEnvelope struct {
 	// TurnID is the durable turn this checkpoint revision belongs to
 	// (round-five reconciliation item 2/TR-I1) -- see adkCheckpointStore's
 	// currentTurnID doc comment for how it is populated. ResumeRun
-	// validates it against the run's newest non-completed turn before ever
-	// claiming the run's fence, and completeTurn retires a promoted
-	// checkpoint whose TurnID matches the turn that just completed.
+	// validates it against the run's currentTurn (turn_loop.go -- round-six
+	// reconciliation items 1-3, the same selector crash reconciliation
+	// uses) before ever claiming the run's fence. A checkpoint recorded for
+	// a turn that has since completed is stale by fact (currentTurn no
+	// longer selects it) rather than explicitly retired mid-run.
 	TurnID  session.TurnID
 	Payload []byte
 }

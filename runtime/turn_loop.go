@@ -125,8 +125,8 @@ func (c *turnLoopCoordinator) finishedRunUsage(engine *adkEngine) model.Usage {
 const firstTurnSentinelID session.InboxID = "\x00first-turn"
 
 // reconciledTurnSentinelID is pushed exactly once by ResumeRun (see
-// pendingReconciledTurn) to hand TurnLoop a run's most recently
-// crash-reconciled interrupted turn (round-four reconciliation item 1/
+// pushReconciledSentinel and currentTurn) to hand TurnLoop a run's most
+// recently crash-reconciled interrupted turn (round-four reconciliation item 1/
 // CR-C1) instead of admitting a fresh turn over new inbox items: it is only
 // ever pushed when the promoted checkpoint's own payload has no real ADK
 // runner state (decodeLoopCheckpointHasRunnerState), so it is guaranteed to
