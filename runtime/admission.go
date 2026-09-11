@@ -434,11 +434,39 @@ func admissionEvent(request admissionRequest, sessionID session.ID, runID sessio
 	}
 }
 
+// admissionConfig durably persists the subset of a run's construction config
+// ResumeRun later needs to rebuild an equivalent turnLoopCoordinator: without
+// system_prompt and agent_options here, a resumed run's post-resume model
+// dispatches would silently run with an empty system prompt and a model
+// resolved without the agent's options (see ResumeRun's doc comment and the
+// W5 doc's Host API bullet).
 func admissionConfig(request admissionRequest) map[string]string {
 	snapshot := request.Config
-	return map[string]string{
+	cfg := map[string]string{
 		"agent":          snapshot.Agent.Name,
 		"workspace_id":   snapshot.Metadata["workspace_id"],
 		"workspace_root": snapshot.Metadata["workspace_root"],
+		"system_prompt":  snapshot.Agent.SystemPrompt,
 	}
+	if len(snapshot.Agent.Options) != 0 {
+		if raw, err := json.Marshal(snapshot.Agent.Options); err == nil {
+			cfg["agent_options"] = string(raw)
+		}
+	}
+	return cfg
+}
+
+// decodeAgentOptions reverses admissionConfig's agent_options encoding. An
+// empty or malformed value decodes to nil rather than failing ResumeRun: a
+// run admitted before this field existed (or one whose options were empty)
+// must still resume, just with no audited options to restore.
+func decodeAgentOptions(raw string) map[string]string {
+	if raw == "" {
+		return nil
+	}
+	var options map[string]string
+	if err := json.Unmarshal([]byte(raw), &options); err != nil {
+		return nil
+	}
+	return options
 }

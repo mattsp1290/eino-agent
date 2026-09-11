@@ -174,6 +174,19 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	// Start returns -- Run/GenInput itself must stay on the goroutine below
 	// since it blocks for the run's lifetime.
 	entry.loop.Push(firstTurnSentinelID)
+	// A durably queued inbox item accepted by an earlier Enqueue call that
+	// found no live loop for this session's (now-terminal) prior run must
+	// still be drained into this fresh loop, or it stays queued forever
+	// (see Enqueue's doc comment). Pushed after the sentinel so it is
+	// admitted as this run's second turn, not confused with the first.
+	// Best-effort: a listing failure here must not fail Start (the run is
+	// already durably admitted); the item(s) simply remain queued for the
+	// next successful Start/ResumeRun to drain.
+	if queued, err := o.drainQueuedInbox(ctx, admitted.Session.ID); err == nil {
+		for _, id := range queued {
+			entry.loop.Push(id)
+		}
+	}
 	go o.runFreshTurnLoop(runCtx, execution, entry, checkpoints, admitted, handle)
 	return handle, nil
 }

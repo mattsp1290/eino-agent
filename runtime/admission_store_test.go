@@ -980,7 +980,7 @@ func (s *fakeExecutionStore) CompleteTurn(_ context.Context, request session.Com
 	}
 	s.turns[candidate.ID] = candidate
 	for id, item := range s.inbox {
-		if item.TurnID == candidate.ID && item.State == session.InboxConsumed {
+		if item.TurnID == candidate.ID && (item.State == session.InboxConsumed || item.State == session.InboxInterrupted) {
 			item.State = session.InboxCompleted
 			s.inbox[id] = item
 		}
@@ -1063,7 +1063,18 @@ func (s *fakeExecutionStore) PromotePause(_ context.Context, request session.Pro
 	for _, id := range request.InboxIDs {
 		item, ok := s.inbox[id]
 		if !ok {
+			// Mirror store/internal/sqlstore's interruptInboxItems: an inbox
+			// ID with no durable row is a protocol error, not a no-op (this
+			// is what let the first-turn sentinel leak into InboxIDs ship
+			// green against this fixture -- see runtime/turn_loop.go's
+			// interruptedItemIDs).
+			return session.PromotePauseResult{}, session.ErrConflict
+		}
+		if item.State == session.InboxInterrupted {
 			continue
+		}
+		if item.State != session.InboxQueued && item.State != session.InboxConsumed {
+			return session.PromotePauseResult{}, session.ErrConflict
 		}
 		item.State = session.InboxInterrupted
 		s.inbox[id] = item

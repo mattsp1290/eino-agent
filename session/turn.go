@@ -34,6 +34,9 @@ type Turn struct {
 	UserMessageIDs     []MessageID
 	AssistantMessageID MessageID
 	ResponseMessageIDs []MessageID
+	// Usage records this turn's own provider usage, written atomically by
+	// CompleteTurn. Zero for a turn that never completed normally.
+	Usage              Usage
 	EpochID            EpochID
 	CreatedAt          time.Time
 	StartedAt          time.Time
@@ -128,7 +131,7 @@ func ApplyCompleteTurn(current Turn, request CompleteTurnRequest) (Turn, error) 
 	}
 	if current.State == TurnCompleted {
 		if sameMessageIDs(current.ResponseMessageIDs, request.ResponseMessageIDs) &&
-			current.FinishedAt.Equal(request.Event.CreatedAt.UTC()) {
+			current.FinishedAt.Equal(request.Event.CreatedAt.UTC()) && current.Usage == request.Usage {
 			return current, nil
 		}
 		return Turn{}, ErrConflict
@@ -142,6 +145,7 @@ func ApplyCompleteTurn(current Turn, request CompleteTurnRequest) (Turn, error) 
 	}
 	current.State = TurnCompleted
 	current.ResponseMessageIDs = append([]MessageID(nil), request.ResponseMessageIDs...)
+	current.Usage = request.Usage
 	current.FinishedAt = request.Event.CreatedAt.UTC()
 	return current, nil
 }

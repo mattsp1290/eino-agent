@@ -684,16 +684,12 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 	}
 	result = publicMsg
 	calls := functionToolCalls(result)
+	var callIDs []session.ToolCallID
 	if len(calls) != 0 {
-		// This turn's ReAct loop will dispatch again after the tools
-		// settle; that next physical dispatch's result is a new logical
-		// assistant message, not a continuation of this one.
-		m.needMessage = true
-		callIDs := make([]session.ToolCallID, len(calls))
+		callIDs = make([]session.ToolCallID, len(calls))
 		for i, call := range calls {
 			callIDs[i] = session.ToolCallID(call.CallID)
 		}
-		m.engine.registerToolBatch(dispatch.messageID, callIDs)
 	}
 	preparedCalls, err := m.host.prepareToolCalls(ctx, m.execution, m.engine.snapshot, dispatch.messageID, calls)
 	if err != nil {
@@ -706,6 +702,17 @@ func (m *adkModel) commit(ctx context.Context, dispatch *adkDispatch, result *ei
 	}
 	if _, err := m.host.persistAssistantTurn(ctx, m.execution, m.engine.snapshot, dispatch.messageID, result, blockIDs, capturedState.payloads, preparedCalls); err != nil {
 		return nil, err
+	}
+	if len(callIDs) != 0 {
+		// This turn's ReAct loop will dispatch again after the tools
+		// settle; that next physical dispatch's result is a new logical
+		// assistant message, not a continuation of this one. Set only now
+		// that persistAssistantTurn has durably committed: a retried commit
+		// that fails here must not have already orphaned the turn's
+		// assistant placeholder as an empty durable row by flipping
+		// needMessage before the write that actually finalizes it.
+		m.needMessage = true
+		m.engine.registerToolBatch(dispatch.messageID, callIDs)
 	}
 	m.engine.recordResponseMessage(dispatch.messageID)
 	// engine.snapshot.providerState is not updated incrementally here: every

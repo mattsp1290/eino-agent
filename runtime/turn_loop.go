@@ -62,6 +62,41 @@ type turnLoopCoordinator struct {
 	resumeTargets     map[string]any
 	firstTurnEngine   *adkEngine
 	firstTurnConsumed bool
+
+	// runUsageMu guards runUsage, the accumulated usage of every turn this
+	// coordinator's completeTurn has durably settled -- kept distinct from
+	// any single adkEngine.usageSnapshot() so a multi-turn run's terminal
+	// settlement (finishTurnLoop) reports every turn's usage exactly once,
+	// never just the last turn's (see completeTurn/finishedRunUsage).
+	runUsageMu sync.Mutex
+	runUsage   model.Usage
+}
+
+func (c *turnLoopCoordinator) addRunUsage(u model.Usage) {
+	c.runUsageMu.Lock()
+	defer c.runUsageMu.Unlock()
+	c.runUsage = addUsage(c.runUsage, u)
+}
+
+func (c *turnLoopCoordinator) runUsageSnapshot() model.Usage {
+	c.runUsageMu.Lock()
+	defer c.runUsageMu.Unlock()
+	return c.runUsage
+}
+
+// finishedRunUsage returns every already-completed turn's usage
+// (runUsageSnapshot) plus, when engine is non-nil and its turn never reached
+// completeTurn (an interrupted or failed exit -- onAgentEvents only calls
+// completeTurn on normal completion), that turn's own not-yet-folded usage.
+// A clean RunCompleted exit must NOT pass its engine here: completeTurn
+// already folded it in via onAgentEvents, and adding it again would double-
+// count the last turn.
+func (c *turnLoopCoordinator) finishedRunUsage(engine *adkEngine) model.Usage {
+	total := c.runUsageSnapshot()
+	if engine != nil {
+		total = addUsage(total, engine.usageSnapshot())
+	}
+	return total
 }
 
 // firstTurnSentinelID is pushed exactly once by Start to hand TurnLoop the
@@ -222,7 +257,25 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, _ *adkTurnLoop, item
 			Remaining: items[1:],
 		}, nil
 	}
-	engine, err := c.admitTurn(ctx, items)
+	// A leftover first-turn sentinel here has no durable inbox row (Start's
+	// first turn is admitted directly inside the admission transaction --
+	// see admission.go's admitDurable -- never through the inbox), so it
+	// must never be looked up. It can reach this fallback branch on a
+	// coordinator that never had (or already consumed) a firstTurnEngine --
+	// a ResumeRun coordinator resuming a checkpoint taken before the very
+	// first GenInput ever ran (a Stop landing before dispatch; see the W5
+	// doc's deviation list). Filter it out of what admitTurn sees -- the
+	// turn it would have started is already durably visible via the
+	// committed history admitDurable wrote, so a fresh admitTurn over the
+	// remaining (possibly empty) items still answers it -- but keep it in
+	// Consumed so TurnLoop's own item partition stays total.
+	filtered := make([]session.InboxID, 0, len(items))
+	for _, id := range items {
+		if id != firstTurnSentinelID {
+			filtered = append(filtered, id)
+		}
+	}
+	engine, err := c.admitTurn(ctx, filtered)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +363,18 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 		c.ordinal = target.Ordinal
 		c.mu.Unlock()
 	}
-	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: c.historyOptions, baseMessageCount: len(priorMessages)}, nil
+	// placeholderUsed starts true: a TurnInterrupted turn was, by
+	// construction, already dispatched at least once before it paused (a
+	// tool interrupt or approval pause only ever fires from inside a
+	// dispatch this turn already committed), so its AssistantMessageID
+	// placeholder already carries durable content. A fresh adkEngine's
+	// zero-value placeholderUsed=false would let the resumed continuation's
+	// first physical dispatch re-claim that same already-content-bearing
+	// message via claimPlaceholder, corrupting it with a second, mismatched
+	// content kind (e.g. assistant_gen_text appended onto a message that
+	// already carries function_tool_call) instead of minting the fresh
+	// message this later dispatch requires.
+	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: c.historyOptions, baseMessageCount: len(priorMessages), placeholderUsed: true}, nil
 }
 
 func (c *turnLoopCoordinator) prepareAgent(ctx context.Context, _ *adkTurnLoop, _ []session.InboxID) (adk.TypedAgent[*einoschema.AgenticMessage], error) {
@@ -352,6 +416,20 @@ func (c *turnLoopCoordinator) onAgentEvents(ctx context.Context, _ *adk.TurnCont
 	if callErr != nil {
 		return callErr
 	}
+	// The mandatory durable guard (adkEngine.buildAgent's durableGuard) must
+	// actually have run: BeforeAgent fires at the very start of any
+	// compliant agent's execution, before any model dispatch, so by the
+	// time the events iterator has fully drained the guard must have marked
+	// itself ran. An AgentFactory that ignores AgentBuildContext.Guard (or
+	// substitutes its own model instead of build.Model) never wires it in
+	// at all, so our own adapters -- and this check -- never observe
+	// anything from that agent's real execution; this is the only point
+	// that can still catch it, since a fully noncompliant agent's dispatch
+	// never reaches adkModel/adkTool at all. Fail the turn as a
+	// construction error rather than silently accepting undurable output.
+	if engine != nil && !engine.guardRan() {
+		return fmt.Errorf("%w: agent factory %T did not install the durable guard before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
+	}
 	if interrupted || engine == nil {
 		return nil
 	}
@@ -359,16 +437,22 @@ func (c *turnLoopCoordinator) onAgentEvents(ctx context.Context, _ *adk.TurnCont
 }
 
 func (c *turnLoopCoordinator) completeTurn(ctx context.Context, engine *adkEngine) error {
+	usage := engine.usageSnapshot()
 	event := session.EventRecord{
 		ID: c.host.ids.NewEventID(), SessionID: c.sessionID, RunID: c.runID, MessageID: engine.assistantMessageID,
 		EpochID: engine.turn.EpochID, TurnID: engine.turn.ID, Kind: session.TurnCompletedEventKind, CreatedAt: c.host.now(),
 	}
 	result, err := c.execution.store.CompleteTurn(ctx, session.CompleteTurnRequest{
-		TurnID: engine.turn.ID, ResponseMessageIDs: engine.responseMessageIDsSnapshot(), Usage: runtimeUsage(engine.usageSnapshot()), Event: event,
+		TurnID: engine.turn.ID, ResponseMessageIDs: engine.responseMessageIDsSnapshot(), Usage: runtimeUsage(usage), Event: event,
 	})
 	if err != nil {
 		return err
 	}
+	// This turn's usage is now durably settled on its own turn row (above);
+	// fold it into the run-level total exactly once so a multi-turn run's
+	// eventual terminal settlement (finishTurnLoop) reports every turn's
+	// usage, not just the last one's (see finishedRunUsage's doc comment).
+	c.addRunUsage(usage)
 	c.execution.publishPersisted(ctx, result.Event)
 	return nil
 }
@@ -553,12 +637,12 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 	case state.ExitReason != nil && !state.CheckpointAttempted && (errors.As(state.ExitReason, &interruptErr) || errors.As(state.ExitReason, &cancelErr)):
 		var messageID session.MessageID
 		var snapshot TurnSnapshot
-		var usage model.Usage
-		if engine := c.currentEngine(); engine != nil {
+		engine := c.currentEngine()
+		if engine != nil {
 			messageID = engine.assistantMessageID
 			snapshot = engine.snapshot
-			usage = engine.usageSnapshot()
 		}
+		usage := c.finishedRunUsage(engine)
 		o.observeError(settleCtx, snapshot, messageID, "provider_stream", state.ExitReason)
 		settlement := session.RunSettlement{Status: session.RunInterrupted, FinishedAt: o.now(), Error: state.ExitReason.Error()}
 		committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
@@ -584,12 +668,18 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 			_ = c.execution.stopLease()
 			return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: state.ExitReason}
 		}
-		var late []session.InboxID
+		// TakeLateItems must still be drained exactly once to seal the late
+		// buffer, but its items (and state.UnhandledItems) were never
+		// consumed by this interrupted turn -- they are still durably
+		// `queued` -- so only the turn's own actually-consumed items
+		// (state.InterruptedItems) are interrupted here. Marking a
+		// never-consumed item interrupted would make a resumed
+		// GenInput->AdmitTurn->consumeInboxForTurn (which accepts only
+		// `queued`) fail the resumed run and lose the input.
 		if state.TakeLateItems != nil {
-			late = state.TakeLateItems()
+			_ = state.TakeLateItems()
 		}
-		inboxIDs := append(interruptedItemIDs(state.InterruptedItems), interruptedItemIDs(state.UnhandledItems)...)
-		inboxIDs = append(inboxIDs, interruptedItemIDs(late)...)
+		inboxIDs := interruptedItemIDs(state.InterruptedItems)
 		event := session.EventRecord{
 			ID: o.ids.NewEventID(), SessionID: c.sessionID, RunID: c.runID, EpochID: c.epochID, TurnID: engine.turn.ID,
 			Kind: session.RunPausedEventKind, CreatedAt: o.now(),
@@ -612,12 +702,12 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 		_ = c.execution.stopLease()
 		var messageID session.MessageID
 		var snapshot TurnSnapshot
-		var usage model.Usage
-		if engine := c.currentEngine(); engine != nil {
+		engine := c.currentEngine()
+		if engine != nil {
 			messageID = engine.assistantMessageID
 			snapshot = engine.snapshot
-			usage = engine.usageSnapshot()
 		}
+		usage := c.finishedRunUsage(engine)
 		o.observeError(settleCtx, snapshot, messageID, "provider_stream", state.ExitReason)
 		status := session.RunFailed
 		// A provider (or context) reporting cancellation is a domain
@@ -641,9 +731,8 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 		return result
 	default:
 		var messageID session.MessageID
-		var usage model.Usage
-		if engine := c.currentEngine(); engine != nil {
-			usage = engine.usageSnapshot()
+		engine := c.currentEngine()
+		if engine != nil {
 			if ids := engine.responseMessageIDsSnapshot(); len(ids) != 0 {
 				messageID = ids[len(ids)-1]
 			} else {
@@ -663,9 +752,17 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 		// Cross-check ctx directly rather than trusting ExitReason alone.
 		if err := ctx.Err(); err != nil {
 			_ = c.execution.stopLease()
-			if engine := c.currentEngine(); engine != nil {
-				o.observeError(context.WithoutCancel(ctx), engine.snapshot, messageID, "provider_stream", err)
+			// Always observe the cancellation, even when no engine was ever
+			// set (Interrupt won the race before genInput ran): every other
+			// interrupt branch above does the same with a zero TurnSnapshot,
+			// and skipping this one when engine is nil is what made
+			// TestStreamingOrchestratorRecordsInterrupt flaky under -race.
+			var snapshot TurnSnapshot
+			if engine != nil {
+				snapshot = engine.snapshot
 			}
+			o.observeError(context.WithoutCancel(ctx), snapshot, messageID, "provider_stream", err)
+			usage := c.finishedRunUsage(engine)
 			settlement := session.RunSettlement{Status: statusForError(err), FinishedAt: o.now(), Error: err.Error()}
 			committed, settleErr := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
 				Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
@@ -678,6 +775,25 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 			c.publishRunSettledNotice(settleCtx, result)
 			return result
 		}
+		// An Enqueue accepted while this loop was live but raced its idle
+		// shutdown lands as a "late" item: drain it now, before ever
+		// settling RunCompleted, so an acknowledged item is never silently
+		// stranded (see Enqueue's doc comment). A non-empty late buffer
+		// means real, still-queued work exists; divert to the same
+		// queued-continuation pause a between-turn stop with pending input
+		// takes, instead of completing the run out from under it.
+		var late []session.InboxID
+		if state.TakeLateItems != nil {
+			late = state.TakeLateItems()
+		}
+		if len(late) != 0 {
+			if err := o.promoteQueuedContinuation(settleCtx, c, checkpoints); err != nil {
+				_ = c.execution.stopLease()
+				return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: err}
+			}
+			return Result{RunID: c.runID, Status: session.RunPaused}
+		}
+		usage := c.runUsageSnapshot()
 		settlement := session.RunSettlement{Status: session.RunCompleted, FinishedAt: o.now()}
 		committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
 			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
@@ -716,8 +832,22 @@ func (o *StreamingOrchestrator) promoteQueuedContinuation(ctx context.Context, c
 	return err
 }
 
+// interruptedItemIDs copies the durable inbox IDs out of a TurnLoop item
+// slice, filtering out the first-turn sentinel. The sentinel is NOT a
+// durable inbox row (Start's first turn is admitted directly inside the
+// admission transaction, never through the inbox -- see admission.go's
+// admitDurable), so it must never reach PromotePause/AdmitTurn: the real
+// stores turn an unknown inbox ID into ErrConflict, which would fail every
+// pause of a run's first turn.
 func interruptedItemIDs(items []session.InboxID) []session.InboxID {
-	return append([]session.InboxID(nil), items...)
+	out := make([]session.InboxID, 0, len(items))
+	for _, id := range items {
+		if id == firstTurnSentinelID {
+			continue
+		}
+		out = append(out, id)
+	}
+	return out
 }
 
 // publishRunSettledNotice notifies RunSettledPoint for a terminal Result,
@@ -838,14 +968,30 @@ type EnqueueRequest struct {
 // Enqueue persists request as a durable inbox item first (idempotent on
 // IdempotencyKey), then pushes its ID into this process's live loop for
 // RunID, if one is registered. A durably persisted item that cannot be
-// pushed (no live loop in this process) stays queued for a later Start,
-// Enqueue against a process that does own the loop, or ResumeRun to pick up.
+// pushed (no live loop in this process) stays queued for a later Start or
+// ResumeRun to drain (see drainQueuedInbox): both push every durably queued
+// item for the session into a freshly registered loop before running it.
+// RunID must belong to sessionID and must not already be terminal --
+// Enqueue never silently acknowledges input nothing will ever consume.
 func (o *StreamingOrchestrator) Enqueue(ctx context.Context, sessionID session.ID, request EnqueueRequest) (session.InboxItem, error) {
 	if err := o.validateConfigured(); err != nil {
 		return session.InboxItem{}, err
 	}
 	if request.IdempotencyKey == "" {
 		return session.InboxItem{}, fmt.Errorf("%w: idempotency key required", ErrInvalidOrchestrator)
+	}
+	if request.RunID == "" {
+		return session.InboxItem{}, fmt.Errorf("%w: run id required", ErrInvalidOrchestrator)
+	}
+	run, err := o.store.GetRun(ctx, request.RunID)
+	if err != nil {
+		return session.InboxItem{}, err
+	}
+	if run.SessionID != sessionID {
+		return session.InboxItem{}, fmt.Errorf("%w: run %s is not in session %s", ErrInvalidOrchestrator, request.RunID, sessionID)
+	}
+	if run.Terminal() {
+		return session.InboxItem{}, fmt.Errorf("%w: run %s already settled", ErrInvalidOrchestrator, request.RunID)
 	}
 	if err := rejectCallerContentBlockIDs(request.Message.Blocks); err != nil {
 		return session.InboxItem{}, err
@@ -886,6 +1032,25 @@ func (o *StreamingOrchestrator) Enqueue(ctx context.Context, sessionID session.I
 	return persisted, nil
 }
 
+// drainQueuedInbox lists sessionID's durably queued inbox items in admission
+// order and returns their IDs, for a fresh Start or ResumeRun to push into
+// its freshly registered loop -- the only path that ever consumes an
+// Enqueue accepted while this process held no live loop for the run (see
+// Enqueue's doc comment). A listing failure here is reported to the caller
+// but never invented as data loss: the items themselves stay durably
+// `queued` and remain available to the next successful drain.
+func (o *StreamingOrchestrator) drainQueuedInbox(ctx context.Context, sessionID session.ID) ([]session.InboxID, error) {
+	items, err := o.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxQueued})
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]session.InboxID, len(items))
+	for i, item := range items {
+		ids[i] = item.ID
+	}
+	return ids, nil
+}
+
 // ResumeRequest resumes a durably paused run.
 type ResumeRequest struct {
 	// Targets maps a current-generation InterruptCtx.ID (see PauseInfo) to
@@ -893,9 +1058,14 @@ type ResumeRequest struct {
 	Targets map[string]any
 }
 
-// ResumeRun claims a paused run's fence (CAS on status=paused), validates
-// its promoted checkpoint envelope, rebuilds the run's engine, and drives a
-// fresh TurnLoop seeded from the promoted checkpoint bytes.
+// ResumeRun validates a paused run's promoted checkpoint envelope, model
+// resolution, and turn history -- everything derivable from the durable
+// GetRun record -- BEFORE ever claiming the run's fence (CAS on
+// status=paused -> running): a rejected resume must leave the run paused,
+// not strand it running with no driver and no heartbeat (see ErrCheckpoint*
+// and the fingerprint/version/model-resolve checks below). Only once every
+// such check has passed does it claim the fence, rebuild the run's engine,
+// and drive a fresh TurnLoop seeded from the promoted checkpoint bytes.
 func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.RunID, request ResumeRequest) (Handle, error) {
 	if err := o.validateConfigured(); err != nil {
 		return nil, err
@@ -907,12 +1077,11 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	if !run.Paused() {
 		return nil, fmt.Errorf("%w: run %s is not paused", ErrInvalidOrchestrator, runID)
 	}
-	claimToken := string(o.ids.NewEventID())
-	claimed, err := o.store.ClaimRun(ctx, session.RunClaim{RunID: runID, OwnerID: o.ownerID(), ClaimToken: claimToken, LeaseDuration: o.lease()})
-	if err != nil {
-		return nil, err
-	}
-	plan, err := o.acquireResumePlan(ctx, claimed.SessionID, claimed.ExtensionPlan.Clone())
+	// Everything below, up to ClaimRun, is validated off the already-read
+	// run record (or read-only, unfenced store calls) and never mutates
+	// durable run state: a rejected resume leaves the run exactly as paused
+	// as GetRun found it.
+	plan, err := o.acquireResumePlan(ctx, run.SessionID, run.ExtensionPlan.Clone())
 	if err != nil {
 		return nil, err
 	}
@@ -933,16 +1102,19 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	if checkpoint.AgentFingerprint != fingerprint || checkpoint.EinoVersion != EinoPinnedVersion || checkpoint.CodecVersion != adkCheckpointCodecVersion {
 		return nil, ErrCheckpointFingerprintMismatch
 	}
-	execution := newRunExecution(o, plan, claimed)
-	selection := model.Selection{ProviderID: model.ProviderID(claimed.ProviderID), ModelID: model.ID(claimed.ModelID)}
+	selection := model.Selection{ProviderID: model.ProviderID(run.ProviderID), ModelID: model.ID(run.ModelID)}
+	agentOptions := decodeAgentOptions(run.Config["agent_options"])
 	resolved, err := o.model.Resolve(ctx, selection, model.Runtime{
-		Directory: claimed.Config["workspace_root"],
+		Directory: run.Config["workspace_root"],
+		Options:   cloneStringMap(agentOptions),
 	})
 	if err != nil {
 		return nil, err
 	}
-	cfg := config.Snapshot{Agent: config.Agent{Name: claimed.Agent, Model: selection}, Metadata: map[string]string{
-		"workspace_id": claimed.Config["workspace_id"], "workspace_root": claimed.Config["workspace_root"],
+	cfg := config.Snapshot{Agent: config.Agent{
+		Name: run.Agent, Model: selection, SystemPrompt: run.Config["system_prompt"], Options: agentOptions,
+	}, Metadata: map[string]string{
+		"workspace_id": run.Config["workspace_id"], "workspace_root": run.Config["workspace_root"],
 	}}
 	turns, err := o.store.ListTurns(ctx, runID)
 	if err != nil {
@@ -954,17 +1126,51 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 			maxOrdinal = t.Ordinal
 		}
 	}
+	// A durably queued inbox item accepted by Enqueue while no live loop
+	// existed for this run must be drained into the loop this call is about
+	// to start -- otherwise it stays queued forever (see Enqueue's doc
+	// comment). Read-only and unfenced: a failure here fails ResumeRun
+	// closed, before ever claiming, rather than risk silently dropping it.
+	queuedIDs, err := o.drainQueuedInbox(ctx, run.SessionID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Only now take the fence: every check above that could reject this
+	// resume has already run against the still-paused run.
+	claimToken := string(o.ids.NewEventID())
+	claimed, err := o.store.ClaimRun(ctx, session.RunClaim{RunID: runID, OwnerID: o.ownerID(), ClaimToken: claimToken, LeaseDuration: o.lease()})
+	if err != nil {
+		return nil, err
+	}
+	execution := newRunExecution(o, plan, claimed)
+	// Best-effort: this is an observability record of the resume, not a
+	// correctness dependency of it. The claim above has already committed;
+	// failing ResumeRun here would strand the run running with no driver
+	// for a much lower-value guarantee than the checks already performed
+	// before the claim.
+	if committed, err := execution.store.AppendEvent(ctx, session.EventRecord{
+		ID: o.ids.NewEventID(), SessionID: claimed.SessionID, RunID: claimed.ID, EpochID: claimed.ContextEpoch,
+		Kind: session.RunResumedEventKind, CreatedAt: o.now(),
+	}); err == nil {
+		execution.publishPersisted(ctx, committed)
+	}
 	coordinator := &turnLoopCoordinator{
 		host: o, execution: execution, plan: plan, sessionID: claimed.SessionID, runID: claimed.ID,
 		config: cfg, resolved: resolved, historyOptions: o.history, epochID: claimed.ContextEpoch, ordinal: maxOrdinal,
 	}
 	coordinator.setResumeTargets(request.Targets)
 	checkpoints := newAdkCheckpointStore(o, execution, plan, runID)
-	handle := &turnLoopHandle{runID: runID, host: o, done: make(chan Result, 1), pause: make(chan PauseInfo, 1)}
+	// The resumed run gets its own cancellable context, detached from the
+	// caller's (possibly request-scoped) ctx: Handle.Interrupt must be able
+	// to cancel it, and a resumed run must not die when an HTTP handler's
+	// context returns -- matching Start (orchestrator.go's context.WithCancel).
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	handle := &turnLoopHandle{runID: runID, host: o, done: make(chan Result, 1), pause: make(chan PauseInfo, 1), cancel: cancel}
 	entry := o.prepareTurnLoop(coordinator, checkpoints)
 	ownershipTransferred = true
 	go func() {
-		started, err := execution.store.StartRun(ctx, o.now())
+		started, err := execution.store.StartRun(runCtx, o.now())
 		if err != nil {
 			o.unregisterLoop(runID)
 			handle.done <- Result{RunID: runID, Status: session.RunFailed, Error: err}
@@ -974,9 +1180,9 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 			return
 		}
 		_ = started
-		runCtx := execution.startLease(ctx, o.lease())
+		leaseCtx := execution.startLease(runCtx, o.lease())
 		defer execution.release()
-		o.runTurnLoop(runCtx, entry, checkpoints, nil, handle.done, handle.pause, nil)
+		o.runTurnLoop(leaseCtx, entry, checkpoints, queuedIDs, handle.done, handle.pause, nil)
 	}()
 	return handle, nil
 }

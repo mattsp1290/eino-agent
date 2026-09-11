@@ -103,6 +103,27 @@ type adkEngine struct {
 	toolBatchOrder   map[session.MessageID][]session.ToolCallID
 	toolBatchDone    map[session.ToolCallID]chan struct{}
 	toolBatchAborted map[session.MessageID]bool
+
+	// guard is the durableGuard instance buildAgent handed this turn's
+	// AgentFactory (as AgentBuildContext.Guard). onAgentEvents checks
+	// guard.hasRun() after the agent finishes: a compliant agent's
+	// BeforeAgent hook always fires before any model dispatch, so this is
+	// the engine-side proof the factory actually installed it (see
+	// guardRan's doc comment).
+	guard *durableGuard
+}
+
+// guardRan reports whether this turn's durable guard actually fired. A
+// factory that never wires AgentBuildContext.Guard into its agent's handler
+// chain -- or substitutes its own model instead of build.Model -- produces
+// an agent whose execution never touches this engine's adapters at all, so
+// this is the only point that can still detect it (see onAgentEvents in
+// runtime/turn_loop.go).
+func (e *adkEngine) guardRan() bool {
+	if e == nil || e.guard == nil {
+		return false
+	}
+	return e.guard.hasRun()
 }
 
 // registerToolBatch records the declared call order for a freshly committed
@@ -161,7 +182,11 @@ func (e *adkEngine) awaitToolTurn(ctx context.Context, messageID session.Message
 // settleToolTurn signals callID's completion, unblocking the next sibling in
 // its batch (if any), and marks the whole batch aborted when fatal is true
 // (a panicking executor) so every later, not-yet-started sibling skips
-// execution.
+// execution. It is idempotent: every exit path of adkTool/adkToolSearch's
+// InvokableRun now calls it exactly once via a defer (see those methods), so
+// a second call for the same callID (there should never be one, but the
+// contract must hold regardless) is a safe no-op rather than a double-close
+// panic.
 func (e *adkEngine) settleToolTurn(messageID session.MessageID, callID session.ToolCallID, fatal bool) {
 	e.toolBatchMu.Lock()
 	if fatal {
@@ -170,11 +195,33 @@ func (e *adkEngine) settleToolTurn(messageID session.MessageID, callID session.T
 		}
 		e.toolBatchAborted[messageID] = true
 	}
-	done := e.toolBatchDone[callID]
+	done, ok := e.toolBatchDone[callID]
+	if ok {
+		delete(e.toolBatchDone, callID)
+	}
 	e.toolBatchMu.Unlock()
-	if done != nil {
+	if ok && done != nil {
 		close(done)
 	}
+}
+
+// messageIDForToolCall best-effort looks up the owning assistant message for
+// a registered batch call ID, for the rare exit paths of InvokableRun that
+// return before the tool call's own durable record (and its MessageID) has
+// been loaded. A miss (callID not in any registered batch, e.g. a
+// single-call "batch" that was never registered at all) returns "" and is
+// harmless: settleToolTurn treats an unregistered/unknown callID as a no-op.
+func (e *adkEngine) messageIDForToolCall(callID session.ToolCallID) session.MessageID {
+	e.toolBatchMu.Lock()
+	defer e.toolBatchMu.Unlock()
+	for messageID, order := range e.toolBatchOrder {
+		for _, id := range order {
+			if id == callID {
+				return messageID
+			}
+		}
+	}
+	return ""
 }
 
 func (e *adkEngine) recordPrepareError(id session.ToolCallID, err error) {
@@ -283,14 +330,16 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 		tools = append(tools, search)
 		durable[e.snapshot.ToolSearch.Name] = true
 	}
+	guard := newDurableGuard(durable)
 	build := AgentBuildContext{
 		Model: inner, Tools: tools, ToolAliases: aliases,
 		Instruction:   "",
 		MaxIterations: e.host.toolTurns(),
-		Guard:         newDurableGuard(durable),
+		Guard:         guard,
 		Retry:         defaultRetryConfig(e.host.attempts()),
 		Failover:      buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
 	}
+	e.guard = guard
 	factory := e.plan.AgentFactory()
 	return factory.BuildAgent(ctx, build)
 }
@@ -383,13 +432,27 @@ type durableTool interface {
 type durableGuard struct {
 	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
 	allowed map[string]bool
+
+	mu  sync.Mutex
+	ran bool
 }
 
 func newDurableGuard(allowed map[string]bool) *durableGuard {
 	return &durableGuard{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, allowed: allowed}
 }
 
+// hasRun reports whether BeforeAgent has fired at least once for this guard
+// instance -- see adkEngine.guardRan's doc comment.
+func (g *durableGuard) hasRun() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.ran
+}
+
 func (g *durableGuard) BeforeAgent(ctx context.Context, runCtx *adk.ChatModelAgentContext) (context.Context, *adk.ChatModelAgentContext, error) {
+	g.mu.Lock()
+	g.ran = true
+	g.mu.Unlock()
 	for _, t := range runCtx.Tools {
 		dt, ok := t.(durableTool)
 		if !ok {
@@ -459,11 +522,26 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	if callID == "" {
 		return "", errors.New("tool call id missing from ADK context")
 	}
+	// Every exit path below must release the next sibling in this call's
+	// declared batch (see adkEngine.registerToolBatch's doc comment):
+	// compose.parallelRunToolCall never cancels a sibling on this one's
+	// failure, so a return without settling leaves the next call parked in
+	// awaitToolTurn until the run context dies. messageID is refined below
+	// once the durable record loads (the handful of exits before that point
+	// use a best-effort lookup; settleToolTurn treats an unknown callID as a
+	// harmless no-op, since those calls are never registered in a batch).
+	messageID := e.messageIDForToolCall(callID)
+	fatal := false
+	defer func() { e.settleToolTurn(messageID, callID, fatal) }()
+
 	record, err := e.host.store.GetToolCall(ctx, callID)
 	if err != nil {
+		fatal = true
 		return "", fmt.Errorf("persisted tool call %s: %w", callID, err)
 	}
+	messageID = record.MessageID
 	if record.RunID != e.snapshot.RunID || record.SessionID != e.snapshot.SessionID {
+		fatal = true
 		return "", fmt.Errorf("persisted tool call %s belongs to run %s, not %s", callID, record.RunID, e.snapshot.RunID)
 	}
 	run := session.Run{ID: e.snapshot.RunID, SessionID: e.snapshot.SessionID, ModelID: string(e.snapshot.Model.Model.ID)}
@@ -473,10 +551,12 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	case record.Status == session.ToolCallRunning:
 		settled, err := e.execution.settleInterruptedRunningTool(ctx, run, t.tool, record)
 		if err != nil {
+			fatal = true
 			return "", err
 		}
 		return string(settled.Output), nil
 	case record.Status != session.ToolCallPending:
+		fatal = true
 		return "", fmt.Errorf("unexpected tool call status %q for %s", record.Status, callID)
 	}
 	call := ToolCall{
@@ -489,9 +569,15 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 		if wasInterrupted && hasState {
 			isTarget, hasData, decision := compose.GetResumeContext[string](ctx)
 			if !isTarget {
+				// A durable pause is a first-class, normal outcome (not a
+				// batch failure): settling here (via the deferred call
+				// above) lets a sibling declared after this one still run
+				// to its own completion/pause, matching ADK's own
+				// wg.Wait()-every-task tool-node semantics.
 				return "", compose.StatefulInterrupt(ctx, &adkToolInterruptInfo{ToolCallID: string(callID)}, &adkToolInterruptState{ToolCallID: string(callID)})
 			}
 			if !hasData {
+				fatal = true
 				return "", fmt.Errorf("host decision for %s missing", callID)
 			}
 			call.ResumeDecision = decision
@@ -500,6 +586,7 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 		}
 	}
 	if canonical, err := canonicalToolObject(record.Input); err != nil || string(canonical) != strings.TrimSpace(arguments) {
+		fatal = true
 		return "", fmt.Errorf("ADK arguments %q diverge from persisted canonical input for %s", arguments, callID)
 	}
 	// ADK's tools node dispatches every call declared in the same assistant
@@ -511,14 +598,15 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	// interruptPendingTool treatment of an unstarted call after a fatal one.
 	aborted, err := e.awaitToolTurn(ctx, record.MessageID, callID)
 	if err != nil {
+		fatal = true
 		return "", err
 	}
 	if aborted {
 		settlement, err := e.execution.interruptPendingTool(ctx, e.snapshot, record)
 		if err != nil {
+			fatal = true
 			return "", err
 		}
-		e.settleToolTurn(record.MessageID, callID, false)
 		return string(settlement.Output), nil
 	}
 	startedAt := e.host.now()
@@ -527,6 +615,7 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 		LeaseDuration: e.host.lease(), Event: toolTransitionEnvelope(e.host, e.snapshot, startedAt),
 	})
 	if err != nil {
+		fatal = true
 		return "", err
 	}
 	extension.Notify(e.execution.dispatch(), ctx, ToolStartedPoint, ToolStartedNotice{
@@ -537,7 +626,6 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	prepareErr := e.takePrepareError(record.ID)
 	settled, err := e.execution.executeAndSettleClaimedTool(ctx, e.snapshot, t.tool, call, claimed.Call, prepareErr)
 	if err != nil {
-		e.settleToolTurn(record.MessageID, callID, false)
 		return "", err
 	}
 	// A panicking executor, or one whose own context was canceled, settles
@@ -553,10 +641,9 @@ func (t *adkTool) InvokableRun(ctx context.Context, arguments string, _ ...tool.
 	// loops until MaxIterations). Fail this node instead, matching the
 	// resume path's equivalent checks (see interrupt.go's
 	// errToolExecutionPanic/context.Canceled handling), and mark this
-	// call's batch aborted so every later, not-yet-started sibling is
-	// interrupted instead of executed.
-	fatal := errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled)
-	e.settleToolTurn(record.MessageID, callID, fatal)
+	// call's batch aborted (via the deferred settle above) so every later,
+	// not-yet-started sibling is interrupted instead of executed.
+	fatal = errors.Is(settled.Outcome.RawError, errToolExecutionPanic) || errors.Is(settled.Outcome.RawError, context.Canceled)
 	if fatal {
 		return "", settled.Outcome.RawError
 	}
@@ -591,11 +678,22 @@ func (t *adkToolSearch) InvokableRun(ctx context.Context, arguments string, _ ..
 	if callID == "" {
 		return "", errors.New("tool call id missing from ADK context")
 	}
+	// tool_search participates in the same sibling-batch settlement protocol
+	// as adkTool.InvokableRun (see that method's doc comment): registered
+	// but never settled, it left the next sibling in a mixed batch parked
+	// in awaitToolTurn forever.
+	messageID := e.messageIDForToolCall(callID)
+	fatal := false
+	defer func() { e.settleToolTurn(messageID, callID, fatal) }()
+
 	record, err := e.host.store.GetToolCall(ctx, callID)
 	if err != nil {
+		fatal = true
 		return "", fmt.Errorf("persisted tool call %s: %w", callID, err)
 	}
+	messageID = record.MessageID
 	if record.RunID != e.snapshot.RunID || record.SessionID != e.snapshot.SessionID {
+		fatal = true
 		return "", fmt.Errorf("persisted tool call %s belongs to run %s, not %s", callID, record.RunID, e.snapshot.RunID)
 	}
 	switch {
@@ -605,21 +703,38 @@ func (t *adkToolSearch) InvokableRun(ctx context.Context, arguments string, _ ..
 		run := session.Run{ID: e.snapshot.RunID, SessionID: e.snapshot.SessionID, ModelID: string(e.snapshot.Model.Model.ID)}
 		settled, err := e.execution.settleInterruptedRunningTool(ctx, run, Tool{Name: t.name}, record)
 		if err != nil {
+			fatal = true
 			return "", err
 		}
 		return string(settled.Output), nil
 	case record.Status != session.ToolCallPending:
+		fatal = true
 		return "", fmt.Errorf("unexpected tool call status %q for %s", record.Status, callID)
+	}
+	aborted, err := e.awaitToolTurn(ctx, record.MessageID, callID)
+	if err != nil {
+		fatal = true
+		return "", err
+	}
+	if aborted {
+		settlement, err := e.execution.interruptPendingTool(ctx, e.snapshot, record)
+		if err != nil {
+			fatal = true
+			return "", err
+		}
+		return string(settlement.Output), nil
 	}
 	call := ToolCall{
 		ID: record.ID, SessionID: record.SessionID, RunID: record.RunID, MessageID: record.MessageID,
 		Name: record.Name, RequestedName: record.RequestedName, Input: cloneJSON(record.Input), Context: toolContext(e.snapshot, e.snapshot.Tools),
 	}
 	if _, err := e.execution.executeToolSearchCall(ctx, e.snapshot, call, record); err != nil {
+		fatal = true
 		return "", err
 	}
 	settled, err := e.host.store.GetToolCall(ctx, callID)
 	if err != nil {
+		fatal = true
 		return "", err
 	}
 	return string(settled.Output), nil

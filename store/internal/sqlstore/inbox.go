@@ -205,12 +205,17 @@ func (s *Store) consumeInboxForTurn(ctx context.Context, sessionKey, turnKey int
 	return nil
 }
 
-// settleInboxForTurn transitions every inbox item currently consumed by
-// turnKey to the given terminal state. It is naturally idempotent: a replay
-// finds no rows still in the consumed state and is a no-op.
-func (s *Store) settleInboxForTurn(ctx context.Context, turnKey int64, to session.InboxState, at time.Time) error {
+// settleInboxForTurn transitions every inbox item currently in one of the
+// `from` states and claimed by turnKey to the given terminal state. It is
+// naturally idempotent: a replay finds no rows still in a `from` state and
+// is a no-op.
+func (s *Store) settleInboxForTurn(ctx context.Context, turnKey int64, from []session.InboxState, to session.InboxState, at time.Time) error {
+	fromValues := make([]string, len(from))
+	for i, state := range from {
+		fromValues[i] = string(state)
+	}
 	var rows []inboxRow
-	if err := s.inboxQuery(ctx).Where("inbox.turn_key = ? AND inbox.state = ?", turnKey, string(session.InboxConsumed)).Find(&rows).Error; err != nil {
+	if err := s.inboxQuery(ctx).Where("inbox.turn_key = ? AND inbox.state IN ?", turnKey, fromValues).Find(&rows).Error; err != nil {
 		return s.mapErr(err)
 	}
 	for _, row := range rows {
@@ -218,13 +223,14 @@ func (s *Store) settleInboxForTurn(ctx context.Context, turnKey int64, to sessio
 		if err != nil {
 			return err
 		}
+		fromState := item.State
 		item.State = to
 		item.UpdatedAt = at.UTC()
 		raw, err := json.Marshal(item)
 		if err != nil {
 			return err
 		}
-		db := s.dbFor(ctx).Table(s.tableName("inbox")).Where("row_key = ? AND state = ?", row.RowKey, string(session.InboxConsumed)).Updates(map[string]any{
+		db := s.dbFor(ctx).Table(s.tableName("inbox")).Where("row_key = ? AND state = ?", row.RowKey, string(fromState)).Updates(map[string]any{
 			"state": string(to), "record": raw, "updated_at": TimeText(item.UpdatedAt),
 		})
 		if err := s.mapErr(db.Error); err != nil {

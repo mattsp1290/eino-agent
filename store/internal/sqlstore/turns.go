@@ -246,7 +246,12 @@ func (e *executionStore) CompleteTurn(ctx context.Context, request session.Compl
 		if err := rowsAffected(db); err != nil {
 			return err
 		}
-		if err := store.settleInboxForTurn(ctx, row.RowKey, session.InboxCompleted, request.Event.CreatedAt); err != nil {
+		// A turn resumed via ResumeRun after a pause may have its own
+		// InboxInterrupted rows (its in-flight items, interrupted by
+		// PromotePause -- see runtime/turn_loop.go's finishTurnLoop): if
+		// that resumed execution now completes normally, those rows must
+		// still reach InboxCompleted, not stay interrupted forever.
+		if err := store.settleInboxForTurn(ctx, row.RowKey, []session.InboxState{session.InboxConsumed, session.InboxInterrupted}, session.InboxCompleted, request.Event.CreatedAt); err != nil {
 			return err
 		}
 		event, err := store.appendCanonicalEvent(ctx, request.Event)
@@ -296,7 +301,7 @@ func (e *executionStore) InterruptTurn(ctx context.Context, request session.Inte
 		if err := rowsAffected(db); err != nil {
 			return err
 		}
-		if err := store.settleInboxForTurn(ctx, row.RowKey, session.InboxInterrupted, request.Event.CreatedAt); err != nil {
+		if err := store.settleInboxForTurn(ctx, row.RowKey, []session.InboxState{session.InboxConsumed}, session.InboxInterrupted, request.Event.CreatedAt); err != nil {
 			return err
 		}
 		// InterruptTurn is itself a typed atomic mutation method: it is

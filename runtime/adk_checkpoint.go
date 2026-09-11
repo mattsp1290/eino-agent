@@ -118,37 +118,56 @@ func (s *adkCheckpointStore) Get(ctx context.Context, checkPointID string) ([]by
 // Set implements adk.CheckPointStore. It stages a new unpromoted revision
 // under the current run fence; the caller (runtime/turn_loop.go) promotes it
 // only after the run's iterator has fully drained with no error.
+//
+// nextRevision only knows about the latest PROMOTED revision: a fresh
+// adapter instance (this run's first Set after a resume, or after this
+// process restarted) that lands on a revision a *different*, crashed
+// staging attempt already occupied with different payload bytes gets
+// ErrConflict from StageCheckpoint (createCheckpoint's SameRecord check).
+// Rather than block every later Set for this run on that stale row, probe
+// forward past it: this is safe exactly because the probing only ever
+// happens on a fresh instance's first attempt (lastStaged == 0 on entry);
+// once this instance has staged anything, s.lastStaged is trusted and a
+// conflict is reported immediately as genuine.
 func (s *adkCheckpointStore) Set(ctx context.Context, checkPointID string, payload []byte) error {
 	revision, err := s.stagedRevision(ctx)
 	if err != nil {
 		return err
 	}
+	trustedSequence := s.lastStaged > 0
 	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: s.fingerprint, Payload: payload}
 	raw, err := encodeCheckpointEnvelope(envelope)
 	if err != nil {
 		return err
 	}
-	_, err = s.execution.store.StageCheckpoint(ctx, session.StageCheckpointRequest{
-		Checkpoint: session.Checkpoint{
-			RunID: s.runID, Revision: revision, Kind: session.CheckpointKindRunner, AgentFingerprint: s.fingerprint,
-			EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, CheckpointID: checkPointID,
-			Bytes: raw, CreatedAt: s.host.now(),
-		},
-		MaxBytes: s.maxBytes,
-	})
-	if err != nil {
-		return err
+	const maxProbeAttempts = 8
+	for attempt := 0; ; attempt++ {
+		_, stageErr := s.execution.store.StageCheckpoint(ctx, session.StageCheckpointRequest{
+			Checkpoint: session.Checkpoint{
+				RunID: s.runID, Revision: revision, Kind: session.CheckpointKindRunner, AgentFingerprint: s.fingerprint,
+				EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, CheckpointID: checkPointID,
+				Bytes: raw, CreatedAt: s.host.now(),
+			},
+			MaxBytes: s.maxBytes,
+		})
+		if stageErr == nil {
+			s.lastStaged = revision
+			return nil
+		}
+		if trustedSequence || !errors.Is(stageErr, session.ErrConflict) || attempt >= maxProbeAttempts-1 {
+			return stageErr
+		}
+		revision++
 	}
-	s.lastStaged = revision
-	return nil
 }
 
-// Delete implements adk.CheckPointDeleter. It records retirement intent for
-// every staged revision up to and including the latest one this adapter
-// staged; the runtime applies it (RetireCheckpoints under the still-live
-// fence, or RetireRunCheckpoints after terminal settlement) once the exit
-// protocol has finished acting on the checkpoint, since upstream may ignore
-// a Delete error.
+// Delete implements adk.CheckPointDeleter. It retires every staged revision
+// up to and including the latest one this adapter staged immediately, under
+// the still-live run fence (RetireCheckpoints) -- not deferred until after
+// the exit protocol finishes acting on the checkpoint. This is safe to call
+// eagerly (upstream may ignore its returned error) precisely because
+// retirement only ever deletes revisions this same fenced execution staged;
+// nothing else can promote or depend on them in the meantime.
 func (s *adkCheckpointStore) Delete(ctx context.Context, checkPointID string) error {
 	if s.lastStaged <= 0 {
 		checkpoint, ok, err := s.host.store.ReadPromotedCheckpoint(ctx, s.runID)

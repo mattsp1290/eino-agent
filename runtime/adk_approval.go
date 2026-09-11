@@ -169,16 +169,38 @@ func (b *adkApprovalBinding) prepare(ctx context.Context, m *adkModel) error {
 		return errors.New("approval record does not match interrupt state")
 	}
 	if record.Status != "pending" {
-		return fmt.Errorf("approval %s already decided: %s", state.ApprovalRequestID, record.Decision)
+		if record.Decision != decision {
+			return fmt.Errorf("approval %s already decided: %s", state.ApprovalRequestID, record.Decision)
+		}
+		// The identical decision is already durably committed: a retried
+		// dispatch (a crash or a transient provider error between the CAS
+		// below and the next successful physical dispatch re-enters prepare
+		// with the same resume Targets) must be a no-op continuation, not a
+		// fatal "already decided" error -- otherwise a single transient
+		// failure right after a successful decision spends the host's
+		// approval and wedges the run forever. The response block this
+		// method would commit is already part of the durable projection
+		// (adkModel.durableProjection reloads it like any other fact), so
+		// there is nothing left to write.
+		m.needMessage = true
+		return nil
 	}
 	record.Status = "decided"
 	record.Decision = decision
 	part.Payload = mustJSON(record)
 	part.UpdatedAt = m.host.now()
-	if err := m.execution.store.UpdatePart(ctx, part); err != nil {
-		return err
-	}
-	if err := b.commitResponse(ctx, m, state.ApprovalRequestID, decision); err != nil {
+	// The decision CAS and the response-message commit must land atomically:
+	// split across two independent writes, a crash or any transient error
+	// between them durably marks the decision "decided" with no response
+	// message ever committed, and every later resume attempt hits the
+	// already-decided branch above -- which, before this fix, was
+	// unconditionally fatal, permanently wedging the run.
+	if err := m.execution.store.WithinTx(ctx, func(ctx context.Context, store session.ExecutionStore) error {
+		if err := store.UpdatePart(ctx, part); err != nil {
+			return err
+		}
+		return b.commitResponse(ctx, store, m, state.ApprovalRequestID, decision)
+	}); err != nil {
 		return err
 	}
 	// The resumed dispatch is a new logical assistant message: the
@@ -192,8 +214,10 @@ func (b *adkApprovalBinding) prepare(ctx context.Context, m *adkModel) error {
 // commitResponse durably records the host's decision as an ordinary,
 // caller-shaped user-role MCPToolApprovalResponse message (the same block
 // kind and role Start/Enqueue accept from a real caller), so it becomes part
-// of the durable projection like any other committed fact.
-func (b *adkApprovalBinding) commitResponse(ctx context.Context, m *adkModel, approvalRequestID, decision string) error {
+// of the durable projection like any other committed fact. store is the
+// (possibly transaction-scoped) ExecutionStore the caller is writing
+// through -- see prepare's WithinTx wrapping.
+func (b *adkApprovalBinding) commitResponse(ctx context.Context, store session.ExecutionStore, m *adkModel, approvalRequestID, decision string) error {
 	blocks, err := assignContentBlockIDs([]session.ContentBlock{{
 		Kind: session.BlockKindMCPToolApprovalResponse,
 		MCPApprovalResponse: &session.MCPApprovalResponseBlock{
@@ -213,13 +237,13 @@ func (b *adkApprovalBinding) commitResponse(ctx context.Context, m *adkModel, ap
 	if err != nil {
 		return err
 	}
-	if _, err := m.execution.store.AppendMessage(ctx, session.Message{
+	if _, err := store.AppendMessage(ctx, session.Message{
 		ID: messageID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, Role: session.RoleUser, CreatedAt: at, UpdatedAt: at,
 	}); err != nil {
 		return err
 	}
 	for _, p := range parts {
-		if _, err := m.execution.store.AppendPart(ctx, p); err != nil {
+		if _, err := store.AppendPart(ctx, p); err != nil {
 			return err
 		}
 	}

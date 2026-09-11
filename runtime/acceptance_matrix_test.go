@@ -276,28 +276,19 @@ func TestConcurrentResumesYieldOneOwner(t *testing.T) {
 // IdempotencyKey twice against the same session durably admits the inbox
 // item only once (session.ExecutionStore.AdmitTurn/EnqueueInbox contract),
 // not twice, whether or not a live loop is currently registered for the
-// run.
+// run. It enqueues against a durably *paused* (nonterminal, but definitely
+// not live-loop-registered) run: Enqueue now fails closed against a
+// terminal run (see Enqueue's doc comment), so the "no live loop" half of
+// this contract can no longer be exercised by racing a completed run.
 func TestDuplicateEnqueueIsIdempotentOnKey(t *testing.T) {
 	store := newAdmissionStore()
-	var calls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
-		calls++
-		return []*einoschema.AgenticMessage{agenticAssistantText("done " + string(rune('0'+calls)))}, nil
-	}))
-	handle, err := orch.Start(context.Background(), Request{SessionID: "duplicate-enqueue-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
-	if err != nil {
-		t.Fatalf("Start error = %v", err)
-	}
-	first := <-handle.Done()
-	if first.Status != session.RunCompleted {
-		t.Fatalf("first result = %+v", first)
-	}
+	orch, runID, _ := startPausedRun(t, store, "duplicate-enqueue-session", new(int))
 
-	item1, err := orch.Enqueue(context.Background(), "duplicate-enqueue-session", EnqueueRequest{RunID: first.RunID, IdempotencyKey: "dup-key-1", Message: TextUserMessage("second")})
+	item1, err := orch.Enqueue(context.Background(), "duplicate-enqueue-session", EnqueueRequest{RunID: runID, IdempotencyKey: "dup-key-1", Message: TextUserMessage("second")})
 	if err != nil {
 		t.Fatalf("first Enqueue error = %v", err)
 	}
-	item2, err := orch.Enqueue(context.Background(), "duplicate-enqueue-session", EnqueueRequest{RunID: first.RunID, IdempotencyKey: "dup-key-1", Message: TextUserMessage("second")})
+	item2, err := orch.Enqueue(context.Background(), "duplicate-enqueue-session", EnqueueRequest{RunID: runID, IdempotencyKey: "dup-key-1", Message: TextUserMessage("second")})
 	if err != nil {
 		t.Fatalf("second Enqueue error = %v", err)
 	}
@@ -316,6 +307,84 @@ func TestDuplicateEnqueueIsIdempotentOnKey(t *testing.T) {
 	}
 	if matching != 1 {
 		t.Fatalf("inbox items with dup-key-1 = %d, want 1", matching)
+	}
+}
+
+// TestEnqueueRejectsTerminalRun proves Enqueue fails closed (never silently
+// accepts input nothing will ever consume) once a run has settled
+// terminally: the plan requires new input racing terminal settlement to
+// "either commit under the active run before the terminal CAS ... or
+// receive a closed-run error without acknowledgement" -- this proves the
+// second half once the run is already terminal by the time Enqueue runs.
+func TestEnqueueRejectsTerminalRun(t *testing.T) {
+	store := newAdmissionStore()
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	}))
+	handle, err := orch.Start(context.Background(), Request{SessionID: "enqueue-terminal-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	first := <-handle.Done()
+	if first.Status != session.RunCompleted {
+		t.Fatalf("first result = %+v", first)
+	}
+	if _, err := orch.Enqueue(context.Background(), "enqueue-terminal-session", EnqueueRequest{RunID: first.RunID, IdempotencyKey: "terminal-key-1", Message: TextUserMessage("too late")}); !errors.Is(err, ErrInvalidOrchestrator) {
+		t.Fatalf("Enqueue against a terminal run error = %v, want ErrInvalidOrchestrator", err)
+	}
+	items, err := store.ListInbox(context.Background(), "enqueue-terminal-session", nil)
+	if err != nil {
+		t.Fatalf("ListInbox error = %v", err)
+	}
+	for _, it := range items {
+		if it.IdempotencyKey == "terminal-key-1" {
+			t.Fatalf("rejected Enqueue nonetheless persisted an inbox item: %+v", it)
+		}
+	}
+}
+
+// TestEnqueueDrainedByNextStart proves an Enqueue accepted while no live
+// loop exists for a paused run's session stays durably `queued` and is
+// drained (processed to completion) by ResumeRun -- the mechanism
+// Enqueue's doc comment promises and drainQueuedInbox implements.
+func TestEnqueueDrainedByNextStart(t *testing.T) {
+	store := newAdmissionStore()
+	orch, runID, pause := startPausedRun(t, store, "enqueue-drain-session", new(int))
+
+	item, err := orch.Enqueue(context.Background(), "enqueue-drain-session", EnqueueRequest{RunID: runID, IdempotencyKey: "drain-key-1", Message: TextUserMessage("queued while paused")})
+	if err != nil {
+		t.Fatalf("Enqueue error = %v", err)
+	}
+	if item.State != session.InboxQueued {
+		t.Fatalf("enqueued item state = %q, want queued", item.State)
+	}
+
+	resumeHandle, err := orch.ResumeRun(context.Background(), runID, ResumeRequest{
+		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun error = %v", err)
+	}
+	resumed := <-resumeHandle.Done()
+	if resumed.Status != session.RunCompleted || resumed.Error != nil {
+		t.Fatalf("resumed result = %+v", resumed)
+	}
+	items, err := store.ListInbox(context.Background(), "enqueue-drain-session", nil)
+	if err != nil {
+		t.Fatalf("ListInbox error = %v", err)
+	}
+	var found bool
+	for _, it := range items {
+		if it.ID != item.ID {
+			continue
+		}
+		found = true
+		if it.State != session.InboxCompleted {
+			t.Fatalf("drained item state = %q, want completed", it.State)
+		}
+	}
+	if !found {
+		t.Fatalf("enqueued item %q not found after resume", item.ID)
 	}
 }
 
