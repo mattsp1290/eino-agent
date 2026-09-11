@@ -325,7 +325,8 @@ func TestToolBatchToolSearchDeclaredFirstDoesNotBlockSiblingAgainstSQLite(t *tes
 // checkpoints the sentinel into ADK's own UnhandledItems. A resume must
 // still complete the run (genInput's fallback branch filters the sentinel
 // before it ever reaches loadInboxItems) rather than fail with "inbox item
-//   first-turn not found".
+//
+//	first-turn not found".
 func TestResumeRunAfterStopBeforeFirstDispatchAgainstSQLite(t *testing.T) {
 	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		return []*einoschema.AgenticMessage{agenticAssistantText("answered")}, nil

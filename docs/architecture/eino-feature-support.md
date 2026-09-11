@@ -934,6 +934,18 @@ that bullet for the exact, now-shorter list).
   turn/inbox/checkpoint/paused-run store contract suites
   (`store/contract/{turns,inbox,checkpoints,paused_runs}`); no further
   suites needed adding.
+  **Phase 4 (W5(b) reconciliation) verification**, re-run in full after the
+  fixes above: `gofmt`/`goimports` clean; `go build ./...`,
+  `go vet ./...`, `go vet -tags postgres_integration ./...`, and
+  `./.bin/golangci-lint run ./...` all pass with 0 issues; `go test ./...`
+  passes for every package; `go test ./runtime -race -count=3` and a
+  combined `-race -count=10` pass over every new/changed focused test named
+  in the bullets above are clean; `make check` passes in full (including
+  `external-consumer-check`, local mode); `TESTCONTAINERS_RYUK_DISABLED=true
+  GOMAXPROCS=2 GOFLAGS='-p=1' make postgres-test` and `make postgres-race`
+  both report "required suites passed; zero skips"; and
+  `EINO_AGENT_CONSUMER_POSTGRES=1 TESTCONTAINERS_RYUK_DISABLED=true
+  testdata/external-consumer/check.sh` also passes in full.
 - Acceptance-test matrix (`runtime/acceptance_matrix_test.go`,
   `runtime/turn_loop_sqlite_test.go`, `runtime/w5_reconciliation_test.go`;
   focused cases clean under `-race -count=10`): checkpoint envelope

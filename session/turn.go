@@ -36,11 +36,11 @@ type Turn struct {
 	ResponseMessageIDs []MessageID
 	// Usage records this turn's own provider usage, written atomically by
 	// CompleteTurn. Zero for a turn that never completed normally.
-	Usage              Usage
-	EpochID            EpochID
-	CreatedAt          time.Time
-	StartedAt          time.Time
-	FinishedAt         time.Time
+	Usage      Usage
+	EpochID    EpochID
+	CreatedAt  time.Time
+	StartedAt  time.Time
+	FinishedAt time.Time
 }
 
 // AdmitTurnRequest atomically admits the next-ordinal turn for a run.
