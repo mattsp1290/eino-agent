@@ -449,9 +449,10 @@ Status: landed; W1 scaffolding kept green.
   its own id: `runtime.publicizeToolCallIDs` (`runtime/orchestrator.go`)
   rewrites `function_tool_call`/`function_tool_result`/`tool_search_result`
   block `CallID`s from the minted `ID` to `ProviderCallID` (falling back to
-  `ID` when the provider supplied none, and to the durable `ID` again when
-  two or more calls in the same outgoing request would otherwise collide on
-  one provider id — see below) in a copy of the messages, applied exactly
+  `ID` when the provider supplied none or an invalid/oversized one, and,
+  processing every call in request order, whenever sending `ProviderCallID`
+  would collide with an earlier call's wire id in that same outgoing
+  request — see below) in a copy of the messages, applied exactly
   once per physical dispatch, at the top of `adkModel.begin` — before that
   request is audited/ledgered, so the request the ledger describes and the
   `ProviderRequest` `adkModel.dispatch` actually sends are the same bytes —

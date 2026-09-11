@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -211,73 +212,160 @@ func TestProviderCallIDReuseAcrossTurnsWithinOneRunProducesDistinctRowsAndCollis
 	}
 }
 
+// selectionAwareModel resolves a distinct model.Resolved (and streamer) per
+// selection.ModelID, unlike resolvedModel (which ignores the selection
+// entirely): needed so a failover attempt's ledger row and wire dispatch
+// are actually distinguishable from the primary attempt's -- with
+// resolvedModel, both report the same fake/test identity, so a test could
+// pass even if the "failover" attempt were silently dispatched through the
+// primary model again (LC-S3).
+type selectionAwareModel struct {
+	streamers map[model.ID]model.Streamer
+}
+
+func (r selectionAwareModel) Resolve(_ context.Context, selection model.Selection, _ model.Runtime) (model.Resolved, error) {
+	streamer, ok := r.streamers[selection.ModelID]
+	if !ok {
+		return model.Resolved{}, fmt.Errorf("selectionAwareModel: no streamer configured for model %q", selection.ModelID)
+	}
+	return model.Resolved{
+		Provider: model.Provider{ID: selection.ProviderID},
+		Model:    model.Descriptor{ID: selection.ModelID, ProviderID: selection.ProviderID},
+		Streamer: streamer,
+	}, nil
+}
+
 // TestModelRequestLedgerMatchesWireRequestForToolCallStep proves
-// reconciliation item 1: for a tool-call continuation dispatch, the request
-// ledger's ContentSHA256 (and the Messages it was derived from) must equal
-// auditModelRequest's hash of the exact request the streamer received --
-// not a request built from different (durable-id) call ids, as happened
-// when publicizeToolCallIDs ran a second time inside dispatch() after
-// begin() had already audited the pre-rewrite input.
+// reconciliation item 1: for EVERY physical attempt in a turn -- the
+// original dispatch, a retried attempt, and a failed-over attempt, not just
+// the happy two-step path -- the request ledger's ContentSHA256 (and the
+// Messages it was derived from) must equal auditModelRequest's hash of the
+// exact request the streamer actually received, never a request rebuilt
+// from different (durable-id) call ids, as happened when
+// publicizeToolCallIDs ran a second time inside dispatch() after begin()
+// had already audited the pre-rewrite input.
 func TestModelRequestLedgerMatchesWireRequestForToolCallStep(t *testing.T) {
-	store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = storePool.Close() }()
-	var mu sync.Mutex
-	var submitted []model.Request
-	streamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
-		clone, cloneErr := request.Clone()
-		if cloneErr != nil {
-			return nil, cloneErr
-		}
-		mu.Lock()
-		submitted = append(submitted, clone)
-		mu.Unlock()
-		if len(submitted) == 1 {
-			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call_0", "echo", `{"text":"hi"}`))}, nil
-		}
-		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
-	})
-	orchestrator, err := NewStreamingOrchestrator(
-		WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
-		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{tools: []Tool{{
-			Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
-			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "hi"}, nil }),
-		}}})}),
-		WithClock(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) }),
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "ledger-tool-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
-	if result.Status != session.RunCompleted {
-		t.Fatalf("result = %+v", result)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(submitted) != 2 {
-		t.Fatalf("submitted = %d requests, want 2", len(submitted))
-	}
-	batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
-	if err != nil || len(batch.Records) != 2 {
-		t.Fatalf("records = %#v, %v", batch, err)
-	}
-	sort.Slice(batch.Records, func(i, j int) bool { return batch.Records[i].Step < batch.Records[j].Step })
-	for i, record := range batch.Records {
-		_, _, hash, err := auditModelRequest(submitted[i], nil, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if record.ContentSHA256 != hash {
-			t.Fatalf("record[%d].ContentSHA256 = %s, want %s (hash of the request the streamer actually received): ledger and wire diverged", i, record.ContentSHA256, hash)
-		}
-	}
-	// Positive check that this actually exercises a tool-call step (would
-	// otherwise vacuously pass for a no-tool run).
-	calls, results := functionCallAndResultBlocks(submitted[1].Messages)
-	if len(calls) != 1 || calls[0] != "call_0" || len(results) != 1 || results[0] != "call_0" {
-		t.Fatalf("submitted[1] call/result ids = %v/%v, want [call_0]/[call_0]", calls, results)
+	for _, tc := range []struct {
+		name           string
+		attempts       int
+		failover       bool
+		wantDispatches int
+	}{
+		{name: "primary", attempts: 1, wantDispatches: 2},
+		{name: "retry", attempts: 2, wantDispatches: 3},
+		{name: "failover", attempts: 1, failover: true, wantDispatches: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, storePool, err := openTestSQLite(context.Background(), filepath.Join(t.TempDir(), "store.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = storePool.Close() }()
+
+			var mu sync.Mutex
+			var submitted []model.Request
+			record := func(request model.Request) {
+				clone, cloneErr := request.Clone()
+				if cloneErr != nil {
+					t.Fatal(cloneErr)
+				}
+				mu.Lock()
+				submitted = append(submitted, clone)
+				mu.Unlock()
+			}
+
+			// Primary/retry: step 1 mints a tool call ("call_0"); step 2
+			// (retry variant) fails once with a transient error before the
+			// retried attempt succeeds with text. Failover: step 1 is the
+			// same tool call; step 2 (the primary model's own continuation
+			// attempt) fails outright, triggering ADK's failover wrapper --
+			// the failover model's own first dispatch then succeeds.
+			primaryCalls := 0
+			primaryStreamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+				primaryCalls++
+				record(request)
+				switch {
+				case primaryCalls == 1:
+					return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call_0", "echo", `{"text":"hi"}`))}, nil
+				case tc.name == "retry" && primaryCalls == 2:
+					return nil, errors.New("transient")
+				case tc.name == "failover" && primaryCalls == 2:
+					return nil, errors.New("primary model unavailable")
+				default:
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+				}
+			})
+			failoverStreamer := scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+				record(request)
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+			})
+			resolver := selectionAwareModel{streamers: map[model.ID]model.Streamer{
+				"test":           primaryStreamer,
+				"failover-model": failoverStreamer,
+			}}
+
+			toolRegistry := staticToolRegistry{tools: []Tool{{
+				Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
+				Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "hi"}, nil }),
+			}}}
+			plan := newTestToolPlan(toolRegistry)
+			if tc.failover {
+				plan = mustTestRunPlan(RunPlanSpec{
+					Components: []PlanComponent{{Component: testPlanComponent("test-tools"), Tools: testPlanTools(toolRegistry)}},
+					Failover:   &FailoverPolicy{Models: []model.Selection{{ProviderID: "fake", ModelID: "failover-model"}}},
+				})
+			}
+
+			options := []Option{
+				WithStore(store), WithModelResolver(resolver), WithIDGenerator(&sequenceIDs{}),
+				WithRunPlanProvider(staticRunPlanProvider{plan: plan}),
+				WithClock(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) }),
+			}
+			if tc.attempts > 1 {
+				options = append(options, WithAttempts(tc.attempts))
+			}
+			orchestrator, err := NewStreamingOrchestrator(options...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := startAndWaitRequest(t, orchestrator, Request{SessionID: session.ID("ledger-tool-session-" + tc.name), Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+			if result.Status != session.RunCompleted {
+				t.Fatalf("result = %+v", result)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(submitted) != tc.wantDispatches {
+				t.Fatalf("submitted = %d requests, want %d", len(submitted), tc.wantDispatches)
+			}
+			batch, err := store.ListModelRequests(context.Background(), result.RunID, session.ModelRequestCursor{Limit: 10})
+			if err != nil || len(batch.Records) != tc.wantDispatches {
+				t.Fatalf("records = %#v, %v", batch, err)
+			}
+			sort.Slice(batch.Records, func(i, j int) bool { return batch.Records[i].Step < batch.Records[j].Step })
+			for i, record := range batch.Records {
+				_, _, hash, err := auditModelRequest(submitted[i], nil, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if record.ContentSHA256 != hash {
+					t.Fatalf("record[%d].ContentSHA256 = %s, want %s (hash of the request the streamer actually received): ledger and wire diverged", i, record.ContentSHA256, hash)
+				}
+			}
+			// Positive check that this actually exercises a tool-call step
+			// (would otherwise vacuously pass for a no-tool run).
+			calls, results := functionCallAndResultBlocks(submitted[1].Messages)
+			if len(calls) != 1 || calls[0] != "call_0" || len(results) != 1 || results[0] != "call_0" {
+				t.Fatalf("submitted[1] call/result ids = %v/%v, want [call_0]/[call_0]", calls, results)
+			}
+			if tc.failover {
+				// LC-S3: prove the failover attempt actually dispatched
+				// through the failover model, not a resolver that silently
+				// ignores the selection and reuses the primary's identity.
+				if got := batch.Records[len(batch.Records)-1].ModelID; got != "failover-model" {
+					t.Fatalf("last ledger row ModelID = %q, want failover-model", got)
+				}
+			}
+		})
 	}
 }
 
