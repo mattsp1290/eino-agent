@@ -1635,7 +1635,7 @@ unwritten (see that bullet for the exact, now-shorter list).
 
 ## W6: typed ADK middleware, context and extensions
 
-Status: groups A, B, C and D landed and are verified per the gate list below
+Status: groups A through E landed and are verified per the gate list below
 (`go test ./composition ./runtime ./session/...`, `go vet -tags
 postgres_integration ./...`, `golangci-lint` 0 issues, `go test ./runtime
 -race -count=3`). The two integration gaps an earlier pass of this work
@@ -1805,3 +1805,61 @@ just construction. Group E (WASM/WIT content-block evolution) and
     `activeModel()`); a bounded, accepted simplification given
     `BeforeModelRewriteState` now runs once per logical cycle, before the
     internal failover/retry wrapper, not once per physical attempt.
+- **Group E (WASM/WIT content-block evolution)**: landed and verified.
+  `wit/eino-agent-extensions.wit`'s `text-message` record is replaced by a
+  `content-block` variant (`text(string)`, `media-reference`,
+  `function-call`, `function-result-text`) inside a `message` record
+  (`role` + `blocks: list<content-block>`), so `context-source` (and any
+  future WASM context/model/tool middleware observing message content) can
+  produce media references and call/result projections without flattening
+  them to text; `context-source-api.load-context` now returns
+  `list<message>`. The package bumped `eino-agent:extensions@0.1.0` ->
+  `@0.2.0`; bindings were regenerated with `make wit`
+  (`wasmext/gen/eino-agent/extensions/v0.2.0/...`) and `make wit-check`
+  passes clean against the committed tree. `wasmext/engine.go`'s six
+  `worldContract` values (world + export names) are pinned to the package
+  version; these were still hardcoded to `@0.1.0` after the bump, which
+  made every fixture -- not only `context-source` -- fail to compile until
+  fixed, confirming the version pin is load-bearing, not decorative.
+  `wasmext/wasmtime_worlds.go`'s new `decodeMessages`/
+  `decodeContentBlocks`/`decodeContentBlock` (modeled on the existing,
+  proven `decodeReplacement` variant-decoding pattern) replace the removed
+  `decodeTextMessages`, bounding block count and cumulative payload bytes
+  against `Limits.MaxOutputBytes`. `wasmext/wrappers.go`'s
+  `loadContextMetadata` maps each WIT case onto the matching
+  `schema.ContentBlock` variant: `text` stays plain text; `media-reference`
+  is classified by its required MIME type (`image/`, `audio/`, `video/`,
+  else treated as an opaque file reference -- `media-reference` carries no
+  separate kind discriminant of its own) into the matching typed
+  `UserInput{Image,Audio,Video,File}` block, never flattened to text;
+  `function-call`/`function-result-text` map onto
+  `FunctionToolCall`/`FunctionToolResult`. All six guest fixtures
+  (`examples/wasm-extensions/*/main.go`) were rebuilt via `make
+  wasm-fixtures` (both `tinygo` and `wasm-tools` are present locally); the
+  `context-source` guest now emits a `content-block` message.
+  **Version rejection is structural, proven, and does not crash**: an old
+  guest built against the superseded `@0.1.0` world exports a
+  structurally-different function signature, so wasmtime's own
+  canonical-ABI type check on that exported signature rejects the
+  component at compile/instantiation time -- before any call -- as an
+  ordinary `*wasmext.Error`, never a panic. This is a permanent regression
+  test, not a one-off manual check:
+  `TestCheckedInOldABIContextSourceRejectedCleanly` loads a checked-in
+  `@0.1.0` `context-source.wasm`
+  (`examples/wasm-extensions/fixtures/context-source-abi-v0.1-incompatible.wasm`,
+  the pre-bump fixture preserved under a new name) against the current host
+  and asserts a clean `*Error`. `TestCheckedInPhaseBComponentsRoundTrip`
+  exercises the new shape end to end through the rebuilt fixture. No
+  classic `PartKind` names existed in this WIT file to rename (the parallel
+  removal work in another worktree does not intersect this package).
+  - **Bounded limitation**: `testdata/external-consumer` (a separate Go
+    module resolving the published module graph, exercised by
+    `make external-consumer-check` / `EINO_AGENT_CONSUMER_POSTGRES=1
+    testdata/external-consumer/check.sh`) covers the store/session/
+    runtime/tools surface only; it does not instantiate WASM components
+    (cgo-gated, backed by local `.wasm` fixture files, not something a
+    published-module consumer loads). The content-block shape and old-ABI
+    rejection are instead exercised, end to end, by this repository's own
+    `wasmext` test suite as described above -- the mechanism the coordinator
+    asked to be documented if this exact scenario weren't literally covered
+    by the external-consumer harness.
