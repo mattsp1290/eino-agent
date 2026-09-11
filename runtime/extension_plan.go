@@ -189,6 +189,9 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	if err != nil {
 		return fail(err)
 	}
+	if err := validateHandlerToolNameCollisions(compiled, toolSearch); err != nil {
+		return fail(err)
+	}
 	if toolSearch != nil {
 		if err := validateToolSearchNameCollision(toolSearch.Name, compiled); err != nil {
 			return fail(err)
@@ -235,6 +238,42 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	}
 	plan.failover = spec.Failover
 	return plan, nil
+}
+
+// validateHandlerToolNameCollisions rejects any agent-handler-contributed
+// tool (HandlerToolSpec, discovered by discoverHandlerTools and sealed by
+// adkEngine.sealHandlerTools) whose name collides with the native runtime
+// tool-search name (toolSearch, nil when not configured for this plan), any
+// owned composition tool's canonical name, any tool alias, or another
+// handler's own contributed tool name (round-two W6 review item 18, HA-S2
+// in the round-two W6 review: named for the toolsearch recipe's own
+// tool_search-shaped output, which upstream defaults to the exact same name
+// the runtime's own native tool-search feature commonly uses, but applied
+// to every handler tool for the same reason validateToolSearchNameCollision
+// exists -- a colliding sealed tool identity is unreachable or ambiguous
+// with no error anywhere it is actually dispatched).
+func validateHandlerToolNameCollisions(compiled compiledRunPlan, toolSearch *ToolSearchConfig) error {
+	seenHandlerToolNames := make(map[string]string, len(compiled.ownedHandlers))
+	for _, handler := range compiled.ownedHandlers {
+		for _, toolSpec := range handler.value.Tools {
+			if toolSearch != nil && toolSpec.Name == toolSearch.Name {
+				return fmt.Errorf("%w: handler %q tool %q collides with the native tool search name", ErrExtensionPlanMismatch, handler.value.ID, toolSpec.Name)
+			}
+			if _, taken := compiled.aliasIndex[toolSpec.Name]; taken {
+				return fmt.Errorf("%w: handler %q tool %q collides with a tool alias", ErrExtensionPlanMismatch, handler.value.ID, toolSpec.Name)
+			}
+			for _, owned := range compiled.ownedTools {
+				if owned.value.Name == toolSpec.Name {
+					return fmt.Errorf("%w: handler %q tool %q collides with a tool name", ErrExtensionPlanMismatch, handler.value.ID, toolSpec.Name)
+				}
+			}
+			if otherHandlerID, taken := seenHandlerToolNames[toolSpec.Name]; taken && otherHandlerID != handler.value.ID {
+				return fmt.Errorf("%w: handler %q tool %q collides with handler %q's own tool of the same name", ErrExtensionPlanMismatch, handler.value.ID, toolSpec.Name, otherHandlerID)
+			}
+			seenHandlerToolNames[toolSpec.Name] = handler.value.ID
+		}
+	}
+	return nil
 }
 
 // validateToolSearchNameCollision rejects a tool-search name that collides
