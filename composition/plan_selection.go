@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/cloudwego/eino/adk"
+	einoschema "github.com/cloudwego/eino/schema"
+
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/tools"
@@ -133,7 +136,21 @@ func (s planSelection) components() []runtime.PlanComponent {
 				})
 			}
 		}
-		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
+		for _, registration := range mounted.payload.handlers {
+			if !extension.ScopeApplies(registration.Scope, s.target) {
+				continue
+			}
+			factory := registration.Factory
+			callbackContext := mounted.callbackContext
+			owned.AgentHandlers = append(owned.AgentHandlers, runtime.PlanAgentHandler{
+				ID: registration.ID, Order: registration.Order, Scope: registration.Scope,
+				Kind: registration.Descriptor.Kind, Version: registration.Descriptor.Version, ConfigHash: registration.configHash,
+				Factory: func(ctx context.Context, build runtime.HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
+					return factory(callbackContext(ctx), build)
+				},
+			})
+		}
+		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions)+len(owned.AgentHandlers) > 0 {
 			result = append(result, owned)
 		}
 	}

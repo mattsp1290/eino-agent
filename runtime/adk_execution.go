@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -360,17 +361,90 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 		durable[e.snapshot.ToolSearch.Name] = true
 	}
 	guard := newDurableGuard(durable)
+	handlers, err := e.buildAgentHandlers(ctx, inner, durable)
+	if err != nil {
+		return nil, err
+	}
 	build := AgentBuildContext{
 		Model: inner, Tools: tools, ToolAliases: aliases,
-		Instruction:   "",
-		MaxIterations: e.host.toolTurns(),
-		Guard:         guard,
-		Retry:         defaultRetryConfig(e.host.attempts()),
-		Failover:      buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
+		Instruction:    "",
+		MaxIterations:  e.host.toolTurns(),
+		Guard:          guard,
+		SettlementSeal: newSettlementSeal(e.host.store),
+		Handlers:       handlers,
+		Retry:          defaultRetryConfig(e.host.attempts()),
+		Failover:       buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
 	}
 	e.guard = guard
 	factory := e.plan.AgentFactory()
 	return factory.BuildAgent(ctx, build)
+}
+
+// buildAgentHandlers resolves this run's plan-ordered, host-registered
+// typed-ADK middleware factories (composition.Registrar.Handler) into
+// concrete instances for this turn. Each factory receives a
+// HandlerBuildContext bounded to this turn: model, a durable tool wrapper
+// (durableToolName is derived from the underlying tool's own advertised
+// name -- see adkGenericDurableTool), and a read-only workspace view rooted
+// at the admitted canonical workspace (nil when none is configured, so a
+// recipe requiring one fails construction closed rather than operating
+// unscoped -- see workspaceFilesystemBackend/workspaceSkillBackend).
+func (e *adkEngine) buildAgentHandlers(ctx context.Context, inner einomodel.AgenticModel, durable map[string]bool) ([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
+	plan := e.plan.AgentHandlers()
+	if len(plan) == 0 {
+		return nil, nil
+	}
+	build := HandlerBuildContext{
+		SessionID:     e.snapshot.SessionID,
+		RunID:         e.snapshot.RunID,
+		WorkspaceRoot: e.snapshot.Config.Metadata["workspace_root"],
+		Model:         inner,
+		ToolWrapper: func(t tool.BaseTool) tool.BaseTool {
+			return newAdkGenericDurableTool(ctx, t, durable)
+		},
+		Store:     e.host.store,
+		Execution: e.execution.store,
+		IDs:       e.host.ids,
+		Now:       e.host.now,
+	}
+	for _, t := range e.snapshot.Tools {
+		if !t.Deferred {
+			continue
+		}
+		wrapped := &adkTool{engine: e, tool: t}
+		durable[t.Name] = true
+		build.DeferredTools = append(build.DeferredTools, wrapped)
+	}
+	if build.WorkspaceRoot != "" {
+		fsBackend, skillBackend, err := newWorkspaceBackends(build.WorkspaceRoot)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		}
+		build.FilesystemBackend = fsBackend
+		build.SkillBackend = skillBackend
+		planTaskBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "plantask"))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		}
+		build.PlanTaskBackend = planTaskBackend
+		reductionBackend, err := newWritableWorkspaceBackend(build.WorkspaceRoot, filepath.Join(".eino-agent", "reduction"))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrExtensionPlanMismatch, err)
+		}
+		build.ReductionBackend = reductionBackend
+	}
+	handlers := make([]adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], 0, len(plan))
+	for _, entry := range plan {
+		handler, err := entry.Factory(ctx, build)
+		if err != nil {
+			return nil, fmt.Errorf("build agent handler %q (%s): %w", entry.ID, entry.Kind, err)
+		}
+		if handler == nil {
+			return nil, fmt.Errorf("agent handler %q (%s) factory returned nil", entry.ID, entry.Kind)
+		}
+		handlers = append(handlers, handler)
+	}
+	return handlers, nil
 }
 
 func cloneStringSliceMap(src map[string][]string) map[string][]string {
@@ -405,6 +479,21 @@ type AgentBuildContext struct {
 	// tool in the built agent's effective tool list that is not one of the
 	// adapters this AgentBuildContext provided.
 	Guard adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	// SettlementSeal is the mandatory final tool/model-content protection
+	// handler (see settlementSeal's doc comment); an AgentFactory must
+	// install it last, after Guard, in its Handlers list.
+	SettlementSeal adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
+	// Handlers is the ordered, per-execution snapshot of every
+	// composition.Registrar.Handler factory output for this run's frozen
+	// plan (see RunPlan.AgentHandlers), built fresh for this turn by
+	// adkEngine.buildAgent. An AgentFactory that installs its own Handlers
+	// must place these first, ahead of Guard and any other mandatory tail
+	// handler, so host handlers are the outermost wrapper layer (ADK: first
+	// registered is outermost) and this runtime's own tail handlers
+	// (durableGuard, settlementSeal) stay innermost, directly around the
+	// mandatory Model/Tools adapters. DefaultChatModelAgentFactory does this
+	// automatically.
+	Handlers []adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
 }
 
 // AgentFactory builds the typed ADK agent for one admitted turn from a
@@ -453,8 +542,19 @@ func (DefaultChatModelAgentFactory) BuildAgent(ctx context.Context, build AgentB
 		ModelRetryConfig:    build.Retry,
 		ModelFailoverConfig: build.Failover,
 	}
+	// Handler order: first registered is outermost (ADK: [A,B,C] wraps as
+	// A(B(C(model/tool)))). Host handlers (build.Handlers, already in the
+	// plan's registered order) go first so they are outermost; this
+	// runtime's own mandatory tail handlers go last so they stay innermost,
+	// directly around the mandatory Model/Tools adapters this
+	// AgentBuildContext provided -- see AgentBuildContext.Handlers and
+	// durableGuard/settlementSeal's doc comments.
+	cfg.Handlers = append(cfg.Handlers, build.Handlers...)
 	if build.Guard != nil {
 		cfg.Handlers = append(cfg.Handlers, build.Guard)
+	}
+	if build.SettlementSeal != nil {
+		cfg.Handlers = append(cfg.Handlers, build.SettlementSeal)
 	}
 	return adk.NewTypedChatModelAgent[*einoschema.AgenticMessage](ctx, cfg)
 }

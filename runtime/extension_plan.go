@@ -74,12 +74,30 @@ type PlanRestriction struct {
 	Denied         []string
 }
 
+// PlanAgentHandler binds one composition-registered typed ADK agent
+// middleware factory to its registration identity. Unlike PlanTool/
+// PlanPrompt/PlanGuard/PlanRestriction, the identity carried here (ID, Kind,
+// Version, ConfigHash) is what gets sealed into the durable
+// ExtensionPlanDescriptor (as session.AgentHandlerPlanIdentity); Factory
+// itself is deliberately excluded from the sealed fingerprint -- like
+// RunPlanSpec.Agent, it is host construction code identity, not durable
+// capability evidence, and every model/tool a built middleware instance can
+// ever use is still validated against the frozen plan and mandatory adapters
+// (AgentBuildContext.Model/ToolWrapper) when it is actually built.
+type PlanAgentHandler struct {
+	ID, Kind, Version, ConfigHash string
+	Order                         int
+	Scope                         extension.Scope
+	Factory                       HandlerFactory
+}
+
 type PlanComponent struct {
-	Component    extension.Component
-	Tools        []PlanTool
-	Prompts      []PlanPrompt
-	Guards       []PlanGuard
-	Restrictions []PlanRestriction
+	Component     extension.Component
+	Tools         []PlanTool
+	Prompts       []PlanPrompt
+	Guards        []PlanGuard
+	Restrictions  []PlanRestriction
+	AgentHandlers []PlanAgentHandler
 }
 
 // ToolSearchConfig configures the runtime-implemented tool-search tool for a
@@ -132,16 +150,17 @@ type RunPlanSpec struct {
 
 // RunPlan is the immutable executable state for one run.
 type RunPlan struct {
-	dispatch   *extension.Plan
-	sessionID  session.ID
-	tools      sealedPlanTools
-	prompts    []MountedPrompt
-	guards     []MountedToolGuard
-	sealed     session.SealedExtensionPlan
-	toolSearch *ToolSearchConfig
-	agent      AgentFactory
-	failover   *FailoverPolicy
-	once       sync.Once
+	dispatch      *extension.Plan
+	sessionID     session.ID
+	tools         sealedPlanTools
+	prompts       []MountedPrompt
+	guards        []MountedToolGuard
+	sealed        session.SealedExtensionPlan
+	toolSearch    *ToolSearchConfig
+	agent         AgentFactory
+	failover      *FailoverPolicy
+	agentHandlers []PlanAgentHandler
+	once          sync.Once
 }
 
 // NewRunPlan derives durable identity from registered behavior and seals it.
@@ -201,6 +220,7 @@ func NewRunPlan(spec RunPlanSpec) (*RunPlan, error) {
 	plan.guards = compiled.guards
 	plan.sealed = sealed
 	plan.toolSearch = toolSearch
+	plan.agentHandlers = compiled.agentHandlers
 	plan.agent = spec.Agent
 	if plan.agent == nil {
 		plan.agent = DefaultChatModelAgentFactory{}
@@ -252,6 +272,11 @@ type ownedPlanRestriction struct {
 	value PlanRestriction
 }
 
+type ownedPlanAgentHandler struct {
+	owner string
+	value PlanAgentHandler
+}
+
 type handlerFragment struct {
 	component extension.Component
 	durable   session.ComponentPlan
@@ -259,14 +284,16 @@ type handlerFragment struct {
 }
 
 type compiledRunPlan struct {
-	descriptor   session.ExtensionPlanDescriptor
-	ownedTools   []ownedPlanTool
-	prompts      []MountedPrompt
-	guards       []MountedToolGuard
-	ownedRules   []ownedPlanRestriction
-	tools        []PlanTool
-	restrictions []PlanRestriction
-	aliasIndex   map[string]string
+	descriptor    session.ExtensionPlanDescriptor
+	ownedTools    []ownedPlanTool
+	prompts       []MountedPrompt
+	guards        []MountedToolGuard
+	ownedRules    []ownedPlanRestriction
+	ownedHandlers []ownedPlanAgentHandler
+	tools         []PlanTool
+	restrictions  []PlanRestriction
+	agentHandlers []PlanAgentHandler
+	aliasIndex    map[string]string
 }
 
 func compileRunPlan(spec RunPlanSpec) (compiledRunPlan, error) {
@@ -320,6 +347,9 @@ func (c *compiledRunPlan) compileCapabilities(owned PlanComponent) (session.Comp
 	if err := c.compileRestrictions(owned, &durable); err != nil {
 		return session.ComponentPlan{}, err
 	}
+	if err := c.compileAgentHandlers(owned, &durable); err != nil {
+		return session.ComponentPlan{}, err
+	}
 	return durable, nil
 }
 
@@ -369,8 +399,22 @@ func (c *compiledRunPlan) compileRestrictions(owned PlanComponent, durable *sess
 	return nil
 }
 
+func (c *compiledRunPlan) compileAgentHandlers(owned PlanComponent, durable *session.ComponentPlan) error {
+	for _, capability := range owned.AgentHandlers {
+		if capability.Factory == nil || capability.Kind == "" || capability.Version == "" || capability.ConfigHash == "" {
+			return fmt.Errorf("%w: agent handler behavior required", ErrExtensionPlanMismatch)
+		}
+		c.ownedHandlers = append(c.ownedHandlers, ownedPlanAgentHandler{owner: owned.Component.InstanceID, value: capability})
+		durable.AgentHandlers = append(durable.AgentHandlers, session.AgentHandlerPlanIdentity{
+			ID: capability.ID, Kind: capability.Kind, Version: capability.Version, ConfigHash: capability.ConfigHash,
+			Order: capability.Order, Scope: capability.Scope,
+		})
+	}
+	return nil
+}
+
 func (c *compiledRunPlan) mergeCapabilityFragment(component extension.Component, durable session.ComponentPlan, handlers []*handlerFragment) {
-	behaviorCount := len(durable.Tools) + len(durable.Prompts) + len(durable.Guards) + len(durable.Restrictions)
+	behaviorCount := len(durable.Tools) + len(durable.Prompts) + len(durable.Guards) + len(durable.Restrictions) + len(durable.AgentHandlers)
 	if behaviorCount != 0 {
 		for _, fragment := range handlers {
 			if !fragment.merged && fragment.component == component {
@@ -392,7 +436,13 @@ func (c *compiledRunPlan) finalize() error {
 	sort.Slice(c.ownedRules, func(i, j int) bool {
 		return comparePlanRestriction(c.ownedRules[i].owner, c.ownedRules[i].value, c.ownedRules[j].owner, c.ownedRules[j].value) < 0
 	})
+	sort.Slice(c.ownedHandlers, func(i, j int) bool {
+		return comparePlanAgentHandler(c.ownedHandlers[i].owner, c.ownedHandlers[i].value, c.ownedHandlers[j].owner, c.ownedHandlers[j].value) < 0
+	})
 	if err := uniqueCapabilityNames(c.ownedTools, c.prompts); err != nil {
+		return err
+	}
+	if err := uniqueAgentHandlerIDs(c.ownedHandlers); err != nil {
 		return err
 	}
 	aliasIndex, err := buildToolAliasIndex(c.ownedTools)
@@ -402,13 +452,40 @@ func (c *compiledRunPlan) finalize() error {
 	c.aliasIndex = aliasIndex
 	c.tools = make([]PlanTool, len(c.ownedTools))
 	c.restrictions = make([]PlanRestriction, len(c.ownedRules))
+	c.agentHandlers = make([]PlanAgentHandler, len(c.ownedHandlers))
 	for index := range c.ownedTools {
 		c.tools[index] = c.ownedTools[index].value
 	}
 	for index := range c.ownedRules {
 		c.restrictions[index] = c.ownedRules[index].value
 	}
+	for index := range c.ownedHandlers {
+		c.agentHandlers[index] = c.ownedHandlers[index].value
+	}
 	return nil
+}
+
+func uniqueAgentHandlerIDs(handlers []ownedPlanAgentHandler) error {
+	seen := make(map[string]bool, len(handlers))
+	for _, handler := range handlers {
+		if seen[handler.value.ID] {
+			return fmt.Errorf("%w: duplicate agent handler id %q", ErrExtensionPlanMismatch, handler.value.ID)
+		}
+		seen[handler.value.ID] = true
+	}
+	return nil
+}
+
+func comparePlanAgentHandler(leftOwner string, left PlanAgentHandler, rightOwner string, right PlanAgentHandler) int {
+	for _, result := range []int{
+		cmp.Compare(left.Order, right.Order), cmp.Compare(left.ID, right.ID), cmp.Compare(leftOwner, rightOwner),
+		compareExecutionScope(left.Scope, right.Scope),
+	} {
+		if result != 0 {
+			return result
+		}
+	}
+	return 0
 }
 
 func uniqueCapabilityNames(tools []ownedPlanTool, prompts []MountedPrompt) error {
@@ -747,6 +824,19 @@ func (p *RunPlan) Guards() []MountedToolGuard {
 		return nil
 	}
 	return append([]MountedToolGuard(nil), p.guards...)
+}
+
+// AgentHandlers returns a defensive copy of the sealed, ordered typed-ADK
+// agent-handler factory list (composition.Registrar.Handler registrations).
+// Order is (Order, ID, owner instance, scope) ascending -- see
+// comparePlanAgentHandler -- and is the order adkEngine.buildAgent installs
+// them into AgentBuildContext.Handlers, before the runtime's mandatory tail
+// handlers (durableGuard, settlementSeal).
+func (p *RunPlan) AgentHandlers() []PlanAgentHandler {
+	if p == nil {
+		return nil
+	}
+	return append([]PlanAgentHandler(nil), p.agentHandlers...)
 }
 
 func (p *RunPlan) Release() { p.release() }
