@@ -1071,13 +1071,39 @@ func (s *fakeExecutionStore) ReconcileInterruptedTurn(_ context.Context, request
 	s.turns[candidate.ID] = candidate
 	for id, item := range s.inbox {
 		if item.TurnID == candidate.ID && item.State == session.InboxConsumed {
-			item.State = session.InboxQueued
-			item.TurnID = ""
+			item.State = session.InboxInterrupted
 			s.inbox[id] = item
 		}
 	}
 	s.putEvent(request.Event)
 	return session.ReconcileInterruptedTurnResult{Turn: candidate, Event: request.Event}, nil
+}
+
+func (s *fakeExecutionStore) ResumeInterruptedTurn(_ context.Context, request session.ResumeInterruptedTurnRequest) (session.ResumeInterruptedTurnResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.valid() {
+		return session.ResumeInterruptedTurnResult{}, session.ErrConflict
+	}
+	current, ok := s.turns[request.TurnID]
+	if !ok {
+		return session.ResumeInterruptedTurnResult{}, session.ErrConflict
+	}
+	candidate, err := session.ApplyResumeInterruptedTurn(current, request)
+	if err != nil {
+		return session.ResumeInterruptedTurnResult{}, err
+	}
+	if candidate.State == current.State {
+		return session.ResumeInterruptedTurnResult{Turn: candidate}, nil
+	}
+	s.turns[candidate.ID] = candidate
+	for id, item := range s.inbox {
+		if item.TurnID == candidate.ID && item.State == session.InboxInterrupted {
+			item.State = session.InboxConsumed
+			s.inbox[id] = item
+		}
+	}
+	return session.ResumeInterruptedTurnResult{Turn: candidate}, nil
 }
 
 func (s *fakeExecutionStore) RepauseRun(_ context.Context, request session.RepauseRunRequest) (session.RepauseRunResult, error) {

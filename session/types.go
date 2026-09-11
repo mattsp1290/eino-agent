@@ -521,10 +521,14 @@ type ExecutionStore interface {
 	// its claimed inbox items as interrupted, without touching run status.
 	InterruptTurn(ctx context.Context, request InterruptTurnRequest) (InterruptTurnResult, error)
 	// ReconcileInterruptedTurn atomically settles a turn a crashed process
-	// left admitted/running as interrupted and requeues its consumed inbox
-	// items back to queued (see ReconcileInterruptedTurnRequest), without
-	// touching run status.
+	// left admitted/running as interrupted, carrying its consumed inbox
+	// items forward as interrupted (see ReconcileInterruptedTurnRequest),
+	// without touching run status.
 	ReconcileInterruptedTurn(ctx context.Context, request ReconcileInterruptedTurnRequest) (ReconcileInterruptedTurnResult, error)
+	// ResumeInterruptedTurn atomically resumes a TurnInterrupted turn under
+	// the same TurnID for a fresh redrive (see ResumeInterruptedTurnRequest),
+	// without touching run status.
+	ResumeInterruptedTurn(ctx context.Context, request ResumeInterruptedTurnRequest) (ResumeInterruptedTurnResult, error)
 	// StageCheckpoint inserts one unpromoted checkpoint revision under the
 	// fence.
 	StageCheckpoint(ctx context.Context, request StageCheckpointRequest) (Checkpoint, error)

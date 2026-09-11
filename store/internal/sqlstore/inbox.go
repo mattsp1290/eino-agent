@@ -299,44 +299,6 @@ func (s *Store) settleInboxForTurn(ctx context.Context, turnKey int64, from []se
 	return nil
 }
 
-// requeueInboxForTurn transitions every InboxConsumed item claimed by
-// turnKey back to InboxQueued, clearing its turn linkage (turn_key and
-// TurnID) so it reads exactly like a fresh, never-claimed row -- used by
-// ReconcileInterruptedTurn to requeue a crashed process's dangling turn's
-// consumed items for a fresh AdmitTurn to re-consume on the next resume
-// (unlike settleInboxForTurn, which only ever moves items to a TERMINAL
-// state and never clears the turn link, since a terminal item's turn
-// association remains a true historical fact).
-func (s *Store) requeueInboxForTurn(ctx context.Context, turnKey int64, at time.Time) error {
-	var rows []inboxRow
-	if err := s.inboxQuery(ctx).Where("inbox.turn_key = ? AND inbox.state = ?", turnKey, string(session.InboxConsumed)).Find(&rows).Error; err != nil {
-		return s.mapErr(err)
-	}
-	for _, row := range rows {
-		item, err := decodeInboxRow(row)
-		if err != nil {
-			return err
-		}
-		item.State = session.InboxQueued
-		item.TurnID = ""
-		item.UpdatedAt = at.UTC()
-		raw, err := json.Marshal(item)
-		if err != nil {
-			return err
-		}
-		db := s.dbFor(ctx).Table(s.tableName("inbox")).Where("row_key = ? AND state = ?", row.RowKey, string(session.InboxConsumed)).Updates(map[string]any{
-			"state": string(session.InboxQueued), "turn_key": nil, "record": raw, "updated_at": TimeText(item.UpdatedAt),
-		})
-		if err := s.mapErr(db.Error); err != nil {
-			return err
-		}
-		if db.RowsAffected == 0 {
-			return session.ErrConflict
-		}
-	}
-	return nil
-}
-
 // interruptInboxItems transitions the given inbox IDs (queued or consumed)
 // directly to interrupted, as part of PromotePause. It is idempotent per ID.
 func (s *Store) interruptInboxItems(ctx context.Context, sessionKey int64, ids []session.InboxID, at time.Time) error {

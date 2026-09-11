@@ -191,12 +191,15 @@ func (s *adkCheckpointStore) stage(ctx context.Context, checkPointID string, kin
 // eino's adk.turnLoopCheckpoint[session.InboxID] (adk/turn_loop.go): gob
 // matches by field name and type, not by concrete struct identity, so
 // encoding this shape produces bytes eino's own unmarshalTurnLoopCheckpoint
-// decodes correctly. Kept in exact sync with upstream's turnLoopCheckpoint;
-// verified by TestEmptyLoopCheckpointMatchesUpstreamGobShape
-// (runtime/w5_round3_test.go), which gob-decodes marshalEmptyLoopCheckpoint's
-// bytes into a field-identical mirror of upstream's private type -- gob
-// silently ignores fields it does not recognize, so this fails loudly on an
-// upstream rename instead of silently decoding to a zero struct.
+// decodes correctly, and decoding upstream's own bytes with this shape
+// recovers them correctly (see decodeLoopCheckpointHasRunnerState, which
+// does exactly that in production on ResumeRun's path). Kept in exact sync
+// with upstream's turnLoopCheckpoint; TestTurnLoopCheckpointShapeDecodesThroughRealTurnLoop
+// (runtime/w5_round3_test.go) drives an encoded non-zero value of this
+// shape through a real adk.TurnLoop's CheckPointStore/GenInput, so a
+// one-field rename here fails that test loudly (it decodes to zero through
+// eino's own unmarshalTurnLoopCheckpoint) instead of silently misreading a
+// promoted checkpoint's UnhandledItems.
 type turnLoopCheckpointShape struct {
 	RunnerCheckpoint []byte
 	HasRunnerState   bool
@@ -213,6 +216,26 @@ func marshalEmptyLoopCheckpoint() ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// decodeLoopCheckpointHasRunnerState gob-decodes an opaque upstream
+// turn-loop checkpoint payload (the Payload field of an already-validated
+// adkCheckpointEnvelope) just far enough to read HasRunnerState -- so a
+// caller can determine, BEFORE ever calling adk.TurnLoop.Run, whether
+// eino's own tryLoadCheckpoint will resume this run via GenResume (true) or
+// route straight through GenInput (false); see eino's adk/turn_loop.go. Used
+// by ResumeRun to decide whether pushing reconciledTurnSentinelID (which is
+// only ever safe to deliver through GenInput -- see resumeReconciledTurn's
+// doc comment) is safe for this resume. A decode failure is reported, not
+// silently treated as false: guessing wrong here would let the sentinel
+// race a genuine ADK-level resume instead of being pushed only when it is
+// guaranteed to land in GenInput.
+func decodeLoopCheckpointHasRunnerState(payload []byte) (bool, error) {
+	var shape turnLoopCheckpointShape
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&shape); err != nil {
+		return false, err
+	}
+	return shape.HasRunnerState, nil
 }
 
 // Delete implements adk.CheckPointDeleter. It retires every staged revision

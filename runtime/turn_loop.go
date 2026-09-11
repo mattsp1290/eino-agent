@@ -117,6 +117,15 @@ func (c *turnLoopCoordinator) finishedRunUsage(engine *adkEngine) model.Usage {
 // normal GenInput -> AdmitTurn path.
 const firstTurnSentinelID session.InboxID = "\x00first-turn"
 
+// reconciledTurnSentinelID is pushed exactly once by ResumeRun (see
+// pendingReconciledTurn) to hand TurnLoop a run's most recently
+// crash-reconciled interrupted turn (round-four reconciliation item 1/
+// CR-C1) instead of admitting a fresh turn over new inbox items: it is only
+// ever pushed when the promoted checkpoint's own payload has no real ADK
+// runner state (decodeLoopCheckpointHasRunnerState), so it is guaranteed to
+// reach GenInput, never GenResume -- see resumeReconciledTurn's doc comment.
+const reconciledTurnSentinelID session.InboxID = "\x00reconciled-turn"
+
 func (c *turnLoopCoordinator) nextOrdinal() int64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -162,7 +171,7 @@ func (c *turnLoopCoordinator) claimItems(ids []session.InboxID) []session.InboxI
 	}
 	out := make([]session.InboxID, 0, len(ids))
 	for _, id := range ids {
-		if id == firstTurnSentinelID || c.admittedItems[id] {
+		if id == firstTurnSentinelID || id == reconciledTurnSentinelID || c.admittedItems[id] {
 			continue
 		}
 		c.admittedItems[id] = true
@@ -316,6 +325,23 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, loop *adkTurnLoop, i
 			Remaining: items[1:],
 		}, nil
 	}
+	// reconciledTurnSentinelID is only ever pushed by ResumeRun when it has
+	// already confirmed (decodeLoopCheckpointHasRunnerState) that this
+	// resume's promoted checkpoint has no real ADK runner state, so this
+	// call is guaranteed to be the one GenInput call ADK makes this Run()
+	// -- never raced by GenResume (round-four reconciliation item 1/CR-C1).
+	// See resumeReconciledTurn's doc comment for the full redrive contract.
+	if items[0] == reconciledTurnSentinelID {
+		engine, err := c.resumeReconciledTurn(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
+			Input:     &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages, EnableStreaming: true},
+			Consumed:  items[:1],
+			Remaining: items[1:],
+		}, nil
+	}
 	// A leftover first-turn sentinel here has no durable inbox row (Start's
 	// first turn is admitted directly inside the admission transaction --
 	// see admission.go's admitDurable -- never through the inbox), so it
@@ -349,10 +375,35 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, loop *adkTurnLoop, i
 	hadRealDuplicate := false
 	if len(filtered) == 0 {
 		for _, id := range items {
-			if id != firstTurnSentinelID {
+			if id != firstTurnSentinelID && id != reconciledTurnSentinelID {
 				hadRealDuplicate = true
 				break
 			}
+		}
+	} else {
+		// Durable-state backstop (round-four reconciliation item 2/CR-I1):
+		// claimItems' in-process admittedItems dedup only sees this ONE
+		// coordinator's lifetime, so a fresh coordinator across a process
+		// restart (or a checkpoint-restored UnhandledItems batch replayed
+		// into a brand-new coordinator) cannot recognize an id its own
+		// earlier delivery already durably admitted -- filtered stays
+		// non-empty here even though every id in it is stale. Left
+		// unchecked, admitTurn below would still run: its own
+		// loadInboxItems silently drops every non-`queued` id, but
+		// admitTurn does not decline just because its resulting batch is
+		// empty -- it happily mints a real, content-free turn and TurnLoop
+		// dispatches the model again for content already durably
+		// committed by whichever delivery actually admitted it first (the
+		// exact dispatch #4 CR-I1 reproduced). Check BEFORE calling
+		// admitTurn, not after: if NONE of filtered is still durably
+		// queued, this is the same "nothing new to do" case as the
+		// in-process check above.
+		genuine, err := c.loadInboxItems(ctx, filtered)
+		if err != nil {
+			return nil, err
+		}
+		if len(genuine) == 0 {
+			hadRealDuplicate = true
 		}
 	}
 	if hadRealDuplicate {
@@ -503,6 +554,36 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 		return nil, err
 	}
 	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: c.historyOptions, baseMessageCount: len(priorMessages), placeholderUsed: placeholderUsed}, nil
+}
+
+// resumeReconciledTurn rebuilds the adkEngine for the run's most recently
+// crash-reconciled interrupted turn -- via the SAME resumeEngine logic
+// genResume already uses for a genuine ADK-level tool-interrupt resume,
+// since both cases share the identical "rebuild bounded per-turn context
+// and reload committed history" shape -- and durably resumes it
+// (ResumeInterruptedTurn: interrupted -> running, its InboxInterrupted rows
+// -> InboxConsumed), so the SAME TurnID and SAME already-committed user
+// message rows drive this turn's redriven dispatch (round-four
+// reconciliation item 1/CR-C1). It is only ever called from genInput's
+// reconciledTurnSentinelID branch, which ResumeRun only pushes after
+// confirming (decodeLoopCheckpointHasRunnerState) this resume's promoted
+// checkpoint has no real ADK runner state -- so resumeEngine's
+// TurnInterrupted target here is never one genuinely mid an ADK-level
+// tool-interrupt pause (that shape always resumes via GenResume instead,
+// which genInput -- and so this function -- is never called during; see
+// eino's tryLoadCheckpoint).
+func (c *turnLoopCoordinator) resumeReconciledTurn(ctx context.Context) (*adkEngine, error) {
+	engine, err := c.resumeEngine(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.execution.store.ResumeInterruptedTurn(ctx, session.ResumeInterruptedTurnRequest{TurnID: engine.turn.ID, ResumedAt: c.host.now()})
+	if err != nil {
+		return nil, err
+	}
+	engine.turn = result.Turn
+	c.setEngine(engine)
+	return engine, nil
 }
 
 // messageHasParts reports whether messageID already has any durable Part
@@ -929,6 +1010,32 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 		}
 		return Result{RunID: c.runID, Status: session.RunPaused, Interrupted: true, Error: state.ExitReason}
 	case state.ExitReason == nil && len(state.UnhandledItems) != 0 && state.CheckpointAttempted && state.CheckpointErr == nil:
+		// Round-four reconciliation item 2 (CR-I1): state.UnhandledItems is
+		// the raw batch genInput's duplicate-delivery guard (or upstream's
+		// own PushFront) pushed back to the buffer -- it may already be
+		// durably consumed by whichever delivery actually admitted it
+		// first (a fresh coordinator's checkpoint-restored UnhandledItems
+		// cannot see a DIFFERENT coordinator's in-process admittedItems
+		// dedup). Filter against durable inbox state before deciding to
+		// pause: pausing on ids that are not genuinely `queued` anymore
+		// would strand the run behind a pause nobody needs to resume; if
+		// none of them is real, settle this run normally instead.
+		genuine, err := o.queuedAmong(settleCtx, c.sessionID, state.UnhandledItems)
+		if err != nil {
+			_ = c.execution.stopLease()
+			return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: err}
+		}
+		if len(genuine) == 0 {
+			var messageID session.MessageID
+			if engine := c.currentEngine(); engine != nil {
+				if ids := engine.responseMessageIDsSnapshot(); len(ids) != 0 {
+					messageID = ids[len(ids)-1]
+				} else {
+					messageID = engine.assistantMessageID
+				}
+			}
+			return o.settleCleanRunCompletion(settleCtx, c, checkpoints, messageID)
+		}
 		if err := o.promoteQueuedContinuation(settleCtx, c, checkpoints); err != nil {
 			_ = c.execution.stopLease()
 			return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: err}
@@ -1017,57 +1124,106 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 		// stranded (see Enqueue's doc comment). A non-empty late buffer
 		// means real, still-queued work exists; divert to the same
 		// queued-continuation pause a between-turn stop with pending input
-		// takes, instead of completing the run out from under it.
+		// takes, instead of completing the run out from under it. Filtered
+		// against durable inbox state (round-four reconciliation item 2/
+		// CR-I1) for the same reason the UnhandledItems branch above is:
+		// defensive, since a late item is ordinarily always freshly
+		// `queued`, but never assume that from this distance.
 		var late []session.InboxID
 		if state.TakeLateItems != nil {
 			late = state.TakeLateItems()
 		}
-		if len(late) != 0 {
+		genuineLate, err := o.queuedAmong(settleCtx, c.sessionID, late)
+		if err != nil {
+			_ = c.execution.stopLease()
+			return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: err}
+		}
+		if len(genuineLate) != 0 {
 			if err := o.promoteQueuedContinuation(settleCtx, c, checkpoints); err != nil {
 				_ = c.execution.stopLease()
 				return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: err}
 			}
 			return Result{RunID: c.runID, Status: session.RunPaused}
 		}
-		usage := c.runUsageSnapshot()
-		settlement := session.RunSettlement{Status: session.RunCompleted, FinishedAt: o.now()}
-		committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
-			Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
-		})
-		if err != nil {
-			// A conflict here can mean a durable inbox item committed (an
-			// Enqueue racing this exact settlement -- see EnqueueInboxForRun
-			// and the store-level queued-inbox check SettleRun itself now
-			// applies before ever finalizing RunCompleted) in the narrow
-			// window between the late-items check above and this CAS. Check
-			// once more before declaring failure: a nonempty queue means
-			// real work arrived, and this diverts to the same queued-
-			// continuation pause a nonempty late buffer takes above, so an
-			// acknowledged item is never silently stranded behind a
-			// RunFailed settlement -- the residual half of the terminal-
-			// settlement race (see Enqueue's doc comment). Any other cause
-			// of the conflict still falls through to ordinary failure
-			// handling below.
-			if errors.Is(err, session.ErrConflict) {
-				if queued, drainErr := o.drainQueuedInbox(settleCtx, c.sessionID); drainErr == nil && len(queued) != 0 {
-					if pauseErr := o.promoteQueuedContinuation(settleCtx, c, checkpoints); pauseErr != nil {
-						_ = c.execution.stopLease()
-						return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: pauseErr}
-					}
-					return Result{RunID: c.runID, Status: session.RunPaused}
-				}
-			}
-			_ = c.execution.stopLease()
-			return Result{RunID: c.runID, Status: session.RunFailed, Error: err}
-		}
-		c.execution.publishPersisted(settleCtx, committed.Event)
-		if checkpoints.lastStaged > 0 {
-			_ = o.store.RetireRunCheckpoints(settleCtx, c.runID, checkpoints.lastStaged)
-		}
-		result := Result{RunID: c.runID, Status: session.RunCompleted, MessageID: messageID, Usage: runtimeUsage(usage)}
-		c.publishRunSettledNotice(settleCtx, result)
-		return result
+		return o.settleCleanRunCompletion(settleCtx, c, checkpoints, messageID)
 	}
+}
+
+// queuedAmong reports which of ids are still durably InboxQueued for
+// sessionID, filtering out the first-turn and reconciled-turn sentinels
+// (round-four reconciliation item 2/CR-I1). Used by finishTurnLoop to
+// distinguish a genuinely still-queued item from one a duplicate delivery's
+// pushed-back or checkpoint-restored id batch carries but that some earlier
+// delivery already durably admitted -- pausing on the latter would strand
+// the run behind a resume nobody needs to issue.
+func (o *StreamingOrchestrator) queuedAmong(ctx context.Context, sessionID session.ID, ids []session.InboxID) ([]session.InboxID, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	queued, err := o.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxQueued})
+	if err != nil {
+		return nil, err
+	}
+	queuedSet := make(map[session.InboxID]bool, len(queued))
+	for _, item := range queued {
+		queuedSet[item.ID] = true
+	}
+	out := make([]session.InboxID, 0, len(ids))
+	for _, id := range ids {
+		if id == firstTurnSentinelID || id == reconciledTurnSentinelID {
+			continue
+		}
+		if queuedSet[id] {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+// settleCleanRunCompletion settles the run RunCompleted when finishTurnLoop
+// has determined no genuine queued or in-flight work remains (round-four
+// reconciliation item 2/CR-I1): shared by the default clean-exit branch and
+// the UnhandledItems branch's durable-state-filtered empty case, so both
+// settle identically instead of one of them pausing on stale ids nobody
+// will ever resume.
+func (o *StreamingOrchestrator) settleCleanRunCompletion(settleCtx context.Context, c *turnLoopCoordinator, checkpoints *adkCheckpointStore, messageID session.MessageID) Result {
+	usage := c.runUsageSnapshot()
+	settlement := session.RunSettlement{Status: session.RunCompleted, FinishedAt: o.now()}
+	committed, err := settleRunRetrying(settleCtx, c.execution.store, session.SettleRunRequest{
+		Settlement: settlement, Event: session.RunSettlementEvent{ID: o.ids.NewEventID(), MessageID: messageID, Usage: runtimeUsage(usage)},
+	})
+	if err != nil {
+		// A conflict here can mean a durable inbox item committed (an
+		// Enqueue racing this exact settlement -- see EnqueueInboxForRun
+		// and the store-level queued-inbox check SettleRun itself now
+		// applies before ever finalizing RunCompleted) in the narrow window
+		// between this function's caller's own check and this CAS. Check
+		// once more before declaring failure: a nonempty queue means real
+		// work arrived, and this diverts to the same queued-continuation
+		// pause a nonempty late/unhandled buffer takes, so an acknowledged
+		// item is never silently stranded behind a RunFailed settlement --
+		// the residual half of the terminal-settlement race (see Enqueue's
+		// doc comment). Any other cause of the conflict still falls through
+		// to ordinary failure handling below.
+		if errors.Is(err, session.ErrConflict) {
+			if queued, drainErr := o.drainQueuedInbox(settleCtx, c.sessionID); drainErr == nil && len(queued) != 0 {
+				if pauseErr := o.promoteQueuedContinuation(settleCtx, c, checkpoints); pauseErr != nil {
+					_ = c.execution.stopLease()
+					return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: pauseErr}
+				}
+				return Result{RunID: c.runID, Status: session.RunPaused}
+			}
+		}
+		_ = c.execution.stopLease()
+		return Result{RunID: c.runID, Status: session.RunFailed, Error: err}
+	}
+	c.execution.publishPersisted(settleCtx, committed.Event)
+	if checkpoints.lastStaged > 0 {
+		_ = o.store.RetireRunCheckpoints(settleCtx, c.runID, checkpoints.lastStaged)
+	}
+	result := Result{RunID: c.runID, Status: session.RunCompleted, MessageID: messageID, Usage: runtimeUsage(usage)}
+	c.publishRunSettledNotice(settleCtx, result)
+	return result
 }
 
 // promoteQueuedContinuation records a between-turn stop with queued durable
@@ -1119,7 +1275,7 @@ func (o *StreamingOrchestrator) promoteQueuedContinuation(ctx context.Context, c
 func interruptedItemIDs(items []session.InboxID) []session.InboxID {
 	out := make([]session.InboxID, 0, len(items))
 	for _, id := range items {
-		if id == firstTurnSentinelID {
+		if id == firstTurnSentinelID || id == reconciledTurnSentinelID {
 			continue
 		}
 		out = append(out, id)
@@ -1407,6 +1563,14 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	if checkpoint.AgentFingerprint != fingerprint || checkpoint.EinoVersion != EinoPinnedVersion || checkpoint.CodecVersion != adkCheckpointCodecVersion {
 		return nil, ErrCheckpointFingerprintMismatch
 	}
+	envelope, err := decodeCheckpointEnvelope(checkpoint.Bytes)
+	if err != nil {
+		return nil, err
+	}
+	hasRunnerState, err := decodeLoopCheckpointHasRunnerState(envelope.Payload)
+	if err != nil {
+		return nil, err
+	}
 	selection := model.Selection{ProviderID: model.ProviderID(run.ProviderID), ModelID: model.ID(run.ModelID)}
 	durable := decodeResumeRunConfig(run.Config)
 	resolved, err := o.model.Resolve(ctx, selection, model.Runtime{
@@ -1426,11 +1590,26 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		return nil, err
 	}
 	var maxOrdinal int64
+	var pendingReconciled session.Turn
 	for _, t := range turns {
 		if t.Ordinal > maxOrdinal {
 			maxOrdinal = t.Ordinal
 		}
+		if t.State == session.TurnInterrupted && t.Ordinal >= pendingReconciled.Ordinal {
+			pendingReconciled = t
+		}
 	}
+	// A crash-reconciled interrupted turn with real, already-committed
+	// content (round-four reconciliation item 1/CR-C1) must be redriven
+	// under its OWN TurnID, never re-admitted as a fresh turn -- but that
+	// redrive is only ever safe to deliver through GenInput
+	// (reconciledTurnSentinelID; see resumeReconciledTurn's doc comment),
+	// which eino's own tryLoadCheckpoint reaches only when this resume's
+	// promoted checkpoint payload has no real ADK runner state. A
+	// degenerate, content-free queued-continuation marker turn (see
+	// promoteQueuedContinuation) has no UserMessageIDs and needs no
+	// redrive at all.
+	pushReconciledSentinel := !hasRunnerState && pendingReconciled.ID != "" && len(pendingReconciled.UserMessageIDs) != 0
 	// A durably queued inbox item accepted by Enqueue while no live loop
 	// existed for this run must be drained into the loop this call is about
 	// to start -- otherwise it stays queued forever (see Enqueue's doc
@@ -1439,6 +1618,9 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	queuedIDs, err := o.drainQueuedInbox(ctx, run.SessionID)
 	if err != nil {
 		return nil, err
+	}
+	if pushReconciledSentinel {
+		queuedIDs = append([]session.InboxID{reconciledTurnSentinelID}, queuedIDs...)
 	}
 	// Read the durable message floor here, unfenced and before ClaimRun,
 	// alongside drainQueuedInbox: this must NOT be deferred to

@@ -263,10 +263,17 @@ func TestDuplicateDeliveryOfAlreadyAdmittedItemDoesNotDispatch(t *testing.T) {
 		t.Fatalf("ResumeRun error = %v", err)
 	}
 	resumed := <-resumeHandle.Done()
-	// The re-pushed duplicate must divert the loop to a between-turn
-	// queued-continuation pause, NOT a third dispatch.
-	if resumed.Status != session.RunPaused {
-		t.Fatalf("resumed result = %+v, want paused (the duplicate-delivery guard must divert to a queued-continuation pause, not dispatch again)", resumed)
+	// Round-four reconciliation item 2 (CR-I1): the re-pushed duplicate's
+	// id is, by the time the loop settles, already durably InboxCompleted
+	// (turn 2's own CompleteTurn consumed it as real content) -- not merely
+	// `queued` elsewhere. finishTurnLoop's durable-state filter recognizes
+	// there is nothing genuinely left to do and settles the run normally,
+	// instead of the pre-fix behavior of promoting a pointless degenerate
+	// pause-carrier turn that a later resume would still have to redeliver
+	// the stale id into (the actual dispatch-#4 hazard this item guards
+	// against end-to-end).
+	if resumed.Status != session.RunCompleted || resumed.Error != nil {
+		t.Fatalf("resumed result = %+v, want completed with no error (no spurious pause, no spurious dispatch)", resumed)
 	}
 	if calls != 3 {
 		t.Fatalf("model dispatch count = %d, want exactly 3 (no spurious third-turn dispatch)", calls)
@@ -276,36 +283,24 @@ func TestDuplicateDeliveryOfAlreadyAdmittedItemDoesNotDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTurns error = %v", err)
 	}
-	// Three turns: turn 1 (tool call, paused/resumed), turn 2 (the
-	// enqueued item, dispatched), and turn 3 -- promoteQueuedContinuation's
-	// own degenerate, NEVER-dispatched turn minted purely to carry the
-	// between-turn pause's identity (see its doc comment). Turn 3 existing
-	// is expected and is NOT a spurious dispatch: calls stayed at 3 above,
-	// so no model call was ever made for it.
-	if len(turns) != 3 {
-		t.Fatalf("turns = %d, want 3 (turn 1, turn 2 with the enqueued item, and the degenerate pause-carrier turn)", len(turns))
+	// Exactly two turns: turn 1 (tool call, paused/resumed) and turn 2 (the
+	// enqueued item, dispatched). No degenerate third turn is minted: the
+	// re-pushed duplicate never needed one.
+	if len(turns) != 2 {
+		t.Fatalf("turns = %d, want 2 (turn 1, and turn 2 with the enqueued item)", len(turns))
 	}
 	for _, turn := range turns {
-		switch turn.Ordinal {
-		case 2:
-			if len(turn.UserMessageIDs) != 1 {
-				t.Fatalf("second turn UserMessageIDs = %d, want exactly 1", len(turn.UserMessageIDs))
-			}
-		case 3:
-			if len(turn.UserMessageIDs) != 0 {
-				t.Fatalf("degenerate pause-carrier turn UserMessageIDs = %d, want 0 (never dispatched)", len(turn.UserMessageIDs))
-			}
-			if turn.State != session.TurnInterrupted {
-				t.Fatalf("degenerate pause-carrier turn state = %q, want interrupted", turn.State)
-			}
+		if turn.Ordinal == 2 && len(turn.UserMessageIDs) != 1 {
+			t.Fatalf("second turn UserMessageIDs = %d, want exactly 1", len(turn.UserMessageIDs))
+		}
+		if len(turn.UserMessageIDs) == 0 && turn.State == session.TurnCompleted {
+			t.Fatalf("turn %s completed with zero UserMessageIDs (a content-free spurious dispatch): %#v", turn.ID, turn)
 		}
 	}
 
-	// The now-paused run must still be resumable: a further ResumeRun picks
-	// the (already-consumed, unaffected) state back up and settles cleanly.
 	finalRun, err := orch.store.GetRun(context.Background(), result.RunID)
-	if err != nil || finalRun.Status != session.RunPaused {
-		t.Fatalf("final run = %+v, err=%v, want status=paused", finalRun, err)
+	if err != nil || finalRun.Status != session.RunCompleted {
+		t.Fatalf("final run = %+v, err=%v, want status=completed", finalRun, err)
 	}
 }
 

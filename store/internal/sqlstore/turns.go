@@ -321,14 +321,17 @@ func (e *executionStore) InterruptTurn(ctx context.Context, request session.Inte
 }
 
 // ReconcileInterruptedTurn implements session.ExecutionStore's crash-
-// recovery reconciliation (round-three reconciliation item 4/SR-4b,
-// RD-S5): like InterruptTurn, it settles an admitted/running turn as
-// interrupted, but requeues the turn's consumed inbox items back to
-// InboxQueued (requeueInboxForTurn) instead of leaving them InboxInterrupted
-// -- there is no checkpoint runner state describing this turn (the process
-// driving it crashed before ever staging one), so nothing will ever resume
-// it directly; a fresh GenInput/AdmitTurn on the run's next resume must be
-// able to re-consume these items into a new turn.
+// recovery reconciliation (round-four reconciliation item 1/CR-C1): exactly
+// like InterruptTurn, it settles an admitted/running turn as interrupted and
+// carries the turn's consumed inbox items forward as InboxInterrupted --
+// never requeued to InboxQueued. The turn's user messages/parts were
+// already durably committed by the AdmitTurn that admitted it (AdmitTurn
+// atomically commits the turn, its UserMessages/UserParts, and the inbox
+// consumption in one transaction), so requeuing the items would let a fresh
+// AdmitTurn re-consume them into a SECOND turn and duplicate that content in
+// provider history. The correct continuation is ResumeInterruptedTurn,
+// which later redrives this SAME turn by TurnID -- never a fresh AdmitTurn
+// over the same inbox items.
 func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request session.ReconcileInterruptedTurnRequest) (session.ReconcileInterruptedTurnResult, error) {
 	var result session.ReconcileInterruptedTurnResult
 	err := e.withFence(ctx, func(store *Store, run session.Run) error {
@@ -363,7 +366,7 @@ func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request s
 		if err := rowsAffected(db); err != nil {
 			return err
 		}
-		if err := store.requeueInboxForTurn(ctx, row.RowKey, request.Event.CreatedAt); err != nil {
+		if err := store.settleInboxForTurn(ctx, row.RowKey, []session.InboxState{session.InboxConsumed}, session.InboxInterrupted, request.Event.CreatedAt); err != nil {
 			return err
 		}
 		// ReconcileInterruptedTurn is itself a typed atomic mutation
@@ -378,6 +381,62 @@ func (e *executionStore) ReconcileInterruptedTurn(ctx context.Context, request s
 	})
 	if err != nil {
 		return session.ReconcileInterruptedTurnResult{}, err
+	}
+	return result, nil
+}
+
+// ResumeInterruptedTurn implements session.ExecutionStore's redrive of a
+// TurnInterrupted turn (round-four reconciliation item 1/CR-C1): see
+// session.ResumeInterruptedTurnRequest for the full contract. It transitions
+// the turn to TurnRunning and its own InboxInterrupted rows back to
+// InboxConsumed, atomically, under the current run fence.
+func (e *executionStore) ResumeInterruptedTurn(ctx context.Context, request session.ResumeInterruptedTurnRequest) (session.ResumeInterruptedTurnResult, error) {
+	var result session.ResumeInterruptedTurnResult
+	err := e.withFence(ctx, func(store *Store, run session.Run) error {
+		row, err := store.turnRowByID(ctx, string(request.TurnID))
+		if err != nil {
+			if errors.Is(err, session.ErrNotFound) {
+				return session.ErrConflict
+			}
+			return err
+		}
+		current, err := decodeTurnRow(row)
+		if err != nil {
+			return err
+		}
+		if current.RunID != run.ID || current.SessionID != run.SessionID || current.RunID != e.fence.RunID {
+			return session.ErrConflict
+		}
+		candidate, err := session.ApplyResumeInterruptedTurn(current, request)
+		if err != nil {
+			return err
+		}
+		if candidate.State == current.State {
+			// Idempotent replay (already TurnRunning): nothing left to move.
+			result = session.ResumeInterruptedTurnResult{Turn: candidate}
+			return nil
+		}
+		raw, err := json.Marshal(candidate)
+		if err != nil {
+			return err
+		}
+		db := store.dbFor(ctx).Table(store.tableName("turns")).Where("row_key = ?", row.RowKey).Updates(map[string]any{
+			"state": string(candidate.State), "record": raw,
+		})
+		if err := store.mapErr(db.Error); err != nil {
+			return err
+		}
+		if err := rowsAffected(db); err != nil {
+			return err
+		}
+		if err := store.settleInboxForTurn(ctx, row.RowKey, []session.InboxState{session.InboxInterrupted}, session.InboxConsumed, request.ResumedAt); err != nil {
+			return err
+		}
+		result = session.ResumeInterruptedTurnResult{Turn: candidate}
+		return nil
+	})
+	if err != nil {
+		return session.ResumeInterruptedTurnResult{}, err
 	}
 	return result, nil
 }

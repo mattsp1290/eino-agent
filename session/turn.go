@@ -8,8 +8,15 @@ type TurnState string
 const (
 	// TurnAdmitted means AdmitTurn created the turn but it has not settled.
 	TurnAdmitted TurnState = "admitted"
-	// TurnRunning is a transient, non-store-owned state runtime callers may
-	// project locally; no store method in this package writes it.
+	// TurnRunning means ResumeInterruptedTurn durably resumed a turn a
+	// prior process left TurnInterrupted (whether by a genuine mid-dispatch
+	// pause or by crash reconciliation -- see ReconcileInterruptedTurnRequest
+	// and ResumeInterruptedTurnRequest) and it is once again being actively
+	// driven. It is also the state runtime callers may project locally for
+	// the equivalent, checkpoint-driven ADK resume path (see
+	// runtime/turn_loop.go's genResume), where no store write marks the
+	// transition explicitly (ADK's own checkpoint restoration is the
+	// durability boundary there).
 	TurnRunning TurnState = "running"
 	// TurnCompleted means CompleteTurn settled the turn normally.
 	TurnCompleted TurnState = "completed"
@@ -88,13 +95,14 @@ type InterruptTurnResult struct {
 
 // ReconcileInterruptedTurnRequest atomically reconciles a turn a crashed
 // process left `admitted`/`running` with no checkpoint describing it: it
-// settles the turn interrupted (like InterruptTurn) and, unlike
-// InterruptTurn's live in-process pause path -- which carries the turn's
-// InboxConsumed rows forward as InboxInterrupted for the SAME turn to
-// complete once its checkpoint runner state resumes -- requeues those rows
-// back to InboxQueued instead, since there is no runner state to resume the
-// abandoned turn itself from. A fresh GenInput/AdmitTurn on the next resume
-// then explicitly re-admits them into a NEW turn.
+// settles the turn interrupted, exactly like InterruptTurn -- including
+// carrying the turn's InboxConsumed rows forward as InboxInterrupted, never
+// requeued to InboxQueued. The turn's user messages/parts were already
+// durably committed by the AdmitTurn that admitted it, so they must never be
+// re-admitted into a second turn (that would duplicate them in provider
+// history); the conservative, correct continuation is to resume THIS SAME
+// turn later, by TurnID, via ResumeInterruptedTurnRequest -- never a fresh
+// AdmitTurn over the same inbox items.
 type ReconcileInterruptedTurnRequest struct {
 	TurnID TurnID
 	Event  EventRecord
@@ -105,6 +113,48 @@ type ReconcileInterruptedTurnRequest struct {
 type ReconcileInterruptedTurnResult struct {
 	Turn  Turn
 	Event EventRecord
+}
+
+// ResumeInterruptedTurnRequest atomically resumes a turn a prior process
+// left TurnInterrupted -- whether by a genuine mid-dispatch pause this same
+// mechanism already resumed once, or by crash reconciliation
+// (ReconcileInterruptedTurnRequest) -- for a fresh redrive under the SAME
+// TurnID and the SAME already-committed user message rows: never a second
+// AdmitTurn, never a new user message. It transitions the turn to
+// TurnRunning and its own InboxInterrupted rows back to InboxConsumed
+// (mirroring AdmitTurn's queued -> consumed claim, but from the interrupted
+// state), so a later crash mid-redrive leaves the turn TurnRunning, which
+// reconcileCrashedRun's existing dangling-turn detection (TurnAdmitted ||
+// TurnRunning) already recognizes: the resume/reconcile cycle is safely
+// repeatable until CompleteTurn (which already accepts TurnRunning as a
+// starting state) finally settles it.
+type ResumeInterruptedTurnRequest struct {
+	TurnID TurnID
+	// ResumedAt stamps the moment this resume is durably recorded, used to
+	// timestamp the turn's own inbox items' transition back to consumed.
+	ResumedAt time.Time
+}
+
+// ResumeInterruptedTurnResult is the canonical turn resumed by
+// ResumeInterruptedTurn.
+type ResumeInterruptedTurnResult struct {
+	Turn Turn
+}
+
+// ApplyResumeInterruptedTurn derives the canonical resumed turn. Applying an
+// identical resume to an already-resumed (TurnRunning) turn is idempotent.
+func ApplyResumeInterruptedTurn(current Turn, request ResumeInterruptedTurnRequest) (Turn, error) {
+	if current.ID == "" || current.ID != request.TurnID || request.ResumedAt.IsZero() {
+		return Turn{}, ErrConflict
+	}
+	if current.State == TurnRunning {
+		return current, nil
+	}
+	if current.State != TurnInterrupted {
+		return Turn{}, ErrConflict
+	}
+	current.State = TurnRunning
+	return current, nil
 }
 
 // ValidateAdmitTurn checks the caller-owned shape of an admission request

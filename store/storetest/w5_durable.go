@@ -235,7 +235,7 @@ func turnsContract(t *testing.T, factory Factory) {
 			}
 		})
 
-		t.Run("reconcile interrupted turn requeues consumed inbox and is idempotent", func(t *testing.T) {
+		t.Run("reconcile interrupted turn carries consumed inbox forward as interrupted and is idempotent", func(t *testing.T) {
 			subject := setup(t, factory)
 			ctx := context.Background()
 			s := createSession(t, ctx, subject.Store, "session-turns-reconcile")
@@ -264,35 +264,95 @@ func turnsContract(t *testing.T, factory Factory) {
 			if result.Turn.State != session.TurnInterrupted {
 				t.Fatalf("reconciled turn = %#v", result.Turn)
 			}
-			// Unlike InterruptTurn, the consumed item must be back to
-			// InboxQueued (not InboxInterrupted), with its turn linkage
-			// cleared, so a fresh AdmitTurn can re-consume it.
-			items, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued})
-			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID || items[0].TurnID != "" {
-				t.Fatalf("requeued inbox = %#v, %v", items, err)
+			// Round-four reconciliation item 1 (CR-C1): unlike the shipped
+			// round-three shape, the consumed item must NOT be requeued --
+			// it settles InboxInterrupted, exactly like InterruptTurn,
+			// still linked to the turn that already durably committed its
+			// content. Requeuing it would let a fresh AdmitTurn re-consume
+			// the same content into a second turn and duplicate it in
+			// provider history.
+			items, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxInterrupted})
+			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID || items[0].TurnID != admitted.Turn.ID {
+				t.Fatalf("interrupted inbox = %#v, %v", items, err)
+			}
+			if queued, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued}); err != nil || len(queued) != 0 {
+				t.Fatalf("queued inbox = %#v, %v, want none (never requeued)", queued, err)
 			}
 			replay, err := execution.ReconcileInterruptedTurn(ctx, session.ReconcileInterruptedTurnRequest{TurnID: admitted.Turn.ID, Event: event})
 			if err != nil || !reflect.DeepEqual(replay, result) {
 				t.Fatalf("reconcile interrupted turn replay = %#v, %v; want %#v", replay, err, result)
 			}
-			// The idempotent replay must not re-touch the now-InboxQueued
-			// item (it is no longer InboxConsumed under this turn).
-			items, err = subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxQueued})
+			items, err = subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxInterrupted})
 			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID {
-				t.Fatalf("requeued inbox after replay = %#v, %v", items, err)
+				t.Fatalf("interrupted inbox after replay = %#v, %v", items, err)
 			}
-			// The requeued item can be admitted fresh by a later turn.
-			if _, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
-				Turn:         buildTurn("turn-reconcile-2", r, 2, reconciledAt),
-				UserMessages: []session.Message{message("turn-reconcile-2-user", s.ID, r.ID, session.RoleUser)},
-				Event:        turnStartedEvent("turn-reconcile-2-started", r, "turn-reconcile-2", reconciledAt),
+		})
+
+		t.Run("resume interrupted turn resumes the same turn and inbox item, and is idempotent", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-turns-resume")
+			r := admitRun(t, ctx, subject.Store, run("run-turns-resume", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			enqueued, err := subject.Store.EnqueueInbox(ctx, inboxItem("inbox-resume", s.ID, "key-resume", "hi", at), session.DefaultContentLimits())
+			if err != nil {
+				t.Fatalf("enqueue inbox: %v", err)
+			}
+			admitted, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-resume", r, 1, at),
+				UserMessages: []session.Message{message("turn-resume-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-resume-started", r, "turn-resume", at),
 				InboxIDs:     []session.InboxID{enqueued.ID},
-			}); err != nil {
-				t.Fatalf("admit second turn over requeued item: %v", err)
+			})
+			if err != nil {
+				t.Fatalf("admit turn: %v", err)
 			}
-			items, err = subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxConsumed})
-			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID || items[0].TurnID != "turn-reconcile-2" {
-				t.Fatalf("consumed inbox after second admit = %#v, %v", items, err)
+			reconciledAt := at.Add(time.Second)
+			reconcileEvent := session.EventRecord{ID: "turn-resume-reconcile-event", SessionID: s.ID, RunID: r.ID, TurnID: admitted.Turn.ID, Kind: "turn_reconcile_test", Payload: []byte(`{}`), CreatedAt: reconciledAt}
+			if _, err := execution.ReconcileInterruptedTurn(ctx, session.ReconcileInterruptedTurnRequest{TurnID: admitted.Turn.ID, Event: reconcileEvent}); err != nil {
+				t.Fatalf("reconcile interrupted turn: %v", err)
+			}
+			resumedAt := reconciledAt.Add(time.Second)
+			result, err := execution.ResumeInterruptedTurn(ctx, session.ResumeInterruptedTurnRequest{TurnID: admitted.Turn.ID, ResumedAt: resumedAt})
+			if err != nil {
+				t.Fatalf("resume interrupted turn: %v", err)
+			}
+			if result.Turn.ID != admitted.Turn.ID || result.Turn.State != session.TurnRunning {
+				t.Fatalf("resumed turn = %#v, want state=running, same TurnID", result.Turn)
+			}
+			// The inbox item is back to InboxConsumed, still linked to the
+			// SAME turn -- never re-admitted as a fresh AdmitTurn.
+			items, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxConsumed})
+			if err != nil || len(items) != 1 || items[0].ID != enqueued.ID || items[0].TurnID != admitted.Turn.ID {
+				t.Fatalf("resumed inbox = %#v, %v", items, err)
+			}
+			replay, err := execution.ResumeInterruptedTurn(ctx, session.ResumeInterruptedTurnRequest{TurnID: admitted.Turn.ID, ResumedAt: resumedAt})
+			if err != nil || !reflect.DeepEqual(replay, result) {
+				t.Fatalf("resume interrupted turn replay = %#v, %v; want %#v", replay, err, result)
+			}
+			// The resumed (TurnRunning) turn now completes through the
+			// ordinary CompleteTurn path, under the SAME TurnID, and its
+			// inbox item reaches InboxCompleted exactly once.
+			completedAt := resumedAt.Add(time.Second)
+			completeResult, err := execution.CompleteTurn(ctx, session.CompleteTurnRequest{
+				TurnID: admitted.Turn.ID, ResponseMessageIDs: []session.MessageID{"turn-resume-assistant"},
+				Event: turnCompletedEvent("turn-resume-finished", r, admitted.Turn.ID, completedAt),
+			})
+			if err != nil {
+				t.Fatalf("complete resumed turn: %v", err)
+			}
+			if completeResult.Turn.State != session.TurnCompleted {
+				t.Fatalf("completed resumed turn = %#v", completeResult.Turn)
+			}
+			completedItems, err := subject.Store.ListInbox(ctx, s.ID, []session.InboxState{session.InboxCompleted})
+			if err != nil || len(completedItems) != 1 || completedItems[0].ID != enqueued.ID {
+				t.Fatalf("completed inbox = %#v, %v, want exactly the one item, completed once", completedItems, err)
+			}
+			// ResumeInterruptedTurn refuses a turn that is not TurnInterrupted
+			// (e.g. already TurnCompleted here).
+			if _, err := execution.ResumeInterruptedTurn(ctx, session.ResumeInterruptedTurnRequest{TurnID: admitted.Turn.ID, ResumedAt: completedAt.Add(time.Second)}); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("resume of a completed turn = %v, want ErrConflict", err)
 			}
 		})
 	})

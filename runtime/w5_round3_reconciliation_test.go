@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -159,6 +160,61 @@ func crashInboxItem(id session.InboxID, sessionID session.ID, key, text string, 
 	}
 }
 
+// crashUserParts encodes real session.Part rows for a user message carrying
+// text, exactly as the real admitTurn (runtime/turn_loop.go) does via
+// session.EncodeContentParts -- used so the round-four reconciliation item 1
+// (CR-C1) tests below reproduce the actual shape a crashed process leaves
+// behind (a bare session.Message with no Part rows cannot see the
+// duplicated-history defect: decoding it yields no text to compare).
+func crashUserParts(t *testing.T, partIDPrefix string, msgID session.MessageID, sessionID session.ID, runID session.RunID, text string, at time.Time) []session.Part {
+	t.Helper()
+	content := session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{{ID: "block-1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: text}}}}
+	n := 0
+	parts, err := session.EncodeContentParts(content, func() session.PartID {
+		n++
+		return session.PartID(fmt.Sprintf("%s-part-%d", partIDPrefix, n))
+	}, msgID, sessionID, runID, at, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("EncodeContentParts: %v", err)
+	}
+	return parts
+}
+
+// countUserMessageText lists sessionID's full committed history and counts
+// how many user messages decode to content containing exactly one
+// user_input_text block whose text equals want.
+func countUserMessageText(t *testing.T, ctx context.Context, store session.Store, sessionID session.ID, want string) int {
+	t.Helper()
+	batch, err := store.ListMessages(ctx, sessionID, session.ReplayCursor{Limit: 1000})
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	partsByMessage := make(map[session.MessageID][]session.Part, len(batch.Messages))
+	for i, part := range batch.Parts {
+		owner := part.MessageID
+		if len(batch.PartOwnerMessageIDs) == len(batch.Parts) {
+			owner = batch.PartOwnerMessageIDs[i]
+		}
+		partsByMessage[owner] = append(partsByMessage[owner], part)
+	}
+	count := 0
+	for _, msg := range batch.Messages {
+		if msg.Role != session.RoleUser {
+			continue
+		}
+		content, err := session.DecodeContentParts(session.RoleUser, partsByMessage[msg.ID], session.DefaultContentLimits())
+		if err != nil {
+			continue
+		}
+		for _, block := range content.Blocks {
+			if block.Kind == session.BlockKindUserInputText && block.Text != nil && block.Text.Text == want {
+				count++
+			}
+		}
+	}
+	return count
+}
+
 // TestResumeReconcilesDanglingAdmittedTurnAfterCrash proves item 4b (SR-4/
 // RD-S5): a turn admitted directly against the store (simulating a process
 // that admitted it, then crashed before ever calling StartRun, driving the
@@ -189,9 +245,15 @@ func TestResumeReconcilesDanglingAdmittedTurnAfterCrash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("enqueue inbox: %v", err)
 	}
+	// Real UserParts, exactly as the real admitTurn would encode them (round-
+	// four reconciliation item 1/CR-C1): the shipped round-three test built a
+	// bare, content-free session.Message, which cannot see the duplicated-
+	// history defect this test now guards against.
+	userParts := crashUserParts(t, "crash-user-msg-1", "crash-user-msg-1", sessionID, admittedRun.ID, "hello", orch.now())
 	if _, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
-		Turn:         session.Turn{ID: "crash-turn-1", RunID: admittedRun.ID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted, CreatedAt: orch.now()},
+		Turn:         session.Turn{ID: "crash-turn-1", RunID: admittedRun.ID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted, UserMessageIDs: []session.MessageID{"crash-user-msg-1"}, CreatedAt: orch.now()},
 		UserMessages: []session.Message{{ID: "crash-user-msg-1", SessionID: sessionID, RunID: admittedRun.ID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
+		UserParts:    userParts,
 		Event:        session.EventRecord{ID: "crash-turn-1-started", SessionID: sessionID, RunID: admittedRun.ID, TurnID: "crash-turn-1", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
 		InboxIDs:     []session.InboxID{item.ID},
 	}); err != nil {
@@ -205,6 +267,10 @@ func TestResumeReconcilesDanglingAdmittedTurnAfterCrash(t *testing.T) {
 	// what a crashed process leaves behind.
 	time.Sleep(2 * time.Millisecond)
 
+	if got := countUserMessageText(t, ctx, orch.store, sessionID, "hello"); got != 1 {
+		t.Fatalf("committed 'hello' user messages before reconciliation = %d, want 1", got)
+	}
+
 	handle, err := orch.Resume(ctx, admittedRun.ID)
 	if err != nil {
 		t.Fatalf("Resume error = %v", err)
@@ -217,13 +283,26 @@ func TestResumeReconcilesDanglingAdmittedTurnAfterCrash(t *testing.T) {
 	if err != nil || turn.State != session.TurnInterrupted {
 		t.Fatalf("dangling turn after reconciliation = %#v, err=%v, want interrupted", turn, err)
 	}
-	requeued, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxQueued})
-	if err != nil || len(requeued) != 1 || requeued[0].ID != item.ID {
-		t.Fatalf("requeued inbox = %#v, %v, want exactly the reconciled item back to queued", requeued, err)
+	// The item must NOT be requeued (that would let a fresh AdmitTurn mint
+	// a second, duplicate user message from the same content on a later
+	// run): it settles InboxInterrupted, exactly like InterruptTurn, still
+	// linked to the turn that already durably consumed it.
+	interruptedItems, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxInterrupted})
+	if err != nil || len(interruptedItems) != 1 || interruptedItems[0].ID != item.ID || interruptedItems[0].TurnID != "crash-turn-1" {
+		t.Fatalf("interrupted inbox = %#v, %v, want exactly the reconciled item, still linked to crash-turn-1", interruptedItems, err)
+	}
+	if requeued, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxQueued}); err != nil || len(requeued) != 0 {
+		t.Fatalf("queued inbox after reconciliation = %#v, %v, want none (never requeued)", requeued, err)
 	}
 	finalRun, err := orch.store.GetRun(ctx, admittedRun.ID)
 	if err != nil || finalRun.Status != session.RunInterrupted {
 		t.Fatalf("final run = %+v, err=%v, want interrupted", finalRun, err)
+	}
+	// The user's text is still in committed history exactly once -- it was
+	// never removed, and (with the run now terminal) never re-admitted
+	// either.
+	if got := countUserMessageText(t, ctx, orch.store, sessionID, "hello"); got != 1 {
+		t.Fatalf("committed 'hello' user messages after reconciliation = %d, want exactly 1 (no duplicate)", got)
 	}
 }
 
@@ -255,7 +334,7 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 	}
 	firstExecution := orch.store.Execution(session.RunFence{RunID: admittedRun.ID, ClaimToken: admittedRun.ClaimToken})
 	admittedTurn, err := firstExecution.AdmitTurn(ctx, session.AdmitTurnRequest{
-		Turn:                 session.Turn{ID: "crash-turn-2-1", RunID: admittedRun.ID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted, CreatedAt: orch.now()},
+		Turn:                 session.Turn{ID: "crash-turn-2-1", RunID: admittedRun.ID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted, UserMessageIDs: []session.MessageID{"crash-user-msg-2-1"}, CreatedAt: orch.now()},
 		UserMessages:         []session.Message{{ID: "crash-user-msg-2-1", SessionID: sessionID, RunID: admittedRun.ID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
 		AssistantPlaceholder: session.Message{ID: "crash-assistant-2-1", SessionID: sessionID, RunID: admittedRun.ID, Role: session.RoleAssistant, CreatedAt: orch.now(), UpdatedAt: orch.now()},
 		Event:                session.EventRecord{ID: "crash-turn-2-1-started", SessionID: sessionID, RunID: admittedRun.ID, TurnID: "crash-turn-2-1", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
@@ -304,11 +383,20 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 	if err != nil {
 		t.Fatalf("enqueue inbox: %v", err)
 	}
+	// Real UserParts, exactly as the real admitTurn would encode them (round-
+	// four reconciliation item 1/CR-C1): the shipped round-three test built a
+	// bare, content-free session.Message, which cannot see the duplicated-
+	// history defect this test now guards against.
+	userParts := crashUserParts(t, "crash-user-msg-2-2", "crash-user-msg-2-2", sessionID, claimed.ID, "second message", orch.now())
 	if _, err := secondExecution.AdmitTurn(ctx, session.AdmitTurnRequest{
-		Turn:         session.Turn{ID: "crash-turn-2-2", RunID: claimed.ID, SessionID: sessionID, Ordinal: 2, State: session.TurnAdmitted, CreatedAt: orch.now()},
+		Turn:         session.Turn{ID: "crash-turn-2-2", RunID: claimed.ID, SessionID: sessionID, Ordinal: 2, State: session.TurnAdmitted, UserMessageIDs: []session.MessageID{"crash-user-msg-2-2"}, CreatedAt: orch.now()},
 		UserMessages: []session.Message{{ID: "crash-user-msg-2-2", SessionID: sessionID, RunID: claimed.ID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
-		Event:        session.EventRecord{ID: "crash-turn-2-2-started", SessionID: sessionID, RunID: claimed.ID, TurnID: "crash-turn-2-2", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
-		InboxIDs:     []session.InboxID{item.ID},
+		UserParts:    userParts,
+		AssistantPlaceholder: session.Message{
+			ID: "crash-assistant-2-2", SessionID: sessionID, RunID: claimed.ID, Role: session.RoleAssistant, CreatedAt: orch.now(), UpdatedAt: orch.now(),
+		},
+		Event:    session.EventRecord{ID: "crash-turn-2-2-started", SessionID: sessionID, RunID: claimed.ID, TurnID: "crash-turn-2-2", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
+		InboxIDs: []session.InboxID{item.ID},
 	}); err != nil {
 		t.Fatalf("admit second turn: %v", err)
 	}
@@ -316,6 +404,10 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 		t.Fatalf("start run: %v", err)
 	}
 	time.Sleep(2 * time.Millisecond)
+
+	if got := countUserMessageText(t, ctx, orch.store, sessionID, "second message"); got != 1 {
+		t.Fatalf("committed 'second message' user messages before reconciliation = %d, want 1", got)
+	}
 
 	handle, err := orch.Resume(ctx, admittedRun.ID)
 	if err != nil {
@@ -329,17 +421,25 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 	if err != nil || turn.State != session.TurnInterrupted {
 		t.Fatalf("dangling second turn after reconciliation = %#v, err=%v, want interrupted", turn, err)
 	}
-	requeued, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxQueued})
-	if err != nil || len(requeued) != 1 || requeued[0].ID != item.ID {
-		t.Fatalf("requeued inbox = %#v, %v", requeued, err)
+	// The item must NOT be requeued (see the no-checkpoint sibling test):
+	// it settles InboxInterrupted, still linked to crash-turn-2-2, so the
+	// SAME turn -- never a fresh one -- redrives it on the next resume.
+	interruptedItems, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxInterrupted})
+	if err != nil || len(interruptedItems) != 1 || interruptedItems[0].ID != item.ID || interruptedItems[0].TurnID != "crash-turn-2-2" {
+		t.Fatalf("interrupted inbox = %#v, %v, want exactly the reconciled item, still linked to crash-turn-2-2", interruptedItems, err)
+	}
+	if requeued, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxQueued}); err != nil || len(requeued) != 0 {
+		t.Fatalf("queued inbox after reconciliation = %#v, %v, want none (never requeued)", requeued, err)
 	}
 	finalRun, err := orch.store.GetRun(ctx, admittedRun.ID)
 	if err != nil || finalRun.Status != session.RunPaused {
 		t.Fatalf("final run = %+v, err=%v, want paused", finalRun, err)
 	}
 
-	// Prove the repause is genuinely resumable: an explicit ResumeRun
-	// drains the requeued item and completes normally.
+	// Prove the repause is genuinely resumable, and that it resumes the
+	// SAME reconciled turn rather than admitting a fresh one: an explicit
+	// ResumeRun redrives crash-turn-2-2 (interrupted -> running -> completed,
+	// same TurnID, same committed user message) and completes normally.
 	resumeHandle, err := orch.ResumeRun(ctx, admittedRun.ID, ResumeRequest{})
 	if err != nil {
 		t.Fatalf("ResumeRun after reconciliation error = %v", err)
@@ -347,5 +447,18 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 	resumed := <-resumeHandle.Done()
 	if resumed.Status != session.RunCompleted || resumed.Error != nil {
 		t.Fatalf("resumed result = %+v", resumed)
+	}
+	completedTurn, err := orch.store.GetTurn(ctx, "crash-turn-2-2")
+	if err != nil || completedTurn.State != session.TurnCompleted {
+		t.Fatalf("crash-turn-2-2 after resume = %#v, err=%v, want completed (the SAME turn, redriven)", completedTurn, err)
+	}
+	completedItems, err := orch.store.ListInbox(ctx, sessionID, []session.InboxState{session.InboxCompleted})
+	if err != nil || len(completedItems) != 1 || completedItems[0].ID != item.ID {
+		t.Fatalf("completed inbox after resume = %#v, %v, want exactly the reconciled item, completed once", completedItems, err)
+	}
+	// The critical assertion (CR-C1): the user's text appears in committed
+	// history EXACTLY ONCE, never duplicated by a second admission.
+	if got := countUserMessageText(t, ctx, orch.store, sessionID, "second message"); got != 1 {
+		t.Fatalf("committed 'second message' user messages after resume = %d, want exactly 1 (no duplicate)", got)
 	}
 }
