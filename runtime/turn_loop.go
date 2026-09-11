@@ -124,7 +124,23 @@ const firstTurnSentinelID session.InboxID = "\x00first-turn"
 // ever pushed when the promoted checkpoint's own payload has no real ADK
 // runner state (decodeLoopCheckpointHasRunnerState), so it is guaranteed to
 // reach GenInput, never GenResume -- see resumeReconciledTurn's doc comment.
+// It is guaranteed to be somewhere in the batch GenInput sees, NOT
+// guaranteed to be items[0]: upstream's tryLoadCheckpoint builds that batch
+// as cp.UnhandledItems ++ newItems, and this package only ever prepends the
+// sentinel to the newItems half it controls (round-five reconciliation item
+// 1/TR-C1) -- genInput scans the whole batch for it.
 const reconciledTurnSentinelID session.InboxID = "\x00reconciled-turn"
+
+// indexOf returns the index of the first occurrence of target in ids, or -1
+// if target is not present.
+func indexOf(ids []session.InboxID, target session.InboxID) int {
+	for i, id := range ids {
+		if id == target {
+			return i
+		}
+	}
+	return -1
+}
 
 func (c *turnLoopCoordinator) nextOrdinal() int64 {
 	c.mu.Lock()
@@ -331,15 +347,28 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, loop *adkTurnLoop, i
 	// call is guaranteed to be the one GenInput call ADK makes this Run()
 	// -- never raced by GenResume (round-four reconciliation item 1/CR-C1).
 	// See resumeReconciledTurn's doc comment for the full redrive contract.
-	if items[0] == reconciledTurnSentinelID {
+	//
+	// The sentinel is NOT guaranteed to land at items[0]: upstream's
+	// tryLoadCheckpoint builds this batch as cp.UnhandledItems ++ newItems
+	// (eino@v0.9.19/adk/turn_loop.go), and ResumeRun only ever prepends the
+	// sentinel to the newItems half it pushes (see pushReconciledSentinel).
+	// A promoted checkpoint carrying its own UnhandledItems -- the shape
+	// promoteQueuedContinuation produces for a graceful stop with queued
+	// input -- puts those ids ahead of the sentinel, so this scans the
+	// whole batch rather than checking only the first id (round-five
+	// reconciliation item 1/TR-C1).
+	if sentinelAt := indexOf(items, reconciledTurnSentinelID); sentinelAt >= 0 {
 		engine, err := c.resumeReconciledTurn(ctx)
 		if err != nil {
 			return nil, err
 		}
+		rest := make([]session.InboxID, 0, len(items)-1)
+		rest = append(rest, items[:sentinelAt]...)
+		rest = append(rest, items[sentinelAt+1:]...)
 		return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
 			Input:     &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages, EnableStreaming: true},
-			Consumed:  items[:1],
-			Remaining: items[1:],
+			Consumed:  []session.InboxID{reconciledTurnSentinelID},
+			Remaining: rest,
 		}, nil
 	}
 	// A leftover first-turn sentinel here has no durable inbox row (Start's
@@ -431,13 +460,24 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, loop *adkTurnLoop, i
 		// dispatch. A later resume's drainQueuedInbox simply will not
 		// find these ids again once they are not InboxQueued anymore
 		// (already consumed by whichever call actually admitted them).
-		engine := c.currentEngine()
-		if engine == nil {
-			return nil, fmt.Errorf("%w: TurnLoop GenInput delivered only already-admitted items with no prior turn to fall back to", ErrInvalidOrchestrator)
+		//
+		// A fresh coordinator can legitimately have no engine at all here
+		// (e.g. a resume whose only batch is an id a durable-state check
+		// -- not this coordinator -- already admitted, with no prior
+		// GenInput call in this coordinator's own lifetime): that is the
+		// same "nothing new to do" outcome as the case above with a live
+		// engine, not an error. Failing the run outright would turn a
+		// stale/duplicate delivery into a hard RunFailed with no answer at
+		// all (round-five reconciliation item 1/TR-C1); fall back to an
+		// empty input instead, which the run loop discards the same way
+		// once isCommitted() is true after Stop below.
+		input := &adk.TypedAgentInput[*einoschema.AgenticMessage]{EnableStreaming: true}
+		if engine := c.currentEngine(); engine != nil {
+			input.Messages = engine.snapshot.Messages
 		}
 		loop.Stop(adk.WithStopCause("duplicate-delivery-noop"))
 		return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
-			Input:    &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages, EnableStreaming: true},
+			Input:    input,
 			Consumed: items,
 		}, nil
 	}
