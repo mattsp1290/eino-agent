@@ -105,9 +105,11 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	var notificationOrder []string
 	// notificationIDs is parallel to notificationOrder: every extension
 	// point captured here (EventPublishedPoint, ToolStartedPoint,
-	// ToolSettledPoint) carries a ToolCallID, so nothing needs to be
-	// filtered by content up front the way the published hook used to
-	// filter by EventToolCallUpdated alone. This run creates exactly one
+	// ToolSettledPoint) carries a ToolCallID. The base version of this test
+	// filtered the published hook by `event.Kind == EventToolCallUpdated &&
+	// event.ToolCallID == "call-panic"` -- a literal provider CallID that
+	// no longer survives as the durable ToolCallID now that IDs are always
+	// freshly minted (see prepareToolCalls). This run creates exactly one
 	// tool call, so every notification observed here belongs to it, but
 	// notificationOrder/sinkEvents are still filtered down to that one id
 	// (onlyToolCallID-style) below before comparing them -- capturing
@@ -183,21 +185,38 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	if err := plan.FlushNotifications(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if toolCallID == "" {
+		t.Fatal("tool call id was never observed via published events")
+	}
+	// Wait for exactly 3 sink events matching toolCallID, not merely 3 sink
+	// events total: this run creates exactly one tool call today, so the
+	// two counts happen to agree, but counting matched events is what
+	// actually enforces the filter instead of relying on that coincidence.
 	deadline := time.Now().Add(time.Second)
 	for {
 		sinkMu.Lock()
-		count := len(sinkEvents)
+		var matched int
+		for _, event := range sinkEvents {
+			if event.ToolCallID == toolCallID {
+				matched++
+			}
+		}
+		total := len(sinkEvents)
 		sinkMu.Unlock()
-		if count == 3 {
+		if matched == 3 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("sink event count = %d, want 3", count)
+			t.Fatalf("filtered sink event count = %d (of %d total), want 3", matched, total)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if toolCallID == "" {
-		t.Fatal("tool call id was never observed via published events")
+	call, err := store.GetToolCall(context.Background(), toolCallID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.ProviderCallID != "call-panic" {
+		t.Fatalf("captured tool call id maps to ProviderCallID = %q, want call-panic", call.ProviderCallID)
 	}
 	assertDurableToolResult(t, store, "panic-session", toolCallID, session.ToolCallFailed, "operational_failure")
 	// Filter every captured notification/sink/published slice down to
