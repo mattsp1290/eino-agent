@@ -264,7 +264,15 @@ settlement, unless the exact post-rewrite content digest was recorded as
 an authorized rewrite for that call ID THIS cycle (reset every cycle) by a
 sanctioned content-management recipe (patchtoolcalls, reduction --
 `wrapAuthorizedContentRewrites`), which also durably records the rewrite
-(handler ID, kind, call ID, before/after digest) as an audit event.
+(handler ID, kind, call ID, before/after digest) as an audit event. That
+authorization is itself Kind-scoped
+(`kindMayRewriteSettledContent`): only reduction may legitimately rewrite
+a call ID the baseline already shows real settled content for. A
+patchtoolcalls-kind authorization is refused for such a call ID even
+though `wrapAuthorizedContentRewrites` recorded it -- patchtoolcalls'
+only legitimate purpose is filling in a call with NO durable settlement
+at all, never rewriting one that has real settled content (round-two W6
+review item 4).
 
 Both integration gaps an earlier pass of this design left open --
 host-injected content never reaching the model, and a handler-injected tool
@@ -288,13 +296,16 @@ retention truncation, can be what shortens it), an immutable-input proof
 via a custom `HandlerFactory` that tries to rewrite a settled result
 without authorization, a discovered deferred tool actually being called
 (not just found) after toolsearch surfaces it, and interrupt/resume
-including a handler `Config` change being refused on resume -- see that
-package's own doc comment and the W6 section of
-`docs/architecture/eino-feature-support.md` for the scope limits this
-pass left open (a dangling-call fixture for patchtoolcalls; toolsearch's
-discovery is only recorded in-memory for the live run, not durably, so it
-does not survive a resume/restart; skill activation is durably recorded
-but not yet re-verified against a live `Get` on resume).
+including a handler `Config` change being refused on resume, and (round-two
+W6 review) toolsearch discovery durably replaying on a fresh turn, after
+`ResumeRun`, and after a brand-new orchestrator instance against the same
+store, plus a resumed run refusing to proceed when an activated skill's
+content changed between pause and resume -- see that package's own doc
+comment and the W6 section of `docs/architecture/eino-feature-support.md`
+for this example's one remaining scope limit (a "dangling call, no durable
+settlement" fixture for patchtoolcalls is exercised at the runtime-internal
+level, via seeded store history, rather than duplicated at this black-box
+level).
 
 ## Request ledger and privacy
 
