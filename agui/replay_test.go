@@ -147,7 +147,15 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-text", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartText, Ordinal: 10, Payload: []byte(`{"text":"settled"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+	textParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "settled"}}},
+	}, func() session.PartID { return "part-text" }, "assistant-1", "session-replay", "run-1", now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	textParts[0].Ordinal = 10
+	if _, err := execution.AppendPart(ctx, textParts[0]); err != nil {
 		t.Fatalf("append part: %v", err)
 	}
 	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-provider-state", MessageID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Kind: session.PartProviderState, Ordinal: 11, Payload: []byte(`{"data":"AGUI_PROVIDER_STATE_SENTINEL"}`), CreatedAt: now, UpdatedAt: now}); err != nil {

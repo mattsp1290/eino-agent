@@ -47,7 +47,7 @@ func observationContract(t *testing.T, factory Factory) {
 			t.Fatal(before)
 		}
 		rollback := errors.New("rollback")
-		part := session.Part{ID: "text", MessageID: m.ID, SessionID: r.SessionID, RunID: r.ID, Kind: session.PartText, Payload: []byte(`{"text":"hello"}`)}
+		part := session.Part{ID: "text", MessageID: m.ID, SessionID: r.SessionID, RunID: r.ID, Kind: session.PartAssistantGenText, Payload: []byte(`{"text":{"text":"hello"}}`)}
 		if err = ex.WithinTx(ctx, func(ctx context.Context, tx session.ExecutionStore) error {
 			if _, err := tx.AppendPart(ctx, part); err != nil {
 				return err
@@ -123,8 +123,8 @@ func boundedObservationContract(t *testing.T, factory Factory) {
 			if role == session.RoleSystem {
 				text = "PRIVATE_SYSTEM"
 			}
-			raw, _ := json.Marshal(map[string]string{"text": text})
-			appendPart(t, ctx, ex, session.Part{ID: session.PartID(fmt.Sprintf("p%d", i)), SessionID: r.SessionID, RunID: r.ID, MessageID: m.ID, Kind: session.PartText, Payload: raw})
+			raw, _ := json.Marshal(map[string]map[string]string{"text": {"text": text}})
+			appendPart(t, ctx, ex, session.Part{ID: session.PartID(fmt.Sprintf("p%d", i)), SessionID: r.SessionID, RunID: r.ID, MessageID: m.ID, Kind: session.PartUserInputText, Payload: raw})
 		}
 		appendPart(t, ctx, ex, session.Part{ID: "reasoning", SessionID: r.SessionID, RunID: r.ID, MessageID: "m1", Kind: session.PartReasoning, Payload: []byte(`{"text":"PRIVATE_REASONING"}`)})
 		limits := session.ObservationLimits{MaxMessages: 1, MaxTools: 1, MaxParts: 1, MaxSnapshotBytes: 64000, MaxTextBytes: 7}
@@ -141,7 +141,7 @@ func boundedObservationContract(t *testing.T, factory Factory) {
 			t.Fatal(err)
 		}
 		limits.MaxTextBytes = 7
-		appendPart(t, ctx, ex, session.Part{ID: "empty", SessionID: r.SessionID, RunID: r.ID, MessageID: "m1", Kind: session.PartText, Payload: []byte(`{"text":""}`)})
+		appendPart(t, ctx, ex, session.Part{ID: "empty", SessionID: r.SessionID, RunID: r.ID, MessageID: "m1", Kind: session.PartUserInputText, Payload: []byte(`{"text":{"text":""}}`)})
 		if _, err = reader.ReadObservationSnapshot(ctx, r.SessionID, limits); !errors.Is(err, session.ErrObservationTooLarge) {
 			t.Fatal("empty part escaped cumulative count", err)
 		}

@@ -148,10 +148,14 @@ func TestAdmitBuildsProviderInputFromFencedHistoryAndCurrentMessage(t *testing.T
 		ID: "prior-user", SessionID: request.IDs.SessionID, RunID: "prior-run",
 		Role: session.RoleUser, CreatedAt: priorAt, UpdatedAt: priorAt,
 	}
-	store.parts["prior-part"] = session.Part{
-		ID: "prior-part", SessionID: request.IDs.SessionID, RunID: "prior-run", MessageID: "prior-user",
-		Kind: session.PartText, Payload: mustJSON(map[string]string{"text": "prior"}), CreatedAt: priorAt, UpdatedAt: priorAt,
+	priorParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "prior-block", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "prior"}}},
+	}, func() session.PartID { return "prior-part" }, "prior-user", request.IDs.SessionID, "prior-run", priorAt, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
 	}
+	store.parts["prior-part"] = priorParts[0]
 	store.listMessagesHook = func(tx *admissionStore, _ session.ID) {
 		if _, ok := tx.runs[request.IDs.RunID]; !ok {
 			t.Fatal("history loaded before AdmitRun established the fence")
@@ -252,7 +256,7 @@ func TestAdmitHistoryProjectionFailureHasNoNewDurableOrLiveSideEffects(t *testin
 		SessionID: request.IDs.SessionID,
 		RunID:     "history-run",
 		MessageID: "history-user",
-		Kind:      session.PartText,
+		Kind:      session.PartUserInputText,
 		Payload:   []byte(`{"text":`),
 	}
 	_, err = (admitter{Store: store}).admit(context.Background(), request)

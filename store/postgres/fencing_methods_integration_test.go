@@ -205,7 +205,7 @@ func fencingAssistantMessage(f *raceFixture, run session.Run, id session.Message
 }
 
 func fencingTextPart(f *raceFixture, run session.Run, messageID session.MessageID, id session.PartID) session.Part {
-	return session.Part{ID: id, MessageID: messageID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Payload: json.RawMessage(`"text"`), CreatedAt: f.now, UpdatedAt: f.now}
+	return session.Part{ID: id, MessageID: messageID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartProviderState, Payload: json.RawMessage(`"text"`), CreatedAt: f.now, UpdatedAt: f.now}
 }
 
 func fencingToolEvent(id session.EventID, at time.Time) session.ToolTransitionEvent {

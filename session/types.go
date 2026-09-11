@@ -172,41 +172,32 @@ type Message struct {
 type PartKind string
 
 const (
-	// PartText stores text content or a settled text delta.
-	//
-	// PartText, PartToolCall, PartToolResult, PartFile, PartStep, and
-	// PartState are superseded by the 20 block-kind PartKind constants and
-	// PartResponseMeta declared below (see content.go for the BlockKind
-	// contract they persist). They are kept only so already-durable history
-	// continues to decode during the W2-to-W5 cutover, and are removed once
-	// the runtime cutover to durable ordered rich content lands in W5.
-	PartText PartKind = "text"
 	// PartReasoning stores model reasoning content when a provider exposes
 	// it. This constant is also the PartKind for BlockKindReasoning content
 	// blocks (see PartKindForBlock in content.go): both already share the
 	// "reasoning" string, so no separate constant is declared for the block
 	// variant.
 	PartReasoning PartKind = "reasoning"
-	// PartToolCall stores a tool-call state transition. Superseded; see
-	// PartText.
-	PartToolCall PartKind = "tool_call"
-	// PartToolResult stores a tool result sent back to the model. Superseded;
-	// see PartText.
-	PartToolResult PartKind = "tool_result"
-	// PartFile stores a durable file or media reference. Superseded; see
-	// PartText.
-	PartFile PartKind = "file"
-	// PartStep stores provider/runtime step start and finish markers.
-	// Superseded; see PartText.
-	PartStep PartKind = "step"
 	// PartCompaction stores compaction request or summary metadata.
 	PartCompaction PartKind = "compaction"
-	// PartState stores app-visible state snapshots or patches. Superseded;
-	// see PartText.
-	PartState PartKind = "state"
 	// PartProviderState stores provider-private continuity data. Public history
-	// projection and replay surfaces always omit this kind.
+	// projection and replay surfaces always omit this kind. Every part of
+	// this kind on an active message is decoded as a strict, ordered
+	// model.ProviderStateItem envelope by runtime's loadProviderHistory
+	// (see runtime/provider_state.go), so no other payload shape may ever
+	// share this kind.
 	PartProviderState PartKind = "provider_state"
+	// PartApprovalDecision stores a runtime-private decision-CAS record
+	// guarding a one-time host approval decision (see adkApprovalBinding in
+	// runtime/adk_approval.go). Like PartProviderState it is never exposed
+	// as public content and is ignored by every history projection, but it
+	// deliberately uses its own kind rather than PartProviderState: it can
+	// live on the same message as a real PartProviderState continuity part
+	// (both may sit alongside the public approval-request content block
+	// that message durably commits), and its payload does not conform to
+	// the strict ProviderStateItem envelope loadProviderHistory requires of
+	// every PartProviderState part on an active message.
+	PartApprovalDecision PartKind = "approval_decision"
 
 	// The following PartKind constants persist the 19 non-reasoning
 	// BlockKind values declared in content.go, one part kind per block kind,

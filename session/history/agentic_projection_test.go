@@ -278,7 +278,7 @@ func TestProjectAgenticMixedKindsRejected(t *testing.T) {
 	batch := session.ReplayBatch{
 		Messages: []session.Message{message("mixed", session.RoleUser)},
 		Parts: []session.Part{
-			part("legacy-text", "mixed", session.PartText, 0, `{"text":"legacy"}`),
+			part("legacy-compaction", "mixed", session.PartCompaction, 0, `{"text":"legacy","epoch_id":"epoch","redacted":true}`),
 			richPart,
 		},
 	}
@@ -291,17 +291,20 @@ func TestProjectAgenticMixedKindsRejected(t *testing.T) {
 func TestProjectAgenticAppliesEpoch(t *testing.T) {
 	t.Parallel()
 
+	tailParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "Continue"}}},
+	}, "tail", "tl")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("old", session.RoleUser),
 			message("summary", session.RoleSystem),
 			message("tail", session.RoleUser),
 		},
-		Parts: []session.Part{
-			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
+		Parts: append([]session.Part{
+			part("old-secret", "old", session.PartProviderState, 10, `{"text":"SECRET old raw prompt"}`),
 			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
-			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
-		},
+		}, tailParts...),
 	}
 	projection, err := ProjectAgentic(batch, Options{Epoch: &session.ContextEpoch{
 		SummaryMessageID: "summary",
@@ -331,20 +334,39 @@ func TestProjectAgenticAppliesEpoch(t *testing.T) {
 	}
 }
 
-func TestProjectAgenticLegacyParity(t *testing.T) {
+// TestProjectAgenticClassicParity asserts that classic (Project) and agentic
+// (ProjectAgentic) projection agree on the same durable block-kind content:
+// a rich user text message, and a rich assistant message combining text,
+// a function_tool_call, and its function_tool_result.
+func TestProjectAgenticClassicParity(t *testing.T) {
 	t.Parallel()
+
+	userParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "Read README"}}},
+	}, "user-1", "u")
+	assistantParts := encodeRichParts(t, session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "I will read it."}},
+			{ID: "b2", Kind: session.BlockKindFunctionToolCall, FunctionCall: &session.FunctionCallBlock{CallID: "call-1", Name: "file_read", Arguments: `{"path":"README.md"}`}},
+		},
+	}, "assistant-1", "a")
+	toolParts := encodeRichParts(t, session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindFunctionToolResult, FunctionResult: &session.FunctionResultBlock{
+			CallID: "call-1", Name: "file_read",
+			Content: []session.ResultContent{{Type: session.ResultContentText, Text: "README contents"}},
+		}}},
+	}, "tool-1", "tr")
 
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("user-1", session.RoleUser),
 			message("assistant-1", session.RoleAssistant),
+			message("tool-1", session.RoleUser),
 		},
-		Parts: []session.Part{
-			part("p0", "user-1", session.PartText, 10, `{"text":"Read README"}`),
-			part("p1", "assistant-1", session.PartText, 10, `{"text":"I will read it."}`),
-			part("p2", "assistant-1", session.PartToolCall, 20, `{"id":"call-1","name":"file_read","arguments":{"path":"README.md"}}`),
-			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","status":"completed","content":"README contents"}`),
-		},
+		Parts: append(append(userParts, assistantParts...), toolParts...),
 	}
 	classic, err := Project(batch, Options{})
 	if err != nil {

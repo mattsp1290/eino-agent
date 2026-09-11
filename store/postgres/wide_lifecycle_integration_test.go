@@ -62,8 +62,8 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
 	if got, err := execution.AppendMessage(f.ctx, message); err != nil || got.ID != message.ID || got.RunID != run.ID {
 		t.Fatalf("append wide assistant: id length=%d err=%v", len(got.ID), err)
 	}
-	textPayload := json.RawMessage(`{"text":"wide lifecycle content"}`)
-	textPart := session.Part{ID: session.PartID(ids.text), MessageID: message.ID, SessionID: message.SessionID, RunID: run.ID, Kind: session.PartText, Ordinal: 0, Payload: textPayload, CreatedAt: created, UpdatedAt: created}
+	textPayload := json.RawMessage(`{"text":{"text":"wide lifecycle content"}}`)
+	textPart := session.Part{ID: session.PartID(ids.text), MessageID: message.ID, SessionID: message.SessionID, RunID: run.ID, Kind: session.PartAssistantGenText, Ordinal: 0, Payload: textPayload, CreatedAt: created, UpdatedAt: created}
 	if got, err := execution.AppendPart(f.ctx, textPart); err != nil || got.ID != textPart.ID || !reflect.DeepEqual(got.Payload, textPayload) {
 		t.Fatalf("append wide text: id length=%d payload=%d err=%v", len(got.ID), len(got.Payload), err)
 	}

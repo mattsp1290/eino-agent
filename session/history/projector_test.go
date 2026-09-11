@@ -18,24 +18,45 @@ import (
 func TestProjectReplayHistoryGolden(t *testing.T) {
 	t.Parallel()
 
+	userParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "Read README"}}},
+	}, "user-1", "u")
+	assistant1Parts := encodeRichParts(t, session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "I will read it."}},
+			{ID: "b2", Kind: session.BlockKindFunctionToolCall, FunctionCall: &session.FunctionCallBlock{CallID: "call-1", Name: "file_read", Arguments: `{"path":"README.md"}`}},
+		},
+	}, "assistant-1", "a1")
+	toolParts := encodeRichParts(t, session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindFunctionToolResult, FunctionResult: &session.FunctionResultBlock{
+			CallID: "call-1", Name: "file_read",
+			Content: []session.ResultContent{{Type: session.ResultContentText, Text: "README contents"}},
+		}}},
+	}, "tool-1", "t1")
+	assistant2Parts := encodeRichParts(t, session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{
+			{ID: "b1", Kind: session.BlockKindReasoning, Reasoning: &session.ReasoningBlock{Text: "LIVE_ONLY_STYLE_REASONING"}},
+			{ID: "b2", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "Summary"}},
+		},
+	}, "assistant-2", "a2")
+	liveParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "settled"}}},
+	}, "assistant-live", "al")
+
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("user-1", session.RoleUser),
 			message("assistant-1", session.RoleAssistant),
-			message("tool-1", session.RoleTool),
+			message("tool-1", session.RoleUser),
 			message("assistant-2", session.RoleAssistant),
 			message("assistant-live", session.RoleAssistant),
 		},
-		Parts: []session.Part{
-			part("p2", "assistant-1", session.PartToolCall, 20, `{"id":"call-1","name":"file_read","arguments":{"path":"README.md"}}`),
-			part("p1", "assistant-1", session.PartText, 10, `{"text":"I will read it."}`),
-			part("p0", "user-1", session.PartText, 10, `{"text":"Read README"}`),
-			part("p3", "assistant-1", session.PartToolResult, 30, `{"tool_call_id":"call-1","status":"completed","content":"README contents"}`),
-			part("reasoning", "assistant-2", session.PartReasoning, 5, `{"text":"LIVE_ONLY_STYLE_REASONING"}`),
-			part("state", "assistant-2", session.PartState, 6, `{"text":"LIVE_ONLY_STYLE_STATE"}`),
-			part("p4", "assistant-2", session.PartText, 10, `{"text":"Summary"}`),
-			part("p5", "assistant-live", session.PartText, 10, `{"text":"settled"}`),
-		},
+		Parts: append(append(append(append(userParts, assistant1Parts...), toolParts...), assistant2Parts...), liveParts...),
 	}
 	projected, err := Project(batch, Options{})
 	if err != nil {
@@ -46,120 +67,18 @@ func TestProjectReplayHistoryGolden(t *testing.T) {
 	requireGoldenEqual(t, got, want)
 }
 
-func TestProjectToolResultStructuredAndExpectedFailurePayloads(t *testing.T) {
-	t.Parallel()
-
-	batch := session.ReplayBatch{
-		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
-		Parts: []session.Part{
-			part("structured", "assistant-1", session.PartToolResult, 10, `{"tool_call_id":"call-1","status":"completed","structured":{"ok":true},"original_size":11,"inline_size":11,"external":false}`),
-			part("failure", "assistant-1", session.PartToolResult, 20, `{"tool_call_id":"call-2","status":"expected_failure","content":"denied"}`),
-		},
-	}
-	projected, err := Project(batch, Options{})
-	if err != nil {
-		t.Fatalf("Project error = %v", err)
-	}
-	if len(projected) != 3 {
-		t.Fatalf("projected len = %d", len(projected))
-	}
-	assertMessage(t, projected[1], schema.Tool, `{"ok":true}`)
-	if projected[1].ToolCallID != "call-1" {
-		t.Fatalf("structured tool call id = %q", projected[1].ToolCallID)
-	}
-	if projected[2].ToolCallID != "call-2" || projected[2].Content == "denied" {
-		t.Fatalf("expected failure projection = %#v", projected[2])
-	}
-}
-
-func TestProjectRejectsNonCanonicalTextPayloads(t *testing.T) {
-	t.Parallel()
-	tests := map[string]struct {
-		kind    session.PartKind
-		payload string
-	}{
-		"bare string":         {kind: session.PartText, payload: `"legacy"`},
-		"content alias":       {kind: session.PartText, payload: `{"content":"legacy"}`},
-		"raw alias":           {kind: session.PartText, payload: `{"raw":{"value":1}}`},
-		"missing text":        {kind: session.PartText, payload: `{}`},
-		"null":                {kind: session.PartText, payload: `null`},
-		"trailing value":      {kind: session.PartText, payload: `{"text":"ok"} {}`},
-		"unknown field":       {kind: session.PartText, payload: `{"text":"ok","extra":true}`},
-		"compaction metadata": {kind: session.PartCompaction, payload: `{"text":"summary"}`},
-	}
-	for name, test := range tests {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			_, err := Project(session.ReplayBatch{
-				Messages: []session.Message{message("message", session.RoleUser)},
-				Parts:    []session.Part{part("part", "message", test.kind, 0, test.payload)},
-			}, Options{IncludeReasoning: true, IncludeState: true})
-			if err == nil {
-				t.Fatal("non-canonical payload was accepted")
-			}
-		})
-	}
-}
-
-func TestProjectRejectsNonCanonicalToolResultPayloads(t *testing.T) {
-	t.Parallel()
-	for name, payload := range map[string]string{
-		"text fallback":   `{"text":"legacy","tool_call_id":"call"}`,
-		"missing call id": `{"status":"completed","content":"ok"}`,
-		"missing status":  `{"tool_call_id":"call","content":"ok"}`,
-		"unknown status":  `{"tool_call_id":"call","status":"future"}`,
-		"unknown field":   `{"tool_call_id":"call","status":"completed","extra":true}`,
-		"null":            `null`,
-		"trailing value":  `{"tool_call_id":"call","status":"completed"} {}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-			_, err := Project(session.ReplayBatch{
-				Messages: []session.Message{message("message", session.RoleTool)},
-				Parts:    []session.Part{part("part", "message", session.PartToolResult, 0, payload)},
-			}, Options{})
-			if err == nil {
-				t.Fatal("non-canonical payload was accepted")
-			}
-		})
-	}
-}
-
-func TestProjectExcludesReasoningAndIncludesStateWhenEnabled(t *testing.T) {
-	t.Parallel()
-
-	batch := session.ReplayBatch{
-		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
-		Parts: []session.Part{
-			part("reasoning", "assistant-1", session.PartReasoning, 10, `{"text":"private reasoning"}`),
-			part("state", "assistant-1", session.PartState, 20, `{"text":"state snapshot"}`),
-		},
-	}
-	projected, err := Project(batch, Options{})
-	if err != nil {
-		t.Fatalf("Project error = %v", err)
-	}
-	if projected[0].Content != "" {
-		t.Fatalf("content with defaults = %q, want empty", projected[0].Content)
-	}
-	projected, err = Project(batch, Options{IncludeReasoning: true, IncludeState: true})
-	if err != nil {
-		t.Fatalf("Project with options error = %v", err)
-	}
-	if projected[0].Content != "private reasoningstate snapshot" {
-		t.Fatalf("content with options = %q", projected[0].Content)
-	}
-}
-
 func TestProjectCompactionBoundaryIncludesSummary(t *testing.T) {
 	t.Parallel()
 
+	textParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleSystem,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: " Tail instruction."}}},
+	}, "summary", "s")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{message("summary", session.RoleSystem)},
-		Parts: []session.Part{
+		Parts: append([]session.Part{
 			part("compaction", "summary", session.PartCompaction, 10, `{"text":"Earlier context summary.","epoch_id":"epoch","redacted":true}`),
-			part("text", "summary", session.PartText, 20, `{"text":" Tail instruction."}`),
-		},
+		}, reorderedOrdinal(textParts, 20)...),
 	}
 	projected, err := Project(batch, Options{})
 	if err != nil {
@@ -168,20 +87,35 @@ func TestProjectCompactionBoundaryIncludesSummary(t *testing.T) {
 	assertMessage(t, projected[0], schema.System, "Earlier context summary. Tail instruction.")
 }
 
+// reorderedOrdinal returns parts with every ordinal shifted to start at
+// start, preserving relative order, so a caller can interleave rich content
+// parts after a fixed-ordinal legacy-family part in the same message.
+func reorderedOrdinal(parts []session.Part, start int64) []session.Part {
+	out := make([]session.Part, len(parts))
+	for i, p := range parts {
+		p.Ordinal = start + int64(i)
+		out[i] = p
+	}
+	return out
+}
+
 func TestProjectEpochExcludesCompactedRawHistory(t *testing.T) {
 	t.Parallel()
 
+	tailParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "Continue"}}},
+	}, "tail", "tl")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("old", session.RoleUser),
 			message("summary", session.RoleSystem),
 			message("tail", session.RoleUser),
 		},
-		Parts: []session.Part{
-			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
+		Parts: append([]session.Part{
+			part("old-secret", "old", session.PartProviderState, 10, `{"text":"SECRET old raw prompt"}`),
 			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
-			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
-		},
+		}, tailParts...),
 	}
 	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
 		SummaryMessageID: "summary",
@@ -207,7 +141,7 @@ func TestProjectEpochWithNoTailIncludesSummaryOnly(t *testing.T) {
 			message("summary", session.RoleSystem),
 		},
 		Parts: []session.Part{
-			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
+			part("old-secret", "old", session.PartProviderState, 10, `{"text":"SECRET old raw prompt"}`),
 			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
 		},
 	}
@@ -230,17 +164,21 @@ func TestProjectEpochWithNoTailIncludesSummaryOnly(t *testing.T) {
 func TestProjectEpochPlacesSummaryBeforeRetainedTail(t *testing.T) {
 	t.Parallel()
 
+	tailParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "Continue"}}},
+	}, "tail", "tl")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			message("old", session.RoleUser),
 			message("tail", session.RoleUser),
 			message("summary", session.RoleSystem),
 		},
-		Parts: []session.Part{
-			part("old-secret", "old", session.PartText, 10, `{"text":"SECRET old raw prompt"}`),
-			part("tail", "tail", session.PartText, 10, `{"text":"Continue"}`),
+		Parts: append(append([]session.Part{
+			part("old-secret", "old", session.PartProviderState, 10, `{"text":"SECRET old raw prompt"}`),
+		}, tailParts...),
 			part("summary", "summary", session.PartCompaction, 10, `{"text":"Summarized safely.","epoch_id":"epoch","redacted":true}`),
-		},
+		),
 	}
 	projected, err := Project(batch, Options{Epoch: &session.ContextEpoch{
 		SummaryMessageID: "summary",
@@ -263,9 +201,10 @@ func TestLoadIgnoresLiveOnlyEvents(t *testing.T) {
 	store := historyStore{
 		batch: session.ReplayBatch{
 			Messages: []session.Message{message("assistant", session.RoleAssistant)},
-			Parts: []session.Part{
-				part("settled", "assistant", session.PartText, 10, `{"text":"settled"}`),
-			},
+			Parts: encodeRichParts(t, session.Content{
+				Role:   session.RoleAssistant,
+				Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "settled"}}},
+			}, "assistant", "st"),
 		},
 		events: []session.EventRecord{{
 			ID:        "live",
@@ -285,8 +224,8 @@ func TestLoadIgnoresLiveOnlyEvents(t *testing.T) {
 func TestLoadBatchRejectsNonParallelPartOwnerMetadata(t *testing.T) {
 	t.Parallel()
 	parts := []session.Part{
-		part("first", "assistant", session.PartText, 0, `{"text":"one"}`),
-		part("second", "assistant", session.PartText, 1, `{"text":"two"}`),
+		part("first", "assistant", session.PartProviderState, 0, `{"text":"one"}`),
+		part("second", "assistant", session.PartProviderState, 1, `{"text":"two"}`),
 	}
 	for name, owners := range map[string][]session.MessageID{
 		"partial":  {"assistant"},
@@ -310,8 +249,8 @@ func TestProjectRejectsNonParallelPartOwnersWhenApplyingEpoch(t *testing.T) {
 	batch := session.ReplayBatch{
 		Messages: []session.Message{message("assistant", session.RoleAssistant)},
 		Parts: []session.Part{
-			part("first", "assistant", session.PartText, 0, `{"text":"one"}`),
-			part("second", "assistant", session.PartText, 1, `{"text":"two"}`),
+			part("first", "assistant", session.PartProviderState, 0, `{"text":"one"}`),
+			part("second", "assistant", session.PartProviderState, 1, `{"text":"two"}`),
 		},
 		PartOwnerMessageIDs: []session.MessageID{"assistant"},
 	}
@@ -327,7 +266,7 @@ func TestProjectRejectsMalformedIncludedPayload(t *testing.T) {
 	_, err := Project(session.ReplayBatch{
 		Messages: []session.Message{message("assistant-1", session.RoleAssistant)},
 		Parts: []session.Part{
-			part("bad", "assistant-1", session.PartText, 10, `{`),
+			part("bad", "assistant-1", session.PartAssistantGenText, 10, `{`),
 		},
 	}, Options{})
 	if err == nil {
@@ -337,13 +276,29 @@ func TestProjectRejectsMalformedIncludedPayload(t *testing.T) {
 
 func TestProjectWithSourcesOmitsProviderStateAndTracksExpansion(t *testing.T) {
 	t.Parallel()
+	// FunctionToolResult is only a valid content block on RoleUser (see
+	// roleAllowedKinds in session/content.go), so it is encoded separately
+	// from the RoleAssistant text block even though both parts end up on
+	// the same durable "assistant" message below -- classic projection
+	// (projectMessage's switch) does not require a part's kind to match its
+	// owning message's declared Role for PartFunctionToolResult.
+	textParts := encodeRichParts(t, session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "answer"}}},
+	}, "assistant", "ex-text")
+	toolParts := encodeRichParts(t, session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindFunctionToolResult, FunctionResult: &session.FunctionResultBlock{
+			CallID: "call", Name: "lookup",
+			Content: []session.ResultContent{{Type: session.ResultContentText, Text: "result"}},
+		}}},
+	}, "assistant", "ex-tool")
 	batch := session.ReplayBatch{
 		Messages: []session.Message{message("assistant", session.RoleAssistant)},
-		Parts: []session.Part{
-			part("text", "assistant", session.PartText, 0, `{"text":"answer"}`),
-			part("private", "assistant", session.PartProviderState, 1, `not even valid JSON SENTINEL`),
-			part("tool", "assistant", session.PartToolResult, 2, `{"tool_call_id":"call","status":"completed","content":"result"}`),
-		},
+		Parts: append(append(reorderedOrdinal(textParts, 0),
+			part("private", "assistant", session.PartProviderState, 1, `not even valid JSON SENTINEL`)),
+			reorderedOrdinal(toolParts, 2)...,
+		),
 	}
 	projection, err := ProjectWithSources(batch, Options{})
 	if err != nil {

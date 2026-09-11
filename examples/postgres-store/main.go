@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -94,12 +93,17 @@ func run(migrate bool) error {
 	if err != nil {
 		return err
 	}
-	if _, err := execution.AppendPart(ctx, session.Part{
-		ID: partID, MessageID: message.ID, SessionID: sess.ID, RunID: run.ID,
-		Kind: session.PartText, Payload: json.RawMessage(`{"text":"hello from PostgreSQL"}`),
-		CreatedAt: now, UpdatedAt: now,
-	}); err != nil {
+	content := session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{
+		{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "hello from PostgreSQL"}},
+	}}
+	contentParts, err := session.EncodeContentParts(content, func() session.PartID { return partID }, message.ID, sess.ID, run.ID, now, session.DefaultContentLimits())
+	if err != nil {
 		return err
+	}
+	for _, part := range contentParts {
+		if _, err := execution.AppendPart(ctx, part); err != nil {
+			return err
+		}
 	}
 	if _, err := execution.AppendEvent(ctx, session.EventRecord{
 		ID: eventID, SessionID: sess.ID, RunID: run.ID, MessageID: message.ID,
@@ -119,7 +123,7 @@ func run(migrate bool) error {
 	if err != nil {
 		return err
 	}
-	if len(replay.Messages) != 1 || len(replay.Parts) != 1 || replay.Messages[0].ID != message.ID || replay.Parts[0].Kind != session.PartText {
+	if len(replay.Messages) != 1 || len(replay.Parts) != 1 || replay.Messages[0].ID != message.ID || replay.Parts[0].Kind != session.PartUserInputText {
 		return errors.New("replay verification failed")
 	}
 	fmt.Printf("session=%s replay_messages=%d\n", sess.ID, len(replay.Messages))

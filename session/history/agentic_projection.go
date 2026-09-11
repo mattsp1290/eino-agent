@@ -13,7 +13,7 @@ import (
 )
 
 // ErrMixedContentKinds reports that one durable message mixes legacy content
-// part kinds (text, tool_call, tool_result, compaction, ...) with the new
+// part kinds (compaction, legacy-shaped reasoning, ...) with the new
 // BlockKind-backed content part kinds. A single message must use one family
 // or the other.
 var ErrMixedContentKinds = errors.New("session history: message mixes legacy and durable content block kinds")
@@ -109,17 +109,16 @@ func projectAgenticMessage(message session.Message, parts []session.Part, option
 	richCount, legacyCount := 0, 0
 	for _, part := range parts {
 		// PartProviderState is private provider continuity data, and
-		// PartState is a private app-visible state marker (runtime's
-		// adkApprovalBinding uses it as a CAS record on the same message as
-		// the public content it guards -- see runtime/adk_approval.go).
-		// Neither participates in the rich-vs-legacy family decision: both
-		// downstream projectors already treat PartState as ignorable by
-		// design (projectLegacyAgenticMessage's explicit case;
-		// DecodeContentParts's "legacy/unrecognized kinds are ignored"
+		// PartApprovalDecision is a private runtime CAS record (runtime's
+		// adkApprovalBinding uses it on the same message as the public
+		// content it guards -- see runtime/adk_approval.go). Neither
+		// participates in the rich-vs-legacy family decision: both are
+		// already ignored by design wherever content is decoded
+		// (DecodeContentParts's "unrecognized kinds are ignored"
 		// fallthrough, which projectRichAgenticMessage relies on), so
-		// counting it here as "legacy" would wrongly reject an otherwise
-		// all-rich message as mixed-kind.
-		if part.Kind == session.PartProviderState || part.Kind == session.PartState {
+		// counting either here as "legacy" would wrongly reject an
+		// otherwise all-rich message as mixed-kind.
+		if part.Kind == session.PartProviderState || part.Kind == session.PartApprovalDecision {
 			continue
 		}
 		if isRichContentPart(part) {
@@ -238,9 +237,9 @@ func agenticRoleFromSessionRole(role session.Role) (einoschema.AgenticRoleType, 
 	}
 }
 
-// legacyTextContentBlock projects a legacy PartText/PartCompaction payload
-// into the agentic text block appropriate for role: assistant messages
-// become assistant_gen_text, everything else (user, system) becomes
+// legacyTextContentBlock projects a legacy PartCompaction payload into the
+// agentic text block appropriate for role: assistant messages become
+// assistant_gen_text, everything else (user, system) becomes
 // user_input_text.
 func legacyTextContentBlock(role session.Role, text string) *einoschema.ContentBlock {
 	if role == session.RoleAssistant {
@@ -249,6 +248,12 @@ func legacyTextContentBlock(role session.Role, text string) *einoschema.ContentB
 	return &einoschema.ContentBlock{Type: einoschema.ContentBlockTypeUserInputText, UserInputText: &einoschema.UserInputText{Text: text}}
 }
 
+// projectLegacyAgenticMessage projects a message whose parts carry none of
+// the durable BlockKind-backed content family: today that is exactly
+// PartCompaction (compaction summary/tail messages) and a PartReasoning part
+// whose payload is the legacy free-text shape rather than the rich
+// BlockKindReasoning envelope (see hasContentSchemaField/isRichContentPart).
+// A RoleTool message never carries either kind, so it always projects empty.
 func projectLegacyAgenticMessage(message session.Message, parts []session.Part, options Options) ([]*einoschema.AgenticMessage, error) {
 	switch message.Role {
 	case session.RoleSystem, session.RoleUser, session.RoleAssistant:
@@ -257,10 +262,9 @@ func projectLegacyAgenticMessage(message session.Message, parts []session.Part, 
 			return nil, err
 		}
 		primary := &einoschema.AgenticMessage{Role: agenticRole}
-		var toolResultParts []session.Part
 		for _, part := range parts {
 			switch part.Kind {
-			case session.PartText, session.PartCompaction:
+			case session.PartCompaction:
 				text, err := partText(part)
 				if err != nil {
 					return nil, err
@@ -278,63 +282,12 @@ func projectLegacyAgenticMessage(message session.Message, parts []session.Part, 
 					Type:      einoschema.ContentBlockTypeReasoning,
 					Reasoning: &einoschema.Reasoning{Text: text},
 				})
-			case session.PartToolCall:
-				toolCall, err := decodeToolCall(part.Payload)
-				if err != nil {
-					return nil, err
-				}
-				primary.ContentBlocks = append(primary.ContentBlocks, &einoschema.ContentBlock{
-					Type: einoschema.ContentBlockTypeFunctionToolCall,
-					FunctionToolCall: &einoschema.FunctionToolCall{
-						CallID: toolCall.ID, Name: toolCall.Function.Name, Arguments: toolCall.Function.Arguments,
-					},
-				})
-			case session.PartToolResult:
-				toolResultParts = append(toolResultParts, part)
-			case session.PartState, session.PartStep, session.PartFile, session.PartProviderState:
-				// ignored by design
 			}
 		}
-		result := []*einoschema.AgenticMessage{primary}
-		toolMessages, err := legacyToolResultMessages(toolResultParts)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, toolMessages...)
-		return result, nil
+		return []*einoschema.AgenticMessage{primary}, nil
 	case session.RoleTool:
-		return legacyToolResultMessages(parts)
+		return nil, nil
 	default:
 		return nil, fmt.Errorf("unsupported session role %q", message.Role)
 	}
-}
-
-// legacyToolResultMessages converts every PartToolResult part into its own
-// user-role agentic message carrying a single function_tool_result text
-// block, rendered exactly as the classic projector's decodeToolResult would.
-func legacyToolResultMessages(parts []session.Part) ([]*einoschema.AgenticMessage, error) {
-	var result []*einoschema.AgenticMessage
-	for _, part := range parts {
-		if part.Kind != session.PartToolResult {
-			continue
-		}
-		toolCallID, content, err := decodeToolResult(part.Payload)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, &einoschema.AgenticMessage{
-			Role: einoschema.AgenticRoleTypeUser,
-			ContentBlocks: []*einoschema.ContentBlock{{
-				Type: einoschema.ContentBlockTypeFunctionToolResult,
-				FunctionToolResult: &einoschema.FunctionToolResult{
-					CallID: toolCallID,
-					Content: []*einoschema.FunctionToolResultContentBlock{{
-						Type: einoschema.FunctionToolResultContentBlockTypeText,
-						Text: &einoschema.UserInputText{Text: content},
-					}},
-				},
-			}},
-		})
-	}
-	return result, nil
 }

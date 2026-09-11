@@ -653,9 +653,9 @@ func testContentMixedMessage(t *testing.T, factory Factory) {
 }
 
 // testContentObservationTextOnly asserts that ReadObservationSnapshot surfaces
-// text only from PartText (legacy), PartUserInputText, and
-// PartAssistantGenText parts; reasoning, media, and function-call blocks in
-// the very same messages must never contribute to observation text.
+// text only from PartUserInputText and PartAssistantGenText parts; reasoning,
+// media, and function-call blocks in the very same messages must never
+// contribute to observation text.
 func testContentObservationTextOnly(t *testing.T, factory Factory) {
 	subject := setup(t, factory)
 	reader, ok := subject.Store.(session.ObservationReader)
@@ -687,15 +687,6 @@ func testContentObservationTextOnly(t *testing.T, factory Factory) {
 	}}
 	appendContentMessage(t, ctx, execution, sessionID, runID, "a1", session.RoleAssistant, assistantMsg)
 
-	// A legacy PartText message must remain visible for backward compatibility
-	// during the W2-to-W5 cutover.
-	legacyMsg := message("legacy1", sessionID, runID, session.RoleUser)
-	appendMessage(t, ctx, execution, legacyMsg)
-	appendPart(t, ctx, execution, session.Part{
-		ID: "legacy1-p1", MessageID: legacyMsg.ID, SessionID: sessionID, RunID: runID,
-		Kind: session.PartText, Ordinal: 0, Payload: json.RawMessage(`{"text":"legacy hello"}`),
-	})
-
 	limits := session.ObservationLimits{MaxMessages: 10, MaxTools: 10, MaxParts: 10, MaxSnapshotBytes: 64000, MaxTextBytes: 1000}
 	snapshot, err := reader.ReadObservationSnapshot(ctx, sessionID, limits)
 	if err != nil {
@@ -710,9 +701,6 @@ func testContentObservationTextOnly(t *testing.T, factory Factory) {
 	}
 	if texts["a1"] != "sure thing" {
 		t.Fatalf("a1 observation text = %q, want %q", texts["a1"], "sure thing")
-	}
-	if texts["legacy1"] != "legacy hello" {
-		t.Fatalf("legacy1 observation text = %q, want %q", texts["legacy1"], "legacy hello")
 	}
 	raw, err := json.Marshal(snapshot)
 	if err != nil {

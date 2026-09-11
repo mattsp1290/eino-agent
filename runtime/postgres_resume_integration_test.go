@@ -57,8 +57,8 @@ func testPostgresRuntimeResume(t *testing.T, server *testpostgres.Server) {
 	}
 	if _, err := oldExecution.AppendPart(f.ctx, session.Part{
 		ID: "postgres-resume-user-part", MessageID: userMessage.ID,
-		SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Ordinal: 0,
-		Payload:   json.RawMessage(`{"text":"original history"}`),
+		SessionID: run.SessionID, RunID: run.ID, Kind: session.PartUserInputText, Ordinal: 0,
+		Payload:   json.RawMessage(`{"text":{"text":"original history"}}`),
 		CreatedAt: userMessage.CreatedAt, UpdatedAt: userMessage.UpdatedAt,
 	}); err != nil {
 		t.Fatalf("append user part: %v", err)
@@ -262,7 +262,7 @@ func assertPostgresRuntimeHistory(t *testing.T, ctx context.Context, store sessi
 	if len(batch.Messages) != 3 || batch.Messages[0].ID != "postgres-resume-user" || batch.Messages[1].ID != "postgres-resume-assistant" || batch.Messages[2].ID != call.ResultMessageID {
 		t.Fatal("replay messages do not contain original history plus one tool result")
 	}
-	if len(batch.Parts) != 3 || batch.Parts[0].ID != "postgres-resume-user-part" || string(batch.Parts[0].Payload) != `{"text":"original history"}` || batch.Parts[1].ID != call.RequestPartID {
+	if len(batch.Parts) != 3 || batch.Parts[0].ID != "postgres-resume-user-part" || string(batch.Parts[0].Payload) != `{"text":{"text":"original history"}}` || batch.Parts[1].ID != call.RequestPartID {
 		t.Fatal("replayed parts do not contain committed history and request")
 	}
 	var results []session.Part

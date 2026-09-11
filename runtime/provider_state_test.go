@@ -128,17 +128,24 @@ func TestLoadProviderHistoryRejectsActiveCorruptionBeforeDispatch(t *testing.T) 
 
 func TestLoadProviderHistoryIgnoresMalformedInactiveCompactedState(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	tailParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "tail-block", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "tail"}}},
+	}, func() session.PartID { return "tail-text" }, "tail", "session", "tail-run", now.Add(time.Second), session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			{ID: "old", SessionID: "session", RunID: "old-run", Role: session.RoleAssistant, ModelID: "test", CreatedAt: now},
 			{ID: "tail", SessionID: "session", RunID: "tail-run", Role: session.RoleUser, CreatedAt: now.Add(time.Second)},
 			{ID: "summary", SessionID: "session", RunID: "summary-run", Role: session.RoleSystem, CreatedAt: now.Add(2 * time.Second)},
 		},
-		Parts: []session.Part{
+		Parts: append([]session.Part{
 			{ID: "bad-state", MessageID: "old", SessionID: "session", RunID: "old-run", Kind: session.PartProviderState, Payload: json.RawMessage(`STATE_SENTINEL malformed`)},
-			{ID: "tail-text", MessageID: "tail", SessionID: "session", RunID: "tail-run", Kind: session.PartText, Payload: json.RawMessage(`{"text":"tail"}`)},
-			{ID: "summary-text", MessageID: "summary", SessionID: "session", RunID: "summary-run", Kind: session.PartCompaction, Payload: json.RawMessage(`{"text":"summary","epoch_id":"epoch","redacted":true}`)},
-		},
+		}, append(tailParts,
+			session.Part{ID: "summary-text", MessageID: "summary", SessionID: "session", RunID: "summary-run", Kind: session.PartCompaction, Payload: json.RawMessage(`{"text":"summary","epoch_id":"epoch","redacted":true}`)},
+		)...),
 		PartOwnerMessageIDs: []session.MessageID{"old", "tail", "summary"},
 	}
 	ordinary := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil })}

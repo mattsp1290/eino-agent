@@ -28,7 +28,7 @@ func testPendingToolReopen(t *testing.T, server *testpostgres.Server) {
 	mustExec(t, db, `UPDATE public.messages SET record=$1`, []byte(`{"ID":"future-user","ParentID":"missing-message"}`))
 	insertPGModelRequest(t, db, "model-request", 1, 2, "future-assistant", 0, 0)
 	insertPGMessage(t, db, 5, "request", 1, 2, "assistant")
-	insertPGPart(t, db, 6, "request-part", 5, 1, 2, 0, "tool_call")
+	insertPGPart(t, db, 6, "request-part", 5, 1, 2, 0, "function_tool_call")
 	insertPGTool(t, db, 7, "tool", 1, 2, 5, 6, "pending")
 	insertPGEvent(t, db, "pending", 1, 2, 7, "tool_pending", "pending")
 	insertPGEvent(t, db, "optional", 1, 2, nil, "custom", nil)
@@ -59,7 +59,7 @@ func testPendingToolReopen(t *testing.T, server *testpostgres.Server) {
 	}
 	// Settlement materializes the exact reserved outputs before the terminal row/event.
 	insertPGMessage(t, db, 8, "future-message", 1, 2, "tool")
-	insertPGPart(t, db, 9, "future-part", 8, 1, 2, 0, "tool_result")
+	insertPGPart(t, db, 9, "future-part", 8, 1, 2, 0, "function_tool_result")
 	mustExec(t, db, `UPDATE public.tool_calls SET status='completed'`)
 	insertPGEvent(t, db, "terminal", 1, 2, 7, "tool_completed", "terminal")
 	if got := queryStrings(t, db, `SELECT m.id FROM public.tool_calls t JOIN public.messages m ON m.id=t.result_message_id JOIN public.parts p ON p.id=t.result_part_id AND p.message_key=m.row_key WHERE t.status='completed'`); !reflect.DeepEqual(got, []string{"future-message"}) {
@@ -96,7 +96,7 @@ func testLargeIdentityIndexes(t *testing.T, server *testpostgres.Server) {
 		insertPGRun(t, db, key, ids["runs"], key, "pending")
 		mustExec(t, db, `INSERT INTO public.context_epochs(row_key,id,session_key,record,created_at,closed_at) VALUES($1,$2,$3,'{}'::bytea,$4,'')`, key, []byte(ids["context_epochs"]), key, pgTime)
 		insertPGMessage(t, db, key, ids["messages"], key, key, "assistant")
-		insertPGPart(t, db, key, ids["parts"], key, key, key, 0, "tool_call")
+		insertPGPart(t, db, key, ids["parts"], key, key, key, 0, "function_tool_call")
 		insertPGTool(t, db, key, ids["tool_calls"], key, key, key, key, "pending")
 		insertPGModelRequest(t, db, ids["model_requests"], key, key, string(incompressibleBytes(size, uint32(77+n))), 0, 0)
 		insertPGEvent(t, db, ids["events"], key, key, nil, "arbitrary\x00kind", nil)

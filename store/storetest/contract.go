@@ -865,6 +865,11 @@ func message(id session.MessageID, sessionID session.ID, runID session.RunID, ro
 	}
 }
 
+// part builds a generic, content-agnostic durable part for ordering and
+// pagination tests that do not exercise content decoding. It uses
+// PartProviderState because that kind is always ignored by every history
+// projection and by DecodeContentParts, so an arbitrary payload never needs
+// to satisfy any decode contract.
 func part(id session.PartID, messageID session.MessageID, sessionID session.ID, runID session.RunID, ordinal int64) session.Part {
 	now := time.Now().UTC()
 	return session.Part{
@@ -872,7 +877,7 @@ func part(id session.PartID, messageID session.MessageID, sessionID session.ID, 
 		MessageID: messageID,
 		SessionID: sessionID,
 		RunID:     runID,
-		Kind:      session.PartText,
+		Kind:      session.PartProviderState,
 		Ordinal:   ordinal,
 		Payload:   []byte(`{"text":"part"}`),
 		CreatedAt: now,

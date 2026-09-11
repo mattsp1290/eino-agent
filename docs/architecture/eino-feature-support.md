@@ -170,9 +170,17 @@ Status: landed (commits 0574474, 3865683, 5b2922f); dual review applied.
   Media-only submissions are admitted and a session that started with media
   continues on later turns.
 
-Superseded part kinds (`text`, `tool_call`, `tool_result`, `file`, `step`,
-`state`) remain declared until the runtime cutover replaces the assistant
-persistence path in W3/W5.
+The superseded classic part kinds (`text`, `tool_call`, `tool_result`,
+`file`, `step`, `state`) are removed (W5 phase 2, commit history at HEAD):
+the typed ADK engine (W5) writes only the 20 block kinds plus
+`response_meta`/`compaction`/`provider_state`; both SQL baselines' `kind`
+CHECK constraints were edited in place (no new migration) and schema
+fingerprints regenerated. `runtime.adk_approval`'s decision-CAS record moved
+off the removed `state` kind onto a new dedicated `PartApprovalDecision`
+("approval_decision") kind rather than reusing `provider_state`, since
+`runtime.loadProviderHistory` strictly decodes every `provider_state` part on
+an active message as a `ProviderStateItem` envelope and would fail closed on
+the CAS record's unrelated payload shape.
 
 ## W3: agentic model boundary
 
@@ -683,9 +691,11 @@ unwritten (see that bullet for the exact, now-shorter list).
   reconstructs the continuation from committed history like any other fact,
   so the binding carries no private transcript/input blob at all, only a
   minimal decision-CAS record (`{Type, ApprovalRequestID, Status, Decision}`)
-  in a `session.PartState` part, read-then-updated once under the run fence
-  and an in-process mutex on resume -- the same accepted simplification the
-  W1 finding already flagged (a true store-level conditional update was not
+  in a `session.PartState` part (now `session.PartApprovalDecision` -- see
+  the W2 section's "superseded part kinds" note), read-then-updated once
+  under the run fence and an in-process mutex on resume -- the same accepted
+  simplification the W1 finding already flagged (a true store-level
+  conditional update was not
   added; the run fence's CAS in `ClaimRun` already guarantees only one
   process holds the fence at a time, so this is safe against concurrent
   resumes, just not a defense against a bug inside one process resuming the
@@ -712,11 +722,12 @@ unwritten (see that bullet for the exact, now-shorter list).
   these production tests to pass surfaced and fixed three real bugs no
   fixture-level test had caught: (1) `session/history/agentic_projection.go`'s
   rich-vs-legacy content-family dispatcher counted a message's private
-  `PartState` CAS part as "legacy" content, so any durable reload of a
-  message carrying both an approval request and ordinary rich content
-  (`ErrMixedContentKinds`) failed -- fixed by excluding `PartState` from the
-  count, matching how both downstream projectors already treated it as
-  ignorable by design. (2) `adkApprovalBinding.commitResponse` built its
+  `PartState` CAS part (now `PartApprovalDecision`) as "legacy" content, so
+  any durable reload of a message carrying both an approval request and
+  ordinary rich content (`ErrMixedContentKinds`) failed -- fixed by
+  excluding it from the count, matching how both downstream projectors
+  already treated it as ignorable by design. (2)
+  `adkApprovalBinding.commitResponse` built its
   committed `MCPToolApprovalResponse` content block without ever assigning
   it a block ID (`ContentBlock.Validate` rejects an empty ID), so a decided
   resume's continuation dispatch always failed content validation -- fixed
@@ -1617,4 +1628,7 @@ unwritten (see that bullet for the exact, now-shorter list).
   `settleInterruptedRunningTool` helper that test exercises, so no
   dedicated new-engine-specific test was added.
 - Out of scope, not started: child agents (typed `AgentTool`/`DeepAgent`),
-  removing the superseded classic `PartKind`s, W6/W7.
+  W6/W7. The superseded classic `PartKind`s were removed in W5 phase 2 (see
+  the W2 section's "superseded part kinds" note); a WIT/bindings reference
+  to those kinds' string values was not found in `wit/eino-agent-extensions.wit`
+  or `wasmext/gen`, so no W6 follow-up was required for this removal.

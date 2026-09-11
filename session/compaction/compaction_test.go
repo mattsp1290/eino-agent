@@ -36,10 +36,10 @@ func TestBoundaryProjectsSummaryWithoutRawPromptLeak(t *testing.T) {
 			message("tail", session.RoleUser, now.Add(time.Second)),
 		},
 		Parts: []session.Part{
-			part("old-part", "old", session.PartText, `{"text":"SECRET raw prompt"}`, now),
+			part("old-part", "old", session.PartProviderState, `{"text":"SECRET raw prompt"}`, now),
 			part("old-provider-state", "old-assistant", session.PartProviderState, `{"data":"SECRET provider state"}`, now.Add(time.Nanosecond)),
 			boundary.Part,
-			part("tail-part", "tail", session.PartText, `{"text":"Continue"}`, now.Add(time.Second)),
+			textContentPart(t, "tail-part", "tail", "Continue", now.Add(time.Second)),
 		},
 	}, history.Options{Epoch: &session.ContextEpoch{
 		SummaryMessageID: boundary.Message.ID,
@@ -108,6 +108,21 @@ func message(id session.MessageID, role session.Role, now time.Time) session.Mes
 
 func part(id session.PartID, messageID session.MessageID, kind session.PartKind, payload string, now time.Time) session.Part {
 	return session.Part{ID: id, MessageID: messageID, SessionID: "session-1", RunID: "run-1", Kind: kind, Payload: json.RawMessage(payload), CreatedAt: now, UpdatedAt: now}
+}
+
+// textContentPart builds a single durable user_input_text part carrying
+// text, using the real EncodeContentParts wire format (rather than a
+// hand-written envelope) so classic history projection can decode it.
+func textContentPart(t *testing.T, id session.PartID, messageID session.MessageID, text string, now time.Time) session.Part {
+	t.Helper()
+	content := session.Content{Role: session.RoleUser, Blocks: []session.ContentBlock{
+		{ID: "b1", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: text}},
+	}}
+	parts, err := session.EncodeContentParts(content, func() session.PartID { return id }, messageID, "session-1", "run-1", now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("EncodeContentParts: %v", err)
+	}
+	return parts[0]
 }
 
 type boundaryStore struct {

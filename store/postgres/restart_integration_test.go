@@ -71,14 +71,14 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 	}
 	if _, err := execution.AppendPart(ctx, session.Part{
 		ID: "restart-user-part", MessageID: user.ID, SessionID: sessionID, RunID: runID,
-		Kind: session.PartText, Ordinal: 0, Payload: json.RawMessage(`{"text":"restart history"}`),
+		Kind: session.PartUserInputText, Ordinal: 0, Payload: json.RawMessage(`{"text":{"text":"restart history"}}`),
 		CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
 	}); err != nil {
 		t.Fatalf("append user part: %v", err)
 	}
 	if _, err := execution.AppendPart(ctx, session.Part{
 		ID: "restart-assistant-part", MessageID: assistant.ID, SessionID: sessionID, RunID: runID,
-		Kind: session.PartText, Ordinal: 0, Payload: json.RawMessage(`{"text":"committed answer"}`),
+		Kind: session.PartAssistantGenText, Ordinal: 0, Payload: json.RawMessage(`{"text":{"text":"committed answer"}}`),
 		CreatedAt: assistant.CreatedAt, UpdatedAt: assistant.UpdatedAt,
 	}); err != nil {
 		t.Fatalf("append assistant part: %v", err)

@@ -138,7 +138,7 @@ func TestPostgresConsumer(t *testing.T) {
 	if _, err := ex.AppendMessage(ctx, message); err != nil {
 		t.Fatal(err)
 	}
-	part := session.Part{ID: "consumer-text", MessageID: message.ID, SessionID: sid, RunID: rid, Kind: session.PartText, Payload: json.RawMessage(`{"text":"hello consumer"}`), CreatedAt: at, UpdatedAt: at}
+	part := session.Part{ID: "consumer-text", MessageID: message.ID, SessionID: sid, RunID: rid, Kind: session.PartUserInputText, Payload: json.RawMessage(`{"text":{"text":"hello consumer"}}`), CreatedAt: at, UpdatedAt: at}
 	if _, err := ex.AppendPart(ctx, part); err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func assertConsumerReplay(t *testing.T, ctx context.Context, store session.Store
 		t.Fatalf("run replay = %+v, err=%v", run, err)
 	}
 	messages, err := store.ListMessages(ctx, sid, session.ReplayCursor{})
-	if err != nil || len(messages.Messages) != 1 || len(messages.Parts) != 1 || messages.Messages[0].ID != "consumer-message" || string(messages.Parts[0].Payload) != `{"text":"hello consumer"}` {
+	if err != nil || len(messages.Messages) != 1 || len(messages.Parts) != 1 || messages.Messages[0].ID != "consumer-message" || string(messages.Parts[0].Payload) != `{"text":{"text":"hello consumer"}}` {
 		t.Fatalf("message replay = %+v, err=%v", messages, err)
 	}
 	events, err := store.ListEvents(ctx, sid, session.EventCursor{})

@@ -48,7 +48,7 @@ func testObservationConsistency(t *testing.T, server *testpostgres.Server) {
 			hooked = true
 			hookErr = writer.WithinTx(f.ctx, func(ctx context.Context, tx session.Store) error {
 				execution := tx.Execution(fence)
-				part := session.Part{ID: "reader-text", MessageID: message.ID, SessionID: message.SessionID, RunID: message.RunID, Kind: session.PartText, Payload: json.RawMessage(`{"text":"hooked"}`), CreatedAt: f.now, UpdatedAt: f.now}
+				part := session.Part{ID: "reader-text", MessageID: message.ID, SessionID: message.SessionID, RunID: message.RunID, Kind: session.PartAssistantGenText, Payload: json.RawMessage(`{"text":{"text":"hooked"}}`), CreatedAt: f.now, UpdatedAt: f.now}
 				if _, err := execution.AppendPart(ctx, part); err != nil {
 					return err
 				}

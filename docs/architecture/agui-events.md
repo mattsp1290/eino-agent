@@ -46,17 +46,17 @@ and never replayed.
 | Family | Persisted durable fact | Replay behavior | Live-tail behavior | Omitted |
 | --- | --- | --- | --- | --- |
 | Run lifecycle | `session.EventRecord` audit with run status metadata. | Not replayed as raw `RUN_STARTED`/`RUN_FINISHED`; replay exposes current run/message state. | Emit live through `eino-agui/emitter`. | None, except transport-only write failures. |
-| Text | Settled `session.Part{Kind: PartText}` on assistant message. | Replay as AG-UI assistant message content projected from durable parts. | Emit `TEXT_MESSAGE_*` deltas live. | Empty deltas. |
+| Text | Settled `session.Part{Kind: PartAssistantGenText}` on assistant message. | Replay as AG-UI assistant message content projected from durable parts. | Emit `TEXT_MESSAGE_*` deltas live. | Empty deltas. |
 | Plain reasoning | `session.Part{Kind: PartReasoning}` only when provider and host policy allow storage. | Replay as reasoning content only from durable reasoning parts. | Emit `REASONING_*` live while allowed. | Provider-private or policy-denied reasoning. |
 | Encrypted reasoning | Never persisted. | Never replayed. | Not emitted by `eino-agent`; scrub from snapshots. | All encrypted reasoning payloads. |
 | Provider-private state | Never persisted as an AG-UI event; runtime may retain a private `PartProviderState`. | Never replayed or decoded by AG-UI. | Never emitted. | All raw bytes, base64, digests, codec diagnostics, and source bindings. |
 | Tool calls | `session.ToolCall` plus one canonical `EventRecord` for each pending, running, and terminal phase; state and event commit atomically. | Replay call state from durable tool-call records, parts, and correlated phase events. | After commit, publish the exact persisted event best-effort when the bridge enables `eino-agui/stream.WithLiveToolCallEvents`. | Duplicate post-turn proposals when live tool calls were already emitted. |
-| Tool results | `PartToolResult` plus settled `session.ToolCall` output/error. | Replay bounded model-facing tool result from durable part. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
-| State snapshots | `PartState` only when host marks snapshot replay-safe. | Replay latest replay-safe snapshot or host-projected state. | Emit live snapshot when state changes. | Sensitive or non-replay-safe host state. |
+| Tool results | `PartFunctionToolResult` plus settled `session.ToolCall` output/error. | Replay bounded model-facing tool result from durable part. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
+| State snapshots | No durable `PartKind` today (would be host-visible app state, distinct from the W2 model-content block kinds); only when host marks snapshot replay-safe. | Replay latest replay-safe snapshot or host-projected state, once implemented. | Emit live snapshot when state changes. | Sensitive or non-replay-safe host state. |
 | State deltas | Optional `EventRecord` audit. | Do not replay raw deltas; replay starts from snapshot. | Emit live deltas. | Deltas superseded by snapshot. |
 | Messages snapshots | Not stored as raw AG-UI frames. | Reconstruct from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
 | Activity | Optional `EventRecord` audit metadata. | Not replayed as conversation content. | Emit live activity. | Transient activity with no audit value. |
-| Steps | `PartStep` plus `EventRecord` correlation. | Replay as annotations/status where UI supports it. | Emit live `STEP_*`. | None. |
+| Steps | No durable `PartKind` today; runtime tracks physical dispatch attempts via `session.EventRecord` (e.g. `AttemptReplacedEventKind`), not a message part. | Replay as annotations/status where UI supports it, once implemented. | Emit live `STEP_*`. | None. |
 | Custom events | Optional audit `EventRecord`. | Not replayed unless promoted to a future typed replay contract. | Emit live. | Unknown sensitive payloads by policy. |
 | Errors | `EventRecord` plus terminal run/message status. | Replay terminal status/error summary, not necessarily raw `RUN_ERROR`. | Emit live `RUN_ERROR` or related error event. | Provider/internal details redacted by policy. |
 

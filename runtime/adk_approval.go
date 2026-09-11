@@ -54,8 +54,8 @@ type adkApprovalState struct {
 	PartID            string
 }
 
-// adkApprovalPartType marks a session.PartState payload as this binding's
-// decision-CAS record.
+// adkApprovalPartType marks a session.PartApprovalDecision payload as
+// this binding's decision-CAS record.
 const adkApprovalPartType = "eino_agent_mcp_approval"
 
 // adkApprovalRecord is the durable CAS record guarding a one-time decision.
@@ -126,7 +126,7 @@ func (b *adkApprovalBinding) pause(ctx context.Context, m *adkModel, dispatch *a
 	payload := mustJSON(adkApprovalRecord{Type: adkApprovalPartType, ApprovalRequestID: request.ID, Status: "pending"})
 	if _, err := m.execution.store.AppendPart(ctx, session.Part{
 		ID: partID, MessageID: dispatch.messageID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
-		Kind: session.PartState, Ordinal: 1000, Payload: payload, CreatedAt: now, UpdatedAt: now,
+		Kind: session.PartApprovalDecision, Ordinal: 1000, Payload: payload, CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
 		return err
 	}
@@ -258,7 +258,7 @@ func (b *adkApprovalBinding) load(ctx context.Context, m *adkModel, messageID se
 			return adkApprovalRecord{}, session.Part{}, err
 		}
 		for _, part := range batch.Parts {
-			if part.ID != partID || part.MessageID != messageID || part.Kind != session.PartState {
+			if part.ID != partID || part.MessageID != messageID || part.Kind != session.PartApprovalDecision {
 				continue
 			}
 			var record adkApprovalRecord

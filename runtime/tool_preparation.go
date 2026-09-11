@@ -56,8 +56,7 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 	// list below: they are owned by store.CreateToolCall, which persists a
 	// tool call's request part atomically with its pending row (and, on the
 	// fenced execution store, a generic AppendPart of a function_tool_call
-	// or function_tool_result part is rejected outright, exactly like the
-	// legacy PartToolCall/PartToolResult kinds it replaces).
+	// or function_tool_result part is rejected outright).
 	parts := make([]session.Part, 0, len(contentParts)+len(providerStatePayloads))
 	for _, part := range contentParts {
 		if part.Kind != session.PartFunctionToolCall {

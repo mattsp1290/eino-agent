@@ -35,7 +35,7 @@ func TestBaselinePendingToolReopen(t *testing.T) {
 	execBaseline(t, db, `UPDATE messages SET record=?`, []byte(`{"ID":"future-user","ParentID":"missing-message"}`))
 	insertBaselineModelRequest(t, db, "model-request", 1, 2, "future-assistant", 0, 0)
 	insertBaselineMessage(t, db, 5, "request", 1, 2, "assistant")
-	insertBaselinePart(t, db, 6, "request-part", 5, 1, 2, 0, "tool_call")
+	insertBaselinePart(t, db, 6, "request-part", 5, 1, 2, 0, "function_tool_call")
 	insertBaselineTool(t, db, 7, "tool", 1, 2, 5, 6, "pending")
 	insertBaselineEvent(t, db, "pending", 1, 2, 7, "tool_pending", "pending")
 	insertBaselineEvent(t, db, "optional", 1, 2, nil, "custom", nil)
@@ -66,7 +66,7 @@ func TestBaselinePendingToolReopen(t *testing.T) {
 	}
 	// Settlement materializes the exact reserved outputs before the terminal row/event.
 	insertBaselineMessage(t, db, 8, "future-message", 1, 2, "tool")
-	insertBaselinePart(t, db, 9, "future-part", 8, 1, 2, 0, "tool_result")
+	insertBaselinePart(t, db, 9, "future-part", 8, 1, 2, 0, "function_tool_result")
 	execBaseline(t, db, `UPDATE tool_calls SET status='completed'`)
 	insertBaselineEvent(t, db, "terminal", 1, 2, 7, "tool_completed", "terminal")
 	if got := baselineStrings(t, db, `SELECT m.id FROM tool_calls t JOIN messages m ON m.id=t.result_message_id JOIN parts p ON p.id=t.result_part_id AND p.message_key=m.row_key WHERE t.status='completed'`); !reflect.DeepEqual(got, []string{"future-message"}) {
@@ -102,7 +102,7 @@ func TestBaselineLargeIdentityIndexes(t *testing.T) {
 		insertBaselineRun(t, db, key, ids["runs"], key, "pending")
 		execBaseline(t, db, `INSERT INTO context_epochs(row_key,id,session_key,record,created_at,closed_at) VALUES(?,?,?,x'7b7d',?,'')`, key, []byte(ids["context_epochs"]), key, baselineTime)
 		insertBaselineMessage(t, db, key, ids["messages"], key, key, "assistant")
-		insertBaselinePart(t, db, key, ids["parts"], key, key, key, 0, "tool_call")
+		insertBaselinePart(t, db, key, ids["parts"], key, key, key, 0, "function_tool_call")
 		insertBaselineTool(t, db, key, ids["tool_calls"], key, key, key, key, "pending")
 		insertBaselineModelRequest(t, db, ids["model_requests"], key, key, string(identityBytes(size, uint32(77+n))), 0, 0)
 		insertBaselineEvent(t, db, ids["events"], key, key, nil, "arbitrary\x00kind", nil)

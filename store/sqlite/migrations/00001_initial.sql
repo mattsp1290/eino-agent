@@ -59,7 +59,7 @@ CREATE TABLE parts (
   session_key INTEGER NOT NULL REFERENCES sessions(row_key),
   run_key INTEGER NOT NULL REFERENCES runs(row_key),
   ordinal INTEGER NOT NULL CHECK (typeof(ordinal) = 'integer'),
-  kind TEXT NOT NULL CHECK (kind IN ('text', 'reasoning', 'tool_call', 'tool_result', 'file', 'step', 'compaction', 'state', 'provider_state', 'user_input_text', 'user_input_image', 'user_input_audio', 'user_input_video', 'user_input_file', 'tool_search_result', 'assistant_gen_text', 'assistant_gen_image', 'assistant_gen_audio', 'assistant_gen_video', 'function_tool_call', 'function_tool_result', 'server_tool_call', 'server_tool_result', 'mcp_tool_call', 'mcp_tool_result', 'mcp_list_tools_result', 'mcp_tool_approval_request', 'mcp_tool_approval_response', 'response_meta')),
+  kind TEXT NOT NULL CHECK (kind IN ('reasoning', 'compaction', 'provider_state', 'approval_decision', 'user_input_text', 'user_input_image', 'user_input_audio', 'user_input_video', 'user_input_file', 'tool_search_result', 'assistant_gen_text', 'assistant_gen_image', 'assistant_gen_audio', 'assistant_gen_video', 'function_tool_call', 'function_tool_result', 'server_tool_call', 'server_tool_result', 'mcp_tool_call', 'mcp_tool_result', 'mcp_list_tools_result', 'mcp_tool_approval_request', 'mcp_tool_approval_response', 'response_meta')),
   display_text BLOB NOT NULL CHECK (typeof(display_text) = 'blob'),
   text_valid INTEGER NOT NULL CHECK (text_valid IN (0,1)),
   record BLOB NOT NULL CHECK (typeof(record) = 'blob'),

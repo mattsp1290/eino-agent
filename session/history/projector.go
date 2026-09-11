@@ -24,7 +24,6 @@ var ErrClassicUnsupported = errors.New("session history: classic projection does
 // Options controls durable history projection.
 type Options struct {
 	IncludeReasoning bool
-	IncludeState     bool
 	Epoch            *session.ContextEpoch
 	// ContentLimits bounds durable content decoding for the BlockKind-backed
 	// content family. The zero value means session.DefaultContentLimits().
@@ -109,24 +108,8 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 		var toolResultParts []session.Part
 		for _, part := range parts {
 			switch part.Kind {
-			case session.PartToolCall:
-				toolCall, err := decodeToolCall(part.Payload)
-				if err != nil {
-					return nil, err
-				}
-				projected.ToolCalls = append(projected.ToolCalls, toolCall)
-			case session.PartToolResult, session.PartFunctionToolResult:
+			case session.PartFunctionToolResult:
 				toolResultParts = append(toolResultParts, part)
-			case session.PartText:
-				text, err := partText(part)
-				if err != nil {
-					return nil, err
-				}
-				if useMultiContent {
-					projected.UserInputMultiContent = append(projected.UserInputMultiContent, textInputPart(text))
-				} else {
-					projected.Content += text
-				}
 			case session.PartReasoning:
 				if !options.IncludeReasoning {
 					continue
@@ -144,15 +127,6 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 					}
 					projected.Content += text
 				}
-			case session.PartState:
-				if !options.IncludeState {
-					continue
-				}
-				text, err := partText(part)
-				if err != nil {
-					return nil, err
-				}
-				projected.Content += text
 			case session.PartCompaction:
 				text, err := partText(part)
 				if err != nil {
@@ -163,7 +137,7 @@ func projectMessage(message session.Message, parts []session.Part, options Optio
 				} else {
 					projected.Content += text
 				}
-			case session.PartFile, session.PartStep, session.PartProviderState, session.PartResponseMeta:
+			case session.PartProviderState, session.PartApprovalDecision, session.PartResponseMeta:
 				// ignored by classic projection
 			case session.PartUserInputText, session.PartAssistantGenText:
 				text, err := classicTextEnvelopeText(part, limits)
@@ -247,12 +221,6 @@ func projectToolResults(parts []session.Part, limits session.ContentLimits) ([]*
 	result := []*einoschema.Message{}
 	for _, part := range parts {
 		switch part.Kind {
-		case session.PartToolResult:
-			toolCallID, content, err := decodeToolResult(part.Payload)
-			if err != nil {
-				return nil, err
-			}
-			result = append(result, einoschema.ToolMessage(content, toolCallID))
 		case session.PartFunctionToolResult:
 			toolCallID, content, err := classicFunctionToolResultEnvelope(part, limits)
 			if err != nil {
@@ -494,7 +462,7 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 
 func partText(part session.Part) (string, error) {
 	switch part.Kind {
-	case session.PartText, session.PartReasoning, session.PartState:
+	case session.PartReasoning:
 		payload, err := decodeCanonical[textPartPayload](part.Payload)
 		if err != nil {
 			return "", fmt.Errorf("part %s payload: %w", part.ID, err)
@@ -530,50 +498,6 @@ type compactionPartPayload struct {
 	Redacted         *bool             `json:"redacted"`
 }
 
-type toolResultPayload struct {
-	ToolCallID   string          `json:"tool_call_id"`
-	Status       string          `json:"status"`
-	Content      string          `json:"content,omitempty"`
-	Structured   json.RawMessage `json:"structured,omitempty"`
-	Truncated    bool            `json:"truncated,omitempty"`
-	OriginalSize int64           `json:"original_size,omitempty"`
-	InlineSize   int64           `json:"inline_size,omitempty"`
-	External     bool            `json:"external,omitempty"`
-	Redacted     bool            `json:"redacted,omitempty"`
-}
-
-func decodeToolResult(raw json.RawMessage) (string, string, error) {
-	output, err := decodeCanonical[toolResultPayload](raw)
-	if err != nil {
-		return "", "", err
-	}
-	if output.ToolCallID == "" {
-		return "", "", fmt.Errorf("tool_call_id required")
-	}
-	switch output.Status {
-	case "completed", "expected_failure", "operational_failure", "interrupted":
-	default:
-		return "", "", fmt.Errorf("unsupported tool result status %q", output.Status)
-	}
-	if len(output.Structured) > 0 && !json.Valid(output.Structured) {
-		return "", "", fmt.Errorf("structured must contain a JSON value")
-	}
-	content := output.Content
-	if content == "" && len(output.Structured) > 0 {
-		content = string(output.Structured)
-	}
-	if output.Status != "completed" {
-		status, _ := json.Marshal(map[string]any{
-			"status":    output.Status,
-			"content":   content,
-			"truncated": output.Truncated,
-			"redacted":  output.Redacted,
-		})
-		content = string(status)
-	}
-	return output.ToolCallID, content, nil
-}
-
 func decodeCanonical[T any](raw json.RawMessage) (T, error) {
 	var value T
 	trimmed := bytes.TrimSpace(raw)
@@ -593,30 +517,6 @@ func decodeCanonical[T any](raw json.RawMessage) (T, error) {
 		return value, err
 	}
 	return value, nil
-}
-
-type toolCallPayload struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-}
-
-func decodeToolCall(raw json.RawMessage) (einoschema.ToolCall, error) {
-	payload, err := decodeCanonical[toolCallPayload](raw)
-	if err != nil {
-		return einoschema.ToolCall{}, err
-	}
-	if payload.ID == "" || payload.Name == "" || len(payload.Arguments) == 0 {
-		return einoschema.ToolCall{}, fmt.Errorf("tool call id, name, and arguments required")
-	}
-	return einoschema.ToolCall{
-		ID:   payload.ID,
-		Type: "function",
-		Function: einoschema.FunctionCall{
-			Name:      payload.Name,
-			Arguments: string(payload.Arguments),
-		},
-	}, nil
 }
 
 func role(role session.Role) einoschema.RoleType {

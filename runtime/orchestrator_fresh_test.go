@@ -356,15 +356,14 @@ func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
-	_, _ = store.AppendPart(context.Background(), session.Part{
-		ID:        "prior-text",
-		MessageID: "prior-assistant",
-		SessionID: "session-1",
-		Kind:      session.PartText,
-		Payload:   []byte(`{"text":"previous"}`),
-		CreatedAt: now,
-		UpdatedAt: now,
-	})
+	priorAssistantParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "prior-block", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "previous"}}},
+	}, func() session.PartID { return "prior-text" }, "prior-assistant", "session-1", "", now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.AppendPart(context.Background(), priorAssistantParts[0])
 	var got []string
 	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {

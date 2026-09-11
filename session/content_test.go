@@ -948,8 +948,8 @@ func TestPartKindBlockKindBijection(t *testing.T) {
 			t.Fatalf("BlockKindForPart(%s) = (%s, %v), want (%s, true)", part, back, ok, k)
 		}
 	}
-	if _, ok := BlockKindForPart(PartText); ok {
-		t.Fatal("BlockKindForPart(PartText) should be false (legacy kind)")
+	if _, ok := BlockKindForPart(PartCompaction); ok {
+		t.Fatal("BlockKindForPart(PartCompaction) should be false (not block-shaped)")
 	}
 	if _, ok := BlockKindForPart(PartProviderState); ok {
 		t.Fatal("BlockKindForPart(PartProviderState) should be false")

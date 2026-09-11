@@ -54,7 +54,7 @@ fallback so its durable failure can settle without masking the original error.
 `runtime.ToolResultTransformPoint` runs after execution and before encoding or
 settlement. Transforms run in registration order, and each receives the value
 returned by its predecessor. The final result
-is used by durable output, the settled event, `PartToolResult`, and the next
+is used by durable output, the settled event, `PartFunctionToolResult`, and the next
 model-visible tool message. The executor error is informational and cannot be
 removed; a middleware error can turn a success into failure but cannot turn an
 executor failure into success.

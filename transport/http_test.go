@@ -230,7 +230,14 @@ func replayStore(t *testing.T) session.Store {
 	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
-	if _, err := execution.AppendPart(ctx, session.Part{ID: "part-http", MessageID: "msg-http", SessionID: "session-http", RunID: "run-http", Kind: session.PartText, Payload: []byte(`{"text":"hello"}`), CreatedAt: now, UpdatedAt: now}); err != nil {
+	httpParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "hello"}}},
+	}, func() session.PartID { return "part-http" }, "msg-http", "session-http", "run-http", now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.AppendPart(ctx, httpParts[0]); err != nil {
 		t.Fatalf("append part: %v", err)
 	}
 	events := []session.EventRecord{
