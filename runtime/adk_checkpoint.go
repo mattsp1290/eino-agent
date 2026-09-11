@@ -192,7 +192,11 @@ func (s *adkCheckpointStore) stage(ctx context.Context, checkPointID string, kin
 // matches by field name and type, not by concrete struct identity, so
 // encoding this shape produces bytes eino's own unmarshalTurnLoopCheckpoint
 // decodes correctly. Kept in exact sync with upstream's turnLoopCheckpoint;
-// verified by a checkpoint-shape round-trip test against a real TurnLoop.
+// verified by TestEmptyLoopCheckpointMatchesUpstreamGobShape
+// (runtime/w5_round3_test.go), which gob-decodes marshalEmptyLoopCheckpoint's
+// bytes into a field-identical mirror of upstream's private type -- gob
+// silently ignores fields it does not recognize, so this fails loudly on an
+// upstream rename instead of silently decoding to a zero struct.
 type turnLoopCheckpointShape struct {
 	RunnerCheckpoint []byte
 	HasRunnerState   bool

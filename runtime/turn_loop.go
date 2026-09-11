@@ -175,10 +175,6 @@ func (c *turnLoopCoordinator) claimItems(ids []session.InboxID) []session.InboxI
 // scans ListInbox (unbounded by state) since the inbox contract does not
 // expose a single-ID lookup; inbox lists are session-scoped and bounded by
 // normal conversational volume.
-// loadInboxItems fetches the durable content for a set of inbox IDs. It
-// scans ListInbox (unbounded by state) since the inbox contract does not
-// expose a single-ID lookup; inbox lists are session-scoped and bounded by
-// normal conversational volume.
 //
 // An ID whose durable state is not InboxQueued is silently dropped rather
 // than admitted a second time or treated as an error: this is the
@@ -296,7 +292,7 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	return engine, nil
 }
 
-func (c *turnLoopCoordinator) genInput(ctx context.Context, _ *adkTurnLoop, items []session.InboxID) (*adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage], error) {
+func (c *turnLoopCoordinator) genInput(ctx context.Context, loop *adkTurnLoop, items []session.InboxID) (*adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage], error) {
 	if len(items) == 0 {
 		return nil, errors.New("runtime: TurnLoop GenInput called with no buffered items")
 	}
@@ -340,6 +336,60 @@ func (c *turnLoopCoordinator) genInput(ctx context.Context, _ *adkTurnLoop, item
 	// (possibly empty) items still answers it -- but the sentinel stays in
 	// Consumed so TurnLoop's own item partition stays total.
 	filtered := c.claimItems(items)
+	// hadRealDuplicate is true only when this batch's emptiness came from
+	// claimItems' admittedItems dedup dropping an id already admitted by an
+	// earlier GenInput call in this coordinator's lifetime -- NOT from the
+	// unconditional sentinel filter (a batch that is only the first-turn
+	// sentinel legitimately empties filtered on a resumed coordinator's
+	// very first GenInput call, e.g. a between-turn stop landing before
+	// the run's first dispatch ever happened; that is the existing,
+	// correct admitTurn(ctx, nil) degenerate-turn path below, exercised by
+	// TestResumeRunAfterStopBeforeFirstDispatchAgainstSQLite, and must not
+	// be confused with a genuine duplicate delivery).
+	hadRealDuplicate := false
+	if len(filtered) == 0 {
+		for _, id := range items {
+			if id != firstTurnSentinelID {
+				hadRealDuplicate = true
+				break
+			}
+		}
+	}
+	if hadRealDuplicate {
+		// Every non-sentinel id in this batch was already admitted earlier
+		// in this coordinator's lifetime (claimItems's own dedup): a
+		// duplicate delivery that still split across two GenInput calls
+		// despite the push-before-Run ordering above (e.g. an idempotent
+		// Enqueue retry re-pushing an id already buffered/admitted). Do
+		// NOT call admitTurn: with no new content it would mint a
+		// content-free turn and TurnLoop would still dispatch the model a
+		// second time for content the earlier call already durably
+		// committed (SR-2/RD-1 "belt and braces", round-three
+		// reconciliation item 2).
+		//
+		// planTurn requires a non-nil Input from every GenInput call, so
+		// this cannot simply decline to run a turn -- but the run loop
+		// re-checks stopCtrl.isCommitted() immediately after this call
+		// returns and, when true, discards whatever this result says and
+		// pushes the ORIGINAL raw items back to the front of the buffer
+		// instead of ever calling PrepareAgent (see eino's
+		// adk/turn_loop.go run()). Stop the loop synchronously here so
+		// that happens: no dispatch occurs, and the pushed-back ids
+		// surface as a between-turn pause with queued input
+		// (finishTurnLoop's UnhandledItems branch), not a spurious
+		// dispatch. A later resume's drainQueuedInbox simply will not
+		// find these ids again once they are not InboxQueued anymore
+		// (already consumed by whichever call actually admitted them).
+		engine := c.currentEngine()
+		if engine == nil {
+			return nil, fmt.Errorf("%w: TurnLoop GenInput delivered only already-admitted items with no prior turn to fall back to", ErrInvalidOrchestrator)
+		}
+		loop.Stop(adk.WithStopCause("duplicate-delivery-noop"))
+		return &adk.GenInputResult[session.InboxID, *einoschema.AgenticMessage]{
+			Input:    &adk.TypedAgentInput[*einoschema.AgenticMessage]{Messages: engine.snapshot.Messages, EnableStreaming: true},
+			Consumed: items,
+		}, nil
+	}
 	engine, err := c.admitTurn(ctx, filtered)
 	if err != nil {
 		return nil, err
@@ -635,6 +685,23 @@ func (o *StreamingOrchestrator) liveLoopFor(runID session.RunID) *liveLoop {
 	return o.loops[runID]
 }
 
+// pushToLoop pushes id into runID's live loop while HOLDING the registry
+// lock, so the push can never be reordered past unregisterLoop (which takes
+// the same lock and runs strictly before finishTurnLoop seals the late
+// buffer -- see runTurnLoop's doc comment). A plain liveLoopFor-then-Push is
+// not enough: the calling goroutine can be preempted between the lookup and
+// the Push, and the Push then panics on a loop whose late buffer has
+// already been sealed by TakeLateItems (round-three reconciliation I1/
+// action item 1). Push with no options is non-blocking (buffer.TrySend /
+// appendLate), so holding the lock across it cannot deadlock.
+func (o *StreamingOrchestrator) pushToLoop(runID session.RunID, id session.InboxID) {
+	o.loopsMu.Lock()
+	defer o.loopsMu.Unlock()
+	if entry := o.loops[runID]; entry != nil {
+		entry.loop.Push(id)
+	}
+}
+
 // runTurnLoop drives one TurnLoop lifetime (fresh Start or ResumeRun) to
 // exit and applies the exit protocol. done receives exactly one Result and
 // pauseCh receives PauseInfo iff that Result is a durable pause; both
@@ -654,10 +721,20 @@ func (o *StreamingOrchestrator) prepareTurnLoop(coordinator *turnLoopCoordinator
 func (o *StreamingOrchestrator) runTurnLoop(ctx context.Context, entry *liveLoop, checkpoints *adkCheckpointStore, pushIDs []session.InboxID, done chan<- Result, pauseCh chan<- PauseInfo, beforeDone func(Result)) Result {
 	coordinator := entry.coordinator
 	loop := entry.loop
-	loop.Run(ctx)
+	// Pushed BEFORE Run, exactly like Start's own sentinel push
+	// (orchestrator.go): upstream buffers a pre-Run Push and
+	// tryLoadCheckpoint's buffer.TakeAll() merges it with the checkpoint's
+	// own UnhandledItems into ONE GenInput batch that claimItems can dedupe.
+	// Pushing after Run (the round-two shape) races that TakeAll: a losing
+	// push lands in a SECOND GenInput call whose items claimItems has
+	// already admitted, and genInput would otherwise still admit a
+	// content-free continuation turn that dispatches the model a second
+	// time for content already durably committed by the first call (SR-2/
+	// RD-1, round-three reconciliation item 2).
 	for _, id := range pushIDs {
 		loop.Push(id)
 	}
+	loop.Run(ctx)
 	// UntilIdleFor never touches a running or queued turn -- unlike
 	// WithGraceful/WithGracefulTimeout, which are CANCEL modes that
 	// interrupt the current turn at its next safe point -- so every pushed
@@ -1219,9 +1296,7 @@ func (o *StreamingOrchestrator) Enqueue(ctx context.Context, sessionID session.I
 	// loop would deliver it a second time (see claimItems's doc comment and
 	// TestDuplicateEnqueueIsIdempotentOnKey).
 	if created {
-		if entry := o.liveLoopFor(request.RunID); entry != nil {
-			entry.loop.Push(persisted.ID)
-		}
+		o.pushToLoop(request.RunID, persisted.ID)
 	}
 	return persisted, nil
 }
@@ -1342,6 +1417,17 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	if err != nil {
 		return nil, err
 	}
+	// Read the durable message floor here, unfenced and before ClaimRun,
+	// alongside drainQueuedInbox: this must NOT be deferred to
+	// nextDurableMessageTime's lazy-init path, whose first call would
+	// otherwise run this same non-transactional read (latestAdmissionMessageTime)
+	// from inside the approval decision's WithinTx-wrapped transaction (see
+	// adk_approval.go's prepare), a busy/deadlock hazard on SQLite and a
+	// snapshot-skew hazard in general.
+	latestMessageAt, err := latestAdmissionMessageTime(ctx, o.store, run.SessionID)
+	if err != nil {
+		return nil, err
+	}
 
 	// Only now take the fence: every check above that could reject this
 	// resume has already run against the still-paused run.
@@ -1351,19 +1437,24 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		return nil, err
 	}
 	execution := newRunExecution(o, plan, claimed)
-	// Seed the durable message floor the same way Start does (orchestrator.go),
-	// instead of leaving it to nextDurableMessageTime's lazy-init path: that
-	// path's first call reads the latest durable message time through the
-	// non-transactional host store (latestAdmissionMessageTime), and the
-	// approval decision path (adk_approval.go's prepare) is exactly the
-	// resume path -- its first nextDurableMessageTime call would otherwise
-	// run that non-transactional read from inside the new WithinTx-wrapped
-	// decision transaction, a busy/deadlock hazard on SQLite and a
-	// snapshot-skew hazard in general. o.now() at this point in ResumeRun is
-	// always at or after every message this run's session already
-	// committed (all in the past relative to this resume), so it is a safe
-	// floor with no store read at all.
-	execution.seedDurableMessageFloor(o.now())
+	// Seed the durable message floor at the LATER of o.now() and the real
+	// maximum already-committed message time (read above, before the
+	// claim). o.now() alone is not a safe floor: message timestamps are
+	// allocated forward in nanosecond steps from a turn's own now()
+	// (admitTurn, nextDurableMessageTime), so a session's committed
+	// messages routinely carry times after the now() they were derived
+	// from -- seeding at o.now() alone can hand the resumed execution
+	// timestamps that collide with, or precede, messages already
+	// committed (round-three reconciliation item 3, SR-3: reproduced as
+	// an approval response sorting before the assistant message that
+	// requested it). Taking the max keeps the "no non-transactional read
+	// inside WithinTx" property this seed exists for, with no regression
+	// in ordering.
+	floor := o.now()
+	if latestMessageAt.After(floor) {
+		floor = latestMessageAt
+	}
+	execution.seedDurableMessageFloor(floor)
 	// Best-effort: this is an observability record of the resume, not a
 	// correctness dependency of it. The claim above has already committed;
 	// failing ResumeRun here would strand the run running with no driver
