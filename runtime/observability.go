@@ -228,6 +228,7 @@ func (o *StreamingOrchestrator) startObservedToolCall(ctx context.Context, snaps
 		ToolName:    tool.Name,
 		ToolKind:    "server",
 		StartTime:   o.now(),
+		Metadata:    toolObservationMetadata(call, nil),
 	})
 }
 
@@ -266,7 +267,7 @@ func (o *StreamingOrchestrator) observeToolSettled(ctx context.Context, snapshot
 		LatencyKnown:   latency != 0,
 		Classification: classification,
 		Retryable:      false,
-		Metadata:       toolMetadata(metadata),
+		Metadata:       toolObservationMetadata(call, metadata),
 	}
 	if classification != "" {
 		event.Error = einoobs.ObservationError{
@@ -443,6 +444,21 @@ func toolMetadata(metadata map[string]string) einoobs.Metadata {
 	result := einoobs.Metadata{}
 	if value := metadata["permission_status"]; value != "" {
 		result["permission_status"] = value
+	}
+	return result
+}
+
+// toolObservationMetadata is toolMetadata plus call's provider-facing tool-
+// call id (session.ToolCall.ProviderCallID via runtime.ToolCall), when the
+// provider supplied one, as a bounded, content-free attribute: it carries
+// no tool input/output, only the identity string the provider itself sent,
+// so a failure observed here can be correlated against that provider's own
+// logs even though the durable ToolCallID this package reports everywhere
+// else is always the freshly minted id.
+func toolObservationMetadata(call ToolCall, metadata map[string]string) einoobs.Metadata {
+	result := toolMetadata(metadata)
+	if call.ProviderCallID != "" {
+		result["provider_call_id"] = call.ProviderCallID
 	}
 	return result
 }
