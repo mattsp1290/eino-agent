@@ -92,13 +92,20 @@ func isWriteLikeToolName(name string) bool {
 // tool list is always non-empty once their required backend is available
 // (filesystem always registers ls/read_file/..., plantask always registers
 // its task tools, skill always registers "skill", toolsearch always
-// registers its search tool) -- so a probe failure for one of these is a
-// real misconfiguration, not a recipe (like summarization) that legitimately
-// has no tools to discover in the first place. discoverHandlerTools fails
-// plan compilation closed for these Kinds instead of silently sealing zero
-// tools (see S2 in the W6 round-1 review).
+// registers its search tool, reduction always registers its own sealed
+// reduction_read_offload tool via toolAppendingMiddleware -- see
+// NewReductionHandlerFactoryWithTokenCounter) -- so a probe failure for one
+// of these is a real misconfiguration, not a recipe (like summarization)
+// that legitimately has no tools to discover in the first place.
+// discoverHandlerTools fails plan compilation closed for these Kinds
+// instead of silently sealing zero tools (see S2 in the W6 round-1 review,
+// and S1 in the round-three authority-regression review for reduction's
+// own addition here: without it, a failing reduction probe silently sealed
+// zero tools instead of failing plan compilation, and every turn then
+// failed at durableGuard instead of at compile time).
 var knownToolBearingHandlerKinds = map[string]bool{
 	HandlerKindFilesystem: true, HandlerKindPlanTask: true, HandlerKindSkill: true, HandlerKindToolSearch: true,
+	HandlerKindReduction: true,
 }
 
 // errHandlerDiscoveryFailed reports that compile-time tool discovery
