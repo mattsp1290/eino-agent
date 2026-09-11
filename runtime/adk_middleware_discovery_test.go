@@ -8,6 +8,7 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 	adkfilesystem "github.com/cloudwego/eino/adk/filesystem"
+	"github.com/cloudwego/eino/adk/middlewares/plantask"
 	einoschema "github.com/cloudwego/eino/schema"
 )
 
@@ -88,5 +89,33 @@ func TestHandlerProbeBuildContextNeverTouchesTheFilesystem(t *testing.T) {
 	// just a nil stub.
 	if err := build.PlanTaskBackend.Write(context.Background(), &adkfilesystem.WriteRequest{FilePath: "probe.json", Content: "{}"}); err != nil {
 		t.Fatalf("in-memory PlanTaskBackend.Write error = %v", err)
+	}
+}
+
+// TestIsWriteLikeToolNameClassifiesPlantaskCorrectly proves the round-two
+// W6 review's HA-S3/RW-S3 fix: plantask's TaskCreate/TaskUpdate -- which
+// genuinely change durable task state but contain none of the substring
+// heuristic's markers ("write", "edit", "execute", "shell", "delete") --
+// are now classified write-like via the explicit override table, while
+// its read-only TaskList/TaskGet (and the substring heuristic's ordinary
+// cases) are unaffected.
+func TestIsWriteLikeToolNameClassifiesPlantaskCorrectly(t *testing.T) {
+	cases := []struct {
+		name      string
+		writeLike bool
+	}{
+		{plantask.TaskCreateToolName, true},
+		{plantask.TaskUpdateToolName, true},
+		{plantask.TaskListToolName, false},
+		{plantask.TaskGetToolName, false},
+		{"write_file", true},
+		{"edit_file", true},
+		{"read_file", false},
+		{"ls", false},
+	}
+	for _, tc := range cases {
+		if got := isWriteLikeToolName(tc.name); got != tc.writeLike {
+			t.Errorf("isWriteLikeToolName(%q) = %v, want %v", tc.name, got, tc.writeLike)
+		}
 	}
 }

@@ -785,6 +785,22 @@ func (c *turnLoopCoordinator) onAgentEvents(ctx context.Context, _ *adk.TurnCont
 	if !engine.guardRan() {
 		return fmt.Errorf("%w: agent factory %T did not install the durable guard before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
 	}
+	// HA-S6 in the W6 round-two review: guardRan alone does not prove a
+	// factory wired DurableBaseline/SettlementSeal into its agent's real
+	// handler chain -- it only proves Guard was wired (both fields are
+	// independent AgentBuildContext values an AgentFactory could drop
+	// while still installing Guard and dispatching through build.Model).
+	// A dispatch that happened without either of these actually running
+	// means state.Messages was never seeded from durable history
+	// (DurableBaseline) and/or a settled result was never verified before
+	// the physical call (SettlementSeal) -- fail the turn rather than
+	// accept output produced under either gap.
+	if !engine.baselineRan() {
+		return fmt.Errorf("%w: agent factory %T did not install the durable baseline handler before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
+	}
+	if !engine.sealRan() {
+		return fmt.Errorf("%w: agent factory %T did not install the settlement seal before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
+	}
 	// A normally-completed turn (not interrupted, guard ran) that recorded
 	// zero durable model dispatches means the agent's real execution never
 	// routed a physical call through adkModel.begin at all -- the rogue-

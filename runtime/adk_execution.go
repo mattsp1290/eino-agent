@@ -118,6 +118,18 @@ type adkEngine struct {
 	// model instead of build.Model: BeforeAgent only inspects the agent's
 	// tool list, never its model -- see dispatches below for that case.
 	guard *durableGuard
+	// baseline/seal are this turn's durableBaselineHandler/settlementSeal
+	// instances (see AgentBuildContext.DurableBaseline/SettlementSeal),
+	// retained the same way guard is so onAgentEvents can post-hoc verify
+	// (baselineRan/sealRan) that a custom AgentFactory actually wired both
+	// into the real agent's handler chain, not just guard/Model -- see
+	// HA-S6 in the W6 round-two review: a factory that installs Guard and
+	// dispatches through build.Model but silently drops DurableBaseline/
+	// SettlementSeal from its own handler chain would otherwise pass both
+	// guardRan and dispatchCount>0 while never seeding durable history or
+	// verifying a settled result before dispatch.
+	baseline *durableBaselineHandler
+	seal     *settlementSeal
 	// dispatches counts this turn's durable model dispatches, incremented
 	// by adkModel.begin once a physical call's ledger row is durably
 	// committed. onAgentEvents checks it alongside guardRan after the
@@ -179,6 +191,28 @@ func (e *adkEngine) guardRan() bool {
 		return false
 	}
 	return e.guard.hasRun()
+}
+
+// baselineRan reports whether this turn's durableBaselineHandler actually
+// fired -- see adkEngine.baseline's doc comment and HA-S6 in the W6
+// round-two review. Complementary to guardRan/dispatchCount: it catches a
+// factory that dispatches through build.Model and wires Guard, satisfying
+// both of those, while silently never installing DurableBaseline into its
+// agent's real handler chain.
+func (e *adkEngine) baselineRan() bool {
+	if e == nil || e.baseline == nil {
+		return false
+	}
+	return e.baseline.hasRun()
+}
+
+// sealRan reports whether this turn's settlementSeal actually fired -- the
+// same complementary check as baselineRan, for AgentBuildContext.SettlementSeal.
+func (e *adkEngine) sealRan() bool {
+	if e == nil || e.seal == nil {
+		return false
+	}
+	return e.seal.hasRun()
 }
 
 // dispatchCount reports how many of this turn's model dispatches were
@@ -414,18 +448,22 @@ func (e *adkEngine) buildAgent(ctx context.Context, approval *adkApprovalBinding
 		durable[e.snapshot.ToolSearch.Name] = true
 	}
 	guard := newDurableGuard(durable)
+	seal := newSettlementSeal(e, authorized)
+	baseline := newDurableBaselineHandler(e)
 	build := AgentBuildContext{
 		Model: inner, Tools: tools, ToolAliases: aliases,
 		Instruction:     "",
 		MaxIterations:   e.host.toolTurns(),
 		Guard:           guard,
-		SettlementSeal:  newSettlementSeal(e, authorized),
-		DurableBaseline: newDurableBaselineHandler(e),
+		SettlementSeal:  seal,
+		DurableBaseline: baseline,
 		Handlers:        handlers,
 		Retry:           defaultRetryConfig(e.host.attempts()),
 		Failover:        buildFailoverConfig(e, approval, e.plan.FailoverPolicy()),
 	}
 	e.guard = guard
+	e.seal = seal
+	e.baseline = baseline
 	factory := e.plan.AgentFactory()
 	return factory.BuildAgent(ctx, build)
 }

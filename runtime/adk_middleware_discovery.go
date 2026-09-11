@@ -57,7 +57,26 @@ func handlerToolPermission(handlerID, name string) string {
 	return "handler:" + handlerID + ":" + name
 }
 
+// explicitWriteLikeTools names this package's own recipes' known tools
+// whose write-like status the substring heuristic below gets wrong -- a
+// converging finding from both round-one W6 reviewers (handler-authority
+// reviewer S3, recipes-and-wit reviewer S3): plantask's TaskCreate/
+// TaskUpdate genuinely change durable task state but contain none of
+// isWriteLikeToolName's substring markers ("write", "edit", "execute",
+// "shell", "delete"), so they were silently ungated even though a
+// deny-by-default permission policy is configured. Consulted first, for
+// exactness on tools this package actually knows about by name; every
+// other tool (including any third-party Kind's) still falls back to the
+// substring heuristic below.
+var explicitWriteLikeTools = map[string]bool{
+	plantask.TaskCreateToolName: true,
+	plantask.TaskUpdateToolName: true,
+}
+
 func isWriteLikeToolName(name string) bool {
+	if writeLike, known := explicitWriteLikeTools[name]; known {
+		return writeLike
+	}
 	lower := strings.ToLower(name)
 	for _, marker := range []string{"write", "edit", "execute", "shell", "delete"} {
 		if strings.Contains(lower, marker) {

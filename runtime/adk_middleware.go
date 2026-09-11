@@ -130,13 +130,27 @@ type HandlerFactory func(context.Context, HandlerBuildContext) (adk.TypedChatMod
 type durableBaselineHandler struct {
 	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
 	engine *adkEngine
+
+	mu  sync.Mutex
+	ran bool
 }
 
 func newDurableBaselineHandler(engine *adkEngine) *durableBaselineHandler {
 	return &durableBaselineHandler{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, engine: engine}
 }
 
+// hasRun reports whether BeforeModelRewriteState has fired at least once
+// for this instance -- see adkEngine.baselineRan's doc comment.
+func (h *durableBaselineHandler) hasRun() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.ran
+}
+
 func (h *durableBaselineHandler) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
+	h.mu.Lock()
+	h.ran = true
+	h.mu.Unlock()
 	// This is the mandatory FIRST handler, so its BeforeModelRewriteState is
 	// the start of a fresh ReAct cycle: clear any authorization a
 	// content-management recipe recorded last cycle before that recipe's
@@ -511,10 +525,21 @@ type settlementSeal struct {
 	*adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]
 	engine     *adkEngine
 	authorized *authorizedRewriteSet
+
+	mu  sync.Mutex
+	ran bool
 }
 
 func newSettlementSeal(engine *adkEngine, authorized *authorizedRewriteSet) *settlementSeal {
 	return &settlementSeal{TypedBaseChatModelAgentMiddleware: &adk.TypedBaseChatModelAgentMiddleware[*einoschema.AgenticMessage]{}, engine: engine, authorized: authorized}
+}
+
+// hasRun reports whether BeforeModelRewriteState has fired at least once
+// for this instance -- see adkEngine.sealRan's doc comment.
+func (s *settlementSeal) hasRun() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ran
 }
 
 // BeforeModelRewriteState is the early, non-authoritative check described in
@@ -524,6 +549,9 @@ func newSettlementSeal(engine *adkEngine, authorized *authorizedRewriteSet) *set
 // (e.engine.baselineMessages, computed this same cycle, before any host
 // handler ran).
 func (s *settlementSeal) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
+	s.mu.Lock()
+	s.ran = true
+	s.mu.Unlock()
 	if state == nil {
 		return ctx, state, nil
 	}
