@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net"
 	"runtime"
 	"strconv"
 	"strings"
@@ -138,7 +139,7 @@ func testMigrationDiscardAfterInterruptWithNoFurtherIOAvoidsMisleadingError(t *t
 	if !errors.Is(stopErr, cause) {
 		t.Fatalf("stop did not report the interrupt cause: %v", stopErr)
 	}
-	if stopErr != nil && strings.Contains(stopErr.Error(), "use of closed network connection") {
+	if errors.Is(stopErr, net.ErrClosed) {
 		t.Fatalf("stop reported a misleading transport error alongside the real cause: %v", stopErr)
 	}
 }
@@ -337,6 +338,27 @@ func (l gatedSessionLock) SessionLock(ctx context.Context, conn *sql.Conn) error
 	return l.SessionLocker.SessionLock(ctx, conn)
 }
 
+// nonOwnerDiscardFrame reports whether trace shows discardPGXConnection
+// being reached from a goroutine that does not own the *sql.Conn:
+// migrationContext.interrupt itself (if a future edit ever has it call
+// discardPGXConnection directly again), the parent-context watcher's
+// AfterFunc callback (newMigrationContext.func - interrupt's caller, so
+// this also catches a violation routed through a helper interrupt calls),
+// or - the shape that survived the first round of this check - any
+// time.AfterFunc-driven goroutine at all, which the Go runtime always shows
+// as time.goFunc regardless of what closure, method value, or
+// helper-returning-a-closure the timer was actually given. That last
+// pattern is what let a non-owner discard on the acquireTimeout/
+// cleanupTimeout timer path, wired through an intermediate helper so no
+// forbidden text appeared at the AfterFunc call site, pass both this
+// runtime check (when only installed in one subtest) and the static guard
+// in TestMigrationOwnershipGuard.
+func nonOwnerDiscardFrame(trace string) bool {
+	return strings.Contains(trace, "time.goFunc") ||
+		strings.Contains(trace, "newMigrationContext.func") ||
+		strings.Contains(trace, "migrationContext).interrupt")
+}
+
 // testCanceledMigrationOwnerRace forces the owning goroutine to issue SQL on
 // a bound *sql.Conn at the exact moment interrupt has just closed that
 // connection's transport, reproducing the interleaving behind
@@ -362,10 +384,14 @@ func (l gatedSessionLock) SessionLock(ctx context.Context, conn *sql.Conn) error
 // are not equally strong:
 //
 //  1. Deterministic, every iteration: discardObserved's hook below captures
-//     the calling goroutine's stack for every discardPGXConnection call and
-//     fails immediately if it was reached from migrationContext.interrupt
-//     or the parent-context watcher's AfterFunc callback, rather than from
-//     migrate's own goroutine. That is a property of who called
+//     the calling goroutine's stack for every discardPGXConnection call made
+//     while this hook is installed, and fails immediately if that call was
+//     reached from a non-owner goroutine - migrationContext.interrupt, the
+//     parent-context watcher's AfterFunc callback, or any time.AfterFunc-
+//     driven goroutine at all (nonOwnerDiscardFrame; the last of those also
+//     catches a non-owner discard routed through an intermediate helper, so
+//     no forbidden text appears at the AfterFunc call site itself) - rather
+//     than from migrate's own goroutine. That is a property of who called
 //     discardPGXConnection, not of timing, so it cannot pass by luck -
 //     confirmed by hand-reverting interrupt to discard directly and
 //     watching this assertion fail on iteration 0, both before and after
@@ -400,8 +426,7 @@ func testCanceledMigrationOwnerRace(t *testing.T, server *testpostgres.Server) {
 		}
 		buf := make([]byte, 16<<10)
 		trace := string(buf[:runtime.Stack(buf, false)])
-		if strings.Contains(trace, "migrationContext).interrupt") ||
-			strings.Contains(trace, "newMigrationContext.func") {
+		if nonOwnerDiscardFrame(trace) {
 			foreignDiscard.Store(true)
 			foreignStack.Store(&trace)
 		}

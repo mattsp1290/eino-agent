@@ -1,8 +1,10 @@
 package postgres
 
 import (
+	"bytes"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"os"
 	"strings"
@@ -22,7 +24,9 @@ import (
 // eino-agent-f3i during this fix's own review, more than once.
 //
 // This is the static half of the guard. It cannot see a violation routed
-// through an intermediate helper this list does not yet know about, or
+// through a helper this list does not yet resolve (afterFuncResolvedTexts
+// follows one level of indirection - a bare function value, a method value,
+// or a call to a function that returns a closure - but not further), or
 // catch every possible obfuscation - that is what
 // testCanceledMigrationOwnerRace's runtime.Stack-based assertion in
 // migration_lock_integration_test.go is for: it checks the actual calling
@@ -30,6 +34,7 @@ import (
 // text scan can be fooled past. Keep both; they catch different mutants.
 func TestMigrationOwnershipGuard(t *testing.T) {
 	files := packageGoFiles(t)
+	pkg := loadOwnershipPackage(t, files)
 
 	// 1. discardPGXConnection has exactly two call sites across every
 	// production .go file in this package: the owner-side choke point
@@ -40,7 +45,7 @@ func TestMigrationOwnershipGuard(t *testing.T) {
 	// reviewed against the ownership invariant before this count changes.
 	total := 0
 	for _, path := range files {
-		total += countCalls(t, path, "discardPGXConnection")
+		total += countCalls(pkg.file(path), "discardPGXConnection")
 	}
 	if got, want := total, 2; got != want {
 		t.Fatalf("discardPGXConnection has %d call sites across %v, want %d "+
@@ -53,10 +58,15 @@ func TestMigrationOwnershipGuard(t *testing.T) {
 	// 2. No argument passed to context.AfterFunc or time.AfterFunc anywhere
 	// in the package may reach into database/sql on a bound *sql.Conn: that
 	// callback always runs on a goroutine that does not own the connection.
-	// This covers a function literal's body, a bare function value, and a
-	// method value (for example time.AfterFunc(d, l.operation.discard)) -
-	// none of them require a call-shaped "(" to be dangerous, so the
-	// forbidden set below matches on the bare name.
+	// The forbidden set matches bare names, not just call-shaped "foo(":
+	// this text is produced by go/printer from a comment-free AST (see
+	// loadOwnershipPackage), so it can never be a doc comment or an inline
+	// comment that merely names one of these - only real, compiled code -
+	// and afterFuncResolvedTexts resolves a function literal's full body, a
+	// bare function value, a method value (time.AfterFunc(d,
+	// l.operation.discard)), or one level through a helper that returns a
+	// closure (time.AfterFunc(d, cleanupAbortFor(cleanup))), so none of
+	// those forms need a call-shaped "(" to be caught either.
 	forbidden := []string{
 		"discardPGXConnection", "sqlConn", ".Raw", ".Close",
 		".discard", ".Query", ".Exec", ".Ping",
@@ -71,8 +81,9 @@ func TestMigrationOwnershipGuard(t *testing.T) {
 		}
 	}
 	for _, path := range files {
-		for _, arg := range afterFuncArgTexts(t, path) {
-			check(path, "a context.AfterFunc/time.AfterFunc argument", arg)
+		for _, arg := range pkg.afterFuncResolvedTexts(path) {
+			check(path, "a context.AfterFunc/time.AfterFunc argument (or the "+
+				"function/closure it resolves to)", arg)
 		}
 	}
 
@@ -84,7 +95,7 @@ func TestMigrationOwnershipGuard(t *testing.T) {
 	// specifically so its own body can be held to the same forbidden set as
 	// an AfterFunc argument, with no special-casing for legitimate
 	// socket/sqlConn access - there is none left in interrupt's own text.
-	interruptBody := funcBody(t, "migration_context.go", "interrupt")
+	interruptBody := pkg.funcDeclText("interrupt")
 	if interruptBody == "" {
 		t.Fatal("migration_context.go: no interrupt function found; update this guard if it was renamed")
 	}
@@ -100,15 +111,33 @@ func TestMigrationOwnershipGuard(t *testing.T) {
 	// guards if take or cancelIfUnbound stopped calling it.
 	allowedCancelSites := map[string]bool{"take": true, "cancelIfUnbound": true}
 	for _, path := range files {
-		for _, site := range cancelCallSites(t, path) {
-			if !allowedCancelSites[site.fn] {
+		for _, site := range cancelCallSites(pkg.file(path)) {
+			if !allowedCancelSites[site] {
 				t.Fatalf("%s: m.cancel is referenced from %s, not just take/cancelIfUnbound; "+
 					"canceling the pgx-visible context anywhere else risks handing a "+
 					"dead-socket connection to database/sql while bound, or silently "+
 					"dropping the pool-wait cancellation path - see migration_context.go's "+
-					"ownership-model doc", path, site.fn)
+					"ownership-model doc", path, site)
 			}
 		}
+	}
+
+	// 5. bind must still refuse to bind an already-canceled m.Context, not
+	// just an m.interrupted cause: take clears m.interrupted once it has
+	// reported it (see take's doc), so after a plain discard/stop
+	// m.interrupted alone no longer reflects that this context was ever
+	// interrupted, even though cancelIfUnbound already canceled m.Context.
+	// This is a structural check for that second gate so it cannot be
+	// quietly dropped again the way base 10292e1's equivalent was.
+	bindBody := pkg.funcDeclText("bind")
+	if bindBody == "" {
+		t.Fatal("migration_context.go: no bind function found; update this guard if it was renamed")
+	}
+	if !strings.Contains(bindBody, "context.Cause") {
+		t.Fatalf("migration_context.go: bind no longer checks context.Cause(m.Context); "+
+			"without that check, bind refuses only on m.interrupted, which take clears once reported, "+
+			"so a future caller that rebinds after a discard could hand database/sql a *sql.Conn on an "+
+			"already-canceled context - see migration_context.go's bind doc. Body:\n%s", bindBody)
 	}
 }
 
@@ -137,44 +166,78 @@ func packageGoFiles(t *testing.T) []string {
 	return files
 }
 
-func countCalls(t *testing.T, path, name string) int {
-	t.Helper()
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
-	count := 0
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == name {
-			count++
-		}
-		return true
-	})
-	return count
+// ownershipPackage is every production file in the package, parsed once
+// with a shared *token.FileSet and without comments (parser mode 0): with
+// nothing for the parser to attach, go/printer's output can never include a
+// doc comment or an inline comment, only compiled code - which is what lets
+// funcDeclText/afterFuncResolvedTexts be matched against forbidden without a
+// comment that merely documents the invariant tripping the guard meant to
+// enforce it.
+type ownershipPackage struct {
+	fset  *token.FileSet
+	files map[string]*ast.File     // path -> parsed file
+	decls map[string]*ast.FuncDecl // name only, regardless of receiver or file - see funcDeclText
 }
 
-// afterFuncArgTexts returns the source text of the function-shaped argument
-// (always the last argument) of every context.AfterFunc or time.AfterFunc
-// call in path - whatever form it takes: a function literal's full body, a
-// bare function value, or a method value. Extracting by source position
-// rather than requiring an *ast.FuncLit is what lets this catch
-// time.AfterFunc(d, l.operation.discard) as well as a wrapping closure.
-func afterFuncArgTexts(t *testing.T, path string) []string {
+func loadOwnershipPackage(t *testing.T, paths []string) *ownershipPackage {
 	t.Helper()
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
+	pkg := &ownershipPackage{
+		fset:  token.NewFileSet(),
+		files: make(map[string]*ast.File, len(paths)),
+		decls: make(map[string]*ast.FuncDecl),
 	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, src, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
+	for _, path := range paths {
+		file, err := parser.ParseFile(pkg.fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		pkg.files[path] = file
+		for _, decl := range file.Decls {
+			if fn, ok := decl.(*ast.FuncDecl); ok {
+				pkg.decls[fn.Name.Name] = fn
+			}
+		}
 	}
+	return pkg
+}
+
+func (p *ownershipPackage) file(path string) *ast.File { return p.files[path] }
+
+// print renders node as comment-free source text via go/printer. Safe to
+// call on any node from a file in p.files, since they share p.fset.
+func (p *ownershipPackage) print(node ast.Node) string {
+	var buf bytes.Buffer
+	if err := printer.Fprint(&buf, p.fset, node); err != nil {
+		return "<go/printer error: " + err.Error() + ">"
+	}
+	return buf.String()
+}
+
+// funcDeclText returns the printed, comment-free source of the function or
+// method declaration named name, matching by name only regardless of
+// receiver or which file declares it. Returns "" if no such declaration
+// exists anywhere in the package.
+func (p *ownershipPackage) funcDeclText(name string) string {
+	fn, ok := p.decls[name]
+	if !ok {
+		return ""
+	}
+	return p.print(fn)
+}
+
+// afterFuncResolvedTexts returns the printed, comment-free text that the
+// function-shaped last argument of every context.AfterFunc/time.AfterFunc
+// call in path stands for. A function literal prints as its own body. A
+// bare function value or a method value (an *ast.Ident or *ast.SelectorExpr
+// naming a package-level function or method) resolves one level, to that
+// declaration's own printed body. A call to a helper that returns a closure
+// (time.AfterFunc(d, cleanupAbortFor(cleanup))) also resolves one level: to
+// the helper's declaration, and if that declaration's body is exactly
+// `return <func literal>`, to the returned literal's body specifically.
+// Anything else falls back to printing the argument expression itself, so
+// an unresolvable argument is still scanned as text rather than skipped.
+func (p *ownershipPackage) afterFuncResolvedTexts(path string) []string {
+	file := p.files[path]
 	var texts []string
 	ast.Inspect(file, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -192,54 +255,91 @@ func afterFuncArgTexts(t *testing.T, path string) []string {
 		if len(call.Args) == 0 {
 			return true
 		}
-		arg := call.Args[len(call.Args)-1]
-		start := fset.Position(arg.Pos()).Offset
-		end := fset.Position(arg.End()).Offset
-		texts = append(texts, string(src[start:end]))
+		texts = append(texts, p.resolveCallableText(call.Args[len(call.Args)-1]))
 		return true
 	})
 	return texts
 }
 
-// funcBody returns the source text of the function or method declaration
-// named name in path, matching by name only regardless of receiver. Returns
-// "" if no such declaration exists.
-func funcBody(t *testing.T, path, name string) string {
-	t.Helper()
-	src, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, src, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
-	}
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != name {
-			continue
+// resolveCallableText implements afterFuncResolvedTexts' one-level
+// resolution for a single argument expression; see that doc for the forms
+// it handles.
+func (p *ownershipPackage) resolveCallableText(arg ast.Expr) string {
+	switch e := arg.(type) {
+	case *ast.FuncLit:
+		return p.print(e)
+	case *ast.Ident:
+		if body := p.funcDeclText(e.Name); body != "" {
+			return body
 		}
-		start := fset.Position(fn.Pos()).Offset
-		end := fset.Position(fn.End()).Offset
-		return string(src[start:end])
+	case *ast.SelectorExpr:
+		if body := p.funcDeclText(e.Sel.Name); body != "" {
+			return body
+		}
+	case *ast.CallExpr:
+		var name string
+		switch fn := e.Fun.(type) {
+		case *ast.Ident:
+			name = fn.Name
+		case *ast.SelectorExpr:
+			name = fn.Sel.Name
+		}
+		if name == "" {
+			break
+		}
+		fn, ok := p.decls[name]
+		if !ok {
+			break
+		}
+		if lit := lastReturnedFuncLit(fn); lit != nil {
+			return p.print(lit)
+		}
+		return p.print(fn)
 	}
-	return ""
+	return p.print(arg)
 }
 
-// cancelSite names the function or method enclosing a m.cancel-shaped call.
-type cancelSite struct{ fn string }
-
-// cancelCallSites returns one cancelSite per call whose selector is "cancel"
-// (for example m.cancel(...)) in path, naming the enclosing function/method.
-func cancelCallSites(t *testing.T, path string) []cancelSite {
-	t.Helper()
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, path, nil, 0)
-	if err != nil {
-		t.Fatalf("parse %s: %v", path, err)
+// lastReturnedFuncLit returns the *ast.FuncLit a function declaration's body
+// returns, when that body is exactly `return <func literal>` - the
+// helper-returning-a-closure shape used to wire a non-owner discard into an
+// AfterFunc call without any forbidden text appearing at the call site
+// itself (for example cleanupAbortFor in the coordinator's mutant proof).
+// Returns nil for any other body shape.
+func lastReturnedFuncLit(fn *ast.FuncDecl) *ast.FuncLit {
+	if fn.Body == nil {
+		return nil
 	}
-	var sites []cancelSite
+	for _, stmt := range fn.Body.List {
+		ret, ok := stmt.(*ast.ReturnStmt)
+		if !ok || len(ret.Results) != 1 {
+			continue
+		}
+		if lit, ok := ret.Results[0].(*ast.FuncLit); ok {
+			return lit
+		}
+	}
+	return nil
+}
+
+func countCalls(file *ast.File, name string) int {
+	count := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		if ident, ok := call.Fun.(*ast.Ident); ok && ident.Name == name {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
+// cancelCallSites returns the name of the enclosing function or method for
+// every call whose selector is "cancel" (for example m.cancel(...)) in file.
+func cancelCallSites(file *ast.File) []string {
+	var sites []string
 	for _, decl := range file.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
 		if !ok || fn.Body == nil {
@@ -251,7 +351,7 @@ func cancelCallSites(t *testing.T, path string) []cancelSite {
 				return true
 			}
 			if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "cancel" {
-				sites = append(sites, cancelSite{fn: fn.Name.Name})
+				sites = append(sites, fn.Name.Name)
 			}
 			return true
 		})

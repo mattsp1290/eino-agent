@@ -96,8 +96,22 @@ func newMigrationContext(parent context.Context) *migrationContext {
 // runs its callback synchronously on the calling goroutine before returning,
 // so m.mu below is acquired only after Raw's own internal locks are already
 // held by this same goroutine.
+//
+// bind refuses both when m.interrupted is set and, independently, when
+// m.Context is already Done. The two are not the same check: take clears
+// m.interrupted once it has reported it (see take), so after a plain
+// discard/stop m.interrupted alone no longer reflects that this context was
+// ever interrupted, even though cancelIfUnbound already canceled m.Context.
+// No current caller re-binds after a discard, so this is a structural
+// guarantee rather than one a live bug depends on today: binding a *sql.Conn
+// to an already-canceled m.Context would hand pgx a context it returns
+// SafeToRetry for before any I/O, with IsClosed() still false - the exact
+// hazard this type exists to prevent.
 func (m *migrationContext) bind(conn *sql.Conn) error {
 	if cause := m.interruptedCause(); cause != nil {
+		return cause
+	}
+	if cause := context.Cause(m.Context); cause != nil {
 		return cause
 	}
 	if conn == nil {
@@ -116,6 +130,9 @@ func (m *migrationContext) bind(conn *sql.Conn) error {
 		defer m.mu.Unlock()
 		if m.interrupted != nil {
 			return m.interrupted
+		}
+		if cause := context.Cause(m.Context); cause != nil {
+			return cause
 		}
 		if m.stopped || m.socket != nil {
 			return errors.New("postgres migration context is already bound")
