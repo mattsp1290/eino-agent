@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
@@ -248,6 +249,12 @@ func validateToolResultPart(part ToolResultPart) error {
 		}
 		if part.Media.Name != "" && part.Type != ToolResultPartFile {
 			return errors.New("only a file part may carry a media Name")
+		}
+		if part.Media.MIMEType != "" && !session.ValidMIMEType(part.Media.MIMEType) {
+			return errors.New("media part MIME type is invalid")
+		}
+		if !utf8.ValidString(part.Media.URL) || !utf8.ValidString(part.Media.Name) {
+			return errors.New("media part URL and Name must be valid UTF-8")
 		}
 	case ToolResultPartToolSearch:
 		if len(part.ToolSearch) != 0 && !json.Valid(part.ToolSearch) {

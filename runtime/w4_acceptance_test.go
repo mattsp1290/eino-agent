@@ -1129,3 +1129,91 @@ func TestResumeNeverReappliesToolPreparePoint(t *testing.T) {
 		t.Fatalf("resumed call Input changed: before=%s after=%s (resume must never re-apply argument-alias remapping)", before.Input, after.Input)
 	}
 }
+
+// resumeHistoryErrorStore fails only the full-history paging shape
+// discoveredToolsFromHistoryPaged uses (Limit: 1000) so the test below
+// exercises a resume-time discovery read failure in isolation.
+type resumeHistoryErrorStore struct {
+	session.Store
+	err error
+}
+
+func (s *resumeHistoryErrorStore) ListMessages(ctx context.Context, sessionID session.ID, cursor session.ReplayCursor) (session.ReplayBatch, error) {
+	if cursor.Limit == 1000 {
+		return session.ReplayBatch{}, s.err
+	}
+	return s.Store.ListMessages(ctx, sessionID, cursor)
+}
+
+// TestResumeHistoryReadFailureStillTerminalizesOutstandingCalls guards the
+// fix-pass finding that a discovery-history read failure on resume must not
+// orphan the outstanding tool calls it was about to resume: the run fails,
+// but every non-terminal call is terminalized before the run settles, so no
+// row stays pending forever behind a terminal run.
+func TestResumeHistoryReadFailureStillTerminalizesOutstandingCalls(t *testing.T) {
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+	now := time.Date(2026, 6, 28, 14, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: "session-resume-history-err", WorkspaceID: "workspace-1", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{
+		ID: "run-resume-history-err", SessionID: "session-resume-history-err", OwnerID: "dead-owner", ClaimToken: "old-claim",
+		Agent: "agent", ProviderID: "fake", ModelID: "test", Status: session.RunPending,
+		Config:        map[string]string{"workspace_id": "workspace-1", "workspace_root": "/workspace"},
+		ExtensionPlan: testEchoPlanDescriptor(), CreatedAt: now,
+	}, time.Millisecond)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	time.Sleep(2 * time.Millisecond)
+	if _, err := execution.AppendMessage(ctx, session.Message{
+		ID: "assistant-resume-history-err", SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	call := session.ToolCall{
+		ID: "call-resume-history-err", SessionID: run.SessionID, RunID: run.ID, MessageID: "assistant-resume-history-err",
+		ResultMessageID: "result-resume-history-err", ResultPartID: "part-resume-history-err",
+		Name: "tool_search", Pattern: "tool_search", Input: json.RawMessage(`{"query":"weather"}`), Status: session.ToolCallPending,
+	}
+	if _, err := execution.CreateToolCall(ctx, testCreateToolRequest(call, "event-create-resume-history-err", now)); err != nil {
+		t.Fatalf("create tool call: %v", err)
+	}
+
+	historyErr := errors.New("history unavailable")
+	plan := testToolPlanWithSearch(t, []Tool{{
+		Name: "weather_tool", Deferred: true, Info: &einoschema.ToolInfo{Name: "weather_tool", Desc: "weather forecast"},
+		Retention: RetentionPolicy{MaxInlineBytes: 4096},
+		Executor:  orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "{}"}, nil }),
+	}}, &ToolSearchConfig{Name: "tool_search"})
+	orchestrator := mustConfiguredOrchestrator(
+		WithStore(&resumeHistoryErrorStore{Store: store, err: historyErr}), WithOwnerID("owner-1"),
+		WithClock(func() time.Time { return now.Add(time.Hour) }),
+	)
+	done := make(chan Result, 1)
+	orchestrator.executeResume(ctx, newRunExecution(orchestrator, plan, run), run, done)
+	result := <-done
+	if result.Status != session.RunFailed || !errors.Is(result.Error, historyErr) {
+		t.Fatalf("result = %+v, want failed with the history error", result)
+	}
+	settled, err := store.GetToolCall(ctx, call.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !session.TerminalToolCall(settled.Status) {
+		t.Fatalf("outstanding call status = %q, want terminal after a failed resume", settled.Status)
+	}
+	reopened, err := store.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reopened.Terminal() {
+		t.Fatalf("run status = %q, want terminal", reopened.Status)
+	}
+}

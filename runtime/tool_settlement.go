@@ -92,7 +92,7 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 	policy := effectiveToolRetentionPolicy(input.Tool.Retention, input.ContentLimits)
 	raw, output, status, errText := encodeToolOutput(input.Call.ID, input.Result, policy, input.Disposition, input.Err)
 	metadata := toolSettlementMetadata(input.Claimed.Metadata, output)
-	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
+	settlement, persisted, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed:       input.Claimed,
 		Status:        status,
 		Output:        raw,
@@ -105,7 +105,10 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 		BlockID:       input.BlockID,
 		ContentLimits: input.ContentLimits,
 	})
-	return settlement, output, err
+	if err != nil {
+		return session.ToolSettlement{}, ToolOutput{}, err
+	}
+	return settlement, persisted, nil
 }
 
 type terminalToolEnvelopeInput struct {
@@ -141,19 +144,24 @@ type terminalToolEnvelopeInput struct {
 // ToolOutput JSON), so the model-visible payload is unchanged from before
 // enhanced results existed; for an enhanced (Parts) result it is one content
 // item per bounded part.
-func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSettlement, error) {
+// buildTerminalToolEnvelope returns the settlement and the ToolOutput record
+// it actually persisted, which differs from input.OutputRecord only when the
+// degrade path below replaced parts with omission records. Callers must use
+// the returned record for the model-visible result so persisted, model-visible
+// and replayed content stay identical.
+func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSettlement, ToolOutput, error) {
 	call := input.Claimed
 	if call.ID == "" || call.ClaimedBy == "" || call.ClaimToken == "" || call.ResultMessageID == "" || call.ResultPartID == "" {
-		return session.ToolSettlement{}, errors.New("tool settlement requires claim identity and reserved result IDs")
+		return session.ToolSettlement{}, ToolOutput{}, errors.New("tool settlement requires claim identity and reserved result IDs")
 	}
 	if input.CompletedAt.IsZero() || !session.TerminalToolCall(input.Status) {
-		return session.ToolSettlement{}, errors.New("tool settlement requires terminal status and completion time")
+		return session.ToolSettlement{}, ToolOutput{}, errors.New("tool settlement requires terminal status and completion time")
 	}
 	if input.MessageAt.IsZero() {
-		return session.ToolSettlement{}, errors.New("tool settlement requires durable message time")
+		return session.ToolSettlement{}, ToolOutput{}, errors.New("tool settlement requires durable message time")
 	}
 	if input.BlockID == "" {
-		return session.ToolSettlement{}, errors.New("tool settlement requires a content block id")
+		return session.ToolSettlement{}, ToolOutput{}, errors.New("tool settlement requires a content block id")
 	}
 	// The persisted block's Name must be the model-facing name (RequestedName)
 	// so a live turn and a later replay always show the model the exact name
@@ -203,18 +211,19 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 		degraded := degradeToolOutputPartsToOmissions(input.OutputRecord)
 		degradedRaw, marshalErr := json.Marshal(degraded)
 		if marshalErr != nil {
-			return session.ToolSettlement{}, fmt.Errorf("encode function tool result content: %w", err)
+			return session.ToolSettlement{}, ToolOutput{}, fmt.Errorf("encode function tool result content: %w", err)
 		}
 		input.Output = degradedRaw
 		input.OutputRecord = degraded
+		input.Metadata = toolSettlementMetadata(call.Metadata, degraded)
 		content.Blocks[0].FunctionResult.Content = toolOutputToResultContent(input.Output, input.OutputRecord)
 		parts, err = session.EncodeContentParts(content, mintResultPartID(), call.ResultMessageID, call.SessionID, call.RunID, input.MessageAt, input.ContentLimits)
 	}
 	if err != nil {
-		return session.ToolSettlement{}, fmt.Errorf("encode function tool result content: %w", err)
+		return session.ToolSettlement{}, ToolOutput{}, fmt.Errorf("encode function tool result content: %w", err)
 	}
 	if len(parts) != 1 {
-		return session.ToolSettlement{}, errors.New("encode function tool result content: unexpected part count")
+		return session.ToolSettlement{}, ToolOutput{}, errors.New("encode function tool result content: unexpected part count")
 	}
 	settlement := session.ToolSettlement{
 		ID:          call.ID,
@@ -231,7 +240,7 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 		},
 		ResultPart: parts[0],
 	}
-	return settlement, nil
+	return settlement, input.OutputRecord, nil
 }
 
 func validateSettlementInput(input ToolSettlementInput) error {

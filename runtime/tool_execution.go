@@ -104,7 +104,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 		result.Output = output.Content
 		result.Structured = cloneJSON(output.Structured)
 	}
-	settlement, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
+	settlement, _, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, OutputRecord: output, Error: errText,
 		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,
 		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits,

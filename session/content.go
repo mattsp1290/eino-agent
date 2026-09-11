@@ -879,6 +879,11 @@ func validateResultContent(item ResultContent, limits ContentLimits) error {
 	return nil
 }
 
+// ValidMIMEType reports whether s is the MIME type shape the content
+// contract accepts for media blocks: valid UTF-8 with exactly one interior
+// "/" separating a non-empty type and subtype.
+func ValidMIMEType(s string) bool { return validMIMEType(s) }
+
 func validMIMEType(s string) bool {
 	if !utf8.ValidString(s) {
 		return false

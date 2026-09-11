@@ -109,11 +109,6 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 	// session.MaxContentLimits() (content may have been admitted under a
 	// writer's raised ContentLimits), and propagate a store failure instead
 	// of silently seeding an empty set.
-	discovered, err := discoveredToolsFromHistoryPaged(ctx, o.store, run.SessionID)
-	if err != nil {
-		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
-	}
-	execution.seedDiscovered(discovered)
 	snapshot := o.resumeSnapshot(run)
 	withCleanup := func(result Result) Result {
 		if cleanupErr := execution.terminalizeUnfinishedTools(context.WithoutCancel(ctx), snapshot, calls); cleanupErr != nil {
@@ -122,6 +117,13 @@ func (o *StreamingOrchestrator) resumeRun(ctx context.Context, execution *runExe
 		}
 		return result
 	}
+	discovered, err := discoveredToolsFromHistoryPaged(ctx, o.store, run.SessionID)
+	if err != nil {
+		// The outstanding calls proved above must still be terminalized,
+		// otherwise settling the run leaves them pending forever.
+		return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
+	}
+	execution.seedDiscovered(discovered)
 	tools, snapshot, toolContext, err := o.resumeTools(ctx, execution, run, snapshot)
 	if err != nil {
 		return withCleanup(Result{RunID: run.ID, Status: session.RunFailed, Error: err})
