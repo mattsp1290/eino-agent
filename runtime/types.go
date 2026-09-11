@@ -183,10 +183,11 @@ type ToolCall struct {
 	// always the freshly runtime-minted, store-unique identity. ID, not
 	// ProviderCallID, is what a later dispatch shows the provider back when
 	// ProviderCallID is empty (the provider omitted its own id, or sent one
-	// that failed validation) or collides with another call's provider-
-	// facing id in the same outgoing request -- see
-	// runtime.publicizeToolCallIDs's doc comment for exactly which case
-	// applies.
+	// that failed validation) or when sending it would be ambiguous in
+	// that outgoing request (an earlier call already sends that exact
+	// string, or it equals the durable id of any call in the request) --
+	// see runtime.publicizeToolCallIDs's doc comment for exactly which
+	// case applies.
 	ProviderCallID string
 	Scope          ToolScope
 	Pattern        string

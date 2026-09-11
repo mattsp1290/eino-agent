@@ -318,6 +318,11 @@ func TestStreamingOrchestratorRecordsProviderCallIDMetadataOnToolObservations(t 
 		if _, ok := settled.Attributes["metadata.provider_call_id"]; ok {
 			t.Fatalf("tool.settled metadata.provider_call_id present = %#v, want absent (attrs=%#v)", settled.Attributes["metadata.provider_call_id"], settled.Attributes)
 		}
+		// The attribute's absence is only meaningful if the call really has
+		// no provider id: confirm the durable record agrees.
+		if call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store)); err != nil || call.ProviderCallID != "" {
+			t.Fatalf("provider call id = %q, err = %v; want empty", call.ProviderCallID, err)
+		}
 	})
 }
 

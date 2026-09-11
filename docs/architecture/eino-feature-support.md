@@ -451,8 +451,9 @@ Status: landed; W1 scaffolding kept green.
   block `CallID`s from the minted `ID` to `ProviderCallID` (falling back to
   `ID` when the provider supplied none or an invalid/oversized one, and,
   processing every call in request order, whenever sending `ProviderCallID`
-  would collide with an earlier call's wire id in that same outgoing
-  request — see below) in a copy of the messages, applied exactly
+  would be ambiguous in that same outgoing request — an earlier call
+  already sends that exact string, or the string equals the durable id of
+  any call in the request — see below) in a copy of the messages, applied exactly
   once per physical dispatch, at the top of `adkModel.begin` — before that
   request is audited/ledgered, so the request the ledger describes and the
   `ProviderRequest` `adkModel.dispatch` actually sends are the same bytes —
@@ -493,22 +494,30 @@ Status: landed; W1 scaffolding kept green.
     its call block and its result block, deterministically), which the same
     reservation keeps from ever colliding with another call's wire id in
     turn. Processing in request order also means the earliest call with a
-    given provider id keeps it: once a request has sent a call's provider id
-    verbatim, a later request that introduces a colliding call never changes
-    that already-sent value, which keeps provider-side prompt-prefix caches
-    (llama.cpp, vLLM, Ollama) valid as history grows.
+    given provider id keeps it when a later call reuses that id, so history
+    already sent normally keeps its wire ids as the conversation grows
+    (provider-side prompt-prefix caches — llama.cpp, vLLM, Ollama — stay
+    valid). One exception, from rule (b): if an earlier call's provider id
+    equals the durable id of a call added to history later (possible only
+    when a provider emits ids in the `IDGenerator`'s minted format), the
+    earlier call sends its own durable id from that request on. Every
+    request is still unique and internally consistent; only the prefix
+    cache for that history is lost.
   - **Failing closed.** A tool-call block with no `tool_calls` row (only
     reachable via direct store writes or imported history, since
     `rejectNonCallerBlocks` refuses caller-authored tool blocks and context
-    contributions are text-only), or one whose row belongs to a different
-    session, fails the dispatch with `errToolCallIDUnresolved` -- but only
-    when the underlying store lookup itself failed deterministically
-    (`session.ErrNotFound` or `session.ErrConflict`, wrapped with `%w` so
-    the cause stays inspectable); a sentinel `defaultShouldRetry`/
+    contributions are text-only) fails the dispatch with
+    `errToolCallIDUnresolved` when the underlying store lookup itself failed
+    deterministically (`session.ErrNotFound` or `session.ErrConflict`,
+    wrapped with `%w` so the cause stays inspectable). A resolved row that
+    belongs to a different session is a separate case, not a lookup error:
+    the cross-session check fails the dispatch with the same sentinel on its
+    own, carrying no store cause. Either way, a sentinel `defaultShouldRetry`/
     `defaultShouldFailover` both refuse to retry or fail over, since a
     deterministic, durable-consistency failure would only burn the run's
     retry/failover budget for nothing. Any other store error (a transient
-    read failure, for example) is returned unwrapped and stays fully
+    read failure, for example) is returned without the sentinel (still
+    wrapped with `%w` for the cause) and stays fully
     retryable/failover-eligible under the run's normal policy.
   - **Provider id validation.** `prepareToolCalls` treats a captured
     provider id as absent (falls back to the minted id) unless it is valid

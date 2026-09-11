@@ -299,10 +299,12 @@ type ToolCall struct {
 	// ProviderCallID is preserved separately so the wire request rebuilt
 	// for the provider on a later dispatch (runtime.publicizeToolCallIDs)
 	// can still show the provider its own id back for call/result
-	// correlation -- unless that id collides with another call's
-	// provider-facing id in the same outgoing request, in which case ID is
-	// sent instead (see publicizeToolCallIDs's doc comment). Every internal
-	// (ADK/ToolCall-store) reference to this call always uses ID.
+	// correlation -- unless sending it would be ambiguous in that outgoing
+	// request (an earlier call already sends that exact string, or the
+	// string equals the durable id of any call in the request), in which
+	// case ID is sent instead (see publicizeToolCallIDs's doc comment).
+	// Every internal (ADK/ToolCall-store) reference to this call always
+	// uses ID.
 	ProviderCallID string
 	Pattern        string
 	Input          json.RawMessage

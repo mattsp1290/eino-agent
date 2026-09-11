@@ -45,9 +45,10 @@ type IDGenerator interface {
 	// facing id when (a) the provider left CallID empty, (b) the provider's
 	// id was not valid UTF-8 or exceeded session.DiscoveryMaxIdentityBytes
 	// (prepareToolCalls/validProviderCallID stores it as absent, the same as
-	// case (a)), or (c) the provider's id collides with another call's
-	// provider-facing id in this same outgoing request (see
-	// publicizeToolCallIDs's "Duplicate provider ids" doc). An
+	// case (a)), or (c) sending the provider's id would be ambiguous in this
+	// outgoing request: an earlier call in request order already sends
+	// that string, or the string is the durable id of any call in the
+	// request (see publicizeToolCallIDs's "Duplicate provider ids" doc). An
 	// implementation whose minted format would violate a provider's own id
 	// rules (for example Mistral, which requires exactly 9 alphanumeric
 	// characters) can surface that constraint to such a provider.
@@ -752,16 +753,18 @@ func canonicalToolObject(raw json.RawMessage) (json.RawMessage, error) {
 	return canonical, nil
 }
 
-// errToolCallIDUnresolved wraps a publicizeToolCallIDs failure whose id
-// lookup returned a deterministic durable-consistency error -- session.
-// ErrNotFound (a function_tool_call/function_tool_result/tool_search_result
-// block's durable CallID has no tool_calls row) or session.ErrConflict (the
-// row exists but under a conflicting identity), including the
-// cross-session check (the row belongs to a different session) -- so the
-// rewrite cannot proceed. It deliberately does NOT wrap any other
+// errToolCallIDUnresolved wraps a publicizeToolCallIDs failure that cannot
+// proceed for a deterministic, durable-consistency reason: either the id
+// lookup itself returned session.ErrNotFound (a function_tool_call/
+// function_tool_result/tool_search_result block's durable CallID has no
+// tool_calls row) or session.ErrConflict (the row exists but under a
+// conflicting identity), or -- a separate case, not a lookup error -- the
+// resolved row belongs to a different session than the one being dispatched
+// for (the cross-session check). It deliberately does NOT wrap any other
 // store.GetToolCall error (a transient read failure, for example): those
-// are returned unwrapped and stay retryable/failover-eligible under the
-// run's normal policy, exactly like every other store error in begin. Only
+// are returned without the sentinel (still wrapped with %w for the cause)
+// and stay retryable/failover-eligible under the run's normal policy,
+// exactly like every other store error in begin. Only
 // ErrNotFound/ErrConflict are worth failing closed over: through the public
 // API they can only happen from direct store writes or imported history --
 // rejectNonCallerBlocks refuses caller-authored tool blocks, and context
@@ -848,11 +851,15 @@ func (c *toolCallIDCache) put(id session.ToolCallID, public string) {
 // the wire under the same id, which a provider that pairs them by value
 // cannot tell apart, and which providers that require unique ids (e.g.
 // Anthropic's Messages API) reject outright. Processing in request order
-// also means the earliest call with a given provider id always keeps it:
-// once a request has sent a call's provider id verbatim, a later request
-// that introduces a colliding call never changes that already-sent value,
-// which keeps provider-side prompt-prefix caches (llama.cpp, vLLM, Ollama)
-// valid as history grows.
+// also means the earliest call with a given provider id keeps it when a
+// later call reuses that id, so history already sent normally keeps its
+// wire ids as the conversation grows (provider-side prompt-prefix caches --
+// llama.cpp, vLLM, Ollama -- stay valid). One exception, from rule (b): if
+// an earlier call's provider id equals the durable id of a call added to
+// history later (possible only when a provider emits ids in the
+// IDGenerator's minted format), the earlier call sends its own durable id
+// from that request on. Every request is still unique and internally
+// consistent; only the prefix cache for that history is lost.
 //
 // sessionID fences every resolved session.ToolCall against the turn's own
 // session: GetToolCall is store-global, so without this check a durable id

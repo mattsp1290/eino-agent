@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -137,6 +138,8 @@ func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testi
 	seedToolCall(store, session.ToolCall{ID: "tool-call-3", SessionID: "session-1", ProviderCallID: "call_1", Name: "echo"})
 	seedToolCall(store, session.ToolCall{ID: "tool-call-search", SessionID: "session-1", ProviderCallID: "call_2", Name: "search"})
 	seedToolCall(store, session.ToolCall{ID: "tool-call-echo2", SessionID: "session-1", ProviderCallID: "call_2", Name: "echo"})
+	seedToolCall(store, session.ToolCall{ID: "tool-call-9", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
+	seedToolCall(store, session.ToolCall{ID: "tool-call-10", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
 
 	t.Run("two calls in one response", func(t *testing.T) {
 		messages := []*einoschema.AgenticMessage{{
@@ -185,6 +188,32 @@ func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testi
 		}
 	})
 
+	t.Run("collision resolved by request order, not lexical order", func(t *testing.T) {
+		// tool-call-9 and tool-call-10 both claim "call_0"; in request
+		// order tool-call-9 comes first, but lexically "tool-call-10" <
+		// "tool-call-9" ("1" < "9"). If durableOrder were sorted lexically
+		// instead of by request order, tool-call-10 would wrongly keep
+		// "call_0" and tool-call-9 would fall back instead.
+		messages := []*einoschema.AgenticMessage{
+			toolCallBlockMessage("tool-call-9", "echo", `{}`),
+			toolResultBlockMessage("tool-call-9", "echo"),
+			toolCallBlockMessage("tool-call-10", "echo", `{}`),
+			toolResultBlockMessage("tool-call-10", "echo"),
+		}
+		out, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, messages)
+		if err != nil {
+			t.Fatal(err)
+		}
+		assertPairwiseDistinctWireIDs(t, out)
+		got := []string{
+			out[0].ContentBlocks[0].FunctionToolCall.CallID,
+			out[2].ContentBlocks[0].FunctionToolCall.CallID,
+		}
+		if want := []string{"call_0", "tool-call-10"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("ids = %v, want %v (tool-call-9 is earliest in request order, so it keeps call_0)", got, want)
+		}
+	})
+
 	t.Run("tool_search_result collision", func(t *testing.T) {
 		messages := []*einoschema.AgenticMessage{
 			toolCallBlockMessage("tool-call-search", "search", `{}`),
@@ -218,7 +247,7 @@ func TestPublicizeToolCallIDsKeepsDurableIDsOnCollisionWithinOneRequest(t *testi
 // saw minted earlier in history can never collide with that call's own
 // fallback.
 func TestPublicizeToolCallIDsFallsBackWhenProviderIDEqualsAnotherCallsDurableID(t *testing.T) {
-	t.Run("LC-I1: a fallback id can collide with a later call's provider id", func(t *testing.T) {
+	t.Run("a provider id equal to an earlier call's durable id falls back", func(t *testing.T) {
 		store := newAdmissionStore()
 		seedToolCall(store, session.ToolCall{ID: "tool-call-1", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
 		seedToolCall(store, session.ToolCall{ID: "tool-call-2", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
@@ -233,8 +262,19 @@ func TestPublicizeToolCallIDsFallsBackWhenProviderIDEqualsAnotherCallsDurableID(
 			t.Fatal(err)
 		}
 		assertPairwiseDistinctWireIDs(t, out)
-		if out[0].ContentBlocks[0].FunctionToolCall.CallID != "call_0" {
-			t.Fatalf("tool-call-1 (earliest) = %q, want call_0", out[0].ContentBlocks[0].FunctionToolCall.CallID)
+		// Exact wire ids, not just pairwise distinctness: under earliest-
+		// keeps alone (rule (a)), tool-call-1 would send "call_0" and
+		// tool-call-3's provider id "tool-call-1" would already be unique,
+		// so this subtest must pin rule (b) -- tool-call-3's provider id
+		// equals tool-call-1's own durable id, reserved from the start of
+		// the request -- to still exercise it.
+		got := []string{
+			out[0].ContentBlocks[0].FunctionToolCall.CallID,
+			out[2].ContentBlocks[0].FunctionToolCall.CallID,
+			out[4].ContentBlocks[0].FunctionToolCall.CallID,
+		}
+		if want := []string{"call_0", "tool-call-2", "tool-call-3"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("wire ids = %v, want %v", got, want)
 		}
 	})
 
@@ -282,6 +322,45 @@ func assertPairwiseDistinctWireIDs(t *testing.T, messages []*einoschema.AgenticM
 	}
 }
 
+// TestPublicizeToolCallIDsLaterDurableIDEqualToEarlierProviderIDRenamesEarlierCall
+// pins the one documented exception to "earliest call keeps its provider
+// id": rule (b) reserves every call's durable id for itself from the start
+// of a request, even when that call is only added to history in a LATER
+// request. So a call whose provider id was already sent verbatim in an
+// earlier request can be forced to fall back once a later call, sharing
+// that same durable id as its own, is appended to history -- see
+// publicizeToolCallIDs's "Duplicate provider ids" doc and the W4 section of
+// docs/architecture/eino-feature-support.md. Every request stays unique and
+// internally consistent; only the provider-side prompt-prefix cache for
+// that history is lost.
+func TestPublicizeToolCallIDsLaterDurableIDEqualToEarlierProviderIDRenamesEarlierCall(t *testing.T) {
+	store := newAdmissionStore()
+	seedToolCall(store, session.ToolCall{ID: "tool-call-1", SessionID: "session-1", ProviderCallID: "tool-call-2", Name: "echo"})
+	seedToolCall(store, session.ToolCall{ID: "tool-call-2", SessionID: "session-1", ProviderCallID: "call_0", Name: "echo"})
+	first := []*einoschema.AgenticMessage{toolCallBlockMessage("tool-call-1", "echo", `{}`), toolResultBlockMessage("tool-call-1", "echo")}
+	second := append(append([]*einoschema.AgenticMessage(nil), first...),
+		toolCallBlockMessage("tool-call-2", "echo", `{}`), toolResultBlockMessage("tool-call-2", "echo"))
+	out1, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out2, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out1[0].ContentBlocks[0].FunctionToolCall.CallID; got != "tool-call-2" {
+		t.Fatalf("request 1 tool-call-1 = %q, want tool-call-2", got)
+	}
+	// Documented exception: rule (b) reserves tool-call-2's durable id.
+	if got := out2[0].ContentBlocks[0].FunctionToolCall.CallID; got != "tool-call-1" {
+		t.Fatalf("request 2 tool-call-1 = %q, want tool-call-1", got)
+	}
+	if got := out2[2].ContentBlocks[0].FunctionToolCall.CallID; got != "call_0" {
+		t.Fatalf("request 2 tool-call-2 = %q, want call_0", got)
+	}
+	assertPairwiseDistinctWireIDs(t, out2)
+}
+
 // TestPublicizeToolCallIDsFailsClosedOnMissingRow proves WC-S1: a block
 // whose durable CallID has no tool_calls row fails the rewrite with
 // errToolCallIDUnresolved (not a bare not-found), so the retry/failover
@@ -306,6 +385,47 @@ func TestPublicizeToolCallIDsFailsClosedOnCrossSessionRow(t *testing.T) {
 	_, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil, messages)
 	if err == nil || !errors.Is(err, errToolCallIDUnresolved) {
 		t.Fatalf("err = %v, want errToolCallIDUnresolved", err)
+	}
+}
+
+// erroringGetToolCallStore returns a fixed error from GetToolCall
+// regardless of which id is asked for, so TestPublicizeToolCallIDsSentinelScopeAndCause
+// can exercise every store.GetToolCall failure mode in isolation.
+type erroringGetToolCallStore struct {
+	*admissionStore
+	err error
+}
+
+func (s *erroringGetToolCallStore) GetToolCall(context.Context, session.ToolCallID) (session.ToolCall, error) {
+	return session.ToolCall{}, s.err
+}
+
+// TestPublicizeToolCallIDsSentinelScopeAndCause pins errToolCallIDUnresolved's
+// exact scope: it wraps a GetToolCall failure only for session.ErrNotFound
+// or session.ErrConflict (the sentinel doc's two named cases), never for an
+// ordinary transient error, and in every case the underlying cause stays
+// inspectable through %w.
+func TestPublicizeToolCallIDsSentinelScopeAndCause(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		cause        error
+		wantSentinel bool
+	}{
+		{"not found", session.ErrNotFound, true},
+		{"conflict", session.ErrConflict, true},
+		{"transient", errors.New("connection reset"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := &erroringGetToolCallStore{admissionStore: newAdmissionStore(), err: tc.cause}
+			_, err := publicizeToolCallIDs(context.Background(), store, "session-1", nil,
+				[]*einoschema.AgenticMessage{toolCallBlockMessage("tool-call-1", "echo", `{}`)})
+			if got := errors.Is(err, errToolCallIDUnresolved); got != tc.wantSentinel {
+				t.Fatalf("errors.Is(err, errToolCallIDUnresolved) = %v, want %v (err=%v)", got, tc.wantSentinel, err)
+			}
+			if !errors.Is(err, tc.cause) {
+				t.Fatalf("cause not preserved with %%w: %v", err)
+			}
+		})
 	}
 }
 
