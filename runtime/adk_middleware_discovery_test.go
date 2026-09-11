@@ -84,15 +84,23 @@ func TestDiscoverHandlerToolsBoundsTheProbeContext(t *testing.T) {
 // 5-second budget.
 func TestDiscoverHandlerToolsEnforcesDeadlineAgainstAContextIgnoringFactory(t *testing.T) {
 	original := discoveryProbeBudget
-	discoveryProbeBudget = 50 * time.Millisecond
+	shrunk := 50 * time.Millisecond
+	discoveryProbeBudget = shrunk
 	defer func() { discoveryProbeBudget = original }()
 
+	// The abandoned probe goroutine is documented to keep running past
+	// discoverHandlerTools' own return (bounded to process lifetime, not
+	// this call's -- see discoverHandlerTools' doc comment), so its closure
+	// must never read the shared, test-mutated discoveryProbeBudget global
+	// itself (a real data race against this test's own deferred restore
+	// above, caught by -race): capture the shrunk value into this local
+	// instead.
 	factoryReturned := make(chan struct{})
 	factory := HandlerFactory(func(ctx context.Context, _ HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
 		// Deliberately ignores ctx: sleeps ten times the shrunk budget,
 		// simulating a factory that blocks on e.g. network I/O without
 		// ever checking its own context.
-		time.Sleep(10 * discoveryProbeBudget)
+		time.Sleep(10 * shrunk)
 		close(factoryReturned)
 		return nil, errors.New("factory finally returned, far too late")
 	})
@@ -108,7 +116,7 @@ func TestDiscoverHandlerToolsEnforcesDeadlineAgainstAContextIgnoringFactory(t *t
 	// factory's own 10x sleep) to absorb scheduler jitter in CI without
 	// weakening the actual assertion: discoverHandlerTools must return
 	// long before the ignored context's factory ever does.
-	if margin := 10 * discoveryProbeBudget; elapsed > margin {
+	if margin := 10 * shrunk; elapsed > margin {
 		t.Fatalf("discoverHandlerTools took %v, want at most %v (the ignoring factory must not be able to block it)", elapsed, margin)
 	}
 	select {
