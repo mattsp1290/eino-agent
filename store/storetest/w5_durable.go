@@ -854,6 +854,93 @@ func pausedRunContract(t *testing.T, factory Factory) {
 			}
 		})
 
+		// Round-five reconciliation item 2 (TR-I1): crash reconciliation of
+		// a dangling turn stages a fresh, correctly turn-identified
+		// Kind=loop checkpoint for it, then promotes that revision as part
+		// of the SAME repause that reverts the reclaimed run back to
+		// paused -- since the reconciled turn is already durably
+		// TurnInterrupted by that point (ReconcileInterruptedTurn already
+		// ran), PromotePause's own turn-interrupt precondition (admitted/
+		// running) no longer holds, so RepauseRun's PromoteRevision is what
+		// promotes it instead.
+		t.Run("repause run also promotes a requested staged revision, superseding the previously promoted one", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-repause-promote")
+			r := admitRun(t, ctx, subject.Store, run("run-repause-promote", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			admitted, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-repause-promote", r, 1, at),
+				UserMessages: []session.Message{message("turn-repause-promote-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-repause-promote-started", r, "turn-repause-promote", at),
+			})
+			if err != nil {
+				t.Fatalf("admit turn: %v", err)
+			}
+			cp1 := stagedCheckpoint(r, 1, "cp-repause-promote-1", session.CheckpointKindLoop, []byte("bytes-1"), at)
+			if _, err := execution.StageCheckpoint(ctx, session.StageCheckpointRequest{Checkpoint: cp1}); err != nil {
+				t.Fatalf("stage checkpoint 1: %v", err)
+			}
+			pauseEvent := runPausedEvent("run-repause-promote-pause-event", r, at.Add(time.Second))
+			if _, err := execution.PromotePause(ctx, session.PromotePauseRequest{Revision: 1, TurnID: admitted.Turn.ID, Event: pauseEvent}); err != nil {
+				t.Fatalf("promote pause: %v", err)
+			}
+			// A second process reclaims (as reconcileCrashedRun's own
+			// ClaimRun does), reconciles the dangling turn interrupted --
+			// already durably TurnInterrupted from the promote above, so
+			// this is the ReconcileInterruptedTurn idempotent-replay branch
+			// here, standing in for a genuinely dangling turn from a later
+			// crash -- and stages a fresh checkpoint revision for it.
+			claimed, err := subject.Store.ClaimRun(ctx, session.RunClaim{RunID: r.ID, OwnerID: "reconciler", ClaimToken: "reconcile-token", LeaseDuration: time.Minute})
+			if err != nil {
+				t.Fatalf("claim paused run: %v", err)
+			}
+			reconcileExecution := executionFor(subject.Store, claimed)
+			cp2 := stagedCheckpoint(claimed, 2, "cp-repause-promote-2", session.CheckpointKindLoop, []byte("bytes-2"), at.Add(2*time.Second))
+			if _, err := reconcileExecution.StageCheckpoint(ctx, session.StageCheckpointRequest{Checkpoint: cp2}); err != nil {
+				t.Fatalf("stage checkpoint 2: %v", err)
+			}
+			repauseEvent := runPausedEvent("run-repause-promote-repause-event", claimed, at.Add(3*time.Second))
+			result, err := reconcileExecution.RepauseRun(ctx, session.RepauseRunRequest{Event: repauseEvent, PromoteRevision: 2})
+			if err != nil {
+				t.Fatalf("repause run with promote revision: %v", err)
+			}
+			if result.Run.Status != session.RunPaused {
+				t.Fatalf("repaused run status = %q", result.Run.Status)
+			}
+			promoted, found, err := subject.Store.ReadPromotedCheckpoint(ctx, r.ID)
+			if err != nil || !found || promoted.Revision != 2 || string(promoted.Bytes) != "bytes-2" || !promoted.Promoted {
+				t.Fatalf("read promoted checkpoint after repause-promote = %#v, %v, %v, want revision 2 promoted", promoted, found, err)
+			}
+			// A fresh claim succeeds immediately, exactly as after any
+			// other durable pause.
+			reclaimed, err := subject.Store.ClaimRun(ctx, session.RunClaim{RunID: r.ID, OwnerID: "resumer-3", ClaimToken: "resume-token-3", LeaseDuration: time.Minute})
+			if err != nil || reclaimed.Status != session.RunRunning {
+				t.Fatalf("reclaim after repause-promote = %#v, %v", reclaimed, err)
+			}
+		})
+
+		t.Run("repause run rejects a promote revision that was never staged", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-repause-promote-missing")
+			r := admitRun(t, ctx, subject.Store, run("run-repause-promote-missing", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			if _, err := execution.AdmitTurn(ctx, session.AdmitTurnRequest{
+				Turn:         buildTurn("turn-repause-promote-missing", r, 1, at),
+				UserMessages: []session.Message{message("turn-repause-promote-missing-user", s.ID, r.ID, session.RoleUser)},
+				Event:        turnStartedEvent("turn-repause-promote-missing-started", r, "turn-repause-promote-missing", at),
+			}); err != nil {
+				t.Fatalf("admit turn: %v", err)
+			}
+			event := runPausedEvent("run-repause-promote-missing-event", r, at.Add(time.Second))
+			if _, err := execution.RepauseRun(ctx, session.RepauseRunRequest{Event: event, PromoteRevision: 7}); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("repause run with an unstaged promote revision = %v, want ErrConflict", err)
+			}
+		})
+
 		t.Run("observation shows paused runs as nonterminal", func(t *testing.T) {
 			subject := setup(t, factory)
 			ctx := context.Background()

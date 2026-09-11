@@ -351,7 +351,7 @@ func TestResumeReclaimsLeaseExpiredRunningRunWithPromotedCheckpoint(t *testing.T
 		t.Fatalf("marshalEmptyLoopCheckpoint: %v", err)
 	}
 	envelopeBytes, err := encodeCheckpointEnvelope(adkCheckpointEnvelope{
-		EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, Payload: payload,
+		EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, TurnID: admittedTurn.Turn.ID, Payload: payload,
 	})
 	if err != nil {
 		t.Fatalf("encodeCheckpointEnvelope: %v", err)

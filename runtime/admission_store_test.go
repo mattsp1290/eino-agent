@@ -1116,6 +1116,15 @@ func (s *fakeExecutionStore) RepauseRun(_ context.Context, request session.Repau
 	if err := session.ValidateRepauseRun(run, request); err != nil {
 		return session.RepauseRunResult{}, err
 	}
+	if request.PromoteRevision > 0 {
+		key := fakeCheckpointKey{RunID: run.ID, Revision: request.PromoteRevision}
+		checkpoint, ok := s.checkpoints[key]
+		if !ok {
+			return session.RepauseRunResult{}, session.ErrConflict
+		}
+		checkpoint.Promoted = true
+		s.checkpoints[key] = checkpoint
+	}
 	run.Status = session.RunPaused
 	run.LeaseUntil = time.Time{}
 	s.runs[run.ID] = run

@@ -461,7 +461,27 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 			ID: o.ids.NewEventID(), SessionID: run.SessionID, RunID: run.ID, EpochID: run.ContextEpoch,
 			Kind: session.RunPausedEventKind, CreatedAt: o.now(),
 		}
-		if _, err := execution.store.RepauseRun(ctx, session.RepauseRunRequest{Event: event}); err != nil {
+		request := session.RepauseRunRequest{Event: event}
+		if dangling.ID != "" {
+			// Round-five reconciliation item 2 (TR-I1): the previously
+			// promoted revision may belong to an older, already-superseded
+			// turn -- or to no turn ResumeRun's own TurnID-consistency
+			// check would now accept at all. Stage a fresh, correctly
+			// turn-identified Kind=loop checkpoint for the JUST-reconciled
+			// turn and promote it instead, so a later ResumeRun reads a
+			// consistent state. dangling is already durably TurnInterrupted
+			// by this point (ReconcileInterruptedTurn above), so
+			// PromotePause's own turn-interrupt precondition (admitted/
+			// running) no longer holds -- RepauseRun's PromoteRevision is
+			// what promotes it here instead.
+			checkpoints := newAdkCheckpointStore(o, execution, execution.plan, run.ID)
+			checkpoints.setCurrentTurnID(dangling.ID)
+			if err := checkpoints.stageLoopCheckpoint(ctx); err != nil {
+				return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+			}
+			request.PromoteRevision = checkpoints.lastStaged
+		}
+		if _, err := execution.store.RepauseRun(ctx, request); err != nil {
 			return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 		}
 		return Result{RunID: run.ID, Status: session.RunPaused}

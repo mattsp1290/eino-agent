@@ -166,6 +166,7 @@ func (o *StreamingOrchestrator) Start(ctx context.Context, request Request) (Han
 	}
 	ownershipTransferred = true
 	checkpoints := newAdkCheckpointStore(o, execution, plan, admitted.Run.ID)
+	coordinator.checkpoints = checkpoints
 	entry := o.prepareTurnLoop(coordinator, checkpoints)
 	// Pushed synchronously, before Run: TurnLoop buffers a Push issued
 	// before Run() and processes it in order once Run is called (its

@@ -55,6 +55,21 @@ type turnLoopCoordinator struct {
 	resolved       model.Resolved
 	historyOptions history.Options
 	epochID        session.EpochID
+	// checkpoints is this run's checkpoint store adapter, set once right
+	// after construction (see Start/ResumeRun's own construction sites).
+	// setEngine keeps its currentTurnID in sync with whichever turn is
+	// currently being driven, so every checkpoint revision it stages
+	// records the turn it actually belongs to (round-five reconciliation
+	// item 2/TR-I1).
+	checkpoints *adkCheckpointStore
+	// resumedFromCheckpoint is true only for a ResumeRun-driven coordinator
+	// (never a fresh Start's): only a resumed run can possibly have an
+	// already-promoted checkpoint for completeTurn's retireOwnStaleCheckpoint
+	// to find and retire. Gating on it keeps a fresh Start's overwhelmingly
+	// common case (no promoted checkpoint ever exists yet) from paying an
+	// extra ReadPromotedCheckpoint round trip on every single turn
+	// completion.
+	resumedFromCheckpoint bool
 
 	mu                sync.Mutex
 	ordinal           int64
@@ -159,6 +174,14 @@ func (c *turnLoopCoordinator) setEngine(e *adkEngine) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.engine = e
+	// Keep the checkpoint store's currentTurnID in sync with whichever
+	// turn's engine is now live: every Set call upstream ADK makes from
+	// here on -- a periodic tool-boundary checkpoint or a genuine
+	// tool-interrupt pause -- stages an envelope recording THIS turn
+	// (round-five reconciliation item 2/TR-I1).
+	if c.checkpoints != nil && e != nil {
+		c.checkpoints.setCurrentTurnID(e.turn.ID)
+	}
 }
 
 func (c *turnLoopCoordinator) setResumeTargets(targets map[string]any) {
@@ -763,7 +786,38 @@ func (c *turnLoopCoordinator) completeTurn(ctx context.Context, engine *adkEngin
 	// usage, not just the last one's (see finishedRunUsage's doc comment).
 	c.addRunUsage(usage)
 	c.execution.publishPersisted(ctx, result.Event)
+	if c.resumedFromCheckpoint {
+		c.retireOwnStaleCheckpoint(ctx, engine.turn.ID)
+	}
 	return nil
+}
+
+// retireOwnStaleCheckpoint retires the run's currently-promoted checkpoint
+// immediately once completedTurnID's own turn durably completes, when that
+// checkpoint's envelope records THIS turn as the one it belongs to (round-
+// five reconciliation item 2/TR-I1): a checkpoint whose runner state
+// belongs to a turn that has since completed must never be replayed by a
+// later resume. Retiring it here, right after CompleteTurn commits, closes
+// the window a crash landing between this turn's completion and this same
+// Run() call's own eventual clean exit (upstream's Delete, or this
+// coordinator's own settlement) would otherwise leave open -- reconcileCrashedRun's
+// own fresh-checkpoint staging for a later dangling turn (interrupt.go) is
+// the complementary defensive brace if a crash lands before this
+// retirement itself commits. Best-effort: a failure here is a durable-
+// state hygiene miss, not a correctness violation -- ResumeRun's own
+// TurnID-consistency check is the backstop that actually prevents a stale
+// checkpoint from ever being misused -- so it must never fail this turn's
+// completion, which has already durably committed by the time this runs.
+func (c *turnLoopCoordinator) retireOwnStaleCheckpoint(ctx context.Context, completedTurnID session.TurnID) {
+	checkpoint, ok, err := c.host.store.ReadPromotedCheckpoint(ctx, c.runID)
+	if err != nil || !ok {
+		return
+	}
+	envelope, err := decodeCheckpointEnvelope(checkpoint.Bytes)
+	if err != nil || envelope.TurnID != completedTurnID {
+		return
+	}
+	_ = c.execution.store.RetireCheckpoints(ctx, checkpoint.Revision)
 }
 
 // planFingerprint derives the checkpoint envelope fingerprint from the run's
@@ -1272,27 +1326,26 @@ func (o *StreamingOrchestrator) settleCleanRunCompletion(settleCtx context.Conte
 // GenResume) and a degenerate, content-free turn is admitted purely to carry
 // PromotePause's required turn identity, then immediately interrupted.
 func (o *StreamingOrchestrator) promoteQueuedContinuation(ctx context.Context, c *turnLoopCoordinator, checkpoints *adkCheckpointStore) error {
-	// A between-turn stop with UnhandledItems (finishTurnLoop's dedicated
-	// branch) always has a real staged revision here: upstream's own
-	// isIdle/shouldSaveCheckpoint computation treats unhandled items as
-	// non-idle and calls this adapter's Set before returning. A clean idle
-	// exit that only discovered late items after upstream's cleanup ran
-	// (finishTurnLoop's default-branch caller) is idle by that same
-	// computation -- late items are not unhandled -- so upstream never
-	// staged anything and checkpoints.lastStaged is still 0. Stage this
-	// adapter's own Kind=loop "between turns, no runner state" revision in
-	// that case so PromotePause below always has a real revision to
-	// promote: promoting revision 0 fails ErrNotFound -> ErrConflict,
-	// leaving the run durably `running` with the heartbeat already stopped
-	// and no driver, recoverable only by lease expiry -- strictly worse
-	// than the terminal completion this pause is meant to avoid.
-	if checkpoints.lastStaged == 0 {
-		if err := checkpoints.stageLoopCheckpoint(ctx); err != nil {
-			return err
-		}
-	}
 	engine, err := c.admitTurn(ctx, nil)
 	if err != nil {
+		return err
+	}
+	// Always stage a FRESH Kind=loop "between turns, no runner state"
+	// revision for this carrier turn, never trust whatever upstream's own
+	// Set call staged (round-five reconciliation item 2/TR-I1): upstream's
+	// own isIdle/shouldSaveCheckpoint computation may already have called
+	// Set with real UnhandledItems before finishTurnLoop's branch ever
+	// runs, but that call necessarily happened BEFORE this carrier turn
+	// was admitted, so its envelope cannot carry the carrier's TurnID --
+	// promoting it as-is would later fail ResumeRun's TurnID-consistency
+	// check (see ResumeRun) against a perfectly legitimate pause. The
+	// queued items such a stale envelope would have carried in
+	// UnhandledItems are redelivered anyway, independently, by ResumeRun's
+	// own drainQueuedInbox (they remain durably `queued` throughout); this
+	// adapter's own empty shape carries none, by design (see
+	// stageLoopCheckpoint).
+	checkpoints.setCurrentTurnID(engine.turn.ID)
+	if err := checkpoints.stageLoopCheckpoint(ctx); err != nil {
 		return err
 	}
 	event := session.EventRecord{
@@ -1631,6 +1684,7 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	}
 	var maxOrdinal int64
 	var pendingReconciled session.Turn
+	var newestNonCompleted session.Turn
 	for _, t := range turns {
 		if t.Ordinal > maxOrdinal {
 			maxOrdinal = t.Ordinal
@@ -1638,6 +1692,24 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		if t.State == session.TurnInterrupted && t.Ordinal >= pendingReconciled.Ordinal {
 			pendingReconciled = t
 		}
+		if t.State != session.TurnCompleted && t.Ordinal >= newestNonCompleted.Ordinal {
+			newestNonCompleted = t
+		}
+	}
+	// Round-five reconciliation item 2 (TR-I1): a promoted checkpoint whose
+	// recorded turn does not match the run's newest non-completed turn must
+	// never be replayed -- it belongs to a turn that has since completed
+	// (or, degenerate, to no currently-pending turn at all), and resuming
+	// from it anyway can silently redrive the WRONG turn's identity
+	// (reproduced: a genuine tool-interrupt pause's real ADK runner state,
+	// replayed under a LATER crash-reconciled turn's bookkeeping, because
+	// resumeEngine's own target selection has no way to notice the
+	// mismatch). Refuse closed here, before ever claiming the fence: the
+	// run is left exactly as paused as GetRun found it above, with a clear
+	// error, rather than corrupting turn identity.
+	if envelope.TurnID != newestNonCompleted.ID {
+		return nil, fmt.Errorf("%w: run %s has a promoted checkpoint recorded for turn %s, but its newest non-completed turn is %s",
+			ErrInvalidOrchestrator, runID, envelope.TurnID, newestNonCompleted.ID)
 	}
 	// A crash-reconciled interrupted turn with real, already-committed
 	// content (round-four reconciliation item 1/CR-C1) must be redriven
@@ -1714,9 +1786,11 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	coordinator := &turnLoopCoordinator{
 		host: o, execution: execution, plan: plan, sessionID: claimed.SessionID, runID: claimed.ID,
 		config: cfg, resolved: resolved, historyOptions: o.history, epochID: claimed.ContextEpoch, ordinal: maxOrdinal,
+		resumedFromCheckpoint: true,
 	}
 	coordinator.setResumeTargets(request.Targets)
 	checkpoints := newAdkCheckpointStore(o, execution, plan, runID)
+	coordinator.checkpoints = checkpoints
 	// The resumed run gets its own cancellable context, detached from the
 	// caller's (possibly request-scoped) ctx: Handle.Interrupt must be able
 	// to cancel it, and a resumed run must not die when an HTTP handler's

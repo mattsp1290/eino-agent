@@ -62,6 +62,23 @@ type adkCheckpointStore struct {
 	// redundant read when Set already established the boundary in this
 	// process.
 	lastStaged int64
+	// currentTurnID is stamped into every envelope this adapter stages
+	// (round-five reconciliation item 2/TR-I1): the coordinator keeps it in
+	// sync with whichever turn's adkEngine is currently set (see
+	// turnLoopCoordinator.setEngine), so a Set call upstream ADK makes
+	// mid-dispatch -- whether a periodic tool-boundary checkpoint or a
+	// genuine tool-interrupt pause -- always records the turn it actually
+	// belongs to. A promoted checkpoint's own TurnID is what lets ResumeRun
+	// refuse to replay one whose turn has since completed, instead of
+	// silently redriving the wrong turn's identity (see ResumeRun and
+	// resumeEngine).
+	currentTurnID session.TurnID
+}
+
+// setCurrentTurnID records which turn's checkpoint state this adapter's
+// NEXT stage call belongs to. See currentTurnID's doc comment.
+func (s *adkCheckpointStore) setCurrentTurnID(id session.TurnID) {
+	s.currentTurnID = id
 }
 
 var (
@@ -76,7 +93,14 @@ type adkCheckpointEnvelope struct {
 	EinoVersion  string
 	CodecVersion int
 	Fingerprint  string
-	Payload      []byte
+	// TurnID is the durable turn this checkpoint revision belongs to
+	// (round-five reconciliation item 2/TR-I1) -- see adkCheckpointStore's
+	// currentTurnID doc comment for how it is populated. ResumeRun
+	// validates it against the run's newest non-completed turn before ever
+	// claiming the run's fence, and completeTurn retires a promoted
+	// checkpoint whose TurnID matches the turn that just completed.
+	TurnID  session.TurnID
+	Payload []byte
 }
 
 func (s *adkCheckpointStore) nextRevision(ctx context.Context) (int64, error) {
@@ -156,12 +180,15 @@ func (s *adkCheckpointStore) stageLoopCheckpoint(ctx context.Context) error {
 // stale row from a crashed prior attempt exactly as Set's own doc comment
 // describes.
 func (s *adkCheckpointStore) stage(ctx context.Context, checkPointID string, kind session.CheckpointKind, payload []byte) error {
+	if s.currentTurnID == "" {
+		return fmt.Errorf("adk checkpoint store: staging revision for run %s with no current turn ID set", s.runID)
+	}
 	revision, err := s.stagedRevision(ctx)
 	if err != nil {
 		return err
 	}
 	trustedSequence := s.lastStaged > 0
-	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: s.fingerprint, Payload: payload}
+	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: s.fingerprint, TurnID: s.currentTurnID, Payload: payload}
 	raw, err := encodeCheckpointEnvelope(envelope)
 	if err != nil {
 		return err
@@ -276,7 +303,7 @@ func decodeCheckpointEnvelope(raw []byte) (adkCheckpointEnvelope, error) {
 	if err := decoder.Decode(&envelope); err != nil {
 		return adkCheckpointEnvelope{}, fmt.Errorf("%w: %v", ErrCheckpointMalformed, err)
 	}
-	if envelope.EinoVersion == "" || envelope.CodecVersion <= 0 || envelope.Fingerprint == "" || len(envelope.Payload) == 0 {
+	if envelope.EinoVersion == "" || envelope.CodecVersion <= 0 || envelope.Fingerprint == "" || envelope.TurnID == "" || len(envelope.Payload) == 0 {
 		return adkCheckpointEnvelope{}, ErrCheckpointMalformed
 	}
 	return envelope, nil

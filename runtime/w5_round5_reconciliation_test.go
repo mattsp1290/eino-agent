@@ -109,9 +109,14 @@ func TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems(t *tes
 
 	// Stage + promote a Kind=loop checkpoint whose UnhandledItems still
 	// names the queued item -- upstream's real shape for a between-turn
-	// stop with input still buffered but undispatched.
+	// stop with input still buffered but undispatched. Its envelope TurnID
+	// (round-five reconciliation item 2/TR-I1) names the turn admitted
+	// below, ahead of when that turn exists: ResumeRun validates this
+	// field against the run's newest non-completed turn, which this turn
+	// becomes once reconciled, so the envelope must already agree by then.
+	const reconciledTurnID session.TurnID = "stale-reconciled-turn"
 	payload := gobEncodeTurnLoopCheckpointShape(t, turnLoopCheckpointShape{UnhandledItems: []session.InboxID{item.ID}})
-	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, Payload: payload}
+	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, TurnID: reconciledTurnID, Payload: payload}
 	raw, err := encodeCheckpointEnvelope(envelope)
 	if err != nil {
 		t.Fatalf("encodeCheckpointEnvelope: %v", err)
@@ -147,13 +152,13 @@ func TestResumeRunRedrivesReconciledTurnPastStaleCheckpointUnhandledItems(t *tes
 	reconciledAssistantID := session.MessageID("stale-reconciled-assistant")
 	admitResult, err := execution1.AdmitTurn(ctx, session.AdmitTurnRequest{
 		Turn: session.Turn{
-			ID: "stale-reconciled-turn", RunID: runID, SessionID: sessionID, Ordinal: 2, State: session.TurnAdmitted,
+			ID: reconciledTurnID, RunID: runID, SessionID: sessionID, Ordinal: 2, State: session.TurnAdmitted,
 			UserMessageIDs: []session.MessageID{"stale-user-1"}, AssistantMessageID: reconciledAssistantID, CreatedAt: orch.now(),
 		},
 		UserMessages:         []session.Message{{ID: "stale-user-1", SessionID: sessionID, RunID: runID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
 		UserParts:            userParts,
 		AssistantPlaceholder: session.Message{ID: reconciledAssistantID, SessionID: sessionID, RunID: runID, Role: session.RoleAssistant, CreatedAt: orch.now(), UpdatedAt: orch.now()},
-		Event:                session.EventRecord{ID: "stale-reconciled-started", SessionID: sessionID, RunID: runID, TurnID: "stale-reconciled-turn", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
+		Event:                session.EventRecord{ID: "stale-reconciled-started", SessionID: sessionID, RunID: runID, TurnID: reconciledTurnID, Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
 		InboxIDs:             []session.InboxID{item.ID},
 	})
 	if err != nil {
@@ -299,7 +304,7 @@ func TestResumeRunAllStaleCheckpointBatchCompletesRatherThanFailing(t *testing.T
 		t.Fatalf("AdmitTurn (carrier): %v", err)
 	}
 	payload := gobEncodeTurnLoopCheckpointShape(t, turnLoopCheckpointShape{UnhandledItems: []session.InboxID{item.ID}})
-	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, Payload: payload}
+	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, TurnID: carrierResult.Turn.ID, Payload: payload}
 	raw, err := encodeCheckpointEnvelope(envelope)
 	if err != nil {
 		t.Fatalf("encodeCheckpointEnvelope: %v", err)
@@ -325,5 +330,218 @@ func TestResumeRunAllStaleCheckpointBatchCompletesRatherThanFailing(t *testing.T
 	final := <-resumeHandle.Done()
 	if final.Status != session.RunCompleted || final.Error != nil {
 		t.Fatalf("ResumeRun result = %+v, want completed with no error (an all-stale batch must not fail the run)", final)
+	}
+}
+
+// TestResumeRunRefusesCheckpointForATurnThatHasSinceCompleted proves round-
+// five reconciliation item 2 (TR-I1): "a promoted checkpoint whose runner
+// state belongs to a turn that has since completed must never be
+// replayed." Direct construction (bypassing completeTurn's own belt-
+// retirement, which this same item also adds -- see
+// TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately) proves the
+// braces: ResumeRun's TurnID-consistency check is what actually stops a
+// stale checkpoint from ever being misused, independent of whether
+// anything upstream remembered to retire it.
+func TestResumeRunRefusesCheckpointForATurnThatHasSinceCompleted(t *testing.T) {
+	ctx := context.Background()
+	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		t.Fatal("model must never be dispatched: ResumeRun must refuse before ever claiming the run")
+		return nil, nil
+	}))
+	defer cleanup()
+
+	sessionID := session.ID("stale-turnid-session")
+	newTestSession(t, ctx, orch, sessionID)
+	plan := newTestToolPlan(staticToolRegistry{})
+	fingerprint := planFingerprint(plan)
+
+	admittedRun, err := orch.store.AdmitRun(ctx, session.Run{
+		ID: "stale-turnid-run", SessionID: sessionID, OwnerID: "owner-0", ClaimToken: "claim-0",
+		Agent: "default", ProviderID: "test", ModelID: "test", Status: session.RunPending, CreatedAt: orch.now(),
+		ExtensionPlan: plan.Descriptor(),
+	}, time.Minute)
+	if err != nil {
+		t.Fatalf("AdmitRun: %v", err)
+	}
+	runID := admittedRun.ID
+	execution0 := orch.store.Execution(session.RunFence{RunID: runID, ClaimToken: admittedRun.ClaimToken})
+	if _, err := execution0.StartRun(ctx, orch.now()); err != nil {
+		t.Fatalf("StartRun: %v", err)
+	}
+	userParts := crashUserParts(t, "stale-turnid-user-1", "stale-turnid-user-1", sessionID, runID, "hello", orch.now())
+	assistantID := session.MessageID("stale-turnid-assistant-1")
+	admitted, err := execution0.AdmitTurn(ctx, session.AdmitTurnRequest{
+		Turn: session.Turn{
+			ID: "stale-turnid-turn-1", RunID: runID, SessionID: sessionID, Ordinal: 1, State: session.TurnAdmitted,
+			UserMessageIDs: []session.MessageID{"stale-turnid-user-1"}, AssistantMessageID: assistantID, CreatedAt: orch.now(),
+		},
+		UserMessages:         []session.Message{{ID: "stale-turnid-user-1", SessionID: sessionID, RunID: runID, Role: session.RoleUser, CreatedAt: orch.now(), UpdatedAt: orch.now()}},
+		UserParts:            userParts,
+		AssistantPlaceholder: session.Message{ID: assistantID, SessionID: sessionID, RunID: runID, Role: session.RoleAssistant, CreatedAt: orch.now(), UpdatedAt: orch.now()},
+		Event:                session.EventRecord{ID: "stale-turnid-turn-1-started", SessionID: sessionID, RunID: runID, TurnID: "stale-turnid-turn-1", Kind: session.TurnStartedEventKind, Payload: []byte(`{}`), CreatedAt: orch.now()},
+	})
+	if err != nil {
+		t.Fatalf("AdmitTurn: %v", err)
+	}
+
+	// Promote a checkpoint recorded for this turn -- a genuine, correctly
+	// turn-identified pause, exactly like a real tool-interrupt.
+	payload := gobEncodeTurnLoopCheckpointShape(t, turnLoopCheckpointShape{})
+	envelope := adkCheckpointEnvelope{EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, Fingerprint: fingerprint, TurnID: admitted.Turn.ID, Payload: payload}
+	raw, err := encodeCheckpointEnvelope(envelope)
+	if err != nil {
+		t.Fatalf("encodeCheckpointEnvelope: %v", err)
+	}
+	if _, err := execution0.StageCheckpoint(ctx, session.StageCheckpointRequest{Checkpoint: session.Checkpoint{
+		RunID: runID, Revision: 1, Kind: session.CheckpointKindLoop, AgentFingerprint: fingerprint,
+		EinoVersion: EinoPinnedVersion, CodecVersion: adkCheckpointCodecVersion, CheckpointID: string(runID),
+		Bytes: raw, CreatedAt: orch.now(),
+	}}); err != nil {
+		t.Fatalf("StageCheckpoint: %v", err)
+	}
+	if _, err := execution0.PromotePause(ctx, session.PromotePauseRequest{
+		Revision: 1, TurnID: admitted.Turn.ID,
+		Event: session.EventRecord{ID: "stale-turnid-paused-1", SessionID: sessionID, RunID: runID, Kind: session.RunPausedEventKind, CreatedAt: orch.now()},
+	}); err != nil {
+		t.Fatalf("PromotePause: %v", err)
+	}
+
+	// The turn is later completed under a DIFFERENT reclaim -- as if it had
+	// been genuinely redriven and finished -- WITHOUT that reclaim's own
+	// completeTurn ever having a chance to retire the checkpoint above
+	// (this test constructs the completion directly, bypassing that path,
+	// precisely to isolate ResumeRun's OWN defense).
+	claimed, err := orch.store.ClaimRun(ctx, session.RunClaim{RunID: runID, OwnerID: "owner-1", ClaimToken: "claim-1", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatalf("ClaimRun: %v", err)
+	}
+	execution1 := orch.store.Execution(session.RunFence{RunID: runID, ClaimToken: claimed.ClaimToken})
+	if _, err := execution1.CompleteTurn(ctx, session.CompleteTurnRequest{
+		TurnID: admitted.Turn.ID, ResponseMessageIDs: []session.MessageID{assistantID},
+		Event: session.EventRecord{ID: "stale-turnid-completed-1", SessionID: sessionID, RunID: runID, MessageID: assistantID, TurnID: admitted.Turn.ID, Kind: session.TurnCompletedEventKind, CreatedAt: orch.now()},
+	}); err != nil {
+		t.Fatalf("CompleteTurn: %v", err)
+	}
+	if _, err := execution1.RepauseRun(ctx, session.RepauseRunRequest{
+		Event: session.EventRecord{ID: "stale-turnid-repaused-1", SessionID: sessionID, RunID: runID, Kind: session.RunPausedEventKind, CreatedAt: orch.now()},
+	}); err != nil {
+		t.Fatalf("RepauseRun: %v", err)
+	}
+
+	// The promoted checkpoint (revision 1, TurnID=turn-1) is now stale:
+	// turn-1 is TurnCompleted, and there is no other turn at all. ResumeRun
+	// must refuse rather than claim the fence and replay it.
+	if _, err := orch.ResumeRun(ctx, runID, ResumeRequest{}); err == nil {
+		t.Fatal("ResumeRun over a checkpoint recorded for a since-completed turn = nil error, want ErrInvalidOrchestrator")
+	}
+	run, err := orch.store.GetRun(ctx, runID)
+	if err != nil || run.Status != session.RunPaused {
+		t.Fatalf("run after refused ResumeRun = %+v, err=%v, want still paused", run, err)
+	}
+}
+
+// TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately proves round-
+// five reconciliation item 2 (TR-I1)'s belt: a checkpoint recorded for a
+// turn is retired IMMEDIATELY once that turn durably completes -- as part
+// of completeTurn's own call -- not left for this Run() call's own eventual
+// clean exit (upstream's Delete cleanup would also retire it, but only once
+// the WHOLE call finally stops). The second turn's own model dispatch is
+// gated so the test can inspect durable state WHILE Run() is still active
+// (Delete has not run yet), isolating completeTurn's own retirement from
+// Delete's: without the belt, the first turn's checkpoint would still be
+// sitting there, promoted, at this exact point.
+func TestCompleteTurnRetiresItsOwnPromotedCheckpointImmediately(t *testing.T) {
+	var executions int
+	gate := Tool{
+		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"},
+		InterruptPolicy: pausingInterruptPolicy{},
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executions++
+			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
+		}),
+	}
+	secondTurnDispatched := make(chan struct{})
+	releaseSecondTurn := make(chan struct{})
+	var calls int
+	orch, cleanup := newSQLiteTestOrchestrator(t, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		calls++
+		switch calls {
+		case 1:
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "gate", `{}`))}, nil
+		case 2:
+			return []*einoschema.AgenticMessage{agenticAssistantText("first turn done")}, nil
+		case 3:
+			// The second turn's OWN dispatch: block here so the test can
+			// inspect durable state while Run() is still active -- the
+			// first turn has already completed (CompleteTurn committed
+			// above, case 2), but Run() has not exited, so upstream's own
+			// Delete cleanup has not run yet either.
+			close(secondTurnDispatched)
+			<-releaseSecondTurn
+			return []*einoschema.AgenticMessage{agenticAssistantText("second turn done")}, nil
+		default:
+			t.Fatal("unexpected extra model dispatch")
+			return nil, nil
+		}
+	}))
+	defer cleanup()
+	configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
+
+	sessionID := session.ID("retire-belt-session")
+	handle, err := orch.Start(context.Background(), Request{SessionID: sessionID, Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunPaused || !result.Interrupted {
+		t.Fatalf("result = %+v", result)
+	}
+	pause, ok := <-handle.AwaitPause()
+	if !ok || len(pause.InterruptContexts) != 1 {
+		t.Fatalf("pause = %+v, ok=%v", pause, ok)
+	}
+	staged, found, err := orch.store.ReadPromotedCheckpoint(context.Background(), result.RunID)
+	if err != nil || !found {
+		t.Fatalf("promoted checkpoint before resume: found=%v err=%v", found, err)
+	}
+	// A second item, still queued through the pause, so the resumed run
+	// admits a genuinely SECOND turn immediately after the first completes
+	// -- in the SAME Run() call, before it ever exits.
+	if _, err := orch.Enqueue(context.Background(), sessionID, EnqueueRequest{
+		RunID: result.RunID, IdempotencyKey: "retire-belt-key", Message: TextUserMessage("second message"),
+	}); err != nil {
+		t.Fatalf("Enqueue error = %v", err)
+	}
+
+	resumeHandle, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{
+		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
+	})
+	if err != nil {
+		t.Fatalf("ResumeRun error = %v", err)
+	}
+	select {
+	case <-secondTurnDispatched:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second turn's model dispatch never reached")
+	}
+	// The first turn's checkpoint (staged.Revision) must ALREADY be gone --
+	// retired by completeTurn immediately once that turn completed, not
+	// deferred to Run()'s own eventual clean exit, which has not happened
+	// yet (this goroutine is still blocking the second turn's dispatch).
+	_, stillFound, err := orch.store.ReadPromotedCheckpoint(context.Background(), result.RunID)
+	if err != nil {
+		t.Fatalf("ReadPromotedCheckpoint mid-cycle: %v", err)
+	}
+	if stillFound {
+		t.Fatalf("promoted checkpoint (revision %d) still present after its turn completed but before Run() exited, want already retired", staged.Revision)
+	}
+	close(releaseSecondTurn)
+
+	resumed := <-resumeHandle.Done()
+	if resumed.Status != session.RunCompleted || resumed.Error != nil {
+		t.Fatalf("resumed result = %+v", resumed)
+	}
+	if executions != 1 {
+		t.Fatalf("tool executions after resume = %d, want 1", executions)
 	}
 }
