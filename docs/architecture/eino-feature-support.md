@@ -1982,13 +1982,22 @@ below.
   id resolve to two different messages with no error, or masking a
   genuinely unresolved durable message so the fail-closed check above never
   fires (round-four W6 correlation-and-seal review, Important #1).
-  Summarization generates a summary at most once per turn
+  Summarization generates a summary at most once per live turn execution
   (`summarizeAtMostOnceMiddleware`): upstream re-evaluates its own trigger
   condition on every ReAct cycle with no per-call override, so without this
   a multi-cycle turn that crosses the threshold once would re-summarize --
   and re-bill a real summary generation call -- on every later cycle of the
   same turn (round-three W6 summarization-correctness review, Important
-  #2). Bounding GENERATION to once per turn does not mean the model sees
+  #2). The bound is per execution, not per turn id: the guard lives on the
+  engine (`adkEngine`'s `summarized*` fields, set by `markSummarized`) and
+  `resumeEngine` constructs a fresh engine, so a turn paused and resumed --
+  or redriven after a crash -- while still above the threshold can generate
+  and bill a second summary and commit a second `ContextEpoch` for the SAME
+  turn. That is a known open defect (`eino-agent-5g3`, raised as S1 by the
+  round-four W6 correlation-and-seal review and deferred with the
+  coordinator's agreement), not a guarantee; closing it needs the guard
+  keyed off a durable per-turn fact, such as an epoch recorded against the
+  turn id, so it survives `ResumeRun`. Bounding GENERATION to once per turn does not mean the model sees
   the full, uncompacted baseline again on later cycles: doing so measured
   as per-cycle message counts regrowing from a compacted 1 back up to 10
   across five cycles of the same tool loop (round-four W6

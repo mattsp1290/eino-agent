@@ -435,9 +435,14 @@ func TestComposedExampleMountsAllEightRecipesInOneRunPlan(t *testing.T) {
 	// mount2 registers all eight recipes again for this turn, but nothing
 	// above checks that patchtoolcalls specifically survived that remount --
 	// the only patchtoolcalls-attributable evidence asserted so far
-	// (sawPatchRewriteEvent, below) is turn 1's own event, which the store's
-	// event log never scopes by turn, so it stays true even if patchtoolcalls
-	// were silently dropped from turn 2's plan. Turn 2's own admitted Run
+	// (sawPatchRewriteEvent, below) is turn 1's own event, and that scan is
+	// not turn-scoped. Durable events do carry a turn: session.EventRecord
+	// has a TurnID field and adk_model.go sets it on exactly this event
+	// kind. But it is a record-JSON-only correlation field with no column
+	// or index behind it, session.EventCursor exposes only AfterEventID and
+	// Limit, and the loop below never inspects TurnID -- so that assertion
+	// stays true even if patchtoolcalls were silently dropped from turn 2's
+	// plan. Turn 2's own admitted Run
 	// durably records its actual sealed AgentHandlers set (see
 	// session.AgentHandlerPlanIdentity, sealed once at admission by
 	// composition.Registry.AcquireRunPlan/runtime's extension_plan.go) --
@@ -474,8 +479,11 @@ func TestComposedExampleMountsAllEightRecipesInOneRunPlan(t *testing.T) {
 	}
 	// Exactly one, not merely "at least one": summarizeAtMostOnceMiddleware
 	// (round-three W6 summarization-correctness review, Important #2)
-	// bounds summarization to firing at most once per turn even though
-	// turn 2 has more than one ReAct cycle after the trigger fires.
+	// bounds summarization to firing at most once per live turn execution
+	// even though turn 2 has more than one ReAct cycle after the trigger
+	// fires. The guard is engine-scoped, so a paused-and-resumed or
+	// crash-redriven turn can still summarize a second time
+	// (eino-agent-5g3); this example never resumes.
 	if summarizationEpochCount != 1 {
 		t.Fatalf("summarization ContextEpoch count = %d, want exactly 1 among %+v", summarizationEpochCount, epochs)
 	}
