@@ -139,8 +139,8 @@ github.com/mattn/go-sqlite3 v1.14.22 h1:2gZY6PC6kBnID23Tichd1K+Z0oS6nE/XwU+Vz/5o
 github.com/mattn/go-sqlite3 v1.14.22/go.mod h1:Uh1q+B4BYcTPb+yiD3kU8Ct7aC0hY9fxUwlHK0RXw+Y=
 github.com/mattsp1290/ag-ui/sdks/community/go v0.0.0-20260909025854-aaa75b54d572 h1:ymOBlna6bESjwEgbyaaunIKrDNC5eytwhRcsYeBCNDI=
 github.com/mattsp1290/ag-ui/sdks/community/go v0.0.0-20260909025854-aaa75b54d572/go.mod h1:ERAMOexUee4AIuoxksuuGoEcHl3aqLwaazjGwlR9ZCI=
-github.com/mattsp1290/eino-agui v0.1.2-0.20260910172717-0e1d33d4f27f h1:madFWpbNQNZh8o0EcdTCxFINKxMfjAE2M02zwbC4Ink=
-github.com/mattsp1290/eino-agui v0.1.2-0.20260910172717-0e1d33d4f27f/go.mod h1:WJUgNHvrv+NsSO2sCr75CgB8BxVgebhB43GiXDQXGyE=
+github.com/mattsp1290/eino-agui v0.1.2-0.20260910210826-ed64f77f3f16 h1:DlwVUYzSDmYOO9oxyEygARKzSVxfpR7M4UqCyaM8v9o=
+github.com/mattsp1290/eino-agui v0.1.2-0.20260910210826-ed64f77f3f16/go.mod h1:WJUgNHvrv+NsSO2sCr75CgB8BxVgebhB43GiXDQXGyE=
 github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b h1:Wk0c8Baxm8DgT3B7iWPaOP1k2QKAoc20Wv6dEvebepc=
 github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b/go.mod h1:h2idE8ypJFzcq4eOKOXGPrx56UyhI+UwKkFUyN4L0o8=
 github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2 h1:vcAOW8f7dWOs3g6IwgKMTvYGpXGaSplaNrcXSh0K2Ko=

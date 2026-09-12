@@ -8,7 +8,7 @@ require (
 	github.com/eino-contrib/jsonschema v1.0.3
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0
-	github.com/mattsp1290/eino-agui v0.1.2-0.20260910172717-0e1d33d4f27f
+	github.com/mattsp1290/eino-agui v0.1.2-0.20260910210826-ed64f77f3f16
 	github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b
 	github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2
 	github.com/pressly/goose/v3 v3.27.3
