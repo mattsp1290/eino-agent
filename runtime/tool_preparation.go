@@ -118,6 +118,7 @@ func (o *StreamingOrchestrator) persistAssistantTurn(ctx context.Context, execut
 		return nil, err
 	}
 	o.sessionObserver.Hint(snapshot.SessionID)
+	o.publishMessageCommitted(ctx, execution, snapshot.SessionID, snapshot.RunID, messageID, snapshot.EpochID, snapshot.TurnID, snapshot.AgentPath)
 	for index := range calls {
 		calls[index].record = created[index].Call
 		calls[index].call.ResultMessageID = created[index].Call.ResultMessageID

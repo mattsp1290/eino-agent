@@ -238,7 +238,8 @@ func (b *adkApprovalBinding) commitResponse(ctx context.Context, store session.E
 		return err
 	}
 	if _, err := store.AppendMessage(ctx, session.Message{
-		ID: messageID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, Role: session.RoleUser, CreatedAt: at, UpdatedAt: at,
+		ID: messageID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, Role: session.RoleUser,
+		TurnID: m.engine.snapshot.TurnID, AgentPath: m.engine.agentPath, CreatedAt: at, UpdatedAt: at,
 	}); err != nil {
 		return err
 	}

@@ -77,6 +77,12 @@ type ToolSettlementInput struct {
 	BlockID string
 	// ContentLimits bounds the encoded result content. Required.
 	ContentLimits session.ContentLimits
+	// TurnID and AgentPath are stamped onto the settlement's ResultMessage
+	// (see session.Message.TurnID/AgentPath). Optional: a caller with no
+	// turn context (e.g. crash-reconciliation settling a tool with no live
+	// TurnSnapshot) may leave both empty.
+	TurnID    session.TurnID
+	AgentPath string
 }
 
 // BuildToolSettlement builds the canonical terminal call, result message, and
@@ -104,6 +110,8 @@ func buildToolSettlement(input ToolSettlementInput, messageAt time.Time) (sessio
 		MessageAt:     messageAt,
 		BlockID:       input.BlockID,
 		ContentLimits: input.ContentLimits,
+		TurnID:        input.TurnID,
+		AgentPath:     input.AgentPath,
 	})
 	if err != nil {
 		return session.ToolSettlement{}, ToolOutput{}, err
@@ -129,6 +137,9 @@ type terminalToolEnvelopeInput struct {
 	BlockID string
 	// ContentLimits bounds the encoded result content. Required.
 	ContentLimits session.ContentLimits
+	// TurnID and AgentPath are stamped onto ResultMessage. Optional.
+	TurnID    session.TurnID
+	AgentPath string
 }
 
 // buildTerminalToolEnvelope persists a tool result as a single
@@ -236,7 +247,8 @@ func buildTerminalToolEnvelope(input terminalToolEnvelopeInput) (session.ToolSet
 		CompletedAt: input.CompletedAt.UTC(),
 		ResultMessage: session.Message{
 			ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID,
-			Role: session.RoleUser, ModelID: input.ModelID, CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
+			Role: session.RoleUser, ModelID: input.ModelID, TurnID: input.TurnID, AgentPath: input.AgentPath,
+			CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
 		},
 		ResultPart: parts[0],
 	}

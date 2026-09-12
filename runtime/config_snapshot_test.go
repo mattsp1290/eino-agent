@@ -46,6 +46,7 @@ func TestFreezeTurnSnapshotClonesConfigAndMessages(t *testing.T) {
 		"run-1",
 		"session-1",
 		"epoch-1",
+		"turn-1",
 		cfg,
 		resolved,
 		messages,
@@ -83,7 +84,7 @@ func TestFreezeTurnSnapshotClonesConfigAndMessages(t *testing.T) {
 		frozen.Model.Model.Options["tier"] != "standard" {
 		t.Fatalf("frozen model mutated: %+v", frozen.Model)
 	}
-	if frozen.RunID != session.RunID("run-1") || frozen.SessionID != session.ID("session-1") {
-		t.Fatalf("frozen identity = %q/%q", frozen.RunID, frozen.SessionID)
+	if frozen.RunID != session.RunID("run-1") || frozen.SessionID != session.ID("session-1") || frozen.TurnID != session.TurnID("turn-1") {
+		t.Fatalf("frozen identity = %q/%q/%q", frozen.RunID, frozen.SessionID, frozen.TurnID)
 	}
 }

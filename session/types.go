@@ -164,6 +164,17 @@ type Message struct {
 	Role      Role
 	Agent     string
 	ModelID   string
+	// TurnID correlates this message to the durable turn that produced it,
+	// stamped at append time by every runtime call site that mints a
+	// Message. Record-JSON-only, like EventRecord.TurnID and
+	// ModelRequestRecord.TurnID: no column or index backs it.
+	TurnID TurnID
+	// AgentPath is the joined RunPath of the (sub)agent that produced this
+	// message, mirroring EventRecord.AgentPath and
+	// ModelRequestRecord.AgentPath. Empty for the root agent; subagent
+	// nesting is not yet wired end to end (see adkEngine.agentPath in the
+	// runtime package), so every current caller stamps "".
+	AgentPath string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
