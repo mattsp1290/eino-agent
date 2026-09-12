@@ -30,6 +30,22 @@ func toolCallBlockMessage(callID, name, arguments string) *einoschema.AgenticMes
 	return agenticAssistantToolCalls(agenticToolCall(callID, name, arguments))
 }
 
+// systemMessageCarryingToolCall builds a function_tool_call block on a
+// RoleSystem message -- the only shape that can put a split call's open
+// index at or before repositionMidTurnCompactionBoundary's own leading
+// system-role prefix floor (a model-authored call is always assistant-role;
+// this exists purely to probe that floor directly, since this runtime never
+// produces such a message itself -- see
+// TestRepositionMidTurnCompactionBoundaryNeverPrecedesTheLeadingSystemPrefix).
+func systemMessageCarryingToolCall(callID, name string) *einoschema.AgenticMessage {
+	return &einoschema.AgenticMessage{
+		Role: einoschema.AgenticRoleTypeSystem,
+		ContentBlocks: []*einoschema.ContentBlock{
+			einoschema.NewContentBlock(&einoschema.FunctionToolCall{CallID: callID, Name: name, Arguments: "{}"}),
+		},
+	}
+}
+
 func toolResultBlockMessage(callID, name string) *einoschema.AgenticMessage {
 	return &einoschema.AgenticMessage{
 		Role: einoschema.AgenticRoleTypeUser,

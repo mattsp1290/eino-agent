@@ -754,6 +754,10 @@ func repositionMidTurnCompactionBoundary(
 	// system-role prefix -- which also covers any earlier epoch's own
 	// boundary message, itself role=system and placed immediately after
 	// that prefix by applyEpoch (see this function's own doc comment).
+	// This floor is only sufficient because applyEpoch guarantees that
+	// placement (round-four W6 final-integration review, Suggestion S2): it
+	// is a property of applyEpoch's construction, not one this function
+	// itself verifies.
 	systemPrefix := 0
 	for systemPrefix < len(full) && full[systemPrefix].Role == einoschema.AgenticRoleTypeSystem {
 		systemPrefix++

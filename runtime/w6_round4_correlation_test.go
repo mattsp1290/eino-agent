@@ -297,6 +297,42 @@ func TestRepositionMidTurnCompactionBoundaryPreservesAnEarlierBoundaryAndDanglin
 	}
 }
 
+// TestRepositionMidTurnCompactionBoundaryNeverPrecedesTheLeadingSystemPrefix
+// is W6 round-four final-integration review Suggestion S1: the systemPrefix
+// clamp at the end of repositionMidTurnCompactionBoundary (never move the
+// boundary ahead of the leading contiguous system-role run) had no test of
+// its own -- disabling it (`if target < systemPrefix` -> `if false &&
+// target < systemPrefix`) left the targeted reposition tests, the full
+// runtime package, and the composed example all green. This constructs the
+// only shape that can reach it: a split call carried by a system-role
+// message INSIDE the leading system prefix, so the naive target (the call's
+// own index, 0) sits before systemPrefix (3, since the boundary message
+// itself is also system-role and part of that same leading run) and the
+// clamp must hold the boundary in place rather than let target land past
+// boundaryIndex.
+//
+// Mutation check performed by hand: with the clamp's `if target <
+// systemPrefix { target = systemPrefix }` replaced by a no-op, this test
+// fails (the boundary is hoisted to index 0, ahead of the leading system
+// prefix); restoring the clamp passes it again.
+func TestRepositionMidTurnCompactionBoundaryNeverPrecedesTheLeadingSystemPrefix(t *testing.T) {
+	full := []*einoschema.AgenticMessage{
+		systemMessageCarryingToolCall("call-A", "x"), // 0 -- split call, system-role
+		agenticSystemText("system two"),              // 1
+		agenticSystemText("NEW boundary"),            // 2
+		toolResultBlockMessage("call-A", "x"),        // 3 -- call-A's own result, after the boundary
+	}
+	ids := []session.MessageID{"m0", "m1", "m-newb", "m3"}
+
+	_, got, _ := repositionMidTurnCompactionBoundary(full, ids, nil, "m-newb")
+	if got[2] != "m-newb" {
+		t.Fatalf("sourceIDs = %v, want the boundary held at index 2 by the system-prefix floor", got)
+	}
+	if !reflect.DeepEqual(got, ids) {
+		t.Fatalf("sourceIDs = %v, want completely unchanged %v (systemPrefix floor makes any move illegal here)", got, ids)
+	}
+}
+
 // TestRecordToolCallAdjacencyAndSettledCallIDsHandleToolSearchResult is a
 // direct unit test for the pure adjacency helpers repositionMidTurnCompactionBoundary
 // depends on (round-four W6 final-integration review followup, Suggestion):
