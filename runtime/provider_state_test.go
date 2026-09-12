@@ -118,7 +118,7 @@ func TestLoadProviderHistoryRejectsActiveCorruptionBeforeDispatch(t *testing.T) 
 			fixture := newProviderStateLoadFixture(t)
 			test.edit(t, &fixture)
 			store := providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}
-			_, _, err := loadProviderHistory(context.Background(), store, fixture.sessionRecord, history.Options{}, resolved)
+			_, _, _, err := loadProviderHistory(context.Background(), store, fixture.sessionRecord, history.Options{}, resolved)
 			if err == nil || !errors.Is(err, test.kind) || strings.Contains(err.Error(), "STATE_SENTINEL") {
 				t.Fatalf("error = %v, want %v", err, test.kind)
 			}
@@ -149,7 +149,7 @@ func TestLoadProviderHistoryIgnoresMalformedInactiveCompactedState(t *testing.T)
 		PartOwnerMessageIDs: []session.MessageID{"old", "tail", "summary"},
 	}
 	ordinary := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil })}
-	messages, states, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, ordinary)
+	messages, _, states, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, ordinary)
 	if err != nil || len(states) != 0 || len(messages) != 2 || agenticMessageText(messages[0]) != "summary" || agenticMessageText(messages[1]) != "tail" {
 		t.Fatalf("messages/states/error = %#v/%#v/%v", messages, states, err)
 	}
@@ -174,7 +174,7 @@ func TestLoadProviderHistoryRejectsOwnerMismatchBeforeInactiveFiltering(t *testi
 		PartOwnerMessageIDs: []session.MessageID{"old", "summary"},
 	}
 	resolved := providerStateResolvedForTest(t)
-	_, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, resolved)
+	_, _, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, resolved)
 	if !errors.Is(err, model.ErrProviderStateMismatch) {
 		t.Fatalf("error = %v, want provider-state mismatch", err)
 	}
@@ -184,7 +184,7 @@ func TestProviderStateStreamerCallbackPanicsAreContentFree(t *testing.T) {
 	fixture := newProviderStateLoadFixture(t)
 	contractPanic := &panicRuntimeProviderStateStreamer{panicContract: true}
 	resolved := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: contractPanic}
-	_, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}, fixture.sessionRecord, history.Options{}, resolved)
+	_, _, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}, fixture.sessionRecord, history.Options{}, resolved)
 	if !errors.Is(err, model.ErrProviderStateInvalid) || strings.Contains(err.Error(), "STATE_SENTINEL") {
 		t.Fatalf("contract panic error = %v", err)
 	}

@@ -224,8 +224,16 @@ func TestResumeRunDedupesCheckpointRestoredAndDrainedItem(t *testing.T) {
 		t.Fatalf("openTestSQLite: %v", err)
 	}
 	defer func() { _ = pool.Close() }()
+	// Two independent StreamingOrchestrator instances (orch and gatedOrch,
+	// below) share this same underlying sqlite store. A plain &sequenceIDs{}
+	// per instance restarts its counter at 1, so both would mint colliding
+	// ids (e.g. "tool-call-1") for unrelated rows -- prepareToolCalls now
+	// always mints a fresh ToolCall.ID (one more mint per run than before),
+	// which shifted this run's counter enough to collide with gatedOrch's.
+	// namespacedSequenceIDs (see w5_round4_acceptance_test.go) avoids this by
+	// giving each instance a distinct namespace prefix.
 	orch, err := NewStreamingOrchestrator(
-		WithStore(sqliteStore), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithStore(sqliteStore), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&namespacedSequenceIDs{namespace: "a"}),
 		WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }), WithOwnerID("sqlite-owner-dedup"), WithQueueSize(2),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	)
@@ -264,7 +272,7 @@ func TestResumeRunDedupesCheckpointRestoredAndDrainedItem(t *testing.T) {
 	// goroutine has pushed the drained duplicate into the buffer.
 	cgs := &checkpointGateStore{Store: sqliteStore, reached: make(chan struct{}), release: make(chan struct{})}
 	gatedOrch, err := NewStreamingOrchestrator(
-		WithStore(cgs), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&sequenceIDs{}),
+		WithStore(cgs), WithModelResolver(resolvedModel{streamer: streamer}), WithIDGenerator(&namespacedSequenceIDs{namespace: "b"}),
 		WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 1, 0, time.UTC) }), WithOwnerID("sqlite-owner-dedup"), WithQueueSize(2),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	)

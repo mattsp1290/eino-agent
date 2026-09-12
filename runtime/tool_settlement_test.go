@@ -236,10 +236,15 @@ func TestToolCallSettlementRoundTripsUnderRaisedContentLimits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The scripted provider CallID ("call-oversized") is preserved separately
+	// as ProviderCallID; the durable session.ToolCall.ID is always a fresh
+	// mint now, so capture the id the executor actually observed.
+	var executedCall ToolCall
 	configureTestTools(orchestrator, staticToolRegistry{tools: []Tool{{
 		Name:      "big_tool",
 		Retention: RetentionPolicy{MaxInlineBytes: 8 << 20, StoreExternal: true}, // wider than even the raised block budget
-		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executedCall = call
 			return ToolResult{Output: oversized}, nil
 		}),
 	}}})
@@ -248,7 +253,7 @@ func TestToolCallSettlementRoundTripsUnderRaisedContentLimits(t *testing.T) {
 	if result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("result = %#v, want RunCompleted with no error", result)
 	}
-	call, err := store.GetToolCall(context.Background(), "call-oversized")
+	call, err := store.GetToolCall(context.Background(), executedCall.ID)
 	if err != nil || call.Status != session.ToolCallCompleted {
 		t.Fatalf("tool call = %#v, err = %v, want ToolCallCompleted", call, err)
 	}

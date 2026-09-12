@@ -59,6 +59,14 @@ type admittedRun struct {
 	// Turn is the run's first admitted turn (ordinal 1), committed
 	// atomically with the run/session/messages/epoch by admitDurable.
 	Turn session.Turn
+	// HistoryOptions is the options actually used to build Snapshot's
+	// projection -- request.History with Epoch resolved to this session's
+	// most recently finished summarization epoch, if any (see
+	// resolveTurnHistoryOptions) -- so the caller's first-turn adkEngine
+	// (which will reload this same session repeatedly across this turn's
+	// own ReAct cycles) stays consistent with what Snapshot/baseMessageCount
+	// were actually computed against.
+	HistoryOptions history.Options
 }
 
 type admitter struct {
@@ -120,7 +128,11 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
-	historyMessages, providerState, err := loadProviderHistory(ctx, store, sessionRecord, request.History, request.Model)
+	resolvedHistory, err := resolveTurnHistoryOptions(ctx, store, sessionRecord.ID, request.History)
+	if err != nil {
+		return admittedRun{}, err
+	}
+	historyMessages, historySourceIDs, providerState, err := loadProviderHistory(ctx, store, sessionRecord, resolvedHistory, request.Model)
 	if err != nil {
 		return admittedRun{}, err
 	}
@@ -132,10 +144,19 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	providerMessages := make([]*einoschema.AgenticMessage, 0, len(historyMessages)+1)
 	providerMessages = append(providerMessages, historyMessages...)
 	providerMessages = append(providerMessages, admittedUserMessage)
+	// providerMessageSourceIDs is providerMessages' durable-id parallel
+	// (round-two W6 review item 8): historySourceIDs for the reloaded
+	// prefix, plus request.IDs.UserMessageID for the freshly admitted user
+	// message this same admission is about to durably commit (below, as
+	// userMessage) -- both are genuinely durable, so both carry real ids.
+	providerMessageSourceIDs := make([]session.MessageID, 0, len(historyMessages)+1)
+	providerMessageSourceIDs = append(providerMessageSourceIDs, paddedMessageSourceIDs(historySourceIDs, len(historyMessages))...)
+	providerMessageSourceIDs = append(providerMessageSourceIDs, request.IDs.UserMessageID)
 	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
 	}
+	snapshot.MessageSourceIDs = providerMessageSourceIDs
 	latestMessageAt, err := latestAdmissionMessageTime(ctx, store, sessionRecord.ID)
 	if err != nil {
 		return admittedRun{}, err
@@ -178,6 +199,7 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	}
 	result := buildAdmission(sessionRecord, runRecord, userMessage, userParts, assistantMessage, committedEvent, snapshot, now)
 	result.Turn = admitted.Turn
+	result.HistoryOptions = resolvedHistory
 	return result, nil
 }
 

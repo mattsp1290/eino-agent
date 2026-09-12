@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
@@ -14,7 +16,7 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 type loadedTool struct {
@@ -197,7 +199,7 @@ func (s *loadedContextSource) loadBoundedContext(ctx context.Context, metadata r
 }
 
 func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn wittypes.TurnMetadata) ([]*einoschema.AgenticMessage, error) {
-	var output []wittypes.TextMessage
+	var output []wittypes.Message
 	if err := s.module.call(ctx, "context-source.load-context", turnMetadataSize(turn), func(callCtx context.Context) error {
 		var callErr error
 		output, callErr = s.component.LoadContext(callCtx, turn)
@@ -208,20 +210,146 @@ func (s *loadedContextSource) loadContextMetadata(ctx context.Context, turn witt
 	messages := make([]*einoschema.AgenticMessage, 0, len(output))
 	var total int64
 	for _, message := range output {
-		total += int64(len(message.Text))
-		if total > s.module.limits.MaxOutputBytes {
-			return nil, extensionError(ErrorSize, s.module.identity, "context-source.load-context", nil)
-		}
-		switch message.Role {
-		case wittypes.TextRoleSystem:
-			messages = append(messages, einoschema.SystemAgenticMessage(message.Text))
-		case wittypes.TextRoleUser:
-			messages = append(messages, einoschema.UserAgenticMessage(message.Text))
-		default:
+		role, err := agenticRoleFromWIT(message.Role)
+		if err != nil {
 			return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
 		}
+		blocks := message.Blocks.Slice()
+		contentBlocks := make([]*einoschema.ContentBlock, 0, len(blocks))
+		for _, block := range blocks {
+			converted, size, err := convertContentBlock(block)
+			if err != nil {
+				return nil, extensionError(ErrorContract, s.module.identity, "context-source.load-context", nil)
+			}
+			total += size
+			if total > s.module.limits.MaxOutputBytes {
+				return nil, extensionError(ErrorSize, s.module.identity, "context-source.load-context", nil)
+			}
+			contentBlocks = append(contentBlocks, converted)
+		}
+		messages = append(messages, &einoschema.AgenticMessage{Role: role, ContentBlocks: contentBlocks})
 	}
 	return messages, nil
+}
+
+// agenticRoleFromWIT maps the WIT text-role enum (system, user) onto
+// AgenticRoleType. context-source guests never speak for the assistant.
+func agenticRoleFromWIT(role wittypes.TextRole) (einoschema.AgenticRoleType, error) {
+	switch role {
+	case wittypes.TextRoleSystem:
+		return einoschema.AgenticRoleTypeSystem, nil
+	case wittypes.TextRoleUser:
+		return einoschema.AgenticRoleTypeUser, nil
+	default:
+		return "", errors.New("component returned an invalid text role")
+	}
+}
+
+// errContextSourceUnsupportedBlock reports a content-block case a
+// context-source guest is not permitted to emit -- see convertContentBlock.
+var errContextSourceUnsupportedBlock = errors.New("context-source guest may only emit text or media-reference blocks")
+
+// convertContentBlock maps one WIT content-block variant case onto its eino
+// schema.ContentBlock projection, for the context-source direction ONLY
+// (this function is called only from loadContextMetadata): text stays
+// plain text, and a media-reference is classified by its required MIME
+// type into the matching typed user-input block (never flattened to
+// text), after its URI is validated (convertMediaReference).
+//
+// The function-call and function-result-text cases exist in the shared WIT
+// content-block variant for OTHER extension points (tool-middleware
+// observation of a real call/result), but a context-source guest observes
+// nothing and only ever INJECTS content ahead of the turn -- content that
+// becomes part of the turn's own admission-time prefix
+// (runtime.adkEngine's snapshot.Messages), which settlementSeal/
+// verifySettledToolResults then treats as already-trusted baseline content.
+// A guest emitting a function-call or function-result-text block here
+// would let it fabricate an apparently-settled tool result no durable
+// session.ToolCall ever backed, so both cases are rejected before any
+// message mutation, not silently converted.
+//
+// It returns the approximate byte size consumed so the caller can enforce
+// MaxOutputBytes uniformly across block kinds.
+func convertContentBlock(block wittypes.ContentBlock) (*einoschema.ContentBlock, int64, error) {
+	if text := block.Text(); text != nil {
+		return einoschema.NewContentBlock(&einoschema.UserInputText{Text: *text}), int64(len(*text)), nil
+	}
+	if ref := block.MediaReference(); ref != nil {
+		converted, err := convertMediaReference(*ref)
+		if err != nil {
+			return nil, 0, err
+		}
+		return converted, int64(len(ref.URI) + len(ref.MIMEType)), nil
+	}
+	if block.FunctionCall() != nil || block.FunctionResultText() != nil {
+		return nil, 0, errContextSourceUnsupportedBlock
+	}
+	return nil, 0, errors.New("component returned an invalid content block case")
+}
+
+// maxMediaReferenceURIBytes bounds a media-reference URI's length. Chosen
+// generously above any realistic URL while still being far smaller than
+// MaxOutputBytes, so a malformed/hostile URI fails this specific,
+// well-labeled check rather than the generic output-size budget.
+const maxMediaReferenceURIBytes = 8192
+
+// allowedMediaReferenceSchemes are the URI schemes a context-source guest's
+// media-reference may use. The WIT contract documents the URI as "a URI a
+// trusted host resolves"; only https is host-resolved in that sense here --
+// data: (embeds arbitrary guest-controlled bytes directly, unbounded by any
+// URI-length check) and file:/relative (host-local filesystem access a
+// guest has no business requesting) are deliberately excluded.
+var allowedMediaReferenceSchemes = map[string]bool{"https": true}
+
+// validateMediaReferenceURI enforces the media-reference contract: valid
+// UTF-8, bounded length, and an allowed scheme.
+func validateMediaReferenceURI(raw string) error {
+	if raw == "" {
+		return errors.New("media-reference URI is empty")
+	}
+	if len(raw) > maxMediaReferenceURIBytes {
+		return errors.New("media-reference URI exceeds the bounded length")
+	}
+	if !utf8.ValidString(raw) {
+		return errors.New("media-reference URI is not valid UTF-8")
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("media-reference URI is not a valid URL: %w", err)
+	}
+	if !allowedMediaReferenceSchemes[strings.ToLower(parsed.Scheme)] {
+		return fmt.Errorf("media-reference URI scheme %q is not allowed", parsed.Scheme)
+	}
+	return nil
+}
+
+// convertMediaReference classifies a bounded, validated media-reference by
+// its required MIME type into the matching typed user-input content block;
+// an unrecognized top-level MIME type is treated as an opaque file
+// reference rather than rejected, since media-reference intentionally
+// carries no separate kind discriminant of its own. MIMEType itself is
+// still required (round-two W6 review item 13 / RA I8): the WIT's own doc
+// comment on media-reference states "uri and mime-type are both required",
+// but WIT's type system has no way to express "non-empty string" -- the
+// host must enforce it. An empty MIMEType previously fell through silently
+// to the file-reference default case instead of being rejected.
+func convertMediaReference(ref wittypes.MediaReference) (*einoschema.ContentBlock, error) {
+	if err := validateMediaReferenceURI(ref.URI); err != nil {
+		return nil, err
+	}
+	if ref.MIMEType == "" {
+		return nil, errors.New("media-reference mime-type is empty")
+	}
+	switch {
+	case strings.HasPrefix(ref.MIMEType, "image/"):
+		return einoschema.NewContentBlock(&einoschema.UserInputImage{URL: ref.URI, MIMEType: ref.MIMEType}), nil
+	case strings.HasPrefix(ref.MIMEType, "audio/"):
+		return einoschema.NewContentBlock(&einoschema.UserInputAudio{URL: ref.URI, MIMEType: ref.MIMEType}), nil
+	case strings.HasPrefix(ref.MIMEType, "video/"):
+		return einoschema.NewContentBlock(&einoschema.UserInputVideo{URL: ref.URI, MIMEType: ref.MIMEType}), nil
+	default:
+		return einoschema.NewContentBlock(&einoschema.UserInputFile{URL: ref.URI, MIMEType: ref.MIMEType}), nil
+	}
 }
 
 func openContextSource(ctx context.Context, cfg ModuleConfig, factory engineFactory) (*loadedContextSource, error) {

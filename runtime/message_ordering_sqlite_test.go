@@ -30,9 +30,14 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		}
 	}()
 	frozenAt := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	// The scripted provider CallID ("call-frozen") is preserved separately
+	// as ProviderCallID; the durable session.ToolCall.ID is always a fresh
+	// mint now, so capture the id the executor actually observed.
+	var executedCall ToolCall
 	toolRegistry := staticToolRegistry{tools: []Tool{{
 		Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
-		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executedCall = call
 			return ToolResult{Output: "echoed"}, nil
 		}),
 	}}}
@@ -101,7 +106,7 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 	if rawMessages[1].ParentID != rawMessages[0].ID || rawMessages[2].ParentID != rawMessages[1].ID || rawMessages[3].ParentID != rawMessages[1].ID {
 		t.Fatalf("message parentage changed: %#v", rawMessages)
 	}
-	toolCall, err := reopened.GetToolCall(ctx, "call-frozen")
+	toolCall, err := reopened.GetToolCall(ctx, executedCall.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +133,7 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		_ = json.Unmarshal([]byte(agenticFunctionResultText(providerHistory[2])), &toolResultOutput)
 	}
 	if len(providerHistory) != 4 || providerHistory[0].Role != einoschema.AgenticRoleTypeUser || agenticMessageText(providerHistory[0]) != "hello" ||
-		providerHistory[1].Role != einoschema.AgenticRoleTypeAssistant || len(agenticToolCallsOf(providerHistory[1])) != 1 || agenticToolCallsOf(providerHistory[1])[0].CallID != "call-frozen" ||
+		providerHistory[1].Role != einoschema.AgenticRoleTypeAssistant || len(agenticToolCallsOf(providerHistory[1])) != 1 || agenticToolCallsOf(providerHistory[1])[0].CallID != string(executedCall.ID) ||
 		providerHistory[2].Role != einoschema.AgenticRoleTypeUser || !isFunctionToolResultMessage(providerHistory[2]) || toolResultOutput.Content != "echoed" ||
 		providerHistory[3].Role != einoschema.AgenticRoleTypeAssistant || agenticMessageText(providerHistory[3]) != "done" {
 		t.Fatalf("provider history = %#v", providerHistory)

@@ -30,4 +30,18 @@ const (
 	// AttemptReplacedEventKind marks a retried or failed-over model
 	// invocation being replaced by a new attempt.
 	AttemptReplacedEventKind = "attempt_replaced"
+	// AuthorizedToolResultRewriteEventKind durably records one sanctioned
+	// content-management rewrite of a function_tool_result's model-visible
+	// content (patchtoolcalls patching a dangling call, reduction
+	// truncating/clearing a settled result): which sealed handler instance
+	// made the change, its Kind, the call ID, and the content digest before
+	// and after -- see runtime.authorizedRewriteRecord. Correlation carries
+	// the call ID.
+	AuthorizedToolResultRewriteEventKind = "authorized_tool_result_rewrite"
+	// SkillActivatedEventKind durably records one skill activation: the
+	// skill's name and a content digest of what was actually loaded, so a
+	// SKILL.md later edited between activation and any later point can be
+	// told apart from the version this run actually used. Correlation
+	// carries the skill name.
+	SkillActivatedEventKind = "skill_activated"
 )

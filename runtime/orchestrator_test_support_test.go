@@ -3,9 +3,10 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
-	"strconv"
 	"sync"
+	"testing"
 	"time"
 
 	einoschema "github.com/cloudwego/eino/schema"
@@ -15,6 +16,62 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+// onlyToolCallID returns the single durable tool-call id minted into an
+// admissionStore during a test run. prepareToolCalls always mints a fresh,
+// store-unique ID now (see ProviderCallID on session.ToolCall/runtime.ToolCall),
+// so tests can no longer assume a scripted provider CallID literal (e.g.
+// "call-1") became the durable ID -- they must discover the minted id from
+// the store instead. Fails the test if zero or more than one tool call exists.
+func onlyToolCallID(t *testing.T, store *admissionStore) session.ToolCallID {
+	t.Helper()
+	var id session.ToolCallID
+	var count int
+	for candidate := range store.toolCalls {
+		id = candidate
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("onlyToolCallID: store has %d tool calls, want exactly 1", count)
+	}
+	return id
+}
+
+// toolCallIDByName returns the durable id of the single tool call in the
+// admissionStore whose Name matches, for tests where more than one tool
+// call is created and onlyToolCallID's single-entry assumption doesn't hold.
+func toolCallIDByName(t *testing.T, store *admissionStore, name string) session.ToolCallID {
+	t.Helper()
+	var id session.ToolCallID
+	var count int
+	for candidate, call := range store.toolCalls {
+		if call.Name == name {
+			id = candidate
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("toolCallIDByName(%q): found %d matching tool calls, want exactly 1", name, count)
+	}
+	return id
+}
+
+// testScratchRootOnce lazily creates ONE process-scoped temp directory used
+// as every test orchestrator's default scratch root (WithScratchRoot),
+// unless a test explicitly overrides it via extra. Without this, every
+// runtime test exercising plantask/reduction would otherwise fall back to
+// NewStreamingOrchestrator's real, machine-global default
+// (os.UserCacheDir()/eino-agent/scratch), writing real files outside the
+// test sandbox and risking cross-test-run collisions on a repeated literal
+// session ID (sessionScratchDirName hashes the session id, but does not
+// scope it to a single test run) -- see round-two W6 review I5.
+var testScratchRootOnce = sync.OnceValue(func() string {
+	dir, err := os.MkdirTemp("", "eino-agent-test-scratch-")
+	if err != nil {
+		panic(err)
+	}
+	return dir
+})
+
 func newTestOrchestrator(store *admissionStore, streamer model.Streamer, extra ...Option) *StreamingOrchestrator {
 	options := []Option{
 		WithStore(store),
@@ -23,6 +80,7 @@ func newTestOrchestrator(store *admissionStore, streamer model.Streamer, extra .
 		WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC) }),
 		WithOwnerID("owner-1"),
 		WithQueueSize(2),
+		WithScratchRoot(testScratchRootOnce()),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
 	}
 	return mustConfiguredOrchestrator(append(options, extra...)...)
@@ -33,6 +91,7 @@ func mustConfiguredOrchestrator(extra ...Option) *StreamingOrchestrator {
 		WithStore(newAdmissionStore()),
 		WithModelResolver(resolvedModel{}),
 		WithIDGenerator(&sequenceIDs{}),
+		WithScratchRoot(testScratchRootOnce()),
 		WithRunPlanProvider(emptyTestRunPlanProvider()),
 	}
 	orchestrator, err := NewStreamingOrchestrator(append(options, extra...)...)
@@ -271,11 +330,33 @@ type sequenceIDs struct {
 	n  int
 }
 
+// next mints "<prefix>-<n>" from a single, ever-increasing counter shared
+// across every id kind. n is zero-padded (round-four W6 correlation-and-seal
+// review followup, Suggestion S-C): every runtime-package test using this
+// generator (newTestOrchestrator) pins the clock to one constant instant
+// (WithClock) for determinism, so the store's own (m.created_at, m.id)
+// ordering ties on created_at for EVERY message and falls through to a
+// plain LEXICAL comparison of these ids -- matching production's own
+// sqlstore.loadReplayMessages exactly (ORDER BY m.created_at, m.id against
+// a TEXT column). An un-padded counter is only a valid total order matching
+// mint order while n stays within one digit width: it silently breaks the
+// moment a session mints its 10th, 100th, ... id of a given prefix (e.g.
+// "message-100" < "message-96" lexically, even though message-100 was
+// minted long after message-96) -- exactly the kind of reordering
+// adkEngine.buildDurableBaseline's prefix/tail splice invariant depends on
+// never happening, and what a previous version of this fixture papered
+// over by making the FAKE STORE's own comparison numeric-suffix-aware
+// instead of the ids -- modeling an ordering the real store does not
+// provide, since IDGenerator is host-supplied (no production implementation
+// ships in this repo) and a host minting un-padded counters would hit this
+// same reordering in sqlstore. Fixing the ids instead keeps the fixture's
+// tie-break faithfully lexical, like production, while still giving mint
+// order and lexical order the same answer.
 func (s *sequenceIDs) next(prefix string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.n++
-	return prefix + "-" + strconv.Itoa(s.n)
+	return fmt.Sprintf("%s-%06d", prefix, s.n)
 }
 
 func (s *sequenceIDs) NewRunID() session.RunID         { return session.RunID(s.next("run")) }

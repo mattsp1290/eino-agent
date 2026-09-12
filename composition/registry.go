@@ -1,12 +1,14 @@
 package composition
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
@@ -66,6 +68,36 @@ type ToolSearchRegistration struct {
 	Description string
 }
 
+// HandlerDescriptor is the bounded, closed-schema identity of one typed ADK
+// agent-handler registration: Kind names the upstream recipe (e.g.
+// "agentsmd", "skill", "filesystem", "plantask", "patchtoolcalls",
+// "reduction", "summarization", "toolsearch" -- see the runtime package's
+// recipe constants), Version is the registration's declared config-schema
+// version, and Config is that kind's own closed-schema configuration
+// document. Kind/Version/a canonical hash of Config are what gets sealed
+// into the durable plan fingerprint (session.AgentHandlerPlanIdentity);
+// Config's raw bytes are never persisted or serialized as part of the
+// fingerprint itself, only their hash.
+type HandlerDescriptor struct {
+	Kind, Version string
+	Config        json.RawMessage
+}
+
+// HandlerRegistration registers one typed ADK agent-handler factory
+// (composition.Registrar.Handler). Order controls installation order among
+// every handler active for a plan (ascending; ties break by ID then owning
+// component instance then scope -- see runtime.comparePlanAgentHandler),
+// which in turn is the order host handlers wrap the agent's model/tools (ADK:
+// first registered is outermost).
+type HandlerRegistration struct {
+	ID         string
+	Order      int
+	Scope      extension.Scope
+	Descriptor HandlerDescriptor
+	Factory    runtime.HandlerFactory
+	configHash string
+}
+
 type Registrar struct {
 	extensions   extension.Registrar
 	component    extension.Component
@@ -74,6 +106,63 @@ type Registrar struct {
 	guards       []GuardRegistration
 	restrictions []RestrictionRegistration
 	toolSearch   []ToolSearchRegistration
+	handlers     []HandlerRegistration
+}
+
+// Handler registers one typed ADK agent-handler factory for this component.
+// The factory closure is snapshotted per execution (never serialized); only
+// registration.Descriptor's identity (Kind, Version, and a canonical hash of
+// Config) is sealed into the run's durable plan fingerprint.
+func (r *Registrar) Handler(registration HandlerRegistration) error {
+	if err := extension.ValidateIdentifier(registration.ID); err != nil {
+		return err
+	}
+	if err := extension.ValidateScope(registration.Scope); err != nil {
+		return err
+	}
+	if strings.TrimSpace(registration.Descriptor.Kind) == "" || strings.TrimSpace(registration.Descriptor.Version) == "" {
+		return fmt.Errorf("%w: agent handler kind and version required", extension.ErrInvalidRegistration)
+	}
+	if registration.Factory == nil {
+		return fmt.Errorf("%w: agent handler factory required", extension.ErrInvalidRegistration)
+	}
+	hash, err := handlerConfigHash(registration.Descriptor.Config)
+	if err != nil {
+		return fmt.Errorf("%w: invalid agent handler config: %v", extension.ErrInvalidRegistration, err)
+	}
+	registration.configHash = hash
+	for _, existing := range r.handlers {
+		if existing.ID == registration.ID && existing.Scope == registration.Scope {
+			return fmt.Errorf("%w: agent handler %s", extension.ErrDuplicateRegistration, registration.ID)
+		}
+	}
+	r.handlers = append(r.handlers, registration)
+	return nil
+}
+
+// handlerConfigHash canonicalizes config (decode then re-marshal, so key
+// order never affects the hash) and hashes it. Decoding uses
+// json.Decoder.UseNumber() so an integer above 2^53 round-trips through its
+// exact decimal text instead of json.Unmarshal's default float64 decoding,
+// which would silently lose precision and let two configs differing only
+// in a large integer hash identically (W6 round-1 review suggestion S5).
+func handlerConfigHash(config json.RawMessage) (string, error) {
+	canonical := config
+	if len(canonical) == 0 {
+		canonical = []byte("null")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(canonical))
+	decoder.UseNumber()
+	var decoded any
+	if err := decoder.Decode(&decoded); err != nil {
+		return "", err
+	}
+	raw, err := json.Marshal(decoded)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func (r *Registrar) Prompt(registration PromptRegistration) error {
@@ -215,6 +304,7 @@ type componentPayload struct {
 	guards       []GuardRegistration
 	restrictions []RestrictionRegistration
 	toolSearch   []ToolSearchRegistration
+	handlers     []HandlerRegistration
 }
 
 func NewRegistry(reporter extension.Reporter, customPoints ...extension.Point) (*Registry, error) {
@@ -252,7 +342,7 @@ func (r *Registry) Mount(ctx context.Context, component extension.Component, ins
 	payload := componentPayload{
 		tools: append([]ToolRegistration(nil), staged.tools...), prompts: append([]PromptRegistration(nil), staged.prompts...),
 		guards: append([]GuardRegistration(nil), staged.guards...), restrictions: append([]RestrictionRegistration(nil), staged.restrictions...),
-		toolSearch: append([]ToolSearchRegistration(nil), staged.toolSearch...),
+		toolSearch: append([]ToolSearchRegistration(nil), staged.toolSearch...), handlers: append([]HandlerRegistration(nil), staged.handlers...),
 	}
 	extensionMount, err := r.extensions.CommitMount(prepared, payload, payloadScopes(payload), validateComponentPayload)
 	if err != nil {
@@ -276,6 +366,9 @@ func payloadScopes(payload componentPayload) []extension.Scope {
 		result = append(result, registration.Scope)
 	}
 	for _, registration := range payload.toolSearch {
+		result = append(result, registration.Scope)
+	}
+	for _, registration := range payload.handlers {
 		result = append(result, registration.Scope)
 	}
 	return result

@@ -81,7 +81,8 @@ func NewBoundary(epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunI
 	}, nil
 }
 
-// AppendBoundary appends the replayable summary message and compaction part.
+// AppendBoundary appends the replayable summary message and compaction part
+// in its own transaction.
 func AppendBoundary(ctx context.Context, store session.ExecutionStore, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {
 	if store == nil {
 		return Boundary{}, fmt.Errorf("store required")
@@ -89,10 +90,23 @@ func AppendBoundary(ctx context.Context, store session.ExecutionStore, epoch ses
 	var boundary Boundary
 	err := store.WithinTx(ctx, func(ctx context.Context, tx session.ExecutionStore) error {
 		var err error
-		boundary, err = appendBoundaryRecords(ctx, tx, epoch, ids, runID, now, summary)
+		boundary, err = AppendBoundaryTx(ctx, tx, epoch, ids, runID, now, summary)
 		return err
 	})
 	return boundary, err
+}
+
+// AppendBoundaryTx is AppendBoundary without its own transaction: store is
+// expected to already be inside a transaction the caller controls (for
+// example one branch of a larger session.ExecutionStore.WithinTx that also
+// calls StartContextEpoch), so the whole epoch swap -- start, boundary
+// append, finish -- commits atomically as a single unit instead of as two
+// separate writes.
+func AppendBoundaryTx(ctx context.Context, store session.ExecutionStore, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {
+	if store == nil {
+		return Boundary{}, fmt.Errorf("store required")
+	}
+	return appendBoundaryRecords(ctx, store, epoch, ids, runID, now, summary)
 }
 
 func appendBoundaryRecords(ctx context.Context, store session.ExecutionStore, epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunID, now time.Time, summary string) (Boundary, error) {

@@ -122,12 +122,22 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	return settlement, nil
 }
 
-func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall, claimed session.ToolCall, prepareErr error) (settledTool, error) {
+// toolResultWrapFunc transforms a tool's raw result before it is durably
+// settled -- the seam a mounted ADK agent-handler middleware's own
+// WrapInvokableToolCall/WrapEnhancedInvokableToolCall (e.g. reduction's
+// MaxLengthForTrunc truncation) hooks into (see
+// adkEngine.applyHandlerToolResultWrappers), so the transform happens
+// before the durable settlement row and settlementSeal's baseline exist,
+// not as an after-settlement rewrite. nil is a no-op: the classic,
+// non-ADK resume path has no handler middleware at all.
+type toolResultWrapFunc func(ctx context.Context, call ToolCall, result ToolResult) (ToolResult, error)
+
+func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot TurnSnapshot, tool Tool, call ToolCall, claimed session.ToolCall, prepareErr error, wrap toolResultWrapFunc) (settledTool, error) {
 	call.ResultMessageID = claimed.ResultMessageID
 	call.ResultPartID = claimed.ResultPartID
 	e.host.observeToolMaterialized(ctx, snapshot, tool, call)
 	observedTool := e.host.startObservedToolCall(ctx, snapshot, tool, call)
-	outcome := e.executeClaimedToolPipeline(ctx, tool, call, prepareErr)
+	outcome := e.executeClaimedToolPipeline(ctx, tool, call, prepareErr, wrap)
 	completedAt := e.host.now()
 	failSettlement := func(err error) (settledTool, error) {
 		e.host.finishObservedToolCall(observedTool, session.ToolCallFailed, err, nil)
@@ -159,7 +169,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 	return settledTool{Outcome: outcome, Settlement: settlement, Output: output}, nil
 }
 
-func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error) (outcome toolOutcome) {
+func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool, call ToolCall, prepareErr error, wrap toolResultWrapFunc) (outcome toolOutcome) {
 	defer func() {
 		if recover() != nil {
 			outcome = newToolOutcome(call, ToolResult{}, toolPermissionAllowed, errToolExecutionPanic)
@@ -175,6 +185,20 @@ func (e *runExecution) executeClaimedToolPipeline(ctx context.Context, tool Tool
 		return e.host.transformToolOutcome(ctx, e, outcome)
 	}
 	outcome = e.host.executeToolOutcome(ctx, e, tool, call)
+	// A mounted handler's own tool-call wrapper (e.g. reduction's
+	// MaxLengthForTrunc truncation) only ever applies to a REAL, successful
+	// execution result -- never to a permission denial/prepare error above,
+	// and never when the tool itself already failed (nothing meaningful to
+	// transform, and a wrapper's own truncation logic is not equipped to
+	// interpret an error outcome).
+	if wrap != nil && outcome.RawError == nil {
+		wrapped, err := wrap(ctx, call, outcome.Result)
+		if err != nil {
+			outcome = newToolOutcome(call, outcome.Result, outcome.Permission, err)
+		} else {
+			outcome = newToolOutcome(call, wrapped, outcome.Permission, nil)
+		}
+	}
 	return e.host.transformToolOutcome(ctx, e, outcome)
 }
 

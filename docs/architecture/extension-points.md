@@ -176,6 +176,153 @@ multimodal, tool-call-bearing, reasoning, response-metadata, and `Extra` shapes
 fail before provider dispatch. Contributions cannot interleave with durable
 history in the first release.
 
+## Typed ADK agent handlers (W6)
+
+`composition.Registrar.Handler(HandlerRegistration{ID, Order, Scope,
+Descriptor: HandlerDescriptor{Kind, Version, Config json.RawMessage},
+Factory runtime.HandlerFactory})` is a distinct registration category from
+the generic hook/transform/gate/around/notification "handler" concept
+described above (`extension.HandlerKind`, `session.RegistrationIdentity` on
+`ComponentPlan.Handlers`): it registers one factory for a typed ADK
+`adk.TypedChatModelAgentMiddleware[*schema.AgenticMessage]`, the interface-based
+per-run agent customization point Eino's `adk` package itself defines
+(`BeforeAgent`, `BeforeModelRewriteState`/`AfterModelRewriteState`,
+`WrapModel`, `WrapInvokableToolCall`/etc., `AfterAgent`). Its sealed identity
+lives in its own nested collection, `session.ComponentPlan.AgentHandlers
+[]AgentHandlerPlanIdentity{ID, Kind, Version, ConfigHash, Order, Scope}`,
+alongside (not merged into) the existing `Handlers`/`Tools`/`Prompts`/
+`Guards`/`Restrictions` collections; it participates in the plan fingerprint
+the same way every other capability collection does. `Config`'s canonical
+hash (decode-then-remarshal, so key order never affects it), not its raw
+bytes, is what gets sealed -- the factory closure itself is never
+serialized, matching `RunPlanSpec.Agent`/`ToolSearch`'s existing "host
+construction identity, not durable capability evidence" treatment.
+
+`discoverHandlerTools` also probes each factory once at plan-compile time
+(a bounded, stub-backed `HandlerBuildContext` -- no real session, model, or
+workspace content) to enumerate the tools it contributes; the discovered
+`{Name, SchemaHash}` set is sealed onto the same `AgentHandlerPlanIdentity`
+(`Tools []HandlerToolIdentity`) and, at real per-turn build time,
+`adkEngine.sealHandlerTools` synthesizes a durable `runtime.Tool` per sealed
+entry and splices it into `TurnSnapshot.Tools` *before* the agent is built
+-- so a handler's own tool belongs to the same frozen tool universe as any
+composition-registered one, resolved by `prepareToolCalls`/
+`resolveToolCall` and dispatched through the full durable claim/permission/
+execute/settle pipeline (`handlerToolExecutor`) rather than ADK's own
+generic tool-node call. A tool a handler's middleware injects at real
+`BeforeAgent` time that was *not* sealed at compile time fails that turn as
+a construction error.
+
+`runtime.RunPlan.AgentHandlers()` exposes the sealed, ordered list with live
+`Factory` and discovered `Tools` attached; `adkEngine.buildAgent` invokes
+every factory fresh for each admitted turn with a bounded
+`runtime.HandlerBuildContext` (session/run identity, a ledger-audited model
+adapter -- the turn's own mandatory one for every recipe except
+summarization, which gets a bounded internal-dispatch adapter instead, see
+below -- read-only workspace-scoped filesystem/skill backend views, private
+writable scratch backends for plantask/reduction rooted per session, and
+this turn's frozen deferred tools). `HandlerBuildContext` carries no
+`session.Store`/`session.ExecutionStore` at all -- it is handed identically
+to every registered `HandlerFactory`, host-provided ones included, so
+either would let an arbitrary host handler fabricate a durable `ToolCall`
+settlement or read checkpoint/provider-private state; summarization, the
+one recipe that legitimately needs a bounded durable write (mapping a
+completed summary into a `session.ContextEpoch`), is given a narrow,
+unexported capability instead, reachable only from this package's own
+recipe code (the same Go-visibility isolation `authorizeRewrite` already
+used). `adkEngine.buildAgent` installs the results into
+`AgentBuildContext.Handlers`, ahead of
+this runtime's own mandatory tail handlers (`durableGuard`, `settlementSeal`
+-- `runtime/adk_middleware.go`), after `durableBaselineHandler`
+(`AgentBuildContext.DurableBaseline`), which is installed *first*.
+`durableBaselineHandler.BeforeModelRewriteState` rewrites the agent's
+in-memory `state.Messages` to a deep clone of the fresh durable projection
+of this cycle's committed history -- the durable projection is the
+*baseline* every host handler then transforms, not a value discarded and
+re-derived afterward; the ledger-audited model adapter dispatches exactly
+what the handler chain leaves that baseline as, with no re-projection.
+Ordering otherwise follows ADK's own first-registered-is-outermost
+handler-wrapping rule for `Wrap*` methods (host handlers, in `Order`/`ID`/
+component/scope order, are outermost; this runtime's own tail handlers stay
+innermost, directly around the mandatory `Model`/`Tools` adapters, so no
+host handler can substitute them) and first-registered-is-first-called for
+hook methods (`BeforeAgent`/`BeforeModelRewriteState`/...), which is why
+`durableBaselineHandler` -- installed first -- establishes the baseline
+before any host handler's own hook runs. The real settlement authority,
+though, is `verifySettledToolResults`, called from
+`adkModel.prepareDispatchInput` -- the innermost dispatch point every
+physical attempt passes through regardless of a host `WrapModel` wrapper
+nested around the model after every handler's hooks (including
+`settlementSeal`'s own `BeforeModelRewriteState`, kept only as an early,
+non-authoritative check calling the identical function) have already run.
+It compares every occurrence of a settled tool's model-visible content
+(not just the last one a map would remember) against
+`durableBaselineHandler`'s own reconstruction for that call ID, hashing the
+full canonical content including media fields, and fails the run on
+divergence, or on a fabricated result for a call with no durable
+settlement, unless the exact post-rewrite content digest was recorded as
+an authorized rewrite for that call ID THIS cycle (reset every cycle) by a
+sanctioned content-management recipe (patchtoolcalls, reduction --
+`wrapAuthorizedContentRewrites`), which also durably records the rewrite
+(handler ID, kind, call ID, before/after digest) as an audit event. That
+authorization is itself Kind-scoped
+(`kindMayRewriteSettledContent`): only reduction may legitimately rewrite
+a call ID the baseline already shows real settled content for. A
+patchtoolcalls-kind authorization is refused for such a call ID even
+though `wrapAuthorizedContentRewrites` recorded it -- patchtoolcalls'
+only legitimate purpose is filling in a call with NO durable settlement
+at all, never rewriting one that has real settled content (round-two W6
+review item 4).
+
+Both integration gaps an earlier pass of this design left open --
+host-injected content never reaching the model, and a handler-injected tool
+never being callable -- are resolved by `durableBaselineHandler` and the
+frozen-tool-universe sealing above, respectively; each fix is proven end to
+end through a real turn (`TestAgentsMDHandlerInjectsContentIntoModelRequest`,
+`TestFilesystemHandlerToolExecutesThroughDurableWrapper`,
+`runtime/adk_middleware_e2e_test.go`).
+
+`examples/agentic-middleware/` proves this same mechanism a second time
+from entirely outside the `runtime` package, through only
+`composition.Registrar.Handler`/`runtime.StreamingOrchestrator`: a `Mount`
+function wires all eight upstream recipes this package ships
+(`runtime.HandlerKindAgentsMD`/`Skill`/`Filesystem`/`PlanTask`/
+`PatchToolCalls`/`Reduction`/`Summarization`/`ToolSearch`), each mounted
+individually and driven through a real turn exercising its own positive
+and failure paths, an immutable-input proof via a custom `HandlerFactory`
+that tries to rewrite a settled result without authorization, a discovered
+deferred tool actually being called (not just found) after toolsearch
+surfaces it, and interrupt/resume including a handler `Config` change
+being refused on resume, and (round-two W6 review) toolsearch discovery
+durably replaying on a fresh turn, after `ResumeRun`, and after a
+brand-new orchestrator instance against the same store, plus a resumed run
+refusing to proceed when an activated skill's content changed between
+pause and resume, scoped to the specific run being resumed rather than the
+whole session. Two DIFFERENT handlers rewriting two different results in
+one turn ("ordering with two rewrites") is proven in `runtime`'s own test
+suite instead
+(`TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized` in
+`runtime/w6_round2_group_g_test.go`: reduction clears a real settled round
+while patchtoolcalls fills a genuinely dangling call in the same turn,
+both authorized and audited); this example package's own
+`TestReductionClearsOlderRoundAsAuthorizedRewrite` exercises only
+reduction's own two-round clearing (one handler, two of its own rewrites),
+not two different handlers.
+See that package's own doc comment and the W6 section of
+`docs/architecture/eino-feature-support.md` for this example's remaining
+scope limits. All eight recipes are mounted together in one `RunPlan`, in
+both turns of the example's own multi-turn scenario, and each is proven
+with its own concrete assertion by
+`TestComposedExampleMountsAllEightRecipesInOneRunPlan` (round-two W6
+review item 14), which also builds a genuine "dangling call, no durable
+settlement" fixture at this black-box level via a custom public
+`HandlerFactory`, in addition to the runtime-internal, store-seeded
+version. The previously bounded limitation on mounting patchtoolcalls and
+summarization together is resolved (eino-agent-0wb): a mid-turn compaction
+boundary this runtime commits can no longer land between a
+function_tool_call and its function_tool_result -- see the W6
+known-limitations history in `eino-feature-support.md`.
+
 ## Request ledger and privacy
 
 Every provider attempt is persisted through the current run's

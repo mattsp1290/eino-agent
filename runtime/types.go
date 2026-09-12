@@ -88,16 +88,29 @@ type Orchestrator interface {
 
 // TurnSnapshot is the immutable state used for one provider request.
 type TurnSnapshot struct {
-	RunID         session.RunID
-	SessionID     session.ID
-	EpochID       session.EpochID
-	Config        config.Snapshot
-	Model         model.Resolved
-	Messages      []*einoschema.AgenticMessage
-	providerState []model.ProviderMessageState
-	Tools         []Tool
-	SystemPrompt  string
-	CreatedAt     time.Time
+	RunID     session.RunID
+	SessionID session.ID
+	EpochID   session.EpochID
+	Config    config.Snapshot
+	Model     model.Resolved
+	Messages  []*einoschema.AgenticMessage
+	// MessageSourceIDs is Messages' durable-message-ID parallel, one entry
+	// per Messages index ("" for an entry with no durable backing, e.g.
+	// content an extension transform injected -- see
+	// contextAssemblePoint/materializeContextAssemblyWithMapping). Shorter
+	// than Messages, or nil, degrades safely to "no durable id for any
+	// message beyond what is present" (see paddedMessageSourceIDs) rather
+	// than panicking; a construction path that never populates it (e.g. a
+	// direct FreezeTurnSnapshot call outside this package's own admission/
+	// resume paths) simply means summarization can correlate nothing for
+	// this snapshot's own prefix, not a hard failure -- see
+	// adkEngine.buildDurableBaseline and summarizationFinalize (round-two
+	// W6 review item 8).
+	MessageSourceIDs []session.MessageID
+	providerState    []model.ProviderMessageState
+	Tools            []Tool
+	SystemPrompt     string
+	CreatedAt        time.Time
 	// ToolSearch configures the runtime-implemented tool-search tool for
 	// this turn's plan, or nil when not enabled (see runtime/tool_search.go
 	// and RunPlan.ToolSearch).
@@ -177,12 +190,24 @@ type ToolCall struct {
 	// RequestedName is the model-facing tool name as the model actually
 	// called it (equal to Name unless the model used a registered alias).
 	RequestedName string
-	Scope         ToolScope
-	Pattern       string
-	Input         json.RawMessage
-	Approval      ApprovalRequester
-	SessionTitle  SessionTitleWriter `json:"-"`
-	Context       ToolContext
+	// ProviderCallID carries the provider's own tool-call id (block.CallID
+	// as received) from prepareToolCalls through to the durable
+	// session.ToolCall record -- see session.ToolCall.ProviderCallID. ID is
+	// always the freshly runtime-minted, store-unique identity. ID, not
+	// ProviderCallID, is what a later dispatch shows the provider back when
+	// ProviderCallID is empty (the provider omitted its own id, or sent one
+	// that failed validation) or when sending it would be ambiguous in
+	// that outgoing request (an earlier call already sends that exact
+	// string, or it equals the durable id of any call in the request) --
+	// see runtime.publicizeToolCallIDs's doc comment for exactly which
+	// case applies.
+	ProviderCallID string
+	Scope          ToolScope
+	Pattern        string
+	Input          json.RawMessage
+	Approval       ApprovalRequester
+	SessionTitle   SessionTitleWriter `json:"-"`
+	Context        ToolContext
 	// ResumeDecision carries the host-supplied resume payload for a call
 	// whose Tool.InterruptPolicy paused it via a durable ADK checkpoint,
 	// once the targeted resume has delivered it. Empty on every other call.

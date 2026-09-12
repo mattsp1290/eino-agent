@@ -5,7 +5,7 @@ import (
 	"go.bytecodealliance.org/cm"
 
 	_ "github.com/mattsp1290/eino-agent/examples/wasm-extensions/internal/guestabi"
-	hookapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/hook-api"
+	hookapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/hook-api"
 )
 
 func ok(hookapi.TurnMetadata) cm.Result[hookapi.StructuredError, struct{}, hookapi.StructuredError] {

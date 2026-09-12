@@ -341,22 +341,33 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	// removes the still-empty assistant placeholder row AdmitTurn also just
 	// created (real, but content-free until adkModel.commit finalizes it),
 	// the same way adkModel.durableProjection does for every later dispatch.
-	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, c.historyOptions, c.resolved)
+	// Resolve fresh for THIS turn admission, from c.historyOptions' pristine
+	// (never-mutated) host template: a summarization epoch committed by an
+	// earlier turn on this same run must narrow this new turn's admission,
+	// while c.historyOptions itself stays unresolved so the NEXT turn after
+	// this one re-resolves independently too -- see
+	// resolveTurnHistoryOptions's doc comment.
+	turnHistoryOptions, err := resolveTurnHistoryOptions(ctx, c.host.store, c.sessionID, c.historyOptions)
 	if err != nil {
 		return nil, err
 	}
-	allMessages, priorProviderState := dropUnfinalizedAssistantPlaceholders(priorMessages, priorProviderState)
+	priorMessages, priorSourceIDs, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
+	if err != nil {
+		return nil, err
+	}
+	allMessages, allSourceIDs, priorProviderState := dropUnfinalizedAssistantPlaceholders(priorMessages, priorSourceIDs, priorProviderState)
 	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, allMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
 	}
+	base.MessageSourceIDs = allSourceIDs
 	base.providerState = priorProviderState
 	snapshot, err := c.host.prepareSnapshot(ctx, c.execution, base)
 	if err != nil {
 		return nil, err
 	}
 	c.execution.seedDiscovered(discoveredToolsFromMessages(snapshot.Messages))
-	engine := &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: result.Turn, assistantMessageID: assistantID, historyOptions: c.historyOptions, baseMessageCount: len(allMessages)}
+	engine := &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: result.Turn, assistantMessageID: assistantID, historyOptions: turnHistoryOptions, baseMessageCount: len(allMessages)}
 	c.setEngine(engine)
 	return engine, nil
 }
@@ -579,7 +590,11 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if target.ID == "" {
 		return nil, fmt.Errorf("%w: no interrupted turn found to resume for run %s", ErrInvalidOrchestrator, c.runID)
 	}
-	priorMessages, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, c.historyOptions, c.resolved)
+	turnHistoryOptions, err := resolveTurnHistoryOptions(ctx, c.host.store, c.sessionID, c.historyOptions)
+	if err != nil {
+		return nil, err
+	}
+	priorMessages, priorSourceIDs, priorProviderState, err := loadProviderHistory(ctx, c.host.store, session.Session{ID: c.sessionID}, turnHistoryOptions, c.resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -588,11 +603,12 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	// still be an unfinalized, content-free row; keep this in sync with
 	// adkModel.durableProjection's later filtering so baseMessageCount below
 	// stays consistent with what a fresh reload will show.
-	priorMessages, priorProviderState = dropUnfinalizedAssistantPlaceholders(priorMessages, priorProviderState)
+	priorMessages, priorSourceIDs, priorProviderState = dropUnfinalizedAssistantPlaceholders(priorMessages, priorSourceIDs, priorProviderState)
 	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, priorMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
 	}
+	base.MessageSourceIDs = priorSourceIDs
 	base.providerState = priorProviderState
 	snapshot, err := c.host.prepareSnapshot(ctx, c.execution, base)
 	if err != nil {
@@ -637,7 +653,7 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	if err != nil {
 		return nil, err
 	}
-	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: c.historyOptions, baseMessageCount: len(priorMessages), placeholderUsed: placeholderUsed}, nil
+	return &adkEngine{host: c.host, execution: c.execution, plan: c.plan, snapshot: snapshot, turn: target, assistantMessageID: target.AssistantMessageID, historyOptions: turnHistoryOptions, baseMessageCount: len(priorMessages), placeholderUsed: placeholderUsed}, nil
 }
 
 // resumeReconciledTurn rebuilds the adkEngine for the run's most recently
@@ -770,6 +786,22 @@ func (c *turnLoopCoordinator) onAgentEvents(ctx context.Context, _ *adk.TurnCont
 	// dispatches check below for that case.
 	if !engine.guardRan() {
 		return fmt.Errorf("%w: agent factory %T did not install the durable guard before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
+	}
+	// HA-S6 in the W6 round-two review: guardRan alone does not prove a
+	// factory wired DurableBaseline/SettlementSeal into its agent's real
+	// handler chain -- it only proves Guard was wired (both fields are
+	// independent AgentBuildContext values an AgentFactory could drop
+	// while still installing Guard and dispatching through build.Model).
+	// A dispatch that happened without either of these actually running
+	// means state.Messages was never seeded from durable history
+	// (DurableBaseline) and/or a settled result was never verified before
+	// the physical call (SettlementSeal) -- fail the turn rather than
+	// accept output produced under either gap.
+	if !engine.baselineRan() {
+		return fmt.Errorf("%w: agent factory %T did not install the durable baseline handler before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
+	}
+	if !engine.sealRan() {
+		return fmt.Errorf("%w: agent factory %T did not install the settlement seal before dispatch", ErrInvalidOrchestrator, engine.plan.AgentFactory())
 	}
 	// A normally-completed turn (not interrupted, guard ran) that recorded
 	// zero durable model dispatches means the agent's real execution never
@@ -1850,6 +1882,17 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	// snapshot-skew hazard in general.
 	latestMessageAt, err := latestAdmissionMessageTime(ctx, o.store, run.SessionID)
 	if err != nil {
+		return nil, err
+	}
+	// Round-two W6 review item 3: re-read every skill this session has
+	// ever durably recorded activating (SkillActivatedEventKind) from the
+	// CURRENT workspace state and compare its content digest against what
+	// was recorded at activation time. A changed or missing SKILL.md
+	// between pause and resume fails this resume closed, with a clear
+	// ErrSkillChangedSinceActivation error, before the fence below is ever
+	// claimed -- the run is left exactly as paused as GetRun found it,
+	// never resumed under silently divergent skill content.
+	if err := verifySkillActivationsUnchanged(ctx, o.store, run.SessionID, run.ID, durable.WorkspaceRoot); err != nil {
 		return nil, err
 	}
 

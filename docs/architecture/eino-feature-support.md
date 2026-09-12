@@ -423,6 +423,125 @@ Status: landed; W1 scaffolding kept green.
   settlement (`dispatchFor`'s counters live entirely in-process; wiring a
   real `runtime.BuildToolSettlement` + store settle through this example is
   tracked as follow-up work, not implemented here).
+- Durable tool-call ids are always runtime-minted, never trusted verbatim
+  from the provider. `runtime.prepareToolCalls` used to mint a call's
+  durable `ID` (the `tool_calls` table's UNIQUE-store-wide primary key) via
+  `IDGenerator.NewToolCallID()` only when the model left its `CallID` empty;
+  otherwise it reused the provider's own `CallID` string verbatim as `ID`.
+  Providers that reissue the same indexed id across unrelated responses
+  (`call_0`-style: llama.cpp, Ollama, vLLM OpenAI-compatible endpoints,
+  replayed/deterministic fixtures) therefore collided on a later turn with a
+  clean `session.ErrConflict`. `prepareToolCalls` now *always* mints a fresh
+  `ID`, and the provider's original `CallID` (verbatim, possibly empty) is
+  preserved separately as `ProviderCallID` on both `session.ToolCall` and
+  `runtime.ToolCall` — persisted in the existing free-form JSON tool-call
+  record with no DDL change, exactly like `RequestedName`. The durable
+  content block's `CallID` (what `compose.GetToolCallID` returns, what
+  `store.GetToolCall` is keyed by everywhere it is looked up —
+  `runtime/adk_execution.go`'s `adkTool`/`adkToolSearch InvokableRun`,
+  `runtime/adk_approval.go`'s sibling-orphan reconciliation,
+  `runtime/interrupt.go`'s resume/crash-reconciliation replay, tool search)
+  stays the minted `ID` throughout, unchanged from before this fix except
+  that it is now unconditionally store-unique — this keeps every internal
+  identity comparison (including ADK's own tracked conversation via
+  `compose.GetToolCallID` and `adkModel.prepareDispatchInput`/`begin`'s own
+  per-dispatch re-projection) exactly as it was. Only the literal
+  wire payload handed to the model provider needs to show the provider back
+  its own id: `runtime.publicizeToolCallIDs` (`runtime/orchestrator.go`)
+  rewrites `function_tool_call`/`function_tool_result`/`tool_search_result`
+  block `CallID`s from the minted `ID` to `ProviderCallID` (falling back to
+  `ID` when the provider supplied none or an invalid/oversized one, and,
+  processing every call in request order, whenever sending `ProviderCallID`
+  would be ambiguous in that same outgoing request — an earlier call
+  already sends that exact string, or the string equals the durable id of
+  any call in the request — see below) in a copy of the messages, applied exactly
+  once per physical dispatch, at the top of `adkModel.begin` — before that
+  request is audited/ledgered, so the request the ledger describes and the
+  `ProviderRequest` `adkModel.dispatch` actually sends are the same bytes —
+  so both a live turn's continuation and a replayed/resumed turn's next
+  dispatch present the provider its own ids for call/result correlation,
+  while every durable record and internal lookup stays keyed on the minted,
+  always-unique `ID`.
+  AG-UI tool events and observability continue to report the durable `ID`
+  (unchanged); tool-call observations (`tool.call`/`tool.settled`) also carry
+  `ProviderCallID` as a bounded, content-free `provider_call_id` metadata
+  attribute when the provider supplied one, so a failure can still be
+  correlated against that provider's own logs.
+  `store/storetest`'s tool-call contract test round-trips `ProviderCallID`
+  through `CreateToolCall`/`GetToolCall`/`ClaimToolCall`/
+  `ListUnfinishedToolCalls`/`SettleToolCall`, and asserts that a settle
+  envelope whose result block is keyed on the provider id instead of the
+  durable id is refused with `session.ErrConflict`.
+
+  Fidelity, duplicates, and failure modes this fix (and the round-two
+  reconciliation that followed it) guarantees:
+  - **Ledger fidelity.** `publicizeToolCallIDs` runs exactly once per
+    physical dispatch, at the top of `adkModel.begin` -- before
+    `nextStep`/`currentMessageID`, so a resolution failure neither consumes
+    a step nor appends an assistant placeholder row -- and its output
+    (`adkDispatch.wireInput`) is both what `begin` audits/hashes into the
+    request ledger (`ModelRequestRecord.Messages`/`ContentSHA256`, the
+    `ModelRequestedNotice.ContentHash`) and what `adkModel.dispatch` sends
+    over the wire. The two can never diverge: there is no second rewrite.
+  - **Duplicate provider ids.** Every distinct durable id referenced
+    anywhere in the outgoing request (across every message, not just the
+    current turn's own calls) is processed in request order -- the order
+    its first block appears. A call's provider id goes on the wire only if
+    (a) no earlier call in that same request has already sent that exact
+    string, and (b) the string is not the durable id of any call referenced
+    in the request (every durable id is reserved for its own call from the
+    start, so a provider id can never be mistaken for another call's
+    fallback); otherwise the call sends its own durable id instead (on both
+    its call block and its result block, deterministically), which the same
+    reservation keeps from ever colliding with another call's wire id in
+    turn. Processing in request order also means the earliest call with a
+    given provider id keeps it when a later call reuses that id, so history
+    already sent normally keeps its wire ids as the conversation grows
+    (provider-side prompt-prefix caches — llama.cpp, vLLM, Ollama — stay
+    valid). One exception, from rule (b): if an earlier call's provider id
+    equals the durable id of a call added to history later (possible only
+    when a provider emits ids in the `IDGenerator`'s minted format), the
+    earlier call sends its own durable id from that request on. Every
+    request is still unique and internally consistent; only the prefix
+    cache for that history is lost.
+  - **Failing closed.** A tool-call block with no `tool_calls` row (only
+    reachable via direct store writes or imported history, since
+    `rejectNonCallerBlocks` refuses caller-authored tool blocks and context
+    contributions are text-only) fails the dispatch with
+    `errToolCallIDUnresolved` when the underlying store lookup itself failed
+    deterministically (`session.ErrNotFound` or `session.ErrConflict`,
+    wrapped with `%w` so the cause stays inspectable). A resolved row that
+    belongs to a different session is a separate case, not a lookup error:
+    the cross-session check fails the dispatch with the same sentinel on its
+    own, carrying no store cause. Either way, a sentinel `defaultShouldRetry`/
+    `defaultShouldFailover` both refuse to retry or fail over, since a
+    deterministic, durable-consistency failure would only burn the run's
+    retry/failover budget for nothing. Any other store error (a transient
+    read failure, for example) is returned without the sentinel (still
+    wrapped with `%w` for the cause) and stays fully
+    retryable/failover-eligible under the run's normal policy.
+  - **Provider id validation.** `prepareToolCalls` treats a captured
+    provider id as absent (falls back to the minted id) unless it is valid
+    UTF-8 and no longer than `session.DiscoveryMaxIdentityBytes` -- reused
+    here as a convenient existing bound, not because a provider call id is
+    itself a discovery identity -- so an invalid or oversized id from a
+    misbehaving provider never round-trips altered through the SQL stores'
+    JSON encoding.
+  - **Model-visible body vs. wire id.** The model reads the provider's own
+    id on the wire `function_tool_call`/`function_tool_result`/
+    `tool_search_result` block's `CallID`. The result's model-visible body
+    (`ToolOutput.tool_call_id` inside the JSON content, and the tool-search
+    output) still carries the *durable* id -- it is never rewritten, since
+    that body is also the durably persisted and replayed content, and both
+    ids are legitimate: the block-level `CallID` is what a stateful
+    provider correlates by, while the body's `tool_call_id` is this
+    package's own durable identity for the call.
+  - **Ordering.** `ListUnfinishedToolCalls` (used by both the legacy
+    non-ADK `resumeRun` and by `terminalizeUnfinishedTools` crash
+    reconciliation) orders by the request assistant message's own creation
+    order and then the call's block position within it, not by the minted
+    tool-call id -- a sequence-generator id like `tool-call-10` sorts before
+    `tool-call-9`, which has no relationship to declared order.
 
 ## W5: typed ADK runtime, checkpoints and turn control
 
@@ -529,7 +648,19 @@ unwritten (see that bullet for the exact, now-shorter list).
   `TestNonCompliantFactoryWithoutGuardFailsAsConstructionError` (missing
   guard) and `TestRogueModelWithGuardInstalledFailsTurn` (guard installed,
   model substituted) in `runtime/w5_reconciliation_test.go` and
-  `runtime/w5_round2_test.go` respectively.
+  `runtime/w5_round2_test.go` respectively. **A third, complementary
+  post-hoc check (round-two W6 review, HA-S6)**: `guardRan`/`dispatches`
+  alone do not prove a factory also wired `AgentBuildContext.DurableBaseline`/
+  `SettlementSeal` into its agent's real handler chain -- both are
+  independent `AgentBuildContext` values a factory could drop while still
+  installing `Guard` and dispatching through `build.Model`, satisfying
+  both existing checks while never seeding `state.Messages` from durable
+  history and never settlement-verifying a result before dispatch.
+  `durableBaselineHandler`/`settlementSeal` now track `hasRun()` the same
+  way `durableGuard` does (`adkEngine.baselineRan()`/`sealRan()`), checked
+  alongside `guardRan`/`dispatches` in the same post-hoc location.
+  `TestNonCompliantFactoryWithoutBaselineOrSealFailsAsConstructionError`
+  (`runtime/adk_agent_factory_compliance_test.go`) proves it.
 - `adkModel.commit` persists exactly the classic engine's per-step facts
   (`captureAssistantProviderState`, `normalizeToolCallIDs`,
   `prepareToolCalls`, `persistAssistantTurn`) before returning a result to
@@ -1628,7 +1759,666 @@ unwritten (see that bullet for the exact, now-shorter list).
   `settleInterruptedRunningTool` helper that test exercises, so no
   dedicated new-engine-specific test was added.
 - Out of scope, not started: child agents (typed `AgentTool`/`DeepAgent`),
-  W6/W7. The superseded classic `PartKind`s were removed in W5 phase 2 (see
+  W7. The superseded classic `PartKind`s were removed in W5 phase 2 (see
   the W2 section's "superseded part kinds" note); a WIT/bindings reference
   to those kinds' string values was not found in `wit/eino-agent-extensions.wit`
   or `wasmext/gen`, so no W6 follow-up was required for this removal.
+
+## W6: typed ADK middleware, context and extensions
+
+Status: groups A through F landed and are verified per the gate list below
+(`go test ./composition ./runtime ./session/... ./examples/agentic-middleware/...`,
+`go vet -tags postgres_integration ./...`, `golangci-lint` 0 issues, `go
+test ./runtime ./examples/agentic-middleware -race -count=3`, `make
+postgres-test`, `make postgres-race`, `EINO_AGENT_CONSUMER_POSTGRES=1
+testdata/external-consumer/check.sh`). The two integration gaps an earlier
+pass of this work documented (host-injected content never reaching the
+model; a handler-injected tool never being callable) are both resolved --
+see below for the mechanism and the tests proving each fix through a real
+turn, not just construction. Group E (WASM/WIT content-block evolution) and
+Group F (`examples/agentic-middleware/`) are covered in their own bullets
+below.
+
+- **Group A (composition + fingerprint)**: `composition.Registrar.Handler(HandlerRegistration{ID,
+  Order, Scope, Descriptor: HandlerDescriptor{Kind, Version, Config
+  json.RawMessage}, Factory runtime.HandlerFactory})` registers one typed
+  ADK agent-handler factory per component. `handlerConfigHash` canonicalizes
+  `Config` (decode-then-remarshal, so key order never affects it) before
+  sealing it. `discoverHandlerTools` additionally probes each factory once
+  at plan-compile time, in a bounded stub-backed `HandlerBuildContext`, to
+  enumerate the tools it contributes; the discovered `{Name, SchemaHash}`
+  set is sealed alongside the handler's own identity as
+  `session.AgentHandlerPlanIdentity{ID, Kind, Version, ConfigHash, Order,
+  Scope, Tools []HandlerToolIdentity}` on `session.ComponentPlan.AgentHandlers`
+  -- part of `ExtensionPlanDescriptor` and therefore the run's fingerprint
+  (golden updated in `session/extensions_test.go`). Neither the factory
+  closure nor the discovered `Info`/schema bytes themselves are sealed, only
+  the hash. `runtime.RunPlan.AgentHandlers()` exposes the sealed, ordered
+  list (with live `Factory` and discovered `Tools []HandlerToolSpec`
+  attached) for `adkEngine.buildAgent` to invoke fresh per admitted turn. A
+  changed `Config` changes the sealed fingerprint
+  (`TestAgentHandlerConfigChangeChangesFingerprintAndRefusesResume`), which
+  the existing `AcquireResumePlan`/`VerifyExtensionPlanForSession`
+  fingerprint-mismatch path already refuses on resume for every capability
+  kind, `AgentHandlers` included by construction.
+- **Group B (`runtime/adk_middleware.go`)**: `AgentBuildContext` gains
+  `DurableBaseline`, `Handlers` (the per-execution snapshot of every
+  plan-ordered handler factory's built instance) and `SettlementSeal`.
+  `adkEngine.buildAgent` installs, in ADK's own handler order (first
+  registered is outermost for `Wrap*` methods, first registered is first
+  called for hooks): `durableBaselineHandler` first, host handlers next,
+  then the existing `durableGuard` (integrated, not duplicated, from W5),
+  then `settlementSeal` last. `durableBaselineHandler.BeforeModelRewriteState`
+  rewrites `state.Messages` to a deep clone of
+  `adkEngine.buildDurableBaseline`'s fresh durable projection for this
+  cycle -- the durable projection is the **baseline every host handler
+  transforms**, not a value discarded and re-derived afterward.
+  `adkModel.prepareDispatchInput` (adk_model.go) dispatches exactly what the
+  handler chain leaves `state.Messages` as, with no re-projection; it trusts
+  the baseline-computed `providerState` (reasoning signatures, citations)
+  unchanged when the final input is at least as long as the baseline
+  (content edited in place or appended -- robust to ADK's retry/failover
+  wrapper defensively cloning the message slice) and drops it, never
+  misapplying it, when a handler shortens history (summarization
+  compacting). The real settlement authority is
+  `verifySettledToolResults`, called from `adkModel.prepareDispatchInput`
+  -- the innermost dispatch point every physical attempt passes through
+  regardless of a host `WrapModel` wrapper nested around the model after
+  every handler's `BeforeModelRewriteState` hook has already run.
+  `settlementSeal.BeforeModelRewriteState` calls the identical function and
+  is kept only as an early, non-authoritative check (round-one review
+  finding C2: a host `WrapModel` rewrite bypassed the hook-only seal --
+  `TestSettlementSealRejectsWrapModelTamperedToolResult`). The comparison
+  is per-occurrence, not a last-write-wins map (a duplicate/shadow
+  `function_tool_result` block for an already-settled call ID is rejected
+  even when the genuine block is also present --
+  `TestSettlementSealRejectsDuplicateShadowToolResult`), and hashes the
+  full canonical content of every block, media fields included, not just
+  `Text` (`TestSettlementSealRejectsMediaSwapOnSettledMultimodalResult`).
+  It enforces two invariants against `adkEngine.baselineMessages`' own
+  reconstruction for that call ID: a settled call's result may never
+  diverge from that reconstruction
+  (`TestSettlementSealRejectsHostRewrittenToolResult`), and a
+  `function_tool_result` with no durable settlement in the baseline is
+  rejected as fabricated
+  (`TestSettlementSealRejectsUnauthorizedFabricatedToolResult`) -- both
+  unless the exact post-rewrite content digest was recorded as an
+  authorized rewrite for that call ID, THIS cycle
+  (`authorizedRewriteSet`, reset every cycle by
+  `durableBaselineHandler.BeforeModelRewriteState`). `wrapAuthorizedContentRewrites`
+  (diffing a wrapped middleware's own `function_tool_result` content
+  before/after its `BeforeModelRewriteState`) gives patchtoolcalls'
+  legitimate dangling-call patches and reduction's legitimate settled-result
+  truncation/clearing that authorization, and durably records each one
+  (handler ID, kind, call ID, before/after digest) as a
+  `session.AuthorizedToolResultRewriteEventKind` event, drained by
+  `adkModel.begin`; no other recipe gets it. `HandlerBuildContext` exposes
+  no `session.Store`/`session.ExecutionStore` to any registered
+  `HandlerFactory` (host-provided ones included) at all -- round-one review
+  finding C1: it previously did, letting a host handler fabricate a durable
+  settlement directly via `ExecutionStore.ClaimToolCall`/`SettleToolCall`
+  (`TestHandlerBuildContextExposesNoDurableStoreAuthority`); the one recipe
+  that legitimately needs a bounded durable write (summarization) is given
+  a narrow, unexported `contextEpochCapability` instead. The ledger model
+  adapter (`adkModel`) remains the sole audit authority structurally --
+  `AgentBuildContext.Model` is always the mandatory adapter, and W5's
+  existing dispatch-count check (`adkEngine.dispatches`/`onAgentEvents`)
+  already detects a factory that substitutes its own model -- so no
+  separate "auditSeal" handler was needed. A handler-injected tool belongs
+  to the frozen tool universe (see Group C); `durableGuard.BeforeAgent`
+  deduplicates a handler's own redundant raw copy of an already-sealed tool
+  (its real `BeforeAgent` still runs and re-appends it) rather than
+  rejecting it, and still fails any other non-durable or unsealed tool as a
+  construction error.
+- **Group C (`runtime/adk_middleware_recipes.go`,
+  `adk_middleware_workspace.go`, `adk_middleware_scratch.go`,
+  `adk_middleware_discovery.go`, `adk_middleware_frozen_tools.go`)**: typed
+  wiring recipes for all eight upstream middlewares (`agentsmd`, `skill`,
+  `filesystem`, `plantask`, `patchtoolcalls`, `reduction`, `summarization`,
+  `dynamictool/toolsearch`), each calling the upstream `NewTyped`
+  constructor directly and failing construction closed when a required
+  backend/config is absent. `workspaceFilesystemBackend`/
+  `workspaceSkillBackend` are read-only views rooted at the admitted
+  canonical workspace (`internal/workspace.CanonicalRoot`), rejecting
+  `..`-relative and symlink path escape
+  (`TestWorkspaceFilesystemBackendRejectsPathEscape`,
+  `TestWorkspaceFilesystemBackendRejectsSymlinkEscape`) and supporting
+  multimodal image/PDF reads as media parts, proven end to end through a
+  real tool call
+  (`TestFilesystemHandlerMultiModalReadReturnsMediaPart`).
+  `MultiModalRead` bounds the source file's size (`maxMultiModalReadBytes`,
+  20MiB, checked via `os.Stat` before ever reading) and rejects an
+  oversized file closed with `errMultiModalReadTooLarge` rather than
+  reading it fully into memory: handler tools are sealed with
+  `Retention{MaxInlineBytes: -1}` (unbounded at the durable-settlement
+  content-budget layer, which only clamps AFTER a result already exists in
+  memory), so without this cap an arbitrarily large attachment would be
+  fully read and base64-encoded before any clamp could apply (round-two W6
+  review, RW-S1 --
+  `TestWorkspaceFilesystemBackendMultiModalReadRejectsOversizedFile`).
+  `writableWorkspaceBackend` is a private, workspace-contained scratch area
+  for plantask/reduction's own state, rooted per-session
+  (`.eino-agent/sessions/<sha256(session id)>/{plantask,reduction}`, never
+  a workspace-wide directory two sessions on the same workspace would
+  otherwise share and collide task IDs/offload files in) and constructed
+  lazily, only for the recipe kinds a plan actually mounts. Both this
+  backend and the read-only `workspaceFilesystemBackend`
+  (`GrepRaw`/`GlobInfo`, and `resolveWorkspacePath` for a not-yet-existing
+  path) resolve every walked/targeted path through symlink evaluation and
+  require the result contained in the canonical workspace root, including
+  when the leaf doesn't exist yet (resolving the deepest existing ancestor
+  instead) -- a checked-in symlink inside an untrusted workspace can
+  neither leak content through grep/glob nor let the writable scratch
+  backends write outside the workspace
+  (`TestWorkspaceFilesystemBackendGrepRejectsSymlinkEscape`,
+  `TestWorkspaceFilesystemBackendGlobRejectsSymlinkEscape`,
+  `TestWritableWorkspaceBackendRejectsSymlinkedRoot`,
+  `TestWritableWorkspaceBackendRejectsSymlinkedIntermediateDirectoryOnWrite`).
+  A handler's tools are discovered once
+  at plan-compile time (`discoverHandlerTools`, Group A) and, at real
+  per-turn build time, `adkEngine.sealHandlerTools` splices a durable
+  `runtime.Tool` per sealed entry into `TurnSnapshot.Tools` *before* the
+  agent is built, so `prepareToolCalls`/`resolveToolCall` resolve it like
+  any other frozen tool; `handlerToolExecutor` dispatches the call through
+  the full durable claim/permission/execute/settle pipeline to the live
+  tool instance `adkEngine.buildAgentHandlers` collected, supporting both
+  `InvokableTool` and `EnhancedInvokableTool`. A write-like tool is sealed
+  with a `Permissions` tag, gated exactly like any other state-changing
+  tool -- disabled unless a permission grants it. `isWriteLikeToolName`
+  classifies by an explicit override table first
+  (`explicitWriteLikeTools`, covering plantask's `TaskCreate`/`TaskUpdate`
+  -- both genuinely state-changing but matching none of the substring
+  markers below), falling back to a substring heuristic
+  (`write`/`edit`/`execute`/`shell`/`delete`) for every other tool name,
+  including third-party ones (round-two W6 review, HA-S3/RW-S3 --
+  `TestIsWriteLikeToolNameClassifiesPlantaskCorrectly`). Proven end to end:
+  `TestFilesystemHandlerToolExecutesThroughDurableWrapper`,
+  `TestPlanTaskHandlerCreateAndUpdateThroughDurableWrapper` (TaskCreate then
+  TaskUpdate, correlating the created task's numeric ID out of its own
+  human-readable result message), `TestSkillHandlerInlineActivationThroughDurableWrapper`.
+  Summarization's own internal summary-generation call runs through a
+  bounded `adkModel.internalDispatch` adapter, not the turn's own
+  conversational adapter (round-one review finding C1/C3: it previously
+  did, so the summary text got persisted onto the turn's own assistant
+  message and corrupted the session -- a second turn on the same session
+  failed to admit). The internal-dispatch adapter is tagged per plan entry
+  with that entry's own registered `HandlerID` (e.g. `AgentPath ==
+  "summarization"` for a handler registered under that ID -- never a
+  shared literal like `"summarizer"`, and never shared across entries),
+  is still fully ledgered (its own `ModelRequestRecord` row, usage
+  charged, retried/failed over through the same audited path) but never
+  claims the turn's assistant placeholder, never persists as
+  conversational content, sends no tool controls, and fails closed on
+  anything but plain text/reasoning
+  (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`
+  drives a real second `orch.Start` on the same session and asserts it
+  completes, the summarizer's ledger row carries the handler's own
+  `AgentPath`, and the turn's own assistant message has exactly one
+  `assistant_gen_text` part).
+  `summarizationFinalize` maps a completed summary into an atomic
+  `session.ContextEpoch`, correlating upstream's in-memory
+  `originalMessages` to durable messages via a PER-CYCLE, POINTER-KEYED
+  lookup (`adkEngine.cycleMessageSourceByPointer`, rebuilt fresh every
+  cycle by the mandatory durable-baseline handler from that cycle's own
+  durable reload -- round-two W6 review item 8), not by positional index
+  or by `history.LoadAgentic` correlated through the active epoch: a
+  message with no durable id (content a host handler like agentsmd/skill
+  injected this cycle) simply resolves as "no durable id" and is always
+  retained verbatim. Because an earlier handler in the chain (host-authored
+  or this package's own, e.g. via `cloneProtectedMessages`) can legitimately
+  replace message pointers without preserving identity, `summarizationFinalize`
+  also falls back to CONTENT-based correlation (`reflect.DeepEqual` against
+  that cycle's own baseline) for anything the pointer lookup misses, and
+  fails the turn closed -- rather than silently compacting on a partial
+  view -- if any durable baseline message still cannot be accounted for
+  either way (round-three W6 summarization-correctness review, Important
+  #1). This correlation (`correlateDurableSubsequence`, shared with the
+  re-apply path below) runs in two STRICT passes -- pointer-keyed first,
+  then content fallback only over what pass one left unresolved and only
+  against baseline slots pass one did not already claim -- rather than one
+  interleaved pass: an ephemeral (non-durable) message that coincidentally
+  matches a baseline entry's content can otherwise steal that entry's slot
+  before its real, pointer-resolvable owner claims it, letting one durable
+  id resolve to two different messages with no error, or masking a
+  genuinely unresolved durable message so the fail-closed check above never
+  fires (round-four W6 correlation-and-seal review, Important #1).
+  Summarization generates a summary at most once per turn
+  (`summarizeAtMostOnceMiddleware`): upstream re-evaluates its own trigger
+  condition on every ReAct cycle with no per-call override, so without this
+  a multi-cycle turn that crosses the threshold once would re-summarize --
+  and re-bill a real summary generation call -- on every later cycle of the
+  same turn (round-three W6 summarization-correctness review, Important
+  #2). Bounding GENERATION to once per turn does not mean the model sees
+  the full, uncompacted baseline again on later cycles: doing so measured
+  as per-cycle message counts regrowing from a compacted 1 back up to 10
+  across five cycles of the same tool loop (round-four W6
+  correlation-and-seal review, Important #2). Every cycle after the one
+  that committed the epoch instead re-applies that SAME compaction
+  (`reapplyDurableSummary`, using the cached `SummarizedFromID`/
+  `SummarizedToID`/boundary id/summary object) without generating or
+  billing a second summary, so a long tool loop stays inside the context
+  window for the rest of the turn (measured as `[1 1 3 5 7]` on the same
+  five-cycle shape: compacted once, then growing by exactly the new
+  call/result pair each cycle adds, not regrowing toward the
+  pre-compaction baseline). `summarizationFinalize`
+  commits `StartContextEpoch` + the compaction boundary in ONE fenced
+  transaction (`compaction.AppendBoundaryTx`) so a mid-sequence failure can
+  never leave an epoch row with no `SummaryMessageID`. It never creates an
+  epoch whose `SummarizedFromID`/`SummarizedToID`/`TailStartID` overlap,
+  moves the retained tail's start back so a `function_tool_call` is never
+  separated from its `function_tool_result` (`moveTailStartToGroupBoundary`),
+  and always keeps the session's leading system-message prefix out of the
+  summarized range. `applyEpoch` (`session/history/projector.go`) likewise
+  always preserves a session's leading system messages regardless of the
+  active epoch, and no longer treats an empty `TailStartID` (nothing
+  retained verbatim) as "nothing produced after this epoch is ever included
+  again" -- the projection picks back up after the boundary message for
+  content later turns produce. A failed or cancelled summary-generation
+  call fails/interrupts the whole turn (upstream's own
+  `BeforeModelRewriteState` propagates the error before the turn's own
+  main dispatch ever runs for that cycle) and never creates a new epoch;
+  any previously committed epoch survives unchanged.
+  `resolveTurnHistoryOptions` resolves the most recently finished
+  summarization epoch fresh at every turn admission (both a brand-new run
+  and a later turn on an existing run), so the provider projection actually
+  narrows for later turns without a host statically configuring
+  `history.Options.Epoch`
+  (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`
+  asserts turn 2's provider-visible message count is narrower than the
+  full durable replay). This resolution happens once per turn admission,
+  not once per ReAct cycle within a turn: `adkEngine.baseMessageCount` and
+  every cycle's `buildDurableBaseline` reload within ONE turn must agree on
+  the same epoch view for their prefix/fresh-reload-tail splice to stay
+  correct, so a summarization epoch a turn's own recipe commits mid-turn
+  takes effect starting the NEXT turn on that session, not later cycles of
+  the same turn that created it -- a documented, bounded scoping choice.
+  Cancelled/failed summary generation never calls `Finalize` (upstream's
+  own contract, not this package's code), so the previous epoch stays
+  active, proven by two dedicated tests that actually trigger and then fail
+  or cancel the internal summary-generation call specifically
+  (`TestSummarizationFailedGenerationKeepsPreviousEpoch`,
+  `TestSummarizationCancelledGenerationKeepsPreviousEpoch`) rather than
+  configuring the trigger so high summarization never runs at all. Keeping
+  the previous epoch does NOT mean the turn itself succeeds: upstream's own
+  `BeforeModelRewriteState` propagates a failed or cancelled summary call's
+  error, which fails that whole cycle -- the turn's own main dispatch never
+  even runs for it. A failed summary call fails the turn
+  (`session.RunFailed`); a cancelled one maps to an interrupted outcome
+  (`session.RunInterrupted`, `Result.Interrupted == true`) -- both proven by
+  the same two tests above, not merely asserted in this paragraph.
+  Reduction's `MaxLengthForTrunc` truncation and `MaxTokensForClear`
+  clearing are BOTH effective, through two different mechanisms with two
+  different timings (round-two W6 review item 2). Truncation applies per
+  call, at EXECUTION time, before this runtime durably settles it:
+  `adkEngine.applyHandlerToolResultWrappers` threads a claimed tool's raw
+  result through every mounted host agent-handler middleware's own
+  `WrapInvokableToolCall`/`WrapEnhancedInvokableToolCall` (the exact
+  mechanism reduction's `MaxLengthForTrunc` uses) from inside
+  `executeClaimedToolPipeline`, BEFORE `buildToolSettlement`/
+  `persistToolSettlement` -- so the settled result, the seal, and what the
+  model sees are all the truncated form, with its offload reference, not
+  an after-the-fact rewrite of an already-settled original. A
+  `tools.Definition`-based tool's duplicate `Structured` field is cleared
+  whenever a wrapper changes `Output`, closing a leak where the
+  untransformed original would otherwise survive in the durable envelope's
+  `Structured` side channel even after `Output` was truncated. Clearing
+  applies across the WHOLE conversation's accumulated size and stays a
+  post-settlement rewrite of the durable baseline via
+  `BeforeModelRewriteState`, explicitly authorized through
+  `wrapAuthorizedContentRewrites`/`settlementSeal` exactly as before. Both
+  are proven with `Retention{MaxInlineBytes:-1}` so the payload is
+  genuinely inline and only reduction (not the runtime's own retention
+  truncation) can be shortening it:
+  `TestReductionTruncatesToolResultBeforeSettlement`/
+  `TestReductionTruncatesSettledToolResultBeforeSettlement` (truncation,
+  asserting the durable settlement row, the durable replay, and the
+  model-visible dispatch all show the truncated form) and
+  `TestReductionClearsOlderSettledResultAsAuthorizedRewrite`/
+  `TestReductionClearsOlderRoundAsAuthorizedRewrite` (clearing, two
+  rounds, `MaxLengthForTrunc` disabled so only clearing fires).
+  `verifySettledToolResults`'s authorization is Kind-scoped
+  (`kindMayRewriteSettledContent`): only reduction may legitimately
+  rewrite a call ID the baseline already shows real settled content for;
+  a patchtoolcalls-kind authorization for such a call ID is refused even
+  though `wrapAuthorizedContentRewrites` itself recorded it (round-two
+  review item 4/HA-S3 convergence with RW-S3 --
+  `TestPatchToolCallsCannotPatchACallWithARealSettlement`).
+- **Group D**: verified no-op. `runtime/extension_{context,model,tool,lifecycle}.go`
+  and `wasmext/*.go` already carry only `*schema.AgenticMessage` (landed in
+  W3), not classic `schema.Message`.
+- **Both previously-documented gaps are resolved.** Root causes and fixes,
+  each proven by an end-to-end test that used to be `t.Skip`ped and now
+  passes unskipped:
+  1. Host content reaching the model: durably fixed by making the durable
+     projection the baseline (see Group B's `durableBaselineHandler`
+     bullet) instead of a value `adkModel` discarded and rebuilt from
+     scratch after every handler ran.
+     `TestAgentsMDHandlerInjectsContentIntoModelRequest` now passes.
+  2. Handler-injected tools: durably fixed by sealing a handler's
+     discovered tools into the frozen tool universe at plan-compile time
+     (see Group C). `TestFilesystemHandlerToolExecutesThroughDurableWrapper`
+     now passes.
+- **Known bounded limitations, not silently dropped**:
+  - `discoverHandlerTools`' compile-time probe uses stub backends/a stub
+    deferred tool and no real session/model identity; this is sufficient
+    for all eight of this package's own recipes (their tool lists are
+    static per configuration) but is a documented limitation for a
+    hypothetical third-party handler Kind whose own tool list genuinely
+    depends on data the bounded probe cannot supply -- such a handler would
+    be sealed with fewer tools than it might produce at real execution
+    time. A static `HandlerRegistration.Tools` declaration (bypassing
+    probing) is the documented escape hatch; it was not added this pass.
+    The probe itself now runs under a bounded deadline
+    (`discoveryProbeBudget`) and through purely in-memory stub backends
+    (`probeWritableBackend`, wrapping upstream's own
+    `adk/filesystem.NewInMemoryBackend()`) -- no temp directory is created
+    -- and fails plan compilation closed, rather than silently sealing zero
+    tools, for a Kind this package knows is always tool-bearing once
+    correctly configured (filesystem, plantask, skill, toolsearch); every
+    other Kind keeps the documented graceful degradation
+    (`TestDiscoverHandlerToolsFailsClosedForKnownToolBearingKind`,
+    `TestDiscoverHandlerToolsDegradesGracefullyForOtherKinds`,
+    `TestDiscoverHandlerToolsBoundsTheProbeContext`,
+    `TestHandlerProbeBuildContextNeverTouchesTheFilesystem`).
+  - **Resolved (round-two W6 review item 4).** patchtoolcalls now has real
+    seeded-durable-history tests, not just the authorization mechanism's
+    generic proof: `TestPatchToolCallsPatchesOrphanedCallWithoutFabricatingSettlement`
+    seeds a genuinely orphaned `function_tool_call` directly through the
+    store (no `session.ToolCall` row at all, bypassing any live turn) and
+    proves the real recipe's patch reaches the model, is durably audited
+    (`AuthorizedToolResultRewriteEventKind`), and creates no settlement
+    row; `TestPatchToolCallsCannotPatchACallWithARealSettlement` seeds a
+    real, fully settled `ToolCall` (via the same `BuildToolSettlement`/
+    `SettleToolCall` path a live turn uses) and proves a
+    patchtoolcalls-kind rewrite attempt against it is rejected
+    (`kindMayRewriteSettledContent`), leaving the durable settlement
+    untouched. The example package's construction/registration proof
+    (`TestPatchToolCallsHandlerFactoryConstructs`) and "mounts and does
+    nothing when nothing is dangling" proof
+    (`TestPatchToolCallsMountsAndCompletesNormalTurnWithoutAlteringSettlement`)
+    still stand alongside these, at the black-box level.
+  - **Resolved (round-two W6 review item 1).** The toolsearch recipe's own
+    sealed search tool no longer settles as an ordinary
+    `function_tool_result` with only an in-memory `markDiscovered` side
+    effect: `adkTool.InvokableRun` type-asserts it as a
+    `toolSearchHandlerToolExecutor` and routes it through
+    `adkEngine.executeAndSettleHandlerToolSearch`
+    (`runtime/tool_search.go`), which settles the call as a durable
+    `tool_search_result` block via `buildTerminalToolSearchEnvelope` --
+    the SAME content-block shape the native tool-search path produces --
+    and marks matches discovered via `markDiscovered`. Because
+    `discoveredToolsFromMessages`/`discoveredToolsFromHistoryPaged` read
+    that durable shape (not any live run's in-memory set) to rebuild the
+    advertised deferred-tool set, discovery now replays on a fresh turn on
+    the same session, after `ResumeRun`, and after a brand-new
+    orchestrator instance against the same store -- proved respectively by
+    `TestToolSearchDiscoveryReplaysOnNextTurn`,
+    `TestToolSearchDiscoveryReplaysAfterResumeRun`, and
+    `TestToolSearchDiscoveryReplaysAfterProcessRestart`, alongside the
+    existing `TestToolSearchFindsDeferredTool` (the discovered tool is
+    actually callable).
+  - **Resolved (round-two W6 review item 3).** `ResumeRun` now re-reads,
+    from the current workspace state, every skill this session has ever
+    durably recorded activating (`SkillActivatedEventKind`) and compares a
+    fresh content digest against the one recorded at activation time
+    (`verifySkillActivationsUnchanged`, `runtime/adk_middleware_recipes.go`)
+    -- read-only, before the run's fence is ever claimed, alongside
+    `ResumeRun`'s other pre-claim checks. A changed or missing `SKILL.md`
+    between pause and resume fails resume closed with the new
+    `ErrSkillChangedSinceActivation`, leaving the run exactly as paused as
+    it was found. Proved by `TestResumeAfterUnchangedSkillContentSucceeds`
+    (resume proceeds normally when the file is untouched) and
+    `TestResumeAfterChangedSkillContentIsRefused` (editing `SKILL.md`
+    between pause and resume is rejected, and the run's durable status is
+    still `RunPaused` afterward).
+  - Failover to an alternate model reuses the primary model's
+    `buildDurableBaseline`-computed `providerState` rather than
+    recomputing it against the failover provider's own projection (the
+    pre-W6 `durableProjection` recomputed per physical attempt, using
+    `activeModel()`); a bounded, accepted simplification given
+    `BeforeModelRewriteState` now runs once per logical cycle, before the
+    internal failover/retry wrapper, not once per physical attempt.
+- **Round-two W6 review, item 5 (suggestions deferred for time in round
+  one, re-evaluated)**. Applied: HA-S5/int64 config-hash precision;
+  RW-S2/RW-S4 (fail-closed discovery probe, reject empty summaries);
+  RW-S8 (real second-turn narrowing assertion) -- all landed earlier this
+  pass, see the relevant bullets above. Newly applied this item: HA-S3/
+  RW-S3 (exact `isWriteLikeToolName` override table for plantask); HA-S6
+  (`baselineRan`/`sealRan` post-hoc compliance checks); RW-S7
+  (`ErrHandlerConfiguration` sentinel); RW-S1 (bounded `MultiModalRead`);
+  RW-S5 (`HandlerFactory`'s `BeforeAgent` idempotence requirement
+  documented). Still deferred, each for a stated reason rather than
+  silently dropped:
+  - **HA-S1** (verify a live handler tool's schema hash against the
+    sealed `HandlerToolSpec.SchemaHash` at real per-turn build time):
+    defense-in-depth against a live tool's schema drifting from what
+    compile-time discovery probed; not exercised by any of this package's
+    own eight recipes, whose tool schemas are static per configuration --
+    only relevant to a hypothetical third-party handler whose schema is
+    genuinely data-dependent.
+  - **HA-S4** (`NewXxxHandlerFactoryFromConfig(json.RawMessage)`
+    constructors binding `HandlerDescriptor.Config` to the factory
+    closure by construction): a larger API/wiring redesign (new
+    constructor shape for every built-in Kind, plus a `Registrar.Handler`
+    change), out of scope for a suggestion-severity finding in this pass.
+  - **HA-S7** (a named `errToolAdapterBypassed` for a clearer message when
+    a host tool wrapper short-circuits the durable adapter): the failure
+    already fails closed correctly (probe P6, round-one review); this is
+    a message-quality improvement, not a correctness/security gap.
+  - **HA-S8** (stop the double `BeforeAgent` probe call structurally, by
+    capturing tools from the real in-context call instead): superseded by
+    RW-S5's lighter alternative applied above (document the idempotence
+    requirement) rather than the larger `BeforeAgent`-wrapper refactor
+    HA-S8 itself proposes.
+  - **RW-S6** (bound `workspaceSkillBackend` discovery to a configured
+    skills subdirectory plus an entry cap, instead of scanning every
+    top-level workspace directory): a hygiene/performance concern, not a
+    demonstrated exploit -- a matching `SKILL.md` would have to
+    deliberately or accidentally exist in e.g. `node_modules`/`.git` to
+    matter; lower severity than the items applied this pass.
+  - **RW-S9** (state plainly in `wit/eino-agent-extensions.wit` that the
+    package version, not a per-case version, is the variant's only
+    negotiable identity): APPLIED -- `wit/eino-agent-extensions.wit`'s
+    `content-block` variant doc comment (around line 116) now states this
+    explicitly, including the exact rejection mechanism (export-name lookup
+    at compile time, not a canonical-ABI/signature check).
+  - **HA-S2** (detect handler-tool name collisions at plan compile, not
+    just "last one wins" at seal time): APPLIED in the round-two W6
+    review's own item 18/Group H -- `validateHandlerToolNameCollisions`
+    (`runtime/extension_plan.go`) rejects a handler-declared tool name that
+    collides with the native `tool_search` name or any plan tool/alias at
+    `NewRunPlan` compile time.
+- **Group E (WASM/WIT content-block evolution)**: landed and verified.
+  `wit/eino-agent-extensions.wit`'s `text-message` record is replaced by a
+  `content-block` variant (`text(string)`, `media-reference`,
+  `function-call`, `function-result-text`) inside a `message` record
+  (`role` + `blocks: list<content-block>`), so `context-source` (and any
+  future WASM context/model/tool middleware observing message content) can
+  produce media references and call/result projections without flattening
+  them to text; `context-source-api.load-context` now returns
+  `list<message>`. The package bumped `eino-agent:extensions@0.1.0` ->
+  `@0.2.0`; bindings were regenerated with `make wit`
+  (`wasmext/gen/eino-agent/extensions/v0.2.0/...`) and `make wit-check`
+  passes clean against the committed tree. `wasmext/engine.go`'s six
+  `worldContract` values (world + export names) are pinned to the package
+  version; these were still hardcoded to `@0.1.0` after the bump, which
+  made every fixture -- not only `context-source` -- fail to compile until
+  fixed, confirming the version pin is load-bearing, not decorative.
+  `wasmext/wasmtime_worlds.go`'s new `decodeMessages`/
+  `decodeContentBlocks`/`decodeContentBlock` (modeled on the existing,
+  proven `decodeReplacement` variant-decoding pattern) replace the removed
+  `decodeTextMessages`, bounding block count and cumulative payload bytes
+  against `Limits.MaxOutputBytes`. `wasmext/wrappers.go`'s
+  `loadContextMetadata` (`convertContentBlock`/`convertMediaReference`)
+  maps the two production WIT cases onto the matching `schema.ContentBlock`
+  variant: `text` stays plain text; `media-reference` is classified by its
+  required MIME type (`image/`, `audio/`, `video/`, else treated as an
+  opaque file reference -- `media-reference` carries no separate kind
+  discriminant of its own) into the matching typed
+  `UserInput{Image,Audio,Video,File}` block, never flattened to text, after
+  its `uri` is validated (non-empty, bounded length, valid UTF-8,
+  `https`-only scheme). `function-call`/`function-result-text` are
+  rejected with a contract error before any message mutation -- see the
+  context-source-output-restriction bullet below. All six guest fixtures
+  (`examples/wasm-extensions/*/main.go`) were rebuilt via `make
+  wasm-fixtures` (both `tinygo` and `wasm-tools` are present locally); the
+  `context-source` guest now emits a `content-block` message.
+  **Version rejection is structural, proven, and does not crash**: an old
+  guest built against the superseded `@0.1.0` world exports a
+  DIFFERENTLY-VERSIONED world interface name
+  (`eino-agent:extensions/context-source-api@0.1.0`, not this package's
+  `@0.2.0`), so it is rejected at `Compile` by a plain export-name lookup
+  failure -- `wasmext/engine_wasmtime.go`'s
+  `component.GetExportIndex(nil, contract.exportName)` finds no export by
+  that name and fails closed with `"required world export missing"`,
+  classified `ErrorContract` -- before any call, before instantiation, as
+  an ordinary `*wasmext.Error`, never a panic. This is a lookup-by-name
+  failure, not a canonical-ABI/signature type check: a guest that happened
+  to export the SAME versioned name with a subtly incompatible function
+  signature is not a case this mechanism catches at all -- signature
+  compatibility within one package version relies on WIT/package-version
+  discipline between host and guest, not a runtime check. This is a
+  permanent regression test, not a one-off manual check:
+  `TestCheckedInOldABIContextSourceRejectedCleanly` loads a checked-in
+  `@0.1.0` `context-source.wasm`
+  (`examples/wasm-extensions/fixtures/context-source-abi-v0.1-incompatible.wasm`,
+  the pre-bump fixture preserved under a new name) against the current host
+  and asserts a clean `*Error` with `Kind == ErrorContract` specifically.
+  `TestCheckedInPhaseBComponentsRoundTrip` exercises the new shape end to
+  end through the rebuilt fixture. No classic `PartKind` names existed in
+  this WIT file to rename (the parallel removal work in another worktree
+  does not intersect this package).
+  - **Context-source output is restricted to text and media-reference**:
+    `function-call`/`function-result-text` are OBSERVATION-only cases in
+    the shared `content-block` variant (valid for a future tool-middleware
+    content-observation point), never valid for `context-source`'s
+    `load-context` output -- that output becomes part of a turn's own
+    admission-time prefix, which the host's settlement seal
+    (`runtime.verifySettledToolResults`) treats as already-trusted baseline
+    content, so a guest emitting either case there would let it fabricate
+    an apparently-settled tool result no durable record ever backed.
+    `wasmext/wrappers.go`'s `convertContentBlock` rejects both with a
+    contract error before any message mutation. A `media-reference`'s
+    `uri` is validated before use: non-empty, bounded length, valid UTF-8,
+    and an allowed scheme (`https` only -- `data:`/`file:`/relative are
+    rejected).
+  - **Bounded limitation**: `testdata/external-consumer` (a separate Go
+    module resolving the published module graph, exercised by
+    `make external-consumer-check` / `EINO_AGENT_CONSUMER_POSTGRES=1
+    testdata/external-consumer/check.sh`) covers the store/session/
+    runtime/tools surface only; it does not instantiate WASM components
+    (cgo-gated, backed by local `.wasm` fixture files, not something a
+    published-module consumer loads). The content-block shape and old-ABI
+    rejection are instead exercised, end to end, by this repository's own
+    `wasmext` test suite as described above -- the mechanism the coordinator
+    asked to be documented if this exact scenario weren't literally covered
+    by the external-consumer harness.
+- **Group F (`examples/agentic-middleware/`)**: landed and verified. A
+  runnable `Mount` wires all eight recipes through only
+  `composition.Registrar.Handler`/`runtime.StreamingOrchestrator` -- never
+  this package's own internals -- and a 22-test black-box suite proves the
+  acceptance scenarios hold from outside the runtime package, not only
+  inside its own white-box test suite. This includes (round-two W6 review
+  item 14) one composed example,
+  `TestComposedExampleMountsAllEightRecipesInOneRunPlan`, that mounts all
+  eight recipes together in one `RunPlan` and drives a real multi-turn
+  scenario exercising every one of them with concrete, per-recipe
+  assertions -- not a registration-only smoke test. Individually: a
+  combined agentsmd + skill +
+  multimodal-filesystem-read + plantask create/update turn; missing-
+  workspace-root failing every workspace-backed recipe closed; a symlink
+  escaping the workspace root rejected without leaking content; reduction
+  truncating a large settled result before settlement, and separately
+  clearing an older round once a second, more recent round exists (ONE
+  handler, two of its own rewrites in the same turn -- not two DIFFERENT
+  handlers; that scenario, "ordering with two rewrites", is proven in
+  `runtime`'s own test suite instead, via
+  `TestTwoHandlersRewriteTwoDifferentResultsInOneTurnBothAuthorized`, and
+  -- as of the composed example below -- also inside this package itself);
+  summarization with a fake summary model
+  writing a `session.ContextEpoch` while the full durable replay stays
+  intact (`TestSummarizationWritesContextEpochPreservesReplayThenNarrowsProjection`),
+  and -- round-three W6 review item 16 -- a genuinely triggered but failed
+  or cancelled summary-generation call leaving a PRIOR, already-committed
+  epoch unchanged and creating no new one
+  (`TestSummarizationFailedGenerationKeepsPreviousEpoch`/
+  `TestSummarizationCancelledGenerationKeepsPreviousEpoch`); patchtoolcalls
+  completing a normal turn without altering a real settlement; toolsearch
+  finding a deferred tool by name and separately refusing construction
+  with zero deferred tools; a custom, unauthorized `HandlerFactory` built
+  through only the public API failing closed when it tries to mutate a
+  settled tool result (immutable input, via `settlementSeal`
+  -- proven from outside the package this time); and interrupt/resume via
+  `Orchestrator.Stop`/`ResumeRun` (the resumable, checkpointed pause API --
+  `Handle.Interrupt` is documented skip-checkpoint and does not produce a
+  resumable pause) resuming a blocked tool call without re-executing it,
+  then a second scenario proving a resume after the mounted handler's own
+  `Config` changed is refused end to end (not just via the static
+  fingerprint-inequality check `TestAgentHandlerConfigChangeChangesFingerprintAndRefusesResume`
+  already covered) -- catching, in the process, a real bug in this
+  example's own first draft: `Mount` was sealing every handler's
+  `HandlerDescriptor.Config` as `nil` regardless of the recipe's real
+  configuration, which would have made every handler's sealed fingerprint
+  identical regardless of its actual settings; fixed by marshaling each
+  recipe's own config value into `Config` alongside the factory that
+  consumes it.
+  - **Resolved (round-two W6 review item 1)**: three new tests --
+    `TestToolSearchDiscoveryReplaysOnNextTurn`,
+    `TestToolSearchDiscoveryReplaysAfterResumeRun`,
+    `TestToolSearchDiscoveryReplaysAfterProcessRestart` -- prove discovery
+    now durably replays on a fresh turn on the same session, after
+    `ResumeRun`, and after a brand-new orchestrator instance against the
+    same store, alongside `TestToolSearchFindsDeferredTool` (the
+    discovered tool is actually callable in the SAME turn it was found).
+    Two new resume tests, `TestResumeAfterUnchangedSkillContentSucceeds`
+    and `TestResumeAfterChangedSkillContentIsRefused`, prove item 3's
+    skill-resume-verification fix end to end from outside the runtime
+    package.
+  - **Resolved (round-two W6 review item 14)**: the composed example
+    (`TestComposedExampleMountsAllEightRecipesInOneRunPlan`,
+    `examples/agentic-middleware/composed_test.go`) builds a genuine
+    "dangling call, no durable settlement" fixture at the black-box level
+    -- a custom public `HandlerFactory` (`danglingCallInjector`) mounted at
+    Order 0 injects an unanswered `function_tool_call` that patchtoolcalls
+    patches in the same cycle, asserted both at the model input and by the
+    absence of a `session.ToolCall` row. Reaching this requires no seeded
+    `ExecutionStore` history: the injector reaches patchtoolcalls' own
+    in-memory scan through the same public extension surface every recipe
+    in the example is built on. The runtime-internal, store-seeded
+    versions (`TestPatchToolCallsPatchesOrphanedCallWithoutFabricatingSettlement`
+    and `TestPatchToolCallsCannotPatchACallWithARealSettlement`,
+    `runtime/patchtoolcalls_settlement_test.go`) still stand alongside it.
+  - **Resolved (`eino-agent-0wb`, round-four W6 correlation-and-seal
+    review, Important #4).** patchtoolcalls and summarization previously
+    could not be mounted together once summarization fired: this runtime
+    commits summarization's compaction boundary message
+    (`session.RoleSystem`, `PartCompaction`) mid-turn, and a turn's own
+    admission-time epoch view does not narrow the provider projection via
+    `applyEpoch` for later cycles of that same turn (only the NEXT turn
+    admitted on the session sees the epoch), so a later cycle's raw reload
+    could place that boundary message BETWEEN an assistant
+    `function_tool_call` and its `function_tool_result` -- specifically
+    when the trigger fired on a turn's own first cycle, since that cycle's
+    assistant placeholder row is reserved at admission (an early durable
+    position) while its eventual call and that call's result both commit
+    later, straddling the boundary. Upstream patchtoolcalls'
+    `hasCorrespondingAgenticToolResult` requires strict adjacency (it stops
+    at the first non-user message), so it judged the already-settled call
+    dangling and appended a fabricated second result; `settlementSeal`
+    correctly rejected that as a diverged occurrence and failed the turn --
+    the right last line of defence, but a failed turn all the same. Fixed
+    by `runtime.repositionMidTurnCompactionBoundary`
+    (`runtime/adk_model.go`), called from `buildDurableBaseline` on every
+    cycle after the one that committed a mid-turn boundary: it moves the
+    boundary, in memory only, to sit immediately before the earliest
+    `function_tool_call` (or toolsearch `ToolSearchFunctionToolResult`
+    -- both call/result content-block shapes are handled) it would
+    otherwise separate from its own result -- the same "never forward,
+    only backward until safe" invariant `moveTailStartToGroupBoundary`
+    already enforces for the tail's own cut point.
+    `TestComposedExampleMountsAllEightRecipesInOneRunPlan` now mounts
+    patchtoolcalls in both turns, and
+    `TestRepositionMidTurnCompactionBoundaryMovesBeforeSplitGroup`/
+    `TestRepositionMidTurnCompactionBoundaryHandlesToolSearchResult`
+    (`runtime/w6_round4_correlation_test.go`) prove the fix directly,
+    mutation-proved by hand against a reverted no-op.

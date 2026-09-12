@@ -8,7 +8,7 @@ import (
 	"go.bytecodealliance.org/cm"
 
 	_ "github.com/mattsp1290/eino-agent/examples/wasm-extensions/internal/guestabi"
-	toolapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/tool-api"
+	toolapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/tool-api"
 	hostlog "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/host/v0.1.0/log"
 )
 

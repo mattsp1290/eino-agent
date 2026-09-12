@@ -429,16 +429,45 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 		byID[message.ID] = message
 	}
 	messages := make([]session.Message, 0, len(batch.Messages))
+	// An active epoch only ever narrows the conversational body (replacing
+	// the summarized range with its summary, retaining the tail); it never
+	// drops the session's leading system-message prefix -- host-injected
+	// system instructions are not conversational history to compact away.
+	for _, message := range batch.Messages {
+		if message.Role != session.RoleSystem {
+			break
+		}
+		if !include[message.ID] {
+			messages = append(messages, message)
+			include[message.ID] = true
+		}
+	}
 	if epoch.SummaryMessageID != "" {
-		if summary, ok := byID[epoch.SummaryMessageID]; ok {
+		if summary, ok := byID[epoch.SummaryMessageID]; ok && !include[summary.ID] {
 			messages = append(messages, summary)
 			include[summary.ID] = true
 		}
 	}
+	// tailAnchor is where the verbatim tail begins: TailStartID when the
+	// epoch retained one, or the boundary/summary message's own ID when it
+	// did not (retainTail == 0). In the latter case nothing existing at
+	// epoch-creation time is retained verbatim, but every message produced
+	// AFTER the boundary (a later turn's own conversation, continuing past
+	// the compaction point) must still flow through -- an empty TailStartID
+	// must never mean "nothing after this epoch is ever included again".
+	tailAnchor := epoch.TailStartID
+	if tailAnchor == "" {
+		tailAnchor = epoch.SummaryMessageID
+	}
 	tailStarted := false
 	for _, message := range batch.Messages {
-		if message.ID == epoch.TailStartID {
+		if message.ID == tailAnchor {
 			tailStarted = true
+			if tailAnchor == epoch.SummaryMessageID {
+				// Already included above; the tail begins with whatever
+				// comes after it, not the boundary message itself again.
+				continue
+			}
 		}
 		if tailStarted && !include[message.ID] {
 			messages = append(messages, message)

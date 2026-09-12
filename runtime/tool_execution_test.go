@@ -43,7 +43,7 @@ func TestAtomicSettlementSurvivesCancellation(t *testing.T) {
 	)
 	plan := newTestToolPlan(staticToolRegistry{tools: []Tool{tool}})
 	call := runtimeCallFromClaim(tool, claimed)
-	settled, err := newRunExecution(orchestrator, plan, run).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil)
+	settled, err := newRunExecution(orchestrator, plan, run).executeAndSettleClaimedTool(ctx, orchestrator.resumeSnapshot(run), tool, call, claimed, nil, nil)
 	if err != nil {
 		t.Fatalf("execute and settle: %v", err)
 	}
@@ -103,25 +103,52 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	})}}}
 	registry := newTestExtensionRegistry(nil)
 	var notificationOrder []string
+	// notificationIDs is parallel to notificationOrder: every extension
+	// point captured here (EventPublishedPoint, ToolStartedPoint,
+	// ToolSettledPoint) carries a ToolCallID. The base version of this test
+	// filtered the published hook by `event.Kind == EventToolCallUpdated &&
+	// event.ToolCallID == "call-panic"` -- a literal provider CallID that
+	// no longer survives as the durable ToolCallID now that IDs are always
+	// freshly minted (see prepareToolCalls). This run creates exactly one
+	// tool call, so every notification observed here belongs to it, but
+	// notificationOrder/sinkEvents are still filtered down to that one id
+	// (onlyToolCallID-style) below before comparing them -- capturing
+	// everything unfiltered and filtering by id afterward, rather than
+	// relying on "there's only ever one call", is what keeps this
+	// assertion correct if a later edit adds a second call.
+	var notificationIDs []session.ToolCallID
 	var publishedIDs []session.EventID
+	var publishedToolCallIDs []session.ToolCallID
+	// The scripted provider CallID ("call-panic") is preserved separately as
+	// ProviderCallID; the durable session.ToolCall.ID (and every event's
+	// ToolCallID) is always a fresh mint now, so there's nothing to filter
+	// events by up front -- capture the minted id from the first one seen.
+	var toolCallID session.ToolCallID
 	mount, err := registry.Mount(context.Background(), testExtensionComponent("transition-order"), extension.InstallerFunc(func(_ context.Context, registrar extension.Registrar) error {
 		if err := extension.On(registrar, EventPublishedPoint, extension.Registration{ID: "published", Scope: extension.GlobalScope()}, func(_ context.Context, event session.EventRecord) error {
-			if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
+			if event.Kind == EventToolCallUpdated {
+				if toolCallID == "" {
+					toolCallID = event.ToolCallID
+				}
 				notificationOrder = append(notificationOrder, "published:"+toolEventStatus(event))
+				notificationIDs = append(notificationIDs, event.ToolCallID)
 				publishedIDs = append(publishedIDs, event.ID)
+				publishedToolCallIDs = append(publishedToolCallIDs, event.ToolCallID)
 			}
 			return nil
 		}); err != nil {
 			return err
 		}
-		if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", Scope: extension.GlobalScope()}, func(context.Context, ToolStartedNotice) error {
+		if err := extension.On(registrar, ToolStartedPoint, extension.Registration{ID: "started", Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolStartedNotice) error {
 			notificationOrder = append(notificationOrder, "started")
+			notificationIDs = append(notificationIDs, notice.ToolCallID)
 			return nil
 		}); err != nil {
 			return err
 		}
-		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(context.Context, ToolSettledNotice) error {
+		return extension.On(registrar, ToolSettledPoint, extension.Registration{ID: "settled", Scope: extension.GlobalScope()}, func(_ context.Context, notice ToolSettledNotice) error {
 			notificationOrder = append(notificationOrder, "settled")
+			notificationIDs = append(notificationIDs, notice.ToolCallID)
 			return nil
 		})
 	}))
@@ -137,7 +164,7 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	var sinkMu sync.Mutex
 	var sinkEvents []session.EventRecord
 	sink := EventSinkFunc(func(_ context.Context, event session.EventRecord) {
-		if event.Kind == EventToolCallUpdated && event.ToolCallID == "call-panic" {
+		if event.Kind == EventToolCallUpdated {
 			sinkMu.Lock()
 			defer sinkMu.Unlock()
 			sinkEvents = append(sinkEvents, event)
@@ -158,29 +185,74 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	if err := plan.FlushNotifications(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if toolCallID == "" {
+		t.Fatal("tool call id was never observed via published events")
+	}
+	// Wait for exactly 3 sink events matching toolCallID, not merely 3 sink
+	// events total: this run creates exactly one tool call today, so the
+	// two counts happen to agree, but counting matched events is what
+	// actually enforces the filter instead of relying on that coincidence.
 	deadline := time.Now().Add(time.Second)
 	for {
 		sinkMu.Lock()
-		count := len(sinkEvents)
+		var matched int
+		for _, event := range sinkEvents {
+			if event.ToolCallID == toolCallID {
+				matched++
+			}
+		}
+		total := len(sinkEvents)
 		sinkMu.Unlock()
-		if count == 3 {
+		if matched == 3 {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("sink event count = %d, want 3", count)
+			t.Fatalf("filtered sink event count = %d (of %d total), want 3", matched, total)
 		}
 		time.Sleep(time.Millisecond)
 	}
-	assertDurableToolResult(t, store, "panic-session", "call-panic", session.ToolCallFailed, "operational_failure")
+	call, err := store.GetToolCall(context.Background(), toolCallID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if call.ProviderCallID != "call-panic" {
+		t.Fatalf("captured tool call id maps to ProviderCallID = %q, want call-panic", call.ProviderCallID)
+	}
+	assertDurableToolResult(t, store, "panic-session", toolCallID, session.ToolCallFailed, "operational_failure")
+	// Filter every captured notification/sink/published slice down to
+	// toolCallID before comparing: this run creates exactly one tool call
+	// today, so the filter is a no-op now, but it is what actually enforces
+	// that invariant (onlyToolCallID-style) instead of silently mixing
+	// events from a second call into these comparisons if one is ever added.
+	var filteredOrder []string
+	for index, id := range notificationIDs {
+		if id == toolCallID {
+			filteredOrder = append(filteredOrder, notificationOrder[index])
+		}
+	}
 	wantOrder := []string{"published:pending", "published:running", "started", "published:failed", "settled"}
-	if !reflect.DeepEqual(notificationOrder, wantOrder) {
-		t.Fatalf("notification order = %v, want %v", notificationOrder, wantOrder)
+	if !reflect.DeepEqual(filteredOrder, wantOrder) {
+		t.Fatalf("notification order = %v, want %v (unfiltered = %v)", filteredOrder, wantOrder, notificationOrder)
+	}
+	var filteredPublishedIDs []session.EventID
+	for index, id := range publishedToolCallIDs {
+		if id == toolCallID {
+			filteredPublishedIDs = append(filteredPublishedIDs, publishedIDs[index])
+		}
 	}
 	sinkMu.Lock()
 	defer sinkMu.Unlock()
-	if len(sinkEvents) != 3 || len(publishedIDs) != 3 {
-		t.Fatalf("sink events = %#v published IDs = %#v", sinkEvents, publishedIDs)
+	var filteredSinkEvents []session.EventRecord
+	for _, event := range sinkEvents {
+		if event.ToolCallID == toolCallID {
+			filteredSinkEvents = append(filteredSinkEvents, event)
+		}
 	}
+	if len(filteredSinkEvents) != 3 || len(filteredPublishedIDs) != 3 {
+		t.Fatalf("sink events = %#v published IDs = %#v (unfiltered sink = %#v, unfiltered published = %#v)", filteredSinkEvents, filteredPublishedIDs, sinkEvents, publishedIDs)
+	}
+	sinkEvents = filteredSinkEvents
+	publishedIDs = filteredPublishedIDs
 	batch, err := store.ListEvents(context.Background(), "panic-session", session.EventCursor{Limit: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +260,7 @@ func TestFreshToolPanicSettlesBeforeFailingRun(t *testing.T) {
 	var durableIDs []session.EventID
 	durableIDSet := make(map[session.EventID]bool)
 	for _, event := range batch.Events {
-		if event.ToolCallID == "call-panic" && event.Kind == string(EventToolCallUpdated) {
+		if event.ToolCallID == toolCallID && event.Kind == string(EventToolCallUpdated) {
 			durableIDs = append(durableIDs, event.ID)
 			durableIDSet[event.ID] = true
 		}
@@ -221,11 +293,14 @@ func TestFreshToolPanicInterruptsEveryRemainingCommittedCall(t *testing.T) {
 	if secondExecutions != 0 {
 		t.Fatalf("second executor ran %d times", secondExecutions)
 	}
-	first, err := store.GetToolCall(context.Background(), "call-panic-first")
+	// The scripted provider CallIDs ("call-panic-first"/"call-skipped-second")
+	// are preserved separately as ProviderCallID; the durable ID is always a
+	// fresh mint, so discover each call's minted id by its tool name instead.
+	first, err := store.GetToolCall(context.Background(), toolCallIDByName(t, store, "panic"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.GetToolCall(context.Background(), "call-skipped-second")
+	second, err := store.GetToolCall(context.Background(), toolCallIDByName(t, store, "second"))
 	if err != nil {
 		t.Fatal(err)
 	}
