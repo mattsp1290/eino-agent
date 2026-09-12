@@ -108,13 +108,17 @@ func danglingCallInjectorFactory(injected *atomic.Bool) runtime.HandlerFactory {
 // turn 1's own intra-turn tool-call rounds, not just once per turn -- see
 // upstream summarization.TypedMiddleware.shouldSummarize -- so a threshold
 // low enough to fire on turn 2 would fire mid-turn-1 instead, corrupting
-// the other seven recipes' own careful round-by-round script). Turn 2 remounts
-// the SAME eight recipes -- still all eight together, one RunPlan per turn --
-// with only the summarization threshold lowered, so turn 2's own first cycle
-// (which already sees turn 1's full history) triggers summarization
-// immediately: it durably commits a session.ContextEpoch, and the full
-// message/part replay before and after turn 2 is asserted byte-for-byte
-// equal on its shared prefix (compaction only ever appends).
+// the other seven recipes' own careful round-by-round script). Turn 2
+// remounts the SAME eight recipes -- all eight together, one RunPlan for
+// this turn too, patchtoolcalls included (see the comment at the Disable-less
+// mount call below for eino-agent-0wb, now fixed) -- with only the
+// summarization threshold lowered, so turn 2's own first cycle (which
+// already sees turn 1's full history) triggers summarization immediately:
+// it durably commits a session.ContextEpoch, and the full message/part
+// replay before and after turn 2 is asserted byte-for-byte equal on its
+// shared prefix (compaction only ever appends). The turn then keeps
+// dispatching real tool calls on later cycles of the SAME turn, proving
+// patchtoolcalls and summarization now co-exist within one turn.
 func TestComposedExampleMountsAllEightRecipesInOneRunPlan(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("Always answer politely."), 0o644); err != nil {
@@ -380,22 +384,27 @@ func TestComposedExampleMountsAllEightRecipesInOneRunPlan(t *testing.T) {
 	turn2Config := turn1Config
 	turn2Config.SummarizationTriggerMsgs = 1
 	turn2Config.SummarizationRetainTail = 2
-	// patchtoolcalls is deliberately excluded from turn 2 only (turn 1
-	// still mounts and exercises it fully, proving its own scenario).
-	// Investigating this test's own "continues after summarization"
-	// scenario surfaced a genuine, separately reportable interaction: once
-	// summarization has narrowed history, patchtoolcalls' own upstream
-	// adjacency scan (hasCorrespondingAgenticToolResult, which requires a
-	// tool call's own result to be the LITERALLY NEXT message with no
-	// intervening non-result message) can misjudge a call this SAME cycle
-	// settled moments earlier as "dangling" and append an unauthorized
-	// second, fabricated result for it -- correctly rejected by
-	// settlementSeal (verifyOccurrenceKind) as a diverged, unauthorized
-	// occurrence, but failing the turn. Root-causing and fixing that
-	// upstream adjacency assumption is out of scope here; turn 1 already
-	// proves patchtoolcalls' own real scenario (a genuinely dangling call,
-	// patched, no fabricated settlement) in full.
-	turn2Config.Disable = map[string]bool{runtime.HandlerKindPatchToolCalls: true}
+	// Turn 2 mounts all eight recipes together too -- patchtoolcalls
+	// included (eino-agent-0wb, round-four W6 correlation-and-seal review,
+	// Important #4, is now fixed: see
+	// runtime.repositionMidTurnCompactionBoundary and
+	// adkEngine.summarizedBoundaryID). Investigating this test's own
+	// "continues after summarization" scenario had surfaced a genuine
+	// interaction: once summarization narrowed history mid-turn, the
+	// compaction boundary this runtime commits could durably land between
+	// an assistant function_tool_call and its function_tool_result (the
+	// turn's own assistant placeholder row is reserved at admission, before
+	// that first cycle's own handler chain runs, so it durably sorts before
+	// a boundary Finalize commits during that SAME cycle, while the call's
+	// eventual content and its result both land after). Upstream
+	// patchtoolcalls' hasCorrespondingAgenticToolResult requires strict
+	// adjacency and would then misjudge the already-settled call as
+	// dangling, appending a fabricated second result that settlementSeal
+	// correctly rejected as a diverged occurrence -- failing the turn. The
+	// fix repositions such a boundary, in memory, past the call/result
+	// group it would otherwise split, in every cycle after the one that
+	// committed it -- the same invariant moveTailStartToGroupBoundary
+	// already enforces for the tail's own cut point.
 	mount2, err := Mount(context.Background(), registry, sessionID, turn2Config)
 	if err != nil {
 		t.Fatal(err)

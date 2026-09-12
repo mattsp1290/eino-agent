@@ -178,23 +178,50 @@ type adkEngine struct {
 	// for a HandlerKindSummarization entry -- see adkEngine.buildAgentHandlers.
 	cycleMessageSourceByPointer map[*einoschema.AgenticMessage]session.MessageID
 
-	// summarizeMu guards summarizedThisTurn.
+	// summarizeMu guards every field below in this group.
 	summarizeMu sync.Mutex
-	// summarizedThisTurn reports whether this turn has already durably
-	// committed a summarization session.ContextEpoch (set by
+	// summarizedThisTurn reports whether THIS adkEngine instance has already
+	// durably committed a summarization session.ContextEpoch (set by
 	// summarizationFinalize via HandlerBuildContext.markSummarized right
-	// after a successful commitSummaryEpoch). adkEngine is turn-scoped (a
-	// fresh one per turn), so this never needs resetting mid-turn; it is
-	// consulted by summarizeAtMostOnceMiddleware, the wrapper
-	// NewSummarizationHandlerFactory installs, BEFORE every cycle's call
-	// into upstream summarization's own BeforeModelRewriteState -- upstream
-	// re-evaluates its trigger condition on EVERY ReAct cycle with no way
-	// to disable that itself (TriggerCondition has no per-call override),
-	// so without this a multi-cycle turn that crosses the threshold once
-	// would re-summarize (and re-bill a summary generation call) on every
-	// subsequent cycle of the SAME turn (round-three W6
-	// summarization-correctness review, Important #2).
+	// after a successful commitSummaryEpoch). It is consulted by
+	// summarizeAtMostOnceMiddleware, the wrapper NewSummarizationHandlerFactory
+	// installs, BEFORE every cycle's call into upstream summarization's own
+	// BeforeModelRewriteState -- upstream re-evaluates its trigger condition
+	// on EVERY ReAct cycle with no way to disable that itself (TriggerCondition
+	// has no per-call override), so without this a multi-cycle turn that
+	// crosses the threshold once would re-summarize (and re-bill a summary
+	// generation call) on every subsequent cycle handled by the SAME engine
+	// (round-three W6 summarization-correctness review, Important #2).
+	//
+	// Scope note (round-four W6 correlation-and-seal review, Suggestion #1):
+	// this is per-adkEngine, which is per turn ONLY across retry/failover
+	// (ADK reuses the same engine for those -- see buildDurableBaseline's own
+	// doc comment) and across a genuine new turn (turn_loop.go's admission
+	// path always builds a fresh engine, so a later turn can summarize
+	// again, as TestSummarizationCorrelatesAfterAnEarlierHandlerClonesMessagePointers
+	// shows). It is NOT durable across a tool-interrupt resume or a
+	// crash-reconciled redrive: resumeEngine (turn_loop.go) builds a FRESH
+	// adkEngine for the SAME turn on that path, so summarizedThisTurn resets
+	// to false there even though the turn itself has not changed. A resumed
+	// turn that is still above the trigger threshold can therefore summarize
+	// (and bill) a second time within the same turn. Closing that gap would
+	// mean keying this off a durable fact (a summarization ContextEpoch
+	// already committed for this TurnID) instead of process memory; until
+	// then, "turn-scoped" above means "per engine", not "per admitted turn
+	// across every resume".
 	summarizedThisTurn bool
+	// summarizedFromID/summarizedToID/summarizedBoundaryID/summarizedMessage
+	// cache the durable range and summary object summarizationFinalize
+	// committed the ONE time it fired this engine's lifetime, so later
+	// cycles can re-apply the SAME compaction (reapplyDurableSummary)
+	// instead of either re-billing a second summary-generation call or
+	// reverting to the full uncompacted baseline (round-four W6
+	// correlation-and-seal review, Important #2). See
+	// HandlerBuildContext.summarizedRange's doc comment.
+	summarizedFromID     session.MessageID
+	summarizedToID       session.MessageID
+	summarizedBoundaryID session.MessageID
+	summarizedMessage    *einoschema.AgenticMessage
 
 	// handlerTools holds this turn's live tool.BaseTool instances
 	// contributed by host agent-handler middleware (filesystem's
@@ -682,15 +709,19 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, authorized *authoriz
 				entryBuild.baselineMessages = func() ([]*einoschema.AgenticMessage, []session.MessageID) {
 					return e.baselineMessages, e.baselineSourceIDs
 				}
-				entryBuild.summarizedThisTurn = func() bool {
+				entryBuild.summarizedRange = func() (fromID, toID, boundaryID session.MessageID, summary *einoschema.AgenticMessage, ok bool) {
 					e.summarizeMu.Lock()
 					defer e.summarizeMu.Unlock()
-					return e.summarizedThisTurn
+					return e.summarizedFromID, e.summarizedToID, e.summarizedBoundaryID, e.summarizedMessage, e.summarizedThisTurn
 				}
-				entryBuild.markSummarized = func() {
+				entryBuild.markSummarized = func(fromID, toID, boundaryID session.MessageID, summary *einoschema.AgenticMessage) {
 					e.summarizeMu.Lock()
 					defer e.summarizeMu.Unlock()
 					e.summarizedThisTurn = true
+					e.summarizedFromID = fromID
+					e.summarizedToID = toID
+					e.summarizedBoundaryID = boundaryID
+					e.summarizedMessage = summary
 				}
 			}
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -386,7 +387,7 @@ func (s *admissionStore) ListMessages(_ context.Context, sessionID session.ID, _
 		if !messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
 			return messages[i].CreatedAt.Before(messages[j].CreatedAt)
 		}
-		return messages[i].ID < messages[j].ID
+		return naturalIDLess(string(messages[i].ID), string(messages[j].ID))
 	})
 	var parts []session.Part
 	for _, part := range s.parts {
@@ -1299,4 +1300,46 @@ func (s *fakeExecutionStore) RetireCheckpoints(_ context.Context, upToRevision i
 		}
 	}
 	return nil
+}
+
+// naturalIDLess breaks a CreatedAt tie the way a well-formed IDGenerator's
+// ids are meant to compare: by numeric suffix when both ids share a common
+// non-numeric prefix and end in digits, falling back to plain string
+// comparison otherwise. This test harness's own sequenceIDs (see
+// orchestrator_test_support_test.go) mints "<prefix>-<n>" ids from a single
+// un-padded, ever-increasing counter shared across every id kind, and every
+// runtime-package test using it (newTestOrchestrator) pins the clock to one
+// constant instant (WithClock) for determinism -- so CreatedAt ties on
+// EVERY message, making this tie-break the sole effective ordering key. A
+// plain string comparison of "<prefix>-<n>" is only a valid total order
+// matching mint order while n stays within one digit width (it silently
+// breaks the moment a session mints its 10th, 100th, ... id of a given
+// prefix -- e.g. "message-100" < "message-96" lexically, even though
+// message-100 was minted long after message-96): exactly the kind of
+// reordering adkEngine.buildDurableBaseline's prefix/tail splice invariant
+// depends on never happening, and exactly what surfaced this fix (a real,
+// if latent, test-fixture-only defect -- see
+// TestSummarizationFiresAtMostOncePerTurnAcrossFiveCycles).
+func naturalIDLess(a, b string) bool {
+	aPrefix, aNum, aOK := splitTrailingDigits(a)
+	bPrefix, bNum, bOK := splitTrailingDigits(b)
+	if aOK && bOK && aPrefix == bPrefix {
+		return aNum < bNum
+	}
+	return a < b
+}
+
+func splitTrailingDigits(s string) (prefix string, num int, ok bool) {
+	i := len(s)
+	for i > 0 && s[i-1] >= '0' && s[i-1] <= '9' {
+		i--
+	}
+	if i == len(s) || i == 0 {
+		return "", 0, false
+	}
+	n, err := strconv.Atoi(s[i:])
+	if err != nil {
+		return "", 0, false
+	}
+	return s[:i], n, true
 }

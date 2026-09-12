@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/cloudwego/eino/adk"
@@ -634,33 +635,225 @@ func NewSummarizationHandlerFactory(cfg SummarizationConfig) HandlerFactory {
 		if err != nil {
 			return nil, err
 		}
-		return &summarizeAtMostOnceMiddleware{TypedChatModelAgentMiddleware: mw, summarizedThisTurn: build.summarizedThisTurn}, nil
+		return &summarizeAtMostOnceMiddleware{
+			TypedChatModelAgentMiddleware: mw,
+			summarizedRange:               build.summarizedRange,
+			sourceMessageID:               build.sourceMessageID,
+			baselineMessages:              build.baselineMessages,
+		}, nil
 	}
 }
 
-// summarizeAtMostOnceMiddleware bounds summarization to firing at most once
-// per turn (round-three W6 summarization-correctness review, Important #2):
+// summarizeAtMostOnceMiddleware bounds summarization to GENERATING at most
+// once per turn (round-three W6 summarization-correctness review,
+// Important #2) while still keeping every later cycle of a long tool loop
+// compacted (round-four W6 correlation-and-seal review, Important #2):
 // upstream summarization.TypedMiddleware re-evaluates its own trigger
 // condition on every ReAct cycle, with no way to disable that after it has
 // already fired once (TriggerCondition carries no per-call override). Left
 // unguarded, a multi-cycle turn that crosses the configured threshold once
 // would re-trigger -- and re-bill a real summary generation model call --
-// on every later cycle of the SAME turn. Once summarizedThisTurn (backed by
-// adkEngine.summarizedThisTurn, set by summarizationFinalize's own
-// markSummarized call right after a successful commit) reports true, this
-// wrapper skips delegating to the inner middleware's
-// BeforeModelRewriteState entirely for the rest of the turn, passing state
-// through unchanged instead.
+// on every later cycle of the SAME turn.
+//
+// Once summarizedRange (backed by adkEngine's summarized* fields, set by
+// summarizationFinalize's own markSummarized call right after a successful
+// commit) reports ok == true, this wrapper never again delegates to the
+// inner middleware's BeforeModelRewriteState (never re-bills a summary
+// generation call) -- instead it re-applies the SAME already-committed
+// compaction to every later cycle's state.Messages via
+// reapplyDurableSummary, so the model-visible context stays collapsed for
+// the rest of the turn instead of regrowing back to the full baseline.
 type summarizeAtMostOnceMiddleware struct {
 	adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage]
-	summarizedThisTurn func() bool
+	summarizedRange  func() (fromID, toID, boundaryID session.MessageID, summary *einoschema.AgenticMessage, ok bool)
+	sourceMessageID  func(msg *einoschema.AgenticMessage) (session.MessageID, bool)
+	baselineMessages func() ([]*einoschema.AgenticMessage, []session.MessageID)
 }
 
 func (m *summarizeAtMostOnceMiddleware) BeforeModelRewriteState(ctx context.Context, state *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], mc *adk.TypedModelContext[*einoschema.AgenticMessage]) (context.Context, *adk.TypedChatModelAgentState[*einoschema.AgenticMessage], error) {
-	if m.summarizedThisTurn != nil && m.summarizedThisTurn() {
-		return ctx, state, nil
+	if m.summarizedRange != nil {
+		if fromID, toID, boundaryID, summary, ok := m.summarizedRange(); ok {
+			recompacted, err := reapplyDurableSummary(state.Messages, m.sourceMessageID, m.baselineMessages, fromID, toID, boundaryID, summary)
+			if err != nil {
+				return ctx, nil, err
+			}
+			afterState := *state
+			afterState.Messages = recompacted
+			return ctx, &afterState, nil
+		}
 	}
 	return m.TypedChatModelAgentMiddleware.BeforeModelRewriteState(ctx, state, mc)
+}
+
+// reapplyDurableSummary re-projects originalMessages through a compaction
+// this turn already committed once: the durable range [fromID, toID]
+// (inclusive, by durable id) collapses to a single copy of summary, and the
+// boundary message itself (boundaryID -- a synthetic system message the
+// model does not need to see twice) is dropped. It shares
+// correlateDurableSubsequence with summarizationFinalize's own first-commit
+// path, so it fails exactly as closed: an unresolved durable baseline
+// message here means the same "an earlier handler replaced content/pointers
+// without preserving identity" hazard Important #1/#3 (round-four W6
+// correlation-and-seal review) guard against at commit time, and a cycle
+// that cannot safely re-apply a compaction it already promised the model
+// must not silently hand back the full, uncompacted baseline instead.
+func reapplyDurableSummary(
+	originalMessages []*einoschema.AgenticMessage,
+	sourceMessageID func(msg *einoschema.AgenticMessage) (session.MessageID, bool),
+	baselineMessages func() ([]*einoschema.AgenticMessage, []session.MessageID),
+	fromID, toID, boundaryID session.MessageID,
+	summary *einoschema.AgenticMessage,
+) ([]*einoschema.AgenticMessage, error) {
+	if sourceMessageID == nil || baselineMessages == nil {
+		return nil, fmt.Errorf("%w: %w: summarization requires per-cycle durable source correlation (sourceMessageID/baselineMessages)", ErrHandlerConfiguration, errADKUnsupportedBlock)
+	}
+	baselineMsgs, baselineIDs := baselineMessages()
+	sourceIDs, durableOriginalIndices, err := correlateDurableSubsequence(originalMessages, sourceMessageID, baselineMsgs, baselineIDs)
+	if err != nil {
+		return nil, err
+	}
+	collapse := make(map[int]bool, len(durableOriginalIndices))
+	dropIndex := -1
+	inRange := false
+	for _, origIndex := range durableOriginalIndices {
+		id := sourceIDs[origIndex]
+		if id == boundaryID {
+			dropIndex = origIndex
+			continue
+		}
+		if id == fromID {
+			inRange = true
+		}
+		if inRange {
+			collapse[origIndex] = true
+		}
+		if id == toID {
+			inRange = false
+		}
+	}
+	if len(collapse) == 0 && dropIndex < 0 {
+		// The already-summarized range (and the boundary itself) is no
+		// longer present in this cycle's projection at all -- nothing to
+		// re-collapse. This is not expected in practice (the range is
+		// durable and this package never deletes history), but returning
+		// originalMessages unchanged is the safe degrade rather than
+		// fabricating a summary the current cycle has no basis for.
+		return originalMessages, nil
+	}
+	result := make([]*einoschema.AgenticMessage, 0, len(originalMessages))
+	summaryEmitted := false
+	for i, msg := range originalMessages {
+		if i == dropIndex {
+			continue
+		}
+		if collapse[i] {
+			if !summaryEmitted {
+				result = append(result, summary)
+				summaryEmitted = true
+			}
+			continue
+		}
+		result = append(result, msg)
+	}
+	return result, nil
+}
+
+// correlateDurableSubsequence resolves every originalMessages entry to its
+// durable session.MessageID, if any, in TWO STRICT PASSES -- shared by
+// summarizationFinalize (the first-commit path) and reapplyDurableSummary
+// (later cycles re-applying an already-committed compaction), and the fix
+// for round-four W6 correlation-and-seal review Important #1.
+//
+// Pass 1 resolves every message it can via sourceMessageID's pointer-keyed
+// lookup (the fast, exact path) and marks the corresponding baseline slot
+// consumed. Pass 2 then runs a content-based FALLBACK, but ONLY over
+// messages pass 1 could not resolve, and ONLY against baseline slots pass 1
+// did not already claim: baseline order is always preserved by every recipe
+// in this package (messages are only ever inserted/appended around it,
+// never reordered), so the next not-yet-consumed baseline entry -- if its
+// content matches an unresolved message exactly -- is the same durable
+// message under a new pointer.
+//
+// Running the fallback strictly after pass 1 (rather than interleaved, one
+// message at a time) matters: an interleaved fallback lets an EPHEMERAL
+// message (agentsmd/skill injected content with no durable id at all) that
+// happens to match the content at the fallback cursor steal a DURABLE
+// baseline slot before pass 1 has claimed it for the real message that
+// actually owns it -- which the previous interleaved implementation could
+// not distinguish from a genuine pointer-replaced durable message, and
+// which defeated the very fail-closed check below (a genuinely absent
+// durable message and a false consume from a coincidental duplicate
+// canceled out in the unresolved count; round-four W6 correlation-and-seal
+// review, Important #1 -- demonstrated as `PROBE2 RESULT: fail-closed check
+// DEFEATED -- compacted and committed an epoch on a partial view`, and
+// separately, with the pointer map intact, as one durable id resolving to
+// two different messages with no error). Two strict passes close both: an
+// ephemeral message finds no unconsumed slot once every real durable
+// message has already claimed its own via pass 1, and cannot mis-claim one
+// pass 1 already gave to someone else.
+//
+// unresolved (a baseline slot no message in either pass claimed) fails
+// closed rather than compacting on a partial view -- the fabricated-slot
+// hazard this whole function exists to close. This does not disambiguate
+// two genuinely IDENTICAL adjacent baseline messages from each other, but
+// that case is harmless: either assignment is correct, since durable ids
+// are positional and durable order is preserved either way. The harmful
+// case -- an ephemeral message stealing a DURABLE slot -- is what the
+// strict ordering above closes.
+func correlateDurableSubsequence(
+	originalMessages []*einoschema.AgenticMessage,
+	sourceMessageID func(msg *einoschema.AgenticMessage) (session.MessageID, bool),
+	baselineMsgs []*einoschema.AgenticMessage,
+	baselineIDs []session.MessageID,
+) (sourceIDs []session.MessageID, durableOriginalIndices []int, err error) {
+	baselineIndexByID := make(map[session.MessageID]int, len(baselineIDs))
+	for idx, id := range baselineIDs {
+		if id != "" {
+			baselineIndexByID[id] = idx
+		}
+	}
+	consumed := make([]bool, len(baselineMsgs))
+	sourceIDs = make([]session.MessageID, len(originalMessages))
+	durableOriginalIndices = make([]int, 0, len(originalMessages))
+	unresolvedIndices := make([]int, 0, len(originalMessages))
+	// Pass 1: pointer-keyed, exact.
+	for i, msg := range originalMessages {
+		if id, ok := sourceMessageID(msg); ok && id != "" {
+			sourceIDs[i] = id
+			durableOriginalIndices = append(durableOriginalIndices, i)
+			if idx, ok := baselineIndexByID[id]; ok {
+				consumed[idx] = true
+			}
+			continue
+		}
+		unresolvedIndices = append(unresolvedIndices, i)
+	}
+	// Pass 2: content fallback, only for what pass 1 could not resolve, and
+	// only against baseline entries pass 1 did not already claim.
+	fallbackCursor := 0
+	for _, i := range unresolvedIndices {
+		msg := originalMessages[i]
+		for fallbackCursor < len(baselineMsgs) && consumed[fallbackCursor] {
+			fallbackCursor++
+		}
+		if fallbackCursor < len(baselineMsgs) && reflect.DeepEqual(msg, baselineMsgs[fallbackCursor]) {
+			sourceIDs[i] = baselineIDs[fallbackCursor]
+			durableOriginalIndices = append(durableOriginalIndices, i)
+			consumed[fallbackCursor] = true
+			fallbackCursor++
+		}
+	}
+	sort.Ints(durableOriginalIndices)
+	var unresolved int
+	for _, ok := range consumed {
+		if !ok {
+			unresolved++
+		}
+	}
+	if unresolved > 0 {
+		return nil, nil, fmt.Errorf("%w: summarization could not correlate %d of %d durable baseline messages to this cycle's projected messages (an earlier handler likely replaced message content/pointers without preserving identity); refusing to compact", errADKUnsupportedBlock, unresolved, len(baselineMsgs))
+	}
+	return sourceIDs, durableOriginalIndices, nil
 }
 
 // errSummarizationTailUnsplittable reports that summarizationFinalize could
@@ -699,67 +892,10 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 		if build.sourceMessageID == nil || build.baselineMessages == nil {
 			return nil, fmt.Errorf("%w: %w: summarization requires per-cycle durable source correlation (sourceMessageID/baselineMessages)", ErrHandlerConfiguration, errADKUnsupportedBlock)
 		}
-		// Resolve every originalMessages entry to its durable id, if any,
-		// via two passes: build.sourceMessageID's pointer-keyed lookup
-		// first (the fast, exact path), then a content-based FALLBACK
-		// against this cycle's own baseline for anything the pointer
-		// lookup misses. The fallback exists because an earlier handler in
-		// the chain -- host-authored or this package's own, via
-		// cloneProtectedMessages, a perfectly reasonable defensive pattern
-		// -- may replace message pointers without preserving identity,
-		// which silently breaks pointer-keyed lookup alone for the rest of
-		// the cycle (round-three W6 authority-regression review,
-		// summarization-correctness Important #1: the probe billed a
-		// summary generation call, wrote no epoch, and raised no error).
-		// baselineIndexByID/consumed track, by BASELINE position, which
-		// durable messages this cycle has already been accounted for --
-		// by either pass -- so every baseline message must be resolved
-		// exactly once or this fails closed below, rather than silently
-		// compacting on a partial view.
 		baselineMsgs, baselineIDs := build.baselineMessages()
-		baselineIndexByID := make(map[session.MessageID]int, len(baselineIDs))
-		for idx, id := range baselineIDs {
-			if id != "" {
-				baselineIndexByID[id] = idx
-			}
-		}
-		consumed := make([]bool, len(baselineMsgs))
-		sourceIDs := make([]session.MessageID, len(originalMessages))
-		durableOriginalIndices := make([]int, 0, len(originalMessages))
-		fallbackCursor := 0
-		for i, msg := range originalMessages {
-			if id, ok := build.sourceMessageID(msg); ok && id != "" {
-				sourceIDs[i] = id
-				durableOriginalIndices = append(durableOriginalIndices, i)
-				if idx, ok := baselineIndexByID[id]; ok {
-					consumed[idx] = true
-				}
-				continue
-			}
-			// Content-based fallback: baseline order is always preserved
-			// by every recipe in this package (messages are only ever
-			// inserted/appended around it, never reordered), so the next
-			// not-yet-consumed baseline entry -- if its content matches
-			// this message exactly -- is the same durable message under a
-			// new pointer.
-			for fallbackCursor < len(baselineMsgs) && consumed[fallbackCursor] {
-				fallbackCursor++
-			}
-			if fallbackCursor < len(baselineMsgs) && reflect.DeepEqual(msg, baselineMsgs[fallbackCursor]) {
-				sourceIDs[i] = baselineIDs[fallbackCursor]
-				durableOriginalIndices = append(durableOriginalIndices, i)
-				consumed[fallbackCursor] = true
-				fallbackCursor++
-			}
-		}
-		var unresolved int
-		for _, ok := range consumed {
-			if !ok {
-				unresolved++
-			}
-		}
-		if unresolved > 0 {
-			return nil, fmt.Errorf("%w: summarization could not correlate %d of %d durable baseline messages to this cycle's projected messages (an earlier handler likely replaced message content/pointers without preserving identity); refusing to compact", errADKUnsupportedBlock, unresolved, len(baselineMsgs))
+		sourceIDs, durableOriginalIndices, err := correlateDurableSubsequence(originalMessages, build.sourceMessageID, baselineMsgs, baselineIDs)
+		if err != nil {
+			return nil, err
 		}
 		if len(durableOriginalIndices) == 0 {
 			// Nothing durable at all this cycle (a genuinely degenerate
@@ -846,7 +982,7 @@ func summarizationFinalize(build HandlerBuildContext, retainTail int) summarizat
 			return nil, err
 		}
 		if build.markSummarized != nil {
-			build.markSummarized()
+			build.markSummarized(epoch.SummarizedFromID, epoch.SummarizedToID, boundaryIDs.MessageID, summary)
 		}
 		// Reassemble originalMessages by ORIGINAL index: every non-durable
 		// message is always retained verbatim, wherever it falls; a

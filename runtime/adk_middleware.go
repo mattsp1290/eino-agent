@@ -162,21 +162,40 @@ type HandlerBuildContext struct {
 	// uses.
 	baselineMessages func() ([]*einoschema.AgenticMessage, []session.MessageID)
 
-	// summarizedThisTurn/markSummarized bound summarization to firing at
-	// most once per turn: summarizeAtMostOnceMiddleware (installed by
-	// NewSummarizationHandlerFactory) consults summarizedThisTurn before
-	// every cycle's call into upstream summarization's own
-	// BeforeModelRewriteState, and summarizationFinalize calls
-	// markSummarized right after a successful commitSummaryEpoch. Without
-	// this, upstream re-evaluates its trigger condition on every ReAct
-	// cycle with no per-call override, so a multi-cycle turn that crosses
-	// the threshold once would otherwise re-summarize (and re-bill a
-	// summary generation call) on every later cycle of the SAME turn
-	// (round-three W6 summarization-correctness review, Important #2).
-	// Populated only for a HandlerKindSummarization entry, the same
-	// Kind-gating sourceMessageID/baselineMessages use.
-	summarizedThisTurn func() bool
-	markSummarized     func()
+	// summarizedRange/markSummarized bound summarization to generating at
+	// most once per turn while still keeping later cycles of a long tool
+	// loop compacted: summarizeAtMostOnceMiddleware (installed by
+	// NewSummarizationHandlerFactory) consults summarizedRange before every
+	// cycle's call into upstream summarization's own BeforeModelRewriteState.
+	// Before the first successful commit this turn, summarizedRange reports
+	// ok == false and the wrapper delegates to upstream normally. After a
+	// successful commit, it reports the durable range that was collapsed
+	// (fromID/toID inclusive), the boundary's own durable id (dropped on
+	// re-projection -- the model does not need to see the same synthetic
+	// system message twice), and the summary message itself, and the
+	// wrapper re-applies that SAME compaction on every later cycle
+	// (reapplyDurableSummary) instead of either re-billing a second
+	// summary-generation call (upstream re-evaluates its trigger condition
+	// on every ReAct cycle with no per-call override) or reverting to the
+	// full uncompacted baseline for the rest of the turn (round-four W6
+	// correlation-and-seal review, Important #2: a long tool loop that
+	// crosses the threshold once must stay inside the context window for
+	// its later cycles too, not regrow back to the full history).
+	// markSummarized is called by summarizationFinalize right after a
+	// successful commitSummaryEpoch. Both populated only for a
+	// HandlerKindSummarization entry, the same Kind-gating
+	// sourceMessageID/baselineMessages use.
+	//
+	// See adkEngine.repositionMidTurnCompactionBoundary (adk_model.go) for
+	// the companion fix that keeps a boundary committed mid-turn (this
+	// turn's own eventual placeholder message may already be durably
+	// reserved with an earlier timestamp than the boundary -- see that
+	// function's doc comment) from ever appearing, in a LATER cycle's own
+	// durable reload, between a function_tool_call and its
+	// function_tool_result (round-four W6 correlation-and-seal review,
+	// Important #4/eino-agent-0wb's true root cause).
+	summarizedRange func() (fromID, toID, boundaryID session.MessageID, summary *einoschema.AgenticMessage, ok bool)
+	markSummarized  func(fromID, toID, boundaryID session.MessageID, summary *einoschema.AgenticMessage)
 }
 
 // HandlerFactory builds one typed ADK agent middleware instance for one

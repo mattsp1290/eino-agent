@@ -546,6 +546,20 @@ func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.Age
 	if len(full) < e.baseMessageCount {
 		return nil, fmt.Errorf("%w: durable history shrank below this turn's admitted base (%d < %d)", errADKProjectionDiverged, len(full), e.baseMessageCount)
 	}
+	// If THIS turn has already committed a compaction boundary mid-turn (a
+	// summarization trigger that fired on an earlier cycle of this same
+	// turn), reposition it in this fresh reload so it never sits between a
+	// function_tool_call and its function_tool_result -- see
+	// repositionMidTurnCompactionBoundary's own doc comment for why the raw
+	// reload can otherwise interleave it there (round-four W6
+	// correlation-and-seal review, Important #4/eino-agent-0wb's true root
+	// cause). This is a no-op until a boundary has actually been committed
+	// (e.summarizedBoundary() is empty for every cycle before that, and for
+	// the very cycle that commits one -- its own buildDurableBaseline reload
+	// already ran before Finalize existed to commit it).
+	if boundaryID := e.summarizedBoundary(); boundaryID != "" {
+		full, fullSourceIDs, fullState = repositionMidTurnCompactionBoundary(full, fullSourceIDs, fullState, boundaryID)
+	}
 	// The turn's own already-transformed snapshot (prepareSnapshot's output,
 	// computed once at turn-admission time) is the correct prefix: it may
 	// carry ephemeral extension-injected content (contextAssemblePoint,
@@ -605,6 +619,147 @@ func (e *adkEngine) buildDurableBaseline(ctx context.Context) ([]*einoschema.Age
 	e.baselineMessages = baseline
 	e.baselineSourceIDs = baselineSourceIDs
 	return baseline, nil
+}
+
+// summarizedBoundary reports the durable message id of the compaction
+// boundary this turn's own summarization recipe has committed, if any --
+// see adkEngine.summarizedBoundaryID's doc comment.
+func (e *adkEngine) summarizedBoundary() session.MessageID {
+	e.summarizeMu.Lock()
+	defer e.summarizeMu.Unlock()
+	return e.summarizedBoundaryID
+}
+
+// repositionMidTurnCompactionBoundary moves the durable message identified
+// by boundaryID later within full (in memory only -- this never touches the
+// store) so it never sits between a function_tool_call and its
+// function_tool_result.
+//
+// Why this is needed: a turn's own assistant placeholder message row is
+// created durably at admission (AdmitTurn), before that turn's first
+// cycle's own handler chain ever runs, and adkModel.currentMessageID reuses
+// that SAME row (via claimPlaceholder) for the turn's first physical
+// dispatch. If summarization's trigger fires on that very first cycle --
+// entirely plausible: TriggerContextMessages/TriggerContextTokens are
+// evaluated against whatever history already exists BEFORE this cycle's own
+// dispatch runs -- Finalize commits the compaction boundary durably before
+// this cycle has generated (let alone committed) its own response. When
+// that response turns out to carry a function_tool_call, the call is
+// persisted into the SAME pre-existing placeholder row (an early durable
+// position, from admission), while its function_tool_result is only
+// minted once the tool actually settles (a fresh, later position) -- and
+// the boundary committed in between durably sorts, by the store's own
+// created_at/id ordering, textually between the two. A LATER cycle's own
+// buildDurableBaseline reload (this turn's own admission-time epoch view
+// deliberately does not narrow via applyEpoch until the NEXT turn -- see
+// this function's caller) then hands a host handler chain a raw sequence
+// with a system-role compaction message wedged inside a call/result group.
+// Upstream patchtoolcalls' hasCorrespondingAgenticToolResult requires
+// strict adjacency (the result must be the literally next message with no
+// intervening non-result message) and judges the already-settled call
+// dangling, appending a fabricated second result that settlementSeal
+// correctly rejects as a diverged occurrence -- failing the turn closed
+// (round-four W6 correlation-and-seal review, Important #4/eino-agent-0wb).
+//
+// This mirrors, for a mid-turn boundary's PLACEMENT, the same invariant
+// moveTailStartToGroupBoundary already enforces for the tail's own CUT
+// POINT: a function_tool_call and its function_tool_result must never be
+// separated. It walks forward from the boundary's current position, tracking
+// every function_tool_call CallID seen (whether opened before the boundary
+// or discovered while walking forward) that has no matching
+// function_tool_result yet, and moves the boundary to sit immediately after
+// the last message needed to close every one of them. If no call before the
+// boundary is left open, or an open call's result never appears at all
+// within full, the boundary is left exactly where it was (there is nothing
+// unsafe to fix, or nothing safe to do yet).
+func repositionMidTurnCompactionBoundary(
+	full []*einoschema.AgenticMessage,
+	fullSourceIDs []session.MessageID,
+	fullState []model.ProviderMessageState,
+	boundaryID session.MessageID,
+) ([]*einoschema.AgenticMessage, []session.MessageID, []model.ProviderMessageState) {
+	boundaryIndex := -1
+	for i, id := range fullSourceIDs {
+		if id == boundaryID {
+			boundaryIndex = i
+			break
+		}
+	}
+	if boundaryIndex < 0 {
+		return full, fullSourceIDs, fullState
+	}
+	open := make(map[string]bool)
+	for i := 0; i < boundaryIndex; i++ {
+		recordToolCallAdjacency(full[i], open)
+	}
+	if len(open) == 0 {
+		return full, fullSourceIDs, fullState
+	}
+	target := boundaryIndex
+	for i := boundaryIndex + 1; i < len(full) && len(open) > 0; i++ {
+		recordToolCallAdjacency(full[i], open)
+		target = i
+	}
+	if len(open) > 0 || target == boundaryIndex {
+		// Either an open call's result never appears in full at all (defer
+		// to the existing behavior -- nothing safe to reposition to), or
+		// the boundary is already immediately after everything it needs to
+		// be: nothing to move.
+		return full, fullSourceIDs, fullState
+	}
+	newOrder := make([]int, 0, len(full))
+	for i := 0; i < len(full); i++ {
+		if i == boundaryIndex {
+			continue
+		}
+		newOrder = append(newOrder, i)
+		if i == target {
+			newOrder = append(newOrder, boundaryIndex)
+		}
+	}
+	reorderedMessages := make([]*einoschema.AgenticMessage, len(full))
+	reorderedSourceIDs := make([]session.MessageID, len(fullSourceIDs))
+	oldToNew := make([]int, len(full))
+	for newIndex, oldIndex := range newOrder {
+		reorderedMessages[newIndex] = full[oldIndex]
+		reorderedSourceIDs[newIndex] = fullSourceIDs[oldIndex]
+		oldToNew[oldIndex] = newIndex
+	}
+	reorderedState := make([]model.ProviderMessageState, len(fullState))
+	for i, state := range fullState {
+		state.MessageIndex = oldToNew[state.MessageIndex]
+		reorderedState[i] = state
+	}
+	return reorderedMessages, reorderedSourceIDs, reorderedState
+}
+
+// recordToolCallAdjacency updates open (a set of function_tool_call CallIDs
+// with no result seen yet) for one message: every function_tool_call block
+// it carries opens its CallID, and every block that settles a call --
+// function_tool_result (an ordinary tool call) or ToolSearchFunctionToolResult
+// (toolsearch's own dynamictool discovery call, a distinct content block type
+// from an ordinary function_tool_result -- see moveTailStartToGroupBoundary,
+// which checks the same two durable session.PartKind values,
+// PartFunctionToolResult and PartToolSearchResult, for the identical reason)
+// -- closes one.
+func recordToolCallAdjacency(msg *einoschema.AgenticMessage, open map[string]bool) {
+	if msg == nil {
+		return
+	}
+	for _, block := range msg.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		if block.FunctionToolCall != nil {
+			open[block.FunctionToolCall.CallID] = true
+		}
+		if block.FunctionToolResult != nil {
+			delete(open, block.FunctionToolResult.CallID)
+		}
+		if block.ToolSearchFunctionToolResult != nil {
+			delete(open, block.ToolSearchFunctionToolResult.CallID)
+		}
+	}
 }
 
 // paddedMessageSourceIDs returns ids truncated or zero-padded to exactly n
