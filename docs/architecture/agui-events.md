@@ -101,22 +101,25 @@ Replay uses this order:
 Replay must preserve durable message/part ordering from `store/storetest`.
 Replay must not infer conversation content from `session.EventRecord.Payload`.
 
-`agui.Replay` materializes its message snapshot through
-`history.Load`/`history.Project` -- the classic (non-agentic) projector, not
-`history.ProjectAgentic`. That projector fails closed with
-`history.ErrClassicUnsupported` (surfacing as a `Replay` error) for any
-durable content it cannot represent as a flat `*schema.Message`: the
-`tool_search_result`, `server_tool_call`/`server_tool_result`,
+As of W7, `agui.Replay` materializes its message snapshot through the
+**agentic** pipeline, not the classic one: `emitMessageSnapshot`
+(`agui/replay.go`) projects every durable message via
+`history.ProjectAgentic`/`convert.ToAgenticProjection` and emits each one
+through `emitter.Emitter.EmitCommittedProjection` with
+`DeliveryModeReplay`. This removes the `history.ErrClassicUnsupported`
+failure the classic (non-agentic) `history.Load`/`history.Project` path hit
+on `tool_search_result`, `server_tool_call`/`server_tool_result`,
 `mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result`,
-`mcp_tool_approval_request`/`mcp_tool_approval_response` block kinds, and any
-assistant-role media block. The runtime writes all of these kinds today (for
-example `runtime/tool_search.go` writes `tool_search_result` and
-`runtime/adk_approval.go` writes `mcp_tool_approval_response`), so
-`agui.Replay` of a session containing tool-search or MCP-approval activity
-fails today rather than silently flattening or dropping that content. This is
-pre-existing, deliberate fail-closed behavior, not a regression; widening AG-UI
-replay to cover these block kinds through the `eino-agui` bridge is tracked
-for a future work package (W7).
+`mcp_tool_approval_request`/`mcp_tool_approval_response`, and assistant-role
+media blocks: every one of those now replays as its native AG-UI
+representation (when the accepted contract's twenty-kind mapping defines
+one) plus an `eino.agentic.v1` custom content-block supplement, proved by
+`TestReplayMessageSnapshotIncludesUserMediaBlock` in `agui/replay_test.go`.
+See "W7: Agentic committed-projection replay and live emission" below for
+the full mechanism. The classic `history.Load`/`convert.ToAGUIMessages` path
+still exists and is still used by `transport.DecodeMessages` for classic
+JSON ingress; it is `agui.Replay`'s emission path specifically that no
+longer uses it.
 
 ## Live Tail
 
@@ -201,3 +204,86 @@ tool arguments/results, arbitrary error text, configuration or reasoning.
 This current-state API coalesces revisions and does not promise every
 RUN_STARTED or TOOL_CALL event. The historical classification table above
 describes the separate event/replay policy, not the watch allowlist.
+
+## W7: Agentic committed-projection replay and live emission
+
+This section states only what W7's implementation and tests actually prove;
+it does not describe an aspirational end state. See
+`docs/dependency-status.md` for the pinned `eino-agui` commit.
+
+### Durable identity (session.Message.TurnID / AgentPath)
+
+`session.Message` carries `TurnID` and `AgentPath`, stamped at every append
+site (admission, turn admission, continuation dispatch, approval response,
+tool settlement, tool search settlement, crash-reconciled carrier turns).
+Both are record-JSON-only correlation fields, matching the pre-existing
+`EventRecord.TurnID`/`AgentPath` and `ModelRequestRecord.TurnID`/`AgentPath`
+convention (no SQL column or index backs any of the four); no migration was
+needed. `AgentPath` is always empty today (a single root-agent path segment
+named `"root"` is synthesized at projection time) because subagent nesting is
+not wired end to end anywhere in the runtime yet.
+
+An assistant message's "attempt identity" for AG-UI purposes is the
+`InvocationID` of the `ModelRequestRecord` that produced it (existing
+`AssistantMessageID` linkage); a user message, or an assistant message with
+no ledger row, uses its own `MessageID` as a stable, never-retried attempt id
+(`agui/agentic_projection.go`'s `attemptResolver`).
+
+`session.MessageCommittedEventKind` ("message_committed") is a new,
+non-canonical durable event, published (best-effort; its own failure never
+unwinds an already-committed write) once after `persistAssistantTurn`
+commits an assistant message's content and once after each tool call
+settles (`runtime/message_commit_event.go`), carrying the message id and the
+session's observation-watermark revision at commit time.
+
+### Committed-projection emission (agui/bridge.go, agui/replay.go)
+
+Both the durable replay path and the live path build an eino-agui
+`convert.AgenticProjection` per durable message and emit it through
+`emitter.Emitter.EmitCommittedProjection`:
+
+- **Replay** (`emitMessageSnapshot`): every durable message in a session,
+  projected via `history.ProjectAgentic` and `convert.ToAgenticProjection`,
+  emitted with `DeliveryModeReplay` (native AG-UI events for every
+  representable content kind, plus one `eino.agentic.v1` custom
+  content-block supplement per block -- nothing is silently dropped for a
+  kind the accepted contract's twenty-kind mapping does not give a native
+  representation to, e.g. `tool_search_result` or `mcp_*`).
+- **Live** (`Bridge.Emit`'s `session.MessageCommittedEventKind` case,
+  `emitLiveMessageCommitted`): reprojects the *whole session's* durable
+  history and emits only the one message the event named, with
+  `DeliveryModeLiveContinuation` (custom supplement only -- representable
+  native content already streamed live via `emitMessageDelta`/
+  `emitToolCallUpdated` before the message committed, so this must not
+  duplicate it). Reprojecting the whole session per commit is a known
+  O(session history) cost: `session.Store` exposes no by-ID single-message
+  read today, so this reuses the same tested path replay uses rather than
+  an unverified narrower one. A future single-message store read should
+  remove this cost without changing behavior.
+
+Every emitted projection's `CommitReceiptV1` binds `Domain: "projection"`,
+the exact `Identity` eino-agui computed, and `Digest: ProjectionDigestV1`.
+Replay's shared revision comes from `session.ObservationReader.
+ReadObservationRevision`, queried once per replay call; every message in
+that call safely shares the same revision string (eino-agui dedupes receipts
+by identity, not by revision).
+
+### Not yet implemented (deferred, not silently dropped)
+
+- Full lifecycle mapping: `run_paused` with `InterruptTargetV1` built from
+  validated durable approval/interrupt records, `run_resumed`,
+  `attempt_replaced`, and subagent events. The runtime does not emit
+  `session.SubagentStartedEventKind`/`SubagentFinishedEventKind`/
+  `SubagentErrorEventKind` anywhere yet (subagent nesting is not wired), so
+  there is nothing for a bridge mapping to consume for that family today.
+- Transient per-block live deltas via `convert.TransientEventForBlock` (the
+  live path today still uses the classic `TextStart`/`TextContent`/
+  `ToolStart`/... emitter methods for in-flight deltas; only the *committed*
+  projection at commit time uses the agentic path).
+- `transport.DecodeUserMessage` (rich AG-UI input decode into
+  `runtime.UserMessage` blocks) exists and is tested but is not yet wired as
+  the default ingress path in `SSEHandler`/`examples/minimal-server`; the
+  classic `DecodeMessages` remains the default for existing callers.
+- Watch (`watch/`) bounded public block state and a block-indexed live
+  overlay, and the observability typed-callback adapters with a single
+  accounting source, are untouched by W7.

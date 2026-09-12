@@ -2422,3 +2422,121 @@ below.
     `TestRepositionMidTurnCompactionBoundaryHandlesToolSearchResult`
     (`runtime/w6_round4_correlation_test.go`) prove the fix directly,
     mutation-proved by hand against a reverted no-op.
+
+## W7: AG-UI bridge, durable identity, and rich transport ingress (partial)
+
+Status: this section states only what is implemented and empirically
+verified below -- it is not a complete account of the W7 plan
+(`.agents/plans/eino-v0-9-19/07-transport-and-observability.md`). Durable
+identity, `message_committed`, and the agentic committed-projection
+emission path (replay and live) are implemented and tested. Rich AG-UI
+transport ingress (decode plus two new handlers) is implemented and tested
+but not yet wired as the default path. Full AG-UI lifecycle mapping
+(`run_paused`/`attempt_replaced`/subagent events), transient per-block live
+deltas, watch bounded block state, and the observability typed-callback
+adapters are **not implemented** by this pass -- see
+`docs/architecture/agui-events.md`'s "W7" section for the exact boundary.
+Verified: `go build ./...`; `go vet ./...` and `-tags postgres_integration`;
+`gofmt`/`goimports` clean; `golangci-lint` 0 issues; `go test ./... -count=1`;
+`go test ./agui ./transport ./watch ./stream ./obs ./runtime -count=1`; `go
+test -race ./agui ./transport ./watch ./stream`; `make check`; `make
+postgres-test` (real Docker PostgreSQL, "required suites passed; zero
+skips"); `EINO_AGENT_CONSUMER_POSTGRES=1 testdata/external-consumer/check.sh`.
+`make postgres-race` passes the full runtime/store contract except one
+subtest (`store/postgres` `TestPostgresStore/contract/paused_runs/
+claim_run_on_a_paused_run_succeeds_immediately_without_waiting_for_lease_expiry`)
+that fails intermittently under the full suite's `-race` load but passes
+reliably standalone (`go test -race -tags=postgres_integration
+./store/postgres -run 'TestPostgresStore/contract/paused_runs'`); this test
+asserts real wall-clock lease timing and this pass's diff does not touch
+`ClaimRun`/`PromotePause`/lease code, so it reads as a pre-existing
+environment-timing flake under heavy concurrent load, not a regression --
+flagged rather than silently ignored.
+
+- **Durable identity (`session.Message.TurnID`/`AgentPath`)**: stamped at
+  every append site (admission, turn admission, continuation dispatch,
+  approval response, tool settlement, tool search settlement,
+  crash-reconciled carrier turns). Both fields are record-JSON-only
+  correlation metadata, matching the pre-existing
+  `EventRecord.TurnID`/`AgentPath` and `ModelRequestRecord.TurnID`/
+  `AgentPath` convention -- no column or index backs any of the four, and no
+  SQL migration was made or needed (confirmed directly against
+  `store/sqlite/migrations/00001_initial.sql` and
+  `store/postgres/migrations/00001_initial.sql`: `messages`/`events` persist
+  the full struct as an opaque blob/bytea `record` with no enum `CHECK` on
+  `kind`). `session.ValidateAdmitTurn` rejects a message stamped with a
+  *different* turn than the one being admitted but tolerates one left
+  unset. `store/storetest/w5_durable.go`'s new `durable_identity` contract
+  suite (registered in `POSTGRES_REQUIRED_SUITES`) proves the round trip
+  through `AdmitTurn` and a follow-up `AppendMessage`, the tolerate-unset
+  case, and the reject-mismatch case, against both SQLite and PostgreSQL.
+  `ServerCallBlock`/`ServerResultBlock` (`session/content.go`) now document
+  that a server tool block's `ProviderServerID` (the eino-agui projection
+  term) is its existing `CallID` field -- no separate field exists or is
+  needed.
+- **`session.MessageCommittedEventKind`** ("message_committed",
+  `session/event_kinds.go`): an ordinary (non-canonical) durable event,
+  published best-effort by `runtime.StreamingOrchestrator.
+  publishMessageCommitted` (`runtime/message_commit_event.go`) once after
+  `persistAssistantTurn` commits an assistant message's content and once
+  after each tool call settles (`persistToolSettlement`), carrying the
+  message id and the session's observation-watermark revision at commit
+  time. Best-effort by design: the underlying content is already durably
+  committed regardless of whether this notification is observed, so its own
+  failure must never be reported as though the commit itself failed.
+  `runtime/message_commit_event_test.go` drives a full turn with a real
+  tool call through a scripted provider and proves exactly three
+  `message_committed` events (no duplicates, correct message ids, every
+  committed message carries a non-empty `TurnID`).
+- **Agentic committed-projection emission (`agui/bridge.go`,
+  `agui/replay.go`, `agui/agentic_projection.go`)**: both the durable replay
+  path and the live path now use the accepted `eino-agui` agentic bridge
+  (`convert.ToAgenticProjection`, `emitter.Emitter.EmitCommittedProjection`)
+  instead of a locally duplicated conversion. `emitMessageSnapshot` projects
+  every durable message and emits it with `DeliveryModeReplay` (native
+  events for representable content plus one `eino.agentic.v1` custom
+  supplement per block), which removes the `history.ErrClassicUnsupported`
+  failure the classic `history.Load` projector hit on `tool_search_result`,
+  `mcp_*`, and assistant media -- `TestReplayMessageSnapshotIncludesUserMediaBlock`
+  now proves the media content actually reaches the stream, not merely that
+  loading didn't error. `Bridge.Emit` gains a
+  `session.MessageCommittedEventKind` case that reprojects the committed
+  message and emits it with `DeliveryModeLiveContinuation` (custom
+  supplement only, since representable native content already streamed
+  live via the existing delta path before the message committed) --
+  `TestBridgeEmitLiveMessageCommittedProjectsDurableContent` proves this
+  end to end against a real SQLite store. `NewBridge`'s signature grew a
+  required `(store session.Store, contentLimits session.ContentLimits)`
+  pair (a nil store disables the new path; existing classic-only tests pass
+  nil), a breaking constructor change per this repository's no-compatibility-
+  shim policy.
+- **Rich transport ingress (`transport/rich.go`)**: `DecodeUserMessage`
+  decodes a native AG-UI `types.InputContent` list into a
+  `runtime.UserMessage`, mapping text/image/audio/video/document onto their
+  `session.ContentBlock` (bounded: 16MiB body, 64 content fragments, every
+  media block requires exactly one URL/base64 source). `EnqueueHandler` and
+  `ResumeTargetedHandler` adapt application-owned routes to
+  `runtime.Enqueue`/`runtime.ResumeRun`; both run the host's auth callback
+  before reading the request body or resolving any session/run content --
+  `TestResumeTargetedHandlerNeverInfersPermissionFromTargetPossession` and
+  `TestEnqueueHandlerAuthFailureNeverReachesEnqueue` prove a well-formed,
+  in-bounds target id or idempotency key never substitutes for a failed
+  auth call. `ResumeTargetedHandler` bounds target count (256) and per-id
+  length (512 bytes); `EnqueueHandler` requires a bounded `Idempotency-Key`
+  header. Not yet wired as the default ingress path in
+  `SSEHandler`/`examples/minimal-server` -- the classic `DecodeMessages`
+  remains the default for existing callers.
+- **Not implemented by this pass** (see `docs/architecture/agui-events.md`):
+  `run_paused`/`InterruptTargetV1` construction from durable approval
+  records, `run_resumed`, `attempt_replaced`, and subagent lifecycle
+  mapping (the runtime does not emit any `Subagent*EventKind` anywhere yet,
+  so there is nothing for a mapping to consume); transient per-block live
+  deltas via `convert.TransientEventForBlock` (today's live path still uses
+  the classic per-delta emitter methods); `watch/`'s bounded public block
+  state and block-indexed live overlay; the observability typed-callback
+  adapters and single accounting source. Each of these touches a
+  deeply concurrent or correctness-sensitive existing subsystem (interrupt/
+  approval identity validation, the watch service's live overlay, or
+  double-counting-safe observability accounting) that this pass judged
+  required its own careful grounding and test pass rather than a partial,
+  unverified change.
