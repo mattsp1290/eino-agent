@@ -199,12 +199,22 @@ func TestScratchRootBackendsAreSessionIsolated(t *testing.T) {
 // pointing OUTSIDE scratchRoot entirely, which os.Root's own containment
 // already refuses to follow), a symlink planted at session C's directory
 // name that points to session A's ALREADY-EXISTING directory resolves
-// WITHIN scratchRoot -- os.Root has no reason to refuse it on that basis
-// alone, so without sessionScratchRoot's own parent.Lstat check, session C
-// would be handed session A's own scratch root instead of its own,
-// defeating TestScratchRootBackendsAreSessionIsolated's whole guarantee for
-// a session whose directory an earlier session, or anything else with
-// filesystem access to scratchRoot, can plant a symlink for in advance.
+// WITHIN scratchRoot -- os.Root's containment against escaping scratchRoot
+// gives it no reason to refuse this on that basis alone, so
+// sessionScratchRoot's own parent.Lstat check is what closes it here. On
+// this platform (darwin), parent.MkdirAll already refuses to create
+// through a pre-existing symlink regardless of what it points to (verified
+// by hand: removing the Lstat check leaves this test passing too --
+// round-four W6 correlation-and-seal review followup, Suggestion S3), so
+// the Lstat check is defence in depth on darwin, not a proven live hole
+// this test closes on every platform. It is still worth keeping and
+// testing: MkdirAll's "name already exists" behavior for a symlink is not
+// something this package controls, and a platform whose os.Root tolerates
+// an existing directory-like entry there would otherwise hand session C
+// session A's own scratch root, defeating
+// TestScratchRootBackendsAreSessionIsolated's guarantee for a session
+// whose directory an earlier session, or anything else with filesystem
+// access to scratchRoot, planted a symlink for in advance.
 func TestSessionScratchRootRejectsSymlinkToAnotherSessionsDirectory(t *testing.T) {
 	scratchDir := t.TempDir()
 	sessionA := session.ID("session-a-real")

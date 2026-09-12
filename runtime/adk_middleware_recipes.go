@@ -755,13 +755,21 @@ func reapplyDurableSummary(
 		}
 	}
 	if len(collapse) == 0 && dropIndex < 0 {
-		// The already-summarized range (and the boundary itself) is no
-		// longer present in this cycle's projection at all -- nothing to
-		// re-collapse. This is not expected in practice (the range is
-		// durable and this package never deletes history), but returning
-		// originalMessages unchanged is the safe degrade rather than
-		// fabricating a summary the current cycle has no basis for.
-		return originalMessages, nil
+		// The already-summarized range AND the boundary itself are both
+		// absent from this cycle's own projection -- this package never
+		// deletes durable history, so every one of fromID/toID/boundaryID
+		// committed by this SAME turn's own earlier Finalize call should
+		// always still resolve here. Reaching this branch means
+		// correlateDurableSubsequence's own fail-closed guarantee was
+		// satisfied against a baseline that itself no longer contains the
+		// range this function was asked to re-collapse -- a genuine
+		// invariant violation, not a degrade case. Failing closed here
+		// (round-four W6 correlation-and-seal review followup, Suggestion
+		// S-D-2) keeps this function's own contract -- a cycle that cannot
+		// safely re-apply a compaction it already promised the model must
+		// not silently hand back the full, uncompacted baseline instead --
+		// true in code, not just in the doc comment above.
+		return nil, fmt.Errorf("%w: summarization could not find the already-committed compaction range (from=%s to=%s boundary=%s) in this cycle's own projection; refusing to re-apply", errADKUnsupportedBlock, fromID, toID, boundaryID)
 	}
 	result := make([]*einoschema.AgenticMessage, 0, len(originalMessages))
 	summaryEmitted := false
@@ -810,10 +818,23 @@ func reapplyDurableSummary(
 // review, Important #1 -- demonstrated as `PROBE2 RESULT: fail-closed check
 // DEFEATED -- compacted and committed an epoch on a partial view`, and
 // separately, with the pointer map intact, as one durable id resolving to
-// two different messages with no error). Two strict passes close both: an
-// ephemeral message finds no unconsumed slot once every real durable
-// message has already claimed its own via pass 1, and cannot mis-claim one
-// pass 1 already gave to someone else.
+// two different messages with no error). Two strict passes close both --
+// WHEN pointer correlation is available for the real owner: an ephemeral
+// message then finds no unconsumed slot once the real durable message has
+// already claimed its own via pass 1, and cannot mis-claim one pass 1
+// already gave to someone else.
+//
+// This does NOT close the case where the pointer map is broken for the
+// REAL owner too (an earlier handler cloned/replaced its pointer) AND an
+// ephemeral duplicate with matching content is also present: with no
+// pointer to resolve either message, pass 2 is all that runs, and content
+// alone cannot distinguish "the real message under a new pointer" from "an
+// ephemeral coincidental duplicate" -- whichever reaches the fallback
+// cursor first wins the slot (round-four W6 correlation-and-seal review
+// followup, Suggestion S-A). This is strictly narrower than the original
+// finding (which needed no broken pointer at all) and is not silent in the
+// case that matters most: with distinct content and a genuinely absent
+// durable message, the fail-closed check below still fires correctly.
 //
 // unresolved (a baseline slot no message in either pass claimed) fails
 // closed rather than compacting on a partial view -- the fabricated-slot

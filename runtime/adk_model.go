@@ -665,14 +665,31 @@ func (e *adkEngine) summarizedBoundary() session.MessageID {
 // moveTailStartToGroupBoundary already enforces for the tail's own CUT
 // POINT, in the same direction: never move it later, only earlier, until it
 // no longer separates a function_tool_call from its function_tool_result.
-// It scans full[0:boundaryIndex] for any function_tool_call CallID with no
-// matching result also before the boundary, and if at least one remains
-// open, moves the boundary to sit immediately before the EARLIEST such
-// call -- ahead of every group it would otherwise split, matching where the
-// boundary's own commit is causally accurate (Finalize ran, and committed
-// it, strictly before this cycle's own dispatch produced that call). If no
-// call before the boundary is left open, the boundary is already safe and
-// is left exactly where it is.
+// It scans full[0:boundaryIndex] for every function_tool_call CallID with no
+// matching result also before the boundary, then narrows that set to only
+// the ones actually SPLIT by the boundary: a call whose own result lands at
+// or after boundaryIndex. A call with no result anywhere in full -- a
+// genuinely dangling call, exactly what patchtoolcalls exists to patch
+// after external history editing -- is not split by anything and must not
+// drag the boundary backwards over unrelated earlier content (round-four W6
+// final-integration review followup, Important #1: an unnarrowed version of
+// this check moved the boundary for a pre-existing dangling call that the
+// boundary split nothing at all, and could reorder two boundaries relative
+// to each other).
+//
+// If any split call remains, the boundary moves to sit immediately before
+// the EARLIEST one -- ahead of every group it would otherwise split,
+// matching where the boundary's own commit is causally accurate (Finalize
+// ran, and committed it, strictly before this cycle's own dispatch produced
+// that call) -- but never earlier than the session's leading contiguous
+// system-role prefix: applyEpoch (session/history/projector.go) always
+// places an already-narrowed EARLIER epoch's own boundary message
+// immediately after that same leading run (also role=system, by
+// compaction.NewBoundary's own construction), so this floor keeps both the
+// genuine leading system prefix and any earlier boundary in place, matching
+// what applyEpoch/summarizationFinalize already treat as untouchable. If no
+// call before the boundary is left open after narrowing, the boundary is
+// already safe and is left exactly where it is.
 func repositionMidTurnCompactionBoundary(
 	full []*einoschema.AgenticMessage,
 	fullSourceIDs []session.MessageID,
@@ -691,14 +708,7 @@ func repositionMidTurnCompactionBoundary(
 	}
 	// open tracks, for every function_tool_call CallID seen in full[0:boundaryIndex]
 	// with no result yet seen there, the index of the message that first
-	// introduced it -- firstOpenIndex[id]. If any remain open at
-	// boundaryIndex, the boundary splits at least one call from its result
-	// (the result is at or after boundaryIndex); target becomes the
-	// EARLIEST such call's own index, so moving the boundary to sit
-	// immediately before it puts the boundary before every open group
-	// instead of inside any of them -- the same "never forward, only
-	// backward until safe" direction moveTailStartToGroupBoundary uses for
-	// the tail's own cut point.
+	// introduced it -- firstOpenIndex[id].
 	open := make(map[string]bool)
 	firstOpenIndex := make(map[string]int)
 	for i := 0; i < boundaryIndex; i++ {
@@ -717,11 +727,39 @@ func repositionMidTurnCompactionBoundary(
 	if len(open) == 0 {
 		return full, fullSourceIDs, fullState
 	}
+	// Narrow open to calls actually SPLIT by the boundary: their own result
+	// must land at or after boundaryIndex. A call still "open" at
+	// boundaryIndex but with no result anywhere in full is genuinely
+	// dangling, not split, and must be dropped here -- see this function's
+	// own doc comment.
+	settledAfter := make(map[string]bool, len(open))
+	for i := boundaryIndex; i < len(full); i++ {
+		recordSettledCallIDs(full[i], settledAfter)
+	}
+	for id := range open {
+		if !settledAfter[id] {
+			delete(open, id)
+		}
+	}
+	if len(open) == 0 {
+		return full, fullSourceIDs, fullState
+	}
 	target := boundaryIndex
 	for id := range open {
 		if idx := firstOpenIndex[id]; idx < target {
 			target = idx
 		}
+	}
+	// Never move the boundary ahead of the session's leading contiguous
+	// system-role prefix -- which also covers any earlier epoch's own
+	// boundary message, itself role=system and placed immediately after
+	// that prefix by applyEpoch (see this function's own doc comment).
+	systemPrefix := 0
+	for systemPrefix < len(full) && full[systemPrefix].Role == einoschema.AgenticRoleTypeSystem {
+		systemPrefix++
+	}
+	if target < systemPrefix {
+		target = systemPrefix
 	}
 	if target >= boundaryIndex {
 		// Should not happen given len(open) > 0 above, but never move the
@@ -748,7 +786,17 @@ func repositionMidTurnCompactionBoundary(
 	}
 	reorderedState := make([]model.ProviderMessageState, len(fullState))
 	for i, state := range fullState {
-		state.MessageIndex = oldToNew[state.MessageIndex]
+		// oldToNew is indexed by this reorder's own full/fullState, which
+		// buildDurableBaseline always keeps in lockstep (round-four W6
+		// correlation-and-seal review followup, Suggestion S-D-1): guarded
+		// rather than trusted, so a future caller passing a stale or
+		// mismatched fullState degrades this one entry instead of panicking.
+		idx := state.MessageIndex
+		if idx < 0 || idx >= len(oldToNew) {
+			reorderedState[i] = state
+			continue
+		}
+		state.MessageIndex = oldToNew[idx]
 		reorderedState[i] = state
 	}
 	return reorderedMessages, reorderedSourceIDs, reorderedState
@@ -779,6 +827,29 @@ func recordToolCallAdjacency(msg *einoschema.AgenticMessage, open map[string]boo
 		}
 		if block.ToolSearchFunctionToolResult != nil {
 			delete(open, block.ToolSearchFunctionToolResult.CallID)
+		}
+	}
+}
+
+// recordSettledCallIDs marks, in settled, every CallID one message settles
+// via a function_tool_result or ToolSearchFunctionToolResult block -- the
+// forward-scan counterpart to recordToolCallAdjacency, used by
+// repositionMidTurnCompactionBoundary to distinguish a call actually SPLIT
+// by the boundary (its result lands at or after it) from a genuinely
+// dangling call (no result anywhere), which must not move the boundary.
+func recordSettledCallIDs(msg *einoschema.AgenticMessage, settled map[string]bool) {
+	if msg == nil {
+		return
+	}
+	for _, block := range msg.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		if block.FunctionToolResult != nil {
+			settled[block.FunctionToolResult.CallID] = true
+		}
+		if block.ToolSearchFunctionToolResult != nil {
+			settled[block.ToolSearchFunctionToolResult.CallID] = true
 		}
 	}
 }
@@ -835,8 +906,20 @@ func dropUnfinalizedAssistantPlaceholders(messages []*einoschema.AgenticMessage,
 // package's own recipes that does), the captured provider state can no
 // longer be trusted to address the right message, so it is dropped rather
 // than risked being misapplied -- a bounded, documented degradation, not
-// silent corruption. Finally strips ADK's own internal per-iteration Extra
-// bookkeeping (stripADKInternalExtra).
+// silent corruption.
+//
+// Steady-state note (round-four W6 correlation-and-seal review followup,
+// Suggestion S-B): once a turn has summarized, reapplyDurableSummary
+// re-collapses state.Messages on EVERY later cycle (not just the one that
+// triggered the compaction), so this reset now fires on every remaining
+// cycle of such a turn, not once. Captured per-message provider state
+// (e.g. cached reasoning/provider-side blocks) is therefore discarded for
+// the rest of a turn that summarized mid-way through, which is the correct
+// trade against misapplying it to the wrong message -- and strictly better
+// than the context regrowth reapplyDurableSummary replaced -- but it is now
+// the norm for such a turn's tail, not a one-cycle exception. Finally
+// strips ADK's own internal per-iteration Extra bookkeeping
+// (stripADKInternalExtra).
 func (m *adkModel) prepareDispatchInput(input []*einoschema.AgenticMessage) ([]*einoschema.AgenticMessage, error) {
 	// An internal-dispatch call's input (e.g. summarization's own,
 	// deliberately shorter, in-progress summary request) must never trigger

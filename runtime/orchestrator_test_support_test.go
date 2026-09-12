@@ -3,8 +3,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -330,11 +330,33 @@ type sequenceIDs struct {
 	n  int
 }
 
+// next mints "<prefix>-<n>" from a single, ever-increasing counter shared
+// across every id kind. n is zero-padded (round-four W6 correlation-and-seal
+// review followup, Suggestion S-C): every runtime-package test using this
+// generator (newTestOrchestrator) pins the clock to one constant instant
+// (WithClock) for determinism, so the store's own (m.created_at, m.id)
+// ordering ties on created_at for EVERY message and falls through to a
+// plain LEXICAL comparison of these ids -- matching production's own
+// sqlstore.loadReplayMessages exactly (ORDER BY m.created_at, m.id against
+// a TEXT column). An un-padded counter is only a valid total order matching
+// mint order while n stays within one digit width: it silently breaks the
+// moment a session mints its 10th, 100th, ... id of a given prefix (e.g.
+// "message-100" < "message-96" lexically, even though message-100 was
+// minted long after message-96) -- exactly the kind of reordering
+// adkEngine.buildDurableBaseline's prefix/tail splice invariant depends on
+// never happening, and what a previous version of this fixture papered
+// over by making the FAKE STORE's own comparison numeric-suffix-aware
+// instead of the ids -- modeling an ordering the real store does not
+// provide, since IDGenerator is host-supplied (no production implementation
+// ships in this repo) and a host minting un-padded counters would hit this
+// same reordering in sqlstore. Fixing the ids instead keeps the fixture's
+// tie-break faithfully lexical, like production, while still giving mint
+// order and lexical order the same answer.
 func (s *sequenceIDs) next(prefix string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.n++
-	return prefix + "-" + strconv.Itoa(s.n)
+	return fmt.Sprintf("%s-%06d", prefix, s.n)
 }
 
 func (s *sequenceIDs) NewRunID() session.RunID         { return session.RunID(s.next("run")) }

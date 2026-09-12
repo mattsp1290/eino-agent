@@ -81,6 +81,57 @@ func TestRepositionMidTurnCompactionBoundaryMovesBeforeSplitGroup(t *testing.T) 
 	}
 }
 
+// TestRepositionMidTurnCompactionBoundaryGuardsOutOfBoundsProviderStateIndex
+// is round-four W6 correlation-and-seal review followup, Suggestion S-D-1:
+// the fullState remap indexes oldToNew (sized len(full)) by each entry's own
+// MessageIndex without a bounds check. Indices arrive in lockstep with full
+// on every real call from buildDurableBaseline today, so this is not
+// reachable in practice, but a stale or malformed MessageIndex (negative, or
+// >= len(full)) must degrade that one entry rather than panic the whole
+// cycle. This constructs exactly that shape directly against the function.
+func TestRepositionMidTurnCompactionBoundaryGuardsOutOfBoundsProviderStateIndex(t *testing.T) {
+	const (
+		userMsgID     session.MessageID = "m-user"
+		callMsgID     session.MessageID = "m-call"
+		boundaryMsgID session.MessageID = "m-boundary"
+		resultMsgID   session.MessageID = "m-result"
+	)
+	full := []*einoschema.AgenticMessage{
+		agenticUserText("hi"),
+		toolCallBlockMessage("call-A", "ping", `{}`),
+		agenticSystemText("compaction summary text"),
+		toolResultBlockMessage("call-A", "ping"),
+	}
+	fullSourceIDs := []session.MessageID{userMsgID, callMsgID, boundaryMsgID, resultMsgID}
+	// stale carries an out-of-bounds index (>= len(full)); negative carries
+	// one below zero. Neither should occur from a real buildDurableBaseline
+	// call today, but the guard must survive both without panicking.
+	fullState := []model.ProviderMessageState{
+		{MessageIndex: 1, MessageID: string(callMsgID)},
+		{MessageIndex: len(full), MessageID: "stale"},
+		{MessageIndex: -1, MessageID: "negative"},
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("repositionMidTurnCompactionBoundary panicked on an out-of-bounds ProviderMessageState.MessageIndex: %v", r)
+		}
+	}()
+	_, _, gotState := repositionMidTurnCompactionBoundary(full, fullSourceIDs, fullState, boundaryMsgID)
+	if len(gotState) != len(fullState) {
+		t.Fatalf("provider state count = %d, want %d entries preserved (out-of-bounds ones degraded, not dropped)", len(gotState), len(fullState))
+	}
+	if gotState[0].MessageIndex != 2 {
+		t.Fatalf("in-bounds entry remapped to %d, want 2 (the call's new position)", gotState[0].MessageIndex)
+	}
+	if gotState[1].MessageIndex != len(full) || gotState[1].MessageID != "stale" {
+		t.Fatalf("out-of-bounds entry = %+v, want left unchanged rather than panicking or being silently dropped", gotState[1])
+	}
+	if gotState[2].MessageIndex != -1 || gotState[2].MessageID != "negative" {
+		t.Fatalf("negative-index entry = %+v, want left unchanged rather than panicking or being silently dropped", gotState[2])
+	}
+}
+
 // TestRepositionMidTurnCompactionBoundaryNoOpWhenAlreadySafe proves the
 // function never moves a boundary that does not split any group -- the
 // common case on every cycle before summarization has fired, and every
@@ -140,6 +191,141 @@ func TestRepositionMidTurnCompactionBoundaryHandlesToolSearchResult(t *testing.T
 	wantSourceIDs := []session.MessageID{userMsgID, boundaryMsgID, callMsgID, resultMsgID}
 	if !reflect.DeepEqual(gotSourceIDs, wantSourceIDs) {
 		t.Fatalf("sourceIDs after reposition = %v, want %v (boundary moved before the tool_search call)", gotSourceIDs, wantSourceIDs)
+	}
+}
+
+// TestRepositionMidTurnCompactionBoundaryDoesNotMoveForADanglingCall is
+// round-four W6 final-integration review followup, Important #1, PROBE2
+// shape: the boundary splits nothing at all -- the only "open" call before
+// it is a genuinely dangling one (no result anywhere in full, exactly what
+// patchtoolcalls exists to patch after external history editing). Before
+// this fix, the reposition condition asked "is any call before the boundary
+// still open" -- true here, though nothing is actually split -- and moved
+// the boundary anyway, contradicting the doc comment's own claim that an
+// already-safe boundary is left where it is.
+func TestRepositionMidTurnCompactionBoundaryDoesNotMoveForADanglingCall(t *testing.T) {
+	const (
+		userMsgID     session.MessageID = "m0"
+		danglingMsgID session.MessageID = "m1"
+		fillerMsgID   session.MessageID = "m2"
+		boundaryMsgID session.MessageID = "m-newb"
+		tailMsgID     session.MessageID = "m4"
+	)
+	full := []*einoschema.AgenticMessage{
+		agenticUserText("hi"),
+		toolCallBlockMessage("call-old", "x", `{}`), // dangling: never settled anywhere in full
+		agenticUserText("filler"),
+		agenticSystemText("new boundary text"),
+		agenticUserText("more filler"),
+	}
+	fullSourceIDs := []session.MessageID{userMsgID, danglingMsgID, fillerMsgID, boundaryMsgID, tailMsgID}
+
+	gotMessages, gotSourceIDs, _ := repositionMidTurnCompactionBoundary(full, fullSourceIDs, nil, boundaryMsgID)
+	if !reflect.DeepEqual(gotSourceIDs, fullSourceIDs) {
+		t.Fatalf("sourceIDs = %v, want unchanged %v -- a dangling call (no result anywhere) splits nothing and must not move the boundary", gotSourceIDs, fullSourceIDs)
+	}
+	for i := range full {
+		if gotMessages[i] != full[i] {
+			t.Fatalf("messages[%d] changed despite nothing being split", i)
+		}
+	}
+}
+
+// TestRepositionMidTurnCompactionBoundaryPreservesAnEarlierBoundaryAndDanglingCall
+// is round-four W6 final-integration review followup, Important #1, PROBE1
+// shape: an older dangling call (never settled) sits before a PREVIOUS
+// turn's own already-committed boundary, which sits before THIS turn's own
+// call/boundary/result group. Before this fix, the unnarrowed "still open"
+// condition treated the dangling call as open at the new boundary too (it
+// is never resolved anywhere), computed target from its early index, and
+// moved the NEW boundary backward past the user message AND the OLDER
+// boundary -- reordering two boundaries relative to each other and
+// presenting this turn's summary to the model before content that precedes
+// it. The fix must move the new boundary only as far as its own genuinely
+// split call, never crossing the older boundary.
+func TestRepositionMidTurnCompactionBoundaryPreservesAnEarlierBoundaryAndDanglingCall(t *testing.T) {
+	const (
+		systemMsgID   session.MessageID = "m0"
+		userMsgID     session.MessageID = "m1"
+		danglingMsgID session.MessageID = "m2"
+		oldBoundaryID session.MessageID = "m-oldb"
+		fillerMsgID   session.MessageID = "m4"
+		callMsgID     session.MessageID = "m5"
+		newBoundaryID session.MessageID = "m-newb"
+		resultMsgID   session.MessageID = "m7"
+	)
+	full := []*einoschema.AgenticMessage{
+		agenticSystemText("leading system prefix"),            // m0
+		agenticUserText("hi"),                                 // m1
+		toolCallBlockMessage("call-old", "x", `{}`),           // m2 -- dangling, never settled
+		agenticSystemText("older, already-committed summary"), // m-oldb
+		agenticUserText("filler"),                             // m4
+		toolCallBlockMessage("call-new", "ping", `{}`),        // m5 -- THIS turn's own call
+		agenticSystemText("new boundary text"),                // m-newb
+		toolResultBlockMessage("call-new", "ping"),            // m7 -- call-new's own result
+	}
+	fullSourceIDs := []session.MessageID{
+		systemMsgID, userMsgID, danglingMsgID, oldBoundaryID, fillerMsgID, callMsgID, newBoundaryID, resultMsgID,
+	}
+
+	gotMessages, gotSourceIDs, _ := repositionMidTurnCompactionBoundary(full, fullSourceIDs, nil, newBoundaryID)
+
+	wantSourceIDs := []session.MessageID{
+		systemMsgID, userMsgID, danglingMsgID, oldBoundaryID, fillerMsgID, newBoundaryID, callMsgID, resultMsgID,
+	}
+	if !reflect.DeepEqual(gotSourceIDs, wantSourceIDs) {
+		t.Fatalf("sourceIDs after reposition = %v, want %v (new boundary moves only before its own split call, never past the older boundary)", gotSourceIDs, wantSourceIDs)
+	}
+	if gotMessages[5] != full[6] {
+		t.Fatalf("messages[5] = %+v, want the new boundary message (full[6])", gotMessages[5])
+	}
+	if gotMessages[6] != full[5] {
+		t.Fatalf("messages[6] = %+v, want call-new (full[5])", gotMessages[6])
+	}
+	// The two boundaries must stay in their original relative order.
+	oldIdx, newIdx := -1, -1
+	for i, id := range gotSourceIDs {
+		if id == oldBoundaryID {
+			oldIdx = i
+		}
+		if id == newBoundaryID {
+			newIdx = i
+		}
+	}
+	if oldIdx >= newIdx {
+		t.Fatalf("older boundary at %d, new boundary at %d -- boundaries were reordered", oldIdx, newIdx)
+	}
+}
+
+// TestRecordToolCallAdjacencyAndSettledCallIDsHandleToolSearchResult is a
+// direct unit test for the pure adjacency helpers repositionMidTurnCompactionBoundary
+// depends on (round-four W6 final-integration review followup, Suggestion):
+// dropping ToolSearchFunctionToolResult handling from these functions left
+// the whole runtime package green last round and was caught only by the
+// examples/agentic-middleware composed test -- a pure function this
+// consequential should not be guarded solely by an integration test.
+func TestRecordToolCallAdjacencyAndSettledCallIDsHandleToolSearchResult(t *testing.T) {
+	call := toolCallBlockMessage("call-search", "tool_search", `{}`)
+	result := toolSearchResultBlockMessage("call-search", "hidden_capability")
+
+	open := map[string]bool{}
+	recordToolCallAdjacency(call, open)
+	if !open["call-search"] {
+		t.Fatal("recordToolCallAdjacency did not open call-search from its function_tool_call block")
+	}
+	recordToolCallAdjacency(result, open)
+	if open["call-search"] {
+		t.Fatal("recordToolCallAdjacency did not close call-search on a ToolSearchFunctionToolResult block")
+	}
+
+	settled := map[string]bool{}
+	recordSettledCallIDs(call, settled)
+	if settled["call-search"] {
+		t.Fatal("recordSettledCallIDs marked a bare function_tool_call as settled")
+	}
+	recordSettledCallIDs(result, settled)
+	if !settled["call-search"] {
+		t.Fatal("recordSettledCallIDs did not mark call-search settled from a ToolSearchFunctionToolResult block")
 	}
 }
 
@@ -239,5 +425,35 @@ func TestCorrelateDurableSubsequenceTwoPassRejectsCoincidentalDuplicate(t *testi
 		if count > 1 {
 			t.Fatalf("durable id %q claimed by %d different messages, want at most 1", id, count)
 		}
+	}
+}
+
+// TestReapplyDurableSummaryFailsClosedWhenTheCommittedRangeIsMissing is
+// round-four W6 correlation-and-seal review followup, Suggestion S-D-2:
+// reapplyDurableSummary's own doc comment says a cycle that cannot safely
+// re-apply an already-committed compaction "must not silently hand back the
+// full, uncompacted baseline instead", but the code used to do exactly that
+// when fromID/toID/boundaryID were all absent from this cycle's own
+// correlated projection. This constructs that shape directly (a baseline
+// with no message resolving to any of the three cached ids) and asserts an
+// error instead of the uncompacted originalMessages coming back unchanged.
+func TestReapplyDurableSummaryFailsClosedWhenTheCommittedRangeIsMissing(t *testing.T) {
+	m0 := agenticUserText("m0 content")
+	baselineMsgs := []*einoschema.AgenticMessage{m0}
+	baselineIDs := []session.MessageID{"id0"}
+	sourceMessageID := func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
+		if msg == m0 {
+			return "id0", true
+		}
+		return "", false
+	}
+	baselineMessages := func() ([]*einoschema.AgenticMessage, []session.MessageID) {
+		return baselineMsgs, baselineIDs
+	}
+	originalMessages := []*einoschema.AgenticMessage{m0}
+
+	_, err := reapplyDurableSummary(originalMessages, sourceMessageID, baselineMessages, "missing-from", "missing-to", "missing-boundary", agenticAssistantText("summary"))
+	if err == nil {
+		t.Fatal("reapplyDurableSummary succeeded despite fromID/toID/boundaryID all being absent from this cycle's own projection -- want a fail-closed error, not the uncompacted baseline handed back unchanged")
 	}
 }

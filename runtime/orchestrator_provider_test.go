@@ -273,7 +273,7 @@ func TestStreamingOrchestratorFailsMalformedToolArgumentsWithoutPanic(t *testing
 		t.Fatalf("tool call persisted despite malformed arguments: %v", err)
 	}
 	for _, part := range store.parts {
-		if part.MessageID == "message-3" {
+		if part.MessageID == "message-000003" {
 			continue
 		}
 		switch part.Kind {
@@ -289,7 +289,7 @@ func assertOnlyAdmittedUserPart(t *testing.T, parts map[session.PartID]session.P
 		t.Fatalf("parts = %#v, want only admitted user part", parts)
 	}
 	for _, part := range parts {
-		if part.MessageID != "message-3" || part.Kind != session.PartUserInputText {
+		if part.MessageID != "message-000003" || part.Kind != session.PartUserInputText {
 			t.Fatalf("admitted user part = %#v", part)
 		}
 		decoded, err := session.DecodeContentParts(session.RoleUser, []session.Part{part}, session.DefaultContentLimits())

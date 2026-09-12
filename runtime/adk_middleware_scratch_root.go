@@ -86,17 +86,25 @@ func sessionScratchRoot(scratchRoot string, sessionID session.ID) (*os.Root, err
 	}
 	// Lstat (not Stat) through the PARENT root before opening: os.Root
 	// follows a symlink as long as it resolves within the root (see os.Root's
-	// own doc comment -- "Methods on Root will follow symbolic links"), so a
+	// own doc comment -- "Methods on Root will follow symbolic links"), so
+	// containment against escaping scratchRoot entirely is not automatically
+	// the same guarantee as isolation BETWEEN sessions within it -- a
 	// symlink planted at exactly this session's directory name that points
-	// to ANOTHER session's directory INSIDE the same scratchRoot would still
-	// be followed by parent.OpenRoot below, giving this session read/write
-	// access to that other session's offloads -- containment against
-	// escaping scratchRoot entirely is not the same guarantee as isolation
-	// BETWEEN sessions within it (round-four W6 correlation-and-seal review,
-	// Suggestion #3). Requiring a real directory (Lstat's own mode bits,
-	// which -- unlike Stat -- never follow the final symlink) closes this: a
-	// symlink here is rejected before ever opening through it, regardless of
-	// where it points.
+	// to ANOTHER session's directory INSIDE the same scratchRoot has no
+	// reason to be refused on that basis alone (round-four W6
+	// correlation-and-seal review, Suggestion #3). On this platform (darwin)
+	// the preceding parent.MkdirAll already refuses to create through such a
+	// pre-existing symlink regardless of what it points to (verified by
+	// hand), so this Lstat check is confirmed defence in depth here rather
+	// than closing a demonstrated live hole on every platform -- it is kept
+	// because MkdirAll's "name already exists" behavior for a symlink is not
+	// something this package controls, and a platform whose os.Root
+	// tolerates an existing directory-like entry there would otherwise let
+	// parent.OpenRoot below follow the symlink, giving this session
+	// read/write access to that other session's offloads. Requiring a real
+	// directory (Lstat's own mode bits, which -- unlike Stat -- never follow
+	// the final symlink) closes this: a symlink here is rejected before
+	// ever opening through it, regardless of where it points.
 	info, err := parent.Lstat(name)
 	if err != nil {
 		return nil, err
