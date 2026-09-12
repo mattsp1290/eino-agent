@@ -1968,17 +1968,39 @@ below.
   or this package's own, e.g. via `cloneProtectedMessages`) can legitimately
   replace message pointers without preserving identity, `summarizationFinalize`
   also falls back to CONTENT-based correlation (`reflect.DeepEqual` against
-  that cycle's own baseline, walked in order) for anything the pointer
-  lookup misses, and fails the turn closed -- rather than silently
-  compacting on a partial view -- if any durable baseline message still
-  cannot be accounted for either way (round-three W6
-  summarization-correctness review, Important #1). Summarization is also
-  bounded to firing at most once per turn (`summarizeAtMostOnceMiddleware`):
-  upstream re-evaluates its own trigger condition on every ReAct cycle with
-  no per-call override, so without this a multi-cycle turn that crosses the
-  threshold once would re-summarize -- and re-bill a real summary
-  generation call -- on every later cycle of the same turn (round-three W6
-  summarization-correctness review, Important #2). `summarizationFinalize`
+  that cycle's own baseline) for anything the pointer lookup misses, and
+  fails the turn closed -- rather than silently compacting on a partial
+  view -- if any durable baseline message still cannot be accounted for
+  either way (round-three W6 summarization-correctness review, Important
+  #1). This correlation (`correlateDurableSubsequence`, shared with the
+  re-apply path below) runs in two STRICT passes -- pointer-keyed first,
+  then content fallback only over what pass one left unresolved and only
+  against baseline slots pass one did not already claim -- rather than one
+  interleaved pass: an ephemeral (non-durable) message that coincidentally
+  matches a baseline entry's content can otherwise steal that entry's slot
+  before its real, pointer-resolvable owner claims it, letting one durable
+  id resolve to two different messages with no error, or masking a
+  genuinely unresolved durable message so the fail-closed check above never
+  fires (round-four W6 correlation-and-seal review, Important #1).
+  Summarization generates a summary at most once per turn
+  (`summarizeAtMostOnceMiddleware`): upstream re-evaluates its own trigger
+  condition on every ReAct cycle with no per-call override, so without this
+  a multi-cycle turn that crosses the threshold once would re-summarize --
+  and re-bill a real summary generation call -- on every later cycle of the
+  same turn (round-three W6 summarization-correctness review, Important
+  #2). Bounding GENERATION to once per turn does not mean the model sees
+  the full, uncompacted baseline again on later cycles: doing so measured
+  as per-cycle message counts regrowing from a compacted 1 back up to 10
+  across five cycles of the same tool loop (round-four W6
+  correlation-and-seal review, Important #2). Every cycle after the one
+  that committed the epoch instead re-applies that SAME compaction
+  (`reapplyDurableSummary`, using the cached `SummarizedFromID`/
+  `SummarizedToID`/boundary id/summary object) without generating or
+  billing a second summary, so a long tool loop stays inside the context
+  window for the rest of the turn (measured as `[1 1 3 5 7]` on the same
+  five-cycle shape: compacted once, then growing by exactly the new
+  call/result pair each cycle adds, not regrowing toward the
+  pre-compaction baseline). `summarizationFinalize`
   commits `StartContextEpoch` + the compaction boundary in ONE fenced
   transaction (`compaction.AppendBoundaryTx`) so a mid-sequence failure can
   never leave an epoch row with no `SummaryMessageID`. It never creates an
@@ -2352,16 +2374,51 @@ below.
     and `TestResumeAfterChangedSkillContentIsRefused`, prove item 3's
     skill-resume-verification fix end to end from outside the runtime
     package.
-  - **Bounded, documented limitation**: this example still does not build
-    a genuine "dangling call, no durable settlement" fixture for
-    patchtoolcalls (constructing one requires seeding raw `ExecutionStore`
-    history for a fenced run outside any live turn); this example instead
-    proves patchtoolcalls leaves a real settlement alone. That exact
-    scenario IS now covered, at the runtime-internal level (round-two W6
-    review item 4), by
-    `TestPatchToolCallsPatchesOrphanedCallWithoutFabricatingSettlement`
-    and `TestPatchToolCallsCannotPatchACallWithARealSettlement`
-    (`runtime/patchtoolcalls_settlement_test.go`), which seed durable
-    history directly through the store the same way this bullet
-    describes; this example package was not additionally extended to
-    duplicate that fixture at the black-box level.
+  - **Resolved (round-two W6 review item 14)**: the composed example
+    (`TestComposedExampleMountsAllEightRecipesInOneRunPlan`,
+    `examples/agentic-middleware/composed_test.go`) builds a genuine
+    "dangling call, no durable settlement" fixture at the black-box level
+    -- a custom public `HandlerFactory` (`danglingCallInjector`) mounted at
+    Order 0 injects an unanswered `function_tool_call` that patchtoolcalls
+    patches in the same cycle, asserted both at the model input and by the
+    absence of a `session.ToolCall` row. Reaching this requires no seeded
+    `ExecutionStore` history: the injector reaches patchtoolcalls' own
+    in-memory scan through the same public extension surface every recipe
+    in the example is built on. The runtime-internal, store-seeded
+    versions (`TestPatchToolCallsPatchesOrphanedCallWithoutFabricatingSettlement`
+    and `TestPatchToolCallsCannotPatchACallWithARealSettlement`,
+    `runtime/patchtoolcalls_settlement_test.go`) still stand alongside it.
+  - **Resolved (`eino-agent-0wb`, round-four W6 correlation-and-seal
+    review, Important #4).** patchtoolcalls and summarization previously
+    could not be mounted together once summarization fired: this runtime
+    commits summarization's compaction boundary message
+    (`session.RoleSystem`, `PartCompaction`) mid-turn, and a turn's own
+    admission-time epoch view does not narrow the provider projection via
+    `applyEpoch` for later cycles of that same turn (only the NEXT turn
+    admitted on the session sees the epoch), so a later cycle's raw reload
+    could place that boundary message BETWEEN an assistant
+    `function_tool_call` and its `function_tool_result` -- specifically
+    when the trigger fired on a turn's own first cycle, since that cycle's
+    assistant placeholder row is reserved at admission (an early durable
+    position) while its eventual call and that call's result both commit
+    later, straddling the boundary. Upstream patchtoolcalls'
+    `hasCorrespondingAgenticToolResult` requires strict adjacency (it stops
+    at the first non-user message), so it judged the already-settled call
+    dangling and appended a fabricated second result; `settlementSeal`
+    correctly rejected that as a diverged occurrence and failed the turn --
+    the right last line of defence, but a failed turn all the same. Fixed
+    by `runtime.repositionMidTurnCompactionBoundary`
+    (`runtime/adk_model.go`), called from `buildDurableBaseline` on every
+    cycle after the one that committed a mid-turn boundary: it moves the
+    boundary, in memory only, to sit immediately before the earliest
+    `function_tool_call` (or toolsearch `ToolSearchFunctionToolResult`
+    -- both call/result content-block shapes are handled) it would
+    otherwise separate from its own result -- the same "never forward,
+    only backward until safe" invariant `moveTailStartToGroupBoundary`
+    already enforces for the tail's own cut point.
+    `TestComposedExampleMountsAllEightRecipesInOneRunPlan` now mounts
+    patchtoolcalls in both turns, and
+    `TestRepositionMidTurnCompactionBoundaryMovesBeforeSplitGroup`/
+    `TestRepositionMidTurnCompactionBoundaryHandlesToolSearchResult`
+    (`runtime/w6_round4_correlation_test.go`) prove the fix directly,
+    mutation-proved by hand against a reverted no-op.

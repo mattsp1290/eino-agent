@@ -445,6 +445,29 @@ type ReductionConfig struct {
 // Use NewReductionHandlerFactoryWithTokenCounter to inject a custom
 // counter -- funcs cannot round-trip through the JSON-serializable Config,
 // so injection is a separate constructor rather than a Config field.
+//
+// Correlation dependency (round-four W6 correlation-and-seal review,
+// Suggestion #2): this constructor -- and NewReductionHandlerFactoryWithTokenCounter
+// below, which it wraps -- deliberately never sets upstream reduction's own
+// ClearAtLeastTokens or ClearMessageRewriter fields on TypedConfig. Clearing
+// today only ever happens through this recipe's own in-place rewrite
+// (`setToolResultContent` on the existing message pointer, per upstream's
+// `reduction.go`), which is what lets summarization's pointer-keyed
+// correlation (cycleMessageSourceByPointer) still resolve a message
+// reduction has cleared -- the pointer identity survives the rewrite.
+// Upstream switches to allocating NEW message pointers
+// (`copyMessagesGeneric`) once ClearAtLeastTokens > 0, and
+// ClearMessageRewriter can restructure the slice outright; either would
+// silently break summarization's pointer lookup for every message reduction
+// touches in a cycle where both recipes are mounted and fire together --
+// summarizationFinalize's own content-based fallback
+// (correlateDurableSubsequence) cannot rescue this case either, since
+// reduction's whole purpose is to change the content the fallback would
+// need to match on. Leaving both fields unset is a real, load-bearing
+// precondition for correlation to hold when reduction and summarization are
+// co-mounted, not an incidental default -- keep it that way unless
+// correlation is re-verified against whichever of these two upstream
+// behaviors gets enabled.
 func NewReductionHandlerFactory(cfg ReductionConfig) HandlerFactory {
 	return NewReductionHandlerFactoryWithTokenCounter(cfg, nil)
 }

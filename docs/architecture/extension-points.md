@@ -309,13 +309,19 @@ both authorized and audited); this example package's own
 reduction's own two-round clearing (one handler, two of its own rewrites),
 not two different handlers.
 See that package's own doc comment and the W6 section of
-`docs/architecture/eino-feature-support.md` for this example's remaining,
-explicitly deferred scope limits: a "dangling call, no durable settlement"
-fixture for patchtoolcalls is exercised at the runtime-internal level, via
-seeded store history, rather than duplicated at this black-box level; and
-no single turn mounts all eight recipes together in one composed
-multi-turn scenario (round-two W6 review item 14, deferred -- each recipe
-is proven individually here, not yet in combination).
+`docs/architecture/eino-feature-support.md` for this example's remaining
+scope limits. All eight recipes are mounted together in one `RunPlan`, in
+both turns of the example's own multi-turn scenario, and each is proven
+with its own concrete assertion by
+`TestComposedExampleMountsAllEightRecipesInOneRunPlan` (round-two W6
+review item 14), which also builds a genuine "dangling call, no durable
+settlement" fixture at this black-box level via a custom public
+`HandlerFactory`, in addition to the runtime-internal, store-seeded
+version. The previously bounded limitation on mounting patchtoolcalls and
+summarization together is resolved (eino-agent-0wb): a mid-turn compaction
+boundary this runtime commits can no longer land between a
+function_tool_call and its function_tool_result -- see the W6
+known-limitations history in `eino-feature-support.md`.
 
 ## Request ledger and privacy
 
