@@ -142,3 +142,102 @@ func TestRepositionMidTurnCompactionBoundaryHandlesToolSearchResult(t *testing.T
 		t.Fatalf("sourceIDs after reposition = %v, want %v (boundary moved before the tool_search call)", gotSourceIDs, wantSourceIDs)
 	}
 }
+
+// TestCorrelateDurableSubsequenceFailsClosedOnGenuinelyAbsentMessage is
+// round-four W6 correlation-and-seal review Important #3: the fail-closed
+// "unresolved > 0" check had no regression test at all -- neutralizing it
+// survived the full runtime and examples/agentic-middleware suites. This
+// constructs the exact shape the check exists to catch: a durable baseline
+// message (id1) that this cycle's projected messages do not contain under
+// ANY resolvable identity (no pointer match, no content match) -- simulating
+// an earlier handler that dropped or unrecognizably rewrote it -- and
+// asserts correlateDurableSubsequence refuses to proceed rather than
+// silently treating the cycle as fully accounted for.
+//
+// Mutation check performed by hand: with the `if unresolved > 0 { return
+// nil, nil, err }` guard in correlateDurableSubsequence commented out, this
+// test fails (no error, and only 1 of the 2 real baseline messages present
+// in durableOriginalIndices) instead of failing closed; restoring the guard
+// passes it again.
+func TestCorrelateDurableSubsequenceFailsClosedOnGenuinelyAbsentMessage(t *testing.T) {
+	m0 := agenticUserText("m0 content")
+	m1 := agenticUserText("m1 content")
+	baselineMsgs := []*einoschema.AgenticMessage{m0, m1}
+	baselineIDs := []session.MessageID{"id0", "id1"}
+	sourceMessageID := func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
+		if msg == m0 {
+			return "id0", true
+		}
+		return "", false
+	}
+	// m1 is genuinely absent from this cycle's own projection -- not merely
+	// under a new pointer (content differs too, so the fallback cannot
+	// mistake anything here for it).
+	originalMessages := []*einoschema.AgenticMessage{m0}
+
+	_, _, err := correlateDurableSubsequence(originalMessages, sourceMessageID, baselineMsgs, baselineIDs)
+	if err == nil {
+		t.Fatal("correlateDurableSubsequence succeeded despite baseline message id1 having no resolvable identity in this cycle -- want a fail-closed error")
+	}
+}
+
+// TestCorrelateDurableSubsequenceTwoPassRejectsCoincidentalDuplicate is
+// round-four W6 correlation-and-seal review Important #1: the fallback must
+// not let an ephemeral (non-durable) message that coincidentally matches a
+// baseline entry's content steal that entry's slot before the REAL durable
+// message (present later in originalMessages, resolvable by pointer) claims
+// it. ephemeral has the SAME content as m0 but no durable id at all --
+// exactly the shape of an agentsmd/skill-injected message that happens to
+// echo real conversational text -- and appears BEFORE the real m0 in
+// originalMessages, the position that defeated the old single, interleaved
+// pass (it would greedily match ephemeral against baselineMsgs[0] before
+// the real m0 got a chance to claim id0 by pointer, producing id0 claimed
+// by TWO different messages with no error at all).
+//
+// Mutation check performed by hand: reverting correlateDurableSubsequence
+// to a single interleaved pass (resolve-or-fallback per message, in
+// original order, instead of two strict passes) makes this test fail:
+// sourceIDs ends up ["id0", "id0", "id1"] (id0 claimed twice, ephemeral
+// wrongly resolved) instead of ephemeral being correctly left unresolved.
+func TestCorrelateDurableSubsequenceTwoPassRejectsCoincidentalDuplicate(t *testing.T) {
+	m0 := agenticUserText("m0 content")
+	m1 := agenticUserText("m1 content")
+	ephemeral := agenticUserText("m0 content") // distinct pointer, coincidentally identical content to m0
+	baselineMsgs := []*einoschema.AgenticMessage{m0, m1}
+	baselineIDs := []session.MessageID{"id0", "id1"}
+	sourceMessageID := func(msg *einoschema.AgenticMessage) (session.MessageID, bool) {
+		switch msg {
+		case m0:
+			return "id0", true
+		case m1:
+			return "id1", true
+		default:
+			return "", false
+		}
+	}
+	originalMessages := []*einoschema.AgenticMessage{ephemeral, m0, m1}
+
+	sourceIDs, durableOriginalIndices, err := correlateDurableSubsequence(originalMessages, sourceMessageID, baselineMsgs, baselineIDs)
+	if err != nil {
+		t.Fatalf("correlateDurableSubsequence error = %v, want success (both real baseline messages ARE present, just alongside a coincidental ephemeral duplicate)", err)
+	}
+	if sourceIDs[0] != "" {
+		t.Fatalf("ephemeral (index 0) resolved to durable id %q, want unresolved (\"\") -- it must never steal a real baseline slot", sourceIDs[0])
+	}
+	if sourceIDs[1] != "id0" || sourceIDs[2] != "id1" {
+		t.Fatalf("real messages resolved to sourceIDs=%v, want [_, id0, id1]", sourceIDs)
+	}
+	if !reflect.DeepEqual(durableOriginalIndices, []int{1, 2}) {
+		t.Fatalf("durableOriginalIndices = %v, want [1 2] (only the two REAL durable messages, ephemeral excluded)", durableOriginalIndices)
+	}
+	// No durable id may be claimed by more than one entry.
+	seen := map[session.MessageID]int{}
+	for _, idx := range durableOriginalIndices {
+		seen[sourceIDs[idx]]++
+	}
+	for id, count := range seen {
+		if count > 1 {
+			t.Fatalf("durable id %q claimed by %d different messages, want at most 1", id, count)
+		}
+	}
+}

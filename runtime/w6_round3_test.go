@@ -165,12 +165,14 @@ func TestSummarizationFiresAtMostOncePerTurnAcrossFiveCycles(t *testing.T) {
 
 	var summaryGenerationCalls int
 	var calls int
+	var perCycleMessageCounts []int
 	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if requestIsSummaryGenerationE2E(request) {
 			summaryGenerationCalls++
 			return []*einoschema.AgenticMessage{agenticAssistantText("a compact summary of everything so far")}, nil
 		}
 		calls++
+		perCycleMessageCounts = append(perCycleMessageCounts, len(request.Messages))
 		// Four tool-call rounds, then a final plain-text reply: five
 		// dispatch cycles total in ONE turn, every one of them past the
 		// configured message-count threshold once the first round's own
@@ -220,6 +222,26 @@ func TestSummarizationFiresAtMostOncePerTurnAcrossFiveCycles(t *testing.T) {
 	}
 	if summarizationEpochs != 1 {
 		t.Fatalf("summarization ContextEpoch count = %d, want exactly 1 among %+v", summarizationEpochs, epochs)
+	}
+	// round-four W6 correlation-and-seal review, Important #2: bounding
+	// summarization to firing (and billing) only once per turn must not come
+	// at the cost of reverting later cycles to the full, uncompacted
+	// baseline -- a genuine regression the review measured directly, on
+	// this exact five-cycle shape, as per-cycle model-visible message counts
+	// of [1 1 6 8 10] (compacted once, then regrowing every cycle after).
+	// With reapplyDurableSummary keeping every later cycle re-collapsed to
+	// the same committed compaction, no cycle after the one that triggered
+	// it may see more messages than the cycle immediately before it grew by
+	// (one new call/result pair per cycle, not the entire pre-compaction
+	// history coming back).
+	t.Logf("perCycleMessageCounts = %v", perCycleMessageCounts)
+	if len(perCycleMessageCounts) != 5 {
+		t.Fatalf("perCycleMessageCounts = %v, want exactly 5 real dispatch cycles", perCycleMessageCounts)
+	}
+	for i := 2; i < len(perCycleMessageCounts); i++ {
+		if growth := perCycleMessageCounts[i] - perCycleMessageCounts[i-1]; growth > 2 {
+			t.Fatalf("perCycleMessageCounts = %v: cycle %d grew by %d messages over cycle %d, want at most 2 (one new call + one new result) -- context is regrowing toward the uncompacted baseline instead of staying compacted", perCycleMessageCounts, i+1, growth, i)
+		}
 	}
 }
 
