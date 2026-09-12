@@ -136,6 +136,21 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if err != nil {
 		return admittedRun{}, err
 	}
+	// A prior run on this same session that failed (or was otherwise never
+	// finalized) can leave its own assistant placeholder row durably behind
+	// with zero content blocks -- AdmitTurn always creates one at admission,
+	// and nothing ever deletes it on failure (session.ApplyFailTurn only
+	// transitions turn state; see turn.go). Every OTHER admission-time reload
+	// in this package (turnLoopCoordinator.admitTurn, resumeEngine) drops
+	// such placeholders immediately after loadProviderHistory before using
+	// the result for baseMessageCount -- this call site must match, or a
+	// leftover placeholder gets counted into THIS run's admitted base here
+	// but is then correctly dropped by every later adkEngine.buildDurableBaseline
+	// reload within this run's own first turn, permanently tripping its
+	// "durable history shrank below this turn's admitted base" guard
+	// (eino-agent-978's true root cause: the guard was correct, this count
+	// was wrong).
+	historyMessages, historySourceIDs, providerState = dropUnfinalizedAssistantPlaceholders(historyMessages, historySourceIDs, providerState)
 	admittedUserContent := session.Content{Role: session.RoleUser, Blocks: request.UserMessage.Blocks}
 	admittedUserMessage, err := session.ContentToAgenticMessage(admittedUserContent)
 	if err != nil {
