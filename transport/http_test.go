@@ -227,7 +227,7 @@ func replayStore(t *testing.T) session.Store {
 		t.Fatalf("admit run: %v", err)
 	}
 	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "msg-http", SessionID: "session-http", RunID: "run-http", Role: session.RoleAssistant, TurnID: "turn-http", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
 	httpParts, err := session.EncodeContentParts(session.Content{

@@ -3,10 +3,12 @@ package agui
 import (
 	"context"
 	"errors"
+	"fmt"
+
+	aguiemitter "github.com/mattsp1290/eino-agui/emitter"
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	"github.com/mattsp1290/eino-agent/session/history"
 )
 
 // ErrTailOverflow reports that live-only tail data was dropped.
@@ -119,17 +121,35 @@ func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail Ev
 	}
 }
 
+// emitMessageSnapshot projects every durable message in sessionID through
+// the agentic pipeline (convert.ToAgenticProjection) and emits each one via
+// the observer emitter's committed-projection path with
+// DeliveryModeReplay -- native events for every representable content kind
+// plus the eino.agentic.v1 custom supplement for every block, so rich kinds
+// the classic *schema.Message projection cannot represent (tool_search_result,
+// mcp_*, assistant media, ...) no longer make replay fail outright the way
+// history.Load's ErrClassicUnsupported did.
 func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, contentLimits session.ContentLimits) error {
 	if bridge == nil {
 		return nil
 	}
-	messages, err := history.Load(ctx, store, sessionID, history.Options{ContentLimits: contentLimits})
+	projections, err := loadCommittedProjections(ctx, store, sessionID, contentLimits)
 	if err != nil {
 		return err
 	}
-	if len(messages) == 0 {
-		return nil
+	for _, p := range projections {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !bridge.EmitCommittedProjection(p.Projection, p.Receipt, aguiemitter.DeliveryModeReplay) {
+			if encErr := bridge.EncErr(); encErr != nil {
+				return encErr
+			}
+			if transportErr := bridge.Err(); transportErr != nil {
+				return transportErr
+			}
+			return fmt.Errorf("agui: replay projection emission failed for message %s", p.MessageID)
+		}
 	}
-	bridge.MessagesSnapshot(messages)
 	return nil
 }

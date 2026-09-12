@@ -21,14 +21,26 @@ type Bridge struct {
 	emit      *aguiemitter.Emitter
 	textOpen  map[session.MessageID]bool
 	reasoning map[session.MessageID]string
+	// store backs the agentic committed-projection path: on
+	// session.MessageCommittedEventKind, Emit reloads and reprojects the
+	// named durable message through convert.ToAgenticProjection and emits
+	// it via the observer emitter (see emitLiveMessageCommitted). A nil
+	// store disables that path (Emit silently skips the event), which
+	// existing classic-only callers/tests may still do.
+	store         session.Store
+	contentLimits session.ContentLimits
 }
 
 // NewBridge binds an AG-UI emitter to the SDK's concrete SSE writer pair.
-func NewBridge(ctx context.Context, writer *bufio.Writer, sseWriter *sse.SSEWriter, threadID, runID string, cancel context.CancelFunc) *Bridge {
+// store and contentLimits back the agentic committed-projection path (see
+// Bridge.store's doc comment); pass a nil store to disable it.
+func NewBridge(ctx context.Context, store session.Store, contentLimits session.ContentLimits, writer *bufio.Writer, sseWriter *sse.SSEWriter, threadID, runID string, cancel context.CancelFunc) *Bridge {
 	return &Bridge{
-		emit:      aguiemitter.NewEmitter(ctx, writer, sseWriter, threadID, runID, cancel),
-		textOpen:  map[session.MessageID]bool{},
-		reasoning: map[session.MessageID]string{},
+		emit:          aguiemitter.NewEmitter(ctx, writer, sseWriter, threadID, runID, cancel),
+		textOpen:      map[session.MessageID]bool{},
+		reasoning:     map[session.MessageID]string{},
+		store:         store,
+		contentLimits: contentLimits,
 	}
 }
 
@@ -49,7 +61,7 @@ func (b *Bridge) EncErr() error {
 }
 
 // Emit implements runtime.EventSink.
-func (b *Bridge) Emit(_ context.Context, event session.EventRecord) {
+func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 	if b == nil || b.emit == nil {
 		return
 	}
@@ -60,6 +72,8 @@ func (b *Bridge) Emit(_ context.Context, event session.EventRecord) {
 		b.emitMessageDelta(event)
 	case runtime.EventToolCallUpdated:
 		b.emitToolCallUpdated(event)
+	case session.MessageCommittedEventKind:
+		b.emitLiveMessageCommitted(ctx, event)
 	case runtime.EventRunFinished:
 		b.closeOpen()
 		if event.Error.Message != "" {
@@ -204,6 +218,51 @@ func (b *Bridge) closeOpen() {
 		b.emit.ReasoningMessageEnd(reasoningID)
 		b.emit.ReasoningEnd(reasoningID)
 		delete(b.reasoning, messageID)
+	}
+}
+
+// EmitCommittedProjection forwards a fully-built agentic projection and its
+// binding receipt to the underlying emitter's committed-projection path
+// (see convert.ToAgenticProjection / emitter.Emitter.EmitCommittedProjection
+// and emitter.DeliveryMode). It never touches b.store: callers (this file's
+// emitLiveMessageCommitted, and package-level replay code) own loading and
+// projecting durable content.
+func (b *Bridge) EmitCommittedProjection(projection *convert.AgenticProjection, receipt convert.CommitReceiptV1, mode aguiemitter.DeliveryMode) bool {
+	if b == nil || b.emit == nil {
+		return false
+	}
+	return b.emit.EmitCommittedProjection(projection, receipt, mode)
+}
+
+// emitLiveMessageCommitted reacts to a durable session.MessageCommittedEventKind
+// notification (see that constant's doc comment) by reloading and
+// reprojecting event.MessageID's session and emitting it through the
+// agentic committed path with DeliveryModeLiveContinuation (custom
+// eino.agentic.v1 supplements only: any representable native content --
+// text, tool calls -- already reached the client as transient deltas during
+// the live phase, via emitMessageDelta/emitToolCallUpdated, so this must not
+// duplicate it as a second native event).
+//
+// It reprojects the WHOLE session's durable history rather than loading just
+// this one message: session.Store exposes no by-ID single-message read
+// (only session-scoped ListMessages), so this reuses the same
+// loadCommittedProjections path replay uses for correctness rather than
+// adding an unverified narrower one. This is O(session history) per commit,
+// a known cost a future single-message store read should remove.
+func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.EventRecord) {
+	if b.store == nil || event.SessionID == "" || event.MessageID == "" {
+		return
+	}
+	projections, err := loadCommittedProjections(ctx, b.store, event.SessionID, b.contentLimits)
+	if err != nil {
+		return
+	}
+	for _, p := range projections {
+		if p.MessageID != event.MessageID {
+			continue
+		}
+		b.EmitCommittedProjection(p.Projection, p.Receipt, aguiemitter.DeliveryModeLiveContinuation)
+		return
 	}
 }
 

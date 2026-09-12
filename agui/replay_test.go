@@ -21,7 +21,7 @@ func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	ctx := context.Background()
 	store := replayStore(t)
 	sink := newSSESink()
-	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 
 	next, err := Replay(ctx, bridge, store, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
 	if err != nil {
@@ -32,12 +32,17 @@ func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	}
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	want := []string{"MESSAGES_SNAPSHOT", "RUN_STARTED", "RUN_FINISHED"}
+	// The single durable assistant message ("settled", one
+	// assistant_gen_text block) projects through the agentic replay path
+	// (see emitMessageSnapshot) as its native representable text triplet
+	// plus one CUSTOM eino.agentic.v1 content-block supplement, ahead of
+	// the durable run_started/run_finished lifecycle events.
+	want := []string{"TEXT_MESSAGE_START", "TEXT_MESSAGE_CONTENT", "TEXT_MESSAGE_END", "CUSTOM", "RUN_STARTED", "RUN_FINISHED"}
 	if stringsJoined(got) != stringsJoined(want) {
 		t.Fatalf("event types = %#v, want %#v", got, want)
 	}
-	if frames[0]["messages"] == nil {
-		t.Fatalf("messages snapshot missing messages: %#v", frames[0])
+	if !strings.Contains(string(sink.Bytes()), "settled") {
+		t.Fatalf("replayed text missing from stream: %s", sink.Bytes())
 	}
 	if strings.Contains(string(sink.Bytes()), "AGUI_PROVIDER_STATE_SENTINEL") || strings.Contains(string(sink.Bytes()), "provider_state") {
 		t.Fatalf("provider state leaked to replay: %s", sink.Bytes())
@@ -52,7 +57,7 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 	store := replayStore(t)
 	tail := newReplayTail()
 	sink := newSSESink()
-	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
 		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
@@ -78,8 +83,9 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 	}
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	if stringsJoined(got) != "MESSAGES_SNAPSHOT,RUN_STARTED,RUN_FINISHED,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT" {
-		t.Fatalf("event types = %#v", got)
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,RUN_STARTED,RUN_FINISHED,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s", got, want)
 	}
 }
 
@@ -90,7 +96,7 @@ func TestReconnectReportsTailOverflow(t *testing.T) {
 	store := replayStore(t)
 	tail := newReplayTail()
 	sink := newSSESink()
-	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
 		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
@@ -111,7 +117,7 @@ func TestReconnectCancelsTailOnDisconnect(t *testing.T) {
 	store := replayStore(t)
 	tail := newReplayTail()
 	sink := newSSESink()
-	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
 		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
@@ -144,7 +150,7 @@ func replayStore(t *testing.T) session.Store {
 		t.Fatalf("admit run: %v", err)
 	}
 	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-1", SessionID: "session-replay", RunID: "run-1", Role: session.RoleAssistant, TurnID: "turn-1", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
 	textParts, err := session.EncodeContentParts(session.Content{
@@ -204,11 +210,12 @@ func (t *replayTail) Subscribe(ctx context.Context, _ session.ID) (<-chan sessio
 
 // TestReplayMessageSnapshotIncludesUserMediaBlock proves that a durable user
 // message carrying a media block (persisted as a user_input_image part) does
-// not break emitMessageSnapshot's history.Load call. history.Load uses the
-// classic projector, which the storage-projection review flagged as
-// permanently bricking replay for any session whose history contains a
-// user-role media block, once that projector started rejecting
-// BlockKind-backed kinds it did not explicitly support.
+// not break emitMessageSnapshot: it now projects every durable message
+// through the agentic pipeline (convert.ToAgenticProjection), which
+// represents a user-role media block natively -- unlike the classic
+// projector this replaced, which the storage-projection review flagged as
+// permanently bricking replay for any session whose history contained a
+// user-role media block.
 func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
 	t.Parallel()
 
@@ -229,7 +236,7 @@ func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
 		t.Fatalf("admit run: %v", err)
 	}
 	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
-	if _, err := execution.AppendMessage(ctx, session.Message{ID: "user-media-1", SessionID: sessionID, RunID: "run-media", Role: session.RoleUser, CreatedAt: now, UpdatedAt: now}); err != nil {
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "user-media-1", SessionID: sessionID, RunID: "run-media", Role: session.RoleUser, TurnID: "turn-media", CreatedAt: now, UpdatedAt: now}); err != nil {
 		t.Fatalf("append message: %v", err)
 	}
 
@@ -250,13 +257,25 @@ func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
 	}
 
 	sink := newSSESink()
-	bridge := NewBridge(ctx, sink.Writer(), sse.NewSSEWriter(), string(sessionID), "run-media", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), string(sessionID), "run-media", nil)
 	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, session.ContentLimits{}); err != nil {
 		t.Fatalf("emitMessageSnapshot error = %v, want nil (a user-role media block must not brick history.Load)", err)
 	}
+	// A user message has no native AG-UI streaming representation to
+	// replay as (TEXT_MESSAGE_* covers assistant output, not input the
+	// client already sent): CommittedNativeEvents legitimately returns
+	// none for user_input_text/user_input_image, so both blocks surface
+	// only as their CUSTOM eino.agentic.v1 content-block supplement --
+	// which is exactly what proves the media block did not brick replay
+	// the way the classic projector's ErrClassicUnsupported once did.
 	frames := frameData(t, sink.Bytes())
-	if len(frames) != 1 || frames[0]["messages"] == nil {
-		t.Fatalf("messages snapshot missing or malformed: %#v", frames)
+	got := typesFromFrames(frames)
+	if stringsJoined(got) != "CUSTOM,CUSTOM" {
+		t.Fatalf("event types = %#v, want two CUSTOM content-block supplements", got)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, "look at this") || !strings.Contains(raw, "https://example.com/pic.png") {
+		t.Fatalf("replayed content missing text or media: %s", raw)
 	}
 }
 

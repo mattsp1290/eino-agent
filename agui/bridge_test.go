@@ -22,7 +22,7 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	t.Parallel()
 
 	sink := newSSESink()
-	bridge := NewBridge(context.Background(), sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted})
 	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:      runtime.EventMessageDelta,

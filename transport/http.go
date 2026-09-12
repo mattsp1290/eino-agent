@@ -107,7 +107,7 @@ func SSEHandler(config SSEConfig) http.Handler {
 		flusher, _ := w.(http.Flusher)
 		tracked := &trackingWriter{ResponseWriter: w}
 		writer := bufio.NewWriter(flushWriter{writer: tracked, flusher: flusher})
-		bridge := agentagui.NewBridge(ctx, writer, sse.NewSSEWriter(), threadID, runID, nil)
+		bridge := agentagui.NewBridge(ctx, config.Store, config.ContentLimits, writer, sse.NewSSEWriter(), threadID, runID, nil)
 		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor, config.ContentLimits)
 		if err != nil && !tracked.wrote {
 			http.Error(w, err.Error(), http.StatusBadGateway)
