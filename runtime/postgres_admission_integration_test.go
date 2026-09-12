@@ -148,13 +148,16 @@ func assertPostgresAdmissionGraph(t *testing.T, f *postgresRuntimeFixture, sessi
 	// completion (session.TurnStartedEventKind/TurnCompletedEventKind)
 	// alongside the run-level start/finish pair, reflecting the durable
 	// turn model -- not just the two run-level events a pre-turn-model run
-	// used to produce.
+	// used to produce. W7 item 2 adds a message_committed notification
+	// right after persistAssistantTurn commits the assistant message's
+	// content, before the turn itself completes.
 	events, err := f.store.ListEvents(f.ctx, sessionID, session.EventCursor{Limit: 100})
-	if err != nil || len(events.Events) != 4 ||
+	if err != nil || len(events.Events) != 5 ||
 		events.Events[0].Kind != EventRunStarted || events.Events[0].EpochID != epochs[0].ID || events.Events[0].MessageID != assistant.ID ||
 		events.Events[1].Kind != session.TurnStartedEventKind || events.Events[1].TurnID == "" ||
-		events.Events[2].Kind != session.TurnCompletedEventKind || events.Events[2].TurnID != events.Events[1].TurnID ||
-		events.Events[3].Kind != EventRunFinished {
+		events.Events[2].Kind != session.MessageCommittedEventKind || events.Events[2].MessageID != assistant.ID || events.Events[2].TurnID != events.Events[1].TurnID ||
+		events.Events[3].Kind != session.TurnCompletedEventKind || events.Events[3].TurnID != events.Events[1].TurnID ||
+		events.Events[4].Kind != EventRunFinished {
 		t.Fatalf("event count=%d err=%v events=%#v", len(events.Events), err, events.Events)
 	}
 	observation, err := f.store.ReadObservationSnapshot(f.ctx, sessionID, session.ObservationLimits{MaxMessages: 10, MaxTools: 10, MaxParts: 20, MaxSnapshotBytes: 1 << 20, MaxTextBytes: 1 << 20})
