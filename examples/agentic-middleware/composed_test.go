@@ -429,6 +429,36 @@ func TestComposedExampleMountsAllEightRecipesInOneRunPlan(t *testing.T) {
 		t.Fatal("turn 2 never reached its own post-summarization tool call -- the turn did not continue normally after summarization triggered")
 	}
 
+	// Positive, structural assertion that patchtoolcalls is actually mounted
+	// for turn 2 (W6 round-four final-integration review, Suggestion S3 /
+	// action item 3, carried forward from an earlier follow-up S2):
+	// mount2 registers all eight recipes again for this turn, but nothing
+	// above checks that patchtoolcalls specifically survived that remount --
+	// the only patchtoolcalls-attributable evidence asserted so far
+	// (sawPatchRewriteEvent, below) is turn 1's own event, which the store's
+	// event log never scopes by turn, so it stays true even if patchtoolcalls
+	// were silently dropped from turn 2's plan. Turn 2's own admitted Run
+	// durably records its actual sealed AgentHandlers set (see
+	// session.AgentHandlerPlanIdentity, sealed once at admission by
+	// composition.Registry.AcquireRunPlan/runtime's extension_plan.go) --
+	// reading it back directly proves patchtoolcalls was really part of THIS
+	// turn's plan, not merely inferred from unrelated behavior.
+	turn2Run, err := store.GetRun(context.Background(), result2.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turn2HasPatchToolCalls bool
+	for _, component := range turn2Run.ExtensionPlan.Components {
+		for _, handler := range component.AgentHandlers {
+			if handler.Kind == runtime.HandlerKindPatchToolCalls {
+				turn2HasPatchToolCalls = true
+			}
+		}
+	}
+	if !turn2HasPatchToolCalls {
+		t.Fatalf("turn 2's sealed ExtensionPlan has no %q agent handler among %+v, want patchtoolcalls mounted for turn 2", runtime.HandlerKindPatchToolCalls, turn2Run.ExtensionPlan.Components)
+	}
+
 	// 8. summarization: a ContextEpoch was durably committed, and the full
 	// replay is unchanged (byte-for-byte) on its pre-existing prefix --
 	// "exact replay equality before and after".
