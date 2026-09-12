@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	stdruntime "runtime"
 	"testing"
 
 	adkfilesystem "github.com/cloudwego/eino/adk/filesystem"
@@ -116,6 +117,19 @@ func TestSessionScratchRootRejectsSymlinkPlantedAtSessionDirName(t *testing.T) {
 
 	root, err := sessionScratchRoot(scratchDir, sessionID)
 	if err == nil {
+		if stdruntime.GOOS == "linux" || stdruntime.GOOS == "darwin" {
+			// round-four W6 correlation-and-seal review, Suggestion #4: on
+			// platforms known to support symlinks (this test would already
+			// have skipped above otherwise), sessionScratchRoot's own
+			// parent.Lstat check (added for Suggestion #3) makes the
+			// fail-closed branch below the ONLY outcome -- assert it
+			// explicitly here instead of silently tolerating success, so a
+			// future change that weakens that check is caught by THIS test
+			// failing, not by the weaker branch quietly becoming the tested
+			// path.
+			_ = root.Close()
+			t.Fatalf("sessionScratchRoot succeeded despite a symlink planted at the per-session directory name on %s -- want a fail-closed error (parent.Lstat should have rejected it)", stdruntime.GOOS)
+		}
 		// os.Root.MkdirAll for a name that already exists as a symlink to a
 		// directory is one acceptable failure mode; if it instead succeeded
 		// (some platform's os.Root implementation may tolerate an
@@ -176,6 +190,48 @@ func TestScratchRootBackendsAreSessionIsolated(t *testing.T) {
 	}
 	if _, err := backendB.Read(context.Background(), &adkfilesystem.ReadRequest{FilePath: "trunc/call-1"}); err == nil {
 		t.Fatal("session B read session A's offload -- scratch backends are not session-isolated")
+	}
+}
+
+// TestSessionScratchRootRejectsSymlinkToAnotherSessionsDirectory is
+// round-four W6 correlation-and-seal review Suggestion #3: unlike
+// TestSessionScratchRootRejectsSymlinkPlantedAtSessionDirName (a symlink
+// pointing OUTSIDE scratchRoot entirely, which os.Root's own containment
+// already refuses to follow), a symlink planted at session C's directory
+// name that points to session A's ALREADY-EXISTING directory resolves
+// WITHIN scratchRoot -- os.Root has no reason to refuse it on that basis
+// alone, so without sessionScratchRoot's own parent.Lstat check, session C
+// would be handed session A's own scratch root instead of its own,
+// defeating TestScratchRootBackendsAreSessionIsolated's whole guarantee for
+// a session whose directory an earlier session, or anything else with
+// filesystem access to scratchRoot, can plant a symlink for in advance.
+func TestSessionScratchRootRejectsSymlinkToAnotherSessionsDirectory(t *testing.T) {
+	scratchDir := t.TempDir()
+	sessionA := session.ID("session-a-real")
+	sessionC := session.ID("session-c-symlinked")
+
+	rootA, err := sessionScratchRoot(scratchDir, sessionA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backendA, err := newScratchRootBackend(rootA, "reduction")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backendA.Write(context.Background(), &adkfilesystem.WriteRequest{FilePath: "secret.txt", Content: "session A's private offload"}); err != nil {
+		t.Fatal(err)
+	}
+
+	sessionADir := filepath.Join(scratchDir, sessionScratchDirName(sessionA))
+	plantedLink := filepath.Join(scratchDir, sessionScratchDirName(sessionC))
+	if err := os.Symlink(sessionADir, plantedLink); err != nil {
+		t.Skipf("symlink unsupported in this environment: %v", err)
+	}
+
+	rootC, err := sessionScratchRoot(scratchDir, sessionC)
+	if err == nil {
+		_ = rootC.Close()
+		t.Fatal("sessionScratchRoot followed a symlink at session C's directory name into session A's real directory -- want a fail-closed error")
 	}
 }
 

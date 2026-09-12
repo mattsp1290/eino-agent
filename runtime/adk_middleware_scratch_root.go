@@ -84,6 +84,26 @@ func sessionScratchRoot(scratchRoot string, sessionID session.ID) (*os.Root, err
 	if err := parent.MkdirAll(name, 0o700); err != nil {
 		return nil, err
 	}
+	// Lstat (not Stat) through the PARENT root before opening: os.Root
+	// follows a symlink as long as it resolves within the root (see os.Root's
+	// own doc comment -- "Methods on Root will follow symbolic links"), so a
+	// symlink planted at exactly this session's directory name that points
+	// to ANOTHER session's directory INSIDE the same scratchRoot would still
+	// be followed by parent.OpenRoot below, giving this session read/write
+	// access to that other session's offloads -- containment against
+	// escaping scratchRoot entirely is not the same guarantee as isolation
+	// BETWEEN sessions within it (round-four W6 correlation-and-seal review,
+	// Suggestion #3). Requiring a real directory (Lstat's own mode bits,
+	// which -- unlike Stat -- never follow the final symlink) closes this: a
+	// symlink here is rejected before ever opening through it, regardless of
+	// where it points.
+	info, err := parent.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("%w: session scratch directory %q is not a real directory (mode %s)", errScratchPathEscape, name, info.Mode())
+	}
 	return parent.OpenRoot(name)
 }
 
