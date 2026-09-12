@@ -1,7 +1,7 @@
 # Dependency Status
 
 Date: 2026-06-27
-Last updated: 2026-09-10 (UTC)
+Last updated: 2026-09-12 (UTC)
 
 This note retains prerequisite and publication evidence for `eino-agent`.
 The initial baseline below is historical. Do not
@@ -26,9 +26,21 @@ External pins for the agentic adoption:
   `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
   `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`.
   Adopted in W7.
-- `github.com/mattsp1290/eino-providers`: native `AgenticModel` contract not
-  yet answered (`eino-agent-td8`); no pin recorded. Native provider integration
-  and the final W8 gate remain blocked on it.
+- `github.com/mattsp1290/eino-providers`: the native `AgenticModel` contract
+  was answered on 2026-09-11 (response document
+  `2026-09-10-eino-v0-9-19-agentic-models.md`) and that work is merged to the
+  repository's `main`: the accepted branch commit
+  `f524a1fefe20f0ebd157440818c253489ae0490c` is an ancestor of it. Verified on
+  2026-09-12 (UTC): `main` commit
+  `79248358b8e6324bbdb1f014526629f82e6bce90` resolves through
+  `https://proxy.golang.org` as `v0.0.0-20260912022125-79248358b8e6`, module
+  checksum `h1:yhGEAfP0NTXwsNBiEQGDR20iZK4Lnk2N6o2JbGDcivo=`, with no
+  `replace` directive. That repository publishes no release tag, so this is a
+  pseudo-version pin. It is recorded as evidence only: this module does not
+  require `eino-providers` today, and W8 is the work package that adds the
+  dependency and its gates. `eino-agent-td8` stays open for the provider
+  deliverables the response document still lists as incomplete, the per-cell
+  capability matrix and native-byte fixture evidence.
 
 ## SQL-store consumer publication
 
