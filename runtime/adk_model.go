@@ -663,15 +663,16 @@ func (e *adkEngine) summarizedBoundary() session.MessageID {
 //
 // This mirrors, for a mid-turn boundary's PLACEMENT, the same invariant
 // moveTailStartToGroupBoundary already enforces for the tail's own CUT
-// POINT: a function_tool_call and its function_tool_result must never be
-// separated. It walks forward from the boundary's current position, tracking
-// every function_tool_call CallID seen (whether opened before the boundary
-// or discovered while walking forward) that has no matching
-// function_tool_result yet, and moves the boundary to sit immediately after
-// the last message needed to close every one of them. If no call before the
-// boundary is left open, or an open call's result never appears at all
-// within full, the boundary is left exactly where it was (there is nothing
-// unsafe to fix, or nothing safe to do yet).
+// POINT, in the same direction: never move it later, only earlier, until it
+// no longer separates a function_tool_call from its function_tool_result.
+// It scans full[0:boundaryIndex] for any function_tool_call CallID with no
+// matching result also before the boundary, and if at least one remains
+// open, moves the boundary to sit immediately before the EARLIEST such
+// call -- ahead of every group it would otherwise split, matching where the
+// boundary's own commit is causally accurate (Finalize ran, and committed
+// it, strictly before this cycle's own dispatch produced that call). If no
+// call before the boundary is left open, the boundary is already safe and
+// is left exactly where it is.
 func repositionMidTurnCompactionBoundary(
 	full []*einoschema.AgenticMessage,
 	fullSourceIDs []session.MessageID,
@@ -688,23 +689,43 @@ func repositionMidTurnCompactionBoundary(
 	if boundaryIndex < 0 {
 		return full, fullSourceIDs, fullState
 	}
+	// open tracks, for every function_tool_call CallID seen in full[0:boundaryIndex]
+	// with no result yet seen there, the index of the message that first
+	// introduced it -- firstOpenIndex[id]. If any remain open at
+	// boundaryIndex, the boundary splits at least one call from its result
+	// (the result is at or after boundaryIndex); target becomes the
+	// EARLIEST such call's own index, so moving the boundary to sit
+	// immediately before it puts the boundary before every open group
+	// instead of inside any of them -- the same "never forward, only
+	// backward until safe" direction moveTailStartToGroupBoundary uses for
+	// the tail's own cut point.
 	open := make(map[string]bool)
+	firstOpenIndex := make(map[string]int)
 	for i := 0; i < boundaryIndex; i++ {
 		recordToolCallAdjacency(full[i], open)
+		for id := range open {
+			if _, seen := firstOpenIndex[id]; !seen {
+				firstOpenIndex[id] = i
+			}
+		}
+		for id := range firstOpenIndex {
+			if !open[id] {
+				delete(firstOpenIndex, id)
+			}
+		}
 	}
 	if len(open) == 0 {
 		return full, fullSourceIDs, fullState
 	}
 	target := boundaryIndex
-	for i := boundaryIndex + 1; i < len(full) && len(open) > 0; i++ {
-		recordToolCallAdjacency(full[i], open)
-		target = i
+	for id := range open {
+		if idx := firstOpenIndex[id]; idx < target {
+			target = idx
+		}
 	}
-	if len(open) > 0 || target == boundaryIndex {
-		// Either an open call's result never appears in full at all (defer
-		// to the existing behavior -- nothing safe to reposition to), or
-		// the boundary is already immediately after everything it needs to
-		// be: nothing to move.
+	if target >= boundaryIndex {
+		// Should not happen given len(open) > 0 above, but never move the
+		// boundary somewhere that isn't strictly earlier.
 		return full, fullSourceIDs, fullState
 	}
 	newOrder := make([]int, 0, len(full))
@@ -712,10 +733,10 @@ func repositionMidTurnCompactionBoundary(
 		if i == boundaryIndex {
 			continue
 		}
-		newOrder = append(newOrder, i)
 		if i == target {
 			newOrder = append(newOrder, boundaryIndex)
 		}
+		newOrder = append(newOrder, i)
 	}
 	reorderedMessages := make([]*einoschema.AgenticMessage, len(full))
 	reorderedSourceIDs := make([]session.MessageID, len(fullSourceIDs))
