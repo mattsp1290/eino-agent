@@ -162,7 +162,22 @@ func Rules() []Rule {
 			LiveTail:  DispositionLive,
 			AuditKind: "messages_snapshot",
 			Redaction: session.RedactionContent,
-			Notes:     "Message snapshots are projected from durable messages and parts; raw snapshot SSE frames are not stored.",
+			Notes: "When a bridge chooses to emit MESSAGES_SNAPSHOT, it must be " +
+				"projected from durable messages and parts, never stored/replayed " +
+				"raw SSE frames. This module's two bridges differ on whether they " +
+				"emit one at all: the built-in agui.Replay/agui.Reconnect " +
+				"(agui/replay.go) deliberately does NOT emit a MESSAGES_SNAPSHOT " +
+				"during replay -- a native snapshot built from " +
+				"convert.ToAgenticProjection would cover user-role messages only, " +
+				"reordering a U1,A1,U2,A2 transcript and clobbering a cursored " +
+				"reconnect (see replay.go's doc comment and " +
+				"docs/architecture/agui-events.md's \"Replay Projection\" section). " +
+				"agui.WatchBridge.Initial (agui/watch.go) is the one bridge here " +
+				"that does emit MESSAGES_SNAPSHOT, from its own durable-message " +
+				"read, as part of its separate watch/current-state contract. A " +
+				"host writing a from-scratch bridge and applying this rule must " +
+				"choose one of those two shapes explicitly, not assume " +
+				"Replay: DispositionReplay means agui.Replay supplies one.",
 		},
 		{
 			Family:    EventActivity,

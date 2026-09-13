@@ -364,16 +364,20 @@ func TestReplayToleratesMessageWithEmptyTurnID(t *testing.T) {
 	}
 }
 
-// TestReplaySkipsMessageCommittedEvents proves the W7 review's A3/finding
-// I2: a durable session.MessageCommittedEventKind event must never be
-// forwarded to bridge.Emit during replay, because the message it names was
-// already emitted by emitMessageSnapshot above it. Before this fix,
-// replay() forwarded it like any other non-LiveOnly durable event, which
-// reprojects and re-emits the SAME message a second time -- on an idle
-// session this collides on the receipt key and latches an EncErr the
-// replay loop never checked, silently masking any later genuine encoding
-// error.
-func TestReplaySkipsMessageCommittedEvents(t *testing.T) {
+// TestReplayDoesNotReEmitAlreadySnapshottedMessage proves the W7 review's
+// A3/finding I2: a durable session.MessageCommittedEventKind event naming a
+// message emitMessageSnapshot already delivered must not be re-projected
+// and re-emitted a second time. replay() itself forwards this event to
+// bridge.Emit like any other non-LiveOnly durable event (see replay()'s doc
+// comment); it is Bridge.projectedMessages/emitLiveMessageCommitted
+// (agui/bridge.go) that recognizes the message ID is already recorded and
+// skips it outright, with no reload and no re-projection attempt. Before
+// the fix this test pins, there was no such dedup at all: a redundant
+// message_committed reprojected and re-emitted the SAME message a second
+// time -- on an idle session this collided on the receipt key and latched
+// an EncErr the replay loop never checked, silently masking any later
+// genuine encoding error.
+func TestReplayDoesNotReEmitAlreadySnapshottedMessage(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -429,7 +433,7 @@ func TestReplaySkipsMessageCommittedEvents(t *testing.T) {
 	got := typesFromFrames(frames)
 	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM"
 	if stringsJoined(got) != want {
-		t.Fatalf("event types = %#v, want %s (message_committed must be skipped during replay, not re-emitted as a second CUSTOM)", got, want)
+		t.Fatalf("event types = %#v, want %s (Bridge must dedupe the redundant message_committed, not re-emit the already-snapshotted message as a second CUSTOM)", got, want)
 	}
 }
 

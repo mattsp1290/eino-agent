@@ -54,7 +54,7 @@ and never replayed.
 | Tool results | `PartFunctionToolResult` plus settled `session.ToolCall` output/error. | Replay bounded model-facing tool result from durable part. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
 | State snapshots | No durable `PartKind` today (would be host-visible app state, distinct from the W2 model-content block kinds); only when host marks snapshot replay-safe. | Replay latest replay-safe snapshot or host-projected state, once implemented. | Emit live snapshot when state changes. | Sensitive or non-replay-safe host state. |
 | State deltas | Optional `EventRecord` audit. | Do not replay raw deltas; replay starts from snapshot. | Emit live deltas. | Deltas superseded by snapshot. |
-| Messages snapshots | Not stored as raw AG-UI frames. | Reconstruct from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
+| Messages snapshots | Not stored as raw AG-UI frames. | `agui.Replay`/`agui.Reconnect` (the built-in Bridge) do **not** emit one -- see "Replay Projection" below. `agui.WatchBridge.Initial` does, reconstructed from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
 | Activity | Optional `EventRecord` audit metadata. | Not replayed as conversation content. | Emit live activity. | Transient activity with no audit value. |
 | Steps | Not persisted today: `Bridge.StepStarted`/`StepFinished` are pure passthroughs to the live emitter and write no durable part or `EventRecord`. (`session.AttemptReplacedEventKind` is a separate, unrelated model-dispatch-retry audit trail, not a record of step boundaries.) | Not replayed; may become annotations/status where UI supports it, once a durable representation is implemented. | Emit live `STEP_*`. | None. |
 | Custom events | Optional audit `EventRecord`. | Not replayed unless promoted to a future typed replay contract. | Emit live. | Unknown sensitive payloads by policy. |
@@ -101,10 +101,15 @@ Replay uses this order:
 
 1. Read durable messages and parts with `session.Store.ListMessages`.
 2. Exclude encrypted reasoning and policy-denied content.
-3. Apply rule gates before including reasoning or state snapshot content.
+3. Gate reasoning content on the host's `includeReasoning`/`IncludeReasoning`
+   attestation (see "Type Contract" above -- `agui.Gate` values are
+   documentation labels only; `includeReasoning` is the actual mechanism,
+   there is no separate "apply rule gates" step).
 4. Materialize assistant/user/tool messages from durable parts.
 5. Convert replayable messages through `eino-agui/convert`.
-6. Emit a messages snapshot or replay response through the transport adapter.
+6. Emit the replay response (committed-projection events; the built-in
+   Bridge does **not** emit a messages snapshot -- see below) through the
+   transport adapter.
 7. If a run is active, attach to live tail from the current run cursor.
 
 Replay must preserve durable message/part ordering from `store/storetest`.
@@ -340,15 +345,35 @@ Both the durable replay path and the live path build an eino-agui
   emitted (see the Replay Projection section above for why).
 - **Live** (`Bridge.Emit`'s `session.MessageCommittedEventKind` case,
   `emitLiveMessageCommitted`): reprojects the *whole session's* durable
-  history and emits only the one message the event named, with
-  `DeliveryModeLiveContinuation` (custom supplement only -- representable
-  native content already streamed live via `emitMessageDelta`/
-  `emitToolCallUpdated` before the message committed, so this must not
-  duplicate it). Reprojecting the whole session per commit is a known
-  O(session history) cost: `session.Store` exposes no by-ID single-message
-  read today, so this reuses the same tested path replay uses rather than
-  an unverified narrower one. A future single-message store read should
-  remove this cost without changing behavior.
+  history and emits only the one message the event named. The delivery
+  mode depends on which phase of the connection observed the notification
+  (`Bridge.inReplaySweep`, set only while `replay()`'s own durable
+  `ListEvents` sweep is running):
+  - during that sweep, `DeliveryModeCommittedOnly` (native events, for the
+    same content kinds `DeliveryModeReplay` above natively represents,
+    plus the custom supplement): a message that first commits strictly
+    during the replay window was never covered by the snapshot, and its
+    live `EventMessageDelta` records are `LiveOnly`, which `replay()`
+    itself skips (see "Replay Projection" above) -- this connection never
+    saw those deltas, so the committed projection must carry a native
+    representation, not custom-only;
+  - once `replay()` has returned and `Reconnect`'s live tail loop is
+    running, `DeliveryModeLiveContinuation` (custom supplement only):
+    representable native content for THIS connection's own live turn
+    already streamed via `emitMessageDelta`/`emitToolCallUpdated` before
+    the message committed, so this must not duplicate it as a second
+    native event.
+
+  A `message_committed` naming a message not (yet) present in a reload's
+  projections (a benign miss -- see `publishMessageCommitted`'s
+  best-effort, separate-call choreography below) is skipped silently and
+  does NOT set `Bridge.liveErr`; only a hard reload failure (a decode or
+  store error) does, and only that is fatal to `Replay`/`Reconnect`.
+  Reprojecting the whole session per commit is a known O(session history)
+  cost: `session.Store` exposes no by-ID single-message read today, so
+  this reuses the same tested path replay uses rather than an unverified
+  narrower one. A future single-message store read should remove this
+  cost without changing behavior.
 
 Every emitted projection's `CommitReceiptV1` binds `Domain: "projection"`,
 the exact `Identity` eino-agui computed, and `Digest: ProjectionDigestV1`.

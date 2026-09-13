@@ -2454,9 +2454,18 @@ environment-timing flake under heavy concurrent load, not a regression --
 flagged rather than silently ignored.
 
 - **Durable identity (`session.Message.TurnID`/`AgentPath`)**: stamped at
-  every append site (admission, turn admission, continuation dispatch,
-  approval response, tool settlement, tool search settlement,
-  crash-reconciled carrier turns). Both fields are record-JSON-only
+  most (not quite every -- see below) append sites: admission, turn
+  admission, continuation dispatch, approval response, tool settlement,
+  tool search settlement, and the compaction boundary message
+  (`session/compaction`). `runtime.settleInterruptedTool`'s
+  crash-reconciliation path (`runtime/tool_execution.go`) is a deliberate
+  exception: no live `TurnSnapshot` exists on that path and `session.Store`
+  exposes no by-ID message read to recover the calling message's turn, so
+  it stamps an empty `TurnID`/`AgentPath` on purpose rather than paying for
+  a full `ListMessages` scan on an already-degraded settlement path (bounded
+  by `agui.agenticIdentity`'s synthetic-turn-id fallback -- see
+  `docs/architecture/agui-events.md`'s "Durable identity" section). Both
+  fields are record-JSON-only
   correlation metadata, matching the pre-existing
   `EventRecord.TurnID`/`AgentPath` and `ModelRequestRecord.TurnID`/
   `AgentPath` convention -- no column or index backs any of the four, and no
@@ -2515,11 +2524,21 @@ flagged rather than silently ignored.
   specifically (not merely that loading didn't error); it does not cover
   `tool_search_result`/`mcp_*`/assistant media. `Bridge.Emit` gains a
   `session.MessageCommittedEventKind` case that reprojects the committed
-  message and emits it with `DeliveryModeLiveContinuation` (custom
-  supplement only, since representable native content already streamed
-  live via the existing delta path before the message committed) --
-  `TestBridgeEmitLiveMessageCommittedProjectsDurableContent` proves this
-  end to end against a real SQLite store. `NewBridge`'s signature grew a
+  message and emits it with one of two delivery modes depending on which
+  phase of the connection observed the notification (`Bridge.inReplaySweep`):
+  `DeliveryModeCommittedOnly` (native events plus the custom supplement) for
+  a message that first commits during `replay()`'s own durable sweep --
+  this connection's live deltas for it were `LiveOnly` records `replay()`
+  skips, so it never saw them -- and `DeliveryModeLiveContinuation` (custom
+  supplement only) once `replay()` has returned and `Reconnect`'s live tail
+  loop is running, where representable native content already streamed
+  live via the existing delta path before the message committed. A miss --
+  the named message not (yet) present in a reload -- is a benign,
+  non-fatal skip (`Bridge.liveErr` is reserved for a hard reload failure);
+  see `docs/architecture/agui-events.md`'s "Committed-projection emission"
+  section. `TestReplayForwardsMessageCommittedDuringReplayWindow` and
+  `TestBridgeEmitLiveMessageCommittedProjectsDurableContent` prove both
+  modes end to end against a real SQLite store. `NewBridge`'s signature grew a
   required `(store session.Store, contentLimits session.ContentLimits,
   includeReasoning bool)` triple (a nil store disables the new path;
   existing classic-only tests pass nil), a breaking constructor change per

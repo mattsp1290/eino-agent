@@ -160,9 +160,14 @@ type committedMessageProjection struct {
 // DIFFERENT revision (e.g. this function called again after the session's
 // observation watermark has advanced) is NOT deduplicated -- it mints a new
 // receipt key and emits again. That is exactly the shape of the
-// message_committed-during-replay bug replay() guards against by skipping
-// that event kind entirely (see replay.go) rather than relying on receipt
-// dedup to catch it.
+// message_committed-during-replay bug Bridge.projectedMessages guards
+// against: replay() forwards every non-LiveOnly durable event, including
+// session.MessageCommittedEventKind, to bridge.Emit (see replay.go); Bridge
+// itself is what skips a notification naming a message it has already
+// emitted through the committed-projection path, rather than relying on
+// this function's receipt dedup to catch a redundant re-projection (see
+// Bridge.projectedMessages and emitLiveMessageCommitted's doc comments in
+// agui/bridge.go).
 //
 // includeReasoning gates whether reasoning content blocks are included in
 // the projection at all (see history.Options.IncludeReasoning and
