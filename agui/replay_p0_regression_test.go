@@ -420,6 +420,13 @@ func TestReconnectToleratesLiveMessageCommittedNamingUnknownMessage(t *testing.T
 	if err := bridge.LiveErr(); err != nil {
 		t.Fatalf("LiveErr() = %v, want nil (a benign not-found miss must not be latched as a live error)", err)
 	}
+	// BenignCommitMisses is documented as "the only host-visible signal"
+	// for this exact case -- assert it actually counts, not just that the
+	// stream survives (W7 fifth fix-pass review P1-5: a no-op
+	// b.benignCommitMisses++ previously kept the whole suite green).
+	if got := bridge.BenignCommitMisses(); got != 1 {
+		t.Fatalf("BenignCommitMisses() = %d, want 1", got)
+	}
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
 	want := "RUN_FINISHED"
