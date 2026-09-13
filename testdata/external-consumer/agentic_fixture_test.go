@@ -571,9 +571,26 @@ func TestPublicOrderedContentCitationsServerAndMCPRecordsSurviveReopen(t *testin
 // --- 3. Tool search discovers a deferred tool, then the model calls it by
 //        its alias --------------------------------------------------------
 
-type toolSearchAliasScript struct{ calls atomic.Int32 }
+type toolSearchAliasScript struct {
+	calls atomic.Int32
+	// offeredToolNames records request.Controls.Tools' names for every call,
+	// in order, so the test can assert the "Deferred" half of this
+	// fixture's name: a deferred tool must not be offered to the model
+	// until tool_search discovers it. Guarded by the same single-threaded
+	// StreamProvider invocation sequence every other fixture script relies
+	// on -- no separate lock needed.
+	offeredToolNames [][]string
+}
 
 func (s *toolSearchAliasScript) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+	names := make([]string, 0, len(request.Controls.Tools))
+	for _, tool := range request.Controls.Tools {
+		if tool != nil {
+			names = append(names, tool.Name)
+		}
+	}
+	s.offeredToolNames = append(s.offeredToolNames, names)
+
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	switch s.calls.Add(1) {
 	case 1:
@@ -585,6 +602,16 @@ func (s *toolSearchAliasScript) StreamProvider(_ context.Context, request model.
 	}
 	writer.Close()
 	return reader, nil
+}
+
+// containsToolNamed reports whether names includes want.
+func containsToolNamed(names []string, want string) bool {
+	for _, name := range names {
+		if name == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPublicToolSearchDiscoversDeferredToolThenAliasExecutes(t *testing.T) {
@@ -643,6 +670,21 @@ func TestPublicToolSearchDiscoversDeferredToolThenAliasExecutes(t *testing.T) {
 	}
 	if executedWith != "weather" {
 		t.Fatalf("executed with requested name = %q, want alias %q", executedWith, "weather")
+	}
+	// The "Deferred" half of this fixture's name: get_weather is registered
+	// with Deferred: true, so it must not be offered to the model until
+	// tool_search's result discovers it. Flipping Deferred to false passes
+	// every assertion above unchanged (tool_search and the alias call are
+	// both still legal even for a non-deferred tool), so without this the
+	// fixture never actually exercises deferral.
+	if len(script.offeredToolNames) < 2 {
+		t.Fatalf("expected at least 2 model calls, got %d", len(script.offeredToolNames))
+	}
+	if containsToolNamed(script.offeredToolNames[0], "get_weather") || containsToolNamed(script.offeredToolNames[0], "weather") {
+		t.Fatalf("call 1 offered the deferred tool before tool_search discovered it: %v", script.offeredToolNames[0])
+	}
+	if !containsToolNamed(script.offeredToolNames[1], "get_weather") && !containsToolNamed(script.offeredToolNames[1], "weather") {
+		t.Fatalf("call 2 (after tool_search) did not offer the discovered tool: %v", script.offeredToolNames[1])
 	}
 	projection, err := history.LoadAgentic(ctx, st, "tool-search-alias", history.Options{})
 	if err != nil {
