@@ -2734,16 +2734,20 @@ real `eino-agent`, `eino-providers`, and Eino/AG-UI constructors against fake
 native HTTP/SSE transports and a real SQLite store, never hand-built
 messages standing in for provider translation. `bash
 testdata/external-consumer/check.sh` (local mode, no Docker) passes with
-these fixtures included, via a plain `go test ./...` inside the temporary
-consumer module `check.sh` generates. Neither `check.sh` nor these fixtures
-are exercised under `-race`: `go test ./testdata/external-consumer/ -race`
-cannot even compile from the repository root --
+these fixtures included, via `go test -race ./...` inside the temporary
+consumer module `check.sh` generates. `go test ./testdata/external-consumer/
+-race` still cannot compile from the repository root --
 `github.com/mattsp1290/eino-providers` is deliberately not a root
-dependency (see `docs/dependency-status.md`), so resolving it fails --
-and `check.sh`'s own `go test ./...` call (`testdata/external-consumer/check.sh`)
-does not pass `-race` either. `EINO_AGENT_CONSUMER_POSTGRES=1 check.sh` and
-published-mode `check.sh` (this branch's commit is not yet resolvable
-through the public proxy) are gates the coordinator runs.
+dependency (see `docs/dependency-status.md`), so resolving it fails -- but
+that is a repository-root-only limitation: inside the generated consumer
+module, `eino-providers` is a required dependency, so `-race` compiles and
+runs there, and `check.sh`'s non-Postgres `go test` call now passes
+`-race` (added by this fix pass; verified locally in ~8s). The Postgres
+path (`EINO_AGENT_CONSUMER_POSTGRES=1 check.sh`, `-tags
+postgres_integration`) does not yet pass `-race` and is unchanged here.
+`EINO_AGENT_CONSUMER_POSTGRES=1 check.sh` and published-mode `check.sh`
+(unsatisfiable at any currently published version -- see
+`docs/dependency-status.md`) are gates the coordinator runs.
 
 - **Native `AgenticModel` generate/stream equivalence and continuation**
   (`TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation`):
