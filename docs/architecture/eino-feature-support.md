@@ -2524,21 +2524,32 @@ flagged rather than silently ignored.
   specifically (not merely that loading didn't error); it does not cover
   `tool_search_result`/`mcp_*`/assistant media. `Bridge.Emit` gains a
   `session.MessageCommittedEventKind` case that reprojects the committed
-  message and emits it with one of two delivery modes depending on which
-  phase of the connection observed the notification (`Bridge.inReplaySweep`):
-  `DeliveryModeCommittedOnly` (native events plus the custom supplement) for
-  a message that first commits during `replay()`'s own durable sweep --
-  this connection's live deltas for it were `LiveOnly` records `replay()`
-  skips, so it never saw them -- and `DeliveryModeLiveContinuation` (custom
-  supplement only) once `replay()` has returned and `Reconnect`'s live tail
-  loop is running, where representable native content already streamed
-  live via the existing delta path before the message committed. A miss --
-  the named message not (yet) present in a reload -- is a benign,
-  non-fatal skip (`Bridge.liveErr` is reserved for a hard reload failure);
-  see `docs/architecture/agui-events.md`'s "Committed-projection emission"
-  section. `TestReplayForwardsMessageCommittedDuringReplayWindow` and
-  `TestBridgeEmitLiveMessageCommittedProjectsDurableContent` prove both
-  modes end to end against a real SQLite store. `NewBridge`'s signature grew a
+  message and emits it with one of two delivery modes depending on whether
+  THIS connection has already natively streamed THIS message's content
+  (`Bridge.nativeStreamed`, a per-message record set by
+  `emitMessageDelta`/`emitToolCallUpdated`): `DeliveryModeCommittedOnly`
+  (native events plus the custom supplement) if not -- covering a message
+  that first commits during `replay()`'s own durable sweep, among other
+  cases -- and `DeliveryModeLiveContinuation` (custom supplement only) if
+  so, where representable native content already streamed live via the
+  existing delta path before the message committed. `emitMessageDelta`/
+  `emitToolCallUpdated` also drop any event naming a message already in
+  `Bridge.projectedMessages` outright, as necessarily stale. (An earlier
+  version of this mode selection keyed off a connection-phase flag,
+  `Bridge.inReplaySweep`; the fourth W7 fix-pass review's P0-1 finding
+  replaced it with the per-message record above after finding that a
+  stale, buffered live delta for a message the durable sweep already
+  delivered could still reach `emitMessageDelta` and duplicate its native
+  content -- a phase flag alone could not prevent that. See
+  `docs/architecture/agui-events.md`'s "Committed-projection emission"
+  section for the full mechanism.) A miss -- the named message not (yet)
+  present in a reload -- is a benign, non-fatal skip (`Bridge.liveErr` is
+  reserved for a hard reload failure; `Bridge.BenignCommitMisses` counts
+  it for host observability). `TestReplayForwardsMessageCommittedDuringReplayWindow`,
+  `TestBridgeEmitLiveMessageCommittedProjectsDurableContent`, and
+  `TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWindow`
+  prove both modes, and the P0-1 dedup, end to end against a real SQLite
+  store. `NewBridge`'s signature grew a
   required `(store session.Store, contentLimits session.ContentLimits,
   includeReasoning bool)` triple (a nil store disables the new path;
   existing classic-only tests pass nil), a breaking constructor change per

@@ -45,7 +45,7 @@ and never replayed.
 
 | Family | Persisted durable fact | Replay behavior | Live-tail behavior | Omitted |
 | --- | --- | --- | --- | --- |
-| Run lifecycle | `session.EventRecord` audit with run status metadata. | Not replayed as raw `RUN_STARTED`/`RUN_FINISHED`; replay exposes current run/message state. | Emit live through `eino-agui/emitter`. | None, except transport-only write failures. |
+| Run lifecycle | `session.EventRecord` audit with run status metadata. | `replay()` forwards every durable, non-`LiveOnly` run lifecycle record (`run_started`, run settlement) to `bridge.Emit` like any other durable event, and `Bridge.Emit` maps them to raw `RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR` -- see `agui/replay_test.go`'s `TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas`, which asserts exactly this sequence. | Emit live through `eino-agui/emitter`. | None, except transport-only write failures. |
 | Text | Settled `session.Part{Kind: PartAssistantGenText}` on assistant message. | Replay as AG-UI assistant message content projected from durable parts. | Emit `TEXT_MESSAGE_*` deltas live. | Empty deltas. |
 | Plain reasoning | `session.Part{Kind: PartReasoning}` only when provider and host policy allow storage. | Replay as reasoning content only from durable reasoning parts. | Emit `REASONING_*` live while allowed. | Provider-private or policy-denied reasoning. |
 | Encrypted reasoning | Never persisted. | Never replayed. | Not emitted by `eino-agent`; scrub from snapshots. | All encrypted reasoning payloads. |
@@ -58,7 +58,7 @@ and never replayed.
 | Activity | Optional `EventRecord` audit metadata. | Not replayed as conversation content. | Emit live activity. | Transient activity with no audit value. |
 | Steps | Not persisted today: `Bridge.StepStarted`/`StepFinished` are pure passthroughs to the live emitter and write no durable part or `EventRecord`. (`session.AttemptReplacedEventKind` is a separate, unrelated model-dispatch-retry audit trail, not a record of step boundaries.) | Not replayed; may become annotations/status where UI supports it, once a durable representation is implemented. | Emit live `STEP_*`. | None. |
 | Custom events | Optional audit `EventRecord`. | Not replayed unless promoted to a future typed replay contract. | Emit live. | Unknown sensitive payloads by policy. |
-| Errors | `EventRecord` plus terminal run/message status. | Replay terminal status/error summary, not necessarily raw `RUN_ERROR`. | Emit live `RUN_ERROR` or related error event. | Provider/internal details redacted by policy. |
+| Errors | `EventRecord` plus terminal run/message status. | A durable run settlement record carrying `Error.Message` replays as a raw `RUN_ERROR`, exactly like any other durable lifecycle record above -- replay does not summarize it into a different shape. | Emit live `RUN_ERROR` or related error event; `transport.SSEHandler`'s out-of-band terminal frame (`agui.Bridge.Terminate`, see "Error Handling" below) uses a fixed, policy-safe message, never the triggering error's own text. | Provider/internal details redacted by policy. |
 
 ## Type Contract
 
@@ -239,10 +239,25 @@ Errors have two projections:
   interrupted state;
 - live transport: AG-UI error events notify connected clients.
 
-Replay should prefer durable status summaries over raw historical `RUN_ERROR`
-frames. Redaction is governed by `session.RedactionClass`,
-`runtime.RedactionClass`, the `obs` field policy model, and
-`docs/architecture/observability.md`.
+Replay forwards a durable run settlement's raw `RUN_ERROR` exactly like any
+other durable lifecycle record (see the classification table's Errors row);
+it does not summarize error state into a different shape. Redaction is
+governed by `session.RedactionClass`, `runtime.RedactionClass`, the `obs`
+field policy model, and `docs/architecture/observability.md`.
+
+`transport.SSEHandler` additionally emits a terminal `RUN_ERROR` frame
+out-of-band, via `agui.Bridge.Terminate`, when `agui.Reconnect` itself
+returns a non-nil error after the response has already written at least one
+byte (so a non-200 status is no longer available to signal the failure).
+This is distinct from the durable/live projections above: it never carries
+the triggering error's own text (a fixed, policy-safe message instead --
+see `Bridge.TerminalErrorMessage`), it is suppressed for a benign
+`context.Canceled` (a client disconnect or graceful server shutdown, where
+nothing is listening or nothing was truncated), and it is a no-op once a
+terminal frame (a durable `RUN_FINISHED`/`RUN_ERROR`, or an earlier
+`Terminate` call) has already reached the wire for the connection --
+`RUN_FINISHED` and `RUN_ERROR` are both terminal for a run, and a client
+must never see a second one.
 
 ## Implementation Requirements for Bridges
 
@@ -346,23 +361,38 @@ Both the durable replay path and the live path build an eino-agui
 - **Live** (`Bridge.Emit`'s `session.MessageCommittedEventKind` case,
   `emitLiveMessageCommitted`): reprojects the *whole session's* durable
   history and emits only the one message the event named. The delivery
-  mode depends on which phase of the connection observed the notification
-  (`Bridge.inReplaySweep`, set only while `replay()`'s own durable
-  `ListEvents` sweep is running):
-  - during that sweep, `DeliveryModeCommittedOnly` (native events, for the
-    same content kinds `DeliveryModeReplay` above natively represents,
-    plus the custom supplement): a message that first commits strictly
-    during the replay window was never covered by the snapshot, and its
-    live `EventMessageDelta` records are `LiveOnly`, which `replay()`
-    itself skips (see "Replay Projection" above) -- this connection never
-    saw those deltas, so the committed projection must carry a native
-    representation, not custom-only;
-  - once `replay()` has returned and `Reconnect`'s live tail loop is
-    running, `DeliveryModeLiveContinuation` (custom supplement only):
+  mode depends on whether THIS connection has already natively streamed
+  THIS message's content (`Bridge.nativeStreamed`, a per-message record set
+  by `emitMessageDelta`/`emitToolCallUpdated`), not on which phase of the
+  connection observed the notification:
+  - if not, `DeliveryModeCommittedOnly` (native events, for the same
+    content kinds `DeliveryModeReplay` above natively represents, plus the
+    custom supplement) -- this covers a message that first commits
+    strictly during the replay window, never covered by the snapshot, but
+    also any other case where this connection has not (yet) natively
+    streamed the message;
+  - if so, `DeliveryModeLiveContinuation` (custom supplement only):
     representable native content for THIS connection's own live turn
     already streamed via `emitMessageDelta`/`emitToolCallUpdated` before
     the message committed, so this must not duplicate it as a second
     native event.
+
+  An earlier version of this mode selection keyed off a connection-phase
+  flag (`Bridge.inReplaySweep`, true only while `replay()`'s own durable
+  `ListEvents` sweep was running) instead of a per-message record. The
+  fourth W7 fix-pass review's P0-1 finding
+  (`reviews/w7-fixes3-2026-09-12/`) showed that flag was wrong: `Reconnect`
+  subscribes to the live tail *before* calling `replay()`, so a delta for a
+  message the sweep already found fully committed can still be sitting
+  buffered in that tail's channel, to be drained by the live loop *after*
+  the sweep already delivered that message's native content -- a phase
+  flag cannot tell that case apart from "this connection's own live turn
+  already streamed it", but a per-message record can. `emitMessageDelta`
+  and `emitToolCallUpdated` also gained a companion guard for the mirror
+  case: a delta or tool-call update naming a message already recorded in
+  `Bridge.projectedMessages` (already delivered through the
+  committed-projection path) is dropped outright, since any such event
+  reaching this connection at that point is necessarily stale.
 
   A `message_committed` naming a message not (yet) present in a reload's
   projections (a benign miss -- see `publishMessageCommitted`'s

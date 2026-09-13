@@ -323,8 +323,12 @@ sseHandler := transport.SSEHandler(transport.SSEConfig{
     // handler serves -- eino-agent does not verify this independently.
     // Defaults to false: set true only once you have confirmed your
     // provider/host policy allows storing and replaying plain reasoning.
-    // It gates the durable message snapshot, live commit reprojection, AND
-    // the live text/reasoning delta stream uniformly.
+    // It gates the durable message snapshot and live commit reprojection,
+    // AND the live EventMessageDelta reasoning-delta stream (the
+    // REASONING_* events Bridge.emitMessageDelta emits while a turn is
+    // streaming) -- but NOT the live text-delta stream, which is
+    // unconditional: leaving this at its default suppresses reasoning
+    // only, never assistant text.
     IncludeReasoning: false,
 })
 ```
