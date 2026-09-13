@@ -318,6 +318,14 @@ sseHandler := transport.SSEHandler(transport.SSEConfig{
     ThreadID: func(_ *http.Request, id session.ID) string {
         return string(id)
     },
+    // IncludeReasoning is the host's attestation that
+    // agui.GateProviderReasoningStorage is satisfied for every session this
+    // handler serves -- eino-agent does not verify this independently.
+    // Defaults to false: set true only once you have confirmed your
+    // provider/host policy allows storing and replaying plain reasoning.
+    // It gates the durable message snapshot, live commit reprojection, AND
+    // the live text/reasoning delta stream uniformly.
+    IncludeReasoning: false,
 })
 ```
 
@@ -362,10 +370,20 @@ Live-only data is:
 - live-tail overflow notices;
 - transport write attempts and old SSE frames.
 
-Replay must reconstruct `MESSAGES_SNAPSHOT` from durable messages and parts. It
-must not infer conversation content from arbitrary event payloads or replay old
-SSE frames. Event records are useful for audit, recovery, observability, and
-cursor boundaries; they are not a substitute for durable message/part history.
+Replay projects every durable message through `emitter.EmitCommittedProjection`
+(native AG-UI events plus an `eino.agentic.v1` custom content-block
+supplement); it does **not** emit a `MESSAGES_SNAPSHOT`. `NativeMessage` is
+populated only for user-role messages upstream (eino-agui's
+`convert.ToAgenticProjection`), so a snapshot built from it would carry user
+turns only, out of order relative to the assistant projections that follow
+it. A native-only client -- one that never parses the `eino.agentic.v1`
+envelope -- has no representation of user-role history on this path; if your
+host needs one, assemble your own `MESSAGES_SNAPSHOT` from your application's
+complete committed transcript rather than relying on `agui.Replay`/
+`agui.Reconnect` to supply it. Replay must not infer conversation content
+from arbitrary event payloads or replay old SSE frames. Event records are
+useful for audit, recovery, observability, and cursor boundaries; they are
+not a substitute for durable message/part history.
 
 ## Storage Requirements
 

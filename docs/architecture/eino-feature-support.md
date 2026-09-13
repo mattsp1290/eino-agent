@@ -2493,9 +2493,16 @@ flagged rather than silently ignored.
   path and the live path now use the accepted `eino-agui` agentic bridge
   (`convert.ToAgenticProjection`, `emitter.Emitter.EmitCommittedProjection`)
   instead of a locally duplicated conversion. `emitMessageSnapshot` projects
-  every durable message, emits one `MESSAGES_SNAPSHOT` built from their
-  `NativeMessage` values (user-role display text, for native-only clients),
-  then emits each projection with `DeliveryModeReplay`. This removes the
+  every durable message and emits each projection with `DeliveryModeReplay`.
+  It does not emit a `MESSAGES_SNAPSHOT`: an earlier fix pass added one
+  built from each projection's `NativeMessage` (user-role display text
+  only, since `convert.ToAgenticProjection` populates `NativeMessage` only
+  for user-role messages upstream), emitted ahead of the assistant
+  projections that follow it -- reordering any transcript containing
+  assistant messages and ignoring the replay cursor entirely. That snapshot
+  was reverted; a native-only client (one that never parses the
+  `eino.agentic.v1` custom envelope) has no representation of user-role
+  history on this path today. This removes the
   `history.ErrClassicUnsupported` failure the classic `history.Load`
   projector hit on `tool_search_result`, `mcp_*`, and assistant media --
   but those specific kinds have no native AG-UI representation at all
@@ -2519,13 +2526,22 @@ flagged rather than silently ignored.
   this repository's no-compatibility-shim policy. `includeReasoning`
   defaults to `false` at the `transport.SSEConfig.IncludeReasoning` host
   boundary: a host must explicitly opt in, attesting
-  `agui.GateProviderReasoningStorage` is satisfied, before durable
-  reasoning content blocks are included in the message snapshot or live
-  commit reprojection. `agui.Replay`/`agui.Reconnect` both gained the same
-  `includeReasoning bool` parameter, and `replay()` now filters out durable
-  `session.MessageCommittedEventKind` events instead of forwarding them to
-  `bridge.Emit` (which would re-project and double-emit a message the
-  snapshot already delivered).
+  `agui.GateProviderReasoningStorage` is satisfied (a host attestation this
+  package trusts and does not independently verify -- the Gate constant
+  itself is a documentation label no code path reads), before durable
+  reasoning content blocks are included in the message snapshot, live
+  commit reprojection, or the live `EventMessageDelta` path uniformly.
+  `agui.Replay`/`agui.Reconnect` both gained the same `includeReasoning
+  bool` parameter. `replay()` forwards every non-`LiveOnly` durable event,
+  including `session.MessageCommittedEventKind`, to `bridge.Emit`
+  unconditionally; `Bridge` itself tracks every message ID already emitted
+  through the committed-projection path for the life of a connection and
+  `emitLiveMessageCommitted` skips a notification naming one already in
+  that set, rather than replay unconditionally dropping every
+  `message_committed` event regardless of whether the message it names was
+  actually covered by the snapshot (an earlier fix pass's version of this
+  did the latter, which silently dropped a message that committed strictly
+  during the replay window).
 - **Rich transport ingress (`transport/rich.go`)**: `DecodeUserMessage`
   decodes a native AG-UI `types.InputContent` list into a
   `runtime.UserMessage`, mapping text/image/audio/video/document onto their
