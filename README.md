@@ -28,7 +28,16 @@ and observability remain provider-neutral.
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.9.19` (exact pin; see [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md))
-- AG-UI bridge: `github.com/mattsp1290/eino-agui v0.1.1`
+- AG-UI bridge: `github.com/mattsp1290/eino-agui v0.1.2-0.20260910210826-ed64f77f3f16`
+  (the accepted agentic-runtime contract's immutable bridge commit; see
+  [docs/dependency-status.md](docs/dependency-status.md) for the accepted-contract
+  evidence).
+  Requires a root replacement in this module's `go.mod` for
+  `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
+  `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`
+  (dependency replacements do not propagate, so any host consuming
+  `eino-agent` must carry this same root replacement). See
+  [docs/dependency-status.md](docs/dependency-status.md).
 - Observability: `github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b`
 - Coding tools: `github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2`
 

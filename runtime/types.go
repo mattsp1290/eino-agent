@@ -91,6 +91,15 @@ type TurnSnapshot struct {
 	RunID     session.RunID
 	SessionID session.ID
 	EpochID   session.EpochID
+	// TurnID is the durable turn this snapshot was frozen for (see
+	// FreezeTurnSnapshot). Every session.Message/session.ToolCall.
+	// ResultMessage this turn appends is stamped with it.
+	TurnID session.TurnID
+	// AgentPath is the joined RunPath of the (sub)agent driving this turn,
+	// mirrored onto every session.Message this turn produces. Always ""
+	// today: subagent nesting is not yet wired end to end (see
+	// adkEngine.agentPath).
+	AgentPath string
 	Config    config.Snapshot
 	Model     model.Resolved
 	Messages  []*einoschema.AgenticMessage

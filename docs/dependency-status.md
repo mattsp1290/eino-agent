@@ -20,12 +20,20 @@ findings are recorded in
 
 External pins for the agentic adoption:
 
-- `github.com/mattsp1290/eino-agui`: accepted contract published at commit
-  `0e1d33d4f27f934226b707f252b7499484f4762e`
-  (`v0.1.2-0.20260910172717-0e1d33d4f27f`); it requires the root replacement
+- `github.com/mattsp1290/eino-agui`: accepted contract, pinned at the
+  immutable bridge commit `ed64f77f3f16d8eb0f63f1cc34b985b870cdde88`
+  (`v0.1.2-0.20260910210826-ed64f77f3f16`; superseding the earlier
+  intermediate pin at `0e1d33d4f27f934226b707f252b7499484f4762e` recorded
+  when this section was first written); it requires the root replacement
   `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
-  `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`.
-  Adopted in W7.
+  `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`
+  in any consuming host's own `go.mod`, since dependency replacements do not
+  propagate. Adopted in W7: `agui/bridge.go` and `agui/replay.go` use
+  `convert.ToAgenticProjection`/`emitter.Emitter.EmitCommittedProjection` for
+  both the durable replay snapshot and live `message_committed` emission
+  (see `docs/architecture/agui-events.md`); the full lifecycle mapping
+  (`run_paused`/`attempt_replaced`/subagent events) and transient per-delta
+  emission via `TransientEventForBlock` are not yet wired.
 - `github.com/mattsp1290/eino-providers`: the native `AgenticModel` contract
   was answered on 2026-09-11 (response document
   `2026-09-10-eino-v0-9-19-agentic-models.md`) and that work is merged to the

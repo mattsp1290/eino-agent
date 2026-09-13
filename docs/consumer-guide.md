@@ -25,6 +25,17 @@ cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
 See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
 CloudWeGo Eino is pinned to exactly `v0.9.19`; PostgreSQL 17 is the supported server baseline.
 
+The AG-UI bridge (`agui`, `transport`; adopted in W7) pins
+`github.com/mattsp1290/eino-agui`, which itself requires a root `replace`
+directive for `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
+`github.com/mattsp1290/ag-ui/sdks/community/go`. Go `replace` directives are
+NOT transitive: any host consuming `eino-agent`'s AG-UI packages must add
+that same root replacement to its OWN `go.mod`, or the build will not
+resolve. See `README.md`'s Pins section and
+[docs/dependency-status.md](dependency-status.md) for the exact version to
+pin; `testdata/external-consumer/check.sh` enforces this mechanically for
+this repository's own gate.
+
 The separately published generated-bindings dependency remains
 `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, through repository tag
 `wasmext/gen/v0.1.0`. Consumers need no workaround for that dependency. Earlier
@@ -318,6 +329,18 @@ sseHandler := transport.SSEHandler(transport.SSEConfig{
     ThreadID: func(_ *http.Request, id session.ID) string {
         return string(id)
     },
+    // IncludeReasoning is the host's attestation that
+    // agui.GateProviderReasoningStorage is satisfied for every session this
+    // handler serves -- eino-agent does not verify this independently.
+    // Defaults to false: set true only once you have confirmed your
+    // provider/host policy allows storing and replaying plain reasoning.
+    // It gates the durable message snapshot and live commit reprojection,
+    // AND the live EventMessageDelta reasoning-delta stream (the
+    // REASONING_* events Bridge.emitMessageDelta emits while a turn is
+    // streaming) -- but NOT the live text-delta stream, which is
+    // unconditional: leaving this at its default suppresses reasoning
+    // only, never assistant text.
+    IncludeReasoning: false,
 })
 ```
 
@@ -362,10 +385,20 @@ Live-only data is:
 - live-tail overflow notices;
 - transport write attempts and old SSE frames.
 
-Replay must reconstruct `MESSAGES_SNAPSHOT` from durable messages and parts. It
-must not infer conversation content from arbitrary event payloads or replay old
-SSE frames. Event records are useful for audit, recovery, observability, and
-cursor boundaries; they are not a substitute for durable message/part history.
+Replay projects every durable message through `emitter.EmitCommittedProjection`
+(native AG-UI events plus an `eino.agentic.v1` custom content-block
+supplement); it does **not** emit a `MESSAGES_SNAPSHOT`. `NativeMessage` is
+populated only for user-role messages upstream (eino-agui's
+`convert.ToAgenticProjection`), so a snapshot built from it would carry user
+turns only, out of order relative to the assistant projections that follow
+it. A native-only client -- one that never parses the `eino.agentic.v1`
+envelope -- has no representation of user-role history on this path; if your
+host needs one, assemble your own `MESSAGES_SNAPSHOT` from your application's
+complete committed transcript rather than relying on `agui.Replay`/
+`agui.Reconnect` to supply it. Replay must not infer conversation content
+from arbitrary event payloads or replay old SSE frames. Event records are
+useful for audit, recovery, observability, and cursor boundaries; they are
+not a substitute for durable message/part history.
 
 ## Storage Requirements
 

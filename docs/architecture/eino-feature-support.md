@@ -2431,3 +2431,209 @@ below.
     `TestRepositionMidTurnCompactionBoundaryHandlesToolSearchResult`
     (`runtime/w6_round4_correlation_test.go`) prove the fix directly,
     mutation-proved by hand against a reverted no-op.
+
+## W7: AG-UI bridge, durable identity, and rich transport ingress (partial)
+
+Status: this section states only what is implemented and empirically
+verified below -- it is not a complete account of the W7 plan
+(`.agents/plans/eino-v0-9-19/07-transport-and-observability.md`). Durable
+identity, `message_committed`, and the agentic committed-projection
+emission path (replay and live) are implemented and tested. Rich AG-UI
+transport ingress (decode plus two new handlers) is implemented and tested
+but not yet wired as the default path. Full AG-UI lifecycle mapping
+(`run_paused`/`attempt_replaced`/subagent events), transient per-block live
+deltas, watch bounded block state, and the observability typed-callback
+adapters are **not implemented** by this pass -- see
+`docs/architecture/agui-events.md`'s "W7" section for the exact boundary.
+Verified: `go build ./...`; `go vet ./...` and `-tags postgres_integration`;
+`gofmt`/`goimports` clean; `golangci-lint` 0 issues; `go test ./... -count=1`;
+`go test ./agui ./transport ./watch ./stream ./obs ./runtime -count=1`; `go
+test -race ./agui ./transport ./watch ./stream`; `make check`; `make
+postgres-test` (real Docker PostgreSQL, "required suites passed; zero
+skips"); `EINO_AGENT_CONSUMER_POSTGRES=1 testdata/external-consumer/check.sh`.
+`make postgres-race` passes the full runtime/store contract except one
+subtest (`store/postgres` `TestPostgresStore/contract/paused_runs/
+claim_run_on_a_paused_run_succeeds_immediately_without_waiting_for_lease_expiry`)
+that fails intermittently under the full suite's `-race` load but passes
+reliably standalone (`go test -race -tags=postgres_integration
+./store/postgres -run 'TestPostgresStore/contract/paused_runs'`); this test
+asserts real wall-clock lease timing and this pass's diff does not touch
+`ClaimRun`/`PromotePause`/lease code, so it reads as a pre-existing
+environment-timing flake under heavy concurrent load, not a regression --
+flagged rather than silently ignored.
+
+- **Durable identity (`session.Message.TurnID`/`AgentPath`)**: stamped at
+  most (not quite every -- see below) append sites: admission, turn
+  admission, continuation dispatch, approval response, tool settlement,
+  tool search settlement, and the compaction boundary message
+  (`session/compaction`). `runtime.settleInterruptedTool`'s
+  crash-reconciliation path (`runtime/tool_execution.go`) is a deliberate
+  exception: no live `TurnSnapshot` exists on that path and `session.Store`
+  exposes no by-ID message read to recover the calling message's turn, so
+  it stamps an empty `TurnID`/`AgentPath` on purpose rather than paying for
+  a full `ListMessages` scan on an already-degraded settlement path (bounded
+  by `agui.agenticIdentity`'s synthetic-turn-id fallback -- see
+  `docs/architecture/agui-events.md`'s "Durable identity" section). Both
+  fields are record-JSON-only
+  correlation metadata, matching the pre-existing
+  `EventRecord.TurnID`/`AgentPath` and `ModelRequestRecord.TurnID`/
+  `AgentPath` convention -- no column or index backs any of the four, and no
+  SQL migration was made or needed (confirmed directly against
+  `store/sqlite/migrations/00001_initial.sql` and
+  `store/postgres/migrations/00001_initial.sql`: `messages`/`events` persist
+  the full struct as an opaque blob/bytea `record` with no enum `CHECK` on
+  `kind`). `session.ValidateAdmitTurn` rejects a message stamped with a
+  *different* turn than the one being admitted but tolerates one left
+  unset. `store/storetest/w5_durable.go`'s new `durable_identity` contract
+  suite (registered in `POSTGRES_REQUIRED_SUITES`) proves the round trip
+  through `AdmitTurn` and a follow-up `AppendMessage`, the tolerate-unset
+  case, and the reject-mismatch case, against both SQLite and PostgreSQL.
+  `ServerCallBlock`/`ServerResultBlock` (`session/content.go`) now document
+  that a server tool block's `ProviderServerID` (the eino-agui projection
+  term) is its existing `CallID` field -- no separate field exists or is
+  needed.
+- **`session.MessageCommittedEventKind`** ("message_committed",
+  `session/event_kinds.go`): an ordinary (non-canonical) durable event,
+  published best-effort by `runtime.StreamingOrchestrator.
+  publishMessageCommitted` (`runtime/message_commit_event.go`) once after
+  `persistAssistantTurn` commits an assistant message's content and once
+  after each tool call settles (`persistToolSettlement`), carrying the
+  message id and the session's observation-watermark revision at commit
+  time. Best-effort by design: the underlying content is already durably
+  committed regardless of whether this notification is observed, so its own
+  failure must never be reported as though the commit itself failed.
+  `runtime/message_commit_event_test.go` drives a full turn with a real
+  tool call through a scripted provider and proves exactly three
+  `message_committed` events (no duplicates, correct message ids, every
+  committed message carries a non-empty `TurnID`).
+- **Agentic committed-projection emission (`agui/bridge.go`,
+  `agui/replay.go`, `agui/agentic_projection.go`)**: both the durable replay
+  path and the live path now use the accepted `eino-agui` agentic bridge
+  (`convert.ToAgenticProjection`, `emitter.Emitter.EmitCommittedProjection`)
+  instead of a locally duplicated conversion. `emitMessageSnapshot` projects
+  every durable message and emits each projection with `DeliveryModeReplay`.
+  It does not emit a `MESSAGES_SNAPSHOT`: an earlier fix pass added one
+  built from each projection's `NativeMessage` (user-role display text
+  only, since `convert.ToAgenticProjection` populates `NativeMessage` only
+  for user-role messages upstream), emitted ahead of the assistant
+  projections that follow it -- reordering any transcript containing
+  assistant messages and ignoring the replay cursor entirely. That snapshot
+  was reverted; a native-only client (one that never parses the
+  `eino.agentic.v1` custom envelope) has no representation of user-role
+  history on this path today. This removes the
+  `history.ErrClassicUnsupported` failure the classic `history.Load`
+  projector hit on `tool_search_result`, `mcp_*`, and assistant media --
+  but those specific kinds have no native AG-UI representation at all
+  (`convert.nativeEventsForBlock` returns none for them) and replay as an
+  `eino.agentic.v1` custom content-block supplement **only**; only
+  `reasoning`, `assistant_gen_text`, `function_tool_call`, and text-only
+  `function_tool_result` get a native event alongside their supplement.
+  `TestReplayMessageSnapshotIncludesUserMediaBlock` proves the media content
+  actually reaches the stream for `user_input_text`/`user_input_image`
+  specifically (not merely that loading didn't error); it does not cover
+  `tool_search_result`/`mcp_*`/assistant media. `Bridge.Emit` gains a
+  `session.MessageCommittedEventKind` case that reprojects the committed
+  message and emits it with one of two delivery modes depending on whether
+  THIS connection has already natively streamed THIS message's TEXT/
+  REASONING content (`Bridge.nativeStreamed`, a per-message record set by
+  `emitMessageDelta` only -- see below for why tool-call natives are
+  tracked separately, per call): `DeliveryModeCommittedOnly` (native events
+  plus the custom supplement) if not -- covering a message that first
+  commits during `replay()`'s own durable sweep, among other cases -- and
+  `DeliveryModeLiveContinuation` (custom supplement only) if so, where
+  representable native content already streamed live via the existing
+  delta path before the message committed. `emitMessageDelta` also drops
+  any delta naming a message already in `Bridge.projectedMessages`
+  outright, as necessarily stale (a delta strictly precedes its own
+  message's commit, by construction). (An earlier version of this mode
+  selection keyed off a connection-phase flag, `Bridge.inReplaySweep`; the
+  fourth W7 fix-pass review's P0-1 finding replaced it with the
+  per-message record above after finding that a stale, buffered live delta
+  for a message the durable sweep already delivered could still reach
+  `emitMessageDelta` and duplicate its native content -- a phase flag
+  alone could not prevent that. See `docs/architecture/agui-events.md`'s
+  "Committed-projection emission" section for the full mechanism.)
+
+  **`emitToolCallUpdated` does NOT share `emitMessageDelta`'s
+  `Bridge.projectedMessages` guard** (W7 fifth fix-pass review P0-1): a
+  `tool_call_updated` record's `MessageID` is the owning ASSISTANT message,
+  which always commits BEFORE any of its own tool transitions publish
+  (`runtime/tool_preparation.go`), so that message is already in
+  `Bridge.projectedMessages` by the time the first such event reaches
+  `Emit` -- a prior fix pass that added the same guard there suppressed
+  EVERY live tool-call event on every tool-calling turn, the common case,
+  not an edge case. Tool-call native dedup is keyed on the CALL instead:
+  `Bridge.toolCallNativeSuppressed` (set when the assistant message's own
+  committed-projection emission already included that call's native
+  `function_tool_call` representation), `Bridge.toolCallLiveStartSent` (the
+  live path's own dedup, since a durable `tool_call_updated` record repeats
+  Name/Arguments at every phase), and `Bridge.toolCallResultSent` (dedup
+  for the terminal `TOOL_CALL_RESULT` against the separate result
+  message's own later commit). See `docs/architecture/agui-events.md`'s
+  "Committed-projection emission" section for the full mechanism. A miss --
+  the named message not (yet)
+  present in a reload -- is a benign, non-fatal skip (`Bridge.liveErr` is
+  reserved for a hard reload failure; `Bridge.BenignCommitMisses` counts
+  it for host observability). `TestReplayForwardsMessageCommittedDuringReplayWindow`,
+  `TestBridgeEmitLiveMessageCommittedProjectsDurableContent`, and
+  `TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWindow`
+  prove both modes, and the message-level dedup, end to end against a real
+  SQLite store. `TestBridgeDeliversFullStreamingTextThenToolCallTurn` and
+  `TestBridgeDeliversToolCallTurnWithNoPrecedingTextDelta`
+  (`agui/tool_call_p0_regression_test.go`) prove the per-call tool dedup
+  above end to end, against a real SQLite store, driving `CreateToolCall`/
+  `ClaimToolCall`/`SettleToolCall` and `runtime.BuildToolSettlement` for
+  both DeliveryMode directions -- text streamed before the tool call, and
+  no text streamed at all. `NewBridge`'s signature grew a
+  required `(store session.Store, contentLimits session.ContentLimits,
+  includeReasoning bool)` triple (a nil store disables the new path;
+  existing classic-only tests pass nil), a breaking constructor change per
+  this repository's no-compatibility-shim policy. `includeReasoning`
+  defaults to `false` at the `transport.SSEConfig.IncludeReasoning` host
+  boundary: a host must explicitly opt in, attesting
+  `agui.GateProviderReasoningStorage` is satisfied (a host attestation this
+  package trusts and does not independently verify -- the Gate constant
+  itself is a documentation label no code path reads), before durable
+  reasoning content blocks are included in the message snapshot, live
+  commit reprojection, or the live `EventMessageDelta` path uniformly.
+  `agui.Replay`/`agui.Reconnect` both gained the same `includeReasoning
+  bool` parameter. `replay()` forwards every non-`LiveOnly` durable event,
+  including `session.MessageCommittedEventKind`, to `bridge.Emit`
+  unconditionally; `Bridge` itself tracks every message ID already emitted
+  through the committed-projection path for the life of a connection and
+  `emitLiveMessageCommitted` skips a notification naming one already in
+  that set, rather than replay unconditionally dropping every
+  `message_committed` event regardless of whether the message it names was
+  actually covered by the snapshot (an earlier fix pass's version of this
+  did the latter, which silently dropped a message that committed strictly
+  during the replay window).
+- **Rich transport ingress (`transport/rich.go`)**: `DecodeUserMessage`
+  decodes a native AG-UI `types.InputContent` list into a
+  `runtime.UserMessage`, mapping text/image/audio/video/document onto their
+  `session.ContentBlock` (bounded: 16MiB body, 64 content fragments, every
+  media block requires exactly one URL/base64 source). `EnqueueHandler` and
+  `ResumeTargetedHandler` adapt application-owned routes to
+  `runtime.Enqueue`/`runtime.ResumeRun`; both run the host's auth callback
+  before reading the request body or resolving any session/run content --
+  `TestResumeTargetedHandlerNeverInfersPermissionFromTargetPossession` and
+  `TestEnqueueHandlerAuthFailureNeverReachesEnqueue` prove a well-formed,
+  in-bounds target id or idempotency key never substitutes for a failed
+  auth call. `ResumeTargetedHandler` bounds target count (256) and per-id
+  length (512 bytes); `EnqueueHandler` requires a bounded `Idempotency-Key`
+  header. Not yet wired as the default ingress path in
+  `SSEHandler`/`examples/minimal-server` -- the classic `DecodeMessages`
+  remains the default for existing callers.
+- **Not implemented by this pass** (see `docs/architecture/agui-events.md`):
+  `run_paused`/`InterruptTargetV1` construction from durable approval
+  records, `run_resumed`, `attempt_replaced`, and subagent lifecycle
+  mapping (the runtime does not emit any `Subagent*EventKind` anywhere yet,
+  so there is nothing for a mapping to consume); transient per-block live
+  deltas via `convert.TransientEventForBlock` (today's live path still uses
+  the classic per-delta emitter methods); `watch/`'s bounded public block
+  state and block-indexed live overlay; the observability typed-callback
+  adapters and single accounting source. Each of these touches a
+  deeply concurrent or correctness-sensitive existing subsystem (interrupt/
+  approval identity validation, the watch service's live overlay, or
+  double-counting-safe observability accounting) that this pass judged
+  required its own careful grounding and test pass rather than a partial,
+  unverified change.

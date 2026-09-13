@@ -255,6 +255,13 @@ func (b *ToolSearchBlock) ToolInfos() ([]*einoschema.ToolInfo, error) {
 
 // ServerCallBlock is the public payload for server_tool_call blocks. The
 // original Arguments value (Go `any`) is stored as bounded finite JSON.
+//
+// CallID is this block's ProviderServerID: the provider-owned identity for a
+// call the provider itself executes (executionOwner: provider in the
+// eino-agui agentic projection). There is no separate ProviderServerID
+// field -- CallID already carries it end to end (session.contentBlockFromEino
+// through ContentToAgenticMessage), and eino-agui's convert package
+// re-derives its own ProviderServerID identically from this same value.
 type ServerCallBlock struct {
 	Name      string          `json:"name"`
 	CallID    string          `json:"call_id,omitempty"`
@@ -262,6 +269,8 @@ type ServerCallBlock struct {
 }
 
 // ServerResultBlock is the public payload for server_tool_result blocks.
+// CallID is this block's ProviderServerID -- see ServerCallBlock's doc
+// comment.
 type ServerResultBlock struct {
 	Name    string          `json:"name"`
 	CallID  string          `json:"call_id,omitempty"`

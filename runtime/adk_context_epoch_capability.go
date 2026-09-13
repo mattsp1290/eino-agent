@@ -41,12 +41,21 @@ import (
 // It grants no ToolCall claim/settle authority and no arbitrary
 // AppendMessage/AppendPart access outside those two bounded write paths.
 type contextEpochCapability struct {
-	sessionID     session.ID
-	runID         session.RunID
-	store         session.Store
-	execution     session.ExecutionStore
-	ids           IDGenerator
-	now           func() time.Time
+	sessionID session.ID
+	runID     session.RunID
+	store     session.Store
+	execution session.ExecutionStore
+	ids       IDGenerator
+	now       func() time.Time
+	// turnID and agentPath are the durable turn identity of the snapshot
+	// that triggered this cycle's summarization (adkEngine.snapshot.TurnID/
+	// AgentPath), stamped onto the compaction boundary message
+	// commitSummaryEpoch appends. Without this, the boundary message keeps
+	// an empty TurnID forever, forcing agui.agenticIdentity to fall back to
+	// a synthetic turn id on every replay of every compacted session (W7
+	// review finding).
+	turnID        session.TurnID
+	agentPath     string
 	contentLimits session.ContentLimits
 }
 
@@ -77,6 +86,12 @@ func (c contextEpochCapability) loadConversationalHistory(ctx context.Context) (
 func (c contextEpochCapability) commitSummaryEpoch(ctx context.Context, epoch session.ContextEpoch, ids compaction.BoundaryIDs, summaryText string) (session.ContextEpoch, compaction.Boundary, error) {
 	if !c.ready() {
 		return session.ContextEpoch{}, compaction.Boundary{}, fmt.Errorf("%w: context epoch capability unavailable", errHandlerMissingBackend)
+	}
+	if ids.TurnID == "" {
+		ids.TurnID = c.turnID
+	}
+	if ids.AgentPath == "" {
+		ids.AgentPath = c.agentPath
 	}
 	var started session.ContextEpoch
 	var boundary compaction.Boundary

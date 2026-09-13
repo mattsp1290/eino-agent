@@ -603,7 +603,7 @@ func admitCarrierTurn(ctx context.Context, o *StreamingOrchestrator, execution *
 	}
 	assistantMessage := session.Message{
 		ID: assistantID, SessionID: run.SessionID, RunID: run.ID, Role: session.RoleAssistant,
-		Agent: run.Agent, ModelID: run.ModelID, CreatedAt: at, UpdatedAt: at,
+		Agent: run.Agent, ModelID: run.ModelID, TurnID: turnID, CreatedAt: at, UpdatedAt: at,
 	}
 	result, err := execution.store.AdmitTurn(ctx, session.AdmitTurnRequest{
 		Turn: turn, AssistantPlaceholder: assistantMessage, Event: event,

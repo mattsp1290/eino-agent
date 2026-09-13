@@ -103,6 +103,20 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 		result.Output = output.Content
 		result.Structured = cloneJSON(output.Structured)
 	}
+	// No live TurnSnapshot exists on this crash-reconciliation path (it
+	// settles a tool call that never rejoined a live turn loop), and
+	// session.Store's ExecutionStore/Store interfaces expose no by-ID
+	// message read to recover the calling message's already-durable
+	// TurnID/AgentPath here (only ListMessages -- a concrete store's own
+	// unexported GetMessage helper is not part of that interface, so it is
+	// not reachable from this call site): this interrupted result message
+	// is stamped with an empty turn identity rather than paying for a full
+	// ListMessages page scan on a rare, already-degraded settlement path.
+	// The cost of that empty identity is bounded by
+	// agui.agenticIdentity's synthetic-turn-id fallback (W7 review finding
+	// A1): a message with an empty TurnID still replays correctly, it just
+	// gets a deterministic synthetic turn id instead of the calling
+	// message's real one.
 	settlement, _, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, OutputRecord: output, Error: errText,
 		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,
@@ -152,6 +166,7 @@ func (e *runExecution) executeAndSettleClaimedTool(ctx context.Context, snapshot
 		Tool: tool, Call: call, Claimed: claimed, Disposition: outcome.Disposition,
 		Result: outcome.Result, Err: outcome.RawError, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt,
 		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits,
+		TurnID: snapshot.TurnID, AgentPath: snapshot.AgentPath,
 	}, messageAt)
 	eventEnvelope := toolTransitionEnvelope(e.host, snapshot, completedAt)
 	if err == nil {
@@ -223,6 +238,8 @@ func (e *runExecution) persistToolSettlement(ctx context.Context, claimed sessio
 	result, err := e.store.SettleToolCall(persistCtx, session.SettleToolCallRequest{Settlement: settlement, Event: event})
 	if err == nil {
 		e.publishPersisted(ctx, result.Event)
+		e.host.publishMessageCommitted(ctx, e, settlement.ResultMessage.SessionID, settlement.ResultMessage.RunID,
+			settlement.ResultMessage.ID, event.EpochID, settlement.ResultMessage.TurnID, settlement.ResultMessage.AgentPath)
 	}
 	return result, err
 }

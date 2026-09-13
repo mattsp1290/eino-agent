@@ -21,7 +21,11 @@ var (
 	_ = schema.System
 
 	_ = convert.ToEinoMessages
+	_ = convert.ProjectAgenticMessage
+	_ = convert.ToAgenticProjection
+	_ = convert.DefaultProjectionLimits
 	_ = emitter.NewEmitter
+	_ = emitter.NewObserverEmitter
 	_ = aguitools.ClientToolInfos
 
 	_ = einoobs.New

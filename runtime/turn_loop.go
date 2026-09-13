@@ -290,6 +290,11 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	var userMessages []session.Message
 	var userParts []session.Part
 	var userMessageIDs []session.MessageID
+	// turnID is minted before this turn's user messages so every message
+	// this admission durably commits (user and assistant placeholder alike)
+	// can be stamped with the same durable turn identity (see
+	// session.Message.TurnID).
+	turnID := c.host.ids.NewTurnID()
 	// consumedIDs is derived from items (already filtered to InboxQueued
 	// rows by loadInboxItems), never from the raw itemIDs parameter: this
 	// keeps userMessages/userParts/InboxIDs consistent by construction, so
@@ -303,7 +308,7 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 		if err != nil {
 			return nil, err
 		}
-		userMessages = append(userMessages, session.Message{ID: msgID, SessionID: c.sessionID, RunID: c.runID, Role: session.RoleUser, CreatedAt: at, UpdatedAt: at})
+		userMessages = append(userMessages, session.Message{ID: msgID, SessionID: c.sessionID, RunID: c.runID, Role: session.RoleUser, TurnID: turnID, CreatedAt: at, UpdatedAt: at})
 		userParts = append(userParts, parts...)
 		userMessageIDs = append(userMessageIDs, msgID)
 		consumedIDs = append(consumedIDs, item.ID)
@@ -311,7 +316,6 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	}
 	assistantID := c.host.ids.NewMessageID()
 	assistantAt := at
-	turnID := c.host.ids.NewTurnID()
 	turn := session.Turn{
 		ID: turnID, RunID: c.runID, SessionID: c.sessionID, Ordinal: c.nextOrdinal(), State: session.TurnAdmitted,
 		UserMessageIDs: userMessageIDs, AssistantMessageID: assistantID, EpochID: c.epochID, CreatedAt: c.host.now(),
@@ -326,7 +330,7 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 	}
 	assistantMessage := session.Message{
 		ID: assistantID, SessionID: c.sessionID, RunID: c.runID, ParentID: parentID, Role: session.RoleAssistant,
-		Agent: c.config.Agent.Name, ModelID: string(c.resolved.Model.ID), CreatedAt: assistantAt, UpdatedAt: assistantAt,
+		Agent: c.config.Agent.Name, ModelID: string(c.resolved.Model.ID), TurnID: turnID, CreatedAt: assistantAt, UpdatedAt: assistantAt,
 	}
 	result, err := c.execution.store.AdmitTurn(ctx, session.AdmitTurnRequest{
 		Turn: turn, UserMessages: userMessages, UserParts: userParts, AssistantPlaceholder: assistantMessage, Event: event, InboxIDs: consumedIDs,
@@ -356,7 +360,7 @@ func (c *turnLoopCoordinator) admitTurn(ctx context.Context, itemIDs []session.I
 		return nil, err
 	}
 	allMessages, allSourceIDs, priorProviderState := dropUnfinalizedAssistantPlaceholders(priorMessages, priorSourceIDs, priorProviderState)
-	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, allMessages, c.config.Agent.SystemPrompt, c.host.now())
+	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, turnID, c.config, c.resolved, allMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
 	}
@@ -604,7 +608,7 @@ func (c *turnLoopCoordinator) resumeEngine(ctx context.Context) (*adkEngine, err
 	// adkModel.durableProjection's later filtering so baseMessageCount below
 	// stays consistent with what a fresh reload will show.
 	priorMessages, priorSourceIDs, priorProviderState = dropUnfinalizedAssistantPlaceholders(priorMessages, priorSourceIDs, priorProviderState)
-	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, c.config, c.resolved, priorMessages, c.config.Agent.SystemPrompt, c.host.now())
+	base, err := FreezeTurnSnapshot(c.runID, c.sessionID, c.epochID, target.ID, c.config, c.resolved, priorMessages, c.config.Agent.SystemPrompt, c.host.now())
 	if err != nil {
 		return nil, err
 	}

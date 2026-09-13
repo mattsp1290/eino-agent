@@ -59,7 +59,17 @@ type SSEConfig struct {
 	// mismatch does not corrupt data, but content legitimately admitted
 	// under raised limits fails to decode for the initial message snapshot.
 	ContentLimits session.ContentLimits
-	OnComplete    func(session.EventCursor, error)
+	// IncludeReasoning is the host's attestation that
+	// agui.GateProviderReasoningStorage is satisfied for every session this
+	// handler serves: only when true do the initial message snapshot, live
+	// commit reprojection, AND the live EventMessageDelta reasoning-delta
+	// stream (the REASONING_* events Bridge.emitMessageDelta emits while a
+	// turn is streaming) include durable/live reasoning content. Defaults
+	// to false (matching the pre-W7 classic history pipeline's default), so
+	// a host must opt in explicitly rather than durable or live reasoning
+	// silently streaming to every reconnecting client.
+	IncludeReasoning bool
+	OnComplete       func(session.EventCursor, error)
 }
 
 // SSEHandler returns an http.Handler for AG-UI SSE reconnect streams.
@@ -107,14 +117,31 @@ func SSEHandler(config SSEConfig) http.Handler {
 		flusher, _ := w.(http.Flusher)
 		tracked := &trackingWriter{ResponseWriter: w}
 		writer := bufio.NewWriter(flushWriter{writer: tracked, flusher: flusher})
-		bridge := agentagui.NewBridge(ctx, writer, sse.NewSSEWriter(), threadID, runID, nil)
-		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor, config.ContentLimits)
+		bridge := agentagui.NewBridge(ctx, config.Store, config.ContentLimits, config.IncludeReasoning, writer, sse.NewSSEWriter(), threadID, runID, nil)
+		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor, config.ContentLimits, config.IncludeReasoning)
 		if err != nil && !tracked.wrote {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			if config.OnComplete != nil {
 				config.OnComplete(next, err)
 			}
 			return
+		}
+		if err != nil {
+			// Reconnect failed after already writing at least one byte: the
+			// response is already a 200 SSE stream, so http.Error's non-200
+			// status is no longer available to signal the failure (W7
+			// fix-pass review finding P0-3). Bridge.Terminate emits a
+			// terminal RUN_ERROR frame instead, so a client can tell a
+			// truncated stream from a completed one rather than the
+			// connection just stopping with no signal at all -- unless a
+			// terminal frame already reached the wire (P0-3) or err is a
+			// benign context.Canceled from a client disconnect or graceful
+			// shutdown (P0-2/C5), in which case Terminate is a documented
+			// no-op. Terminate derives an uncancelable context from ctx
+			// itself, so a host deadline (context.DeadlineExceeded) still
+			// reaches this still-connected client instead of silently
+			// failing to encode anything (see Terminate's doc comment).
+			bridge.Terminate(ctx, err)
 		}
 		_ = writer.Flush()
 		if flusher != nil {

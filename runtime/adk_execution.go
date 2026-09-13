@@ -699,6 +699,7 @@ func (e *adkEngine) buildAgentHandlers(ctx context.Context, authorized *authoriz
 			entryBuild.epochs = contextEpochCapability{
 				sessionID: e.snapshot.SessionID, runID: e.snapshot.RunID,
 				store: e.host.store, execution: e.execution.store, ids: e.host.ids, now: e.host.now,
+				turnID: e.snapshot.TurnID, agentPath: e.snapshot.AgentPath,
 				contentLimits: e.host.contentLimits,
 			}
 			if entry.Kind == HandlerKindSummarization {

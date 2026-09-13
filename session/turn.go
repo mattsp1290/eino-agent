@@ -177,7 +177,10 @@ func ValidateAdmitTurn(run Run, request AdmitTurnRequest) error {
 		return ErrConflict
 	}
 	for _, m := range request.UserMessages {
-		if m.RunID != run.ID || m.SessionID != run.SessionID || m.Role != RoleUser {
+		// TurnID is correlation metadata (like EventRecord.TurnID): a caller
+		// that leaves it unset is tolerated, but one that stamps a turn
+		// other than this admission's own turn is rejected outright.
+		if m.RunID != run.ID || m.SessionID != run.SessionID || m.Role != RoleUser || (m.TurnID != "" && m.TurnID != t.ID) {
 			return ErrConflict
 		}
 	}
@@ -188,7 +191,7 @@ func ValidateAdmitTurn(run Run, request AdmitTurnRequest) error {
 	}
 	if request.AssistantPlaceholder.ID != "" {
 		placeholder := request.AssistantPlaceholder
-		if placeholder.RunID != run.ID || placeholder.SessionID != run.SessionID || placeholder.Role != RoleAssistant {
+		if placeholder.RunID != run.ID || placeholder.SessionID != run.SessionID || placeholder.Role != RoleAssistant || (placeholder.TurnID != "" && placeholder.TurnID != t.ID) {
 			return ErrConflict
 		}
 	}

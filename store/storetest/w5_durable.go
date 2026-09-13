@@ -1112,3 +1112,101 @@ func pausedRunContract(t *testing.T, factory Factory) {
 		})
 	})
 }
+
+// durableIdentityContract exercises session.Message.TurnID/AgentPath (W7
+// durable identity): both fields round-trip through AdmitTurn and a
+// follow-up AppendMessage exactly as stamped, a message that leaves TurnID
+// unset is tolerated (it is correlation metadata, like
+// session.EventRecord.TurnID -- see ValidateAdmitTurn), and a message that
+// stamps a turn other than the one being admitted is rejected.
+func durableIdentityContract(t *testing.T, factory Factory) {
+	t.Run("durable_identity", func(t *testing.T) {
+		t.Run("turn id and agent path round trip through admit turn and append message", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-durable-identity")
+			r := admitRun(t, ctx, subject.Store, run("run-durable-identity", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			userMessage := message("durable-identity-user", s.ID, r.ID, session.RoleUser)
+			userMessage.TurnID = "turn-durable-identity"
+			userMessage.AgentPath = "root"
+			assistant := message("durable-identity-assistant", s.ID, r.ID, session.RoleAssistant)
+			assistant.TurnID = "turn-durable-identity"
+			assistant.AgentPath = "root"
+			request := session.AdmitTurnRequest{
+				Turn:                 buildTurn("turn-durable-identity", r, 1, at),
+				UserMessages:         []session.Message{userMessage},
+				AssistantPlaceholder: assistant,
+				Event:                turnStartedEvent("turn-durable-identity-started", r, "turn-durable-identity", at),
+			}
+			if _, err := execution.AdmitTurn(ctx, request); err != nil {
+				t.Fatalf("admit turn: %v", err)
+			}
+			// A follow-up message this turn appends outside admission (e.g.
+			// a tool result or approval response) stamps the same identity.
+			followUp := message("durable-identity-followup", s.ID, r.ID, session.RoleUser)
+			followUp.TurnID = "turn-durable-identity"
+			followUp.AgentPath = "root"
+			followUp.CreatedAt, followUp.UpdatedAt = at.Add(time.Second), at.Add(time.Second)
+			if _, err := execution.AppendMessage(ctx, followUp); err != nil {
+				t.Fatalf("append message: %v", err)
+			}
+			batch, err := subject.Store.ListMessages(ctx, s.ID, session.ReplayCursor{Limit: 10})
+			if err != nil {
+				t.Fatalf("list messages: %v", err)
+			}
+			seen := map[session.MessageID]session.Message{}
+			for _, msg := range batch.Messages {
+				seen[msg.ID] = msg
+			}
+			for _, id := range []session.MessageID{"durable-identity-user", "durable-identity-assistant", "durable-identity-followup"} {
+				got, ok := seen[id]
+				if !ok {
+					t.Fatalf("message %s missing from replay", id)
+				}
+				if got.TurnID != "turn-durable-identity" || got.AgentPath != "root" {
+					t.Fatalf("message %s identity = %#v, want turn-durable-identity/root", id, got)
+				}
+			}
+		})
+
+		t.Run("turn id left unset on a message is tolerated", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-durable-identity-unset")
+			r := admitRun(t, ctx, subject.Store, run("run-durable-identity-unset", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			request := session.AdmitTurnRequest{
+				Turn:                 buildTurn("turn-durable-identity-unset", r, 1, at),
+				UserMessages:         []session.Message{message("durable-identity-unset-user", s.ID, r.ID, session.RoleUser)},
+				AssistantPlaceholder: message("durable-identity-unset-assistant", s.ID, r.ID, session.RoleAssistant),
+				Event:                turnStartedEvent("turn-durable-identity-unset-started", r, "turn-durable-identity-unset", at),
+			}
+			if _, err := execution.AdmitTurn(ctx, request); err != nil {
+				t.Fatalf("admit turn with unset TurnID on messages: %v", err)
+			}
+		})
+
+		t.Run("a message stamped with a different turn is rejected", func(t *testing.T) {
+			subject := setup(t, factory)
+			ctx := context.Background()
+			s := createSession(t, ctx, subject.Store, "session-durable-identity-mismatch")
+			r := admitRun(t, ctx, subject.Store, run("run-durable-identity-mismatch", s.ID, "owner"))
+			execution := executionFor(subject.Store, r)
+			at := r.CreatedAt.Add(time.Second)
+			userMessage := message("durable-identity-mismatch-user", s.ID, r.ID, session.RoleUser)
+			userMessage.TurnID = "some-other-turn"
+			request := session.AdmitTurnRequest{
+				Turn:                 buildTurn("turn-durable-identity-mismatch", r, 1, at),
+				UserMessages:         []session.Message{userMessage},
+				AssistantPlaceholder: message("durable-identity-mismatch-assistant", s.ID, r.ID, session.RoleAssistant),
+				Event:                turnStartedEvent("turn-durable-identity-mismatch-started", r, "turn-durable-identity-mismatch", at),
+			}
+			if _, err := execution.AdmitTurn(ctx, request); !errors.Is(err, session.ErrConflict) {
+				t.Fatalf("admit turn with mismatched user message TurnID = %v, want ErrConflict", err)
+			}
+		})
+	})
+}

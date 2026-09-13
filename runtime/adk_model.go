@@ -146,7 +146,7 @@ func (m *adkModel) currentMessageID(ctx context.Context) (session.MessageID, err
 	if _, err := m.execution.store.AppendMessage(ctx, session.Message{
 		ID: nextID, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, ParentID: m.engine.assistantMessageID,
 		Role: session.RoleAssistant, Agent: m.engine.snapshot.Config.Agent.Name, ModelID: string(m.activeModel().Model.ID),
-		CreatedAt: at, UpdatedAt: at,
+		TurnID: m.engine.snapshot.TurnID, AgentPath: m.engine.agentPath, CreatedAt: at, UpdatedAt: at,
 	}); err != nil {
 		return "", err
 	}

@@ -35,6 +35,7 @@ func Run(t *testing.T, factory Factory) {
 	inboxContract(t, factory)
 	checkpointContract(t, factory)
 	pausedRunContract(t, factory)
+	durableIdentityContract(t, factory)
 
 	t.Run("atomic run ownership", func(t *testing.T) {
 		subject := setup(t, factory)

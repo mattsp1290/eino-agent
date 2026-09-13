@@ -167,7 +167,7 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	providerMessageSourceIDs := make([]session.MessageID, 0, len(historyMessages)+1)
 	providerMessageSourceIDs = append(providerMessageSourceIDs, paddedMessageSourceIDs(historySourceIDs, len(historyMessages))...)
 	providerMessageSourceIDs = append(providerMessageSourceIDs, request.IDs.UserMessageID)
-	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
+	snapshot, err := freezeTurnSnapshotWithProviderState(request.IDs.RunID, request.IDs.SessionID, request.IDs.ContextEpochID, request.IDs.TurnID, request.Config, request.Model, providerMessages, providerState, request.Config.Agent.SystemPrompt, now)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: freeze snapshot: %v", ErrInvalidAdmission, err)
 	}
@@ -185,12 +185,12 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	if _, err := executionStore.StartContextEpoch(ctx, admissionContextEpoch(request, sessionRecord.ID, now)); err != nil {
 		return admittedRun{}, err
 	}
-	userMessage := admissionUserMessage(request, sessionRecord.ID, runRecord.ID, userAt)
+	userMessage := admissionUserMessage(request, sessionRecord.ID, runRecord.ID, userAt, request.IDs.TurnID)
 	userParts, err := admissionUserParts(request, sessionRecord.ID, runRecord.ID, userMessage.ID, userAt)
 	if err != nil {
 		return admittedRun{}, fmt.Errorf("%w: encode user content: %v", ErrInvalidAdmission, err)
 	}
-	assistantMessage := admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, assistantAt)
+	assistantMessage := admissionAssistantMessage(request, sessionRecord.ID, runRecord.ID, assistantAt, request.IDs.TurnID)
 	turn := session.Turn{
 		ID: request.IDs.TurnID, RunID: runRecord.ID, SessionID: sessionRecord.ID, Ordinal: 1, State: session.TurnAdmitted,
 		UserMessageIDs: []session.MessageID{userMessage.ID}, AssistantMessageID: assistantMessage.ID,
@@ -409,12 +409,13 @@ func admissionRun(request admissionRequest, sessionID session.ID, now time.Time)
 	}
 }
 
-func admissionUserMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time) session.Message {
+func admissionUserMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time, turnID session.TurnID) session.Message {
 	return session.Message{
 		ID:        request.IDs.UserMessageID,
 		SessionID: sessionID,
 		RunID:     runID,
 		Role:      session.RoleUser,
+		TurnID:    turnID,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -436,7 +437,7 @@ func admissionUserParts(request admissionRequest, sessionID session.ID, runID se
 	return session.EncodeContentParts(content, next, messageID, sessionID, runID, now, request.ContentLimits)
 }
 
-func admissionAssistantMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time) session.Message {
+func admissionAssistantMessage(request admissionRequest, sessionID session.ID, runID session.RunID, now time.Time, turnID session.TurnID) session.Message {
 	return session.Message{
 		ID:        request.IDs.AssistantMessageID,
 		SessionID: sessionID,
@@ -445,6 +446,7 @@ func admissionAssistantMessage(request admissionRequest, sessionID session.ID, r
 		Role:      session.RoleAssistant,
 		Agent:     request.Config.Agent.Name,
 		ModelID:   string(request.Model.Model.ID),
+		TurnID:    turnID,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}

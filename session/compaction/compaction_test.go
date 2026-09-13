@@ -82,6 +82,34 @@ func TestBoundaryPayloadCarriesIDsOnly(t *testing.T) {
 	}
 }
 
+// TestBoundaryStampsTurnIDAndAgentPath proves the W7 review's P0 finding
+// (durable-identity-reviewer item 3 / A1's "also"): a compaction boundary
+// message must carry the durable turn identity that triggered compaction,
+// not an empty one. Before this fix, NewBoundary never set Message.TurnID
+// or Message.AgentPath at all, so agui.agenticIdentity fell back to a
+// synthetic turn id for EVERY compacted session, every time -- not just
+// pre-fix data.
+func TestBoundaryStampsTurnIDAndAgentPath(t *testing.T) {
+	t.Parallel()
+
+	boundary, err := NewBoundary(session.ContextEpoch{
+		ID:               "epoch-turn",
+		SessionID:        "session-1",
+		SummarizedFromID: "old-a",
+		SummarizedToID:   "old-b",
+		TailStartID:      "tail",
+	}, BoundaryIDs{MessageID: "summary", PartID: "part", TurnID: "turn-that-triggered-compaction", AgentPath: "root"}, "run-1", time.Unix(1, 0).UTC(), "Summary")
+	if err != nil {
+		t.Fatalf("NewBoundary error = %v", err)
+	}
+	if boundary.Message.TurnID != "turn-that-triggered-compaction" {
+		t.Fatalf("boundary.Message.TurnID = %q, want %q", boundary.Message.TurnID, "turn-that-triggered-compaction")
+	}
+	if boundary.Message.AgentPath != "root" {
+		t.Fatalf("boundary.Message.AgentPath = %q, want %q", boundary.Message.AgentPath, "root")
+	}
+}
+
 func TestAppendBoundaryWritesReplayableRecords(t *testing.T) {
 	t.Parallel()
 

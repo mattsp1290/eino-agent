@@ -185,6 +185,9 @@ type terminalToolSearchEnvelopeInput struct {
 	BlockID       string
 	ContentLimits session.ContentLimits
 	Matches       []Tool
+	// TurnID and AgentPath are stamped onto ResultMessage. Optional.
+	TurnID    session.TurnID
+	AgentPath string
 }
 
 // buildTerminalToolSearchEnvelope is the tool-search analogue of
@@ -235,7 +238,8 @@ func buildTerminalToolSearchEnvelope(input terminalToolSearchEnvelopeInput) (ses
 		Output: output, CompletedAt: input.CompletedAt.UTC(),
 		ResultMessage: session.Message{
 			ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID,
-			Role: session.RoleUser, ModelID: input.ModelID, CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
+			Role: session.RoleUser, ModelID: input.ModelID, TurnID: input.TurnID, AgentPath: input.AgentPath,
+			CreatedAt: input.MessageAt.UTC(), UpdatedAt: input.MessageAt.UTC(),
 		},
 		ResultPart: parts[0],
 	}, nil
@@ -303,6 +307,7 @@ func (e *runExecution) executeToolSearchCall(ctx context.Context, snapshot TurnS
 	settlement, err := buildTerminalToolSearchEnvelope(terminalToolSearchEnvelopeInput{
 		Claimed: claimed.Call, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt, MessageAt: messageAt,
 		BlockID: string(e.host.ids.NewPartID()), ContentLimits: e.host.contentLimits, Matches: matches,
+		TurnID: snapshot.TurnID, AgentPath: snapshot.AgentPath,
 	})
 	if err != nil {
 		return failSettlement(err)
@@ -367,6 +372,7 @@ func (e *adkEngine) executeAndSettleHandlerToolSearch(ctx context.Context, tool 
 	settlement, err := buildTerminalToolSearchEnvelope(terminalToolSearchEnvelopeInput{
 		Claimed: claimed, ModelID: string(snapshot.Model.Model.ID), CompletedAt: completedAt, MessageAt: messageAt,
 		BlockID: string(execution.host.ids.NewPartID()), ContentLimits: execution.host.contentLimits, Matches: matches,
+		TurnID: snapshot.TurnID, AgentPath: snapshot.AgentPath,
 	})
 	if err != nil {
 		return failSettlement(err)

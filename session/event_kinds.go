@@ -44,4 +44,17 @@ const (
 	// told apart from the version this run actually used. Correlation
 	// carries the skill name.
 	SkillActivatedEventKind = "skill_activated"
+	// MessageCommittedEventKind marks a durable message becoming readable:
+	// emitted once after an assistant turn's content commits
+	// (persistAssistantTurn) and once after each tool call settles
+	// (persistToolSettlement), always carrying the committed message's ID
+	// (EventRecord.MessageID) and the session's observation-watermark
+	// revision at the moment of commit (see the "revision" field in
+	// Payload). It is the notification an AG-UI bridge or other watcher
+	// uses to know a durable projection is now safe to build and emit --
+	// the underlying content is already committed regardless of whether
+	// this notification itself is ever observed, so publishing it is
+	// best-effort and its own failure never unwinds the commit it
+	// describes. Ordinary AppendEvent payload, not canonical.
+	MessageCommittedEventKind = "message_committed"
 )

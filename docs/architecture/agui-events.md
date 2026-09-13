@@ -45,7 +45,7 @@ and never replayed.
 
 | Family | Persisted durable fact | Replay behavior | Live-tail behavior | Omitted |
 | --- | --- | --- | --- | --- |
-| Run lifecycle | `session.EventRecord` audit with run status metadata. | Not replayed as raw `RUN_STARTED`/`RUN_FINISHED`; replay exposes current run/message state. | Emit live through `eino-agui/emitter`. | None, except transport-only write failures. |
+| Run lifecycle | `session.EventRecord` audit with run status metadata. | `replay()` forwards every durable, non-`LiveOnly` run lifecycle record (`run_started`, run settlement) to `bridge.Emit` like any other durable event, and `Bridge.Emit` maps them to raw `RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR` -- see `agui/replay_test.go`'s `TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas`, which asserts exactly this sequence. | Emit live through `eino-agui/emitter`. | None, except transport-only write failures. |
 | Text | Settled `session.Part{Kind: PartAssistantGenText}` on assistant message. | Replay as AG-UI assistant message content projected from durable parts. | Emit `TEXT_MESSAGE_*` deltas live. | Empty deltas. |
 | Plain reasoning | `session.Part{Kind: PartReasoning}` only when provider and host policy allow storage. | Replay as reasoning content only from durable reasoning parts. | Emit `REASONING_*` live while allowed. | Provider-private or policy-denied reasoning. |
 | Encrypted reasoning | Never persisted. | Never replayed. | Not emitted by `eino-agent`; scrub from snapshots. | All encrypted reasoning payloads. |
@@ -54,11 +54,11 @@ and never replayed.
 | Tool results | `PartFunctionToolResult` plus settled `session.ToolCall` output/error. | Replay bounded model-facing tool result from durable part. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
 | State snapshots | No durable `PartKind` today (would be host-visible app state, distinct from the W2 model-content block kinds); only when host marks snapshot replay-safe. | Replay latest replay-safe snapshot or host-projected state, once implemented. | Emit live snapshot when state changes. | Sensitive or non-replay-safe host state. |
 | State deltas | Optional `EventRecord` audit. | Do not replay raw deltas; replay starts from snapshot. | Emit live deltas. | Deltas superseded by snapshot. |
-| Messages snapshots | Not stored as raw AG-UI frames. | Reconstruct from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
+| Messages snapshots | Not stored as raw AG-UI frames. | `agui.Replay`/`agui.Reconnect` (the built-in Bridge) do **not** emit one -- see "Replay Projection" below. `agui.WatchBridge.Initial` does, reconstructed from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
 | Activity | Optional `EventRecord` audit metadata. | Not replayed as conversation content. | Emit live activity. | Transient activity with no audit value. |
 | Steps | Not persisted today: `Bridge.StepStarted`/`StepFinished` are pure passthroughs to the live emitter and write no durable part or `EventRecord`. (`session.AttemptReplacedEventKind` is a separate, unrelated model-dispatch-retry audit trail, not a record of step boundaries.) | Not replayed; may become annotations/status where UI supports it, once a durable representation is implemented. | Emit live `STEP_*`. | None. |
 | Custom events | Optional audit `EventRecord`. | Not replayed unless promoted to a future typed replay contract. | Emit live. | Unknown sensitive payloads by policy. |
-| Errors | `EventRecord` plus terminal run/message status. | Replay terminal status/error summary, not necessarily raw `RUN_ERROR`. | Emit live `RUN_ERROR` or related error event. | Provider/internal details redacted by policy. |
+| Errors | `EventRecord` plus terminal run/message status. | A durable run settlement record carrying `Error.Message` replays as a raw `RUN_ERROR`, exactly like any other durable lifecycle record above -- replay does not summarize it into a different shape. | Emit live `RUN_ERROR` or related error event; `transport.SSEHandler`'s out-of-band terminal frame (`agui.Bridge.Terminate`, see "Error Handling" below) uses a fixed, policy-safe message, never the triggering error's own text. | Provider/internal details redacted by policy. |
 
 ## Type Contract
 
@@ -82,9 +82,18 @@ and `eino-agui/stream`. `AuditKind` is only a stable label for optional
 Conditional content remains unsafe until its gate is satisfied:
 
 - `GateProviderReasoningStorage`: required before plain reasoning can be
-  persisted, included in snapshots, or replayed.
+  persisted, included in snapshots, or replayed. `agui.Gate` values name
+  these requirements for documentation and the policy table; they are not
+  independently enforced by any code path. The actual mechanism a host
+  uses to attest this gate is satisfied is the `includeReasoning`/
+  `IncludeReasoning` boolean threaded through `agui.Replay`/
+  `agui.Reconnect`/`Bridge`/`transport.SSEConfig` (see the paragraph on it
+  under "Replay Projection" below) -- passing `true` there IS the
+  attestation; this package trusts it and does not separately verify
+  provider/host policy.
 - `GateHostReplaySafeState`: required before host state snapshots can be
-  persisted, included in snapshots, or replayed.
+  persisted, included in snapshots, or replayed. Also a documentation
+  label, not an enforced check.
 
 ## Replay Projection
 
@@ -92,31 +101,133 @@ Replay uses this order:
 
 1. Read durable messages and parts with `session.Store.ListMessages`.
 2. Exclude encrypted reasoning and policy-denied content.
-3. Apply rule gates before including reasoning or state snapshot content.
+3. Gate reasoning content on the host's `includeReasoning`/`IncludeReasoning`
+   attestation (see "Type Contract" above -- `agui.Gate` values are
+   documentation labels only; `includeReasoning` is the actual mechanism,
+   there is no separate "apply rule gates" step).
 4. Materialize assistant/user/tool messages from durable parts.
 5. Convert replayable messages through `eino-agui/convert`.
-6. Emit a messages snapshot or replay response through the transport adapter.
+6. Emit the replay response (committed-projection events; the built-in
+   Bridge does **not** emit a messages snapshot -- see below) through the
+   transport adapter.
 7. If a run is active, attach to live tail from the current run cursor.
 
 Replay must preserve durable message/part ordering from `store/storetest`.
 Replay must not infer conversation content from `session.EventRecord.Payload`.
 
-`agui.Replay` materializes its message snapshot through
-`history.Load`/`history.Project` -- the classic (non-agentic) projector, not
-`history.ProjectAgentic`. That projector fails closed with
-`history.ErrClassicUnsupported` (surfacing as a `Replay` error) for any
-durable content it cannot represent as a flat `*schema.Message`: the
-`tool_search_result`, `server_tool_call`/`server_tool_result`,
+As of W7, `agui.Replay` materializes its message snapshot through the
+**agentic** pipeline, not the classic one: `emitMessageSnapshot`
+(`agui/replay.go`) projects every durable message via
+`history.ProjectAgentic`/`convert.ToAgenticProjection` and emits each one
+through `emitter.Emitter.EmitCommittedProjection` with
+`DeliveryModeReplay`. This removes the `history.ErrClassicUnsupported`
+failure the classic (non-agentic) `history.Load`/`history.Project` path hit
+on `tool_search_result`, `server_tool_call`/`server_tool_result`,
 `mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result`,
-`mcp_tool_approval_request`/`mcp_tool_approval_response` block kinds, and any
-assistant-role media block. The runtime writes all of these kinds today (for
-example `runtime/tool_search.go` writes `tool_search_result` and
-`runtime/adk_approval.go` writes `mcp_tool_approval_response`), so
-`agui.Replay` of a session containing tool-search or MCP-approval activity
-fails today rather than silently flattening or dropping that content. This is
-pre-existing, deliberate fail-closed behavior, not a regression; widening AG-UI
-replay to cover these block kinds through the `eino-agui` bridge is tracked
-for a future work package (W7).
+`mcp_tool_approval_request`/`mcp_tool_approval_response`, and assistant-role
+media blocks. **These specific kinds have no native AG-UI representation at
+all** (`convert.nativeEventsForBlock` returns none for them): they replay as
+an `eino.agentic.v1` custom content-block supplement **only**. Only
+`reasoning`, `assistant_gen_text`, `function_tool_call`, and text-only
+`function_tool_result` blocks get a native representation alongside their
+supplement; every other block kind -- including every `user_input_*` kind --
+is custom-supplement-only.
+
+`emitMessageSnapshot` does **not** emit a `MESSAGES_SNAPSHOT`. An earlier W7
+fix pass added one built from each projection's `NativeMessage` (populated
+by `convert.ToAgenticProjection` for user-role messages only -- see
+eino-agui's `nativeUserMessage`), emitted ahead of the per-message
+projections, so a native-only client could see user-role history. That
+snapshot was reverted: `NativeMessage` is user-role-only upstream, so it
+carried user turns alone, ahead of every assistant projection emitted after
+it -- reordering a `U1,A1,U2,A2` transcript into `U1,U2,A1,A2` for any
+client that treats `MESSAGES_SNAPSHOT` as authoritative -- and it ignored
+the cursor entirely, clobbering client state on a cursored reconnect.
+eino-agui's own `nativeUserMessage` doc comment states the design intent
+directly: hosts assemble snapshots from their own complete committed
+transcript, so this bridge must not overwrite unrelated history while
+projecting one durable record. **A native-only AG-UI client -- one that
+never parses the `eino.agentic.v1` custom envelope -- therefore has no
+representation of user-role history on this path at all.** A host that
+needs native-only clients to see user turns must assemble its own
+`MESSAGES_SNAPSHOT` from its complete committed transcript (as eino-agui's
+own doc comment recommends), not rely on `agui.Replay`/`agui.Reconnect` to
+supply one.
+
+**The replacement committed-projection replay also ignores the replay
+cursor, and is not idempotent the way the reverted `MESSAGES_SNAPSHOT` was.**
+`emitMessageSnapshot` calls `loadCommittedProjections`, which loads the
+**entire** durable session history (`history.LoadBatch`, no cursor, no
+limit) on every `agui.Replay`/`agui.Reconnect` call, and emits each message
+as append-style native `TEXT_MESSAGE_*`/`TOOL_CALL_*`/... events plus one
+`eino.agentic.v1` `CUSTOM` per content block. A `MESSAGES_SNAPSHOT` is
+idempotent (a client replaces its whole transcript on each one); this is
+not -- a client that reconnects with a cursor still receives its full
+durable history a second time as new native content. A client must
+therefore dedupe on `eino.agentic.v1` block identity (`identity.messageId`
++ the block's position) rather than assume a cursored reconnect only
+re-delivers what is new (W7 fifth fix-pass review I1).
+
+**An unfinalized, still-streaming assistant message row is excluded from
+`loadCommittedProjections`, not projected as a zero-frame placeholder** (W7
+fifth fix-pass review P0-2). `runtime/adk_model.go` appends the assistant
+message ROW at `begin()` time, before the model streams a single token;
+its content parts are only written at `persistAssistantTurn`, strictly
+later. `store.ListMessages` has no `finalized` predicate, so this in-flight
+row is visible to a reload for the entire duration of the streaming turn.
+Before this fix, `emitMessageSnapshot` projected it anyway (a zero-content-
+block `AgenticMessage` that emitted no frames) and still marked it
+delivered in `Bridge.projectedMessages` -- so on a mid-stream reconnect,
+EVERY subsequent live `EventMessageDelta` for that exact message id was
+immediately dropped by `emitMessageDelta`'s own guard as "already
+delivered", even though nothing had actually reached the client: the
+reconnecting client saw a valid, error-free, but completely empty stream
+for the rest of that turn. `loadCommittedProjections` now applies the same
+check `runtime.dropUnfinalizedAssistantPlaceholders` already applies on
+the model-input side (`runtime/adk_model.go`): a message that projects to
+`Role == assistant` with zero content blocks is skipped outright.
+`TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder`
+(`agui/replay_p0_regression_test.go`) proves the live delta reaches the
+wire end to end, against a real SQLite store, driving `Reconnect` exactly
+as a host would.
+
+`TestReplayMessageSnapshotIncludesUserMediaBlock` in `agui/replay_test.go`
+proves the media content reaches the stream for `user_input_text`/
+`user_input_image` as a `CUSTOM` supplement; it does not cover, and does not
+prove anything about, `tool_search_result`/`server_tool_*`/`mcp_*`/assistant
+media. See "W7: Agentic committed-projection replay and live emission"
+below for the full mechanism. The classic `history.Load`/
+`convert.ToAGUIMessages` path still exists and is still used by
+`transport.DecodeMessages` for classic JSON ingress; it is `agui.Replay`'s
+emission path specifically that no longer uses it.
+
+`agui.Replay`/`agui.Reconnect` also take an explicit `includeReasoning`
+parameter (`transport.SSEConfig.IncludeReasoning` at the HTTP boundary),
+defaulting to `false`. This is a **host attestation**, not a policy check
+this package independently verifies: `agui.GateProviderReasoningStorage`
+(`agui/policy.go`) is a documentation/policy label, not a value any code
+path reads. `includeReasoning`/`IncludeReasoning` is the actual mechanism,
+and it gates durable reasoning content blocks in the message snapshot, live
+commit reprojection, **and** the live `EventMessageDelta` path
+(`Bridge.emitMessageDelta`) uniformly -- a host that has not set it to
+`true` sees no reasoning on any of the three. A host that never sets it
+gets the same default the pre-W7 classic pipeline had (no durable reasoning
+replayed).
+
+`session.MessageCommittedEventKind` ("message_committed") durable events
+are always forwarded to `bridge.Emit`, like any other non-`LiveOnly`
+durable event (see `replay()` in `agui/replay.go`); `Bridge` itself is what
+skips a redundant one. `Bridge` tracks every message ID it has already
+emitted through the committed-projection path (snapshot emission or an
+earlier live continuation) for the life of a connection
+(`Bridge.projectedMessages`); `emitLiveMessageCommitted` skips a
+notification naming a message already in that set instead of re-projecting
+it. This is what lets a message that commits **during** the replay window
+(never covered by the snapshot, so not in that set yet) reach the client
+instead of being dropped alongside the ones the snapshot already covers --
+the earlier, broader "skip every `message_committed` during replay" rule
+did the latter unconditionally, silently losing that message for the life
+of the connection.
 
 ## Live Tail
 
@@ -148,8 +259,10 @@ replay:
 - encrypted reasoning is excluded;
 - provider-private state, its base64 representation, digests, and source bindings are excluded;
 - provider-private reasoning is excluded unless explicitly allowed;
-- plain reasoning is excluded unless `GateProviderReasoningStorage` is
-  satisfied;
+- plain reasoning is excluded unless a host attests
+  `GateProviderReasoningStorage` is satisfied (see `includeReasoning` above
+  -- this package trusts the attestation, it does not independently verify
+  it);
 - raw oversized tool output is replaced by bounded output and durable
   attachment references;
 - state snapshots are stored only when host policy marks them replay-safe;
@@ -163,10 +276,41 @@ Errors have two projections:
   interrupted state;
 - live transport: AG-UI error events notify connected clients.
 
-Replay should prefer durable status summaries over raw historical `RUN_ERROR`
-frames. Redaction is governed by `session.RedactionClass`,
-`runtime.RedactionClass`, the `obs` field policy model, and
-`docs/architecture/observability.md`.
+Replay forwards a durable run settlement's raw `RUN_ERROR` exactly like any
+other durable lifecycle record (see the classification table's Errors row);
+it does not summarize error state into a different shape. Redaction is
+governed by `session.RedactionClass`, `runtime.RedactionClass`, the `obs`
+field policy model, and `docs/architecture/observability.md`.
+
+`transport.SSEHandler` additionally emits a terminal `RUN_ERROR` frame
+out-of-band, via `agui.Bridge.Terminate`, when `agui.Reconnect` itself
+returns a non-nil error after the response has already written at least one
+byte (so a non-200 status is no longer available to signal the failure).
+This is distinct from the durable/live projections above: it never carries
+the triggering error's own text (a fixed, policy-safe message instead --
+see `Bridge.TerminalErrorMessage`), it is suppressed for a benign
+`context.Canceled` (a client disconnect or graceful server shutdown, where
+nothing is listening or nothing was truncated), and it is a no-op once a
+terminal frame (a durable `RUN_FINISHED`/`RUN_ERROR`, or an earlier
+`Terminate` call) has already reached the wire for the connection --
+`RUN_FINISHED` and `RUN_ERROR` are both terminal for a run, and a client
+must never see a second one.
+
+This at-most-one-terminal-frame invariant is enforced at every producer
+that can write a `RUN_ERROR`, not only `Terminate` (W7 fifth fix-pass
+review P0-3): `Emit`'s own `runtime.EventRunFinished` case, `Terminate`,
+`emitToolCallUpdated`'s malformed-payload branch, and the exported
+`Bridge.Error` all check/set the same `Bridge.terminated` flag before
+writing. The latter two route through a single shared helper,
+`emitTerminalError`, specifically so a future new `RUN_ERROR` producer
+does not have to re-derive the check: it also closes any open
+`TEXT_MESSAGE`/`REASONING` span first and never puts a caller- or
+error-supplied string on the wire, only the fixed `TerminalErrorMessage` --
+matching `Terminate`'s own contract. Before this fix, only two of these
+four producers enforced the invariant: a single malformed tool payload
+wrote an unredacted `RUN_ERROR` (the raw `encoding/json` parser message)
+without setting `terminated`, so a subsequent `Terminate` call added a
+SECOND `RUN_ERROR` frame to the same connection.
 
 ## Implementation Requirements for Bridges
 
@@ -201,3 +345,182 @@ tool arguments/results, arbitrary error text, configuration or reasoning.
 This current-state API coalesces revisions and does not promise every
 RUN_STARTED or TOOL_CALL event. The historical classification table above
 describes the separate event/replay policy, not the watch allowlist.
+
+## W7: Agentic committed-projection replay and live emission
+
+This section states only what W7's implementation and tests actually prove;
+it does not describe an aspirational end state. See
+`docs/dependency-status.md` for the pinned `eino-agui` commit.
+
+### Durable identity (session.Message.TurnID / AgentPath)
+
+`session.Message` carries `TurnID` and `AgentPath`, stamped at most (not
+quite every -- see below) append sites (admission, turn admission,
+continuation dispatch, approval response, tool settlement, tool search
+settlement, crash-reconciled carrier turns, and now the compaction boundary
+message -- `session/compaction`). Both are record-JSON-only correlation
+fields, matching the pre-existing `EventRecord.TurnID`/`AgentPath` and
+`ModelRequestRecord.TurnID`/`AgentPath` convention (no SQL column or index
+backs any of the four); no migration was needed. `agui.agenticIdentity`
+keys the projected agent-path segment off `AgentPath` specifically (not the
+separate `Agent` field, which carries the configured agent's display name
+and is set only on assistant messages) so every message in one turn --
+user and assistant alike -- projects the same agent path; `AgentPath` is
+always empty today (a single root-agent path segment named `"root"` is
+synthesized at projection time) because subagent nesting is not wired end
+to end anywhere in the runtime yet.
+
+Not every durable message actually gets a `TurnID`: all pre-W7 data, every
+compaction boundary message before this fix, and
+`runtime.settleInterruptedTool`'s deliberate crash-reconciliation stamp
+(that function's own doc comment explains why: no by-ID message read exists
+to recover the calling message's turn) all carry an empty `TurnID`.
+`convert.validateIdentity` rejects an empty `TurnID` outright, so
+`agui.agenticIdentity` substitutes a deterministic synthetic id
+(`"msg:" + message.ID`) whenever `TurnID` is empty -- mirroring
+`blockContexts`' existing synthetic-block-id precedent -- so a single such
+message can never fail `loadCommittedProjections`' whole batch and brick
+replay for an entire session.
+
+An assistant message's "attempt identity" for AG-UI purposes is the
+`InvocationID` of the `ModelRequestRecord` that produced it (existing
+`AssistantMessageID` linkage); a user message, or an assistant message with
+no ledger row, uses its own `MessageID` as a stable, never-retried attempt id
+(`agui/agentic_projection.go`'s `attemptResolver`).
+
+`session.MessageCommittedEventKind` ("message_committed") is a new,
+non-canonical durable event, published (best-effort; its own failure never
+unwinds an already-committed write) once after `persistAssistantTurn`
+commits an assistant message's content and once after each tool call
+settles (`runtime/message_commit_event.go`), carrying the message id and the
+session's observation-watermark revision at commit time.
+
+### Committed-projection emission (agui/bridge.go, agui/replay.go)
+
+Both the durable replay path and the live path build an eino-agui
+`convert.AgenticProjection` per durable message and emit it through
+`emitter.Emitter.EmitCommittedProjection`:
+
+- **Replay** (`emitMessageSnapshot`): every durable message in a session,
+  projected via `history.ProjectAgentic` and `convert.ToAgenticProjection`,
+  emitted with `DeliveryModeReplay` (a native AG-UI representation for the
+  content kinds `convert.nativeEventsForBlock` maps one to -- `reasoning`,
+  `assistant_gen_text`, `function_tool_call`, text-only
+  `function_tool_result` -- plus one `eino.agentic.v1` custom content-block
+  supplement per block, always; nothing is silently dropped, but a kind
+  outside that native list, e.g. `tool_search_result` or `mcp_*`, gets the
+  custom supplement only, never a native event). No `MESSAGES_SNAPSHOT` is
+  emitted (see the Replay Projection section above for why).
+- **Live** (`Bridge.Emit`'s `session.MessageCommittedEventKind` case,
+  `emitLiveMessageCommitted`): reprojects the *whole session's* durable
+  history and emits only the one message the event named. The delivery
+  mode depends on whether THIS connection has already natively streamed
+  THIS message's content (`Bridge.nativeStreamed`, a per-message record set
+  by `emitMessageDelta`/`emitToolCallUpdated`), not on which phase of the
+  connection observed the notification:
+  - if not, `DeliveryModeCommittedOnly` (native events, for the same
+    content kinds `DeliveryModeReplay` above natively represents, plus the
+    custom supplement) -- this covers a message that first commits
+    strictly during the replay window, never covered by the snapshot, but
+    also any other case where this connection has not (yet) natively
+    streamed the message;
+  - if so, `DeliveryModeLiveContinuation` (custom supplement only):
+    representable native content for THIS connection's own live turn
+    already streamed via `emitMessageDelta`/`emitToolCallUpdated` before
+    the message committed, so this must not duplicate it as a second
+    native event.
+
+  An earlier version of this mode selection keyed off a connection-phase
+  flag (`Bridge.inReplaySweep`, true only while `replay()`'s own durable
+  `ListEvents` sweep was running) instead of a per-message record. The
+  fourth W7 fix-pass review's P0-1 finding
+  (`reviews/w7-fixes3-2026-09-12/`) showed that flag was wrong: `Reconnect`
+  subscribes to the live tail *before* calling `replay()`, so a delta for a
+  message the sweep already found fully committed can still be sitting
+  buffered in that tail's channel, to be drained by the live loop *after*
+  the sweep already delivered that message's native content -- a phase
+  flag cannot tell that case apart from "this connection's own live turn
+  already streamed it", but a per-message record can. `emitMessageDelta`
+  also gained a companion guard for the mirror case: a delta naming a
+  message already recorded in `Bridge.projectedMessages` (already
+  delivered through the committed-projection path) is dropped outright,
+  since a delta for a message strictly precedes that message's own
+  commit, by construction -- so any further delta naming an
+  already-projected message on this connection is necessarily stale.
+
+  **`emitToolCallUpdated` does NOT share that guard** (W7 fifth fix-pass
+  review P0-1). A prior fix pass added the identical
+  `Bridge.projectedMessages` check to `emitToolCallUpdated`, reasoning by
+  analogy from `emitMessageDelta` -- but the staleness argument does not
+  hold there: a `tool_call_updated` record's `MessageID` is the *owning
+  assistant message* (`session/tool_transition.go`), and that message is
+  published *after* it has already committed
+  (`runtime/tool_preparation.go` publishes `message_committed` for the
+  assistant strictly before its own tool transitions), not before. Keying
+  suppression on message identity therefore suppressed *every* tool-call
+  event on *every* turn that called a tool -- the common case, not an edge
+  case -- reaching the wire as a bare `TOOL_CALL_RESULT` for a call the
+  client never saw opened, with no `TOOL_CALL_START`/`ARGS`/`END` and no
+  `TEXT_MESSAGE_END`. The real dedup key for a tool call is the call
+  itself: `Bridge.toolCallNativeSuppressed` (set by
+  `emitLiveMessageCommitted`'s `recordNativeToolDelivery`, from the
+  assistant message's own committed-projection emission of that call's
+  `function_tool_call` block, when that emission's `DeliveryMode` actually
+  included natives) and `Bridge.toolCallLiveStartSent` (set by
+  `emitToolCallUpdated` itself, since a durable `tool_call_updated` record
+  repeats the call's Name/Arguments at every phase -- pending/running/
+  terminal -- so the live path must dedupe its OWN repeated Start/Args
+  too) together decide whether to (re-)emit that call's native
+  `TOOL_CALL_START`/`ARGS`/`END`; `Bridge.toolCallResultSent` is the
+  symmetric guard for the terminal `TOOL_CALL_RESULT`, since a tool
+  call's separate *result* message commits (and can independently trigger
+  a native `TOOL_CALL_RESULT` from its own `function_tool_result` block)
+  strictly *after* the live terminal transition that already sent one.
+
+  A `message_committed` naming a message not (yet) present in a reload's
+  projections (a benign miss -- see `publishMessageCommitted`'s
+  best-effort, separate-call choreography below) is skipped silently and
+  does NOT set `Bridge.liveErr`; only a hard reload failure (a decode or
+  store error) does, and only that is fatal to `Replay`/`Reconnect`.
+  Reprojecting the whole session per commit is a known O(session history)
+  cost: `session.Store` exposes no by-ID single-message read today, so
+  this reuses the same tested path replay uses rather than an unverified
+  narrower one. A future single-message store read should remove this
+  cost without changing behavior.
+
+Every emitted projection's `CommitReceiptV1` binds `Domain: "projection"`,
+the exact `Identity` eino-agui computed, and `Digest: ProjectionDigestV1`.
+Replay's shared revision comes from `session.ObservationReader.
+ReadObservationRevision`, queried once per replay call; every message in
+that call safely shares the same revision string, because eino-agui's
+receipt dedup key (`agenticReceiptKey`) folds the full `Identity` in
+alongside `Revision` -- the identity fields still disambiguate messages that
+share one revision. That same revision-folding means the SAME message
+re-projected under a **different** revision is not deduplicated at the
+receipt layer at all: this is why `Bridge` maintains its own
+connection-lifetime record of which message IDs it has already emitted
+through the committed-projection path (`Bridge.projectedMessages`) and
+`emitLiveMessageCommitted` consults it before re-projecting, rather than
+relying on `agenticReceiptKey` to catch a redundant `message_committed`
+notification for a message the snapshot (or an earlier live continuation)
+already delivered.
+
+### Not yet implemented (deferred, not silently dropped)
+
+- Full lifecycle mapping: `run_paused` with `InterruptTargetV1` built from
+  validated durable approval/interrupt records, `run_resumed`,
+  `attempt_replaced`, and subagent events. The runtime does not emit
+  `session.SubagentStartedEventKind`/`SubagentFinishedEventKind`/
+  `SubagentErrorEventKind` anywhere yet (subagent nesting is not wired), so
+  there is nothing for a bridge mapping to consume for that family today.
+- Transient per-block live deltas via `convert.TransientEventForBlock` (the
+  live path today still uses the classic `TextStart`/`TextContent`/
+  `ToolStart`/... emitter methods for in-flight deltas; only the *committed*
+  projection at commit time uses the agentic path).
+- `transport.DecodeUserMessage` (rich AG-UI input decode into
+  `runtime.UserMessage` blocks) exists and is tested but is not yet wired as
+  the default ingress path in `SSEHandler`/`examples/minimal-server`; the
+  classic `DecodeMessages` remains the default for existing callers.
+- Watch (`watch/`) bounded public block state and a block-indexed live
+  overlay, and the observability typed-callback adapters with a single
+  accounting source, are untouched by W7.

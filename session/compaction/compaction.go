@@ -13,6 +13,17 @@ import (
 type BoundaryIDs struct {
 	MessageID session.MessageID
 	PartID    session.PartID
+	// TurnID stamps the boundary message with the durable turn that
+	// triggered compaction, mirroring session.Message.TurnID. Without it,
+	// the boundary message carries an empty TurnID forever, which forces
+	// agui's identity projection (agui.agenticIdentity) to fall back to a
+	// synthetic turn id on every replay of every compacted session (W7
+	// review finding). Optional: a caller that leaves it empty gets that
+	// same synthetic-fallback behavior, just like any other unstamped
+	// message.
+	TurnID session.TurnID
+	// AgentPath mirrors session.Message.AgentPath for the same reason.
+	AgentPath string
 }
 
 // SummaryPayload is stored in a PartCompaction record and replayed as text.
@@ -64,6 +75,8 @@ func NewBoundary(epoch session.ContextEpoch, ids BoundaryIDs, runID session.RunI
 			SessionID: epoch.SessionID,
 			RunID:     runID,
 			Role:      session.RoleSystem,
+			TurnID:    ids.TurnID,
+			AgentPath: ids.AgentPath,
 			CreatedAt: now,
 			UpdatedAt: now,
 		},
