@@ -2858,16 +2858,23 @@ this fixture file itself exercises. This W8 pass does not claim either.
   `agentic_fixture_test.go` is copied unconditionally, so it also runs
   under the PostgreSQL consumer mode once the coordinator executes it.
 - No new authoritative root-level (`store/postgres`/`runtime`,
-  `postgres_integration`-tagged) storage/recovery test was added: every
-  capability this pass proves through a live durable turn already has
-  existing PostgreSQL-tagged coverage from W1-W7 (for example
-  `durable_identity`, `turn_loop_pause_resume` in
+  `postgres_integration`-tagged) storage/recovery test was added: the
+  storage primitives underlying every capability this pass proves through a
+  live durable turn already have existing PostgreSQL-tagged coverage from
+  W1-W7 (for example `durable_identity`, `turn_loop_pause_resume` in
   `POSTGRES_REQUIRED_SUITES`), and the two genuinely new proofs above
   (native-provider continuation, server/MCP direct-store content) are
   exercised against SQLite, consistent with every existing
-  `testdata/external-consumer/` fixture. `Makefile`'s
-  `POSTGRES_REQUIRED_SUITES` is therefore unchanged by this pass; this is a
-  deliberate scope decision, not an oversight.
+  `testdata/external-consumer/` fixture. One exception: `ContextEpoch`
+  *storage* is covered under required suites
+  (`TestPostgresRuntime/admission` and `/optional_references`, plus the
+  stale-fence cases, all in `POSTGRES_REQUIRED_SUITES`), but an epoch
+  *produced by the typed summarization middleware specifically* --
+  `TestPublicSummarizationMiddlewareWritesDurableContextEpochSurvivingReopen`
+  -- has its only durable proof in this pass's new SQLite fixture; no
+  PostgreSQL-tagged case exercises the summarization-triggered path.
+  `Makefile`'s `POSTGRES_REQUIRED_SUITES` is therefore unchanged by this
+  pass; this is a deliberate scope decision, not an oversight.
 - The two `eino-agent-td8` deliverables (provider-side per-cell capability
   matrix, native-byte fixture evidence beyond this file) and a merged
   immutable release tag remain open on `eino-providers`' side.
