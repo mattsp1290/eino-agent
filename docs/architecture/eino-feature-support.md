@@ -2525,31 +2525,57 @@ flagged rather than silently ignored.
   `tool_search_result`/`mcp_*`/assistant media. `Bridge.Emit` gains a
   `session.MessageCommittedEventKind` case that reprojects the committed
   message and emits it with one of two delivery modes depending on whether
-  THIS connection has already natively streamed THIS message's content
-  (`Bridge.nativeStreamed`, a per-message record set by
-  `emitMessageDelta`/`emitToolCallUpdated`): `DeliveryModeCommittedOnly`
-  (native events plus the custom supplement) if not -- covering a message
-  that first commits during `replay()`'s own durable sweep, among other
-  cases -- and `DeliveryModeLiveContinuation` (custom supplement only) if
-  so, where representable native content already streamed live via the
-  existing delta path before the message committed. `emitMessageDelta`/
-  `emitToolCallUpdated` also drop any event naming a message already in
-  `Bridge.projectedMessages` outright, as necessarily stale. (An earlier
-  version of this mode selection keyed off a connection-phase flag,
-  `Bridge.inReplaySweep`; the fourth W7 fix-pass review's P0-1 finding
-  replaced it with the per-message record above after finding that a
-  stale, buffered live delta for a message the durable sweep already
-  delivered could still reach `emitMessageDelta` and duplicate its native
-  content -- a phase flag alone could not prevent that. See
-  `docs/architecture/agui-events.md`'s "Committed-projection emission"
-  section for the full mechanism.) A miss -- the named message not (yet)
+  THIS connection has already natively streamed THIS message's TEXT/
+  REASONING content (`Bridge.nativeStreamed`, a per-message record set by
+  `emitMessageDelta` only -- see below for why tool-call natives are
+  tracked separately, per call): `DeliveryModeCommittedOnly` (native events
+  plus the custom supplement) if not -- covering a message that first
+  commits during `replay()`'s own durable sweep, among other cases -- and
+  `DeliveryModeLiveContinuation` (custom supplement only) if so, where
+  representable native content already streamed live via the existing
+  delta path before the message committed. `emitMessageDelta` also drops
+  any delta naming a message already in `Bridge.projectedMessages`
+  outright, as necessarily stale (a delta strictly precedes its own
+  message's commit, by construction). (An earlier version of this mode
+  selection keyed off a connection-phase flag, `Bridge.inReplaySweep`; the
+  fourth W7 fix-pass review's P0-1 finding replaced it with the
+  per-message record above after finding that a stale, buffered live delta
+  for a message the durable sweep already delivered could still reach
+  `emitMessageDelta` and duplicate its native content -- a phase flag
+  alone could not prevent that. See `docs/architecture/agui-events.md`'s
+  "Committed-projection emission" section for the full mechanism.)
+
+  **`emitToolCallUpdated` does NOT share `emitMessageDelta`'s
+  `Bridge.projectedMessages` guard** (W7 fifth fix-pass review P0-1): a
+  `tool_call_updated` record's `MessageID` is the owning ASSISTANT message,
+  which always commits BEFORE any of its own tool transitions publish
+  (`runtime/tool_preparation.go`), so that message is already in
+  `Bridge.projectedMessages` by the time the first such event reaches
+  `Emit` -- a prior fix pass that added the same guard there suppressed
+  EVERY live tool-call event on every tool-calling turn, the common case,
+  not an edge case. Tool-call native dedup is keyed on the CALL instead:
+  `Bridge.toolCallNativeSuppressed` (set when the assistant message's own
+  committed-projection emission already included that call's native
+  `function_tool_call` representation), `Bridge.toolCallLiveStartSent` (the
+  live path's own dedup, since a durable `tool_call_updated` record repeats
+  Name/Arguments at every phase), and `Bridge.toolCallResultSent` (dedup
+  for the terminal `TOOL_CALL_RESULT` against the separate result
+  message's own later commit). See `docs/architecture/agui-events.md`'s
+  "Committed-projection emission" section for the full mechanism. A miss --
+  the named message not (yet)
   present in a reload -- is a benign, non-fatal skip (`Bridge.liveErr` is
   reserved for a hard reload failure; `Bridge.BenignCommitMisses` counts
   it for host observability). `TestReplayForwardsMessageCommittedDuringReplayWindow`,
   `TestBridgeEmitLiveMessageCommittedProjectsDurableContent`, and
   `TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWindow`
-  prove both modes, and the P0-1 dedup, end to end against a real SQLite
-  store. `NewBridge`'s signature grew a
+  prove both modes, and the message-level dedup, end to end against a real
+  SQLite store. `TestBridgeDeliversFullStreamingTextThenToolCallTurn` and
+  `TestBridgeDeliversToolCallTurnWithNoPrecedingTextDelta`
+  (`agui/tool_call_p0_regression_test.go`) prove the per-call tool dedup
+  above end to end, against a real SQLite store, driving `CreateToolCall`/
+  `ClaimToolCall`/`SettleToolCall` and `runtime.BuildToolSettlement` for
+  both DeliveryMode directions -- text streamed before the tool call, and
+  no text streamed at all. `NewBridge`'s signature grew a
   required `(store session.Store, contentLimits session.ContentLimits,
   includeReasoning bool)` triple (a nil store disables the new path;
   existing classic-only tests pass nil), a breaking constructor change per

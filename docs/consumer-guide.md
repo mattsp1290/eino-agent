@@ -25,6 +25,17 @@ cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
 See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
 CloudWeGo Eino is pinned to exactly `v0.9.19`; PostgreSQL 17 is the supported server baseline.
 
+The AG-UI bridge (`agui`, `transport`; adopted in W7) pins
+`github.com/mattsp1290/eino-agui`, which itself requires a root `replace`
+directive for `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
+`github.com/mattsp1290/ag-ui/sdks/community/go`. Go `replace` directives are
+NOT transitive: any host consuming `eino-agent`'s AG-UI packages must add
+that same root replacement to its OWN `go.mod`, or the build will not
+resolve. See `README.md`'s Pins section and
+[docs/dependency-status.md](dependency-status.md) for the exact version to
+pin; `testdata/external-consumer/check.sh` enforces this mechanically for
+this repository's own gate.
+
 The separately published generated-bindings dependency remains
 `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, through repository tag
 `wasmext/gen/v0.1.0`. Consumers need no workaround for that dependency. Earlier

@@ -154,6 +154,43 @@ needs native-only clients to see user turns must assemble its own
 own doc comment recommends), not rely on `agui.Replay`/`agui.Reconnect` to
 supply one.
 
+**The replacement committed-projection replay also ignores the replay
+cursor, and is not idempotent the way the reverted `MESSAGES_SNAPSHOT` was.**
+`emitMessageSnapshot` calls `loadCommittedProjections`, which loads the
+**entire** durable session history (`history.LoadBatch`, no cursor, no
+limit) on every `agui.Replay`/`agui.Reconnect` call, and emits each message
+as append-style native `TEXT_MESSAGE_*`/`TOOL_CALL_*`/... events plus one
+`eino.agentic.v1` `CUSTOM` per content block. A `MESSAGES_SNAPSHOT` is
+idempotent (a client replaces its whole transcript on each one); this is
+not -- a client that reconnects with a cursor still receives its full
+durable history a second time as new native content. A client must
+therefore dedupe on `eino.agentic.v1` block identity (`identity.messageId`
++ the block's position) rather than assume a cursored reconnect only
+re-delivers what is new (W7 fifth fix-pass review I1).
+
+**An unfinalized, still-streaming assistant message row is excluded from
+`loadCommittedProjections`, not projected as a zero-frame placeholder** (W7
+fifth fix-pass review P0-2). `runtime/adk_model.go` appends the assistant
+message ROW at `begin()` time, before the model streams a single token;
+its content parts are only written at `persistAssistantTurn`, strictly
+later. `store.ListMessages` has no `finalized` predicate, so this in-flight
+row is visible to a reload for the entire duration of the streaming turn.
+Before this fix, `emitMessageSnapshot` projected it anyway (a zero-content-
+block `AgenticMessage` that emitted no frames) and still marked it
+delivered in `Bridge.projectedMessages` -- so on a mid-stream reconnect,
+EVERY subsequent live `EventMessageDelta` for that exact message id was
+immediately dropped by `emitMessageDelta`'s own guard as "already
+delivered", even though nothing had actually reached the client: the
+reconnecting client saw a valid, error-free, but completely empty stream
+for the rest of that turn. `loadCommittedProjections` now applies the same
+check `runtime.dropUnfinalizedAssistantPlaceholders` already applies on
+the model-input side (`runtime/adk_model.go`): a message that projects to
+`Role == assistant` with zero content blocks is skipped outright.
+`TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder`
+(`agui/replay_p0_regression_test.go`) proves the live delta reaches the
+wire end to end, against a real SQLite store, driving `Reconnect` exactly
+as a host would.
+
 `TestReplayMessageSnapshotIncludesUserMediaBlock` in `agui/replay_test.go`
 proves the media content reaches the stream for `user_input_text`/
 `user_input_image` as a `CUSTOM` supplement; it does not cover, and does not
@@ -258,6 +295,22 @@ terminal frame (a durable `RUN_FINISHED`/`RUN_ERROR`, or an earlier
 `Terminate` call) has already reached the wire for the connection --
 `RUN_FINISHED` and `RUN_ERROR` are both terminal for a run, and a client
 must never see a second one.
+
+This at-most-one-terminal-frame invariant is enforced at every producer
+that can write a `RUN_ERROR`, not only `Terminate` (W7 fifth fix-pass
+review P0-3): `Emit`'s own `runtime.EventRunFinished` case, `Terminate`,
+`emitToolCallUpdated`'s malformed-payload branch, and the exported
+`Bridge.Error` all check/set the same `Bridge.terminated` flag before
+writing. The latter two route through a single shared helper,
+`emitTerminalError`, specifically so a future new `RUN_ERROR` producer
+does not have to re-derive the check: it also closes any open
+`TEXT_MESSAGE`/`REASONING` span first and never puts a caller- or
+error-supplied string on the wire, only the fixed `TerminalErrorMessage` --
+matching `Terminate`'s own contract. Before this fix, only two of these
+four producers enforced the invariant: a single malformed tool payload
+wrote an unredacted `RUN_ERROR` (the raw `encoding/json` parser message)
+without setting `terminated`, so a subsequent `Terminate` call added a
+SECOND `RUN_ERROR` frame to the same connection.
 
 ## Implementation Requirements for Bridges
 
@@ -388,11 +441,41 @@ Both the durable replay path and the live path build an eino-agui
   the sweep already delivered that message's native content -- a phase
   flag cannot tell that case apart from "this connection's own live turn
   already streamed it", but a per-message record can. `emitMessageDelta`
-  and `emitToolCallUpdated` also gained a companion guard for the mirror
-  case: a delta or tool-call update naming a message already recorded in
-  `Bridge.projectedMessages` (already delivered through the
-  committed-projection path) is dropped outright, since any such event
-  reaching this connection at that point is necessarily stale.
+  also gained a companion guard for the mirror case: a delta naming a
+  message already recorded in `Bridge.projectedMessages` (already
+  delivered through the committed-projection path) is dropped outright,
+  since a delta for a message strictly precedes that message's own
+  commit, by construction -- so any further delta naming an
+  already-projected message on this connection is necessarily stale.
+
+  **`emitToolCallUpdated` does NOT share that guard** (W7 fifth fix-pass
+  review P0-1). A prior fix pass added the identical
+  `Bridge.projectedMessages` check to `emitToolCallUpdated`, reasoning by
+  analogy from `emitMessageDelta` -- but the staleness argument does not
+  hold there: a `tool_call_updated` record's `MessageID` is the *owning
+  assistant message* (`session/tool_transition.go`), and that message is
+  published *after* it has already committed
+  (`runtime/tool_preparation.go` publishes `message_committed` for the
+  assistant strictly before its own tool transitions), not before. Keying
+  suppression on message identity therefore suppressed *every* tool-call
+  event on *every* turn that called a tool -- the common case, not an edge
+  case -- reaching the wire as a bare `TOOL_CALL_RESULT` for a call the
+  client never saw opened, with no `TOOL_CALL_START`/`ARGS`/`END` and no
+  `TEXT_MESSAGE_END`. The real dedup key for a tool call is the call
+  itself: `Bridge.toolCallNativeSuppressed` (set by
+  `emitLiveMessageCommitted`'s `recordNativeToolDelivery`, from the
+  assistant message's own committed-projection emission of that call's
+  `function_tool_call` block, when that emission's `DeliveryMode` actually
+  included natives) and `Bridge.toolCallLiveStartSent` (set by
+  `emitToolCallUpdated` itself, since a durable `tool_call_updated` record
+  repeats the call's Name/Arguments at every phase -- pending/running/
+  terminal -- so the live path must dedupe its OWN repeated Start/Args
+  too) together decide whether to (re-)emit that call's native
+  `TOOL_CALL_START`/`ARGS`/`END`; `Bridge.toolCallResultSent` is the
+  symmetric guard for the terminal `TOOL_CALL_RESULT`, since a tool
+  call's separate *result* message commits (and can independently trigger
+  a native `TOOL_CALL_RESULT` from its own `function_tool_result` block)
+  strictly *after* the live terminal transition that already sent one.
 
   A `message_committed` naming a message not (yet) present in a reload's
   projections (a benign miss -- see `publishMessageCommitted`'s

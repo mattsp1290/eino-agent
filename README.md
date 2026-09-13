@@ -30,7 +30,8 @@ and observability remain provider-neutral.
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.9.19` (exact pin; see [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md))
 - AG-UI bridge: `github.com/mattsp1290/eino-agui v0.1.2-0.20260910210826-ed64f77f3f16`
   (the accepted agentic-runtime contract's immutable bridge commit; see
-  `$HOME/.agents/projects/eino-agui/responses/2026-09-10-eino-v0-9-19-agentic-runtime.md`).
+  [docs/dependency-status.md](docs/dependency-status.md) for the accepted-contract
+  evidence).
   Requires a root replacement in this module's `go.mod` for
   `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
   `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`
