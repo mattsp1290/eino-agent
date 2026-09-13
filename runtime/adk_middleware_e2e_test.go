@@ -918,6 +918,48 @@ func TestSummarizationHandlerTriggersAndWritesContextEpoch(t *testing.T) {
 	if !found {
 		t.Fatalf("no summarization ContextEpoch row found among %+v (turn 2's message count genuinely exceeds the threshold)", epochs)
 	}
+
+	// This is the W7 fix-pass review's P1-F production-wiring proof
+	// (fix-verification-reviewer I4): unlike
+	// TestCommitSummaryEpochStampsTurnIdentityFromCapability, which hand-
+	// constructs contextEpochCapability{turnID, agentPath} directly, this
+	// drives a REAL turn through StreamingOrchestrator.Start, so
+	// adk_execution.go's buildAgentHandlers is the thing that must
+	// populate entryBuild.epochs.turnID/agentPath from e.snapshot for the
+	// compaction boundary message to carry turn 2's real identity.
+	// Deleting `turnID: e.snapshot.TurnID, agentPath: e.snapshot.AgentPath`
+	// at adk_execution.go:702 leaves the boundary message's TurnID empty
+	// and must fail this assertion.
+	all, err := store.ListMessages(context.Background(), sessionID, session.ReplayCursor{Limit: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turn2TurnID session.TurnID
+	var boundary *session.Message
+	for i := range all.Messages {
+		m := all.Messages[i]
+		if m.RunID != handle2.RunID() {
+			continue
+		}
+		if m.Role == session.RoleUser && turn2TurnID == "" {
+			turn2TurnID = m.TurnID
+		}
+		if m.Role == session.RoleSystem {
+			boundary = &all.Messages[i]
+		}
+	}
+	if turn2TurnID == "" {
+		t.Fatalf("could not find turn 2's user message (run %v) to determine its real TurnID among %+v", handle2.RunID(), all.Messages)
+	}
+	if boundary == nil {
+		t.Fatalf("no compaction boundary (RoleSystem) message found for run %v among %+v", handle2.RunID(), all.Messages)
+	}
+	if boundary.TurnID == "" || boundary.TurnID != turn2TurnID {
+		t.Fatalf("compaction boundary TurnID = %q, want turn 2's real TurnID %q -- buildAgentHandlers must wire entryBuild.epochs.turnID from e.snapshot.TurnID", boundary.TurnID, turn2TurnID)
+	}
+	if boundary.AgentPath != "" {
+		t.Fatalf("compaction boundary AgentPath = %q, want %q (root agent, no subagent nesting wired yet)", boundary.AgentPath, "")
+	}
 }
 
 // TestSummarizationFiftyMessageTriggerDoesNotFireOnAShortConversation is
