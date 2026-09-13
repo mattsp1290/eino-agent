@@ -3,7 +3,6 @@ package agui
 import (
 	"context"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -82,7 +81,7 @@ func (s *lateCommitStore) injectLateMessage(ctx context.Context) error {
 // the life of the connection: both by the skip itself, and because
 // seen[record.ID] was still set for the skipped record, which would also
 // have suppressed the same event's live-tail copy on a Reconnect.
-// TestReplaySkipsMessageCommittedEvents cannot catch this: its
+// TestReplayDoesNotReEmitAlreadySnapshottedMessage cannot catch this: its
 // message_committed event is appended before Replay is ever called, so the
 // message it names is always already in the snapshot.
 func TestReplayForwardsMessageCommittedDuringReplayWindow(t *testing.T) {
@@ -136,12 +135,91 @@ func TestReplayForwardsMessageCommittedDuringReplayWindow(t *testing.T) {
 	if err := bridge.LiveErr(); err != nil {
 		t.Fatalf("LiveErr = %v, want nil", err)
 	}
-	raw := string(sink.Bytes())
-	if !strings.Contains(raw, "EARLY-TEXT") {
-		t.Fatalf("EARLY-TEXT (delivered by the snapshot) missing from replay: %s", raw)
+	// Assert the exact frame-type sequence, like the sibling tests in this
+	// package (TestReconnectToleratesDuplicateLiveMessageCommittedReceipt,
+	// TestReplayDoesNotReEmitAlreadySnapshottedMessage) already do. A substring check
+	// against the raw SSE bytes (the previous version of this test) passes
+	// even when LATE-TEXT is trapped inside the CUSTOM envelope's own JSON
+	// payload with no native TEXT_MESSAGE_* events -- exactly the shape a
+	// native-only AG-UI client renders as nothing (W7 fix-pass review
+	// findings P0-1/C1/I2). Both assistant-early (delivered by the
+	// snapshot, DeliveryModeReplay) and assistant-late (delivered by
+	// emitLiveMessageCommitted with DeliveryModeCommittedOnly, because it
+	// committed while bridge.inReplaySweep was true) must each carry a full
+	// native text message plus its custom supplement.
+	frames := frameData(t, sink.Bytes())
+	got := typesFromFrames(frames)
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s (assistant-late must get native TEXT_MESSAGE_* events too, not just a CUSTOM supplement)", got, want)
 	}
-	if !strings.Contains(raw, "LATE-TEXT") {
-		t.Fatalf("LATE-TEXT (committed during the replay window) missing from replay -- it was dropped: %s", raw)
+	if messageID, _ := frames[0]["messageId"].(string); messageID != "assistant-early" {
+		t.Fatalf("frame[0] messageId = %q, want assistant-early", messageID)
+	}
+	if delta, _ := frames[1]["delta"].(string); delta != "EARLY-TEXT" {
+		t.Fatalf("frame[1] delta = %q, want EARLY-TEXT", delta)
+	}
+	if messageID, _ := frames[4]["messageId"].(string); messageID != "assistant-late" {
+		t.Fatalf("frame[4] messageId = %q, want assistant-late (the late-committing message's own native TEXT_MESSAGE_START)", messageID)
+	}
+	if delta, _ := frames[5]["delta"].(string); delta != "LATE-TEXT" {
+		t.Fatalf("frame[5] delta = %q, want LATE-TEXT (committed during the replay window, must still reach the client natively)", delta)
+	}
+}
+
+// TestReplaySurfacesLiveCommittedProjectionFailureDuringDurableSweep proves
+// the W7 fix-pass review's C7/I4 finding: agui/replay.go:79-81's
+// bridge.LiveErr() check, inside replay()'s own durable ListEvents sweep,
+// is load-bearing on its own -- deleting it left the whole suite green
+// (mutation M4), because the only existing coverage
+// (transport/http_liveerr_test.go) exercises the sibling check in
+// Reconnect's LIVE tail loop (agui/replay.go:137-139), not this one.
+//
+// Reuses lateCommitStore's exact scenario (a message that commits strictly
+// during replay()'s own ListEvents sweep, after emitMessageSnapshot's batch
+// load already ran) but with a caller ContentLimits too small to decode the
+// late message's content -- the exact SSEConfig.ContentLimits/ContentLimits
+// mismatch transport/http.go's doc comment warns about, here landing on the
+// DURABLE sweep instead of the live-tail path
+// TestSSEHandlerSurfacesLiveCommittedProjectionFailureThroughOnComplete
+// covers. Before the C7 fix, replay() silently swallowed this failure and
+// returned a nil error, exactly like P1-E on the durable path instead of
+// the live one.
+func TestReplaySurfacesLiveCommittedProjectionFailureDuringDurableSweep(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-late-commit-fatal"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-late-commit-fatal", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-late-commit-fatal", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	fence := session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken}
+	// Deliberately no pre-existing message: emitMessageSnapshot's own
+	// initial load sees zero messages and succeeds trivially, isolating
+	// the failure to the durable ListEvents sweep's own live-continuation
+	// dispatch (emitLiveMessageCommitted), not the initial snapshot.
+	lateStore := &lateCommitStore{Store: store, fence: fence, sessionID: sessionID}
+	sink := newSSESink()
+	// Mismatched against lateCommitStore's own (large, default) encoding
+	// limits for "LATE-TEXT" -- the same mismatch lateAppendStore uses in
+	// transport/http_liveerr_test.go, here reached through replay()'s
+	// durable sweep instead of Reconnect's live tail.
+	tinyLimits := session.ContentLimits{MaxMessageBytes: 1024, MaxBlocks: 4, MaxBlockBytes: 1}
+	bridge := NewBridge(ctx, lateStore, tinyLimits, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	_, err = Replay(ctx, bridge, lateStore, sessionID, session.EventCursor{Limit: 10}, tinyLimits, false)
+	if err == nil {
+		t.Fatalf("Replay err = nil, want a surfaced failure (a message that commits during replay()'s own durable sweep failed to decode under the caller's ContentLimits, and replay() must not silently swallow that)")
 	}
 }
 
@@ -260,5 +338,91 @@ func TestReconnectToleratesDuplicateLiveMessageCommittedReceipt(t *testing.T) {
 	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (the duplicate commit must be skipped silently, and RUN_FINISHED must still be delivered)", got, want)
+	}
+}
+
+// TestReconnectToleratesLiveMessageCommittedNamingUnknownMessage proves the
+// W7 fix-pass review's P0-2 finding (dedup-correctness-reviewer I1,
+// wire-contract-reviewer C7's sibling): a live message_committed naming a
+// message not (yet) present in this reload's committed projections is a
+// BENIGN miss -- runtime.publishMessageCommitted documents itself as
+// best-effort and appends/publishes its notification in a separate call
+// strictly AFTER the message's content transaction commits, so a reload
+// through a different session.Store handle (a read replica, a long-held
+// repeatable-read snapshot, ...) can observe the notification before the
+// content it names. Before this fix, emitLiveMessageCommitted latched this
+// exact case into Bridge.liveErr indistinguishably from a genuine hard
+// reload failure, and cadfc7a made Reconnect's live loop return on any
+// non-nil LiveErr() -- so this benign race silently killed the stream: no
+// RUN_ERROR, no RUN_FINISHED, nothing wrong reported anywhere.
+func TestReconnectToleratesLiveMessageCommittedNamingUnknownMessage(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	storeCtx := context.Background()
+	store, storePool, err := openTestSQLite(storeCtx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-unknown-commit"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(storeCtx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(storeCtx, session.Run{ID: "run-unknown-commit", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-unknown-commit", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	// Deliberately no durable message for "assistant-never-written": the
+	// session has zero messages, so loadCommittedProjections' reload
+	// succeeds with an empty projection set, and the message named below is
+	// never found in it -- the benign-miss branch, not the hard-failure one.
+
+	tail := newReplayTail()
+	sink := newSSESink()
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := Reconnect(ctx, bridge, store, tail, sessionID, session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
+		done <- err
+	}()
+	<-tail.subscribed
+	const timeout = 5 * time.Second
+	sendOrTimeout := func(event session.EventRecord) {
+		t.Helper()
+		select {
+		case tail.events <- event:
+		case err := <-done:
+			t.Fatalf("Reconnect returned (err = %v) before the test finished delivering live events -- it exited early on the benign unknown-message commit instead of tolerating it", err)
+		case <-time.After(timeout):
+			t.Fatalf("timed out sending event %s to the live tail", event.ID)
+		}
+	}
+	sendOrTimeout(session.EventRecord{
+		ID: "evt-unknown-commit", SessionID: sessionID, RunID: run.ID, MessageID: "assistant-never-written",
+		Kind: session.MessageCommittedEventKind, TurnID: "turn-unknown-commit", Payload: []byte(`{"revision":1}`),
+	})
+	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-unknown-finished", SessionID: sessionID, MessageID: "assistant-never-written"})
+	close(tail.events)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Reconnect err = %v, want nil (a message_committed naming a message not yet visible to this reload must not kill the stream)", err)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("Reconnect did not return after the live tail closed")
+	}
+	if err := bridge.LiveErr(); err != nil {
+		t.Fatalf("LiveErr() = %v, want nil (a benign not-found miss must not be latched as a live error)", err)
+	}
+	frames := frameData(t, sink.Bytes())
+	got := typesFromFrames(frames)
+	want := "RUN_FINISHED"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s (the unknown-message commit must be skipped silently -- no CUSTOM, no natives -- and RUN_FINISHED must still be delivered)", got, want)
 	}
 }
