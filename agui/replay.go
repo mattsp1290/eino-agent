@@ -76,6 +76,9 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 			if err := bridge.EncErr(); err != nil {
 				return next, seen, err
 			}
+			if err := bridge.LiveErr(); err != nil {
+				return next, seen, err
+			}
 			next = session.EventCursor{AfterEventID: record.ID, Limit: cursor.Limit}
 		}
 		if batch.Next.AfterEventID == "" {
@@ -129,6 +132,9 @@ func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail Ev
 				return next, err
 			}
 			if err := bridge.EncErr(); err != nil {
+				return next, err
+			}
+			if err := bridge.LiveErr(); err != nil {
 				return next, err
 			}
 			if event.ID != "" {
