@@ -12,7 +12,12 @@ The `transport` package contains small adapters for common HTTP glue:
   handle. Applications decide how handles are located and authorized.
 - `ResumeHandler` adapts an application resume endpoint to a runtime resume
   call and returns the resumed run ID in a response header.
-- `DecodeMessages` is a convenience JSON decoder, not a required wire format.
+- `DecodeUserMessage` decodes a rich AG-UI user-message request body into a
+  `runtime.UserMessage` (`transport/rich.go`). It exists and is tested but is
+  not yet wired as the default ingress path in `SSEHandler`/
+  `examples/minimal-server`, which decode their own request bodies inline.
+  The classic `DecodeMessages` JSON decoder this bullet previously described
+  was removed in W8: it had zero callers anywhere in the module.
 
 Durable replay comes from `session.Store` and AG-UI replay helpers. Live token
 deltas come from a tail such as `stream.Tail`; they are not treated as durable

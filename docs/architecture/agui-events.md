@@ -197,9 +197,12 @@ proves the media content reaches the stream for `user_input_text`/
 prove anything about, `tool_search_result`/`server_tool_*`/`mcp_*`/assistant
 media. See "W7: Agentic committed-projection replay and live emission"
 below for the full mechanism. The classic `history.Load`/
-`convert.ToAGUIMessages` path still exists and is still used by
-`transport.DecodeMessages` for classic JSON ingress; it is `agui.Replay`'s
-emission path specifically that no longer uses it.
+`convert.ToAGUIMessages` path still exists as public API
+(`runtime.LoadHistory`, `Bridge.MessagesSnapshot`), but the classic JSON
+ingress decoder this paragraph previously paired it with,
+`transport.DecodeMessages`, was removed in W8 (zero callers anywhere in the
+module); it is `agui.Replay`'s emission path specifically that no longer
+uses the classic path.
 
 `agui.Replay`/`agui.Reconnect` also take an explicit `includeReasoning`
 parameter (`transport.SSEConfig.IncludeReasoning` at the HTTP boundary),
@@ -519,8 +522,12 @@ already delivered.
   projection at commit time uses the agentic path).
 - `transport.DecodeUserMessage` (rich AG-UI input decode into
   `runtime.UserMessage` blocks) exists and is tested but is not yet wired as
-  the default ingress path in `SSEHandler`/`examples/minimal-server`; the
-  classic `DecodeMessages` remains the default for existing callers.
+  the default ingress path in `SSEHandler`/`examples/minimal-server`, which
+  decode their own request bodies inline. The classic `transport.DecodeMessages`
+  decoder this bullet previously named as "the default for existing callers"
+  had zero callers anywhere in the module and was removed in W8's
+  unused-classic-public-entrypoint cleanup (see
+  `docs/architecture/eino-feature-support.md`'s W8 section).
 - Watch (`watch/`) bounded public block state and a block-indexed live
   overlay, and the observability typed-callback adapters with a single
   accounting source, are untouched by W7.
