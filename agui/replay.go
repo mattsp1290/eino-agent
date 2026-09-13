@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	aguiemitter "github.com/mattsp1290/eino-agui/emitter"
 
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -22,11 +21,14 @@ type EventTail interface {
 
 // Replay emits durable events after cursor through bridge. Live-only deltas are
 // intentionally skipped because token deltas are transport events, not durable
-// conversation facts. session.MessageCommittedEventKind events are also
-// skipped here (though they are durable, not live-only): the content they
-// notify about was already emitted by this same call's message snapshot
-// (see emitMessageSnapshot), so forwarding them to bridge.Emit would
-// re-project and re-emit a message this replay already delivered.
+// conversation facts. session.MessageCommittedEventKind events are durable
+// (not live-only) and so are always forwarded to bridge.Emit like any other
+// durable event; Bridge itself is what skips a message_committed naming a
+// message this same call's snapshot already delivered (see
+// Bridge.projectedMessages and emitLiveMessageCommitted's doc comments) --
+// this is what lets a message_committed for a message that commits DURING
+// this replay window (never covered by the snapshot) reach the client
+// instead of being dropped alongside the ones the snapshot already covers.
 //
 // contentLimits must match the session.ContentLimits the orchestrator that
 // produced this session's durable content was configured with (see
@@ -63,7 +65,7 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 				return next, seen, err
 			}
 			seen[record.ID] = true
-			if record.LiveOnly || record.Kind == session.MessageCommittedEventKind {
+			if record.LiveOnly {
 				next = session.EventCursor{AfterEventID: record.ID, Limit: cursor.Limit}
 				continue
 			}
@@ -146,16 +148,20 @@ func Reconnect(ctx context.Context, bridge *Bridge, store session.Store, tail Ev
 // mcp_*, assistant media, ...) no longer make replay fail outright the way
 // history.Load's ErrClassicUnsupported did.
 //
-// Before those per-message projections, it emits one MESSAGES_SNAPSHOT
-// built from every projection's NativeMessage (populated by
-// convert.ToAgenticProjection for user-role messages precisely so a host
-// can reconstruct native-client-visible history from it). Without this, a
-// client that does not parse the eino.agentic.v1 custom envelope sees no
-// user-role history at all: CommittedNativeEvents legitimately returns no
-// native events for user_input_* kinds (there is no AG-UI streaming event
-// shape for "the user already sent this"), so user turns would otherwise be
-// invisible and the transcript would read as an assistant monologue to any
-// native-only AG-UI client.
+// This does NOT emit a MESSAGES_SNAPSHOT: convert.ToAgenticProjection only
+// populates NativeMessage for user-role messages (eino-agui's
+// nativeUserMessage), so a snapshot built from it would carry user turns
+// only, ahead of every assistant projection this loop emits after it --
+// reordering a U1,A1,U2,A2 transcript into U1,U2,A1,A2 for any client that
+// treats MESSAGES_SNAPSHOT as authoritative, and clobbering client state on
+// a cursored reconnect since it ignores the cursor entirely (W7 fix-pass
+// review finding P0-C). eino-agui's own nativeUserMessage doc comment says
+// as much: hosts assemble snapshots from their complete committed
+// transcript, so this bridge must not overwrite unrelated history while
+// projecting one durable record. A native-only AG-UI client -- one that
+// never parses the eino.agentic.v1 custom envelope -- therefore has no
+// representation of user-role history at all on this path; see
+// docs/architecture/agui-events.md and docs/consumer-guide.md.
 func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, contentLimits session.ContentLimits, includeReasoning bool) error {
 	if bridge == nil {
 		return nil
@@ -164,13 +170,6 @@ func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Stor
 	if err != nil {
 		return err
 	}
-	natives := make([]aguitypes.Message, 0, len(projections))
-	for _, p := range projections {
-		if p.Projection.NativeMessage != nil {
-			natives = append(natives, *p.Projection.NativeMessage)
-		}
-	}
-	bridge.nativeMessagesSnapshot(natives)
 	for _, p := range projections {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -184,6 +183,7 @@ func emitMessageSnapshot(ctx context.Context, bridge *Bridge, store session.Stor
 			}
 			return fmt.Errorf("agui: replay projection emission failed for message %s", p.MessageID)
 		}
+		bridge.markMessageProjected(p.MessageID)
 	}
 	return nil
 }

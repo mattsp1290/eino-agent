@@ -267,16 +267,17 @@ func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
 	// none for user_input_text/user_input_image, so both blocks surface as
 	// their CUSTOM eino.agentic.v1 content-block supplement -- which is
 	// exactly what proves the media block did not brick replay the way the
-	// classic projector's ErrClassicUnsupported once did. But
-	// emitMessageSnapshot also emits one MESSAGES_SNAPSHOT ahead of those
-	// CUSTOM supplements, built from convert.ToAgenticProjection's
-	// NativeMessage for this user message (W7 review finding A5): without
-	// it, a native-only AG-UI client that never parses eino.agentic.v1
-	// would see no user-role history at all.
+	// classic projector's ErrClassicUnsupported once did. emitMessageSnapshot
+	// does NOT also emit a MESSAGES_SNAPSHOT here (W7 fix-pass review
+	// finding P0-C reverted that: NativeMessage is user-role-only upstream,
+	// so a snapshot built from it would reorder any transcript with
+	// assistant messages in it -- see emitMessageSnapshot's doc comment) --
+	// a native-only AG-UI client that never parses eino.agentic.v1 has no
+	// representation of this user turn at all on this path.
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	if stringsJoined(got) != "MESSAGES_SNAPSHOT,CUSTOM,CUSTOM" {
-		t.Fatalf("event types = %#v, want one MESSAGES_SNAPSHOT plus two CUSTOM content-block supplements", got)
+	if stringsJoined(got) != "CUSTOM,CUSTOM" {
+		t.Fatalf("event types = %#v, want two CUSTOM content-block supplements (no MESSAGES_SNAPSHOT)", got)
 	}
 	raw := string(sink.Bytes())
 	if !strings.Contains(raw, "look at this") || !strings.Contains(raw, "https://example.com/pic.png") {

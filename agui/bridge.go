@@ -7,7 +7,6 @@ import (
 	"fmt"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
-	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
@@ -49,6 +48,24 @@ type Bridge struct {
 	// records them internally regardless of whether this bridge inspects
 	// its returned bool.
 	liveErr error
+	// projectedMessages records every message ID this Bridge has already
+	// emitted through the agentic committed-projection path -- either
+	// emitMessageSnapshot's replay projection or an earlier
+	// emitLiveMessageCommitted live continuation -- for the life of this
+	// connection. Each durable message is finalized and receipt-stamped
+	// exactly once (loadCommittedProjections' revision-folded receipt
+	// key), so a repeat session.MessageCommittedEventKind notification
+	// naming a message already in this set is always the documented
+	// at-least-once publishMessageCommitted choreography (see that
+	// function's doc comment), never new content: re-projecting it would
+	// mint a receipt that collides with the one already emitted and latch
+	// a benign EncErr that kills the stream (see emitLiveMessageCommitted
+	// and replay()'s doc comments). This replaces the old, broader
+	// "skip every session.MessageCommittedEventKind event during replay"
+	// rule, which also silently dropped a message that first committed
+	// during the replay window (never in this set) instead of forwarding
+	// it.
+	projectedMessages map[session.MessageID]bool
 }
 
 // NewBridge binds an AG-UI emitter to the SDK's concrete SSE writer pair.
@@ -85,6 +102,30 @@ func (b *Bridge) LiveErr() error {
 		return nil
 	}
 	return b.liveErr
+}
+
+// messageProjected reports whether id has already been emitted through the
+// agentic committed-projection path on this Bridge (see
+// Bridge.projectedMessages's doc comment).
+func (b *Bridge) messageProjected(id session.MessageID) bool {
+	if b == nil {
+		return false
+	}
+	return b.projectedMessages[id]
+}
+
+// markMessageProjected records id as delivered through the agentic
+// committed-projection path (see Bridge.projectedMessages's doc comment).
+// Callers must only call this after a projection attempt actually
+// succeeded.
+func (b *Bridge) markMessageProjected(id session.MessageID) {
+	if b == nil {
+		return
+	}
+	if b.projectedMessages == nil {
+		b.projectedMessages = map[session.MessageID]bool{}
+	}
+	b.projectedMessages[id] = true
 }
 
 // EncErr returns the first event validation/encoding error.
@@ -131,23 +172,6 @@ func (b *Bridge) MessagesSnapshot(messages []*einoschema.Message) {
 		return
 	}
 	b.emit.MessagesSnapshot(convert.ToAGUIMessages(messages))
-}
-
-// nativeMessagesSnapshot emits a MESSAGES_SNAPSHOT built directly from
-// eino-agui-native types.Message values -- e.g.
-// convert.AgenticProjection.NativeMessage, which convert.ToAgenticProjection
-// already computes for a durable user-role message specifically so a host
-// can reconstruct native-client-visible history from it (see
-// emitMessageSnapshot). This bypasses MessagesSnapshot's
-// convert.ToAGUIMessages(*schema.Message) conversion entirely: the agentic
-// pipeline never produces classic Eino messages, only these. A nil or empty
-// slice is a no-op (nothing to snapshot, e.g. a session with no user-role
-// messages at all).
-func (b *Bridge) nativeMessagesSnapshot(messages []aguitypes.Message) {
-	if b == nil || b.emit == nil || len(messages) == 0 {
-		return
-	}
-	b.emit.MessagesSnapshot(messages)
 }
 
 func (b *Bridge) StateSnapshot(snapshot any) {
@@ -301,8 +325,24 @@ func (b *Bridge) EmitCommittedProjection(projection *convert.AgenticProjection, 
 // loadCommittedProjections path replay uses for correctness rather than
 // adding an unverified narrower one. This is O(session history) per commit,
 // a known cost a future single-message store read should remove.
+//
+// A message already recorded in b.projectedMessages is skipped outright,
+// with no reload attempt and no error: publishMessageCommitted's own doc
+// comment documents this notification as best-effort and thus
+// at-least-once, and a caller (replay() and Reconnect's live loop both
+// forward every non-live-only durable event, including this one, to
+// Bridge.Emit -- see replay.go) can hand the same messageID to this method
+// more than once for the same durable content. Re-attempting the
+// projection would mint a receipt colliding with the one already emitted
+// at the observation revision the message committed at, and the
+// underlying emitter's dedup (agenticReceiptKey) treats that collision as
+// a hard encoding error -- exactly the shape that used to abort Reconnect
+// on a benign duplicate commit receipt (W7 fix-pass review finding P0-A).
 func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.EventRecord) {
 	if b.store == nil || event.SessionID == "" || event.MessageID == "" {
+		return
+	}
+	if b.messageProjected(event.MessageID) {
 		return
 	}
 	projections, err := loadCommittedProjections(ctx, b.store, event.SessionID, b.contentLimits, b.includeReasoning)
@@ -314,12 +354,16 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 		if p.MessageID != event.MessageID {
 			continue
 		}
-		// EmitCommittedProjection's own bool return is intentionally not
-		// re-recorded here: every path that returns false already calls
-		// the underlying emitter's recordEncodingError, so EncErr() (and,
-		// for a transport write failure, Err()) already reflects it --
-		// see this bridge's EncErr/Err doc comments.
-		b.EmitCommittedProjection(p.Projection, p.Receipt, aguiemitter.DeliveryModeLiveContinuation)
+		// EmitCommittedProjection's own bool return IS consulted here
+		// (unlike EncErr()/Err(), which every path that returns false
+		// already records on the underlying emitter -- see this bridge's
+		// EncErr/Err doc comments): only a successful emission is safe to
+		// remember in projectedMessages, so a transient failure here
+		// still allows a later retry of the same messageID to attempt
+		// the projection again instead of being permanently skipped.
+		if b.EmitCommittedProjection(p.Projection, p.Receipt, aguiemitter.DeliveryModeLiveContinuation) {
+			b.markMessageProjected(p.MessageID)
+		}
 		return
 	}
 	b.recordLiveErr(fmt.Errorf("agui: message_committed named message %s not found in session %s's current projections", event.MessageID, event.SessionID))
