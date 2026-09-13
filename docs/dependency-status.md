@@ -50,6 +50,33 @@ External pins for the agentic adoption:
   deliverables the response document still lists as incomplete, the per-cell
   capability matrix and native-byte fixture evidence.
 
+  **W8 update (2026-09-13, UTC)**: re-verified the identical pin in a fresh
+  temporary module with `GOWORK=off go mod download -json
+  github.com/mattsp1290/eino-providers@79248358b8e6324bbdb1f014526629f82e6bce90`;
+  it resolved identically (same version, checksum, `Origin.Hash`, no
+  replace). `github.com/mattsp1290/eino-agent`'s own root `go.mod` still
+  does not (and should not) require this module -- the exclusion is
+  deliberate, not an oversight: `go mod tidy` never scans `testdata/`
+  packages, so it silently drops any `require` added there. The dependency
+  is added instead where it belongs -- the external CONSUMER --
+  `testdata/external-consumer/agentic_fixture_test.go` imports
+  `github.com/mattsp1290/eino-providers/claude` directly, and
+  `testdata/external-consumer/check.sh` pins the exact version above via its
+  own `go mod edit -require` before `go mod tidy`, so the consumer module
+  resolves it deterministically rather than the untagged default branch's
+  moving head. `bash testdata/external-consumer/check.sh` (local mode)
+  passed with this pin selected, unreplaced, and `go mod verify` reporting
+  all modules verified. See
+  [architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+  W8 section for the fixtures this pin backs and two discovered
+  eino-agent/eino-providers integration gaps (a required
+  `ResponseMeta.Extension` host-side normalization, and the current
+  typed-ADK adapter's rejection of model-emitted server/MCP-call content
+  blocks). `eino-agent-td8`'s two remaining deliverables (the per-cell
+  capability matrix, native-byte fixture evidence beyond this file) and a
+  merged immutable release tag are unaffected by this update and remain
+  open.
+
 ## SQL-store consumer publication
 
 The current reusable SQL-store implementation is full remote commit
@@ -78,6 +105,18 @@ GOWORK=off GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
   EINO_AGENT_CONSUMER_VERSION=cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e \
   testdata/external-consumer/check.sh
 ```
+
+The last command above (published-mode `check.sh` at
+`EINO_AGENT_CONSUMER_VERSION=cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`) is a
+historical record, not a currently reproducible result: `check.sh` now
+unconditionally copies `agentic_fixture_test.go` into the generated consumer
+module regardless of mode, and that fixture requires
+`model.NewAgenticStreamerWithProviderState` and imports `eino-providers/claude`
+— neither exists at this published pin (`git grep -c NewAgenticStreamer` at
+this commit returns zero). Re-running that exact command today fails to
+compile. It was true on 2026-09-10 and predates W8's agentic-fixture addition
+to `check.sh`; it cannot be re-executed until a post-agentic commit is
+published (see `docs/consumer-guide.md`'s Installation section).
 
 Ryuk was disabled for this host's Docker environment; fixtures still explicitly
 close host pools and terminate disposable containers. CI uses normal Ryuk

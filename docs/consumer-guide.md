@@ -25,6 +25,21 @@ cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
 See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
 CloudWeGo Eino is pinned to exactly `v0.9.19`; PostgreSQL 17 is the supported server baseline.
 
+**This pin predates the agentic adoption (Eino v0.9.19 work, W1-W8) and does
+NOT include it.** `model.NewAgenticStreamer`/`NewAgenticStreamerWithProviderState`,
+the AG-UI bridge, and everything else described below under "Native model
+providers" do not exist at commit `cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`
+(`git grep -c NewAgenticStreamer cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e` finds
+zero matches). No commit past the agentic cutover has been publication-verified
+through the public Go proxy yet -- this branch is "not yet resolvable through
+the public proxy" (see
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+W8 section) -- so there is no pin to cite for the agentic APIs today. A host
+that needs them must build against a local `replace` directive pointed at this
+repository (as `testdata/external-consumer/check.sh` does in local mode) until
+a post-agentic commit is verified and published; do not combine the pin above
+with the agentic APIs below.
+
 The AG-UI bridge (`agui`, `transport`; adopted in W7) pins
 `github.com/mattsp1290/eino-agui`, which itself requires a root `replace`
 directive for `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
@@ -41,6 +56,44 @@ The separately published generated-bindings dependency remains
 `wasmext/gen/v0.1.0`. Consumers need no workaround for that dependency. Earlier
 release/discovery pins use older store APIs or schemas; their evidence is
 historical. Existing SQLite files are unsupported and remain untouched.
+
+### Native model providers
+
+`eino-agent`'s own `go.mod` deliberately does not depend on
+`github.com/mattsp1290/eino-providers` -- `model.Streamer` is the provider
+boundary, and any Eino `model.AgenticModel` implementation can supply it via
+`model.NewAgenticStreamer`/`NewAgenticStreamerWithProviderState`. A host that
+wants a real native provider (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/
+OpenCode Messages/Responses/Chat-Completions protocols) adds
+`github.com/mattsp1290/eino-providers` to its OWN `go.mod` directly; no
+`replace` directive is required for it (unlike the AG-UI fork above).
+Verified pin: `v0.0.0-20260912022125-79248358b8e6` at commit
+`79248358b8e6324bbdb1f014526629f82e6bce90` -- see
+[dependency-status.md](dependency-status.md) and
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+W8 section for the exact `go mod download -json` evidence.
+
+Two integration caveats a host must account for today, both discovered and
+reproduced while building `testdata/external-consumer/agentic_fixture_test.go`:
+
+- Every `eino-providers` native adapter stamps
+  `ResponseMeta.Extension = einoproviders.AgenticResponseIdentity{...}` on
+  every completed response. `eino-agent`'s content pipeline rejects any
+  non-nil generic `ResponseMeta.Extension` (`ErrContentUnsupported`), and
+  `model.NewTypedExtensionStateCodec` does not capture it either. A host
+  must wrap the native client with a thin decorator that clears
+  `ResponseMeta.Extension` after the real call returns (see
+  `nativeResponseIdentityStripper` in the fixture) before handing it to
+  `model.NewAgenticStreamer`.
+- The current typed-ADK runtime adapter accepts only
+  text/reasoning/media/function-tool-call blocks (plus
+  `mcp_tool_approval_request` when an approval binding is configured) as
+  assistant OUTPUT. A native provider's `server_tool_call`/
+  `mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result` blocks in a
+  model result fail the turn closed today
+  (`runtime/adk_model.go`'s `errADKUnsupportedBlock`), even though the
+  durable store contract fully supports persisting and replaying those
+  kinds when written directly.
 
 ## Package Surface
 
@@ -364,6 +417,16 @@ persist client cursor state or log that the client needs a fresh snapshot.
 Live-tail overflow means the subscriber fell behind a bounded queue, so the
 client should reconnect and resync from durable replay rather than assuming it
 received every live event.
+
+**Known bridge defects on reconnect** (tracked as `eino-agent-doj` and
+`eino-agent-6wj`, disclosed in full in
+`docs/architecture/agui-events.md`'s "Not yet implemented" section): on every
+reconnect, AG-UI replay currently re-emits a tool call's entire lifecycle a
+second time (a client sees two `TOOL_CALL_START`/`TOOL_CALL_RESULT` pairs for
+one call), and the replayed tool result carries a synthesized
+`{"status":...}` stub instead of the tool's real output. A host wiring
+`transport.SSEHandler` for tool-using conversations should account for both
+until they are fixed.
 
 ## Durable Versus Live-Only
 
@@ -702,6 +765,17 @@ Bounded input/output summaries require explicit host opt-in and must be
 scrubbed before export.
 
 ## Migration Notes
+
+### Breaking changes since the published pin
+
+- **`transport.DecodeMessages` removed (W8).** This exported JSON decoder had
+  zero callers anywhere in the module and was deleted as part of W8's
+  unused-classic-public-entrypoint cleanup. It still exists at the currently
+  published pin (`v0.3.4-0.20260910012408-cec27e5eb734`), so a host that calls
+  it will fail to compile after upgrading past this cutover. Use
+  `transport.DecodeUserMessage` (`transport/rich.go`) for rich AG-UI input
+  decode instead; it is not a drop-in replacement (different request shape),
+  so callers must adapt, not just rename.
 
 When adapting an existing agent backend:
 

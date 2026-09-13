@@ -4,13 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
-	einoschema "github.com/cloudwego/eino/schema"
 
 	agentagui "github.com/mattsp1290/eino-agent/agui"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -214,21 +211,6 @@ func ResumeHandler(auth AuthFunc, resume func(context.Context, *http.Request) (r
 		w.Header().Set("Eino-Agent-Run-ID", string(handle.RunID()))
 		w.WriteHeader(http.StatusAccepted)
 	})
-}
-
-// DecodeMessages decodes an application request body into Eino messages for
-// callers that want a small default JSON contract.
-func DecodeMessages(r *http.Request) ([]*einoschema.Message, error) {
-	var payload struct {
-		Messages []*einoschema.Message `json:"messages"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
-		return nil, err
-	}
-	if len(payload.Messages) == 0 {
-		return nil, fmt.Errorf("messages required")
-	}
-	return payload.Messages, nil
 }
 
 func writeAuthError(w http.ResponseWriter, err error) {

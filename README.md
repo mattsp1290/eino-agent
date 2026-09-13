@@ -24,7 +24,12 @@ and observability remain provider-neutral.
   with `make check`, the required PostgreSQL test/race suites, and a fresh
   PostgreSQL consumer using no replacement, workspace, vendor tree or checkout
   access. Earlier release/discovery pins are historical; use this pin for the
-  host-owned SQLite and PostgreSQL APIs.
+  host-owned SQLite and PostgreSQL APIs. **This pin predates the agentic
+  adoption below (W1-W8) and does not include it** -- `NewAgenticStreamer`,
+  the AG-UI bridge, and the native-provider integration described further
+  down do not exist at this commit. No later commit is publication-verified
+  yet; see `docs/consumer-guide.md`'s Installation section for what a host
+  needing the agentic APIs must do in the meantime.
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.9.19` (exact pin; see [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md))
@@ -40,6 +45,20 @@ and observability remain provider-neutral.
   [docs/dependency-status.md](docs/dependency-status.md).
 - Observability: `github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b`
 - Coding tools: `github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2`
+- Native model providers (optional, host-added): `github.com/mattsp1290/eino-providers`
+  is NOT a dependency of this module's own `go.mod` -- `eino-agent` stays
+  provider-agnostic. A host that wants a real native `model.AgenticModel`
+  (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/OpenCode) adds it directly and
+  wraps the constructed client with `model.NewAgenticStreamer`/
+  `NewAgenticStreamerWithProviderState`. Verified pin:
+  `v0.0.0-20260912022125-79248358b8e6` at commit
+  `79248358b8e6324bbdb1f014526629f82e6bce90` (no release tag exists
+  upstream, so this is a pseudo-version pin), no `replace` required. See
+  [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md)'s
+  W8 section for the exact publication evidence and two discovered
+  integration caveats (a `ResponseMeta.Extension` normalization a host must
+  supply, and the current typed-ADK adapter's rejection of model-emitted
+  server/MCP-call content blocks).
 
 See `docs/dependency-status.md` for prerequisite evidence,
 `docs/consumer-guide.md` for the public embedding contract,
@@ -152,6 +171,12 @@ the active live tail.
 
 See `docs/architecture/agui-events.md` and `docs/architecture/storage.md` for
 the detailed rules.
+
+**Known bridge defects:** on reconnect, AG-UI replay currently duplicates a
+tool call's entire lifecycle (`eino-agent-doj`) and replaces the replayed
+tool result with a synthesized stub instead of the real output
+(`eino-agent-6wj`). See `docs/architecture/agui-events.md`'s "Not yet
+implemented" section for the exact symptoms.
 
 ## Integration Guides
 

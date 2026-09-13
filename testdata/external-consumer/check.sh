@@ -12,6 +12,18 @@ readonly nested_version="v0.1.0"
 readonly aguisdk_replace_path="github.com/ag-ui-protocol/ag-ui/sdks/community/go"
 readonly aguisdk_replace_target="github.com/mattsp1290/ag-ui/sdks/community/go"
 readonly aguisdk_replace_version="v0.0.0-20260909025854-aaa75b54d572"
+# agentic_fixture_test.go imports the real native-provider constructors from
+# github.com/mattsp1290/eino-providers directly. eino-agent's own go.mod does
+# not (and should not: the library is provider-agnostic) require this
+# module, so it is invisible to `go mod tidy` scanning eino-agent's own
+# packages -- testdata/ directories are excluded from that scan the same way
+# they are excluded from `go build ./...`. This consumer module DOES need
+# it, since it is the one that actually combines eino-agent with a concrete
+# native provider. Pin the exact commit verified in
+# docs/dependency-status.md (no release tag exists upstream, so this is a
+# pseudo-version pin) rather than letting a bare `go mod tidy` resolve
+# whatever the module's default branch HEAD happens to be at run time.
+readonly einoproviders_version="v0.0.0-20260912022125-79248358b8e6"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly script_dir
 repository_root="$(cd -- "${script_dir}/../.." && pwd -P)"
@@ -89,6 +101,7 @@ cp -f -- "${script_dir}/session_discovery_fixture_test.go" "${consumer_dir}/sess
 cp -f -- "${script_dir}/session_title_fixture_test.go" "${consumer_dir}/session_title_fixture_test.go"
 cp -f -- "${script_dir}/session_watch_fixture_test.go" "${consumer_dir}/session_watch_fixture_test.go"
 cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"
+cp -f -- "${script_dir}/agentic_fixture_test.go" "${consumer_dir}/agentic_fixture_test.go"
 if [[ "${postgres_mode}" == "1" ]]; then
 	cp -f -- "${script_dir}/../../internal/testpostgres/check_output.py" "${temporary_root}/check_output.py"
 	cp -f -- "${script_dir}/postgres_store_fixture_test.go" "${consumer_dir}/postgres_store_fixture_test.go"
@@ -115,6 +128,10 @@ printf 'ROOT_MODULE_REQUESTED=%s@%s\n' "${root_module}" "${required_version}"
 printf 'ROOT_MODULE_SELECTED=%s@%s\n' "${root_module}" "${selected_required_version}"
 "${go_command[@]}" mod edit -require="${root_module}@${selected_required_version}"
 "${go_command[@]}" mod edit -replace="${aguisdk_replace_path}=${aguisdk_replace_target}@${aguisdk_replace_version}"
+# Pin the exact verified eino-providers pseudo-version explicitly (see the
+# comment at this script's top) rather than letting `go mod tidy` resolve
+# whatever version its default branch happens to report right now.
+"${go_command[@]}" mod edit -require="github.com/mattsp1290/eino-providers@${einoproviders_version}"
 
 if [[ "${mode}" == "local" ]]; then
 	"${go_command[@]}" mod edit -replace="${root_module}=${repository_root}"
@@ -183,7 +200,7 @@ fi
 if [[ "${postgres_mode}" == "1" ]]; then
 	"${go_command[@]}" test -tags postgres_integration -timeout 10m -json ./... | python3 "${temporary_root}/check_output.py" "example.com/eino-agent-external-consumer:TestPostgresConsumer"
 else
-	"${go_command[@]}" test ./...
+	"${go_command[@]}" test -race ./...
 fi
 "${go_command[@]}" build ./...
 
