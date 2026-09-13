@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
@@ -29,18 +30,39 @@ type Bridge struct {
 	// existing classic-only callers/tests may still do.
 	store         session.Store
 	contentLimits session.ContentLimits
+	// includeReasoning gates whether the agentic committed-projection path
+	// (both the live path here and agui.Replay's) includes durable
+	// reasoning content blocks. It must only be true once the host has
+	// confirmed GateProviderReasoningStorage (agui/policy.go) is satisfied
+	// for this session -- the default (false) matches the pre-W7 classic
+	// history pipeline's default and keeps durable reasoning from
+	// streaming to every reconnecting client unless a host explicitly
+	// opts in.
+	includeReasoning bool
+	// liveErr is the first error a live committed-projection attempt
+	// (emitLiveMessageCommitted) hit that the runtime.EventSink.Emit
+	// signature has no way to return synchronously: a
+	// loadCommittedProjections failure, or event.MessageID not being
+	// found among this session's current projections. It does NOT
+	// duplicate EmitCommittedProjection's own failures -- those already
+	// surface through EncErr()/Err(), since the underlying emitter
+	// records them internally regardless of whether this bridge inspects
+	// its returned bool.
+	liveErr error
 }
 
 // NewBridge binds an AG-UI emitter to the SDK's concrete SSE writer pair.
-// store and contentLimits back the agentic committed-projection path (see
-// Bridge.store's doc comment); pass a nil store to disable it.
-func NewBridge(ctx context.Context, store session.Store, contentLimits session.ContentLimits, writer *bufio.Writer, sseWriter *sse.SSEWriter, threadID, runID string, cancel context.CancelFunc) *Bridge {
+// store, contentLimits, and includeReasoning back the agentic
+// committed-projection path (see Bridge.store's and
+// Bridge.includeReasoning's doc comments); pass a nil store to disable it.
+func NewBridge(ctx context.Context, store session.Store, contentLimits session.ContentLimits, includeReasoning bool, writer *bufio.Writer, sseWriter *sse.SSEWriter, threadID, runID string, cancel context.CancelFunc) *Bridge {
 	return &Bridge{
-		emit:          aguiemitter.NewEmitter(ctx, writer, sseWriter, threadID, runID, cancel),
-		textOpen:      map[session.MessageID]bool{},
-		reasoning:     map[session.MessageID]string{},
-		store:         store,
-		contentLimits: contentLimits,
+		emit:             aguiemitter.NewEmitter(ctx, writer, sseWriter, threadID, runID, cancel),
+		textOpen:         map[session.MessageID]bool{},
+		reasoning:        map[session.MessageID]string{},
+		store:            store,
+		contentLimits:    contentLimits,
+		includeReasoning: includeReasoning,
 	}
 }
 
@@ -50,6 +72,19 @@ func (b *Bridge) Err() error {
 		return nil
 	}
 	return b.emit.Err()
+}
+
+// LiveErr returns the first error the live committed-projection path
+// (emitLiveMessageCommitted) hit that could not be reported through
+// EncErr()/Err() -- see Bridge.liveErr's doc comment. Callers that care
+// about a live session.MessageCommittedEventKind failure (as opposed to
+// durable replay, which already returns its error synchronously from
+// agui.Replay) should poll this after Emit.
+func (b *Bridge) LiveErr() error {
+	if b == nil {
+		return nil
+	}
+	return b.liveErr
 }
 
 // EncErr returns the first event validation/encoding error.
@@ -96,6 +131,23 @@ func (b *Bridge) MessagesSnapshot(messages []*einoschema.Message) {
 		return
 	}
 	b.emit.MessagesSnapshot(convert.ToAGUIMessages(messages))
+}
+
+// nativeMessagesSnapshot emits a MESSAGES_SNAPSHOT built directly from
+// eino-agui-native types.Message values -- e.g.
+// convert.AgenticProjection.NativeMessage, which convert.ToAgenticProjection
+// already computes for a durable user-role message specifically so a host
+// can reconstruct native-client-visible history from it (see
+// emitMessageSnapshot). This bypasses MessagesSnapshot's
+// convert.ToAGUIMessages(*schema.Message) conversion entirely: the agentic
+// pipeline never produces classic Eino messages, only these. A nil or empty
+// slice is a no-op (nothing to snapshot, e.g. a session with no user-role
+// messages at all).
+func (b *Bridge) nativeMessagesSnapshot(messages []aguitypes.Message) {
+	if b == nil || b.emit == nil || len(messages) == 0 {
+		return
+	}
+	b.emit.MessagesSnapshot(messages)
 }
 
 func (b *Bridge) StateSnapshot(snapshot any) {
@@ -253,16 +305,31 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 	if b.store == nil || event.SessionID == "" || event.MessageID == "" {
 		return
 	}
-	projections, err := loadCommittedProjections(ctx, b.store, event.SessionID, b.contentLimits)
+	projections, err := loadCommittedProjections(ctx, b.store, event.SessionID, b.contentLimits, b.includeReasoning)
 	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: live committed-projection reload failed for session %s message %s: %w", event.SessionID, event.MessageID, err))
 		return
 	}
 	for _, p := range projections {
 		if p.MessageID != event.MessageID {
 			continue
 		}
+		// EmitCommittedProjection's own bool return is intentionally not
+		// re-recorded here: every path that returns false already calls
+		// the underlying emitter's recordEncodingError, so EncErr() (and,
+		// for a transport write failure, Err()) already reflects it --
+		// see this bridge's EncErr/Err doc comments.
 		b.EmitCommittedProjection(p.Projection, p.Receipt, aguiemitter.DeliveryModeLiveContinuation)
 		return
+	}
+	b.recordLiveErr(fmt.Errorf("agui: message_committed named message %s not found in session %s's current projections", event.MessageID, event.SessionID))
+}
+
+// recordLiveErr is first-error-wins, matching the underlying emitter's own
+// Err()/EncErr() semantics.
+func (b *Bridge) recordLiveErr(err error) {
+	if b.liveErr == nil {
+		b.liveErr = err
 	}
 }
 

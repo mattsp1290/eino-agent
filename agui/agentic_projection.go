@@ -12,28 +12,52 @@ import (
 )
 
 // rootAgentPathName is the display name used for a durable message's agent
-// path segment when session.Message.Agent is empty -- true for every
+// path segment when session.Message.AgentPath is empty -- true for every
 // message today, since subagent nesting is not yet wired end to end (see
-// runtime's adkEngine.agentPath doc comment). convert.ProjectAgenticMessage
-// requires at least one agent-path segment for every identity.
+// runtime's adkEngine.agentPath doc comment: every current caller stamps
+// AgentPath ""). convert.ProjectAgenticMessage requires at least one
+// agent-path segment for every identity. Note this is session.Message's
+// AgentPath field, not its separate Agent field (the configured agent's
+// display name, e.g. "root" or a host's own agent name) -- Agent is set for
+// assistant messages but left empty for user messages, so keying off it
+// would project a different agent path for a user message than for the
+// assistant message in the same turn. AgentPath mirrors EventRecord/
+// ModelRequestRecord.AgentPath and is the field that will actually carry a
+// real (sub)agent path once nesting is wired, so every message in a turn
+// projects the same agent path both today (all "root") and once nesting
+// lands (one shared path per turn).
 const rootAgentPathName = "root"
 
 // agenticIdentity builds the AgenticIdentityV1 an eino-agui projection call
 // requires from a durable session.Message plus its resolved attempt id.
-// TurnID comes from session.Message.TurnID (W7 durable identity), which
-// every message this bridge can reach has been stamped with since it was
-// introduced; ThreadID is always set equal to SessionID, matching eino-agui's
-// own validateIdentity requirement.
+// ThreadID is always set equal to SessionID, matching eino-agui's own
+// validateIdentity requirement.
+//
+// TurnID normally comes straight from session.Message.TurnID (W7 durable
+// identity). It falls back to a deterministic synthetic id ("msg:" + the
+// message's own ID) when TurnID is empty -- true for every message written
+// before W7 stamped TurnID at all, every compaction boundary message that
+// predates session/compaction stamping one, and
+// runtime.settleInterruptedTool's deliberately-empty crash-reconciliation
+// stamp (see that function's doc comment). Without this fallback,
+// convert.validateIdentity rejects the empty TurnID outright, which used to
+// fail loadCommittedProjections' whole batch and brick replay for the
+// entire session over a single such message (W7 review finding A1/C1) --
+// mirrors the existing synthetic-block-id precedent in blockContexts below.
 func agenticIdentity(sessionID session.ID, message session.Message, attemptID string) convert.AgenticIdentityV1 {
-	name := message.Agent
+	name := message.AgentPath
 	if name == "" {
 		name = rootAgentPathName
+	}
+	turnID := string(message.TurnID)
+	if turnID == "" {
+		turnID = syntheticTurnID(message.ID)
 	}
 	return convert.AgenticIdentityV1{
 		SessionID: string(sessionID),
 		ThreadID:  string(sessionID),
 		RunID:     string(message.RunID),
-		TurnID:    string(message.TurnID),
+		TurnID:    turnID,
 		MessageID: string(message.ID),
 		AttemptID: attemptID,
 		AgentPath: []convert.AgentPathSegment{{Name: name, RunID: string(message.RunID)}},
@@ -127,11 +151,24 @@ type committedMessageProjection struct {
 // eino-agui agentic projections plus the receipt needed to emit each one, in
 // durable (created_at, id) order -- the same order history.Load/ListMessages
 // return. Every projection in one call shares the session's current
-// observation-watermark revision (see currentRevision): receipts are
-// deduplicated by identity (session/run/turn/message/attempt), not by
-// revision, so many messages safely sharing one revision string is not a
-// collision risk (see eino-agui's agenticReceiptKey).
-func loadCommittedProjections(ctx context.Context, store session.Store, sessionID session.ID, contentLimits session.ContentLimits) ([]committedMessageProjection, error) {
+// observation-watermark revision (see currentRevision): eino-agui's
+// agenticReceiptKey folds the receipt's Revision into its dedup key
+// alongside the full identity (session/run/turn/message/attempt/...), so
+// many messages safely sharing one revision string in a single call is not
+// a collision risk (the rest of the identity still disambiguates them).
+// That same revision-folding is why re-projecting the SAME message under a
+// DIFFERENT revision (e.g. this function called again after the session's
+// observation watermark has advanced) is NOT deduplicated -- it mints a new
+// receipt key and emits again. That is exactly the shape of the
+// message_committed-during-replay bug replay() guards against by skipping
+// that event kind entirely (see replay.go) rather than relying on receipt
+// dedup to catch it.
+//
+// includeReasoning gates whether reasoning content blocks are included in
+// the projection at all (see history.Options.IncludeReasoning and
+// agui.GateProviderReasoningStorage): callers must only pass true once the
+// host has confirmed that gate is satisfied for this session.
+func loadCommittedProjections(ctx context.Context, store session.Store, sessionID session.ID, contentLimits session.ContentLimits, includeReasoning bool) ([]committedMessageProjection, error) {
 	batch, err := history.LoadBatch(ctx, store, sessionID)
 	if err != nil {
 		return nil, err
@@ -139,7 +176,7 @@ func loadCommittedProjections(ctx context.Context, store session.Store, sessionI
 	if len(batch.Messages) == 0 {
 		return nil, nil
 	}
-	projected, err := history.ProjectAgentic(batch, history.Options{ContentLimits: contentLimits, IncludeReasoning: true})
+	projected, err := history.ProjectAgentic(batch, history.Options{ContentLimits: contentLimits, IncludeReasoning: includeReasoning})
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +231,15 @@ func blockContexts(messageID session.MessageID, agentic *einoschema.AgenticMessa
 		blocks[i] = convert.AgenticBlockContext{BlockID: id}
 	}
 	return blocks
+}
+
+// syntheticTurnID mints a deterministic, per-message turn id for a durable
+// message whose own TurnID is empty (see agenticIdentity's doc comment). It
+// is derived only from the message's own ID, so replaying the same session
+// twice (or reprojecting the same message on the live commit path) always
+// produces the same synthetic id.
+func syntheticTurnID(messageID session.MessageID) string {
+	return "msg:" + string(messageID)
 }
 
 func currentRevision(ctx context.Context, store session.Store, sessionID session.ID) string {

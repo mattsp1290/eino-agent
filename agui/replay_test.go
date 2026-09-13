@@ -21,9 +21,9 @@ func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	ctx := context.Background()
 	store := replayStore(t)
 	sink := newSSESink()
-	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 
-	next, err := Replay(ctx, bridge, store, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
+	next, err := Replay(ctx, bridge, store, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
 	if err != nil {
 		t.Fatalf("Replay error = %v", err)
 	}
@@ -57,10 +57,10 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 	store := replayStore(t)
 	tail := newReplayTail()
 	sink := newSSESink()
-	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
+		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
 		done <- err
 	}()
 	<-tail.subscribed
@@ -96,10 +96,10 @@ func TestReconnectReportsTailOverflow(t *testing.T) {
 	store := replayStore(t)
 	tail := newReplayTail()
 	sink := newSSESink()
-	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
+		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
 		done <- err
 	}()
 	<-tail.subscribed
@@ -117,10 +117,10 @@ func TestReconnectCancelsTailOnDisconnect(t *testing.T) {
 	store := replayStore(t)
 	tail := newReplayTail()
 	sink := newSSESink()
-	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-replay", "run-1", nil)
 	done := make(chan error, 1)
 	go func() {
-		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{})
+		_, err := Reconnect(ctx, bridge, store, tail, "session-replay", session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
 		done <- err
 	}()
 	<-tail.subscribed
@@ -257,25 +257,178 @@ func TestReplayMessageSnapshotIncludesUserMediaBlock(t *testing.T) {
 	}
 
 	sink := newSSESink()
-	bridge := NewBridge(ctx, store, session.ContentLimits{}, sink.Writer(), sse.NewSSEWriter(), string(sessionID), "run-media", nil)
-	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, session.ContentLimits{}); err != nil {
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), "run-media", nil)
+	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, session.ContentLimits{}, false); err != nil {
 		t.Fatalf("emitMessageSnapshot error = %v, want nil (a user-role media block must not brick history.Load)", err)
 	}
-	// A user message has no native AG-UI streaming representation to
+	// A user message has no native AG-UI STREAMING representation to
 	// replay as (TEXT_MESSAGE_* covers assistant output, not input the
 	// client already sent): CommittedNativeEvents legitimately returns
-	// none for user_input_text/user_input_image, so both blocks surface
-	// only as their CUSTOM eino.agentic.v1 content-block supplement --
-	// which is exactly what proves the media block did not brick replay
-	// the way the classic projector's ErrClassicUnsupported once did.
+	// none for user_input_text/user_input_image, so both blocks surface as
+	// their CUSTOM eino.agentic.v1 content-block supplement -- which is
+	// exactly what proves the media block did not brick replay the way the
+	// classic projector's ErrClassicUnsupported once did. But
+	// emitMessageSnapshot also emits one MESSAGES_SNAPSHOT ahead of those
+	// CUSTOM supplements, built from convert.ToAgenticProjection's
+	// NativeMessage for this user message (W7 review finding A5): without
+	// it, a native-only AG-UI client that never parses eino.agentic.v1
+	// would see no user-role history at all.
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	if stringsJoined(got) != "CUSTOM,CUSTOM" {
-		t.Fatalf("event types = %#v, want two CUSTOM content-block supplements", got)
+	if stringsJoined(got) != "MESSAGES_SNAPSHOT,CUSTOM,CUSTOM" {
+		t.Fatalf("event types = %#v, want one MESSAGES_SNAPSHOT plus two CUSTOM content-block supplements", got)
 	}
 	raw := string(sink.Bytes())
 	if !strings.Contains(raw, "look at this") || !strings.Contains(raw, "https://example.com/pic.png") {
 		t.Fatalf("replayed content missing text or media: %s", raw)
+	}
+}
+
+// TestReplayToleratesMessageWithEmptyTurnID proves the W7 review's top P0
+// finding (both reviewers independently reproduced it, C1/A1): one durable
+// message with TurnID == "" must never brick replay for the whole session.
+// Before this fix, agenticIdentity passed message.TurnID straight through,
+// convert.validateIdentity rejected the empty string outright, and
+// loadCommittedProjections failed its WHOLE BATCH on that one message --
+// aborting emitMessageSnapshot before a single byte reached the client, for
+// every message in the session, healthy or not. This affects all pre-W7
+// durable data, every compaction boundary message (session/compaction did
+// not stamp a TurnID until this same review pass), and every
+// crash-interrupted tool result (runtime.settleInterruptedTool deliberately
+// leaves TurnID empty).
+func TestReplayToleratesMessageWithEmptyTurnID(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-empty-turn"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-empty-turn", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-empty-turn", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+
+	// The bad message: no TurnID at all, exactly like pre-W7 data, an
+	// unstamped compaction boundary, or a crash-interrupted tool result.
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-no-turn", SessionID: sessionID, RunID: run.ID, Role: session.RoleAssistant, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	noTurnParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "no turn id here"}}},
+	}, func() session.PartID { return "part-no-turn" }, "assistant-no-turn", sessionID, run.ID, now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.AppendPart(ctx, noTurnParts[0]); err != nil {
+		t.Fatalf("append part: %v", err)
+	}
+
+	// A second, healthy message with a real TurnID: this is what must
+	// still reach the client even though the first message is broken.
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-healthy", SessionID: sessionID, RunID: run.ID, Role: session.RoleAssistant, TurnID: "turn-healthy", CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second)}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	healthyParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "healthy content"}}},
+	}, func() session.PartID { return "part-healthy" }, "assistant-healthy", sessionID, run.ID, now.Add(time.Second), session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.AppendPart(ctx, healthyParts[0]); err != nil {
+		t.Fatalf("append part: %v", err)
+	}
+
+	sink := newSSESink()
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	if _, err := Replay(ctx, bridge, store, sessionID, session.EventCursor{Limit: 10}, session.ContentLimits{}, false); err != nil {
+		t.Fatalf("Replay err = %v, want nil (a message with an empty TurnID must not brick the whole session's replay)", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, "no turn id here") {
+		t.Fatalf("replayed content missing the empty-TurnID message's own text (it should still get a synthetic turn id, not be dropped): %s", raw)
+	}
+	if !strings.Contains(raw, "healthy content") {
+		t.Fatalf("replayed content missing the healthy message's text: %s", raw)
+	}
+}
+
+// TestReplaySkipsMessageCommittedEvents proves the W7 review's A3/finding
+// I2: a durable session.MessageCommittedEventKind event must never be
+// forwarded to bridge.Emit during replay, because the message it names was
+// already emitted by emitMessageSnapshot above it. Before this fix,
+// replay() forwarded it like any other non-LiveOnly durable event, which
+// reprojects and re-emits the SAME message a second time -- on an idle
+// session this collides on the receipt key and latches an EncErr the
+// replay loop never checked, silently masking any later genuine encoding
+// error.
+func TestReplaySkipsMessageCommittedEvents(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, storePool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-committed-skip"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-committed-skip", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-committed-skip", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	if _, err := execution.AppendMessage(ctx, session.Message{ID: "assistant-committed-skip", SessionID: sessionID, RunID: run.ID, Role: session.RoleAssistant, TurnID: "turn-committed-skip", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+	parts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "b1", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "settled once"}}},
+	}, func() session.PartID { return "part-committed-skip" }, "assistant-committed-skip", sessionID, run.ID, now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.AppendPart(ctx, parts[0]); err != nil {
+		t.Fatalf("append part: %v", err)
+	}
+	// The durable notification a real turn would have published via
+	// runtime.publishMessageCommitted right after this same content
+	// committed.
+	if _, err := execution.AppendEvent(ctx, session.EventRecord{
+		ID: "evt-committed", SessionID: sessionID, RunID: run.ID, MessageID: "assistant-committed-skip",
+		Kind: session.MessageCommittedEventKind, TurnID: "turn-committed-skip",
+		Payload: []byte(`{"revision":1}`), CreatedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("append message_committed event: %v", err)
+	}
+
+	sink := newSSESink()
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	if _, err := Replay(ctx, bridge, store, sessionID, session.EventCursor{Limit: 10}, session.ContentLimits{}, false); err != nil {
+		t.Fatalf("Replay err = %v", err)
+	}
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("EncErr = %v, want nil (message_committed must not be re-projected and collide with the snapshot's own receipt)", err)
+	}
+	frames := frameData(t, sink.Bytes())
+	got := typesFromFrames(frames)
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s (message_committed must be skipped during replay, not re-emitted as a second CUSTOM)", got, want)
 	}
 }
 

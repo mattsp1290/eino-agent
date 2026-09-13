@@ -59,7 +59,15 @@ type SSEConfig struct {
 	// mismatch does not corrupt data, but content legitimately admitted
 	// under raised limits fails to decode for the initial message snapshot.
 	ContentLimits session.ContentLimits
-	OnComplete    func(session.EventCursor, error)
+	// IncludeReasoning is the host's attestation that
+	// agui.GateProviderReasoningStorage is satisfied for every session this
+	// handler serves: only when true does the initial message snapshot and
+	// live commit reprojection include durable reasoning content blocks.
+	// Defaults to false (matching the pre-W7 classic history pipeline's
+	// default), so a host must opt in explicitly rather than durable
+	// reasoning silently streaming to every reconnecting client.
+	IncludeReasoning bool
+	OnComplete       func(session.EventCursor, error)
 }
 
 // SSEHandler returns an http.Handler for AG-UI SSE reconnect streams.
@@ -107,8 +115,8 @@ func SSEHandler(config SSEConfig) http.Handler {
 		flusher, _ := w.(http.Flusher)
 		tracked := &trackingWriter{ResponseWriter: w}
 		writer := bufio.NewWriter(flushWriter{writer: tracked, flusher: flusher})
-		bridge := agentagui.NewBridge(ctx, config.Store, config.ContentLimits, writer, sse.NewSSEWriter(), threadID, runID, nil)
-		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor, config.ContentLimits)
+		bridge := agentagui.NewBridge(ctx, config.Store, config.ContentLimits, config.IncludeReasoning, writer, sse.NewSSEWriter(), threadID, runID, nil)
+		next, err := agentagui.Reconnect(ctx, bridge, config.Store, config.Tail, sessionID, cursor, config.ContentLimits, config.IncludeReasoning)
 		if err != nil && !tracked.wrote {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			if config.OnComplete != nil {
