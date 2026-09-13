@@ -964,10 +964,13 @@ unwritten (see that bullet for the exact, now-shorter list).
   exactly a `ContentBlockTypeToolSearchResult` block and fails if none is
   found. This corrects an earlier version of this bullet, which claimed
   unconditionally that "a model that inspects the conversation for a
-  `tool_search_result`-shaped block ... will not find one" -- a grep of
-  `runtime/w4_acceptance_test.go` (the suite that claim referenced) finds no
-  assertion on `tool_search_result`/`ToolSearchFunctionToolResult` today, so
-  that specific failure mode could not be reproduced. What remains
+  `tool_search_result`-shaped block ... will not find one." That claim does
+  not hold: `runtime/w4_acceptance_test.go` defines `isToolSearchResultMessage`
+  (`:55`, keyed on `einoschema.ContentBlockTypeToolSearchResult`) and
+  `hasAnyToolSearchResult` (`:83`), and three model scripts branch on
+  `hasAnyToolSearchResult(request.Messages)` (`:544`, `:579`, `:677`) --
+  precisely a model inspecting the conversation for a `tool_search_result`
+  block -- and all three tests pass today, so the block is found. What remains
   unverified (not claimed fixed here): whether ADK's own generic tools-node
   round trip -- as opposed to `runtime/tool_search.go`'s direct persistence
   and same-turn model-visible construction -- ever independently represents
