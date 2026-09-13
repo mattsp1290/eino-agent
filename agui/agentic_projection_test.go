@@ -10,6 +10,7 @@ import (
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 
+	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -19,8 +20,20 @@ import (
 // Bridge.Emit reloads and reprojects the named durable message and emits it
 // through the observer emitter's committed-projection path with
 // DeliveryModeLiveContinuation -- custom eino.agentic.v1 supplements only,
-// no duplicate native TEXT_MESSAGE_* events (those already streamed live via
-// emitMessageDelta before the message committed).
+// no duplicate native TEXT_MESSAGE_* events -- when this same connection has
+// already natively streamed that message's content via emitMessageDelta.
+//
+// The fourth W7 fix-pass review's P0-1 finding replaced the earlier
+// connection-phase flag (Bridge.inReplaySweep) this mode selection used to
+// key off with a per-message record (Bridge.nativeStreamed), because a
+// phase flag cannot tell a message whose deltas genuinely streamed on this
+// connection apart from one that merely committed after the phase ended
+// (see Bridge.nativeStreamed's doc comment; reviews/w7-fixes3-2026-09-12/).
+// This test drives the real bridge.Emit(EventMessageDelta) path first, so
+// it fails if nativeStreamed's bookkeeping is ever broken or removed --
+// unlike a version of this test that skipped straight to the
+// message_committed event, which cannot distinguish "no native content
+// streamed" from "native content streamed but not tracked".
 func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 	t.Parallel()
 
@@ -60,6 +73,17 @@ func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 
 	sink := newSSESink()
 	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	// Simulate this connection's own live turn actually streaming the
+	// message's content BEFORE it commits -- the real precondition
+	// DeliveryModeLiveContinuation's "no duplicate native events" guarantee
+	// depends on (Bridge.nativeStreamed). Without this, nativeStreamed
+	// would be empty and the commit below would correctly (per
+	// emitLiveMessageCommitted's doc comment) use DeliveryModeCommittedOnly
+	// instead, defeating this test's purpose.
+	bridge.Emit(ctx, session.EventRecord{
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
+		Payload: []byte(`{"content":"streaming preview","reasoning":""}`),
+	})
 	bridge.Emit(ctx, session.EventRecord{
 		Kind: session.MessageCommittedEventKind, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
 		TurnID: "turn-live-commit", Payload: []byte(`{"revision":1}`),
@@ -73,8 +97,9 @@ func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	if stringsJoined(got) != "CUSTOM" {
-		t.Fatalf("event types = %#v, want a single CUSTOM content-block supplement (no duplicate native events on the live path)", got)
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,CUSTOM"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s (the delta's own native frames, then a single CUSTOM content-block supplement for the commit -- no duplicate native events on the live path)", got, want)
 	}
 	raw := string(sink.Bytes())
 	if !strings.Contains(raw, "committed live") {

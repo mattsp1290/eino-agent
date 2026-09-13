@@ -144,9 +144,10 @@ func TestReplayForwardsMessageCommittedDuringReplayWindow(t *testing.T) {
 	// native-only AG-UI client renders as nothing (W7 fix-pass review
 	// findings P0-1/C1/I2). Both assistant-early (delivered by the
 	// snapshot, DeliveryModeReplay) and assistant-late (delivered by
-	// emitLiveMessageCommitted with DeliveryModeCommittedOnly, because it
-	// committed while bridge.inReplaySweep was true) must each carry a full
-	// native text message plus its custom supplement.
+	// emitLiveMessageCommitted with DeliveryModeCommittedOnly, because this
+	// connection had not yet natively streamed any content for it --
+	// bridge.nativeStreamed was empty at commit time) must each carry a
+	// full native text message plus its custom supplement.
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
 	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM"
@@ -424,5 +425,127 @@ func TestReconnectToleratesLiveMessageCommittedNamingUnknownMessage(t *testing.T
 	want := "RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (the unknown-message commit must be skipped silently -- no CUSTOM, no natives -- and RUN_FINISHED must still be delivered)", got, want)
+	}
+}
+
+// TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWindow
+// proves the fourth W7 fix-pass review's P0-1 finding
+// (phase-state-reviewer C1 / final-coherence-reviewer C1,
+// reviews/w7-fixes3-2026-09-12/): a message that commits strictly during
+// replay()'s own ListEvents sweep -- reusing lateCommitStore's exact
+// scenario from TestReplayForwardsMessageCommittedDuringReplayWindow -- is
+// delivered with DeliveryModeCommittedOnly (native TEXT_MESSAGE_* plus
+// CUSTOM), because this connection has not yet natively streamed any
+// content for it. Reconnect subscribes to the live tail BEFORE calling
+// replay() (see Reconnect's doc comment), so a stale runtime.EventMessageDelta
+// for that SAME message -- one that was, in production, published to the
+// live tail before its content ever committed, sat buffered in the tail's
+// channel through the whole replay window, and is only now drained by the
+// live loop -- can still arrive after the sweep already delivered that
+// message in full. Before this fix, emitMessageDelta had no way to know the
+// message it names was already fully, natively delivered by the sweep
+// (Bridge.projectedMessages), and unconditionally re-emitted native
+// TEXT_MESSAGE_* frames for it: a native-only AG-UI client would render
+// "LATE-TEXT" twice and receive a second TEXT_MESSAGE_START for a message
+// it was already told had ended.
+//
+// This MUST drive Reconnect, not Replay: Replay never subscribes to a live
+// tail at all, so it cannot reproduce the buffered-delta interaction, and
+// per the review, transport.SSEHandler only ever calls Reconnect.
+func TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWindow(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	storeCtx := context.Background()
+	store, storePool, err := openTestSQLite(storeCtx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-late-commit-reconnect"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(storeCtx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(storeCtx, session.Run{ID: "run-late-commit-reconnect", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-late-commit-reconnect", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	fence := session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken}
+	// Deliberately no pre-existing messages: emitMessageSnapshot's own
+	// initial load sees zero messages, isolating "assistant-late" entirely
+	// to lateCommitStore's ListEvents-time injection below (the exact
+	// scenario TestReplayForwardsMessageCommittedDuringReplayWindow uses).
+	lateStore := &lateCommitStore{Store: store, fence: fence, sessionID: sessionID}
+
+	tail := newReplayTail()
+	sink := newSSESink()
+	bridge := NewBridge(ctx, lateStore, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := Reconnect(ctx, bridge, lateStore, tail, sessionID, session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
+		done <- err
+	}()
+	<-tail.subscribed
+
+	const timeout = 5 * time.Second
+	sendOrTimeout := func(event session.EventRecord) {
+		t.Helper()
+		select {
+		case tail.events <- event:
+		case err := <-done:
+			t.Fatalf("Reconnect returned (err = %v) before the test finished delivering live events -- it exited early instead of tolerating the stale buffered delta", err)
+		case <-time.After(timeout):
+			t.Fatalf("timed out sending event %s to the live tail", event.ID)
+		}
+	}
+	// A stale buffered delta for "assistant-late" -- the exact message
+	// lateCommitStore.injectLateMessage durably commits during replay()'s
+	// own ListEvents sweep, which the sweep therefore already delivered
+	// natively (DeliveryModeCommittedOnly, since Bridge.nativeStreamed is
+	// empty at that point). This delta carries no ID, matching every real
+	// runtime.EventMessageDelta record (runtime/adk_model.go never sets
+	// one), so agui/replay.go's seen[event.ID] guard cannot suppress it --
+	// only Bridge.projectedMessages (emitMessageDelta's new guard) can.
+	sendOrTimeout(session.EventRecord{
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: "assistant-late",
+		Payload: []byte(`{"content":"LATE-TEXT","reasoning":""}`),
+	})
+	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-late-finished", SessionID: sessionID, MessageID: "assistant-late"})
+	close(tail.events)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Reconnect err = %v, want nil", err)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("Reconnect did not return after the live tail closed")
+	}
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("EncErr = %v, want nil", err)
+	}
+	if err := bridge.LiveErr(); err != nil {
+		t.Fatalf("LiveErr = %v, want nil", err)
+	}
+	frames := frameData(t, sink.Bytes())
+	got := typesFromFrames(frames)
+	// Exactly one native TEXT_MESSAGE_START/_CONTENT/_END triplet (from the
+	// sweep's DeliveryModeCommittedOnly commit projection) plus its CUSTOM
+	// supplement, then RUN_FINISHED. Before this fix, the stale buffered
+	// delta processed by the live loop after the sweep added a SECOND
+	// native TEXT_MESSAGE_START/_CONTENT pair (delta events never close
+	// their own text span) between CUSTOM and RUN_FINISHED.
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,RUN_FINISHED"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s (assistant-late's native content must reach the client exactly once -- from the sweep's commit projection -- not a second time from the stale buffered delta)", got, want)
+	}
+	if messageID, _ := frames[0]["messageId"].(string); messageID != "assistant-late" {
+		t.Fatalf("frame[0] messageId = %q, want assistant-late", messageID)
+	}
+	if delta, _ := frames[1]["delta"].(string); delta != "LATE-TEXT" {
+		t.Fatalf("frame[1] delta = %q, want LATE-TEXT (the sweep's own native projection of the durably committed content)", delta)
 	}
 }

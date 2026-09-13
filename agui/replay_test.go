@@ -70,10 +70,17 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 		SessionID: "session-replay",
 		MessageID: "assistant-1",
 	}
+	// Deliberately a DIFFERENT messageID than the snapshot's "assistant-1":
+	// Bridge.projectedMessages already marks "assistant-1" delivered (via
+	// the snapshot above), and emitMessageDelta now drops any further
+	// delta naming an already-projected message as stale (W7 fourth
+	// fix-pass review P0-1) -- this test's purpose is to prove the live
+	// loop keeps forwarding NEW events after RUN_FINISHED, not to exercise
+	// that dedup, so it uses a message the snapshot never covered.
 	tail.events <- session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
 		SessionID: "session-replay",
-		MessageID: "assistant-1",
+		MessageID: "assistant-2",
 		Payload:   []byte(`{"content":"live","reasoning":""}`),
 		LiveOnly:  true,
 	}

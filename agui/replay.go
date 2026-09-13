@@ -53,13 +53,6 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, contentLimits, includeReasoning); err != nil {
 		return cursor, nil, err
 	}
-	// bridge.inReplaySweep brackets only this durable ListEvents sweep --
-	// never emitMessageSnapshot above (which always uses
-	// DeliveryModeReplay directly) and never the live tail loop below in
-	// Reconnect. See Bridge.inReplaySweep's doc comment for why
-	// emitLiveMessageCommitted needs to tell the two phases apart.
-	bridge.beginReplaySweep()
-	defer bridge.endReplaySweep()
 	next := cursor
 	seen := map[session.EventID]bool{}
 	for {
@@ -71,11 +64,18 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 			if err := ctx.Err(); err != nil {
 				return next, seen, err
 			}
-			seen[record.ID] = true
 			if record.LiveOnly {
+				// This sweep never emits a LiveOnly record (see below), so
+				// marking its ID seen here would buy no dedup -- it would
+				// only risk suppressing a live-tail copy of the SAME ID the
+				// client could otherwise still receive and render. Nothing
+				// in this runtime durably persists a LiveOnly record today
+				// (see runtime/adk_model.go, stream/tail.go), so this is
+				// defensive rather than a fix for an observed failure.
 				next = session.EventCursor{AfterEventID: record.ID, Limit: cursor.Limit}
 				continue
 			}
+			seen[record.ID] = true
 			bridge.Emit(ctx, record)
 			if err := bridge.Err(); err != nil {
 				return next, seen, err

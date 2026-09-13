@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
@@ -20,10 +21,19 @@ import (
 // events. One Bridge serves exactly one connection: replay() (its own
 // ListEvents sweep) and then Reconnect's live tail loop call Emit
 // sequentially from a single goroutine at a time, never concurrently, so
-// the unexported fields below (including inReplaySweep) need no locking.
-// Bridge is not safe for concurrent Emit calls from multiple goroutines.
+// the unexported fields below need no locking. Bridge is not safe for
+// concurrent Emit calls from multiple goroutines.
 type Bridge struct {
-	emit      *aguiemitter.Emitter
+	emit *aguiemitter.Emitter
+	// writer, sseWriter, threadID, and runID are the exact values used to
+	// build emit above, retained here (in addition to being bound into it)
+	// so Terminate can build a short-lived fallback emitter sharing them on
+	// an uncancelable context when emit's own context is already Done --
+	// see Terminate's doc comment.
+	writer    *bufio.Writer
+	sseWriter *sse.SSEWriter
+	threadID  string
+	runID     string
 	textOpen  map[session.MessageID]bool
 	reasoning map[session.MessageID]string
 	// store backs the agentic committed-projection path: on
@@ -46,13 +56,23 @@ type Bridge struct {
 	// liveErr is the first error a live committed-projection attempt
 	// (emitLiveMessageCommitted) hit that the runtime.EventSink.Emit
 	// signature has no way to return synchronously: a
-	// loadCommittedProjections failure, or event.MessageID not being
-	// found among this session's current projections. It does NOT
-	// duplicate EmitCommittedProjection's own failures -- those already
-	// surface through EncErr()/Err(), since the underlying emitter
-	// records them internally regardless of whether this bridge inspects
-	// its returned bool.
+	// loadCommittedProjections failure. event.MessageID not being found
+	// among this session's current projections is deliberately NOT one of
+	// these -- see emitLiveMessageCommitted's benign-miss doc comment and
+	// BenignCommitMisses -- that case used to be documented here, but is
+	// now the opposite: a benign, non-fatal, observable-elsewhere miss,
+	// never latched into liveErr. liveErr also does NOT duplicate
+	// EmitCommittedProjection's own failures -- those already surface
+	// through EncErr()/Err(), since the underlying emitter records them
+	// internally regardless of whether this bridge inspects its returned
+	// bool.
 	liveErr error
+	// benignCommitMisses counts every session.MessageCommittedEventKind
+	// notification this Bridge has observed naming a message not (yet)
+	// visible to a live reload (see emitLiveMessageCommitted's benign-miss
+	// doc comment) -- the only host-visible signal for that case, since it
+	// is deliberately not latched into liveErr.
+	benignCommitMisses int
 	// projectedMessages records every message ID this Bridge has already
 	// emitted through the agentic committed-projection path -- either
 	// emitMessageSnapshot's replay projection or an earlier
@@ -71,21 +91,36 @@ type Bridge struct {
 	// during the replay window (never in this set) instead of forwarding
 	// it.
 	projectedMessages map[session.MessageID]bool
-	// inReplaySweep is true only while replay()'s own ListEvents loop
-	// (agui/replay.go) is forwarding a connection's initial catch-up sweep
-	// of durable events, and false everywhere else, including while
-	// Reconnect's live tail loop runs after replay() has returned. A
-	// session.MessageCommittedEventKind event observed while this is true
-	// names a message whose EventMessageDelta records were LiveOnly and
-	// were therefore SKIPPED by replay() (see replay()'s doc comment):
-	// this connection never saw that message's live deltas, so
-	// emitLiveMessageCommitted must include native events, not just the
-	// eino.agentic.v1 supplement. Once inReplaySweep is false, a
-	// message_committed can only arrive after this connection's own live
-	// tail already streamed that message's content natively via
-	// emitMessageDelta/emitToolCallUpdated, so a custom-only supplement is
-	// correct there and does not duplicate content already delivered.
-	inReplaySweep bool
+	// nativeStreamed records every message ID for which this Bridge has
+	// actually emitted at least one native AG-UI event (TEXT_MESSAGE_*,
+	// REASONING_*, or TOOL_CALL_*) via emitMessageDelta/emitToolCallUpdated
+	// on THIS connection. emitLiveMessageCommitted consults it (not a
+	// connection-phase flag -- see the fourth W7 fix-pass review's P0-1
+	// finding, reviews/w7-fixes3-2026-09-12/) to decide whether a
+	// session.MessageCommittedEventKind notification for a message still
+	// needs a native representation or can be a custom-only supplement:
+	// the earlier "are we still in replay()'s durable sweep" phase test
+	// assumed a message's live deltas are necessarily unseen during that
+	// sweep and necessarily already seen once the sweep ends, but
+	// Reconnect subscribes to the live tail BEFORE calling replay() (see
+	// Reconnect's doc comment), so a delta for a message replay()'s own
+	// sweep already found fully committed can still be sitting in that
+	// buffered channel, to be drained by the live loop AFTER the sweep
+	// already delivered that message's native content. A phase flag can't
+	// tell that apart; per-message "did native content actually reach
+	// this connection for THIS message" can. See also
+	// emitMessageDelta/emitToolCallUpdated's own messageProjected guard,
+	// which handles the mirror case (a stale delta arriving for a message
+	// already delivered via the committed-projection path).
+	nativeStreamed map[session.MessageID]bool
+	// terminated is true once this Bridge has written a terminal frame --
+	// either Emit's runtime.EventRunFinished case (a durable
+	// RUN_FINISHED/RUN_ERROR) or a Terminate call -- for the life of this
+	// connection. AG-UI treats RUN_FINISHED and RUN_ERROR as equally
+	// terminal for a run: a client that has already seen one must never
+	// see a second, and never one after a successful RUN_FINISHED (W7
+	// fourth fix-pass review P0-3).
+	terminated bool
 }
 
 // NewBridge binds an AG-UI emitter to the SDK's concrete SSE writer pair.
@@ -95,6 +130,10 @@ type Bridge struct {
 func NewBridge(ctx context.Context, store session.Store, contentLimits session.ContentLimits, includeReasoning bool, writer *bufio.Writer, sseWriter *sse.SSEWriter, threadID, runID string, cancel context.CancelFunc) *Bridge {
 	return &Bridge{
 		emit:             aguiemitter.NewEmitter(ctx, writer, sseWriter, threadID, runID, cancel),
+		writer:           writer,
+		sseWriter:        sseWriter,
+		threadID:         threadID,
+		runID:            runID,
 		textOpen:         map[session.MessageID]bool{},
 		reasoning:        map[session.MessageID]string{},
 		store:            store,
@@ -148,22 +187,39 @@ func (b *Bridge) markMessageProjected(id session.MessageID) {
 	b.projectedMessages[id] = true
 }
 
-// beginReplaySweep and endReplaySweep bracket replay()'s own ListEvents
-// loop (see Bridge.inReplaySweep's doc comment). Callers must always pair
-// beginReplaySweep with a deferred endReplaySweep so the flag cannot leak
-// true into Reconnect's live tail loop on any return path.
-func (b *Bridge) beginReplaySweep() {
+// nativeAlreadyStreamed reports whether this Bridge has already emitted at
+// least one native AG-UI event for id on this connection (see
+// Bridge.nativeStreamed's doc comment).
+func (b *Bridge) nativeAlreadyStreamed(id session.MessageID) bool {
 	if b == nil {
-		return
+		return false
 	}
-	b.inReplaySweep = true
+	return b.nativeStreamed[id]
 }
 
-func (b *Bridge) endReplaySweep() {
-	if b == nil {
+// markNativeStreamed records id as having had native AG-UI content emitted
+// for it on this connection (see Bridge.nativeStreamed's doc comment).
+func (b *Bridge) markNativeStreamed(id session.MessageID) {
+	if b == nil || id == "" {
 		return
 	}
-	b.inReplaySweep = false
+	if b.nativeStreamed == nil {
+		b.nativeStreamed = map[session.MessageID]bool{}
+	}
+	b.nativeStreamed[id] = true
+}
+
+// BenignCommitMisses returns the number of session.MessageCommittedEventKind
+// notifications this Bridge has observed naming a message not (yet) visible
+// to a live reload -- see emitLiveMessageCommitted's benign-miss doc
+// comment. This is deliberately not surfaced through LiveErr() (it is not a
+// failure), but it is the only host-visible signal for that case: a real
+// bug producing a persistently non-zero rate is otherwise invisible.
+func (b *Bridge) BenignCommitMisses() int {
+	if b == nil {
+		return 0
+	}
+	return b.benignCommitMisses
 }
 
 // EncErr returns the first event validation/encoding error.
@@ -189,6 +245,16 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 	case session.MessageCommittedEventKind:
 		b.emitLiveMessageCommitted(ctx, event)
 	case runtime.EventRunFinished:
+		// terminated guards against writing a second terminal frame: a
+		// durable RUN_FINISHED/RUN_ERROR reaching Emit twice (a redundant
+		// replay/live delivery of the same settlement record) must not
+		// duplicate it, and once this fires, a later out-of-band
+		// Terminate call (transport/http.go) must not add a THIRD (W7
+		// fourth fix-pass review P0-3).
+		if b.terminated {
+			return
+		}
+		b.terminated = true
 		b.closeOpen()
 		if event.Error.Message != "" {
 			b.emit.RunError(event.Error.Message)
@@ -202,6 +268,65 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		}
 	}
 }
+
+// Terminate emits a terminal RUN_ERROR frame reporting that this
+// connection's Reconnect/Replay call ended in err, unless:
+//
+//   - a terminal frame has already reached the wire for this connection
+//     (a durable RUN_FINISHED/RUN_ERROR via Emit's runtime.EventRunFinished
+//     case, or an earlier Terminate call -- see Bridge.terminated's doc
+//     comment: RUN_FINISHED and RUN_ERROR are both terminal for a run, and
+//     a client must never see a second one, nor one after a successful
+//     RUN_FINISHED), or
+//   - err is a benign context.Canceled from a client disconnect or a
+//     graceful server shutdown, neither of which is a failure the client
+//     needs signalled (nothing is listening on a client disconnect, and a
+//     graceful shutdown is not a truncation). context.DeadlineExceeded is
+//     deliberately NOT treated as benign here: a host-imposed request
+//     deadline leaves the client connected and genuinely needing the
+//     truncation signal (W7 fourth fix-pass review P0-2).
+//
+// err's own text never reaches the wire -- only a fixed, policy-safe
+// message does (docs/architecture/agui-events.md's Errors row: "Provider/
+// internal details redacted by policy"). err can wrap identifiers (e.g.
+// emitLiveMessageCommitted's own wrapped reload-failure errors carry
+// session/message IDs) this bridge has no business putting on an
+// AG-UI client's wire.
+//
+// This deliberately does not reuse the primary emitter (b.emit, bound to
+// ctx at NewBridge time): by the time Reconnect/Replay has returned a
+// non-nil error, ctx is very often already Done (Reconnect returns
+// ctx.Err() on both client disconnect and server shutdown, and the SAME
+// ctx.Err() propagates through a host's context.DeadlineExceeded too), and
+// the AG-UI SDK's JSON encoder refuses to encode anything once ctx.Err() !=
+// nil -- checked before encoding, so the failure surfaces as an encoding
+// error, never a transport one, and nothing is written (W7 fourth fix-pass
+// review P0-2). Instead this builds a short-lived emitter sharing this
+// connection's writer/threadID/runID but bound to
+// context.WithoutCancel(ctx), so the encoder sees a live (never-canceled,
+// never-deadlined) context regardless of why ctx itself ended. For a
+// non-context error while ctx is still live (e.g. ErrTailOverflow, a store
+// failure) this changes nothing observable: the fallback emitter behaves
+// identically to the primary one in that case.
+func (b *Bridge) Terminate(ctx context.Context, err error) bool {
+	if b == nil || b.emit == nil || err == nil || b.terminated {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	b.terminated = true
+	fallback := aguiemitter.NewEmitter(context.WithoutCancel(ctx), b.writer, b.sseWriter, b.threadID, b.runID, nil)
+	fallback.RunError(TerminalErrorMessage)
+	return fallback.Err() == nil && fallback.EncErr() == nil
+}
+
+// TerminalErrorMessage is the fixed, policy-safe text Terminate puts on the
+// wire for every non-benign termination it reports -- see Terminate's doc
+// comment for why the triggering error's own text never reaches the wire.
+// Exported so a host (or a test) that needs to recognize this exact
+// terminal frame does not have to hardcode a duplicate string literal.
+const TerminalErrorMessage = "stream terminated unexpectedly"
 
 // MessagesSnapshot converts Eino messages with eino-agui/convert before
 // emitting MESSAGES_SNAPSHOT.
@@ -268,9 +393,27 @@ func (b *Bridge) ReasoningEncryptedValue(subtype aguievents.ReasoningEncryptedVa
 }
 
 func (b *Bridge) emitMessageDelta(event session.EventRecord) {
+	messageID := event.MessageID
+	// A message already delivered through the agentic committed-projection
+	// path (b.projectedMessages, set by emitMessageSnapshot or an earlier
+	// emitLiveMessageCommitted) has already reached this connection in
+	// full -- natively if nativeStreamed was false at commit time, or as a
+	// custom-only supplement otherwise (see emitLiveMessageCommitted's
+	// mode-selection doc comment). Any FURTHER delta naming the same
+	// messageID on this connection is therefore necessarily stale: content
+	// that was sitting buffered on the live tail (Reconnect subscribes
+	// before calling replay(), see Reconnect's doc comment) when this
+	// connection's own sweep already found the message fully committed, or
+	// a duplicate publish. Re-emitting it here would duplicate native
+	// content the client already has -- the fourth W7 fix-pass review's
+	// P0-1 finding (reviews/w7-fixes3-2026-09-12/). Dropping it is safe
+	// because it is transport content, not protocol bookkeeping: nothing
+	// downstream depends on having seen it.
+	if b.messageProjected(messageID) {
+		return
+	}
 	payload := messageDeltaPayload{}
 	_ = json.Unmarshal(event.Payload, &payload)
-	messageID := event.MessageID
 	// includeReasoning gates this live delta path exactly like it gates
 	// the durable committed-projection path (emitLiveMessageCommitted,
 	// emitMessageSnapshot): a host that has not attested
@@ -291,6 +434,7 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 			b.emit.ReasoningMessageStart(reasoningID)
 		}
 		b.emit.ReasoningContent(reasoningID, payload.Reasoning)
+		b.markNativeStreamed(messageID)
 	}
 	if payload.Content != "" {
 		if b.reasoning[messageID] != "" {
@@ -303,10 +447,17 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 			b.textOpen[messageID] = true
 		}
 		b.emit.TextContent(string(messageID), payload.Content)
+		b.markNativeStreamed(messageID)
 	}
 }
 
 func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
+	// See emitMessageDelta's messageProjected guard: the same staleness
+	// argument applies to a tool-call update for a message already fully
+	// delivered through the committed-projection path.
+	if b.messageProjected(event.MessageID) {
+		return
+	}
 	payload := toolPayload{}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
 		b.emit.RunError(err.Error())
@@ -319,14 +470,17 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 	b.closeOpen()
 	if payload.Name != "" {
 		b.emit.ToolStart(toolCallID, payload.Name, string(event.MessageID))
+		b.markNativeStreamed(event.MessageID)
 	}
 	if payload.Arguments != "" {
 		b.emit.ToolArgs(toolCallID, payload.Arguments.String())
+		b.markNativeStreamed(event.MessageID)
 	}
 	switch payload.Status {
 	case string(session.ToolCallCompleted), string(session.ToolCallFailed), string(session.ToolCallInterrupted):
 		b.emit.ToolEnd(toolCallID)
 		b.emit.ToolResult(string(event.MessageID), toolCallID, payload.ResultContent())
+		b.markNativeStreamed(event.MessageID)
 	}
 }
 
@@ -358,22 +512,26 @@ func (b *Bridge) EmitCommittedProjection(projection *convert.AgenticProjection, 
 // emitLiveMessageCommitted reacts to a durable session.MessageCommittedEventKind
 // notification (see that constant's doc comment) by reloading and
 // reprojecting event.MessageID's session and emitting it through the
-// agentic committed path. The delivery mode depends on which phase of the
-// connection observed the notification -- see Bridge.inReplaySweep's doc
-// comment for why:
+// agentic committed path. The delivery mode depends on whether THIS
+// message already had native content streamed to THIS connection -- see
+// Bridge.nativeStreamed's doc comment for why a per-message record is used
+// instead of a connection-phase flag:
 //
-//   - While replay()'s own durable ListEvents sweep is running
-//     (b.inReplaySweep true), this uses DeliveryModeCommittedOnly, which
-//     includes a native AG-UI representation (TEXT_MESSAGE_*/TOOL_CALL_*/...)
-//     alongside the eino.agentic.v1 custom supplement, because this
-//     connection's live deltas for the message were LiveOnly records that
-//     replay() skips (see replay()'s doc comment) -- it never saw them.
-//   - Once replay() has returned and Reconnect's live tail loop is running
-//     (b.inReplaySweep false), this uses DeliveryModeLiveContinuation
-//     (custom supplement only): any representable native content already
-//     reached this same connection as transient deltas via
-//     emitMessageDelta/emitToolCallUpdated before the message committed, so
-//     this must not duplicate it as a second native event.
+//   - If b.nativeStreamed[event.MessageID] is false, this uses
+//     DeliveryModeCommittedOnly, which includes a native AG-UI
+//     representation (TEXT_MESSAGE_*/TOOL_CALL_*/...) alongside the
+//     eino.agentic.v1 custom supplement: this connection has not (yet)
+//     natively streamed this message's content, whether because it
+//     committed during replay()'s own durable sweep (its live
+//     EventMessageDelta records, if any, were never durable -- see
+//     runtime/adk_model.go -- so this connection cannot have seen them)
+//     or for any other reason.
+//   - If b.nativeStreamed[event.MessageID] is true, this uses
+//     DeliveryModeLiveContinuation (custom supplement only): representable
+//     native content for this message already reached this same
+//     connection via emitMessageDelta/emitToolCallUpdated before the
+//     message committed, so this must not duplicate it as a second native
+//     event.
 //
 // It reprojects the WHOLE session's durable history rather than loading just
 // this one message: session.Store exposes no by-ID single-message read
@@ -407,7 +565,7 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 		return
 	}
 	mode := aguiemitter.DeliveryModeLiveContinuation
-	if b.inReplaySweep {
+	if !b.nativeAlreadyStreamed(event.MessageID) {
 		mode = aguiemitter.DeliveryModeCommittedOnly
 	}
 	for _, p := range projections {
@@ -442,16 +600,32 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 	// is unreachable: nothing in this module ever constructs a
 	// RoleTool message; runtime's two publishMessageCommitted call sites
 	// use RoleUser/RoleAssistant, both of which always project at least
-	// one AgenticMessage.) Deliberately do NOT call recordLiveErr: since
-	// publishMessageCommitted is at-least-once, a later message_committed
-	// for the same messageID -- once its content is actually visible to a
-	// reload -- can still succeed, and turning this transient,
-	// self-healing miss into a fatal LiveErr() would abort Reconnect over
-	// a benign read-your-writes gap, exactly the class of stream-kill this
-	// bridge exists to avoid (see also emitLiveMessageCommitted's
-	// projectedMessages paragraph above, for the sibling P0-A case). The
-	// message is left out of projectedMessages so a later retry is not
+	// one AgenticMessage.) Deliberately do NOT call recordLiveErr: turning
+	// this transient, read-your-writes race into a fatal LiveErr() would
+	// abort Reconnect over a benign gap, exactly the class of stream-kill
+	// this bridge exists to avoid (see also emitLiveMessageCommitted's
+	// projectedMessages paragraph above, for the sibling P0-A case).
+	//
+	// The fourth W7 fix-pass review's I2 finding corrected the recovery
+	// story an earlier version of this comment told: publishMessageCommitted
+	// being at-least-once does NOT mean this exact notification is
+	// re-delivered later -- both runtime call sites (tool_preparation.go,
+	// tool_execution.go) publish it exactly once per commit, with no retry
+	// or re-publish. The real recovery is a FRESH reconnect: its own
+	// emitMessageSnapshot reload will see the message once it becomes
+	// visible, independent of this notification, which this connection has
+	// already consumed (Reconnect's seen map, agui/replay.go). The message
+	// is left out of projectedMessages here so that fresh-reconnect path
+	// -- or, on this same connection, the extremely unlikely case that this
+	// exact messageID commits and re-notifies a second time -- is not
 	// mistaken for already-delivered.
+	//
+	// This miss is deliberately not fatal, but it must not be invisible
+	// either: BenignCommitMisses gives a host watching this Bridge (or a
+	// metrics scrape built on top of it) a way to see a rate that should
+	// normally be zero or near-zero, since nothing else on this path is
+	// otherwise observable when it happens.
+	b.benignCommitMisses++
 }
 
 // recordLiveErr is first-error-wins, matching the underlying emitter's own
