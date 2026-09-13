@@ -106,20 +106,46 @@ As of W7, `agui.Replay` materializes its message snapshot through the
 (`agui/replay.go`) projects every durable message via
 `history.ProjectAgentic`/`convert.ToAgenticProjection` and emits each one
 through `emitter.Emitter.EmitCommittedProjection` with
-`DeliveryModeReplay`. This removes the `history.ErrClassicUnsupported`
-failure the classic (non-agentic) `history.Load`/`history.Project` path hit
-on `tool_search_result`, `server_tool_call`/`server_tool_result`,
+`DeliveryModeReplay`, after first emitting one `MESSAGES_SNAPSHOT` built
+from those projections' `NativeMessage` values (populated for user-role
+messages) so a native-only AG-UI client -- one that does not parse the
+`eino.agentic.v1` custom envelope -- still sees user-role history instead of
+what would otherwise read as an assistant monologue. This removes the
+`history.ErrClassicUnsupported` failure the classic (non-agentic)
+`history.Load`/`history.Project` path hit on `tool_search_result`,
+`server_tool_call`/`server_tool_result`,
 `mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result`,
 `mcp_tool_approval_request`/`mcp_tool_approval_response`, and assistant-role
-media blocks: every one of those now replays as its native AG-UI
-representation (when the accepted contract's twenty-kind mapping defines
-one) plus an `eino.agentic.v1` custom content-block supplement, proved by
-`TestReplayMessageSnapshotIncludesUserMediaBlock` in `agui/replay_test.go`.
-See "W7: Agentic committed-projection replay and live emission" below for
-the full mechanism. The classic `history.Load`/`convert.ToAGUIMessages` path
-still exists and is still used by `transport.DecodeMessages` for classic
-JSON ingress; it is `agui.Replay`'s emission path specifically that no
-longer uses it.
+media blocks. **These specific kinds have no native AG-UI representation at
+all** (`convert.nativeEventsForBlock` returns none for them): they replay as
+an `eino.agentic.v1` custom content-block supplement **only**. Only
+`reasoning`, `assistant_gen_text`, `function_tool_call`, and text-only
+`function_tool_result` blocks get a native representation alongside their
+supplement; every other block kind -- including the `user_input_*` kinds the
+new `MESSAGES_SNAPSHOT` above separately covers -- is custom-supplement-only.
+`TestReplayMessageSnapshotIncludesUserMediaBlock` in `agui/replay_test.go`
+proves the media content reaches the stream for `user_input_text`/
+`user_input_image`; it does not cover, and does not prove anything about,
+`tool_search_result`/`server_tool_*`/`mcp_*`/assistant media. See "W7:
+Agentic committed-projection replay and live emission" below for the full
+mechanism. The classic `history.Load`/`convert.ToAGUIMessages` path still
+exists and is still used by `transport.DecodeMessages` for classic JSON
+ingress; it is `agui.Replay`'s emission path specifically that no longer
+uses it.
+
+`agui.Replay`/`agui.Reconnect` also take an explicit `includeReasoning`
+parameter (`transport.SSEConfig.IncludeReasoning` at the HTTP boundary),
+defaulting to `false`: durable reasoning content blocks are included in the
+message snapshot and live commit reprojection only when a host passes
+`true`, attesting that `GateProviderReasoningStorage` is satisfied for the
+session being served. A host that never sets it gets the same default the
+pre-W7 classic pipeline had (no durable reasoning replayed).
+
+`session.MessageCommittedEventKind` ("message_committed") durable events are
+never forwarded to `bridge.Emit` during replay (see `replay()` in
+`agui/replay.go`): the message they notify about was already emitted by the
+snapshot above, so forwarding them would re-project and re-emit it a second
+time.
 
 ## Live Tail
 
@@ -213,15 +239,33 @@ it does not describe an aspirational end state. See
 
 ### Durable identity (session.Message.TurnID / AgentPath)
 
-`session.Message` carries `TurnID` and `AgentPath`, stamped at every append
-site (admission, turn admission, continuation dispatch, approval response,
-tool settlement, tool search settlement, crash-reconciled carrier turns).
-Both are record-JSON-only correlation fields, matching the pre-existing
-`EventRecord.TurnID`/`AgentPath` and `ModelRequestRecord.TurnID`/`AgentPath`
-convention (no SQL column or index backs any of the four); no migration was
-needed. `AgentPath` is always empty today (a single root-agent path segment
-named `"root"` is synthesized at projection time) because subagent nesting is
-not wired end to end anywhere in the runtime yet.
+`session.Message` carries `TurnID` and `AgentPath`, stamped at most (not
+quite every -- see below) append sites (admission, turn admission,
+continuation dispatch, approval response, tool settlement, tool search
+settlement, crash-reconciled carrier turns, and now the compaction boundary
+message -- `session/compaction`). Both are record-JSON-only correlation
+fields, matching the pre-existing `EventRecord.TurnID`/`AgentPath` and
+`ModelRequestRecord.TurnID`/`AgentPath` convention (no SQL column or index
+backs any of the four); no migration was needed. `agui.agenticIdentity`
+keys the projected agent-path segment off `AgentPath` specifically (not the
+separate `Agent` field, which carries the configured agent's display name
+and is set only on assistant messages) so every message in one turn --
+user and assistant alike -- projects the same agent path; `AgentPath` is
+always empty today (a single root-agent path segment named `"root"` is
+synthesized at projection time) because subagent nesting is not wired end
+to end anywhere in the runtime yet.
+
+Not every durable message actually gets a `TurnID`: all pre-W7 data, every
+compaction boundary message before this fix, and
+`runtime.settleInterruptedTool`'s deliberate crash-reconciliation stamp
+(that function's own doc comment explains why: no by-ID message read exists
+to recover the calling message's turn) all carry an empty `TurnID`.
+`convert.validateIdentity` rejects an empty `TurnID` outright, so
+`agui.agenticIdentity` substitutes a deterministic synthetic id
+(`"msg:" + message.ID`) whenever `TurnID` is empty -- mirroring
+`blockContexts`' existing synthetic-block-id precedent -- so a single such
+message can never fail `loadCommittedProjections`' whole batch and brick
+replay for an entire session.
 
 An assistant message's "attempt identity" for AG-UI purposes is the
 `InvocationID` of the `ModelRequestRecord` that produced it (existing
@@ -244,11 +288,15 @@ Both the durable replay path and the live path build an eino-agui
 
 - **Replay** (`emitMessageSnapshot`): every durable message in a session,
   projected via `history.ProjectAgentic` and `convert.ToAgenticProjection`,
-  emitted with `DeliveryModeReplay` (native AG-UI events for every
-  representable content kind, plus one `eino.agentic.v1` custom
-  content-block supplement per block -- nothing is silently dropped for a
-  kind the accepted contract's twenty-kind mapping does not give a native
-  representation to, e.g. `tool_search_result` or `mcp_*`).
+  emitted with `DeliveryModeReplay` (a native AG-UI representation for the
+  content kinds `convert.nativeEventsForBlock` maps one to -- `reasoning`,
+  `assistant_gen_text`, `function_tool_call`, text-only
+  `function_tool_result` -- plus one `eino.agentic.v1` custom content-block
+  supplement per block, always; nothing is silently dropped, but a kind
+  outside that native list, e.g. `tool_search_result` or `mcp_*`, gets the
+  custom supplement only, never a native event). A `MESSAGES_SNAPSHOT` built
+  from these projections' `NativeMessage` values is emitted first (see the
+  Replay Projection section above).
 - **Live** (`Bridge.Emit`'s `session.MessageCommittedEventKind` case,
   `emitLiveMessageCommitted`): reprojects the *whole session's* durable
   history and emits only the one message the event named, with
@@ -265,8 +313,14 @@ Every emitted projection's `CommitReceiptV1` binds `Domain: "projection"`,
 the exact `Identity` eino-agui computed, and `Digest: ProjectionDigestV1`.
 Replay's shared revision comes from `session.ObservationReader.
 ReadObservationRevision`, queried once per replay call; every message in
-that call safely shares the same revision string (eino-agui dedupes receipts
-by identity, not by revision).
+that call safely shares the same revision string, because eino-agui's
+receipt dedup key (`agenticReceiptKey`) folds the full `Identity` in
+alongside `Revision` -- the identity fields still disambiguate messages that
+share one revision. That same revision-folding means the SAME message
+re-projected under a **different** revision is not deduplicated at all: this
+is why `agui.replay()` filters out durable `message_committed` events
+outright rather than relying on receipt dedup to prevent replay from
+double-emitting a message the initial snapshot already delivered.
 
 ### Not yet implemented (deferred, not silently dropped)
 

@@ -2493,23 +2493,39 @@ flagged rather than silently ignored.
   path and the live path now use the accepted `eino-agui` agentic bridge
   (`convert.ToAgenticProjection`, `emitter.Emitter.EmitCommittedProjection`)
   instead of a locally duplicated conversion. `emitMessageSnapshot` projects
-  every durable message and emits it with `DeliveryModeReplay` (native
-  events for representable content plus one `eino.agentic.v1` custom
-  supplement per block), which removes the `history.ErrClassicUnsupported`
-  failure the classic `history.Load` projector hit on `tool_search_result`,
-  `mcp_*`, and assistant media -- `TestReplayMessageSnapshotIncludesUserMediaBlock`
-  now proves the media content actually reaches the stream, not merely that
-  loading didn't error. `Bridge.Emit` gains a
+  every durable message, emits one `MESSAGES_SNAPSHOT` built from their
+  `NativeMessage` values (user-role display text, for native-only clients),
+  then emits each projection with `DeliveryModeReplay`. This removes the
+  `history.ErrClassicUnsupported` failure the classic `history.Load`
+  projector hit on `tool_search_result`, `mcp_*`, and assistant media --
+  but those specific kinds have no native AG-UI representation at all
+  (`convert.nativeEventsForBlock` returns none for them) and replay as an
+  `eino.agentic.v1` custom content-block supplement **only**; only
+  `reasoning`, `assistant_gen_text`, `function_tool_call`, and text-only
+  `function_tool_result` get a native event alongside their supplement.
+  `TestReplayMessageSnapshotIncludesUserMediaBlock` proves the media content
+  actually reaches the stream for `user_input_text`/`user_input_image`
+  specifically (not merely that loading didn't error); it does not cover
+  `tool_search_result`/`mcp_*`/assistant media. `Bridge.Emit` gains a
   `session.MessageCommittedEventKind` case that reprojects the committed
   message and emits it with `DeliveryModeLiveContinuation` (custom
   supplement only, since representable native content already streamed
   live via the existing delta path before the message committed) --
   `TestBridgeEmitLiveMessageCommittedProjectsDurableContent` proves this
   end to end against a real SQLite store. `NewBridge`'s signature grew a
-  required `(store session.Store, contentLimits session.ContentLimits)`
-  pair (a nil store disables the new path; existing classic-only tests pass
-  nil), a breaking constructor change per this repository's no-compatibility-
-  shim policy.
+  required `(store session.Store, contentLimits session.ContentLimits,
+  includeReasoning bool)` triple (a nil store disables the new path;
+  existing classic-only tests pass nil), a breaking constructor change per
+  this repository's no-compatibility-shim policy. `includeReasoning`
+  defaults to `false` at the `transport.SSEConfig.IncludeReasoning` host
+  boundary: a host must explicitly opt in, attesting
+  `agui.GateProviderReasoningStorage` is satisfied, before durable
+  reasoning content blocks are included in the message snapshot or live
+  commit reprojection. `agui.Replay`/`agui.Reconnect` both gained the same
+  `includeReasoning bool` parameter, and `replay()` now filters out durable
+  `session.MessageCommittedEventKind` events instead of forwarding them to
+  `bridge.Emit` (which would re-project and double-emit a message the
+  snapshot already delivered).
 - **Rich transport ingress (`transport/rich.go`)**: `DecodeUserMessage`
   decodes a native AG-UI `types.InputContent` list into a
   `runtime.UserMessage`, mapping text/image/audio/video/document onto their
