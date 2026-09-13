@@ -681,6 +681,12 @@ func TestPublicToolSearchDiscoversDeferredToolThenAliasExecutes(t *testing.T) {
 	if len(script.offeredToolNames) < 2 {
 		t.Fatalf("expected at least 2 model calls, got %d", len(script.offeredToolNames))
 	}
+	// The "weather" arm on each side below is belt-and-braces, not
+	// load-bearing: the tool is always registered and offered under its
+	// real name "get_weather" (never the bare alias "weather"), so only
+	// the "get_weather" arm evaluates on this fixture today. It is kept in
+	// case alias resolution ever changes to report the short alias name
+	// instead of the registered tool name.
 	if containsToolNamed(script.offeredToolNames[0], "get_weather") || containsToolNamed(script.offeredToolNames[0], "weather") {
 		t.Fatalf("call 1 offered the deferred tool before tool_search discovered it: %v", script.offeredToolNames[0])
 	}
@@ -1177,6 +1183,13 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 	// (fixture-integrity-reviewer, C3; contrast fixture 8's identical
 	// concern at mountEchoNoteTool's Retention comment).
 	snapshotResult := decodeJSONObject(t, toolCallResults[0].Content)
+	// Belt-and-braces, not the primary assertion: on the happy path the
+	// decoded snapshot result has no "truncated" key at all (it only
+	// appears in an omission record), so this guard is a no-op unless
+	// echo_note's Retention policy above is later removed or weakened, at
+	// which point it is the assertion that catches the regression. The
+	// structured["echoed"] check immediately below is what actually
+	// proves the real output reached the wire on this run.
 	if snapshotResult["truncated"] == true {
 		t.Fatalf("expected echo_note's real output to durably inline under its Retention policy, got an omission record in: %s", stream)
 	}
@@ -1195,6 +1208,12 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 	// (which the legitimate snapshot result above also contains) -- so
 	// this fails the moment toolPayload decodes the real output instead.
 	liveForwardedResult := decodeJSONObject(t, toolCallResults[1].Content)
+	// Belt-and-braces, not the definitive assertion: "echoed" lives nested
+	// under a "structured" sub-object on a real result, never as a
+	// top-level key, so this guard only catches a fix shape that returns
+	// the structured sub-object directly at the top level. The
+	// reflect.DeepEqual below against the exact three-key stub is what
+	// actually fails the moment toolPayload decodes real output instead.
 	if _, ok := liveForwardedResult["echoed"]; ok {
 		t.Fatalf("tool result carried real output; eino-agent-6wj is apparently fixed, update this fixture: %s", stream)
 	}
@@ -1214,7 +1233,11 @@ type sseFrame struct {
 
 // decodeSSEEvents parses raw's "data: {...}" lines (frames are separated by a
 // blank line, per the SSE wire format sse.NewSSEWriter produces) into
-// sseFrame values, in wire order.
+// sseFrame values, in wire order. The outer per-frame split is not
+// structurally necessary against this fixture's input -- the inner "data: "
+// prefix filter alone finds every event line regardless of blank-line
+// framing -- it is kept only to mirror the real SSE wire shape for a future
+// reader comparing this decoder against the wire format.
 func decodeSSEEvents(t *testing.T, raw string) []sseFrame {
 	t.Helper()
 	var events []sseFrame
