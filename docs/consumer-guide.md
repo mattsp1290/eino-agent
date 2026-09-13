@@ -25,6 +25,21 @@ cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
 See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
 CloudWeGo Eino is pinned to exactly `v0.9.19`; PostgreSQL 17 is the supported server baseline.
 
+**This pin predates the agentic adoption (Eino v0.9.19 work, W1-W8) and does
+NOT include it.** `model.NewAgenticStreamer`/`NewAgenticStreamerWithProviderState`,
+the AG-UI bridge, and everything else described below under "Native model
+providers" do not exist at commit `cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`
+(`git grep -c NewAgenticStreamer cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e` finds
+zero matches). No commit past the agentic cutover has been publication-verified
+through the public Go proxy yet -- this branch is "not yet resolvable through
+the public proxy" (see
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+W8 section) -- so there is no pin to cite for the agentic APIs today. A host
+that needs them must build against a local `replace` directive pointed at this
+repository (as `testdata/external-consumer/check.sh` does in local mode) until
+a post-agentic commit is verified and published; do not combine the pin above
+with the agentic APIs below.
+
 The AG-UI bridge (`agui`, `transport`; adopted in W7) pins
 `github.com/mattsp1290/eino-agui`, which itself requires a root `replace`
 directive for `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>

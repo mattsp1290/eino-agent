@@ -24,7 +24,12 @@ and observability remain provider-neutral.
   with `make check`, the required PostgreSQL test/race suites, and a fresh
   PostgreSQL consumer using no replacement, workspace, vendor tree or checkout
   access. Earlier release/discovery pins are historical; use this pin for the
-  host-owned SQLite and PostgreSQL APIs.
+  host-owned SQLite and PostgreSQL APIs. **This pin predates the agentic
+  adoption below (W1-W8) and does not include it** -- `NewAgenticStreamer`,
+  the AG-UI bridge, and the native-provider integration described further
+  down do not exist at this commit. No later commit is publication-verified
+  yet; see `docs/consumer-guide.md`'s Installation section for what a host
+  needing the agentic APIs must do in the meantime.
 - Generated bindings: `github.com/mattsp1290/eino-agent/wasmext/gen v0.1.0`
   via submodule tag `wasmext/gen/v0.1.0`
 - CloudWeGo Eino: `github.com/cloudwego/eino v0.9.19` (exact pin; see [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md))
