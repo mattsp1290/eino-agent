@@ -2620,9 +2620,13 @@ flagged rather than silently ignored.
   in-bounds target id or idempotency key never substitutes for a failed
   auth call. `ResumeTargetedHandler` bounds target count (256) and per-id
   length (512 bytes); `EnqueueHandler` requires a bounded `Idempotency-Key`
-  header. Not yet wired as the default ingress path in
-  `SSEHandler`/`examples/minimal-server` -- the classic `DecodeMessages`
-  remains the default for existing callers.
+  header. Not yet wired as the default ingress path in `SSEHandler` or
+  `examples/minimal-server`, which decodes its own request body inline
+  (`examples/minimal-server/main.go`). The classic `transport.DecodeMessages`
+  this paragraph previously described as "the default for existing callers"
+  had zero callers anywhere in the module (its own declaration and doc
+  comment were the only two matches) and has been removed as part of W8's
+  unused-classic-public-entrypoint cleanup (Definition of done item 6).
 - **Not implemented by this pass** (see `docs/architecture/agui-events.md`):
   `run_paused`/`InterruptTargetV1` construction from durable approval
   records, `run_resumed`, `attempt_replaced`, and subagent lifecycle
