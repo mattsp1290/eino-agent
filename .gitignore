@@ -31,10 +31,8 @@ go.work.sum
 # .idea/
 # .vscode/
 
-# Beads / Dolt files (added by bd init)
-.dolt/
+# SQLite database created by examples/minimal-server when its default path is used
 *.db
-.beads-credential-key
 
 # Tool binaries built from internal/tools nested module
 .bin/
