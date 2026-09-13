@@ -896,24 +896,41 @@ unwritten (see that bullet for the exact, now-shorter list).
 - Tool search: `adkToolSearch` registers the runtime-implemented
   `tool_search` pseudo-tool as an ordinary `tool.BaseTool` so ADK's tools node
   can route a model call to it at all, then delegates to the unchanged
-  `runtime/tool_search.go` (`executeToolSearchCall`). **Known gap**: ADK's
-  tools node always represents *any* registered `tool.InvokableTool`'s result
-  as a generic `function_tool_result` content block; it has no notion of this
-  codebase's dedicated `tool_search_result` block kind. A model that inspects
-  the conversation for a `tool_search_result`-shaped block (as several W4
-  acceptance tests do) will not find one, and in the affected tests ADK's own
-  `MaxIterations` guard eventually fails the run rather than looping forever.
-  Achieving byte-for-byte parity with the classic engine's tool-search
-  representation needs a deeper interception design (recognizing a
-  `tool_search` call at the model boundary, like the approval binding, rather
-  than letting ADK's tools node drive it) and is deferred as follow-up work.
-- Enhanced (multi-part) tool results: **known gap**. `adkTool.InvokableRun`
-  implements only `tool.InvokableTool` (a `string` return), so a settled
-  `ToolResult.Parts`-bearing (enhanced) result cannot be represented as ADK
-  expects one -- `tool.EnhancedInvokableTool` (`*schema.ToolResult`) would be
-  needed. `TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay`
-  fails on this exactly (the model-visible content collapses to one text item
-  instead of three). Deferred as follow-up work.
+  `runtime/tool_search.go` (`executeToolSearchCall`). The durable content
+  block this produces DOES carry the dedicated `tool_search_result` kind
+  (`session.BlockKindToolSearchResult`, built by `toolSearchResultBlock` in
+  `runtime/tool_search.go`) rather than a generic `function_tool_result` --
+  proven end to end through a real orchestrator run by W8's own
+  `TestPublicToolSearchDiscoversDeferredToolThenAliasExecutes`
+  (`testdata/external-consumer/agentic_fixture_test.go`), which asserts
+  exactly a `ContentBlockTypeToolSearchResult` block and fails if none is
+  found. This corrects an earlier version of this bullet, which claimed
+  unconditionally that "a model that inspects the conversation for a
+  `tool_search_result`-shaped block ... will not find one" -- a grep of
+  `runtime/w4_acceptance_test.go` (the suite that claim referenced) finds no
+  assertion on `tool_search_result`/`ToolSearchFunctionToolResult` today, so
+  that specific failure mode could not be reproduced. What remains
+  unverified (not claimed fixed here): whether ADK's own generic tools-node
+  round trip -- as opposed to `runtime/tool_search.go`'s direct persistence
+  and same-turn model-visible construction -- ever independently represents
+  a tool-search result as a plain `function_tool_result` on some other path.
+- Enhanced (multi-part) tool results: `adkTool.InvokableRun` still implements
+  only `tool.InvokableTool` (a `string` return), not `tool.EnhancedInvokableTool`
+  (`*schema.ToolResult`) -- but `TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay`
+  passes today (`runtime/w4_acceptance_test.go:1103`; reverify with `go test
+  ./runtime -run TestOrchestratorEnhancedToolResultPersistedMatchesModelVisibleAndReplay
+  -v`), contradicting this bullet's earlier claim that it fails. The reason:
+  the same-turn model-visible content this test checks is NOT built by
+  round-tripping through `adkTool.InvokableRun`'s string return at all -- it
+  is assembled directly from the settlement's `ToolResult.Parts` by the same
+  mechanism `toolSearchResultBlock`'s doc comment calls "the same-turn
+  outgoing model message" (`runtime/tool_search.go`, `executePreparedTools`),
+  independent of what ADK's own tools node does with the string `adkTool`
+  returns. So this specific property (durable persistence and same-turn
+  model-visible content both preserving all parts) is proven; it is not
+  evidence that ADK's own generic tools-node round trip (a *later* turn's
+  request rebuilt purely from ADK's own history mechanism, if one exists) is
+  multi-part-aware.
 - Resume: `ResumeRun` now validates everything derivable from the durable
   `GetRun` record -- the promoted checkpoint envelope (fingerprint/Eino
   version/codec), the plan fingerprint, `model.Resolver.Resolve` (an earlier
