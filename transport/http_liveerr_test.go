@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	agentagui "github.com/mattsp1290/eino-agent/agui"
 	"github.com/mattsp1290/eino-agent/session"
 	sqlite "github.com/mattsp1290/eino-agent/store/sqlite"
 )
@@ -331,7 +332,21 @@ func TestSSEHandlerEmitsRunErrorFrameForStreamTruncatedAfterWriting(t *testing.T
 	if !strings.Contains(body, "RUN_ERROR") {
 		t.Fatalf("body = %s, want a terminal RUN_ERROR frame so the client can tell the stream was truncated instead of completed", body)
 	}
-	if !strings.Contains(body, gotErr.Error()) {
-		t.Fatalf("body = %s, want the RUN_ERROR frame to include the surfaced error message %q", body, gotErr.Error())
+	// The fourth W7 fix-pass review's P0-3/C5 finding: the Errors row
+	// (docs/architecture/agui-events.md) promises "provider/internal
+	// details redacted by policy", but the terminal frame used to carry
+	// gotErr.Error() verbatim -- here a wrapped
+	// "agui: live committed-projection reload failed for session %s
+	// message %s: %w" carrying this test's own session ID and
+	// errSimulatedListMessagesFailure's text. Bridge.Terminate now emits a
+	// fixed, policy-safe message instead.
+	if strings.Contains(body, gotErr.Error()) {
+		t.Fatalf("body = %s, want the RUN_ERROR frame to NOT include the raw internal error message %q (policy requires redaction)", body, gotErr.Error())
+	}
+	if strings.Contains(body, errSimulatedListMessagesFailure.Error()) {
+		t.Fatalf("body = %s, want the RUN_ERROR frame to NOT leak the underlying store error text", body)
+	}
+	if !strings.Contains(body, agentagui.TerminalErrorMessage) {
+		t.Fatalf("body = %s, want the RUN_ERROR frame to carry the fixed terminal error message %q", body, agentagui.TerminalErrorMessage)
 	}
 }
