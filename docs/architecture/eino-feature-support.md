@@ -2637,3 +2637,218 @@ flagged rather than silently ignored.
   double-counting-safe observability accounting) that this pass judged
   required its own careful grounding and test pass rather than a partial,
   unverified change.
+
+## W8: external-consumer fixtures and publication validation
+
+Status: landed. `testdata/external-consumer/agentic_fixture_test.go` (package
+`consumer`, always copied by `check.sh`) is a fresh set of fixtures proving
+the agentic adoption composes from a genuine external module boundary --
+real `eino-agent`, `eino-providers`, and Eino/AG-UI constructors against fake
+native HTTP/SSE transports and a real SQLite store, never hand-built
+messages standing in for provider translation. `bash
+testdata/external-consumer/check.sh` (local mode, no Docker) passes with
+these fixtures included; `go test ./testdata/external-consumer/ -race` also
+passes. `EINO_AGENT_CONSUMER_POSTGRES=1 check.sh` and published-mode
+`check.sh` (this branch's commit is not yet resolvable through the public
+proxy) are gates the coordinator runs.
+
+- **Native `AgenticModel` generate/stream equivalence and continuation**
+  (`TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation`):
+  drives `github.com/mattsp1290/eino-providers/claude.NewAgenticModel`
+  against a fake `httptest` native Anthropic Messages server serving both a
+  JSON response and an SSE stream with identical content (message start,
+  thinking/signature/text deltas, `message_stop`), asserts `Generate` and
+  concatenated `Stream` chunks are content-equivalent, round-trips the
+  private reasoning signature through `SplitAgenticContinuation`/
+  `RestoreAgenticContinuation` (public projection carries no signature;
+  restore brings it back exactly), then drives one real durable turn through
+  `runtime.StreamingOrchestrator` and a real SQLite store using
+  `model.NewAgenticStreamerWithProviderState` plus
+  `model.NewTypedExtensionStateCodec` to capture that same signature as
+  private block state.
+  - **Discovered integration gap, worked around and documented in-line, not
+    hidden**: every `eino-providers` native adapter populates
+    `ResponseMeta.Extension` with `einoproviders.AgenticResponseIdentity` on
+    every completed response. `session.responseMetaFromEino` fails closed
+    with `ErrContentUnsupported` on any non-nil generic `ResponseMeta.Extension`,
+    and `model.NewTypedExtensionStateCodec` -- the only `AgenticStateCodec`
+    eino-agent ships -- also rejects a non-nil `Extension`. Pairing a
+    real `eino-providers` client directly with `model.NewAgenticStreamer`/
+    `NewAgenticStreamerWithProviderState` therefore fails the very first
+    completed turn today. The fixture's `nativeResponseIdentityStripper`
+    decorator (wraps `einomodel.AgenticModel`, clears `ResponseMeta.Extension`
+    after the real client returns) is the minimum a host must supply until
+    either side adds a typed seam for this identity sidecar. This is left
+    OUT of scope for W8 itself (it is a finding, not a requested capability)
+    and is not one of the two `eino-agent-td8` deliverables (the per-cell
+    capability matrix and native-byte fixture evidence) that remain
+    incomplete on the provider's own side.
+- **Ordered media/citations, function call, and server/MCP records survive a
+  real SQLite reopen**
+  (`TestPublicOrderedContentCitationsServerAndMCPRecordsSurviveReopen`):
+  proves two things through two different, honestly-labeled seams.
+  (1) A real model turn emits an assistant message with an
+  `assistant_gen_text` block carrying a Claude web-search citation
+  (`claude.TextCitation`/`CitationWebSearchResultLocation`), an
+  `assistant_gen_image` block, and a real `function_tool_call` that a
+  registered tool executes; ordering, citation content, and the function
+  call all survive a close/reopen of the SQLite file, read back through
+  `session/history.LoadAgentic`. (2) Separately,
+  `server_tool_call`/`server_tool_result`/`mcp_tool_call`/`mcp_tool_result`/
+  `mcp_list_tools_result` blocks are written directly through the store's
+  own public contract (`AdmitRun`, `Execution`, `AppendMessage`/
+  `AppendPart`, `FinalizeAssistantMessage`) and also survive reopen in
+  order.
+  - **Discovered, grounded gap** (not a test-writing mistake -- reproduced
+    directly against `runtime/adk_model.go`): `adkModel.commit`
+    (`errADKUnsupportedBlock`) fails a turn closed if the MODEL's own result
+    carries a `server_tool_call`/`server_tool_result`/`mcp_tool_call`/
+    `mcp_tool_result`/`mcp_list_tools_result` block -- the current typed-ADK
+    adapter accepts only text/reasoning/media/function-tool-call blocks
+    (plus `mcp_tool_approval_request` when an approval binding is wired) as
+    assistant OUTPUT, even though `session.ContentFromAgenticMessage` (the
+    content/store layer) fully supports encoding/decoding all 20 kinds.
+    This is consistent with, and broader than, the W5 "known gaps" note
+    that ADK's own tools node cannot represent `tool_search_result` either.
+    No live model-turn path can legally produce server/MCP output content
+    today; part (2) above is therefore a store-contract proof, not a
+    runtime/ADK proof, and is labeled as such in the fixture itself.
+- **Tool search discovers a deferred tool, then the model calls it by alias**
+  (`TestPublicToolSearchDiscoversDeferredToolThenAliasExecutes`): a real
+  `composition.Registrar.ToolSearch` registration plus a `Deferred: true`
+  tool with an `Aliases` entry; the scripted model calls `tool_search` with
+  `select:get_weather`, then calls the tool by its alias `weather`; the
+  fixture asserts the durable `tool_search_result` block, the durable
+  `function_tool_call` block under the model-requested alias name, and that
+  the executor observes `RequestedName == "weather"`.
+- **`adk.TurnLoop`: two completed turns under one run**
+  (`TestPublicTurnLoopTwoCompletedTurnsUnderOneRunAgainstSQLite`): `Start`
+  then an immediate `Enqueue` (before the loop idles out) against a real
+  SQLite store; asserts `store.ListTurns` returns two turns with ordinals 1
+  and 2, distinct assistant messages, and `store.ListModelRequests` returns
+  two ledger rows with distinct `InvocationID`s.
+- **MCP approval pause, checkpoint reopen (simulated process restart), and
+  resume** (`TestPublicApprovalCheckpointSurvivesProcessRestartAndResumes`):
+  a scripted model result carrying `MCPToolApprovalRequest` pauses the run
+  at the model boundary; `handle.AwaitPause()` reports the current-generation
+  `adk.InterruptCtx.ID`; the SQLite pool is closed entirely and reopened
+  from scratch with a brand-new store handle, registry, and orchestrator
+  (no in-process state survives); `ResumeRun(..., ResumeRequest{Targets:
+  map[string]any{interruptID: "approve"}})` against the reopened store
+  completes the run, commits the durable `mcp_tool_approval_response`
+  block, and the public `session.Run` record carries no private material.
+- **Typed ADK summarization middleware writes a durable `ContextEpoch`,
+  surviving reopen**
+  (`TestPublicSummarizationMiddlewareWritesDurableContextEpochSurvivingReopen`):
+  mounts `examples/agentic-middleware.Mount` (a real, already-reviewed
+  public example package, imported directly -- not copied -- since it lives
+  outside `testdata/` and is part of the published module) with only the
+  `summarization` recipe enabled and `TriggerContextMessages: 1`; two real
+  turns trigger summarization on the second; `store.ListContextEpochs`
+  shows a `Trigger == "summarization"` epoch with a non-empty
+  `SummaryMessageID`; the epoch (same ID and `SummaryMessageID`) is still
+  present after closing and reopening the SQLite file.
+- **AG-UI decode of native input, plus real Bridge/Replay projection of
+  committed content -- eino-agent-doj and eino-agent-6wj documented, not
+  hidden** (`TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent`):
+  `transport.DecodeUserMessage` decodes a real `types.InputContent` JSON
+  body into a `runtime.UserMessage`, admitted through `orchestrator.Start`;
+  the same real `agui.NewBridge`/`agui.Replay` entry points
+  `transport.SSEHandler` uses in production replay every durable event for
+  the session into a buffer. The fixture asserts:
+  - the final assistant text reaches the replayed stream, and no
+    `PRIVATE_` sentinel does;
+  - **eino-agent-doj** (AG-UI replay re-emits a tool call's whole lifecycle
+    a second time on reconnect, since `emitMessageSnapshot`'s replay path
+    never calls `recordNativeToolDelivery`/`markToolCallResultSent` the way
+    the live path does): the fixture asserts the tool name occurs **at
+    least twice** in one full replay -- the actual current (buggy)
+    behavior -- rather than a single-emission contract that does not hold;
+  - **eino-agent-6wj** (`agui/bridge.go`'s `toolPayload` decodes
+    `content`/`structured`, but the durable wire payload carries
+    `output`/`error`/`metadata`): the fixture asserts the replayed tool
+    result carries the synthesized `{"status":...}` stub, and explicitly
+    fails itself (naming the bead) if the real tool output ever appears
+    instead, so a future fix is caught rather than silently re-validated
+    against a fixture written to expect the bug forever.
+
+### Publication validation (exact evidence)
+
+Every external pin below was verified with `GOWORK=off go mod download
+-json <module>@<version>` in a fresh, empty temporary module (no
+replacement, no workspace, no vendor tree, no sibling checkout):
+
+| Module | Version | Origin commit | Module checksum |
+| --- | --- | --- | --- |
+| `github.com/mattsp1290/eino-providers` | `v0.0.0-20260912022125-79248358b8e6` | `79248358b8e6324bbdb1f014526629f82e6bce90` | `h1:yhGEAfP0NTXwsNBiEQGDR20iZK4Lnk2N6o2JbGDcivo=` |
+| `github.com/mattsp1290/eino-agui` | `v0.1.2-0.20260910210826-ed64f77f3f16` | `ed64f77f3f16d8eb0f63f1cc34b985b870cdde88` | `h1:DlwVUYzSDmYOO9oxyEygARKzSVxfpR7M4UqCyaM8v9o=` |
+| `github.com/mattsp1290/ag-ui/sdks/community/go` | `v0.0.0-20260909025854-aaa75b54d572` | `aaa75b54d572be8cd1d51c72e951273c5b893ed0` | `h1:ymOBlna6bESjwEgbyaaunIKrDNC5eytwhRcsYeBCNDI=` |
+
+`github.com/mattsp1290/eino-providers`'s own `go.mod` declares no `replace`
+directive, and its module graph resolved every transitive dependency
+(including `github.com/cloudwego/eino-ext/components/model/claude` and its
+own SDK dependencies) through the public proxy with no manual intervention
+-- a self-contained resolvable module graph on its own. `github.com/mattsp1290/eino-agui`'s
+own `go.mod` confirms, by direct inspection, that it `require`s
+`github.com/ag-ui-protocol/ag-ui/sdks/community/go
+v0.0.0-20260909025854-aaa75b54d572` and separately `replace`s that exact
+path to the `mattsp1290` fork at the identical version -- so this repository
+(and, transitively, every consumer of its AG-UI packages) is NOT a
+self-contained module graph: the root replacement is mandatory, documented
+precisely in `README.md`'s Module Baseline section, `docs/consumer-guide.md`'s
+Installation section, and enforced mechanically by
+`testdata/external-consumer/check.sh`'s own `go.mod edit -replace` calls
+(exactly 2 replace directives in local mode, exactly 1 -- the AG-UI fork --
+in published mode).
+
+`github.com/mattsp1290/eino-providers` is deliberately NOT a dependency of
+`eino-agent`'s own root `go.mod` -- the library stays provider-agnostic, and
+Go's `testdata/` exclusion means `go mod tidy` never sees
+`agentic_fixture_test.go`'s import of it anyway (confirmed empirically:
+manually adding the `require` and running `go mod tidy` silently drops it
+again, since nothing outside `testdata/` imports it). Instead,
+`testdata/external-consumer/check.sh` pins the exact verified pseudo-version
+explicitly via its own `go mod edit -require` call before `go mod tidy`, so
+the external consumer module -- the one that actually combines `eino-agent`
+with a concrete native provider -- resolves it deterministically rather
+than whatever the module's default (untagged) branch head happens to be at
+run time. `bash testdata/external-consumer/check.sh` (local mode) passed
+with `eino-providers` selected at exactly that pin, unreplaced, and `go mod
+verify` reporting "all modules verified".
+
+`eino-agent-td8` stays open for the two `eino-providers` deliverables its
+own response still lists as incomplete: a merged immutable release tag (no
+tag exists upstream today, so every pin above remains a pseudo-version) and
+the per-cell capability matrix plus native-byte fixture evidence beyond what
+this fixture file itself exercises. This W8 pass does not claim either.
+
+### Not delivered by this pass, and why
+
+- A live, credentialed native-provider round trip (real Claude/OpenAI/Gemini
+  credentials, a real tool call settled through a real provider turn after a
+  process restart) is an explicit bounded opt-in per the plan; no
+  credentials were available in this environment. This is reported as an
+  external validation limitation, not a passed capability.
+- `make postgres-test`, `make postgres-race`, and
+  `EINO_AGENT_CONSUMER_POSTGRES=1 testdata/external-consumer/check.sh`
+  require Docker the coordinator runs separately to avoid contention; this
+  pass ran `make check` and non-Docker `go test`/`go vet`/`gofmt` only.
+  `agentic_fixture_test.go` is copied unconditionally, so it also runs
+  under the PostgreSQL consumer mode once the coordinator executes it.
+- No new authoritative root-level (`store/postgres`/`runtime`,
+  `postgres_integration`-tagged) storage/recovery test was added: every
+  capability this pass proves through a live durable turn already has
+  existing PostgreSQL-tagged coverage from W1-W7 (for example
+  `durable_identity`, `turn_loop_pause_resume` in
+  `POSTGRES_REQUIRED_SUITES`), and the two genuinely new proofs above
+  (native-provider continuation, server/MCP direct-store content) are
+  exercised against SQLite, consistent with every existing
+  `testdata/external-consumer/` fixture. `Makefile`'s
+  `POSTGRES_REQUIRED_SUITES` is therefore unchanged by this pass; this is a
+  deliberate scope decision, not an oversight.
+- The two `eino-agent-td8` deliverables (provider-side per-cell capability
+  matrix, native-byte fixture evidence beyond this file) and a merged
+  immutable release tag remain open on `eino-providers`' side.
+- The `nativeResponseIdentityStripper` gap and the `errADKUnsupportedBlock`
+  server/MCP-as-model-output gap (both documented above) are real,
+  reproduced findings from this pass, not resolved by it.

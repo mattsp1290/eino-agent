@@ -42,6 +42,44 @@ The separately published generated-bindings dependency remains
 release/discovery pins use older store APIs or schemas; their evidence is
 historical. Existing SQLite files are unsupported and remain untouched.
 
+### Native model providers
+
+`eino-agent`'s own `go.mod` deliberately does not depend on
+`github.com/mattsp1290/eino-providers` -- `model.Streamer` is the provider
+boundary, and any Eino `model.AgenticModel` implementation can supply it via
+`model.NewAgenticStreamer`/`NewAgenticStreamerWithProviderState`. A host that
+wants a real native provider (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/
+OpenCode Messages/Responses/Chat-Completions protocols) adds
+`github.com/mattsp1290/eino-providers` to its OWN `go.mod` directly; no
+`replace` directive is required for it (unlike the AG-UI fork above).
+Verified pin: `v0.0.0-20260912022125-79248358b8e6` at commit
+`79248358b8e6324bbdb1f014526629f82e6bce90` -- see
+[dependency-status.md](dependency-status.md) and
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+W8 section for the exact `go mod download -json` evidence.
+
+Two integration caveats a host must account for today, both discovered and
+reproduced while building `testdata/external-consumer/agentic_fixture_test.go`:
+
+- Every `eino-providers` native adapter stamps
+  `ResponseMeta.Extension = einoproviders.AgenticResponseIdentity{...}` on
+  every completed response. `eino-agent`'s content pipeline rejects any
+  non-nil generic `ResponseMeta.Extension` (`ErrContentUnsupported`), and
+  `model.NewTypedExtensionStateCodec` does not capture it either. A host
+  must wrap the native client with a thin decorator that clears
+  `ResponseMeta.Extension` after the real call returns (see
+  `nativeResponseIdentityStripper` in the fixture) before handing it to
+  `model.NewAgenticStreamer`.
+- The current typed-ADK runtime adapter accepts only
+  text/reasoning/media/function-tool-call blocks (plus
+  `mcp_tool_approval_request` when an approval binding is configured) as
+  assistant OUTPUT. A native provider's `server_tool_call`/
+  `mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result` blocks in a
+  model result fail the turn closed today
+  (`runtime/adk_model.go`'s `errADKUnsupportedBlock`), even though the
+  durable store contract fully supports persisting and replaying those
+  kinds when written directly.
+
 ## Package Surface
 
 | Package | Use it for | You still provide |

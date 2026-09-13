@@ -40,6 +40,20 @@ and observability remain provider-neutral.
   [docs/dependency-status.md](docs/dependency-status.md).
 - Observability: `github.com/mattsp1290/eino-obs v0.0.0-20260627060807-a9a6f8bb478b`
 - Coding tools: `github.com/mattsp1290/eino-tools v0.1.1-0.20260825160656-63a3c99272c2`
+- Native model providers (optional, host-added): `github.com/mattsp1290/eino-providers`
+  is NOT a dependency of this module's own `go.mod` -- `eino-agent` stays
+  provider-agnostic. A host that wants a real native `model.AgenticModel`
+  (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/OpenCode) adds it directly and
+  wraps the constructed client with `model.NewAgenticStreamer`/
+  `NewAgenticStreamerWithProviderState`. Verified pin:
+  `v0.0.0-20260912022125-79248358b8e6` at commit
+  `79248358b8e6324bbdb1f014526629f82e6bce90` (no release tag exists
+  upstream, so this is a pseudo-version pin), no `replace` required. See
+  [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md)'s
+  W8 section for the exact publication evidence and two discovered
+  integration caveats (a `ResponseMeta.Extension` normalization a host must
+  supply, and the current typed-ADK adapter's rejection of model-emitted
+  server/MCP-call content blocks).
 
 See `docs/dependency-status.md` for prerequisite evidence,
 `docs/consumer-guide.md` for the public embedding contract,
