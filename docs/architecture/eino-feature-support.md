@@ -51,6 +51,11 @@ COVERED by a test that does not assert what the row claims.
 | 26 | Indexer WithIndex | COVERED (added by this fix pass) | `TestIndexerWithIndexOptionReachesStore` and `TestIndexerWithoutIndexOptionLeavesIndexNil` (`examples/indexer-option/indexer_option_test.go`): a small test indexer reads the real upstream `indexer.WithIndex` call option through `indexer.GetCommonOptions`; no new indexing service. |
 | 27 | Graph scheduling/checkpoint/panic/stream fixes, Jinja formatting and other changed existing behavior | NOT COVERED | No section of this document addresses this row, and there are zero occurrences of "Jinja" (case-insensitive) anywhere in the module. Needs a semantic-diff re-read of `compose/graph.go`/`compose/checkpoint.go`/`compose/stream_concat.go` plus fixtures proving graph panic/cancel/checkpoint behavior, and either a Jinja-formatting regression fixture or an explicit note that this codebase has no Jinja-formatting surface to regress. Bead `eino-agent-2wi`. |
 
+Of the 27 rows above: **7 COVERED, 16 PARTIAL, 4 NOT COVERED.** The adoption
+proves its core agentic path end to end; most rows have a specific named
+unmet clause rather than full coverage, and every gap is named rather than
+hidden.
+
 **Changed-public-source ledger** (`01-feature-inventory.md`'s appendix): of the
 paths with no mention anywhere in this document, `components/indexer` is now
 addressed by row 26 above; `schema/stream.go` by row 25's bead
