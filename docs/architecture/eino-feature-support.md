@@ -2651,10 +2651,16 @@ real `eino-agent`, `eino-providers`, and Eino/AG-UI constructors against fake
 native HTTP/SSE transports and a real SQLite store, never hand-built
 messages standing in for provider translation. `bash
 testdata/external-consumer/check.sh` (local mode, no Docker) passes with
-these fixtures included; `go test ./testdata/external-consumer/ -race` also
-passes. `EINO_AGENT_CONSUMER_POSTGRES=1 check.sh` and published-mode
-`check.sh` (this branch's commit is not yet resolvable through the public
-proxy) are gates the coordinator runs.
+these fixtures included, via a plain `go test ./...` inside the temporary
+consumer module `check.sh` generates. Neither `check.sh` nor these fixtures
+are exercised under `-race`: `go test ./testdata/external-consumer/ -race`
+cannot even compile from the repository root --
+`github.com/mattsp1290/eino-providers` is deliberately not a root
+dependency (see `docs/dependency-status.md`), so resolving it fails --
+and `check.sh`'s own `go test ./...` call (`testdata/external-consumer/check.sh`)
+does not pass `-race` either. `EINO_AGENT_CONSUMER_POSTGRES=1 check.sh` and
+published-mode `check.sh` (this branch's commit is not yet resolvable
+through the public proxy) are gates the coordinator runs.
 
 - **Native `AgenticModel` generate/stream equivalence and continuation**
   (`TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation`):
