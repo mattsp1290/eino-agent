@@ -766,6 +766,17 @@ scrubbed before export.
 
 ## Migration Notes
 
+### Breaking changes since the published pin
+
+- **`transport.DecodeMessages` removed (W8).** This exported JSON decoder had
+  zero callers anywhere in the module and was deleted as part of W8's
+  unused-classic-public-entrypoint cleanup. It still exists at the currently
+  published pin (`v0.3.4-0.20260910012408-cec27e5eb734`), so a host that calls
+  it will fail to compile after upgrading past this cutover. Use
+  `transport.DecodeUserMessage` (`transport/rich.go`) for rich AG-UI input
+  decode instead; it is not a drop-in replacement (different request shape),
+  so callers must adapt, not just rename.
+
 When adapting an existing agent backend:
 
 - Pick a stable `session.ID` first; do not use per-turn IDs as the AG-UI
