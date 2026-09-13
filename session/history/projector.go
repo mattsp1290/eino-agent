@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -13,11 +14,32 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+// ErrClassicUnsupported reports that a durable part uses one of the new
+// BlockKind-backed content kinds that the classic *schema.Message projection
+// cannot represent (anything other than reasoning, user_input_text,
+// assistant_gen_text, function_tool_call, and function_tool_result). Classic
+// callers fail loudly instead of silently flattening rich content.
+var ErrClassicUnsupported = errors.New("session history: classic projection does not support this content block kind")
+
 // Options controls durable history projection.
 type Options struct {
 	IncludeReasoning bool
-	IncludeState     bool
 	Epoch            *session.ContextEpoch
+	// ContentLimits bounds durable content decoding for the BlockKind-backed
+	// content family. The zero value means session.DefaultContentLimits().
+	// It must match the limits content was admitted under (runtime's
+	// configured session.ContentLimits, see WithContentLimits), or content
+	// legitimately persisted under raised limits becomes unprojectable.
+	ContentLimits session.ContentLimits
+}
+
+// contentLimits resolves the configured content bounds, defaulting to
+// session.DefaultContentLimits() when Options.ContentLimits is unset.
+func (o Options) contentLimits() session.ContentLimits {
+	if o.ContentLimits == (session.ContentLimits{}) {
+		return session.DefaultContentLimits()
+	}
+	return o.ContentLimits
 }
 
 // Project converts durable session messages and parts into provider messages.
@@ -70,56 +92,324 @@ func Load(ctx context.Context, store session.Store, sessionID session.ID, option
 }
 
 func projectMessage(message session.Message, parts []session.Part, options Options) ([]*einoschema.Message, error) {
+	limits := options.contentLimits()
 	switch message.Role {
 	case session.RoleSystem, session.RoleUser, session.RoleAssistant:
 		projected := &einoschema.Message{
 			Role: role(message.Role),
 			Name: message.Agent,
 		}
-		content, err := textContent(parts, options)
-		if err != nil {
-			return nil, err
-		}
-		projected.Content = content
-		result := []*einoschema.Message{projected}
+		// A user-role message that carries at least one media block projects
+		// all of its ordinary content (text included) as ordered
+		// UserInputMultiContent parts instead of the flat Content string, so
+		// text/media order relative to each other is preserved. Text-only
+		// user messages are unaffected and keep using Content.
+		useMultiContent := message.Role == session.RoleUser && hasUserMediaPart(parts)
+		var toolResultParts []session.Part
 		for _, part := range parts {
-			if part.Kind != session.PartToolCall {
-				if part.Kind == session.PartToolResult {
-					toolMessages, err := projectToolResults([]session.Part{part})
+			switch part.Kind {
+			case session.PartFunctionToolResult:
+				toolResultParts = append(toolResultParts, part)
+			case session.PartReasoning:
+				if !options.IncludeReasoning {
+					continue
+				}
+				if hasContentSchemaField(part.Payload) {
+					text, err := classicReasoningEnvelopeText(part, limits)
 					if err != nil {
 						return nil, err
 					}
-					result = append(result, toolMessages...)
+					projected.ReasoningContent += text
+				} else {
+					text, err := partText(part)
+					if err != nil {
+						return nil, err
+					}
+					projected.Content += text
 				}
-				continue
+			case session.PartCompaction:
+				text, err := partText(part)
+				if err != nil {
+					return nil, err
+				}
+				if useMultiContent {
+					projected.UserInputMultiContent = append(projected.UserInputMultiContent, textInputPart(text))
+				} else {
+					projected.Content += text
+				}
+			case session.PartProviderState, session.PartApprovalDecision, session.PartResponseMeta:
+				// ignored by classic projection
+			case session.PartUserInputText, session.PartAssistantGenText:
+				text, err := classicTextEnvelopeText(part, limits)
+				if err != nil {
+					return nil, err
+				}
+				if useMultiContent && part.Kind == session.PartUserInputText {
+					projected.UserInputMultiContent = append(projected.UserInputMultiContent, textInputPart(text))
+				} else {
+					projected.Content += text
+				}
+			case session.PartUserInputImage, session.PartUserInputAudio, session.PartUserInputVideo, session.PartUserInputFile:
+				if message.Role != session.RoleUser {
+					// Assistant-role media stays unsupported; only user-role
+					// media has a classic projection.
+					return nil, fmt.Errorf("part %s: %w: kind %q", part.ID, ErrClassicUnsupported, part.Kind)
+				}
+				inputPart, err := classicMediaEnvelopeInputPart(part, limits)
+				if err != nil {
+					return nil, err
+				}
+				projected.UserInputMultiContent = append(projected.UserInputMultiContent, inputPart)
+			case session.PartFunctionToolCall:
+				toolCall, err := classicFunctionToolCallEnvelope(part, limits)
+				if err != nil {
+					return nil, err
+				}
+				projected.ToolCalls = append(projected.ToolCalls, toolCall)
+			default:
+				if _, ok := session.BlockKindForPart(part.Kind); ok {
+					return nil, fmt.Errorf("part %s: %w: kind %q", part.ID, ErrClassicUnsupported, part.Kind)
+				}
+				return nil, fmt.Errorf("part %s: unsupported part kind %q", part.ID, part.Kind)
 			}
-			toolCall, err := decodeToolCall(part.Payload)
-			if err != nil {
-				return nil, err
-			}
-			projected.ToolCalls = append(projected.ToolCalls, toolCall)
 		}
+		// A user-role message whose parts are entirely tool-result parts
+		// (the durable shape a settled function_tool_result now uses: role
+		// user, one function_tool_result/tool_result part, nothing else)
+		// has nothing left to say through the primary projected message
+		// once its content is diverted to toolResultParts below; skip
+		// emitting that now-empty placeholder so a tool result still
+		// projects to exactly one classic message, matching the classic
+		// RoleTool shape it replaces. This is scoped to RoleUser
+		// specifically so an assistant- or system-role message that mixes
+		// (legacy) tool-result parts with otherwise no content keeps its
+		// prior placeholder-message behavior.
+		result := []*einoschema.Message{}
+		if message.Role != session.RoleUser || len(parts) == 0 || len(toolResultParts) != len(parts) {
+			result = append(result, projected)
+		}
+		toolMessages, err := projectToolResults(toolResultParts, limits)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, toolMessages...)
 		return result, nil
 	case session.RoleTool:
-		return projectToolResults(parts)
+		return projectToolResults(parts, limits)
 	default:
 		return nil, fmt.Errorf("unsupported session role %q", message.Role)
 	}
 }
 
-func projectToolResults(parts []session.Part) ([]*einoschema.Message, error) {
+// hasUserMediaPart reports whether parts contains at least one durable
+// user-input media block (image, audio, video, or file).
+func hasUserMediaPart(parts []session.Part) bool {
+	for _, part := range parts {
+		switch part.Kind {
+		case session.PartUserInputImage, session.PartUserInputAudio, session.PartUserInputVideo, session.PartUserInputFile:
+			return true
+		}
+	}
+	return false
+}
+
+func textInputPart(text string) einoschema.MessageInputPart {
+	return einoschema.MessageInputPart{Type: einoschema.ChatMessagePartTypeText, Text: text}
+}
+
+func projectToolResults(parts []session.Part, limits session.ContentLimits) ([]*einoschema.Message, error) {
 	result := []*einoschema.Message{}
 	for _, part := range parts {
-		if part.Kind != session.PartToolResult {
-			continue
+		switch part.Kind {
+		case session.PartFunctionToolResult:
+			toolCallID, content, err := classicFunctionToolResultEnvelope(part, limits)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, einoschema.ToolMessage(content, toolCallID))
+		default:
+			if _, ok := session.BlockKindForPart(part.Kind); ok {
+				return nil, fmt.Errorf("part %s: %w: kind %q", part.ID, ErrClassicUnsupported, part.Kind)
+			}
+			// legacy non-result kinds on a tool message remain ignored by design.
 		}
-		toolCallID, content, err := decodeToolResult(part.Payload)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, einoschema.ToolMessage(content, toolCallID))
 	}
 	return result, nil
+}
+
+// hasContentSchemaField reports whether raw carries the durable content
+// envelope's top-level "schema" field. PartReasoning is the one PartKind
+// shared between the legacy free-text payload ({"text": "..."}) and the new
+// BlockKindReasoning envelope, so callers use this probe to tell them apart
+// before decoding.
+func hasContentSchemaField(raw json.RawMessage) bool {
+	var probe struct {
+		Schema *int `json:"schema"`
+	}
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return false
+	}
+	return probe.Schema != nil
+}
+
+// decodeSingleBlock decodes one durable content-block Part payload through
+// session.DecodeContentParts by presenting it as a synthetic single-part,
+// single-block Content of decodeRole. decodeRole only needs to be a role that
+// permits kind; it need not match the durable message's actual role, since
+// classic projection tolerates rich content on any message role.
+func decodeSingleBlock(part session.Part, kind session.BlockKind, decodeRole session.Role, limits session.ContentLimits) (session.ContentBlock, error) {
+	synthetic := part
+	synthetic.Ordinal = 0
+	content, err := session.DecodeContentParts(decodeRole, []session.Part{synthetic}, limits)
+	if err != nil {
+		return session.ContentBlock{}, fmt.Errorf("part %s payload: %w", part.ID, err)
+	}
+	if len(content.Blocks) != 1 || content.Blocks[0].Kind != kind {
+		return session.ContentBlock{}, fmt.Errorf("part %s: unexpected decoded block", part.ID)
+	}
+	return content.Blocks[0], nil
+}
+
+func classicTextEnvelopeText(part session.Part, limits session.ContentLimits) (string, error) {
+	var kind session.BlockKind
+	var decodeRole session.Role
+	switch part.Kind {
+	case session.PartUserInputText:
+		kind, decodeRole = session.BlockKindUserInputText, session.RoleUser
+	case session.PartAssistantGenText:
+		kind, decodeRole = session.BlockKindAssistantGenText, session.RoleAssistant
+	default:
+		return "", fmt.Errorf("part %s: unsupported text kind %q", part.ID, part.Kind)
+	}
+	block, err := decodeSingleBlock(part, kind, decodeRole, limits)
+	if err != nil {
+		return "", err
+	}
+	if block.Text == nil {
+		return "", fmt.Errorf("part %s: text block missing payload", part.ID)
+	}
+	return block.Text.Text, nil
+}
+
+func classicReasoningEnvelopeText(part session.Part, limits session.ContentLimits) (string, error) {
+	block, err := decodeSingleBlock(part, session.BlockKindReasoning, session.RoleAssistant, limits)
+	if err != nil {
+		return "", err
+	}
+	if block.Reasoning == nil {
+		return "", fmt.Errorf("part %s: reasoning block missing payload", part.ID)
+	}
+	return block.Reasoning.Text, nil
+}
+
+func classicFunctionToolCallEnvelope(part session.Part, limits session.ContentLimits) (einoschema.ToolCall, error) {
+	block, err := decodeSingleBlock(part, session.BlockKindFunctionToolCall, session.RoleAssistant, limits)
+	if err != nil {
+		return einoschema.ToolCall{}, err
+	}
+	if block.FunctionCall == nil {
+		return einoschema.ToolCall{}, fmt.Errorf("part %s: function_tool_call block missing payload", part.ID)
+	}
+	fc := block.FunctionCall
+	return einoschema.ToolCall{
+		ID:   fc.CallID,
+		Type: "function",
+		Function: einoschema.FunctionCall{
+			Name:      fc.Name,
+			Arguments: fc.Arguments,
+		},
+	}, nil
+}
+
+func classicFunctionToolResultEnvelope(part session.Part, limits session.ContentLimits) (string, string, error) {
+	block, err := decodeSingleBlock(part, session.BlockKindFunctionToolResult, session.RoleUser, limits)
+	if err != nil {
+		return "", "", err
+	}
+	if block.FunctionResult == nil {
+		return "", "", fmt.Errorf("part %s: function_tool_result block missing payload", part.ID)
+	}
+	fr := block.FunctionResult
+	var content string
+	for _, item := range fr.Content {
+		if item.Type != session.ResultContentText {
+			return "", "", fmt.Errorf("part %s: %w: non-text function tool result content %q", part.ID, ErrClassicUnsupported, item.Type)
+		}
+		content += item.Text
+	}
+	return fr.CallID, content, nil
+}
+
+// mediaPartBlockKind maps a durable user-input media PartKind to its
+// BlockKind for decoding.
+func mediaPartBlockKind(kind session.PartKind) (session.BlockKind, bool) {
+	switch kind {
+	case session.PartUserInputImage:
+		return session.BlockKindUserInputImage, true
+	case session.PartUserInputAudio:
+		return session.BlockKindUserInputAudio, true
+	case session.PartUserInputVideo:
+		return session.BlockKindUserInputVideo, true
+	case session.PartUserInputFile:
+		return session.BlockKindUserInputFile, true
+	default:
+		return "", false
+	}
+}
+
+// classicMediaEnvelopeInputPart decodes one durable user-input media Part
+// into the schema.MessageInputPart shape schema.Message.UserInputMultiContent
+// expects. There is no classic *schema.Message ingest path to mirror here
+// (durable content is admitted through the agentic *schema.AgenticMessage
+// contract in session/content.go, e.g. mediaToUserInputImage and friends);
+// this is the sole *schema.Message-facing projection of a durable media
+// block.
+func classicMediaEnvelopeInputPart(part session.Part, limits session.ContentLimits) (einoschema.MessageInputPart, error) {
+	blockKind, ok := mediaPartBlockKind(part.Kind)
+	if !ok {
+		return einoschema.MessageInputPart{}, fmt.Errorf("part %s: unsupported media kind %q", part.ID, part.Kind)
+	}
+	block, err := decodeSingleBlock(part, blockKind, session.RoleUser, limits)
+	if err != nil {
+		return einoschema.MessageInputPart{}, err
+	}
+	if block.Media == nil {
+		return einoschema.MessageInputPart{}, fmt.Errorf("part %s: media block missing payload", part.ID)
+	}
+	m := block.Media
+	common := einoschema.MessagePartCommon{MIMEType: m.MIMEType}
+	if m.URL != "" {
+		url := m.URL
+		common.URL = &url
+	}
+	if m.Base64Data != "" {
+		data := m.Base64Data
+		common.Base64Data = &data
+	}
+	switch blockKind {
+	case session.BlockKindUserInputImage:
+		return einoschema.MessageInputPart{
+			Type:  einoschema.ChatMessagePartTypeImageURL,
+			Image: &einoschema.MessageInputImage{MessagePartCommon: common, Detail: einoschema.ImageURLDetail(m.Detail)},
+		}, nil
+	case session.BlockKindUserInputAudio:
+		return einoschema.MessageInputPart{
+			Type:  einoschema.ChatMessagePartTypeAudioURL,
+			Audio: &einoschema.MessageInputAudio{MessagePartCommon: common},
+		}, nil
+	case session.BlockKindUserInputVideo:
+		return einoschema.MessageInputPart{
+			Type:  einoschema.ChatMessagePartTypeVideoURL,
+			Video: &einoschema.MessageInputVideo{MessagePartCommon: common},
+		}, nil
+	case session.BlockKindUserInputFile:
+		return einoschema.MessageInputPart{
+			Type: einoschema.ChatMessagePartTypeFileURL,
+			File: &einoschema.MessageInputFile{MessagePartCommon: common, Name: m.Name},
+		}, nil
+	default:
+		return einoschema.MessageInputPart{}, fmt.Errorf("part %s: unsupported media kind %q", part.ID, part.Kind)
+	}
 }
 
 func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session.ReplayBatch, error) {
@@ -139,16 +429,45 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 		byID[message.ID] = message
 	}
 	messages := make([]session.Message, 0, len(batch.Messages))
+	// An active epoch only ever narrows the conversational body (replacing
+	// the summarized range with its summary, retaining the tail); it never
+	// drops the session's leading system-message prefix -- host-injected
+	// system instructions are not conversational history to compact away.
+	for _, message := range batch.Messages {
+		if message.Role != session.RoleSystem {
+			break
+		}
+		if !include[message.ID] {
+			messages = append(messages, message)
+			include[message.ID] = true
+		}
+	}
 	if epoch.SummaryMessageID != "" {
-		if summary, ok := byID[epoch.SummaryMessageID]; ok {
+		if summary, ok := byID[epoch.SummaryMessageID]; ok && !include[summary.ID] {
 			messages = append(messages, summary)
 			include[summary.ID] = true
 		}
 	}
+	// tailAnchor is where the verbatim tail begins: TailStartID when the
+	// epoch retained one, or the boundary/summary message's own ID when it
+	// did not (retainTail == 0). In the latter case nothing existing at
+	// epoch-creation time is retained verbatim, but every message produced
+	// AFTER the boundary (a later turn's own conversation, continuing past
+	// the compaction point) must still flow through -- an empty TailStartID
+	// must never mean "nothing after this epoch is ever included again".
+	tailAnchor := epoch.TailStartID
+	if tailAnchor == "" {
+		tailAnchor = epoch.SummaryMessageID
+	}
 	tailStarted := false
 	for _, message := range batch.Messages {
-		if message.ID == epoch.TailStartID {
+		if message.ID == tailAnchor {
 			tailStarted = true
+			if tailAnchor == epoch.SummaryMessageID {
+				// Already included above; the tail begins with whatever
+				// comes after it, not the boundary message itself again.
+				continue
+			}
 		}
 		if tailStarted && !include[message.ID] {
 			messages = append(messages, message)
@@ -170,46 +489,9 @@ func applyEpoch(batch session.ReplayBatch, epoch *session.ContextEpoch) (session
 	return batch, nil
 }
 
-func textContent(parts []session.Part, options Options) (string, error) {
-	content := ""
-	for _, part := range parts {
-		switch part.Kind {
-		case session.PartText:
-			text, err := partText(part)
-			if err != nil {
-				return "", err
-			}
-			content += text
-		case session.PartReasoning:
-			if options.IncludeReasoning {
-				text, err := partText(part)
-				if err != nil {
-					return "", err
-				}
-				content += text
-			}
-		case session.PartState:
-			if options.IncludeState {
-				text, err := partText(part)
-				if err != nil {
-					return "", err
-				}
-				content += text
-			}
-		case session.PartCompaction:
-			text, err := partText(part)
-			if err != nil {
-				return "", err
-			}
-			content += text
-		}
-	}
-	return content, nil
-}
-
 func partText(part session.Part) (string, error) {
 	switch part.Kind {
-	case session.PartText, session.PartReasoning, session.PartState:
+	case session.PartReasoning:
 		payload, err := decodeCanonical[textPartPayload](part.Payload)
 		if err != nil {
 			return "", fmt.Errorf("part %s payload: %w", part.ID, err)
@@ -245,50 +527,6 @@ type compactionPartPayload struct {
 	Redacted         *bool             `json:"redacted"`
 }
 
-type toolResultPayload struct {
-	ToolCallID   string          `json:"tool_call_id"`
-	Status       string          `json:"status"`
-	Content      string          `json:"content,omitempty"`
-	Structured   json.RawMessage `json:"structured,omitempty"`
-	Truncated    bool            `json:"truncated,omitempty"`
-	OriginalSize int64           `json:"original_size,omitempty"`
-	InlineSize   int64           `json:"inline_size,omitempty"`
-	External     bool            `json:"external,omitempty"`
-	Redacted     bool            `json:"redacted,omitempty"`
-}
-
-func decodeToolResult(raw json.RawMessage) (string, string, error) {
-	output, err := decodeCanonical[toolResultPayload](raw)
-	if err != nil {
-		return "", "", err
-	}
-	if output.ToolCallID == "" {
-		return "", "", fmt.Errorf("tool_call_id required")
-	}
-	switch output.Status {
-	case "completed", "expected_failure", "operational_failure", "interrupted":
-	default:
-		return "", "", fmt.Errorf("unsupported tool result status %q", output.Status)
-	}
-	if len(output.Structured) > 0 && !json.Valid(output.Structured) {
-		return "", "", fmt.Errorf("structured must contain a JSON value")
-	}
-	content := output.Content
-	if content == "" && len(output.Structured) > 0 {
-		content = string(output.Structured)
-	}
-	if output.Status != "completed" {
-		status, _ := json.Marshal(map[string]any{
-			"status":    output.Status,
-			"content":   content,
-			"truncated": output.Truncated,
-			"redacted":  output.Redacted,
-		})
-		content = string(status)
-	}
-	return output.ToolCallID, content, nil
-}
-
 func decodeCanonical[T any](raw json.RawMessage) (T, error) {
 	var value T
 	trimmed := bytes.TrimSpace(raw)
@@ -308,30 +546,6 @@ func decodeCanonical[T any](raw json.RawMessage) (T, error) {
 		return value, err
 	}
 	return value, nil
-}
-
-type toolCallPayload struct {
-	ID        string          `json:"id"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-}
-
-func decodeToolCall(raw json.RawMessage) (einoschema.ToolCall, error) {
-	payload, err := decodeCanonical[toolCallPayload](raw)
-	if err != nil {
-		return einoschema.ToolCall{}, err
-	}
-	if payload.ID == "" || payload.Name == "" || len(payload.Arguments) == 0 {
-		return einoschema.ToolCall{}, fmt.Errorf("tool call id, name, and arguments required")
-	}
-	return einoschema.ToolCall{
-		ID:   payload.ID,
-		Type: "function",
-		Function: einoschema.FunctionCall{
-			Name:      payload.Name,
-			Arguments: string(payload.Arguments),
-		},
-	}, nil
 }
 
 func role(role session.Role) einoschema.RoleType {

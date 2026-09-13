@@ -16,22 +16,24 @@ func FreezeTurnSnapshot(
 	runID session.RunID,
 	sessionID session.ID,
 	epochID session.EpochID,
+	turnID session.TurnID,
 	snapshot config.Snapshot,
 	resolved model.Resolved,
-	messages []*einoschema.Message,
+	messages []*einoschema.AgenticMessage,
 	systemPrompt string,
 	now time.Time,
 ) (TurnSnapshot, error) {
-	return freezeTurnSnapshotWithProviderState(runID, sessionID, epochID, snapshot, resolved, messages, nil, systemPrompt, now)
+	return freezeTurnSnapshotWithProviderState(runID, sessionID, epochID, turnID, snapshot, resolved, messages, nil, systemPrompt, now)
 }
 
 func freezeTurnSnapshotWithProviderState(
 	runID session.RunID,
 	sessionID session.ID,
 	epochID session.EpochID,
+	turnID session.TurnID,
 	snapshot config.Snapshot,
 	resolved model.Resolved,
-	messages []*einoschema.Message,
+	messages []*einoschema.AgenticMessage,
 	providerState []model.ProviderMessageState,
 	systemPrompt string,
 	now time.Time,
@@ -44,6 +46,7 @@ func freezeTurnSnapshotWithProviderState(
 		RunID:         runID,
 		SessionID:     sessionID,
 		EpochID:       epochID,
+		TurnID:        turnID,
 		Config:        snapshot.Clone(),
 		Model:         cloneResolved(resolved),
 		Messages:      request.Messages,

@@ -28,7 +28,7 @@ import (
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 	"github.com/mattsp1290/eino-agent/tools"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
@@ -70,7 +70,7 @@ func TestToolWrapperRoundTripAndBoundedSnapshot(t *testing.T) {
 		Config: config.Snapshot{
 			Agent: config.Agent{Name: "agent", Mode: "primary", Options: map[string]string{"SECRET": "agent-secret"}},
 		},
-		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.Message{einoschema.SystemMessage("secret conversation"), einoschema.UserMessage("secret user")},
+		Model: runtimeResolvedWithSecret(), Messages: []*einoschema.AgenticMessage{einoschema.SystemAgenticMessage("secret conversation"), einoschema.UserAgenticMessage("secret user")},
 		SystemPrompt: "secret system prompt",
 	}
 	materialized, err := tools.Materialize(context.Background(), definition, runtime.NewToolScopeContext(snapshot))
@@ -455,6 +455,34 @@ func TestCheckedInComponentsCompileAndExposeExpectedWorlds(t *testing.T) {
 	}
 }
 
+// TestCheckedInContextSourceEnforcesOutputByteBudget is round-two W6 review
+// item 13 / RA I8's byte-budget half, through the REAL compiled
+// context-source component (not the fake-component unit tests in
+// phase_b_test.go): a MaxOutputBytes limit tighter than the checked-in
+// fixture's own "wasm context" text (13 bytes) must make loadBoundedContext
+// fail closed with ErrorSize, proving the budget is actually enforced
+// against a genuine component's wasmtime-decoded output, not merely
+// against hand-constructed Go values.
+func TestCheckedInContextSourceEnforcesOutputByteBudget(t *testing.T) {
+	requireCGO(t)
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	ctx := context.Background()
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+
+	cfg := checkedInFixtureConfig(t, root, "context-source.wasm")
+	cfg.Limits.MaxOutputBytes = 5 // smaller than "wasm context" (13 bytes)
+	source, err := openContextSource(ctx, cfg, loader.engineFactory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = source.close() }()
+	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}}
+	if _, err := source.loadBoundedContext(ctx, metadata); !IsKind(err, ErrorSize) {
+		t.Fatalf("loadBoundedContext with a tighter-than-output MaxOutputBytes err = %v, want ErrorSize", err)
+	}
+}
+
 func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	requireCGO(t)
 	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
@@ -469,8 +497,25 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	defer func() { _ = source.close() }()
 	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}}
 	messages, err := source.loadBoundedContext(ctx, metadata)
-	if err != nil || len(messages) != 1 || messages[0].Content != "wasm context" {
+	if err != nil || len(messages) != 1 || agenticMessageText(messages[0]) != "wasm context" {
 		t.Fatalf("context source = %#v, %v", messages, err)
+	}
+	// Round-two W6 review item 13 / RA I8: the fixture's second content
+	// block is a media-reference (a bounded https URI, image/png), proving
+	// the real component path -- not just the fake-component unit tests in
+	// phase_b_test.go -- converts it into the matching typed UserInputImage
+	// block.
+	var sawMediaReference bool
+	for _, block := range messages[0].ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeUserInputImage && block.UserInputImage != nil {
+			if block.UserInputImage.MIMEType != "image/png" || block.UserInputImage.URL != "https://example.com/wasm-context-fixture.png" {
+				t.Fatalf("media-reference block = %+v, want the fixture's own URI/mime-type preserved", block.UserInputImage)
+			}
+			sawMediaReference = true
+		}
+	}
+	if !sawMediaReference {
+		t.Fatalf("context source messages = %#v, want a UserInputImage block converted from the fixture's media-reference", messages)
 	}
 	sink, err := loadEventSinkForTest(loader, ctx, checkedInFixtureConfig(t, root, "event-sink.wasm"))
 	if err != nil {
@@ -508,6 +553,35 @@ func TestCheckedInPhaseBComponentsRoundTrip(t *testing.T) {
 	result, err := middleware.afterToolCall(ctx, runtime.Tool{Name: "echo"}, call, runtime.ToolResult{Structured: json.RawMessage(`{"replace":true}`), Metadata: map[string]string{"protected": "yes"}})
 	if err != nil || string(result.Structured) != `{"result":"wasm"}` || result.Metadata["protected"] != "yes" {
 		t.Fatalf("middleware result = %#v, %v", result, err)
+	}
+}
+
+// TestCheckedInOldABIContextSourceRejectedCleanly loads a checked-in
+// context-source.wasm built against the superseded eino-agent:extensions
+// @0.1.0 world (flat text-message load-context, before the content-block
+// variant was introduced) against the current @0.2.0 host, surfaced here as
+// an ordinary *Error, never a panic or process crash -- before any call is
+// attempted. TestCheckedInOldABIContextSourceRejectedCleanly proves the actual
+// rejection mechanism: the fixture is rejected at Compile because the
+// versioned world export name (eino-agent:extensions/context-source-api@0.2.0)
+// simply isn't found on a v0.1.0-built component -- a lookup-by-name
+// failure, not a canonical-ABI/signature type check -- so the classified
+// error Kind must be ErrorContract specifically, not merely "some *Error".
+func TestCheckedInOldABIContextSourceRejectedCleanly(t *testing.T) {
+	requireCGO(t)
+	root := filepath.Join("..", "examples", "wasm-extensions", "fixtures")
+	loader := NewLoader()
+	defer func() { _ = loader.Close(context.Background()) }()
+	_, err := openContextSource(context.Background(), checkedInFixtureConfig(t, root, "context-source-abi-v0.1-incompatible.wasm"), loader.engineFactory())
+	if err == nil {
+		t.Fatal("old-ABI (v0.1.0) context-source fixture was accepted instead of rejected")
+	}
+	var extensionErr *Error
+	if !errors.As(err, &extensionErr) {
+		t.Fatalf("old-ABI rejection was not a clean *Error: %v (%T)", err, err)
+	}
+	if extensionErr.Kind != ErrorContract {
+		t.Fatalf("old-ABI rejection Kind = %v, want %v", extensionErr.Kind, ErrorContract)
 	}
 }
 
@@ -729,17 +803,25 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 	defer func() { _ = storePool.Close() }()
 	var modelTurns atomic.Int64
-	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		if modelTurns.Add(1) == 1 {
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID: "wasm-call", Type: "function", Function: einoschema.FunctionCall{
-					Name: "wasm_echo", Arguments: `{"value":1}`,
+			return []*einoschema.AgenticMessage{{
+				Role: einoschema.AgenticRoleTypeAssistant,
+				ContentBlocks: []*einoschema.ContentBlock{
+					einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{
+						CallID: "wasm-call", Name: "wasm_echo", Arguments: `{"value":1}`,
+					}, &einoschema.StreamingMeta{Index: 0}),
 				},
-			}})}, nil
+			}}, nil
 		}
 		for _, message := range request.Messages {
-			if message.Role == einoschema.Tool && strings.Contains(message.Content, `"echo"`) {
-				return []*einoschema.Message{einoschema.AssistantMessage("complete", nil)}, nil
+			if message.Role == einoschema.AgenticRoleTypeUser && strings.Contains(agenticFunctionResultText(message), `"echo"`) {
+				return []*einoschema.AgenticMessage{{
+					Role: einoschema.AgenticRoleTypeAssistant,
+					ContentBlocks: []*einoschema.ContentBlock{
+						einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "complete"}, &einoschema.StreamingMeta{Index: 0}),
+					},
+				}}, nil
 			}
 		}
 		return nil, errors.New("Wasm tool result was not model-visible")
@@ -764,7 +846,7 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	}
 	admission, err := orch.Start(ctx, runtime.Request{
 		SessionID: "wasm-session",
-		Message:   runtime.UserMessage{Content: "run the Wasm tool"},
+		Message:   runtime.TextUserMessage("run the Wasm tool"),
 		Config: config.Snapshot{
 			Agent: config.Agent{Name: "agent", Model: selection}, Model: selection,
 			Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": t.TempDir()},
@@ -773,11 +855,18 @@ func TestOrchestratorMixesNativeRuntimeWithWasmToolAndPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := <-admission.Handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunCompleted || result.Error != nil || modelTurns.Load() != 2 {
 		t.Fatalf("result = %+v, model turns = %d", result, modelTurns.Load())
 	}
-	toolCall, err := store.GetToolCall(ctx, "wasm-call")
+	// The scripted streamer's tool call carried CallID "wasm-call", but
+	// runtime.prepareToolCalls always mints a fresh, durable, store-unique
+	// ToolCall.ID regardless of what the provider sent (see
+	// session.ToolCall.ProviderCallID), so the durable row's primary key is
+	// not "wasm-call". Recover the minted id from the persisted
+	// function_tool_call content block itself, which now carries it.
+	toolCallID := findFunctionToolCallID(t, ctx, store, "wasm-session")
+	toolCall, err := store.GetToolCall(ctx, toolCallID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -849,7 +938,7 @@ func (e *signalExporter) Export(context.Context, []einoobs.Observation) error {
 func (*signalExporter) Flush(context.Context) error    { return nil }
 func (*signalExporter) Shutdown(context.Context) error { return nil }
 
-type wasmScriptedStreamer func(context.Context, model.Request) ([]*einoschema.Message, error)
+type wasmScriptedStreamer func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error)
 
 func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	messages, err := s(ctx, request)
@@ -860,12 +949,57 @@ func (s wasmScriptedStreamer) StreamProvider(ctx context.Context, request model.
 	go func() {
 		defer writer.Close()
 		for _, message := range messages {
-			if writer.Send(model.StreamDelta{Message: message, Usage: model.UsageFromMessage(message)}, nil) {
+			if writer.Send(model.StreamDelta{Message: message, Usage: model.UsageFromAgenticMessage(message)}, nil) {
 				return
 			}
 		}
 	}()
 	return reader, nil
+}
+
+// agenticMessageText concatenates the text of every user_input_text or
+// assistant_gen_text block on message.
+func agenticMessageText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeUserInputText:
+			if block.UserInputText != nil {
+				sb.WriteString(block.UserInputText.Text)
+			}
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				sb.WriteString(block.AssistantGenText.Text)
+			}
+		}
+	}
+	return sb.String()
+}
+
+// agenticFunctionResultText concatenates the text content of every
+// function_tool_result block on message.
+func agenticFunctionResultText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, block := range message.ContentBlocks {
+		if block == nil || block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
+			continue
+		}
+		for _, item := range block.FunctionToolResult.Content {
+			if item != nil && item.Type == einoschema.FunctionToolResultContentBlockTypeText && item.Text != nil {
+				sb.WriteString(item.Text.Text)
+			}
+		}
+	}
+	return sb.String()
 }
 
 type wasmTestIDs struct{ next atomic.Uint64 }
@@ -882,6 +1016,9 @@ func (i *wasmTestIDs) NewToolCallID() session.ToolCallID {
 }
 func (i *wasmTestIDs) NewEventID() session.EventID { return session.EventID(i.id("event")) }
 func (i *wasmTestIDs) NewEpochID() session.EpochID { return session.EpochID(i.id("epoch")) }
+func (i *wasmTestIDs) NewTurnID() session.TurnID   { return session.TurnID(i.id("turn")) }
+func (i *wasmTestIDs) NewInboxID() session.InboxID { return session.InboxID(i.id("inbox")) }
+func (i *wasmTestIDs) NewInvocationID() string     { return i.id("invocation") }
 
 func checkedInFixtureConfig(t *testing.T, root, name string) ModuleConfig {
 	t.Helper()
@@ -971,9 +1108,15 @@ func (c *fakeComponent) DecidePermissions(ctx context.Context, input wittypes.Pe
 	err = c.invoke(ctx, "permissions-policy.decide", input, &output)
 	return
 }
-func (c *fakeComponent) LoadContext(ctx context.Context, input wittypes.TurnMetadata) (output []wittypes.TextMessage, err error) {
+func (c *fakeComponent) LoadContext(ctx context.Context, input wittypes.TurnMetadata) (output []wittypes.Message, err error) {
 	err = c.invoke(ctx, "context-source.load-context", input, &output)
 	return
+}
+
+// textOnlyMessage builds a wittypes.Message carrying a single text
+// content-block, for tests that only exercise the plain-text projection.
+func textOnlyMessage(role wittypes.TextRole, text string) wittypes.Message {
+	return wittypes.Message{Role: role, Blocks: cm.ToList([]wittypes.ContentBlock{wittypes.ContentBlockText(text)})}
 }
 func (c *fakeComponent) EmitEvent(ctx context.Context, input wittypes.BoundedEvent) error {
 	return c.invoke(ctx, "event-sink.emit", input, nil)
@@ -1011,3 +1154,42 @@ func newBlockingComponent() *blockingComponent {
 	return component
 }
 func (c *blockingComponent) Interrupt() { c.interrupts.Add(1); c.once.Do(func() { close(c.release) }) }
+
+// findFunctionToolCallID scans sessionID's durable history for the first
+// function_tool_call content block and returns its (runtime-minted)
+// CallID -- see session.ToolCall.ProviderCallID's doc comment: the
+// provider's own CallID is preserved separately from the durable, always-
+// unique ToolCall.ID prepareToolCalls mints, and only the minted id is
+// ever persisted in the block itself.
+func findFunctionToolCallID(t *testing.T, ctx context.Context, store session.Store, sessionID session.ID) session.ToolCallID {
+	t.Helper()
+	cursor := session.ReplayCursor{Limit: 1000}
+	for {
+		batch, err := store.ListMessages(ctx, sessionID, cursor)
+		if err != nil {
+			t.Fatalf("ListMessages: %v", err)
+		}
+		for _, part := range batch.Parts {
+			if part.Kind != session.PartFunctionToolCall {
+				continue
+			}
+			var envelope struct {
+				FunctionCall struct {
+					CallID string `json:"call_id"`
+				} `json:"function_call"`
+			}
+			if err := json.Unmarshal(part.Payload, &envelope); err != nil {
+				t.Fatalf("decode function_tool_call part: %v", err)
+			}
+			if envelope.FunctionCall.CallID != "" {
+				return session.ToolCallID(envelope.FunctionCall.CallID)
+			}
+		}
+		if batch.Next == (session.ReplayCursor{}) {
+			break
+		}
+		cursor = batch.Next
+	}
+	t.Fatal("no function_tool_call content block found")
+	return ""
+}

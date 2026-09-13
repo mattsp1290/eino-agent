@@ -75,7 +75,8 @@ func TestProviderStatePayloadMetadataBoundaries(t *testing.T) {
 		CodecID: strings.Repeat("c", ProviderStateMaxCodecIDBytes), Version: 1,
 		ProviderID: strings.Repeat("p", ProviderStateMaxProviderIDBytes), SourceModelID: strings.Repeat("m", ProviderStateMaxModelIDBytes),
 		CompatibilityKey: strings.Repeat("k", ProviderStateMaxCompatibilityKeyBytes), ItemIndex: ProviderStateHardMaxItems - 1,
-		Data: json.RawMessage(`{"x":1}`),
+		BlockID: strings.Repeat("i", maxBlockIDBytes),
+		Data:    json.RawMessage(`{"x":1}`),
 	}
 	if _, err := EncodeProviderStatePayload(valid); err != nil {
 		t.Fatalf("maximum metadata rejected: %v", err)
@@ -86,6 +87,7 @@ func TestProviderStatePayloadMetadataBoundaries(t *testing.T) {
 		"model":         func(e *ProviderStateEnvelope) { e.SourceModelID += "m" },
 		"compatibility": func(e *ProviderStateEnvelope) { e.CompatibilityKey += "k" },
 		"index":         func(e *ProviderStateEnvelope) { e.ItemIndex++ },
+		"block_id":      func(e *ProviderStateEnvelope) { e.BlockID += "i" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			envelope := valid
@@ -95,4 +97,56 @@ func TestProviderStatePayloadMetadataBoundaries(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProviderStatePayloadBlockIDRoundTrip(t *testing.T) {
+	t.Run("empty block id is message-level and always emitted", func(t *testing.T) {
+		payload, err := EncodeProviderStatePayload(ProviderStateEnvelope{
+			CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model",
+			CompatibilityKey: "compat", ItemIndex: 0, Data: json.RawMessage(`{"x":1}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(payload, []byte(`"block_id":""`)) {
+			t.Fatalf("canonical payload omits empty block_id: %s", payload)
+		}
+		got, err := DecodeProviderStatePayload(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.BlockID != "" {
+			t.Fatalf("BlockID = %q, want empty", got.BlockID)
+		}
+	})
+
+	t.Run("non-empty block id round trips", func(t *testing.T) {
+		payload, err := EncodeProviderStatePayload(ProviderStateEnvelope{
+			CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model",
+			CompatibilityKey: "compat", ItemIndex: 0, BlockID: "block-42", Data: json.RawMessage(`{"x":1}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(payload, []byte(`"block_id":"block-42"`)) {
+			t.Fatalf("canonical payload missing block_id: %s", payload)
+		}
+		got, err := DecodeProviderStatePayload(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.BlockID != "block-42" {
+			t.Fatalf("BlockID = %q, want block-42", got.BlockID)
+		}
+	})
+
+	t.Run("non-printable block id rejected", func(t *testing.T) {
+		_, err := EncodeProviderStatePayload(ProviderStateEnvelope{
+			CodecID: "codec", Version: 1, ProviderID: "provider", SourceModelID: "model",
+			CompatibilityKey: "compat", ItemIndex: 0, BlockID: "bad\nid", Data: json.RawMessage(`{"x":1}`),
+		})
+		if !errors.Is(err, ErrProviderStateInvalid) {
+			t.Fatalf("error = %v, want ErrProviderStateInvalid", err)
+		}
+	})
 }

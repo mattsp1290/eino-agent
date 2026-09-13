@@ -135,7 +135,9 @@ func testStaleMethods(t *testing.T, server *testpostgres.Server) {
 				t.Fatal(err)
 			}
 			at := f.now.Add(2 * time.Second)
-			settlement := session.ToolSettlement{ID: "settle-call", ClaimedBy: "worker", ClaimToken: "tool-token", Status: session.ToolCallCompleted, Output: json.RawMessage(`{"ok":true}`), CompletedAt: at, ResultMessage: session.Message{ID: call.ResultMessageID, SessionID: run.SessionID, RunID: run.ID, ParentID: message.ID, Role: session.RoleTool, CreatedAt: at, UpdatedAt: at}, ResultPart: session.Part{ID: call.ResultPartID, MessageID: call.ResultMessageID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartToolResult, Payload: json.RawMessage(`{"ok":true}`), CreatedAt: at, UpdatedAt: at}}
+			output := json.RawMessage(`{"ok":true}`)
+			resultMessage, resultPart := postgresToolResultEnvelope(call, output, at)
+			settlement := session.ToolSettlement{ID: "settle-call", ClaimedBy: "worker", ClaimToken: "tool-token", Status: session.ToolCallCompleted, Output: output, CompletedAt: at, ResultMessage: resultMessage, ResultPart: resultPart}
 			return func(ctx context.Context, ex session.ExecutionStore) error {
 				_, err := ex.SettleToolCall(ctx, session.SettleToolCallRequest{Settlement: settlement, Event: fencingToolEvent("settle-terminal", at)})
 				return err
@@ -203,7 +205,7 @@ func fencingAssistantMessage(f *raceFixture, run session.Run, id session.Message
 }
 
 func fencingTextPart(f *raceFixture, run session.Run, messageID session.MessageID, id session.PartID) session.Part {
-	return session.Part{ID: id, MessageID: messageID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Payload: json.RawMessage(`"text"`), CreatedAt: f.now, UpdatedAt: f.now}
+	return session.Part{ID: id, MessageID: messageID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartProviderState, Payload: json.RawMessage(`"text"`), CreatedAt: f.now, UpdatedAt: f.now}
 }
 
 func fencingToolEvent(id session.EventID, at time.Time) session.ToolTransitionEvent {
@@ -212,12 +214,47 @@ func fencingToolEvent(id session.EventID, at time.Time) session.ToolTransitionEv
 
 func fencingToolCreateRequest(run session.Run, messageID session.MessageID, id session.ToolCallID, eventID session.EventID, at time.Time) session.CreateToolCallRequest {
 	call := session.ToolCall{ID: id, SessionID: run.SessionID, RunID: run.ID, MessageID: messageID, RequestPartID: session.PartID(string(id) + "-part"), ResultMessageID: session.MessageID(string(id) + "-result"), ResultPartID: session.PartID(string(id) + "-result-part"), Name: "tool", Input: json.RawMessage(`{}`), Status: session.ToolCallPending}
-	payload := json.RawMessage(`{"id":"` + string(id) + `","name":"tool","arguments":{}}`)
-	return session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: call.RequestPartID, MessageID: messageID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartToolCall, Payload: payload, CreatedAt: at, UpdatedAt: at}, Event: fencingToolEvent(eventID, at)}
+	return session.CreateToolCallRequest{Call: call, RequestPart: postgresToolRequestPart(call.RequestPartID, messageID, run.SessionID, run.ID, call.ID, call.Name, call.Input, at), Event: fencingToolEvent(eventID, at)}
+}
+
+// postgresToolRequestPart builds a durable function_tool_call content-block
+// envelope part (see session.EncodeContentParts) for a pending tool call
+// request, matching what runtime's tool_preparation.go persists.
+func postgresToolRequestPart(id session.PartID, messageID session.MessageID, sessionID session.ID, runID session.RunID, callID session.ToolCallID, name string, arguments json.RawMessage, at time.Time) session.Part {
+	parts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "block-request", Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(callID), Name: name, Arguments: string(arguments)},
+		}},
+	}, func() session.PartID { return id }, messageID, sessionID, runID, at.UTC(), session.DefaultContentLimits())
+	if err != nil {
+		panic(err)
+	}
+	return parts[0]
+}
+
+// postgresToolResultEnvelope builds a settlement's reserved result message and
+// content-block envelope part for call, with output as the sole
+// function_tool_result text content (matching what runtime's
+// buildTerminalToolEnvelope persists).
+func postgresToolResultEnvelope(call session.ToolCall, output json.RawMessage, at time.Time) (session.Message, session.Part) {
+	message := session.Message{ID: call.ResultMessageID, SessionID: call.SessionID, RunID: call.RunID, ParentID: call.MessageID, Role: session.RoleUser, CreatedAt: at.UTC(), UpdatedAt: at.UTC()}
+	parts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleUser,
+		Blocks: []session.ContentBlock{{
+			ID: "block-result", Kind: session.BlockKindFunctionToolResult,
+			FunctionResult: &session.FunctionResultBlock{CallID: string(call.ID), Name: call.Name, Content: []session.ResultContent{{Type: session.ResultContentText, Text: string(output)}}},
+		}},
+	}, func() session.PartID { return call.ResultPartID }, call.ResultMessageID, call.SessionID, call.RunID, at.UTC(), session.DefaultContentLimits())
+	if err != nil {
+		panic(err)
+	}
+	return message, parts[0]
 }
 
 func fencingModelRequest(run session.Run, id session.ModelRequestID, at time.Time, state session.ModelRequestState) session.ModelRequestRecord {
-	return session.ModelRequestRecord{ID: id, SessionID: run.SessionID, RunID: run.ID, Attempt: 0, Step: 0, State: state, Messages: json.RawMessage(`[]`), CreatedAt: at, UpdatedAt: at}
+	return session.ModelRequestRecord{ID: id, SessionID: run.SessionID, RunID: run.ID, InvocationID: "invocation-" + string(id), Attempt: 0, Step: 0, State: state, Messages: json.RawMessage(`[]`), CreatedAt: at, UpdatedAt: at}
 }
 
 func testDelayedWriter(t *testing.T, server *testpostgres.Server) {

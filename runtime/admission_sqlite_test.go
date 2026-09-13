@@ -36,9 +36,9 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	var responseNumber int
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			responseNumber++
-			return []*einoschema.Message{einoschema.AssistantMessage(fmt.Sprintf("answer-%d", responseNumber), nil)}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantText(fmt.Sprintf("answer-%d", responseNumber))}, nil
 		})}),
 		WithIDGenerator(&reverseAdmissionIDs{}),
 		WithRunPlanProvider(emptyTestRunPlanProvider()),
@@ -54,11 +54,11 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	prompts := []string{"first prompt", "  héllo 世界\n"}
 	var originalSession session.Session
 	for index, prompt := range prompts {
-		admission, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: UserMessage{Content: prompt}, Config: orchestratorConfig(), Metadata: metadata})
+		admission, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage(prompt), Config: orchestratorConfig(), Metadata: metadata})
 		if err != nil {
 			t.Fatalf("Start %d: %v", index+1, err)
 		}
-		result := <-admission.Handle.Done()
+		result := <-admission.Done()
 		if result.Error != nil || result.Status != session.RunCompleted {
 			t.Fatalf("run %d result = %+v", index+1, result)
 		}
@@ -84,7 +84,7 @@ func TestAdmissionSQLiteReplaysFrozenClockPairsAfterReopen(t *testing.T) {
 	}
 	if _, err := orchestrator.Start(ctx, Request{
 		SessionID: sessionID,
-		Message:   UserMessage{Content: "identity drift"},
+		Message:   TextUserMessage("identity drift"),
 		Config:    orchestratorConfig(),
 		Metadata:  map[string]string{"source": "changed"},
 	}); !errors.Is(err, session.ErrConflict) {
@@ -187,12 +187,14 @@ func TestAdmissionSQLiteRollsBackAfterUserPartWrite(t *testing.T) {
 	secondRequest := testRunAdmission()
 	secondRequest.IDs.RunID = "run-2"
 	secondRequest.IDs.UserMessageID = "user-2"
-	secondRequest.IDs.UserPartID = "user-part-2"
+	secondRequest.IDs.UserPartIDs = []session.PartID{"user-part-2"}
 	secondRequest.IDs.AssistantMessageID = "assistant-2"
 	secondRequest.IDs.ContextEpochID = "epoch-2"
 	secondRequest.IDs.EventID = "event-2"
 	secondRequest.IDs.RunClaimToken = "claim-run-2"
-	secondRequest.UserMessage.Content = "second prompt"
+	secondRequest.IDs.TurnID = "turn-2"
+	secondRequest.IDs.TurnStartedEventID = "turn-started-2"
+	secondRequest.UserMessage.Blocks[0].Text.Text = "second prompt"
 	_, err = (admitter{Store: &failingAdmissionStore{Store: store}, Clock: func() time.Time { return now }}).admit(ctx, secondRequest)
 	if !errors.Is(err, errInjectedSecondAdmissionMessage) {
 		t.Fatalf("Admit error = %v, want injected second-message failure", err)
@@ -219,10 +221,11 @@ func TestAdmissionSQLiteRollsBackAfterUserPartWrite(t *testing.T) {
 }
 
 type reverseAdmissionIDs struct {
-	mu                    sync.Mutex
-	runs, messages, parts int
-	toolCalls, events     int
-	epochs                int
+	mu                          sync.Mutex
+	runs, messages, parts       int
+	toolCalls, events           int
+	epochs                      int
+	turns, inboxes, invocations int
 }
 
 func (s *reverseAdmissionIDs) next(counter *int, prefix string) string {
@@ -263,6 +266,18 @@ func (s *reverseAdmissionIDs) NewEpochID() session.EpochID {
 	return session.EpochID(s.next(&s.epochs, "epoch"))
 }
 
+func (s *reverseAdmissionIDs) NewTurnID() session.TurnID {
+	return session.TurnID(s.next(&s.turns, "turn"))
+}
+
+func (s *reverseAdmissionIDs) NewInboxID() session.InboxID {
+	return session.InboxID(s.next(&s.inboxes, "inbox"))
+}
+
+func (s *reverseAdmissionIDs) NewInvocationID() string {
+	return s.next(&s.invocations, "invocation")
+}
+
 var errInjectedSecondAdmissionMessage = errors.New("injected second admission message failure")
 
 type failingAdmissionStore struct {
@@ -277,7 +292,7 @@ func (s *failingAdmissionStore) WithinTx(ctx context.Context, fn func(context.Co
 
 type failingAdmissionTx struct {
 	session.Store
-	appendMessages int
+	appendEvents int
 }
 
 func (s *failingAdmissionTx) Execution(fence session.RunFence) session.ExecutionStore {
@@ -289,12 +304,20 @@ type failingAdmissionExecution struct {
 	tx *failingAdmissionTx
 }
 
-func (s *failingAdmissionExecution) AppendMessage(ctx context.Context, message session.Message) (session.Message, error) {
-	s.tx.appendMessages++
-	if s.tx.appendMessages == 2 {
-		return session.Message{}, errInjectedSecondAdmissionMessage
+// AppendEvent is the only admission write that still reaches this wrapper
+// through the public ExecutionStore interface: AdmitTurn (turn/message/part
+// admission) is implemented directly on the concrete sqlstore.Store, not
+// through the injected interface, so fault injection targets the run_started
+// event admitDurable appends immediately after AdmitTurn commits -- still
+// proving that a failure partway through admission (after the turn's
+// messages/parts/turn row are durably written) rolls back the whole
+// transaction, including the earlier AdmitTurn writes.
+func (s *failingAdmissionExecution) AppendEvent(ctx context.Context, event session.EventRecord) (session.EventRecord, error) {
+	s.tx.appendEvents++
+	if s.tx.appendEvents == 1 {
+		return session.EventRecord{}, errInjectedSecondAdmissionMessage
 	}
-	return s.ExecutionStore.AppendMessage(ctx, message)
+	return s.ExecutionStore.AppendEvent(ctx, event)
 }
 
 var _ session.Store = (*failingAdmissionStore)(nil)

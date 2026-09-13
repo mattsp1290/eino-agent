@@ -23,20 +23,37 @@ type ModelRequestRecord struct {
 	SessionID          ID
 	RunID              RunID
 	AssistantMessageID MessageID
-	Attempt            int
-	Step               int
-	ProviderID         string
-	ModelID            string
-	State              ModelRequestState
-	Messages           json.RawMessage
-	System             string
-	Tools              json.RawMessage
-	SafeCallConfig     json.RawMessage
-	ContentSHA256      string
-	ExtensionPlanHash  string
-	ErrorCode          string
-	CreatedAt          time.Time
-	UpdatedAt          time.Time
+	// InvocationID identifies one physical dispatch and is unique per run
+	// (run_key, invocation_id). It replaces (Attempt, Step) as the durable
+	// identity; Attempt and Step are retained as informational fields only.
+	InvocationID string
+	// TurnID correlates this request to the durable turn that produced it.
+	TurnID TurnID
+	// AgentPath is the joined RunPath of the (sub)agent that issued this
+	// request.
+	AgentPath  string
+	Attempt    int
+	Step       int
+	ProviderID string
+	ModelID    string
+	State      ModelRequestState
+	Messages   json.RawMessage
+	System     string
+	Tools      json.RawMessage
+	// Controls carries the marshaled remainder of the audited model-visible
+	// request that Tools alone does not capture: DeferredTools,
+	// ToolSearchTool, ToolChoice, and the scalar generation controls
+	// (temperature, top_p, max_tokens, stop). See
+	// runtime.AuditedModelInput / runtime.prepareModelRequest. Optional:
+	// empty for requests that set none of these (matching legacy rows that
+	// predate this field).
+	Controls          json.RawMessage
+	SafeCallConfig    json.RawMessage
+	ContentSHA256     string
+	ExtensionPlanHash string
+	ErrorCode         string
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
 }
 
 type ModelRequestCursor struct {

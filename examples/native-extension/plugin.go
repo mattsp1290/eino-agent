@@ -46,8 +46,8 @@ func Mount(ctx context.Context, registry *composition.Registry, sessionID sessio
 		})}); err != nil {
 			return err
 		}
-		if err := runtime.OnContextSource(registrar.Extensions(), extension.Registration{ID: "context/session", Order: runtime.OrderApplication, Scope: scope}, func(context.Context, runtime.ContextSourceInput) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.SystemMessage("Native example extension is active for this session.")}, nil
+		if err := runtime.OnContextSource(registrar.Extensions(), extension.Registration{ID: "context/session", Order: runtime.OrderApplication, Scope: scope}, func(context.Context, runtime.ContextSourceInput) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{einoschema.SystemAgenticMessage("Native example extension is active for this session.")}, nil
 		}); err != nil {
 			return err
 		}

@@ -83,11 +83,11 @@ func Rules() []Rule {
 			Persist:      DispositionPersist,
 			Replay:       DispositionReplay,
 			LiveTail:     DispositionLive,
-			SessionPart:  session.PartText,
+			SessionPart:  session.PartAssistantGenText,
 			AuditKind:    "message_delta",
 			Redaction:    session.RedactionContent,
 			SnapshotSafe: true,
-			Notes:        "Live text deltas are emitted immediately; replay uses settled message text parts, not stored SSE frames.",
+			Notes:        "Live text deltas are emitted immediately; replay uses settled assistant_gen_text message parts, not stored SSE frames.",
 		},
 		{
 			Family:      EventReasoning,
@@ -121,31 +121,30 @@ func Rules() []Rule {
 			Persist:     DispositionPersist,
 			Replay:      DispositionReplay,
 			LiveTail:    DispositionLive,
-			SessionPart: session.PartToolCall,
+			SessionPart: session.PartFunctionToolCall,
 			AuditKind:   "tool_call_updated",
 			Redaction:   session.RedactionContent,
-			Notes:       "Tool call starts/args/ends settle into durable tool-call records and replayable tool-call parts.",
+			Notes:       "Tool call starts/args/ends settle into durable tool-call records and replayable function_tool_call parts.",
 		},
 		{
 			Family:      EventToolResult,
 			Persist:     DispositionPersist,
 			Replay:      DispositionReplay,
 			LiveTail:    DispositionLive,
-			SessionPart: session.PartToolResult,
+			SessionPart: session.PartFunctionToolResult,
 			AuditKind:   "tool_result",
 			Redaction:   session.RedactionContent,
-			Notes:       "Tool results replay from bounded durable tool-result parts; live emission uses eino-agui emitter helpers.",
+			Notes:       "Tool results replay from bounded durable function_tool_result parts; live emission uses eino-agui emitter helpers.",
 		},
 		{
-			Family:      EventStateSnapshot,
-			Persist:     DispositionPersist,
-			Replay:      DispositionReplay,
-			LiveTail:    DispositionLive,
-			SessionPart: session.PartState,
-			AuditKind:   "state_snapshot",
-			Redaction:   session.RedactionContent,
-			Gates:       []Gate{GateHostReplaySafeState},
-			Notes:       "State snapshots are durable and replayable only after host policy marks them replay-safe.",
+			Family:    EventStateSnapshot,
+			Persist:   DispositionOmit,
+			Replay:    DispositionOmit,
+			LiveTail:  DispositionLive,
+			AuditKind: "state_snapshot",
+			Redaction: session.RedactionContent,
+			Gates:     []Gate{GateHostReplaySafeState},
+			Notes:     "State snapshots are live-tail only today: no durable PartKind backs this yet -- the W2 content contract's 20 block kinds cover model-authored content, not arbitrary host-visible app state -- so persistence and replay remain unimplemented pending a future work package. Once a PartKind is added, Persist/Replay should become DispositionPersist/DispositionReplay and this rule should gain a SessionPart, still gated on host replay-safety.",
 		},
 		{
 			Family:    EventStateDelta,
@@ -163,7 +162,22 @@ func Rules() []Rule {
 			LiveTail:  DispositionLive,
 			AuditKind: "messages_snapshot",
 			Redaction: session.RedactionContent,
-			Notes:     "Message snapshots are projected from durable messages and parts; raw snapshot SSE frames are not stored.",
+			Notes: "When a bridge chooses to emit MESSAGES_SNAPSHOT, it must be " +
+				"projected from durable messages and parts, never stored/replayed " +
+				"raw SSE frames. This module's two bridges differ on whether they " +
+				"emit one at all: the built-in agui.Replay/agui.Reconnect " +
+				"(agui/replay.go) deliberately does NOT emit a MESSAGES_SNAPSHOT " +
+				"during replay -- a native snapshot built from " +
+				"convert.ToAgenticProjection would cover user-role messages only, " +
+				"reordering a U1,A1,U2,A2 transcript and clobbering a cursored " +
+				"reconnect (see replay.go's doc comment and " +
+				"docs/architecture/agui-events.md's \"Replay Projection\" section). " +
+				"agui.WatchBridge.Initial (agui/watch.go) is the one bridge here " +
+				"that does emit MESSAGES_SNAPSHOT, from its own durable-message " +
+				"read, as part of its separate watch/current-state contract. A " +
+				"host writing a from-scratch bridge and applying this rule must " +
+				"choose one of those two shapes explicitly, not assume " +
+				"Replay: DispositionReplay means agui.Replay supplies one.",
 		},
 		{
 			Family:    EventActivity,
@@ -175,14 +189,13 @@ func Rules() []Rule {
 			Notes:     "Activity is live UI state plus optional audit metadata, not replayable conversation content.",
 		},
 		{
-			Family:      EventStep,
-			Persist:     DispositionPersist,
-			Replay:      DispositionReplay,
-			LiveTail:    DispositionLive,
-			SessionPart: session.PartStep,
-			AuditKind:   "step",
-			Redaction:   session.RedactionMetadata,
-			Notes:       "Step boundaries are durable for audit, replay annotations, and observability correlation.",
+			Family:    EventStep,
+			Persist:   DispositionOmit,
+			Replay:    DispositionOmit,
+			LiveTail:  DispositionLive,
+			AuditKind: "step",
+			Redaction: session.RedactionMetadata,
+			Notes:     "Step boundaries are live-tail only today: Bridge.StepStarted/StepFinished are pure passthroughs to the eino-agui emitter and write no durable part or EventRecord (session.AttemptReplacedEventKind is a separate, unrelated model-dispatch-retry audit trail, not a record of AG-UI step boundaries). No durable PartKind backs step boundaries yet, so persistence, audit, and replay remain unimplemented pending a future work package.",
 		},
 		{
 			Family:    EventCustom,

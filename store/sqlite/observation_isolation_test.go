@@ -122,11 +122,11 @@ func TestObservationCommitBetweenWatermarkAndFields(t *testing.T) {
 			written, committed := make(chan struct{}), make(chan error, 1)
 			go func() {
 				committed <- ex.WithinTx(ctx, func(ctx context.Context, tx session.ExecutionStore) error {
-					if _, err := tx.AppendPart(ctx, session.Part{ID: "p", MessageID: "m", SessionID: "s", RunID: "r", Kind: session.PartText, Payload: []byte(`{"text":"atomic"}`)}); err != nil {
+					if _, err := tx.AppendPart(ctx, session.Part{ID: "p", MessageID: "m", SessionID: "s", RunID: "r", Kind: session.PartUserInputText, Payload: []byte(`{"text":{"text":"atomic"}}`)}); err != nil {
 						return err
 					}
 					call := session.ToolCall{ID: "tool", SessionID: "s", RunID: "r", MessageID: "m", RequestPartID: "request", ResultMessageID: "result", ResultPartID: "result-part", Name: "echo", Pattern: "echo", Input: []byte("{}"), Status: session.ToolCallPending}
-					if _, err := tx.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: "request", MessageID: "m", SessionID: "s", RunID: "r", Kind: session.PartToolCall, Payload: []byte(`{"id":"tool","name":"echo","arguments":{}}`)}, Event: session.ToolTransitionEvent{ID: "event", CreatedAt: time.Now()}}); err != nil {
+					if _, err := tx.CreateToolCall(ctx, sqliteCreateRequest(call, "event", time.Now())); err != nil {
 						return err
 					}
 					if err := tx.FinalizeAssistantMessage(ctx, "m"); err != nil {

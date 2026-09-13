@@ -68,7 +68,7 @@ func TestExtensionPlanJSONAndFingerprintGolden(t *testing.T) {
 			Tools:      []ToolPlanIdentity{{Name: "tool", RegistrationID: "registration", Scope: extension.GlobalScope(), SchemaHash: "schema", ExecutorHash: "executor"}},
 		}},
 	}
-	const expectedJSON = `{"Fingerprint":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor","Order":0}],"Prompts":null,"Guards":null,"Restrictions":null}]}`
+	const expectedJSON = `{"Fingerprint":"","ToolSearch":"","Components":[{"InstanceID":"component","Artifact":{"Name":"artifact","Version":"1","Hash":"hash","ConfigHash":"config","SourceKind":"native"},"Handlers":null,"Tools":[{"Name":"tool","RegistrationID":"registration","Scope":{"Kind":"global","Key":""},"SchemaHash":"schema","ExecutorHash":"executor","Order":0,"Aliases":null,"Deferred":false}],"Prompts":null,"Guards":null,"Restrictions":null,"AgentHandlers":null}]}`
 	raw, err := json.Marshal(descriptor)
 	if err != nil {
 		t.Fatal(err)
@@ -80,7 +80,7 @@ func TestExtensionPlanJSONAndFingerprintGolden(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const expectedFingerprint = "f47936e2385ec28496bcf84bcbb1392fc80a99bf3670b8d9d23e6ed0678a9031"
+	const expectedFingerprint = "91b766c22335447fc92ca7a15196d01c09663641744dbeb63821679f8dc9c2bd"
 	if fingerprint != expectedFingerprint {
 		t.Fatalf("descriptor fingerprint = %s", fingerprint)
 	}

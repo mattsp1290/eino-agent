@@ -93,21 +93,21 @@ func TestBlockedInfrastructureSinkCannotBlockAdmissionOrHandleDone(t *testing.T)
 	release := make(chan struct{})
 	var once sync.Once
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}), WithEventSink(EventSinkFunc(func(context.Context, session.EventRecord) {
 		once.Do(func() { close(started) })
 		<-release
 	})), WithQueueSize(2))
 	admission, err := orch.Start(context.Background(), Request{
-		SessionID: "blocked-sink-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig(),
+		SessionID: "blocked-sink-session", Message: TextUserMessage("hello"), Config: orchestratorConfig(),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	<-started
 	select {
-	case result := <-admission.Handle.Done():
+	case result := <-admission.Done():
 		if result.Status != session.RunCompleted {
 			t.Fatalf("result = %+v", result)
 		}

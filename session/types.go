@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -25,6 +26,12 @@ type ToolCallID string
 // EpochID identifies a context epoch, including compacted epochs.
 type EpochID string
 
+// TurnID identifies one durable turn admitted inside a run.
+type TurnID string
+
+// InboxID identifies one durable queued inbox item.
+type InboxID string
+
 var (
 	// ErrSessionBusy reports that a session already has a nonterminal owner run.
 	ErrSessionBusy = errors.New("session has active run")
@@ -32,6 +39,22 @@ var (
 	ErrConflict = errors.New("session store conflict")
 	// ErrNotFound reports that a durable session record does not exist.
 	ErrNotFound = errors.New("session record not found")
+	// ErrRunClosed reports that a run-scoped write (e.g. EnqueueInboxForRun)
+	// was rejected because the targeted run is already terminal. Distinct
+	// from ErrConflict so a caller can tell "the run is closed, do not
+	// acknowledge this input" apart from an unrelated write conflict (e.g. a
+	// mismatched idempotent retry payload).
+	ErrRunClosed = errors.New("session: run is closed")
+	// ErrRunHasQueuedInput reports that a SettleRun(RunCompleted) was
+	// refused because the run's session has a durably queued inbox item
+	// (see SettleRun's terminal-settlement race guard). It wraps
+	// ErrConflict (errors.Is(err, ErrConflict) still holds for existing
+	// callers), but is distinguished from a generic conflict so a caller
+	// like settleRunRetrying can skip retrying a conflict that a bounded
+	// retry loop can never clear -- only a FUTURE run's drain does -- and
+	// divert immediately instead of burning its full retry budget first
+	// (round-three reconciliation item 9, SR-S1/RD-S4).
+	ErrRunHasQueuedInput = fmt.Errorf("%w: run has queued input pending drain", ErrConflict)
 )
 
 // Session is durable conversation metadata. Runtime dependencies such as model
@@ -61,6 +84,11 @@ const (
 	RunFailed RunStatus = "failed"
 	// RunCompleted means execution reached a normal terminal state.
 	RunCompleted RunStatus = "completed"
+	// RunPaused means execution durably suspended after a promoted
+	// checkpoint. Paused runs are nonterminal but hold no live fence: the
+	// session remains reserved (see runs_session_active_unique_idx) until a
+	// resume claims the run and moves it back to running.
+	RunPaused RunStatus = "paused"
 )
 
 // Run records one admitted execution attempt before provider streaming starts.
@@ -105,6 +133,13 @@ func (r Run) Terminal() bool {
 	return r.Status == RunInterrupted || r.Status == RunFailed || r.Status == RunCompleted
 }
 
+// Paused reports whether the run is durably suspended awaiting resume. A
+// paused run is nonterminal but has no live fence: only ClaimRun can move it
+// back to running.
+func (r Run) Paused() bool {
+	return r.Status == RunPaused
+}
+
 // Role is the durable role of a message in replayable history.
 type Role string
 
@@ -129,6 +164,17 @@ type Message struct {
 	Role      Role
 	Agent     string
 	ModelID   string
+	// TurnID correlates this message to the durable turn that produced it,
+	// stamped at append time by every runtime call site that mints a
+	// Message. Record-JSON-only, like EventRecord.TurnID and
+	// ModelRequestRecord.TurnID: no column or index backs it.
+	TurnID TurnID
+	// AgentPath is the joined RunPath of the (sub)agent that produced this
+	// message, mirroring EventRecord.AgentPath and
+	// ModelRequestRecord.AgentPath. Empty for the root agent; subagent
+	// nesting is not yet wired end to end (see adkEngine.agentPath in the
+	// runtime package), so every current caller stamps "".
+	AgentPath string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -137,25 +183,60 @@ type Message struct {
 type PartKind string
 
 const (
-	// PartText stores text content or a settled text delta.
-	PartText PartKind = "text"
-	// PartReasoning stores model reasoning content when a provider exposes it.
+	// PartReasoning stores model reasoning content when a provider exposes
+	// it. This constant is also the PartKind for BlockKindReasoning content
+	// blocks (see PartKindForBlock in content.go): both already share the
+	// "reasoning" string, so no separate constant is declared for the block
+	// variant.
 	PartReasoning PartKind = "reasoning"
-	// PartToolCall stores a tool-call state transition.
-	PartToolCall PartKind = "tool_call"
-	// PartToolResult stores a tool result sent back to the model.
-	PartToolResult PartKind = "tool_result"
-	// PartFile stores a durable file or media reference.
-	PartFile PartKind = "file"
-	// PartStep stores provider/runtime step start and finish markers.
-	PartStep PartKind = "step"
 	// PartCompaction stores compaction request or summary metadata.
 	PartCompaction PartKind = "compaction"
-	// PartState stores app-visible state snapshots or patches.
-	PartState PartKind = "state"
 	// PartProviderState stores provider-private continuity data. Public history
-	// projection and replay surfaces always omit this kind.
+	// projection and replay surfaces always omit this kind. Every part of
+	// this kind on an active message is decoded as a strict, ordered
+	// model.ProviderStateItem envelope by runtime's loadProviderHistory
+	// (see runtime/provider_state.go), so no other payload shape may ever
+	// share this kind.
 	PartProviderState PartKind = "provider_state"
+	// PartApprovalDecision stores a runtime-private decision-CAS record
+	// guarding a one-time host approval decision (see adkApprovalBinding in
+	// runtime/adk_approval.go). Like PartProviderState it is never exposed
+	// as public content and is ignored by every history projection, but it
+	// deliberately uses its own kind rather than PartProviderState: it can
+	// live on the same message as a real PartProviderState continuity part
+	// (both may sit alongside the public approval-request content block
+	// that message durably commits), and its payload does not conform to
+	// the strict ProviderStateItem envelope loadProviderHistory requires of
+	// every PartProviderState part on an active message.
+	PartApprovalDecision PartKind = "approval_decision"
+
+	// The following PartKind constants persist the 19 non-reasoning
+	// BlockKind values declared in content.go, one part kind per block kind,
+	// using identical string values (BlockKindReasoning reuses PartReasoning
+	// above). See PartKindForBlock / BlockKindForPart in content.go.
+	PartUserInputText           PartKind = "user_input_text"
+	PartUserInputImage          PartKind = "user_input_image"
+	PartUserInputAudio          PartKind = "user_input_audio"
+	PartUserInputVideo          PartKind = "user_input_video"
+	PartUserInputFile           PartKind = "user_input_file"
+	PartToolSearchResult        PartKind = "tool_search_result"
+	PartAssistantGenText        PartKind = "assistant_gen_text"
+	PartAssistantGenImage       PartKind = "assistant_gen_image"
+	PartAssistantGenAudio       PartKind = "assistant_gen_audio"
+	PartAssistantGenVideo       PartKind = "assistant_gen_video"
+	PartFunctionToolCall        PartKind = "function_tool_call"
+	PartFunctionToolResult      PartKind = "function_tool_result"
+	PartServerToolCall          PartKind = "server_tool_call"
+	PartServerToolResult        PartKind = "server_tool_result"
+	PartMCPToolCall             PartKind = "mcp_tool_call"
+	PartMCPToolResult           PartKind = "mcp_tool_result"
+	PartMCPListToolsResult      PartKind = "mcp_list_tools_result"
+	PartMCPToolApprovalRequest  PartKind = "mcp_tool_approval_request"
+	PartMCPToolApprovalResponse PartKind = "mcp_tool_approval_response"
+
+	// PartResponseMeta stores one durable ResponseMeta projection per
+	// assistant message, ordered after all of that message's block parts.
+	PartResponseMeta PartKind = "response_meta"
 )
 
 // Part is an ordered, replayable fragment of a message. Payload is structured
@@ -208,18 +289,46 @@ type ToolCall struct {
 	ResultMessageID MessageID
 	ResultPartID    PartID
 	Name            string
-	Pattern         string
-	Input           json.RawMessage
-	Output          json.RawMessage
-	Status          ToolCallStatus
-	RetrySafe       bool
-	Metadata        map[string]string
-	ClaimedBy       string
-	ClaimToken      string
-	LeaseUntil      time.Time
-	StartedAt       time.Time
-	CompletedAt     time.Time
-	Error           string
+	// RequestedName is the model-facing tool name as the model actually
+	// called it: equal to Name when the model used the canonical name,
+	// or the alias the model used when Name was resolved from an alias.
+	// It is persisted so the function_tool_result sent back to the model
+	// (and any replay of this call) can correlate on the name the model
+	// itself used.
+	RequestedName string
+	// ProviderCallID is the tool-call identity exactly as the provider sent
+	// it (block.CallID at dispatch time), or empty when the provider left
+	// its own CallID empty, or when the id it sent was not valid UTF-8 or
+	// exceeded DiscoveryMaxIdentityBytes (runtime.validProviderCallID treats
+	// either as if CallID had been left empty). ID is always a freshly
+	// runtime-minted, store-wide-unique identity (see
+	// runtime.prepareToolCalls) -- it is never reused verbatim from the
+	// provider, because some providers (llama.cpp/Ollama/vLLM-style
+	// OpenAI-compatible endpoints, replayed fixtures) reissue the same
+	// indexed id (e.g. "call_0") across unrelated responses, which would
+	// collide against the store's tool_calls.id uniqueness constraint.
+	// ProviderCallID is preserved separately so the wire request rebuilt
+	// for the provider on a later dispatch (runtime.publicizeToolCallIDs)
+	// can still show the provider its own id back for call/result
+	// correlation -- unless sending it would be ambiguous in that outgoing
+	// request (an earlier call already sends that exact string, or the
+	// string equals the durable id of any call in the request), in which
+	// case ID is sent instead (see publicizeToolCallIDs's doc comment).
+	// Every internal (ADK/ToolCall-store) reference to this call always
+	// uses ID.
+	ProviderCallID string
+	Pattern        string
+	Input          json.RawMessage
+	Output         json.RawMessage
+	Status         ToolCallStatus
+	RetrySafe      bool
+	Metadata       map[string]string
+	ClaimedBy      string
+	ClaimToken     string
+	LeaseUntil     time.Time
+	StartedAt      time.Time
+	CompletedAt    time.Time
+	Error          string
 }
 
 // ContextEpoch records the history segment used to build provider context.
@@ -287,22 +396,34 @@ type EventRecord struct {
 	// typed tool mutation methods may persist records with this field set.
 	ToolTransition ToolTransitionPhase
 	EpochID        EpochID
-	ProviderID     string
-	ModelID        string
-	ParentID       string
-	Kind           string
-	Correlation    string
-	Usage          Usage
-	Error          EventError
-	Redaction      RedactionClass
-	Payload        json.RawMessage
-	LiveOnly       bool
-	CreatedAt      time.Time
+	// TurnID correlates an event to the durable turn that produced it, when
+	// applicable. It is a record-JSON-only correlation field: no column or
+	// index backs it.
+	TurnID TurnID
+	// AgentPath is the joined RunPath of the (sub)agent that produced this
+	// event, when applicable. Record-JSON-only, like TurnID.
+	AgentPath   string
+	ProviderID  string
+	ModelID     string
+	ParentID    string
+	Kind        string
+	Correlation string
+	Usage       Usage
+	Error       EventError
+	Redaction   RedactionClass
+	Payload     json.RawMessage
+	LiveOnly    bool
+	CreatedAt   time.Time
 }
 
 // Usage records provider usage data in a store-level event projection.
 type Usage struct {
-	InputTokens      int64
+	InputTokens int64
+	// TotalTokens is the provider-reported total, which is not always
+	// InputTokens + OutputTokens (reasoning tokens, cache accounting, or
+	// provider-side rounding can make it differ). It is carried verbatim,
+	// never derived.
+	TotalTokens      int64
 	OutputTokens     int64
 	ReasoningTokens  int64
 	CacheReadTokens  int64
@@ -373,7 +494,44 @@ type Store interface {
 	ListMessages(ctx context.Context, sessionID ID, cursor ReplayCursor) (ReplayBatch, error)
 	ListEvents(ctx context.Context, sessionID ID, cursor EventCursor) (EventBatch, error)
 	GetToolCall(ctx context.Context, id ToolCallID) (ToolCall, error)
+	// ListUnfinishedToolCalls returns runID's pending and running tool
+	// calls in declared order: by the creation order of each call's
+	// request assistant message, then by the call's block position (part
+	// ordinal) within that message -- never by ToolCallID, whose lexical
+	// order is an IDGenerator implementation artifact with no relationship
+	// to the order the model actually declared the calls in.
+	// runtime.StreamingOrchestrator.resumeRun (the legacy non-ADK resume
+	// path) executes calls in exactly this order, and
+	// runtime.runExecution.terminalizeUnfinishedTools (crash
+	// reconciliation) settles them in exactly this order, so an
+	// implementation that returns any other order (message id order,
+	// tool-call creation order, or an unspecified order) breaks both.
 	ListUnfinishedToolCalls(ctx context.Context, runID RunID) ([]ToolCall, error)
+	// EnqueueInbox durably admits one idempotent submission for a session.
+	// Replaying the same IdempotencyKey with the same payload returns the
+	// existing row; a different payload under the same key is ErrConflict.
+	EnqueueInbox(ctx context.Context, item InboxItem, limits ContentLimits) (InboxItem, error)
+	// EnqueueInboxForRun is EnqueueInbox, additionally checked -- atomically,
+	// under the same session-row lock SettleRun's fenced terminal transition
+	// takes -- against runID's current terminal status: if runID is already
+	// terminal by the time this call's transaction acquires that lock, the
+	// item is never persisted and ErrRunClosed is returned instead of a
+	// silent acknowledgement. created reports whether this call durably
+	// inserted a new row (false for an idempotent replay of an existing
+	// item), so a caller pushing the result into a live loop can skip an
+	// already-buffered/already-consumed ID instead of re-delivering it.
+	EnqueueInboxForRun(ctx context.Context, runID RunID, item InboxItem, limits ContentLimits) (InboxItem, bool, error)
+	ListInbox(ctx context.Context, sessionID ID, states []InboxState) ([]InboxItem, error)
+	GetTurn(ctx context.Context, id TurnID) (Turn, error)
+	ListTurns(ctx context.Context, runID RunID) ([]Turn, error)
+	// ReadPromotedCheckpoint reads the latest promoted checkpoint revision for
+	// a run without a fence: promotion is the durability boundary, not the
+	// live claim.
+	ReadPromotedCheckpoint(ctx context.Context, runID RunID) (Checkpoint, bool, error)
+	// RetireRunCheckpoints deletes promoted or staged revisions at or below
+	// upToRevision for a terminal run, where no fence is available. It is
+	// idempotent and never deletes a revision above upToRevision.
+	RetireRunCheckpoints(ctx context.Context, runID RunID, upToRevision int64) error
 }
 
 // ExecutionStore is the run-fenced mutation capability used after admission or
@@ -382,6 +540,12 @@ type ExecutionStore interface {
 	WithinTx(ctx context.Context, fn func(context.Context, ExecutionStore) error) error
 	StartRun(ctx context.Context, startedAt time.Time) (Run, error)
 	RenewRunLease(ctx context.Context, leaseDuration time.Duration) (Run, error)
+	// SettleRun applies a run's single terminal settlement under the fence.
+	// It refuses RunCompleted while the session still has queued inbox
+	// input (ErrRunHasQueuedInput) and, in the same transaction, forces
+	// every turn still admitted/running/interrupted to TurnFailed with its
+	// consumed/interrupted inbox rows carried forward as InboxInterrupted
+	// (ApplyFailTurn), so no turn is left non-terminal under a terminal run.
 	SettleRun(ctx context.Context, request SettleRunRequest) (RunSettlementResult, error)
 	SetSessionTitle(ctx context.Context, request SessionTitleRequest) (SessionTitleResult, error)
 	AppendMessage(ctx context.Context, message Message) (Message, error)
@@ -394,6 +558,43 @@ type ExecutionStore interface {
 	SettleToolCall(ctx context.Context, request SettleToolCallRequest) (ToolTransitionResult, error)
 	StartContextEpoch(ctx context.Context, epoch ContextEpoch) (ContextEpoch, error)
 	FinishContextEpoch(ctx context.Context, epoch ContextEpoch) error
+	// AdmitTurn atomically admits the next-ordinal turn for the fenced run:
+	// it appends the user messages/parts and assistant placeholder, creates
+	// the turn row, claims the given queued inbox items into it (queued ->
+	// consumed), and appends the canonical turn_started event.
+	AdmitTurn(ctx context.Context, request AdmitTurnRequest) (AdmitTurnResult, error)
+	// CompleteTurn atomically settles an admitted turn as completed and its
+	// claimed inbox items as completed, without touching run status.
+	CompleteTurn(ctx context.Context, request CompleteTurnRequest) (CompleteTurnResult, error)
+	// InterruptTurn atomically settles an admitted turn as interrupted and
+	// its claimed inbox items as interrupted, without touching run status.
+	InterruptTurn(ctx context.Context, request InterruptTurnRequest) (InterruptTurnResult, error)
+	// ReconcileInterruptedTurn atomically settles a turn a crashed process
+	// left admitted/running as interrupted, carrying its consumed inbox
+	// items forward as interrupted (see ReconcileInterruptedTurnRequest),
+	// without touching run status.
+	ReconcileInterruptedTurn(ctx context.Context, request ReconcileInterruptedTurnRequest) (ReconcileInterruptedTurnResult, error)
+	// ResumeInterruptedTurn atomically resumes a TurnInterrupted turn under
+	// the same TurnID for a fresh redrive (see ResumeInterruptedTurnRequest),
+	// without touching run status.
+	ResumeInterruptedTurn(ctx context.Context, request ResumeInterruptedTurnRequest) (ResumeInterruptedTurnResult, error)
+	// StageCheckpoint inserts one unpromoted checkpoint revision under the
+	// fence.
+	StageCheckpoint(ctx context.Context, request StageCheckpointRequest) (Checkpoint, error)
+	// PromotePause atomically promotes a staged checkpoint revision into the
+	// durable pause boundary: it marks the revision promoted, interrupts the
+	// given turn and inbox items, sets the run paused with no live lease, and
+	// appends the run_paused event. After it commits, this fence can no
+	// longer write (loadRunFence rejects paused runs).
+	PromotePause(ctx context.Context, request PromotePauseRequest) (PromotePauseResult, error)
+	// RetireCheckpoints deletes staged or promoted revisions at or below
+	// upToRevision for the fenced (running) run. Idempotent; never deletes a
+	// revision above upToRevision.
+	RetireCheckpoints(ctx context.Context, upToRevision int64) error
+	// RepauseRun atomically reverts this fence's claim back to paused, with
+	// no live lease, keeping whatever checkpoint is currently promoted
+	// unchanged (see RepauseRunRequest).
+	RepauseRun(ctx context.Context, request RepauseRunRequest) (RepauseRunResult, error)
 	// RecordAdmission inserts the immutable receipt in the same fenced
 	// transaction as its run graph.
 	RecordAdmission(ctx context.Context, record AdmissionRecord) error

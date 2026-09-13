@@ -26,12 +26,24 @@ func mountScriptedTool(ctx context.Context, registry *composition.Registry) (*co
 		}})
 	}))
 }
-func currentTurnHasTool(messages []*einoschema.Message) bool {
+
+// currentTurnHasTool reports whether the most recent user-role message in
+// messages carries a function_tool_result block (a settled tool call from
+// the current turn) rather than plain user input.
+func currentTurnHasTool(messages []*einoschema.AgenticMessage) bool {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == einoschema.User {
-			return false
+		msg := messages[i]
+		if msg == nil || msg.Role != einoschema.AgenticRoleTypeUser {
+			continue
 		}
-		if messages[i].Role == einoschema.Tool {
+		return messageHasFunctionToolResult(msg)
+	}
+	return false
+}
+
+func messageHasFunctionToolResult(msg *einoschema.AgenticMessage) bool {
+	for _, block := range msg.ContentBlocks {
+		if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolResult {
 			return true
 		}
 	}

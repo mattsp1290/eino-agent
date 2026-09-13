@@ -35,7 +35,7 @@ func TestStreamingOrchestratorRejectsInvalidUserMessageBeforeDependencies(t *tes
 			orchestrator.ids = nil
 			_, err := orchestrator.Start(context.Background(), Request{
 				SessionID: "session-invalid",
-				Message:   UserMessage{Content: content},
+				Message:   TextUserMessage(content),
 				Config:    orchestratorConfig(),
 			})
 			if !errors.Is(err, ErrInvalidOrchestrator) {
@@ -50,11 +50,11 @@ func TestStreamingOrchestratorPreservesAcceptedUserMessageBytes(t *testing.T) {
 
 	const content = "  héllo 世界\n"
 	var providerContent string
-	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
-		providerContent = request.Messages[len(request.Messages)-1].Content
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orchestrator := newTestOrchestrator(newAdmissionStore(), scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+		providerContent = agenticMessageText(request.Messages[len(request.Messages)-1])
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
-	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "exact-content", Message: UserMessage{Content: content}, Config: orchestratorConfig()})
+	result := startAndWaitRequest(t, orchestrator, Request{SessionID: "exact-content", Message: TextUserMessage(content), Config: orchestratorConfig()})
 	if result.Error != nil {
 		t.Fatal(result.Error)
 	}
@@ -81,7 +81,7 @@ func TestPreExecutionRejectionRetainsAdmittedPair(t *testing.T) {
 		t.Fatal(err)
 	}
 	providerCalls := 0
-	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		providerCalls++
 		return nil, errors.New("provider should not be called")
 	}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
@@ -116,9 +116,9 @@ func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 	newOrchestrator := func(sink *blockingSink) *StreamingOrchestrator {
 		return mustConfiguredOrchestrator(
 			WithStore(store),
-			WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+			WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 				dispatches.Add(1)
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			})}),
 			WithIDGenerator(&sequenceIDs{}),
 			WithRunPlanProvider(emptyTestRunPlanProvider()),
@@ -140,7 +140,7 @@ func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 		go func(orchestrator *StreamingOrchestrator) {
 			defer wait.Done()
 			<-ready
-			admission, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+			admission, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 			results <- startResult{handle: admission.Handle, err: err}
 		}(orchestrator)
 	}
@@ -172,18 +172,18 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	t.Parallel()
 
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("hel", nil), einoschema.AssistantMessage("lo", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticTextChunk(0, "hel"), agenticTextChunk(0, "lo")}, nil
 	}))
 	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "hello"},
+		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	result := <-admission.Handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("result = %+v", result)
 	}
@@ -194,19 +194,28 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	if run.Status != session.RunCompleted {
 		t.Fatalf("run status = %s", run.Status)
 	}
-	var textParts []session.Part
+	var textParts, userInputTextParts []session.Part
 	for _, part := range store.parts {
-		if part.Kind == session.PartText {
+		switch part.Kind {
+		case session.PartAssistantGenText:
 			textParts = append(textParts, part)
+		case session.PartUserInputText:
+			userInputTextParts = append(userInputTextParts, part)
 		}
 	}
-	if len(textParts) != 2 {
-		t.Fatalf("text parts = %#v", textParts)
+	if len(textParts) != 1 || textParts[0].MessageID != result.MessageID {
+		t.Fatalf("assistant text part = %#v, want settled assistant text \"hello\"", textParts)
 	}
-	for _, part := range textParts {
-		if string(part.Payload) != `{"text":"hello"}` || part.MessageID != "message-2" && part.MessageID != result.MessageID {
-			t.Fatalf("text part = %#v, want admitted user or settled assistant", part)
-		}
+	assistantDecoded, err := session.DecodeContentParts(session.RoleAssistant, textParts, session.DefaultContentLimits())
+	if err != nil || len(assistantDecoded.Blocks) != 1 || assistantDecoded.Blocks[0].Text == nil || assistantDecoded.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("decoded assistant text = %#v, error = %v", assistantDecoded, err)
+	}
+	if len(userInputTextParts) != 1 {
+		t.Fatalf("user input text parts = %#v", userInputTextParts)
+	}
+	decoded, err := session.DecodeContentParts(session.RoleUser, userInputTextParts, session.DefaultContentLimits())
+	if err != nil || len(decoded.Blocks) != 1 || decoded.Blocks[0].Text == nil || decoded.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("decoded user input text = %#v, error = %v", decoded, err)
 	}
 }
 
@@ -244,8 +253,8 @@ func TestStreamingOrchestratorUsesCanonicalEventSinkForAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orchestrator := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}), WithEventSink(runtimeSink), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
 
 	result := startAndWait(t, orchestrator)
@@ -304,8 +313,8 @@ func TestAdmissionSinkPanicDoesNotPreventRunOrExtensionNotification(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}), WithEventSink(panickingEventSink{}), WithRunPlanProvider(staticRunPlanProvider{plan: newTestDispatchPlan(dispatch)}))
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted || result.Error != nil {
@@ -347,21 +356,20 @@ func TestStreamingOrchestratorLoadsDurableHistoryBeforeCurrentInput(t *testing.T
 		CreatedAt: now,
 		UpdatedAt: now,
 	})
-	_, _ = store.AppendPart(context.Background(), session.Part{
-		ID:        "prior-text",
-		MessageID: "prior-assistant",
-		SessionID: "session-1",
-		Kind:      session.PartText,
-		Payload:   []byte(`{"text":"previous"}`),
-		CreatedAt: now,
-		UpdatedAt: now,
-	})
+	priorAssistantParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleAssistant,
+		Blocks: []session.ContentBlock{{ID: "prior-block", Kind: session.BlockKindAssistantGenText, Text: &session.TextBlock{Text: "previous"}}},
+	}, func() session.PartID { return "prior-text" }, "prior-assistant", "session-1", "", now, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.AppendPart(context.Background(), priorAssistantParts[0])
 	var got []string
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			got = append(got, msg.Content)
+			got = append(got, agenticMessageText(msg))
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("next", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("next")}, nil
 	}))
 	result := startAndWait(t, orch)
 	if result.Status != session.RunCompleted {

@@ -87,7 +87,7 @@ func (s *Store) activeRun(ctx context.Context, sessionID session.ID) (session.Ru
 	if err != nil {
 		return session.Run{}, err
 	}
-	db := s.runQuery(ctx).Where("runs.session_key = ? AND runs.status IN ?", sessionKey, []string{string(session.RunPending), string(session.RunRunning)}).Order("runs.created_at, runs.id").Limit(1)
+	db := s.runQuery(ctx).Where("runs.session_key = ? AND runs.status IN ?", sessionKey, []string{string(session.RunPending), string(session.RunRunning), string(session.RunPaused)}).Order("runs.created_at, runs.id").Limit(1)
 	if err := db.Take(&row).Error; err != nil {
 		return session.Run{}, translateReadError(err)
 	}
@@ -145,12 +145,23 @@ func (s *Store) ClaimRun(ctx context.Context, claim session.RunClaim) (session.R
 		if err != nil {
 			return err
 		}
-		// The conditional update is evaluated against the database clock. The
-		// row locks retain ownership; expiry still uses the live database clock.
-		db := st.dbFor(ctx).Table(st.tableName("runs")).Where("row_key = ? AND status IN ? AND lease_until <= "+st.dialect.ClockSQL(), row.RowKey, []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
-			"status": string(session.RunRunning), "owner_id": []byte(claim.OwnerID), "claim_token": []byte(claim.ClaimToken), "record": raw,
-			"lease_until": gorm.Expr(st.dialect.ClockSQL()+" + ?", durationMicros(claim.LeaseDuration)),
-		})
+		// A paused run has no live lease: ClaimRun succeeds immediately by CAS
+		// on status='paused' rather than waiting for a lease to expire. Every
+		// other nonterminal status still requires the lease to have expired
+		// against the live database clock; the row lock retains ownership of
+		// that comparison.
+		var db *gorm.DB
+		if current.Status == session.RunPaused {
+			db = st.dbFor(ctx).Table(st.tableName("runs")).Where("row_key = ? AND status = ?", row.RowKey, string(session.RunPaused)).Updates(map[string]any{
+				"status": string(session.RunRunning), "owner_id": []byte(claim.OwnerID), "claim_token": []byte(claim.ClaimToken), "record": raw,
+				"lease_until": gorm.Expr(st.dialect.ClockSQL()+" + ?", durationMicros(claim.LeaseDuration)),
+			})
+		} else {
+			db = st.dbFor(ctx).Table(st.tableName("runs")).Where("row_key = ? AND status IN ? AND lease_until <= "+st.dialect.ClockSQL(), row.RowKey, []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+				"status": string(session.RunRunning), "owner_id": []byte(claim.OwnerID), "claim_token": []byte(claim.ClaimToken), "record": raw,
+				"lease_until": gorm.Expr(st.dialect.ClockSQL()+" + ?", durationMicros(claim.LeaseDuration)),
+			})
+		}
 		if err := db.Error; err != nil {
 			return st.mapErr(err)
 		}

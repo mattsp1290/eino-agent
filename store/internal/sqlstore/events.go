@@ -21,14 +21,14 @@ func (s *Store) appendEvent(ctx context.Context, record session.EventRecord) (se
 // appendCanonicalEvent is reserved for typed lifecycle methods. Arbitrary
 // AppendEvent cannot manufacture a run/tool lifecycle event.
 func (s *Store) appendCanonicalEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
-	if record.ToolTransition == "" && record.Kind != session.RunSettlementEventKind {
+	if record.ToolTransition == "" && !canonicalOnlyEventKinds[record.Kind] {
 		return session.EventRecord{}, session.ErrConflict
 	}
 	return s.insertEvent(ctx, record, true)
 }
 
 func (s *Store) insertEvent(ctx context.Context, record session.EventRecord, canonical bool) (session.EventRecord, error) {
-	if !canonical && (record.Kind == session.RunSettlementEventKind || record.ToolTransition != "") {
+	if !canonical && (canonicalOnlyEventKinds[record.Kind] || record.ToolTransition != "") {
 		return session.EventRecord{}, session.ErrConflict
 	}
 	raw, err := json.Marshal(record)

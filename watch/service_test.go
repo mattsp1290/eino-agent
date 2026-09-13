@@ -89,7 +89,7 @@ func TestWatchAdmissionPollingAndFinalization(t *testing.T) {
 		t.Fatal(live)
 	}
 	if err := ex.WithinTx(t.Context(), func(ctx context.Context, tx session.ExecutionStore) error {
-		if _, err := tx.AppendPart(ctx, session.Part{ID: "p", SessionID: "s", RunID: "r", MessageID: "m", Kind: session.PartText, Payload: []byte(`{"text":"final"}`)}); err != nil {
+		if _, err := tx.AppendPart(ctx, session.Part{ID: "p", SessionID: "s", RunID: "r", MessageID: "m", Kind: session.PartAssistantGenText, Payload: []byte(`{"text":{"text":"final"}}`)}); err != nil {
 			return err
 		}
 		return tx.FinalizeAssistantMessage(ctx, "m")

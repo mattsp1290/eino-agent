@@ -23,13 +23,77 @@ watch. On 2026-09-10 (UTC), its local gates and an unrelated PostgreSQL consumer
 passed through the public Go proxy and checksum database with an empty module
 cache, `GOWORK=off`, no replacement, workspace, vendor tree or sibling checkout.
 See [the exact evidence](dependency-status.md#sql-store-consumer-publication).
-CloudWeGo Eino is `v0.8.13`; PostgreSQL 17 is the supported server baseline.
+CloudWeGo Eino is pinned to exactly `v0.9.19`; PostgreSQL 17 is the supported server baseline.
+
+**This pin predates the agentic adoption (Eino v0.9.19 work, W1-W8) and does
+NOT include it.** `model.NewAgenticStreamer`/`NewAgenticStreamerWithProviderState`,
+the AG-UI bridge, and everything else described below under "Native model
+providers" do not exist at commit `cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`
+(`git grep -c NewAgenticStreamer cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e` finds
+zero matches). No commit past the agentic cutover has been publication-verified
+through the public Go proxy yet -- this branch is "not yet resolvable through
+the public proxy" (see
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+W8 section) -- so there is no pin to cite for the agentic APIs today. A host
+that needs them must build against a local `replace` directive pointed at this
+repository (as `testdata/external-consumer/check.sh` does in local mode) until
+a post-agentic commit is verified and published; do not combine the pin above
+with the agentic APIs below.
+
+The AG-UI bridge (`agui`, `transport`; adopted in W7) pins
+`github.com/mattsp1290/eino-agui`, which itself requires a root `replace`
+directive for `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
+`github.com/mattsp1290/ag-ui/sdks/community/go`. Go `replace` directives are
+NOT transitive: any host consuming `eino-agent`'s AG-UI packages must add
+that same root replacement to its OWN `go.mod`, or the build will not
+resolve. See `README.md`'s Pins section and
+[docs/dependency-status.md](dependency-status.md) for the exact version to
+pin; `testdata/external-consumer/check.sh` enforces this mechanically for
+this repository's own gate.
 
 The separately published generated-bindings dependency remains
 `github.com/mattsp1290/eino-agent/wasmext/gen@v0.1.0`, through repository tag
 `wasmext/gen/v0.1.0`. Consumers need no workaround for that dependency. Earlier
 release/discovery pins use older store APIs or schemas; their evidence is
 historical. Existing SQLite files are unsupported and remain untouched.
+
+### Native model providers
+
+`eino-agent`'s own `go.mod` deliberately does not depend on
+`github.com/mattsp1290/eino-providers` -- `model.Streamer` is the provider
+boundary, and any Eino `model.AgenticModel` implementation can supply it via
+`model.NewAgenticStreamer`/`NewAgenticStreamerWithProviderState`. A host that
+wants a real native provider (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/
+OpenCode Messages/Responses/Chat-Completions protocols) adds
+`github.com/mattsp1290/eino-providers` to its OWN `go.mod` directly; no
+`replace` directive is required for it (unlike the AG-UI fork above).
+Verified pin: `v0.0.0-20260912022125-79248358b8e6` at commit
+`79248358b8e6324bbdb1f014526629f82e6bce90` -- see
+[dependency-status.md](dependency-status.md) and
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+W8 section for the exact `go mod download -json` evidence.
+
+Two integration caveats a host must account for today, both discovered and
+reproduced while building `testdata/external-consumer/agentic_fixture_test.go`:
+
+- Every `eino-providers` native adapter stamps
+  `ResponseMeta.Extension = einoproviders.AgenticResponseIdentity{...}` on
+  every completed response. `eino-agent`'s content pipeline rejects any
+  non-nil generic `ResponseMeta.Extension` (`ErrContentUnsupported`), and
+  `model.NewTypedExtensionStateCodec` does not capture it either. A host
+  must wrap the native client with a thin decorator that clears
+  `ResponseMeta.Extension` after the real call returns (see
+  `nativeResponseIdentityStripper` in the fixture) before handing it to
+  `model.NewAgenticStreamer`.
+- The current typed-ADK runtime adapter accepts only
+  text/reasoning/media/function-tool-call blocks (plus
+  `mcp_tool_approval_request` when an approval binding is configured) as
+  assistant OUTPUT. A native provider's `server_tool_call`/
+  `mcp_tool_call`/`mcp_tool_result`/`mcp_list_tools_result` blocks in a
+  model result fail the turn closed today
+  (`runtime/adk_model.go`'s `errADKUnsupportedBlock`), even though the
+  durable store contract fully supports persisting and replaying those
+  kinds when written directly.
 
 ## Package Surface
 
@@ -123,7 +187,16 @@ A typical server wires these pieces once at startup through
 implementations. A successful construction requires a Store, ModelResolver,
 RunPlanProvider, and IDGenerator. A successful start also requires a non-empty
 request `SessionID`. EventSink, permissions policy, owner ID override, queue
-sizing, and lease tuning are optional.
+sizing, and lease tuning are optional. `IDGenerator`'s minted IDs must be
+globally unique, not per-process: a resumed or crash-reconciled run mints new
+rows into a session a different process already wrote, so an implementation
+that restarts a counter per process fails admission with `session.ErrConflict`
+once its IDs collide with an earlier process's. Embedders implementing
+`runtime.IDGenerator` must also provide `NewTurnID`, `NewInboxID` and
+`NewInvocationID`; implementers of `session.Store`/`session.ExecutionStore`
+must provide the turn, inbox, checkpoint, repause and resume-interrupted-turn
+operations, and `SettleRun` must terminalize residual turns (see
+`session.ApplyFailTurn`).
 
 ```go
 // sql is database/sql; url is net/url. The SQLite package registers modernc.
@@ -165,7 +238,7 @@ and an immutable `config.Snapshot`:
 ```go
 admission, err := orchestrator.Start(ctx, runtime.Request{
     SessionID: session.ID("tenant-123/thread-456"),
-    Message:   runtime.UserMessage{Content: submittedText},
+    Message:   runtime.TextUserMessage(submittedText),
     Config:    snapshot,
     Metadata:  map[string]string{"workspace_id": "workspace-1"},
 })
@@ -173,7 +246,41 @@ handle := admission.Handle // non-nil for an unkeyed/new admission
 ```
 
 The returned `runtime.Handle` is the live control surface for that admitted
-run. Use `Done()` for terminal status and `Interrupt()` for cancellation.
+run. `Done()` reports this call's outcome, which is either terminal **or a
+nonterminal `session.RunPaused`** — a tool or approval interrupt, or a stop
+with input still queued. When it is a pause, `AwaitPause()` delivers the
+matching `runtime.PauseInfo` (its `InterruptContexts` carry the
+current-generation addresses a targeted resume uses); on a terminal outcome
+that channel is closed without a value. `Interrupt()` is an explicit
+*terminal* interruption, not a resumable pause.
+
+A paused run holds no lease and is resumed with
+`orchestrator.ResumeRun(ctx, runID, runtime.ResumeRequest{Targets: …})`,
+which may be called from a different process after a restart. Additional
+user input for a live or paused run goes through
+`orchestrator.Enqueue(ctx, sessionID, runtime.EnqueueRequest{...})` — durable
+and idempotent on `IdempotencyKey`; an item accepted while no loop is live
+stays queued for the next `Start`/`ResumeRun`. `Enqueue` never acknowledges
+input nothing will consume: against a run that has already settled it returns
+`runtime.ErrInvalidOrchestrator` ("run … already settled"), checked atomically
+against the terminal CAS, so a caller that loses the race to idle shutdown is
+told rather than silently dropped. `Handle.Status(ctx)` reports the run's
+current durable status at any time, including after the process that started
+it is gone. `orchestrator.Stop(ctx, runID, runtime.StopPolicy{Graceful: true})`
+requests a checkpointed stop.
+
+`ResumeRun` refuses a paused run whose promoted checkpoint disagrees with the
+run's current turn (a defensive assertion that a coherent crash-reconciliation
+pass should never actually trip — see the W5 section of
+[eino-feature-support.md](architecture/eino-feature-support.md)) rather than
+strand it running with no driver; the run is left exactly as paused as before
+the call. There is one documented way forward for a paused run a host does not
+intend to resume: `orchestrator.Stop(ctx, runID, runtime.StopPolicy{Abandon:
+true})` ("Stop-with-abandon") settles it terminally as `session.RunInterrupted`
+and retires its checkpoints, freeing the session for a fresh `Start`. It
+applies only when this process has no live loop for the run (a genuinely
+paused run, not one it is actively driving) and reports
+`runtime.ErrInvalidOrchestrator` otherwise.
 
 For retried ingress, set `AdmissionKey` from the host's frozen event identity.
 The caller that commits the receipt receives `AdmissionNew` and its handle.
@@ -212,7 +319,7 @@ codec, err := model.NewEinoJSONExtraStateCodec(model.EinoJSONExtraStateConfig{
 if err != nil {
     return err
 }
-streamer, err := model.NewEinoStreamerWithProviderState(einoModel, codec)
+streamer, err := model.NewClassicStreamerWithProviderState(einoModel, codec)
 if err != nil {
     return err
 }
@@ -288,6 +395,18 @@ sseHandler := transport.SSEHandler(transport.SSEConfig{
     ThreadID: func(_ *http.Request, id session.ID) string {
         return string(id)
     },
+    // IncludeReasoning is the host's attestation that
+    // agui.GateProviderReasoningStorage is satisfied for every session this
+    // handler serves -- eino-agent does not verify this independently.
+    // Defaults to false: set true only once you have confirmed your
+    // provider/host policy allows storing and replaying plain reasoning.
+    // It gates the durable message snapshot and live commit reprojection,
+    // AND the live EventMessageDelta reasoning-delta stream (the
+    // REASONING_* events Bridge.emitMessageDelta emits while a turn is
+    // streaming) -- but NOT the live text-delta stream, which is
+    // unconditional: leaving this at its default suppresses reasoning
+    // only, never assistant text.
+    IncludeReasoning: false,
 })
 ```
 
@@ -312,6 +431,16 @@ Live-tail overflow means the subscriber fell behind a bounded queue, so the
 client should reconnect and resync from durable replay rather than assuming it
 received every live event.
 
+**Known bridge defects on reconnect** (tracked as `eino-agent-doj` and
+`eino-agent-6wj`, disclosed in full in
+`docs/architecture/agui-events.md`'s "Not yet implemented" section): on every
+reconnect, AG-UI replay currently re-emits a tool call's entire lifecycle a
+second time (a client sees two `TOOL_CALL_START`/`TOOL_CALL_RESULT` pairs for
+one call), and the replayed tool result carries a synthesized
+`{"status":...}` stub instead of the tool's real output. A host wiring
+`transport.SSEHandler` for tool-using conversations should account for both
+until they are fixed.
+
 ## Durable Versus Live-Only
 
 The durable source of truth is:
@@ -332,10 +461,20 @@ Live-only data is:
 - live-tail overflow notices;
 - transport write attempts and old SSE frames.
 
-Replay must reconstruct `MESSAGES_SNAPSHOT` from durable messages and parts. It
-must not infer conversation content from arbitrary event payloads or replay old
-SSE frames. Event records are useful for audit, recovery, observability, and
-cursor boundaries; they are not a substitute for durable message/part history.
+Replay projects every durable message through `emitter.EmitCommittedProjection`
+(native AG-UI events plus an `eino.agentic.v1` custom content-block
+supplement); it does **not** emit a `MESSAGES_SNAPSHOT`. `NativeMessage` is
+populated only for user-role messages upstream (eino-agui's
+`convert.ToAgenticProjection`), so a snapshot built from it would carry user
+turns only, out of order relative to the assistant projections that follow
+it. A native-only client -- one that never parses the `eino.agentic.v1`
+envelope -- has no representation of user-role history on this path; if your
+host needs one, assemble your own `MESSAGES_SNAPSHOT` from your application's
+complete committed transcript rather than relying on `agui.Replay`/
+`agui.Reconnect` to supply it. Replay must not infer conversation content
+from arbitrary event payloads or replay old SSE frames. Event records are
+useful for audit, recovery, observability, and cursor boundaries; they are
+not a substitute for durable message/part history.
 
 ## Storage Requirements
 
@@ -371,15 +510,6 @@ Mount native and Wasm-backed tool definitions through the same
 
 ```go
 loader := wasmext.NewLoader()
-wasmDefinition, err := loader.LoadTool(ctx, wasmext.ModuleConfig{
-    Name:           "review_tool",
-    Path:           "extensions/review-tool.wasm",
-    AllowedRoot:    "extensions",
-    ExpectedSHA256: expectedDigest,
-})
-if err != nil {
-    return err
-}
 plans, err := composition.NewRegistry(nil)
 if err != nil {
     return err
@@ -392,10 +522,15 @@ component := extension.Component{
     },
 }
 mount, err := plans.Mount(ctx, component, composition.InstallerFunc(
-    func(_ context.Context, registrar *composition.Registrar) error {
-        return registrar.Tool(composition.ToolRegistration{
-            ID: "review-tool",
-            Scope: extension.GlobalScope(), Definition: wasmDefinition,
+    func(ctx context.Context, registrar *composition.Registrar) error {
+        return loader.RegisterTool(ctx, registrar, composition.ToolRegistration{
+            ID:    "review-tool",
+            Scope: extension.GlobalScope(),
+        }, wasmext.ModuleConfig{
+            Name:           "review_tool",
+            Path:           "extensions/review-tool.wasm",
+            AllowedRoot:    "extensions",
+            ExpectedSHA256: expectedDigest,
         })
     },
 ))
@@ -644,6 +779,17 @@ scrubbed before export.
 
 ## Migration Notes
 
+### Breaking changes since the published pin
+
+- **`transport.DecodeMessages` removed (W8).** This exported JSON decoder had
+  zero callers anywhere in the module and was deleted as part of W8's
+  unused-classic-public-entrypoint cleanup. It still exists at the currently
+  published pin (`v0.3.4-0.20260910012408-cec27e5eb734`), so a host that calls
+  it will fail to compile after upgrading past this cutover. Use
+  `transport.DecodeUserMessage` (`transport/rich.go`) for rich AG-UI input
+  decode instead; it is not a drop-in replacement (different request shape),
+  so callers must adapt, not just rename.
+
 When adapting an existing agent backend:
 
 - Pick a stable `session.ID` first; do not use per-turn IDs as the AG-UI
@@ -785,10 +931,13 @@ tool results. Display text itself can contain sensitive user content. Hosts
 must authorize the exact session and escape text appropriately.
 
 Host shutdown remains explicit: stop admitting requests, interrupt and await
-owned handles, deactivate and close mounts with bounded contexts, close any
-Wasm loaders, close subscriptions/service and any legacy tail, then close the
-store after all users drain. Service.Close(ctx) owns only observation and can
-be called again after a timeout. StreamingOrchestrator has no public Close.
+owned handles (and, for runs you intend to keep, `Stop` + `ResumeRun` rather
+than `Interrupt`, which settles terminally), noting that durably paused runs
+survive shutdown and are resumed by run ID, deactivate and close mounts with
+bounded contexts, close any Wasm loaders, close subscriptions/service and any
+legacy tail, then close the store after all users drain. Service.Close(ctx)
+owns only observation and can be called again after a timeout.
+StreamingOrchestrator has no public Close.
 
 The external-consumer fixture exercises SQLite, mounted native tools, real
 scripted streaming, blocked sinks, detach, overflow recovery, interruption,

@@ -178,7 +178,7 @@ func privacyGraph(t *testing.T, f *replayFixture) (session.Run, session.Message,
 	if _, err := execution.AppendMessage(f.ctx, message); err != nil {
 		t.Fatal(err)
 	}
-	textPart := session.Part{ID: "privacy-text", MessageID: message.ID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartText, Ordinal: 0, Payload: json.RawMessage(`{"text":"visible text"}`), CreatedAt: f.now, UpdatedAt: f.now}
+	textPart := session.Part{ID: "privacy-text", MessageID: message.ID, SessionID: run.SessionID, RunID: run.ID, Kind: session.PartAssistantGenText, Ordinal: 0, Payload: json.RawMessage(`{"text":{"text":"visible text"}}`), CreatedAt: f.now, UpdatedAt: f.now}
 	if _, err := execution.AppendPart(f.ctx, textPart); err != nil {
 		t.Fatal(err)
 	}

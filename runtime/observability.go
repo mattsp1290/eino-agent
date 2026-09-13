@@ -117,23 +117,6 @@ func (o *StreamingOrchestrator) startObservedStream(ctx context.Context, snapsho
 	})
 }
 
-func (o *StreamingOrchestrator) observeRetry(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt int, attempts int, err error) {
-	if o == nil || o.observer == nil {
-		return
-	}
-	o.observer.Retry(ctx, einoobs.RetryEvent{
-		Correlation:    o.snapshotCorrelation(snapshot, messageID, "retry"),
-		Attempt:        int64(attempt),
-		MaxAttempts:    int64(attempts),
-		Classification: errorClassification(err, "retryable"),
-		Reason:         "provider_retry",
-		Time:           o.now(),
-		Metadata: einoobs.Metadata{
-			"error": safeErrorMessage(err),
-		},
-	})
-}
-
 func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, operation string, err error) {
 	if o == nil || o.observer == nil || err == nil {
 		return
@@ -155,6 +138,26 @@ func (o *StreamingOrchestrator) observeError(ctx context.Context, snapshot TurnS
 		Classification: errorClassification(err, "error"),
 		Err:            observationError(err, "error"),
 		Retryable:      retryable(err),
+		Time:           o.now(),
+	})
+}
+
+// observeRetry records that a physical dispatch is about to supersede a
+// previously failed one (see adkEngine.recordFailedAttempt/takeFailedAttempt
+// and the durable attempt_replaced event adkModel.begin also emits at the
+// same point). attempt is this new dispatch's ordinal (its ledger Step,
+// under the invocation-per-physical-dispatch model every retry/failover
+// attempt uses -- see adk_retry.go); failedErr is the prior attempt's error.
+func (o *StreamingOrchestrator) observeRetry(ctx context.Context, snapshot TurnSnapshot, messageID session.MessageID, attempt, maxAttempts int, failedErr error) {
+	if o == nil || o.observer == nil {
+		return
+	}
+	classification := errorClassification(failedErr, "retry")
+	o.observer.Retry(ctx, einoobs.RetryEvent{
+		Correlation:    o.snapshotCorrelation(snapshot, messageID, "retry"),
+		Attempt:        int64(attempt),
+		MaxAttempts:    int64(maxAttempts),
+		Classification: classification,
 		Time:           o.now(),
 	})
 }
@@ -225,6 +228,7 @@ func (o *StreamingOrchestrator) startObservedToolCall(ctx context.Context, snaps
 		ToolName:    tool.Name,
 		ToolKind:    "server",
 		StartTime:   o.now(),
+		Metadata:    toolObservationMetadata(call, nil),
 	})
 }
 
@@ -263,7 +267,7 @@ func (o *StreamingOrchestrator) observeToolSettled(ctx context.Context, snapshot
 		LatencyKnown:   latency != 0,
 		Classification: classification,
 		Retryable:      false,
-		Metadata:       toolMetadata(metadata),
+		Metadata:       toolObservationMetadata(call, metadata),
 	}
 	if classification != "" {
 		event.Error = einoobs.ObservationError{
@@ -444,10 +448,26 @@ func toolMetadata(metadata map[string]string) einoobs.Metadata {
 	return result
 }
 
+// toolObservationMetadata is toolMetadata plus call's provider-facing tool-
+// call id (session.ToolCall.ProviderCallID via runtime.ToolCall), when the
+// provider supplied one, as a bounded, content-free attribute: it carries
+// no tool input/output, only the identity string the provider itself sent,
+// so a failure observed here can be correlated against that provider's own
+// logs even though the durable ToolCallID this package reports everywhere
+// else is always the freshly minted id.
+func toolObservationMetadata(call ToolCall, metadata map[string]string) einoobs.Metadata {
+	result := toolMetadata(metadata)
+	if call.ProviderCallID != "" {
+		result["provider_call_id"] = call.ProviderCallID
+	}
+	return result
+}
+
 func errorClassification(err error, fallback string) string {
 	if err == nil {
 		return fallback
 	}
+	err = unwrapRetryExhausted(err)
 	var providerErr model.Error
 	if errors.As(err, &providerErr) && providerErr.Code != "" {
 		return providerErr.Code
@@ -467,13 +487,6 @@ func observationErrorFromClassification(classification string) error {
 		classification = "error"
 	}
 	return errors.New(classification)
-}
-
-func safeErrorMessage(err error) string {
-	if err == nil {
-		return ""
-	}
-	return errorClassification(err, "error")
 }
 
 func firstNonEmpty(values ...string) string {

@@ -41,6 +41,22 @@ func TestDefaultFieldsForbidRawContent(t *testing.T) {
 	}
 }
 
+func TestDefaultFieldsAllowToolCallProviderID(t *testing.T) {
+	t.Parallel()
+
+	fields := fieldsByName(DefaultFields())
+	f := fields["tool_call.provider_id"]
+	if f.Class != FieldAllowed {
+		t.Fatalf("tool_call.provider_id class = %q, want %q", f.Class, FieldAllowed)
+	}
+	if f.Attribute != "metadata.provider_call_id" {
+		t.Fatalf("tool_call.provider_id attribute = %q, want metadata.provider_call_id", f.Attribute)
+	}
+	if f.Cardinality != "high" {
+		t.Fatalf("tool_call.provider_id cardinality = %q, want high", f.Cardinality)
+	}
+}
+
 func TestRequiredCorrelationFields(t *testing.T) {
 	t.Parallel()
 

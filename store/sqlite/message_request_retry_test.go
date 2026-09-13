@@ -72,7 +72,7 @@ func TestUpdatePartCreatedAtSynchronizesProjectionAndReplay(t *testing.T) {
 	ctx := context.Background()
 	part := session.Part{
 		ID: "retry-part", MessageID: "msg-tool", SessionID: "session-tool", RunID: "run-tool",
-		Kind: session.PartText, Ordinal: 1, Payload: json.RawMessage(`{"text":"before"}`),
+		Kind: session.PartUserInputText, Ordinal: 1, Payload: json.RawMessage(`{"text":{"text":"before"}}`),
 		CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := execution.AppendPart(ctx, part); err != nil {
@@ -80,7 +80,7 @@ func TestUpdatePartCreatedAtSynchronizesProjectionAndReplay(t *testing.T) {
 	}
 	part.CreatedAt = now.Add(time.Second)
 	part.UpdatedAt = now.Add(time.Second)
-	part.Payload = json.RawMessage(`{"text":"after"}`)
+	part.Payload = json.RawMessage(`{"text":{"text":"after"}}`)
 	if err := execution.UpdatePart(ctx, part); err != nil {
 		t.Fatal(err)
 	}
@@ -119,8 +119,8 @@ func TestDistinctModelRequestIDCollisionReturnsConflict(t *testing.T) {
 	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	original := session.ModelRequestRecord{
-		ID: "request-a", SessionID: "session-tool", RunID: "run-tool", AssistantMessageID: "msg-tool",
-		Attempt: 1, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
+		ID: "request-a", SessionID: "session-tool", RunID: "run-tool", AssistantMessageID: "msg-tool", InvocationID: "invocation-a",
+		Attempt: 1, Step: 1, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := execution.CreateModelRequest(ctx, original); err != nil {
 		t.Fatal(err)
@@ -144,8 +144,8 @@ func TestCaughtModelRequestCollisionLeavesOuterTransactionUsable(t *testing.T) {
 	defer func() { _ = st.db.Close() }()
 	ctx := context.Background()
 	original := session.ModelRequestRecord{
-		ID: "request-a", SessionID: "session-tool", RunID: "run-tool", AssistantMessageID: "msg-tool",
-		Attempt: 2, Step: 3, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
+		ID: "request-a", SessionID: "session-tool", RunID: "run-tool", AssistantMessageID: "msg-tool", InvocationID: "invocation-a",
+		Attempt: 2, Step: 3, State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{}`), ContentSHA256: "hash", CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := execution.CreateModelRequest(ctx, original); err != nil {
 		t.Fatal(err)

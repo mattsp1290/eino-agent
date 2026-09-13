@@ -14,13 +14,20 @@ func testCreateToolRequest(call session.ToolCall, id session.EventID, at time.Ti
 	if len(call.Input) == 0 {
 		call.Input = json.RawMessage(`{}`)
 	}
+	parts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "block-" + string(call.RequestPartID), Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(call.ID), Name: call.Name, Arguments: string(call.Input)},
+		}},
+	}, func() session.PartID { return call.RequestPartID }, call.MessageID, call.SessionID, call.RunID, at.UTC(), session.DefaultContentLimits())
+	if err != nil {
+		panic(err)
+	}
 	return session.CreateToolCallRequest{
-		Call: call,
-		RequestPart: session.Part{
-			ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID,
-			Kind: session.PartToolCall, Payload: mustJSON(toolCallPayload{ID: string(call.ID), Name: call.Name, Arguments: call.Input}), CreatedAt: at.UTC(), UpdatedAt: at.UTC(),
-		},
-		Event: session.ToolTransitionEvent{ID: id, CreatedAt: at.UTC()},
+		Call:        call,
+		RequestPart: parts[0],
+		Event:       session.ToolTransitionEvent{ID: id, CreatedAt: at.UTC()},
 	}
 }
 

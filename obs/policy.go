@@ -118,6 +118,8 @@ func DefaultFields() []FieldPolicy {
 		{Name: "run.id", Class: FieldAllowed, Attribute: "run.id", Cardinality: "high"},
 		{Name: "assistant_message.id", Class: FieldAllowed, Attribute: "assistant_message.id", Cardinality: "high"},
 		{Name: "tool_call.id", Class: FieldAllowed, Attribute: "tool_call.id", Cardinality: "high"},
+		{Name: "tool_call.provider_id", Class: FieldAllowed, Attribute: "metadata.provider_call_id", Cardinality: "high",
+			Notes: "Provider-issued tool-call id, present only when the provider supplied one. Identity only, validated UTF-8, <= session.DiscoveryMaxIdentityBytes. Span attribute (tool.call/tool.settled metadata), never a metric tag."},
 		{Name: "agui.thread.id", Class: FieldAllowed, Attribute: "agui.thread.id", Cardinality: "high"},
 		{Name: "agui.run.id", Class: FieldAllowed, Attribute: "agui.run.id", Cardinality: "high"},
 		{Name: "input.summary", Class: FieldSummaryOnly, Attribute: "genai.request.summary", Cardinality: "bounded"},

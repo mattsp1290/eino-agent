@@ -25,6 +25,52 @@ type runExecution struct {
 	durableMessageMu          sync.Mutex
 	durableMessageFloor       time.Time
 	durableMessageInitialized bool
+
+	// discoveredMu guards discovered, the per-execution advertised set of
+	// deferred tool names the model has discovered via the tool-search tool
+	// (see runtime/tool_search.go). It starts empty for a fresh run;
+	// StreamingOrchestrator seeds it from durable history on resume via
+	// discoveredToolsFromHistory.
+	discoveredMu sync.Mutex
+	discovered   map[string]bool
+}
+
+// markDiscovered adds names to the per-execution advertised set.
+func (e *runExecution) markDiscovered(names ...string) {
+	if len(names) == 0 {
+		return
+	}
+	e.discoveredMu.Lock()
+	defer e.discoveredMu.Unlock()
+	if e.discovered == nil {
+		e.discovered = make(map[string]bool, len(names))
+	}
+	for _, name := range names {
+		e.discovered[name] = true
+	}
+}
+
+// seedDiscovered replaces the per-execution advertised set, used to restore
+// it from durable history on resume.
+func (e *runExecution) seedDiscovered(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	e.markDiscovered(names...)
+}
+
+// discoveredSnapshot returns a defensive copy of the current advertised set.
+func (e *runExecution) discoveredSnapshot() map[string]bool {
+	e.discoveredMu.Lock()
+	defer e.discoveredMu.Unlock()
+	if len(e.discovered) == 0 {
+		return nil
+	}
+	snapshot := make(map[string]bool, len(e.discovered))
+	for name := range e.discovered {
+		snapshot[name] = true
+	}
+	return snapshot
 }
 
 func (e *runExecution) seedDurableMessageFloor(at time.Time) {

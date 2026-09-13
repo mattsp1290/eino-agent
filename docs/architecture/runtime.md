@@ -78,9 +78,11 @@ claim. A changed
 payload returns the content-free `session.ErrAdmissionConflict` error.
 
 The v1 fingerprint is SHA-256 of `eino-agent-admission-v1`, a NUL byte, and
-canonical JSON for the current message, agent, model selection, tool selection,
-config metadata, and request metadata. Nil maps and slices encode as empty
-objects and arrays; included strings must be valid UTF-8. It excludes
+canonical JSON for the current message's ordered caller-authored typed blocks,
+agent, model selection, tool selection, config metadata, and request metadata.
+The block projection includes kind and every text, media, or MCP approval
+response payload field, but excludes runtime-generated block IDs. Nil maps and
+slices encode as empty objects and arrays; included strings must be valid UTF-8. It excludes
 observability, credentials, resolver output, history, clocks, generated IDs,
 observers, and execution ownership. Keys are 1–256 ASCII bytes matching
 `[A-Za-z0-9][A-Za-z0-9._:-]*`; keyed messages are limited to 256 KiB and the
@@ -90,13 +92,14 @@ must freeze a desired resolved workspace before the first keyed submission.
 
 1. Host code loads a `config.Snapshot` and submits exactly one current
    `runtime.UserMessage`.
-2. Runtime validates that text and resolves immutable run dependencies.
+2. Runtime bounds rich keyed input before cloning, assigns private block IDs,
+   validates typed content, and resolves immutable run dependencies.
 3. One store transaction creates or locates the `session.Session`, acquires
    per-session run ownership, loads the prior committed history, and admits the
-   run, context epoch, current user message and text part, assistant
-   placeholder, and `run_started` event.
+   run, context epoch, current user message and all content parts, first turn,
+   assistant placeholder, admission receipt, and start events.
 4. Runtime builds a `runtime.TurnSnapshot` from prior durable history followed
-   by the current user text. The provider never receives a caller-owned
+   by the current user content. The provider never receives a caller-owned
    transcript.
 5. Runtime publishes the committed start event and resolves tools for the
    frozen snapshot.
@@ -413,4 +416,7 @@ change. The authoritative point catalog and model and tool pipeline diagrams are
 
 The model-request ledger assigns one `(attempt, step)` record per
 adapter invocation. Here, a step is a provider request plus its resulting tool
-batch; it does not add a user-visible turn abstraction.
+batch. Since W5 the runtime *does* own a coarser, user-visible durable turn
+abstraction above it — `session.Turn`, one per admitted submission batch,
+with a per-run ordinal and `turn_started`/`turn_completed` durable events;
+see [`docs/architecture/eino-feature-support.md`](eino-feature-support.md).

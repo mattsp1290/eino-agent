@@ -192,8 +192,8 @@ semantics are binding, grounded in `executeTools`
   returns and **before**
   `ExecutionStore.SettleToolCall(SettleToolCallRequest)`. The
   durable output, the settled tool-call event, the persisted
-  `PartToolResult`, and the model-visible tool message all observe the
-  patched result.
+  `PartFunctionToolResult`, and the model-visible tool message all observe
+  the patched result.
 - **Ordering**: `BeforeToolCall` and `AfterToolCall` both run as transform
   waterfalls in registration order. Permissions
   decide after the rewrite chain completes, so policy always evaluates what

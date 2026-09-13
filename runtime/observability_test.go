@@ -24,14 +24,14 @@ func TestStreamingOrchestratorRecordsNoNetworkObservations(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		response := einoschema.AssistantMessage("hello", nil)
-		response.ResponseMeta = &einoschema.ResponseMeta{Usage: &einoschema.TokenUsage{
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		response := agenticAssistantText("hello")
+		response.ResponseMeta = &einoschema.AgenticResponseMeta{TokenUsage: &einoschema.TokenUsage{
 			PromptTokens: 3, CompletionTokens: 2,
 			CompletionTokensDetails: einoschema.CompletionTokensDetails{ReasoningTokens: 1},
 			PromptTokenDetails:      einoschema.PromptTokenDetails{CachedTokens: 4},
 		}}
-		return []*einoschema.Message{response}, nil
+		return []*einoschema.AgenticMessage{response}, nil
 	}))
 	orch.observer = observer
 	orch.trace = agentcontext.TraceContext{TraceID: "trace-1"}
@@ -60,7 +60,7 @@ func TestStreamingOrchestratorRecordsRetryAndProviderError(t *testing.T) {
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
 	var calls int
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls++
 		return nil, model.Error{Code: "rate_limited", Message: "SECRET prompt retry me", Retryable: true, Cause: model.ErrProviderRateLimited}
 	}))
@@ -97,7 +97,7 @@ func TestStreamingOrchestratorRecordsCancellation(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		return nil, context.Canceled
 	}))
 	orch.observer = observer
@@ -118,23 +118,23 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}))
 	orch.observer = observer
 	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
-		Message:   UserMessage{Content: "SECRET prompt"},
+		Message:   TextUserMessage("SECRET prompt"),
 		Config:    orchestratorConfig(),
 	})
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	if err := admission.Handle.Interrupt(context.Background(), "disconnect"); err != nil {
+	if err := admission.Interrupt(context.Background(), "disconnect"); err != nil {
 		t.Fatalf("Interrupt error = %v", err)
 	}
-	result := <-admission.Handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunInterrupted {
 		t.Fatalf("result = %+v", result)
 	}
@@ -193,20 +193,13 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-1",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"text":"SECRET tool input"}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "echo", `{"text":"SECRET tool input"}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -219,22 +212,118 @@ func TestStreamingOrchestratorRecordsToolLifecycleWithoutPayloadLeak(t *testing.
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
+	// The scripted provider CallID ("call-1") is preserved separately as
+	// ProviderCallID; the observability attributes now carry the freshly
+	// runtime-minted, store-unique durable ToolCall.ID instead. Discover it
+	// from the store rather than assuming the provider literal survived.
+	callID := onlyToolCallID(t, store)
 	observations := observer.Snapshot().Observations
 	assertObservation(t, observations, "tool.registered", "ok", "")
 	assertObservation(t, observations, "tool.materialized", "ok", "")
 	toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
-	if toolSpan.Attributes["tool.call_id"] != "call-1" || toolSpan.Attributes["tool.status"] != "succeeded" {
+	if toolSpan.Attributes["tool.call_id"] != string(callID) || toolSpan.Attributes["tool.status"] != "succeeded" {
 		t.Fatalf("tool span attrs = %#v", toolSpan.Attributes)
 	}
 	settled := assertObservation(t, observations, "tool.settled", "ok", "")
 	if settled.Attributes["tool.status"] != "succeeded" {
 		t.Fatalf("settled attrs = %#v", settled.Attributes)
 	}
+	// The golden fixture encodes the tool call id as the placeholder
+	// "call-1" (the scripted provider CallID at the time the fixture was
+	// captured); substitute the actual minted id before comparing, since the
+	// fixture file is a fixed literal and the durable id is no longer.
 	want := readObservationGolden(t, "../testdata/obs/tool_lifecycle_observations.json")
+	for i := range want {
+		if want[i].ToolCallID == "call-1" {
+			want[i].ToolCallID = string(callID)
+		}
+	}
 	requireGoldenEqual(t, goldenToolObservations(observations), want)
 	if observationContains(observations, "SECRET tool input") || observationContains(observations, "SECRET tool output") {
 		t.Fatalf("observations leaked tool payloads: %#v", observations)
 	}
+}
+
+// TestStreamingOrchestratorRecordsProviderCallIDMetadataOnToolObservations
+// proves OC-S4: a tool call's provider-facing id (session.ToolCall.
+// ProviderCallID) is exported as a bounded, content-free
+// "metadata.provider_call_id" attribute on both the tool_call (start) and
+// tool.settled observations when the provider supplied one, and the key is
+// absent from both when it did not -- eino-obs exports Metadata verbatim as
+// "metadata.<key>" span attributes (see einoobs's session.go), so this
+// pins toolObservationMetadata's contract at the observation boundary, not
+// just the helper function in isolation.
+func TestStreamingOrchestratorRecordsProviderCallIDMetadataOnToolObservations(t *testing.T) {
+	t.Parallel()
+
+	t.Run("provider supplied an id", func(t *testing.T) {
+		t.Parallel()
+		observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+		store := newAdmissionStore()
+		orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+			for _, msg := range request.Messages {
+				if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+				}
+			}
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call_0", "echo", `{}`))}, nil
+		}))
+		orch.observer = observer
+		configureTestTools(orch, staticToolRegistry{tools: []Tool{{
+			Name:     "echo",
+			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil }),
+		}}})
+		result := startAndWait(t, orch)
+		if result.Status != session.RunCompleted {
+			t.Fatalf("result = %+v", result)
+		}
+		observations := observer.Snapshot().Observations
+		toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
+		if toolSpan.Attributes["metadata.provider_call_id"] != "call_0" {
+			t.Fatalf("tool_call metadata.provider_call_id = %#v, want call_0 (attrs=%#v)", toolSpan.Attributes["metadata.provider_call_id"], toolSpan.Attributes)
+		}
+		settled := assertObservation(t, observations, "tool.settled", "ok", "")
+		if settled.Attributes["metadata.provider_call_id"] != "call_0" {
+			t.Fatalf("tool.settled metadata.provider_call_id = %#v, want call_0 (attrs=%#v)", settled.Attributes["metadata.provider_call_id"], settled.Attributes)
+		}
+	})
+
+	t.Run("provider left the id empty", func(t *testing.T) {
+		t.Parallel()
+		observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
+		store := newAdmissionStore()
+		orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
+			for _, msg := range request.Messages {
+				if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+				}
+			}
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("", "echo", `{}`))}, nil
+		}))
+		orch.observer = observer
+		configureTestTools(orch, staticToolRegistry{tools: []Tool{{
+			Name:     "echo",
+			Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) { return ToolResult{Output: "ok"}, nil }),
+		}}})
+		result := startAndWait(t, orch)
+		if result.Status != session.RunCompleted {
+			t.Fatalf("result = %+v", result)
+		}
+		observations := observer.Snapshot().Observations
+		toolSpan := assertObservation(t, observations, "tool_call", "ok", "")
+		if _, ok := toolSpan.Attributes["metadata.provider_call_id"]; ok {
+			t.Fatalf("tool_call metadata.provider_call_id present = %#v, want absent (attrs=%#v)", toolSpan.Attributes["metadata.provider_call_id"], toolSpan.Attributes)
+		}
+		settled := assertObservation(t, observations, "tool.settled", "ok", "")
+		if _, ok := settled.Attributes["metadata.provider_call_id"]; ok {
+			t.Fatalf("tool.settled metadata.provider_call_id present = %#v, want absent (attrs=%#v)", settled.Attributes["metadata.provider_call_id"], settled.Attributes)
+		}
+		// The attribute's absence is only meaningful if the call really has
+		// no provider id: confirm the durable record agrees.
+		if call, err := store.GetToolCall(context.Background(), onlyToolCallID(t, store)); err != nil || call.ProviderCallID != "" {
+			t.Fatalf("provider call id = %q, err = %v; want empty", call.ProviderCallID, err)
+		}
+	})
 }
 
 func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *testing.T) {
@@ -242,20 +331,13 @@ func TestStreamingOrchestratorRecordsPermissionDeniedToolAsExpectedFailure(t *te
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("handled")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-denied",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{"target":"SECRET danger pattern"}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-denied", "echo", `{"target":"SECRET danger pattern"}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -297,20 +379,13 @@ func TestStreamingOrchestratorRecordsOperationalToolFailure(t *testing.T) {
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	orch := newTestOrchestrator(store, scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, msg := range request.Messages {
-			if msg.Role == einoschema.Tool {
-				return []*einoschema.Message{einoschema.AssistantMessage("handled", nil)}, nil
+			if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+				return []*einoschema.AgenticMessage{agenticAssistantText("handled")}, nil
 			}
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-fail",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-fail", "echo", `{}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{
@@ -337,15 +412,8 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-missing",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "missing",
-				Arguments: `{"text":"SECRET missing tool input"}`,
-			},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-missing", "missing", `{"text":"SECRET missing tool input"}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{})
@@ -353,9 +421,20 @@ func TestStreamingOrchestratorRecordsUnavailableToolFailureWithoutPayloadLeak(t 
 	if result.Status != session.RunFailed {
 		t.Fatalf("result = %+v", result)
 	}
+	// An unresolvable tool name fails resolveToolCall before prepareToolCalls
+	// ever durably persists a session.ToolCall row, so there's no store
+	// record to discover the minted id from here (unlike the
+	// admissionStore-backed tests elsewhere in this file). The scripted
+	// provider CallID ("call-missing") is preserved separately as
+	// ProviderCallID and is no longer what observability reports as
+	// tool.call_id -- that's now the freshly runtime-minted id. What this
+	// test actually verifies is payload-leak safety and correlation
+	// consistency, so assert the id is present and matches across the
+	// correlated attributes rather than pinning the provider literal.
 	observations := observer.Snapshot().Observations
 	settled := assertObservation(t, observations, "tool.settled", "error", "")
-	if settled.Attributes["tool.call_id"] != "call-missing" || settled.Attributes["tool.status"] != "failed" {
+	mintedCallID, _ := settled.Attributes["tool.call_id"].(string)
+	if mintedCallID == "" || settled.Attributes["correlation.tool_call_id"] != mintedCallID || settled.Attributes["tool.status"] != "failed" {
 		t.Fatalf("settled attrs = %#v", settled.Attributes)
 	}
 	if settled.Error == nil || settled.Error.Classification != "operational_failure" {
@@ -372,15 +451,8 @@ func TestStreamingOrchestratorRecordsSettlementFailure(t *testing.T) {
 	observer := einoobs.New(einoobs.Config{Service: "eino-agent-test"})
 	store := newAdmissionStore()
 	store.settleToolCallErr = errors.New("SECRET settlement detail")
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID:   "call-settle",
-			Type: "function",
-			Function: einoschema.FunctionCall{
-				Name:      "echo",
-				Arguments: `{}`,
-			},
-		}})}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-settle", "echo", `{}`))}, nil
 	}))
 	orch.observer = observer
 	configureTestTools(orch, staticToolRegistry{tools: []Tool{{

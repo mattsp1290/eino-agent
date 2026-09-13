@@ -23,7 +23,7 @@ func TestPublicAdmissionReceiptRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	selection := model.Selection{ProviderID: "discovery", ModelID: "deterministic"}
-	request := runtime.Request{SessionID: "receipt-session", AdmissionKey: "consumer-event-1", Message: runtime.UserMessage{Content: "hello"}, Config: config.Snapshot{Agent: config.Agent{Name: "receipt", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": "consumer"}}}
+	request := runtime.Request{SessionID: "receipt-session", AdmissionKey: "consumer-event-1", Message: runtime.TextUserMessage("hello"), Config: config.Snapshot{Agent: config.Agent{Name: "receipt", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": "consumer"}}}
 	owner := discoveryRuntime(t, store, &discoveryModel{})
 	first, err := owner.Start(ctx, request)
 	if err != nil || first.Disposition != runtime.AdmissionNew || first.Handle == nil {
@@ -49,7 +49,7 @@ func TestPublicAdmissionReceiptRecovery(t *testing.T) {
 		t.Fatalf("lookup=%#v err=%v", record, err)
 	}
 
-	request.Message.Content = "changed"
+	request.Message = runtime.TextUserMessage("changed")
 	if _, err := retry.Start(ctx, request); !errors.Is(err, session.ErrAdmissionConflict) {
 		t.Fatalf("conflict=%v", err)
 	}

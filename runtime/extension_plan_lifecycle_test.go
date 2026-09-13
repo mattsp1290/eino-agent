@@ -121,7 +121,7 @@ func TestStartReleasesAcquiredPlanWhenResolverPanics(t *testing.T) {
 			t.Fatalf("mount remained leased after panic: %v", err)
 		}
 	}()
-	_, _ = orchestrator.Start(context.Background(), Request{SessionID: "session", Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	_, _ = orchestrator.Start(context.Background(), Request{SessionID: "session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 }
 
 func TestRunPlanDescriptorReturnsDefensiveClone(t *testing.T) {
@@ -246,17 +246,17 @@ func TestRunSettledNoticeRequiresDurableFreshTerminalState(t *testing.T) {
 		wantError  bool
 		wantCauses []error
 	}{
-		{name: "completed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		{name: "completed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		}), wantStatus: session.RunCompleted, wantNotice: 1},
-		{name: "failed and persisted", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		{name: "failed and persisted", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			return nil, providerErr
 		}), wantStatus: session.RunFailed, wantNotice: 1, wantError: true, wantCauses: []error{providerErr}},
-		{name: "work and terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+		{name: "work and terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 			return nil, providerErr
 		}), finishErr: finishErr, wantStatus: session.RunFailed, wantError: true, wantCauses: []error{providerErr, finishErr}},
-		{name: "terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		{name: "terminal persistence failed", streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		}), finishErr: finishErr, wantStatus: session.RunFailed, wantNotice: 0, wantError: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {

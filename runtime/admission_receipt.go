@@ -21,7 +21,11 @@ const (
 type AdmissionResult struct {
 	Receipt     session.AdmissionReceipt
 	Disposition AdmissionDisposition
-	Handle      Handle
+	// Handle is embedded so existing in-package and example control-flow code
+	// can invoke Handle methods directly on a new admission result. It is nil
+	// for AdmissionExisting; duplicate callers must use Receipt and committed
+	// readers instead of live-control methods.
+	Handle
 }
 
 func admissionResultForExisting(record session.AdmissionRecord, fingerprint [32]byte) (AdmissionResult, error) {

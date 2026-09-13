@@ -50,22 +50,22 @@ func (m *watchScript) StreamProvider(ctx context.Context, request model.Request)
 			return
 		}
 		for i := len(request.Messages) - 1; i >= 0; i-- {
-			if request.Messages[i].Role == einoschema.User {
-				break
-			}
-			if request.Messages[i].Role == einoschema.Tool {
-				writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("durable final", nil)}, nil)
+			if isFunctionToolResultMessage(request.Messages[i]) {
+				writer.Send(model.StreamDelta{Message: agenticAssistantText("durable final")}, nil)
 				return
 			}
+			if request.Messages[i].Role == einoschema.AgenticRoleTypeUser {
+				break
+			}
 		}
-		writer.Send(model.StreamDelta{Message: &einoschema.Message{Role: einoschema.Assistant, Content: "paused prefix", ReasoningContent: "PRIVATE_REASONING"}}, nil)
+		writer.Send(model.StreamDelta{Message: agenticAssistantTextAndReasoning("paused prefix", "PRIVATE_REASONING")}, nil)
 		m.partialOnce.Do(func() { close(m.partial) })
 		select {
 		case <-ctx.Done():
 			return
 		case <-m.release:
 		}
-		writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("", []einoschema.ToolCall{{ID: "watch-call", Type: "function", Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"PRIVATE_ARGUMENT"}`}}})}, nil)
+		writer.Send(model.StreamDelta{Message: agenticAssistantToolCalls(agenticToolCall("watch-call", "echo", `{"text":"PRIVATE_ARGUMENT"}`))}, nil)
 	}()
 	return reader, nil
 }
@@ -187,7 +187,7 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	config := delegatedRuntimeConfig()
 	config.Agent.SystemPrompt = "PRIVATE_SYSTEM"
 	config.Metadata["secret"] = "PRIVATE_METADATA"
-	admission, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.UserMessage{Content: "new submission"}, Config: config})
+	admission, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.TextUserMessage("new submission"), Config: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,27 +222,27 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	close(script.release)
 	select {
 	case <-script.toolStarted:
-	case result := <-admission.Handle.Done():
+	case result := <-admission.Done():
 		t.Fatalf("run finished before tool: %+v", result)
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
 	// Detachment has left the native tool independently running.
 	select {
-	case <-admission.Handle.Done():
+	case <-admission.Done():
 		t.Fatal("run ended while tool paused")
 	default:
 	}
 	close(script.toolRelease)
 	select {
-	case result := <-admission.Handle.Done():
+	case result := <-admission.Done():
 		if result.Status != session.RunCompleted {
 			t.Fatal(result)
 		}
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	final := watchTerminal(t, second, admission.Handle.RunID())
+	final := watchTerminal(t, second, admission.RunID())
 	if final.Messages[len(final.Messages)-1].Text != "durable final" || !final.Messages[len(final.Messages)-1].Finalized || len(final.Tools) != 1 || final.Tools[0].Status != session.ToolCallCompleted || script.toolCalls.Load() != 1 {
 		t.Fatal(final)
 	}
@@ -255,7 +255,7 @@ func TestPublicSessionWatchConstructionExecutionAndReopen(t *testing.T) {
 	// remains blocked. Done and durable settlement cannot wait for that sink.
 	script.cancelStarted = make(chan struct{})
 	script.cancelRun.Store(true)
-	interrupted, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.UserMessage{Content: "interrupt next"}, Config: config})
+	interrupted, err := orchestrator.Start(ctx, runtime.Request{SessionID: "watch-session", Message: runtime.TextUserMessage("interrupt next"), Config: config})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +403,20 @@ func TestPublicWatchStrictResumeDoesNotDuplicateTool(t *testing.T) {
 		t.Fatal(err)
 	}
 	call := session.ToolCall{ID: "resume-call", SessionID: r.SessionID, RunID: r.ID, MessageID: m.ID, RequestPartID: "request", ResultMessageID: "result-message", ResultPartID: "result-part", Name: "echo", Pattern: "echo", Input: []byte(`{"text":"PRIVATE_ARGUMENT"}`), Status: session.ToolCallPending}
-	if _, err = ex.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: call.RequestPartID, MessageID: m.ID, SessionID: r.SessionID, RunID: r.ID, Kind: session.PartToolCall, Payload: []byte(`{"id":"resume-call","name":"echo","arguments":{"text":"PRIVATE_ARGUMENT"}}`)}, Event: session.ToolTransitionEvent{ID: "pending-event", CreatedAt: time.Now()}}); err != nil {
+	requestParts, err := session.EncodeContentParts(session.Content{
+		Role: session.RoleAssistant,
+		Blocks: []session.ContentBlock{{
+			ID: "resume-request-block", Kind: session.BlockKindFunctionToolCall,
+			FunctionCall: &session.FunctionCallBlock{CallID: string(call.ID), Name: call.Name, Arguments: string(call.Input)},
+		}},
+	}, func() session.PartID { return call.RequestPartID }, m.ID, r.SessionID, r.ID, time.Now().UTC(), session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requestParts) != 1 {
+		t.Fatal("unexpected resume request part count")
+	}
+	if _, err = ex.CreateToolCall(ctx, session.CreateToolCallRequest{Call: call, RequestPart: requestParts[0], Event: session.ToolTransitionEvent{ID: "pending-event", CreatedAt: time.Now()}}); err != nil {
 		t.Fatal(err)
 	}
 	if err = ex.FinalizeAssistantMessage(ctx, m.ID); err != nil {

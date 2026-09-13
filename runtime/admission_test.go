@@ -28,7 +28,7 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Admit error = %v", err)
 	}
-	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.UserMessage.ID != "user-1" || admitted.UserPart.ID != "user-part-1" || admitted.AssistantMessage.ID != "assistant-1" {
+	if admitted.Session.ID != "session-1" || admitted.Run.ID != "run-1" || admitted.UserMessage.ID != "user-1" || len(admitted.UserParts) != 1 || admitted.UserParts[0].ID != "user-part-1" || admitted.AssistantMessage.ID != "assistant-1" {
 		t.Fatalf("admitted identity = %+v", admitted)
 	}
 	if admitted.Run.ParentMsgID != admitted.UserMessage.ID || admitted.AssistantMessage.ParentID != admitted.UserMessage.ID {
@@ -50,8 +50,12 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant {
 		t.Fatalf("messages = %#v", batch.Messages)
 	}
-	if len(batch.Parts) != 1 || batch.Parts[0].SessionID != admitted.Session.ID || batch.Parts[0].RunID != admitted.Run.ID || batch.Parts[0].MessageID != admitted.UserMessage.ID || batch.Parts[0].Ordinal != 0 || string(batch.Parts[0].Payload) != `{"text":"hello"}` {
+	if len(batch.Parts) != 1 || batch.Parts[0].SessionID != admitted.Session.ID || batch.Parts[0].RunID != admitted.Run.ID || batch.Parts[0].MessageID != admitted.UserMessage.ID || batch.Parts[0].Ordinal != 0 || batch.Parts[0].Kind != session.PartUserInputText {
 		t.Fatalf("parts = %#v", batch.Parts)
+	}
+	decodedUserContent, err := session.DecodeContentParts(session.RoleUser, batch.Parts, session.DefaultContentLimits())
+	if err != nil || len(decodedUserContent.Blocks) != 1 || decodedUserContent.Blocks[0].Text == nil || decodedUserContent.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("decoded user content = %#v, error = %v", decodedUserContent, err)
 	}
 	if !admitted.AssistantMessage.CreatedAt.Equal(admitted.UserMessage.CreatedAt.Add(time.Nanosecond)) {
 		t.Fatalf("message times = user %s assistant %s", admitted.UserMessage.CreatedAt, admitted.AssistantMessage.CreatedAt)
@@ -60,7 +64,7 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list events: %v", err)
 	}
-	if len(events.Events) != 1 || events.Events[0].Kind != string(EventRunStarted) {
+	if len(events.Events) != 2 || events.Events[0].Kind != session.TurnStartedEventKind || events.Events[1].Kind != string(EventRunStarted) {
 		t.Fatalf("events = %#v", events.Events)
 	}
 	epochs, err := store.ListContextEpochs(context.Background(), "session-1")
@@ -70,19 +74,20 @@ func TestAdmitPersistsDurableRecordsBeforeExecution(t *testing.T) {
 	if len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].Trigger != "turn" || epochs[0].Reason != "run_admission" {
 		t.Fatalf("epochs = %#v", epochs)
 	}
-	if !reflect.DeepEqual(admitted.Event, events.Events[0]) {
-		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[0])
+	if !reflect.DeepEqual(admitted.Event, events.Events[1]) {
+		t.Fatalf("admitted event = %#v, want canonical %#v", admitted.Event, events.Events[1])
 	}
 	request.Config.Agent.Options["temperature"] = "changed"
-	request.UserMessage.Content = "changed"
+	request.UserMessage.Blocks[0].Text.Text = "changed"
 	if admitted.Snapshot.Config.Agent.Options["temperature"] != "0.2" {
 		t.Fatalf("snapshot config mutated: %#v", admitted.Snapshot.Config.Agent.Options)
 	}
-	if admitted.Snapshot.Messages[0].Content != "hello" {
+	if agenticMessageText(admitted.Snapshot.Messages[0]) != "hello" {
 		t.Fatalf("snapshot messages mutated: %#v", admitted.Snapshot.Messages[0])
 	}
-	if string(admitted.UserPart.Payload) != `{"text":"hello"}` {
-		t.Fatalf("persisted user part mutated: %s", admitted.UserPart.Payload)
+	persistedUserContent, err := session.DecodeContentParts(session.RoleUser, []session.Part{admitted.UserParts[0]}, session.DefaultContentLimits())
+	if err != nil || persistedUserContent.Blocks[0].Text.Text != "hello" {
+		t.Fatalf("persisted user part mutated: %#v, error = %v", persistedUserContent, err)
 	}
 }
 
@@ -118,7 +123,7 @@ func TestAdmitRejectsCollidingGeneratedIDsBeforeStoreUse(t *testing.T) {
 
 	store := newAdmissionStore()
 	request := testRunAdmission()
-	request.IDs.UserPartID = session.PartID(request.IDs.UserMessageID)
+	request.IDs.UserPartIDs[0] = session.PartID(request.IDs.UserMessageID)
 	_, err := (admitter{Store: store}).admit(context.Background(), request)
 	if !errors.Is(err, ErrInvalidAdmission) {
 		t.Fatalf("Admit error = %v, want ErrInvalidAdmission", err)
@@ -143,10 +148,14 @@ func TestAdmitBuildsProviderInputFromFencedHistoryAndCurrentMessage(t *testing.T
 		ID: "prior-user", SessionID: request.IDs.SessionID, RunID: "prior-run",
 		Role: session.RoleUser, CreatedAt: priorAt, UpdatedAt: priorAt,
 	}
-	store.parts["prior-part"] = session.Part{
-		ID: "prior-part", SessionID: request.IDs.SessionID, RunID: "prior-run", MessageID: "prior-user",
-		Kind: session.PartText, Payload: mustJSON(map[string]string{"text": "prior"}), CreatedAt: priorAt, UpdatedAt: priorAt,
+	priorParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "prior-block", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "prior"}}},
+	}, func() session.PartID { return "prior-part" }, "prior-user", request.IDs.SessionID, "prior-run", priorAt, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
 	}
+	store.parts["prior-part"] = priorParts[0]
 	store.listMessagesHook = func(tx *admissionStore, _ session.ID) {
 		if _, ok := tx.runs[request.IDs.RunID]; !ok {
 			t.Fatal("history loaded before AdmitRun established the fence")
@@ -157,7 +166,7 @@ func TestAdmitBuildsProviderInputFromFencedHistoryAndCurrentMessage(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(admitted.Snapshot.Messages) != 2 || admitted.Snapshot.Messages[0].Content != "prior" || admitted.Snapshot.Messages[1].Content != "hello" {
+	if len(admitted.Snapshot.Messages) != 2 || agenticMessageText(admitted.Snapshot.Messages[0]) != "prior" || agenticMessageText(admitted.Snapshot.Messages[1]) != "hello" {
 		t.Fatalf("provider messages = %#v, want prior then current user", admitted.Snapshot.Messages)
 	}
 	if !admitted.UserMessage.CreatedAt.Equal(priorAt.Add(time.Nanosecond)) || !admitted.AssistantMessage.CreatedAt.Equal(priorAt.Add(2*time.Nanosecond)) {
@@ -200,6 +209,28 @@ func TestAdmitPersistsResolvedWorkspaceAcrossSymlinkRetarget(t *testing.T) {
 	}
 	if admitted.Run.Config["workspace_root"] != resolved {
 		t.Fatalf("retarget changed persisted root to %q", admitted.Run.Config["workspace_root"])
+	}
+}
+
+func TestKeyedAdmitPreservesCleanAbsoluteWorkspaceSymlink(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "workspace")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	request := testRunAdmission()
+	request.AdmissionKey = "symlink-key"
+	request.Config.Metadata["workspace_root"] = alias
+	admitted, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Run.Config["workspace_root"] != alias || admitted.Snapshot.Config.Metadata["workspace_root"] != alias || admitted.Session.Directory != alias {
+		t.Fatalf("keyed workspace changed: session=%q run=%q snapshot=%q want=%q", admitted.Session.Directory, admitted.Run.Config["workspace_root"], admitted.Snapshot.Config.Metadata["workspace_root"], alias)
 	}
 }
 
@@ -247,7 +278,7 @@ func TestAdmitHistoryProjectionFailureHasNoNewDurableOrLiveSideEffects(t *testin
 		SessionID: request.IDs.SessionID,
 		RunID:     "history-run",
 		MessageID: "history-user",
-		Kind:      session.PartText,
+		Kind:      session.PartUserInputText,
 		Payload:   []byte(`{"text":`),
 	}
 	_, err = (admitter{Store: store}).admit(context.Background(), request)
@@ -264,14 +295,14 @@ func TestAdmitRejectsEveryRepeatedRunID(t *testing.T) {
 		"session":           func(r *admissionRequest) { r.IDs.SessionID = "other-session" },
 		"epoch":             func(r *admissionRequest) { r.IDs.ContextEpochID = "other-epoch" },
 		"user message id":   func(r *admissionRequest) { r.IDs.UserMessageID = "other-user" },
-		"user part id":      func(r *admissionRequest) { r.IDs.UserPartID = "other-part" },
+		"user part id":      func(r *admissionRequest) { r.IDs.UserPartIDs = []session.PartID{"other-part"} },
 		"assistant message": func(r *admissionRequest) { r.IDs.AssistantMessageID = "other-assistant" },
 		"config":            func(r *admissionRequest) { r.Config.Agent.Mode = "other-mode" },
 		"model": func(r *admissionRequest) {
 			r.Config.Model.ModelID = "other-model"
 			r.Model.Model.ID = "other-model"
 		},
-		"message": func(r *admissionRequest) { r.UserMessage.Content = "other-input" },
+		"message": func(r *admissionRequest) { r.UserMessage.Blocks[0].Text.Text = "other-input" },
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -311,6 +342,22 @@ func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.
 	}
 }
 
+func TestKeyedAdmitRollsBackCompleteTurnGraphWhenReceiptWriteFails(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	store.recordAdmissionErr = errors.New("record admission failed")
+	request := testRunAdmission()
+	request.AdmissionKey = "rollback-key"
+	_, err := (admitter{Store: store}).admit(context.Background(), request)
+	if !errors.Is(err, store.recordAdmissionErr) {
+		t.Fatalf("Admit error = %v, want receipt failure", err)
+	}
+	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.parts) != 0 || len(store.events) != 0 || len(store.epochs) != 0 || len(store.turns) != 0 || len(store.admissions) != 0 {
+		t.Fatalf("receipt failure leaked graph: sessions=%d runs=%d messages=%d parts=%d events=%d epochs=%d turns=%d admissions=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.parts), len(store.events), len(store.epochs), len(store.turns), len(store.admissions))
+	}
+}
+
 func TestAdmitRollsBackUserAndSessionWhenUserPartFails(t *testing.T) {
 	t.Parallel()
 
@@ -347,13 +394,15 @@ func testRunAdmission() admissionRequest {
 			SessionID:          "session-1",
 			RunID:              "run-1",
 			UserMessageID:      "user-1",
-			UserPartID:         "user-part-1",
+			UserPartIDs:        []session.PartID{"user-part-1"},
 			AssistantMessageID: "assistant-1",
 			ContextEpochID:     "epoch-1",
 			EventID:            "event-1",
 			RunClaimToken:      "claim-run-1",
+			TurnID:             "turn-1",
+			TurnStartedEventID: "turn-started-1",
 		},
-		UserMessage: UserMessage{Content: "hello"},
+		UserMessage: testUserMessage("hello"),
 		Config: config.Snapshot{
 			Agent: config.Agent{
 				Name:         "default",
@@ -370,13 +419,26 @@ func testRunAdmission() admissionRequest {
 		Model: model.Resolved{
 			Provider: model.Provider{ID: "openai"},
 			Model:    model.Descriptor{ID: "gpt-4.1", ProviderID: "openai"},
-			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil }),
+			Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil }),
 		},
 		OwnerID:       "owner-1",
 		LeaseDuration: time.Minute,
 		Metadata:      map[string]string{"request": "admission"},
 		ExtensionPlan: emptyTestPlanDescriptor(),
+		ContentLimits: session.DefaultContentLimits(),
 	}
+}
+
+// testUserMessage builds a UserMessage with a fixed, pre-assigned block ID so
+// admission-level tests (which construct admissionRequest directly, bypassing
+// StreamingOrchestrator.Start's block-ID assignment) can exercise
+// session.EncodeContentParts deterministically.
+func testUserMessage(text string) UserMessage {
+	return UserMessage{Blocks: []session.ContentBlock{{
+		ID:   "user-block-1",
+		Kind: session.BlockKindUserInputText,
+		Text: &session.TextBlock{Text: text},
+	}}}
 }
 
 type capturingSink struct {

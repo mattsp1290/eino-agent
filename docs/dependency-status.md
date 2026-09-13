@@ -1,12 +1,81 @@
 # Dependency Status
 
 Date: 2026-06-27
-Last updated: 2026-09-10 (UTC)
+Last updated: 2026-09-12 (UTC)
 
 This note retains prerequisite and publication evidence for `eino-agent`.
 The initial baseline below is historical. Do not
 upgrade them inside unrelated implementation work; file a dependency-upgrade
 bead with compatibility gates instead.
+
+## Eino v0.9.19 pin
+
+Verified on 2026-09-10 (UTC): `github.com/cloudwego/eino v0.9.19`, origin
+`9d983b36a5112a1c233056b1a099825298fafb8f` (`refs/tags/v0.9.19`), module
+checksum `h1:i71YUBK3nwY4L53dkzRgZpAcPSZ4v4eRponN7W9sDtk=`, resolved through
+`go mod download -json` with no `replace` directive. The exact pin is enforced
+by `internal/deps/eino_pin_test.go`. The typed ADK interception proof and its
+findings are recorded in
+[architecture/eino-feature-support.md](architecture/eino-feature-support.md).
+
+External pins for the agentic adoption:
+
+- `github.com/mattsp1290/eino-agui`: accepted contract, pinned at the
+  immutable bridge commit `ed64f77f3f16d8eb0f63f1cc34b985b870cdde88`
+  (`v0.1.2-0.20260910210826-ed64f77f3f16`; superseding the earlier
+  intermediate pin at `0e1d33d4f27f934226b707f252b7499484f4762e` recorded
+  when this section was first written); it requires the root replacement
+  `github.com/ag-ui-protocol/ag-ui/sdks/community/go` =>
+  `github.com/mattsp1290/ag-ui/sdks/community/go@v0.0.0-20260909025854-aaa75b54d572`
+  in any consuming host's own `go.mod`, since dependency replacements do not
+  propagate. Adopted in W7: `agui/bridge.go` and `agui/replay.go` use
+  `convert.ToAgenticProjection`/`emitter.Emitter.EmitCommittedProjection` for
+  both the durable replay snapshot and live `message_committed` emission
+  (see `docs/architecture/agui-events.md`); the full lifecycle mapping
+  (`run_paused`/`attempt_replaced`/subagent events) and transient per-delta
+  emission via `TransientEventForBlock` are not yet wired.
+- `github.com/mattsp1290/eino-providers`: the native `AgenticModel` contract
+  was answered on 2026-09-11 (response document
+  `2026-09-10-eino-v0-9-19-agentic-models.md`) and that work is merged to the
+  repository's `main`: the accepted branch commit
+  `f524a1fefe20f0ebd157440818c253489ae0490c` is an ancestor of it. Verified on
+  2026-09-12 (UTC): `main` commit
+  `79248358b8e6324bbdb1f014526629f82e6bce90` resolves through
+  `https://proxy.golang.org` as `v0.0.0-20260912022125-79248358b8e6`, module
+  checksum `h1:yhGEAfP0NTXwsNBiEQGDR20iZK4Lnk2N6o2JbGDcivo=`, with no
+  `replace` directive. That repository publishes no release tag, so this is a
+  pseudo-version pin. It is recorded as evidence only: this module does not
+  require `eino-providers` today, and W8 is the work package that adds the
+  dependency and its gates. `eino-agent-td8` stays open for the provider
+  deliverables the response document still lists as incomplete, the per-cell
+  capability matrix and native-byte fixture evidence.
+
+  **W8 update (2026-09-13, UTC)**: re-verified the identical pin in a fresh
+  temporary module with `GOWORK=off go mod download -json
+  github.com/mattsp1290/eino-providers@79248358b8e6324bbdb1f014526629f82e6bce90`;
+  it resolved identically (same version, checksum, `Origin.Hash`, no
+  replace). `github.com/mattsp1290/eino-agent`'s own root `go.mod` still
+  does not (and should not) require this module -- the exclusion is
+  deliberate, not an oversight: `go mod tidy` never scans `testdata/`
+  packages, so it silently drops any `require` added there. The dependency
+  is added instead where it belongs -- the external CONSUMER --
+  `testdata/external-consumer/agentic_fixture_test.go` imports
+  `github.com/mattsp1290/eino-providers/claude` directly, and
+  `testdata/external-consumer/check.sh` pins the exact version above via its
+  own `go mod edit -require` before `go mod tidy`, so the consumer module
+  resolves it deterministically rather than the untagged default branch's
+  moving head. `bash testdata/external-consumer/check.sh` (local mode)
+  passed with this pin selected, unreplaced, and `go mod verify` reporting
+  all modules verified. See
+  [architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
+  W8 section for the fixtures this pin backs and two discovered
+  eino-agent/eino-providers integration gaps (a required
+  `ResponseMeta.Extension` host-side normalization, and the current
+  typed-ADK adapter's rejection of model-emitted server/MCP-call content
+  blocks). `eino-agent-td8`'s two remaining deliverables (the per-cell
+  capability matrix, native-byte fixture evidence beyond this file) and a
+  merged immutable release tag are unaffected by this update and remain
+  open.
 
 ## SQL-store consumer publication
 
@@ -36,6 +105,18 @@ GOWORK=off GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
   EINO_AGENT_CONSUMER_VERSION=cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e \
   testdata/external-consumer/check.sh
 ```
+
+The last command above (published-mode `check.sh` at
+`EINO_AGENT_CONSUMER_VERSION=cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`) is a
+historical record, not a currently reproducible result: `check.sh` now
+unconditionally copies `agentic_fixture_test.go` into the generated consumer
+module regardless of mode, and that fixture requires
+`model.NewAgenticStreamerWithProviderState` and imports `eino-providers/claude`
+— neither exists at this published pin (`git grep -c NewAgenticStreamer` at
+this commit returns zero). Re-running that exact command today fails to
+compile. It was true on 2026-09-10 and predates W8's agentic-fixture addition
+to `check.sh`; it cannot be re-executed until a post-agentic commit is
+published (see `docs/consumer-guide.md`'s Installation section).
 
 Ryuk was disabled for this host's Docker environment; fixtures still explicitly
 close host pools and terminate disposable containers. CI uses normal Ryuk

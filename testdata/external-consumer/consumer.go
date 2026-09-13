@@ -14,7 +14,7 @@ var (
 	_ = model.Provider{}
 	_ = fake.Provider{}
 	_ = runtime.Request{
-		Message: runtime.UserMessage{Content: "current user submission"},
+		Message: runtime.TextUserMessage("current user submission"),
 	}
 	_ *sqlite.Store
 	_ = stream.NewTail
@@ -25,5 +25,5 @@ var (
 		Limits: model.ProviderStateLimits{MaxItems: 1, MaxItemBytes: 1024, MaxMessageBytes: 1024, MaxEnvelopeBytes: 4096, MaxStoredMessageBytes: 4096},
 	}
 	_ = model.NewEinoJSONExtraStateCodec
-	_ = model.NewEinoStreamerWithProviderState
+	_ = model.NewClassicStreamerWithProviderState
 )

@@ -5,8 +5,8 @@ import (
 	"strings"
 
 	_ "github.com/mattsp1290/eino-agent/examples/wasm-extensions/internal/guestabi"
-	middlewareapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/tool-middleware-api"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	middlewareapi "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/tool-middleware-api"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 func init() {

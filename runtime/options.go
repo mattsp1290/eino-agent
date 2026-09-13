@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
@@ -30,6 +31,8 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		queueSize:            64,
 		leaseValue:           time.Minute,
 		modelRequestMaxBytes: defaultModelRequestMaxBytes,
+		contentLimits:        session.DefaultContentLimits(),
+		streamLimits:         defaultStreamLimits(),
 	}
 	for index, option := range opts {
 		if option == nil {
@@ -38,6 +41,17 @@ func NewStreamingOrchestrator(opts ...Option) (*StreamingOrchestrator, error) {
 		if err := option(o); err != nil {
 			return nil, err
 		}
+	}
+	if o.scratchRoot == "" {
+		// No WithScratchRoot supplied: default to a private, non-workspace
+		// scratch root under the user cache directory (round-two W6 review
+		// I5 -- plantask/reduction scratch and offload state must never
+		// live inside a host's admitted workspace).
+		dir, err := defaultScratchRootDir()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidOrchestrator, err)
+		}
+		o.scratchRoot = dir
 	}
 	var missing []string
 	if nilInterface(o.store) {
@@ -195,6 +209,18 @@ func WithObserver(value *einoobs.Observer) Option {
 	return func(o *StreamingOrchestrator) error { o.observer = value; return nil }
 }
 
+// WithContentLimits overrides the durable content bounds enforced on
+// admission. Defaults to session.DefaultContentLimits().
+func WithContentLimits(value session.ContentLimits) Option {
+	return func(o *StreamingOrchestrator) error {
+		if err := value.Validate(); err != nil {
+			return fmt.Errorf("%w: ContentLimits: %v", ErrInvalidOrchestrator, err)
+		}
+		o.contentLimits = value
+		return nil
+	}
+}
+
 func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator, int)) Option {
 	return func(o *StreamingOrchestrator) error {
 		if value <= 0 {
@@ -205,7 +231,52 @@ func positiveIntOption(name string, value int, apply func(*StreamingOrchestrator
 	}
 }
 
+// WithScratchRoot overrides the runtime-owned root plantask/reduction
+// scratch and offload state is kept under (default: a directory under
+// os.UserCacheDir(), see defaultScratchRootDir). Must be an absolute,
+// non-empty path; NEVER point this at a directory a host also exposes as an
+// admitted workspace root -- see sessionScratchRoot/scratchRootBackend and
+// round-two W6 review I5.
+func WithScratchRoot(value string) Option {
+	return func(o *StreamingOrchestrator) error {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%w: ScratchRoot cannot be empty", ErrInvalidOrchestrator)
+		}
+		if !filepath.IsAbs(value) {
+			return fmt.Errorf("%w: ScratchRoot must be absolute: %s", ErrInvalidOrchestrator, value)
+		}
+		o.scratchRoot = value
+		return nil
+	}
+}
+
 // WithSessionObserver attaches the bounded same-process state-watch tap.
 func WithSessionObserver(value *watch.Service) Option {
 	return interfaceOption("SessionObserver", value, func(o *StreamingOrchestrator, value *watch.Service) { o.sessionObserver = value })
+}
+
+// StreamLimits bounds provider stream accumulation: the chunk count and the
+// cumulative encoded-JSON byte budget receiveModelStream accepts before
+// failing closed with a typed stream_limit_exceeded error.
+type StreamLimits struct {
+	MaxChunks int
+	MaxBytes  int
+}
+
+// defaultStreamLimits returns the production stream accumulation bounds:
+// up to 1<<20 chunks and 8 MiB of encoded chunk bytes.
+func defaultStreamLimits() StreamLimits {
+	return StreamLimits{MaxChunks: 1 << 20, MaxBytes: 8 << 20}
+}
+
+// WithStreamLimits overrides the default provider stream accumulation
+// bounds. Both fields must be positive.
+func WithStreamLimits(value StreamLimits) Option {
+	return func(o *StreamingOrchestrator) error {
+		if value.MaxChunks <= 0 || value.MaxBytes <= 0 {
+			return fmt.Errorf("%w: StreamLimits must be positive", ErrInvalidOrchestrator)
+		}
+		o.streamLimits = value
+		return nil
+	}
 }

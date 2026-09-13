@@ -41,9 +41,9 @@ func testPostgresRuntimeOptionalReferences(t *testing.T, server *testpostgres.Se
 		t.Fatal(err)
 	}
 	request := session.ModelRequestRecord{
-		ID: "request", SessionID: run.SessionID, RunID: run.ID, AssistantMessageID: "future-assistant",
+		ID: "request", SessionID: run.SessionID, RunID: run.ID, AssistantMessageID: "future-assistant", InvocationID: "request-invocation",
 		State: session.ModelRequestPrepared, Messages: json.RawMessage(`[]`), Tools: json.RawMessage(`[]`),
-		SafeCallConfig: json.RawMessage(`{}`), CreatedAt: now, UpdatedAt: now,
+		Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{}`), CreatedAt: now, UpdatedAt: now,
 	}
 	if _, err := execution.CreateModelRequest(f.ctx, request); err != nil {
 		t.Fatal(err)

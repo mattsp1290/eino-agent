@@ -18,8 +18,8 @@ func assertConcurrentKeyedAdmission(t *testing.T, ctx context.Context, stores []
 		t.Fatal("concurrency test requires independent stores")
 	}
 	ids := &sequenceIDs{}
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	})
 	newOrchestrator := func(target session.Store) *StreamingOrchestrator {
 		return mustConfiguredOrchestrator(
@@ -27,7 +27,7 @@ func assertConcurrentKeyedAdmission(t *testing.T, ctx context.Context, stores []
 			WithIDGenerator(ids), WithRunPlanProvider(emptyTestRunPlanProvider()),
 		)
 	}
-	request := Request{SessionID: sessionID, AdmissionKey: "same-event", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: sessionID, AdmissionKey: "same-event", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)}
 	results := make(chan AdmissionResult, contenders)
 	errs := make(chan error, contenders)
 	start := make(chan struct{})
@@ -56,7 +56,7 @@ func assertConcurrentKeyedAdmission(t *testing.T, ctx context.Context, stores []
 	for result := range results {
 		if result.Disposition == AdmissionNew {
 			newCount++
-			<-result.Handle.Done()
+			<-result.Done()
 		}
 		if receipt == (session.AdmissionReceipt{}) {
 			receipt = result.Receipt

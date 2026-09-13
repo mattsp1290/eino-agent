@@ -51,7 +51,7 @@ func (invalidResolvedModel) Resolve(context.Context, model.Selection, model.Runt
 }
 
 func TestKeyedAdmissionRechecksAfterPlanAndResolvedValidationFailures(t *testing.T) {
-	request := Request{SessionID: "recheck", AdmissionKey: "event-recheck", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: "recheck", AdmissionKey: "event-recheck", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)}
 	fingerprint, err := fingerprintAdmission(frozenRequest(request))
 	if err != nil {
 		t.Fatal(err)
@@ -81,7 +81,7 @@ func TestKeyedAdmissionRechecksAfterPlanAndResolvedValidationFailures(t *testing
 }
 
 func TestKeyedAdmissionMasksFailedRecoveryLookup(t *testing.T) {
-	request := Request{SessionID: "unknown", AdmissionKey: "event-unknown", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: "unknown", AdmissionKey: "event-unknown", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)}
 	store := &sequencedLookupStore{Store: newAdmissionStore(), err: errors.New("private driver details")}
 	orch := mustConfiguredOrchestrator(
 		WithStore(store), WithModelResolver(&countingResolver{}), WithIDGenerator(&sequenceIDs{}),
@@ -107,8 +107,8 @@ func (r *countingResolver) Resolve(_ context.Context, selection model.Selection,
 	return model.Resolved{
 		Provider: model.Provider{ID: selection.ProviderID},
 		Model:    model.Descriptor{ID: selection.ModelID, ProviderID: selection.ProviderID},
-		Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		}),
 	}, nil
 }
@@ -120,7 +120,7 @@ func TestKeyedAdmissionReturnsReceiptWithoutSecondResolution(t *testing.T) {
 		WithStore(store), WithModelResolver(resolver), WithIDGenerator(&sequenceIDs{}),
 		WithRunPlanProvider(emptyTestRunPlanProvider()),
 	)
-	request := Request{SessionID: "keyed", AdmissionKey: "event-42", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: "keyed", AdmissionKey: "event-42", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)}
 	first, err := orch.Start(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -128,7 +128,7 @@ func TestKeyedAdmissionReturnsReceiptWithoutSecondResolution(t *testing.T) {
 	if first.Disposition != AdmissionNew || first.Handle == nil || first.Receipt.Key != request.AdmissionKey {
 		t.Fatalf("first = %#v", first)
 	}
-	<-first.Handle.Done()
+	<-first.Done()
 
 	duplicate, err := orch.Start(context.Background(), request)
 	if err != nil {
@@ -148,16 +148,16 @@ func TestKeyedAdmissionReturnsReceiptWithoutSecondResolution(t *testing.T) {
 
 func TestKeyedAdmissionConflictDoesNotExposePayload(t *testing.T) {
 	store := newAdmissionStore()
-	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 	}))
-	request := Request{SessionID: "keyed-conflict", AdmissionKey: "event-43", Message: UserMessage{Content: "first private prompt"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: "keyed-conflict", AdmissionKey: "event-43", Message: TextUserMessage("first private prompt"), Config: keyedAdmissionConfig(t)}
 	first, err := orch.Start(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-first.Handle.Done()
-	request.Message.Content = "second private prompt"
+	<-first.Done()
+	request.Message = TextUserMessage("second private prompt")
 	_, err = orch.Start(context.Background(), request)
 	if !errors.Is(err, session.ErrAdmissionConflict) {
 		t.Fatalf("error = %v", err)

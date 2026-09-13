@@ -91,6 +91,8 @@ Allowed by default:
 - total latency and first-token latency;
 - token usage counts;
 - tool name, kind, and status;
+- provider-facing tool call ID (`tool_call.provider_id` → `metadata.provider_call_id`,
+  tool observations only, when the provider supplied one);
 - error operation, classification, retryable, canceled, and dropped flags;
 - correlation IDs listed above.
 

@@ -71,14 +71,14 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 	}
 	if _, err := execution.AppendPart(ctx, session.Part{
 		ID: "restart-user-part", MessageID: user.ID, SessionID: sessionID, RunID: runID,
-		Kind: session.PartText, Ordinal: 0, Payload: json.RawMessage(`{"text":"restart history"}`),
+		Kind: session.PartUserInputText, Ordinal: 0, Payload: json.RawMessage(`{"text":{"text":"restart history"}}`),
 		CreatedAt: user.CreatedAt, UpdatedAt: user.UpdatedAt,
 	}); err != nil {
 		t.Fatalf("append user part: %v", err)
 	}
 	if _, err := execution.AppendPart(ctx, session.Part{
 		ID: "restart-assistant-part", MessageID: assistant.ID, SessionID: sessionID, RunID: runID,
-		Kind: session.PartText, Ordinal: 0, Payload: json.RawMessage(`{"text":"committed answer"}`),
+		Kind: session.PartAssistantGenText, Ordinal: 0, Payload: json.RawMessage(`{"text":{"text":"committed answer"}}`),
 		CreatedAt: assistant.CreatedAt, UpdatedAt: assistant.UpdatedAt,
 	}); err != nil {
 		t.Fatalf("append assistant part: %v", err)
@@ -93,21 +93,22 @@ func testPostgresRestartCase(t *testing.T, server *testpostgres.Server, containe
 		Input: json.RawMessage(`{"text":"pending across restart"}`), Status: session.ToolCallPending,
 		RetrySafe: true, Metadata: map[string]string{"fixture": "restart"},
 	}
+	requestPart := postgresToolRequestPart(call.RequestPartID, assistant.ID, sessionID, runID, call.ID, call.Name, call.Input, now.Add(3*time.Nanosecond))
+	requestPart.Ordinal = 1
 	created, err := execution.CreateToolCall(ctx, session.CreateToolCallRequest{
-		Call: call,
-		RequestPart: session.Part{ID: call.RequestPartID, MessageID: assistant.ID, SessionID: sessionID, RunID: runID, Kind: session.PartToolCall, Ordinal: 1,
-			Payload: json.RawMessage(`{"id":"restart-tool","name":"echo","arguments":{"text":"pending across restart"}}`), CreatedAt: now.Add(3 * time.Nanosecond), UpdatedAt: now.Add(3 * time.Nanosecond)},
-		Event: session.ToolTransitionEvent{ID: "restart-tool-pending", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now.Add(3 * time.Nanosecond)},
+		Call:        call,
+		RequestPart: requestPart,
+		Event:       session.ToolTransitionEvent{ID: "restart-tool-pending", ProviderID: run.ProviderID, ModelID: run.ModelID, CreatedAt: now.Add(3 * time.Nanosecond)},
 	})
 	if err != nil {
 		t.Fatalf("create pending tool: %v", err)
 	}
 	call = created.Call
 	request := session.ModelRequestRecord{
-		ID: "restart-model-request", SessionID: sessionID, RunID: runID, AssistantMessageID: assistant.ID,
+		ID: "restart-model-request", SessionID: sessionID, RunID: runID, AssistantMessageID: assistant.ID, InvocationID: "restart-invocation",
 		Attempt: 0, Step: 1, ProviderID: run.ProviderID, ModelID: run.ModelID, State: session.ModelRequestPrepared,
 		Messages: json.RawMessage(`[{"role":"user","content":"restart history"}]`), System: "restart system",
-		Tools: json.RawMessage(`[{"name":"echo"}]`), SafeCallConfig: json.RawMessage(`{"mode":"safe"}`),
+		Tools: json.RawMessage(`[{"name":"echo"}]`), Controls: json.RawMessage(`null`), SafeCallConfig: json.RawMessage(`{"mode":"safe"}`),
 		ContentSHA256: "restart-content", ExtensionPlanHash: plan.Fingerprint, CreatedAt: now.Add(4 * time.Nanosecond), UpdatedAt: now.Add(4 * time.Nanosecond),
 	}
 	if _, err := execution.CreateModelRequest(ctx, request); err != nil {

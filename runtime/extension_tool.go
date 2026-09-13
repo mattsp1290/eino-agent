@@ -3,10 +3,12 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"reflect"
+	"unicode/utf8"
 
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/eino-contrib/jsonschema"
@@ -177,10 +179,16 @@ func sameProtectedToolInfo(left, right *einoschema.ToolInfo) bool {
 	if left == nil || right == nil {
 		return left == nil && right == nil
 	}
-	leftRaw, leftErr := json.Marshal(left)
-	rightRaw, rightErr := json.Marshal(right)
+	// Eino v0.9.19 ToolInfo marshals ParamsOneOf natively and distinguishes the
+	// params form from the JSON-schema form. Protected clones normalize to the
+	// JSON-schema form, so compare the converted schema separately from the
+	// remaining fields.
 	leftSchema, leftSchemaErr := protectedParamsOneOfJSON(left.ParamsOneOf)
 	rightSchema, rightSchemaErr := protectedParamsOneOfJSON(right.ParamsOneOf)
+	leftInfo, rightInfo := *left, *right
+	leftInfo.ParamsOneOf, rightInfo.ParamsOneOf = nil, nil
+	leftRaw, leftErr := json.Marshal(&leftInfo)
+	rightRaw, rightErr := json.Marshal(&rightInfo)
 	return leftErr == nil && rightErr == nil && leftSchemaErr == nil && rightSchemaErr == nil && bytes.Equal(leftRaw, rightRaw) && bytes.Equal(leftSchema, rightSchema)
 }
 
@@ -210,12 +218,59 @@ func validateToolResult(result ToolResult) error {
 	if len(result.Structured) != 0 && !json.Valid(result.Structured) {
 		return errors.New("invalid structured tool result")
 	}
+	if len(result.Parts) != 0 && (result.Output != "" || len(result.Structured) != 0) {
+		return errors.New("enhanced tool result parts are authoritative and must not also carry Output/Structured")
+	}
+	for index, part := range result.Parts {
+		if err := validateToolResultPart(part); err != nil {
+			return fmt.Errorf("tool result part %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateToolResultPart(part ToolResultPart) error {
+	switch part.Type {
+	case ToolResultPartText:
+		if part.Media != nil || len(part.ToolSearch) != 0 {
+			return errors.New("text part must carry only Text")
+		}
+	case ToolResultPartImage, ToolResultPartAudio, ToolResultPartVideo, ToolResultPartFile:
+		if part.Media == nil {
+			return errors.New("media part requires Media")
+		}
+		if (part.Media.URL != "") == (part.Media.Base64Data != "") {
+			return errors.New("media part requires exactly one of URL or Base64Data")
+		}
+		if part.Media.Base64Data != "" {
+			if _, err := base64.StdEncoding.Strict().DecodeString(part.Media.Base64Data); err != nil {
+				return errors.New("media part base64 payload is invalid")
+			}
+		}
+		if part.Media.Name != "" && part.Type != ToolResultPartFile {
+			return errors.New("only a file part may carry a media Name")
+		}
+		if part.Media.MIMEType != "" && !session.ValidMIMEType(part.Media.MIMEType) {
+			return errors.New("media part MIME type is invalid")
+		}
+		if !utf8.ValidString(part.Media.URL) || !utf8.ValidString(part.Media.Name) {
+			return errors.New("media part URL and Name must be valid UTF-8")
+		}
+	case ToolResultPartToolSearch:
+		if len(part.ToolSearch) != 0 && !json.Valid(part.ToolSearch) {
+			return errors.New("tool_search part payload is not valid JSON")
+		}
+	default:
+		return fmt.Errorf("unknown tool result part type %q", part.Type)
+	}
 	return nil
 }
 
 func cloneToolChecked(tool Tool) (Tool, error) {
 	tool.Scope.Permissions = cloneSlice(tool.Scope.Permissions)
 	tool.Metadata = cloneStringMap(tool.Metadata)
+	tool.Aliases = cloneSlice(tool.Aliases)
+	tool.ArgumentAliases = cloneArgumentAliasesMap(tool.ArgumentAliases)
 	if tool.Info != nil {
 		params, paramsErr := cloneProtectedParamsOneOf(tool.Info.ParamsOneOf)
 		raw, err := json.Marshal(tool.Info)
@@ -295,7 +350,36 @@ func cloneRuntimeToolResult(result ToolResult) ToolResult {
 	result.Structured = cloneJSON(result.Structured)
 	result.Attachments = cloneAttachments(result.Attachments)
 	result.Metadata = cloneStringMap(result.Metadata)
+	result.Parts = cloneToolResultPartsChecked(result.Parts)
 	return result
+}
+
+func cloneToolResultPartsChecked(parts []ToolResultPart) []ToolResultPart {
+	if parts == nil {
+		return nil
+	}
+	cloned := make([]ToolResultPart, len(parts))
+	for index, part := range parts {
+		next := part
+		if part.Media != nil {
+			media := *part.Media
+			next.Media = &media
+		}
+		next.ToolSearch = cloneJSON(part.ToolSearch)
+		cloned[index] = next
+	}
+	return cloned
+}
+
+func cloneArgumentAliasesMap(src map[string][]string) map[string][]string {
+	if src == nil {
+		return nil
+	}
+	dst := make(map[string][]string, len(src))
+	for key, value := range src {
+		dst[key] = cloneSlice(value)
+	}
+	return dst
 }
 
 func cloneAttachments(attachments []Attachment) []Attachment {

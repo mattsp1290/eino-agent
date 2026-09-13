@@ -26,9 +26,9 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 	removeProbe := installRuntimeAdmissionOrderProbe(t, f)
 
 	var calls atomic.Int32
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls.Add(1)
-		return []*einoschema.Message{einoschema.AssistantMessage("postgres answer", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("postgres answer")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(f.store), WithModelResolver(resolvedModel{streamer: streamer}),
@@ -53,7 +53,7 @@ func testPostgresRuntimeAdmission(t *testing.T, server *testpostgres.Server) {
 		t.Fatal(err)
 	}
 	admission, err := orchestrator.Start(f.ctx, Request{
-		SessionID: sessionID, Message: UserMessage{Content: "postgres question"},
+		SessionID: sessionID, Message: TextUserMessage("postgres question"),
 		Config: orchestratorConfig(), Metadata: map[string]string{"source": "postgres"},
 	})
 	if err != nil {
@@ -97,9 +97,9 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 	f := newPostgresRuntimeFixture(t, server)
 	removeProbe := installRuntimeAdmissionRollbackTrigger(t, f)
 	var calls atomic.Int32
-	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		calls.Add(1)
-		return []*einoschema.Message{einoschema.AssistantMessage("retry answer", nil)}, nil
+		return []*einoschema.AgenticMessage{agenticAssistantText("retry answer")}, nil
 	})
 	orchestrator, err := NewStreamingOrchestrator(
 		WithStore(f.store), WithModelResolver(resolvedModel{streamer: streamer}),
@@ -110,7 +110,7 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 		t.Fatal(err)
 	}
 	_, err = orchestrator.Start(f.ctx, Request{
-		SessionID: "postgres-admission-rollback", Message: UserMessage{Content: "failed question"},
+		SessionID: "postgres-admission-rollback", Message: TextUserMessage("failed question"),
 		Config: orchestratorConfig(),
 	})
 	var pgErr *pgconn.PgError
@@ -124,7 +124,7 @@ func testPostgresRuntimeAdmissionRollback(t *testing.T, server *testpostgres.Ser
 	removeProbe()
 
 	admission, err := orchestrator.Start(f.ctx, Request{
-		SessionID: "postgres-admission-rollback", Message: UserMessage{Content: "retry question"},
+		SessionID: "postgres-admission-rollback", Message: TextUserMessage("retry question"),
 		Config: orchestratorConfig(),
 	})
 	if err != nil {
@@ -154,9 +154,21 @@ func assertPostgresAdmissionGraph(t *testing.T, f *postgresRuntimeFixture, sessi
 	if err != nil || len(epochs) != 1 || epochs[0].ID != "epoch-1" || epochs[0].SessionID != sessionID {
 		t.Fatalf("epoch count=%d err=%v", len(epochs), err)
 	}
+	// A completed run now durably records its turn's admission and normal
+	// completion (session.TurnStartedEventKind/TurnCompletedEventKind)
+	// alongside the run-level start/finish pair, reflecting the durable
+	// turn model -- not just the two run-level events a pre-turn-model run
+	// used to produce. W7 item 2 adds a message_committed notification
+	// right after persistAssistantTurn commits the assistant message's
+	// content, before the turn itself completes.
 	events, err := f.store.ListEvents(f.ctx, sessionID, session.EventCursor{Limit: 100})
-	if err != nil || len(events.Events) != 2 || events.Events[0].Kind != EventRunStarted || events.Events[0].EpochID != epochs[0].ID || events.Events[0].MessageID != assistant.ID || events.Events[1].Kind != EventRunFinished {
-		t.Fatalf("event count=%d err=%v", len(events.Events), err)
+	if err != nil || len(events.Events) != 5 ||
+		events.Events[0].Kind != EventRunStarted || events.Events[0].EpochID != epochs[0].ID || events.Events[0].MessageID != assistant.ID ||
+		events.Events[1].Kind != session.TurnStartedEventKind || events.Events[1].TurnID == "" ||
+		events.Events[2].Kind != session.MessageCommittedEventKind || events.Events[2].MessageID != assistant.ID || events.Events[2].TurnID != events.Events[1].TurnID ||
+		events.Events[3].Kind != session.TurnCompletedEventKind || events.Events[3].TurnID != events.Events[1].TurnID ||
+		events.Events[4].Kind != EventRunFinished {
+		t.Fatalf("event count=%d err=%v events=%#v", len(events.Events), err, events.Events)
 	}
 	observation, err := f.store.ReadObservationSnapshot(f.ctx, sessionID, session.ObservationLimits{MaxMessages: 10, MaxTools: 10, MaxParts: 20, MaxSnapshotBytes: 1 << 20, MaxTextBytes: 1 << 20})
 	if err != nil || len(observation.Messages) != 2 || observation.Messages[0].Text != userText || observation.Messages[1].Text != assistantText {
@@ -181,6 +193,12 @@ CREATE TRIGGER runtime_admission_order_probe BEFORE INSERT ON public.runs FOR EA
 	return remove
 }
 
+// installRuntimeAdmissionRollbackTrigger's witness checks part id
+// 'part-2', not 'part-1': reverseAdmissionIDs.NewPartID() is called once by
+// assignContentBlockIDs to mint the block's own ContentBlock.ID ("part-1")
+// and once more, independently, by partIDsFromBlocks to mint the durable
+// Part ID actually stored in parts.id ("part-2") — block identity and part
+// identity are deliberately separate durable identifiers.
 func installRuntimeAdmissionRollbackTrigger(t *testing.T, f *postgresRuntimeFixture) func() {
 	t.Helper()
 	remove := registerRuntimeAdmissionTriggerCleanup(t, f)
@@ -188,7 +206,7 @@ func installRuntimeAdmissionRollbackTrigger(t *testing.T, f *postgresRuntimeFixt
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM public.context_epochs WHERE id = convert_to('epoch-1', 'UTF8')) OR
      NOT EXISTS (SELECT 1 FROM public.messages WHERE id = convert_to('z-user-1', 'UTF8') AND role = 'user') OR
-     NOT EXISTS (SELECT 1 FROM public.parts WHERE id = convert_to('part-1', 'UTF8') AND kind = 'text') OR
+     NOT EXISTS (SELECT 1 FROM public.parts WHERE id = convert_to('part-2', 'UTF8') AND kind = 'user_input_text') OR
      NOT EXISTS (SELECT 1 FROM public.messages WHERE id = convert_to('a-assistant-1', 'UTF8') AND role = 'assistant') THEN
     RAISE EXCEPTION 'runtime admission order witness missing' USING ERRCODE = 'P0001';
   END IF;

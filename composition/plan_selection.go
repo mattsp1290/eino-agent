@@ -2,7 +2,11 @@ package composition
 
 import (
 	"context"
+	"fmt"
 	"sort"
+
+	"github.com/cloudwego/eino/adk"
+	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -68,6 +72,26 @@ func newPlanSelection(target extension.Scope, selectTool planToolSelector, value
 	return selection
 }
 
+// toolSearchConfig returns the single active tool-search configuration
+// across every selected component, or nil if none is registered. More than
+// one active registration (even across different components) is rejected
+// here, before runtime.NewRunPlan ever sees the spec.
+func (s planSelection) toolSearchConfig() (*runtime.ToolSearchConfig, error) {
+	var found *runtime.ToolSearchConfig
+	for _, mounted := range s.componentsSet {
+		for _, registration := range mounted.payload.toolSearch {
+			if !extension.ScopeApplies(registration.Scope, s.target) {
+				continue
+			}
+			if found != nil {
+				return nil, fmt.Errorf("%w: more than one tool search registration is active", runtime.ErrExtensionPlanMismatch)
+			}
+			found = &runtime.ToolSearchConfig{Name: registration.Name, Description: registration.Description}
+		}
+	}
+	return found, nil
+}
+
 func (s planSelection) components() []runtime.PlanComponent {
 	result := make([]runtime.PlanComponent, 0, len(s.componentsSet))
 	for _, mounted := range s.componentsSet {
@@ -80,6 +104,7 @@ func (s planSelection) components() []runtime.PlanComponent {
 			owned.Tools = append(owned.Tools, runtime.PlanTool{
 				Name: registration.Definition.Name, RegistrationID: registration.ID, Scope: registration.Scope,
 				SchemaHash: registration.schemaHash, ExecutorHash: registration.executorHash, Order: registration.Order,
+				Aliases: registration.Definition.Aliases, ArgumentAliases: registration.Definition.ArgumentAliases, Deferred: registration.Definition.Deferred,
 				Resolve: func(ctx context.Context, scope runtime.ToolScopeContext) (runtime.Tool, error) {
 					return tools.Materialize(ctx, definition, scope)
 				},
@@ -111,7 +136,21 @@ func (s planSelection) components() []runtime.PlanComponent {
 				})
 			}
 		}
-		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions) > 0 {
+		for _, registration := range mounted.payload.handlers {
+			if !extension.ScopeApplies(registration.Scope, s.target) {
+				continue
+			}
+			factory := registration.Factory
+			callbackContext := mounted.callbackContext
+			owned.AgentHandlers = append(owned.AgentHandlers, runtime.PlanAgentHandler{
+				ID: registration.ID, Order: registration.Order, Scope: registration.Scope,
+				Kind: registration.Descriptor.Kind, Version: registration.Descriptor.Version, ConfigHash: registration.configHash,
+				Factory: func(ctx context.Context, build runtime.HandlerBuildContext) (adk.TypedChatModelAgentMiddleware[*einoschema.AgenticMessage], error) {
+					return factory(callbackContext(ctx), build)
+				},
+			})
+		}
+		if len(owned.Tools)+len(owned.Prompts)+len(owned.Guards)+len(owned.Restrictions)+len(owned.AgentHandlers) > 0 {
 			result = append(result, owned)
 		}
 	}

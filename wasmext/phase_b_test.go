@@ -12,13 +12,15 @@ import (
 
 	einoschema "github.com/cloudwego/eino/schema"
 
+	"go.bytecodealliance.org/cm"
+
 	"github.com/mattsp1290/eino-agent/composition"
 	"github.com/mattsp1290/eino-agent/config"
 	"github.com/mattsp1290/eino-agent/extension"
 	"github.com/mattsp1290/eino-agent/model"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
-	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.1.0/types"
+	wittypes "github.com/mattsp1290/eino-agent/wasmext/gen/eino-agent/extensions/v0.2.0/types"
 )
 
 func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
@@ -31,9 +33,9 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 		if turn.RunID != "run-1" || turn.MessageCount != 1 || strings.Contains(turn.AgentName, "SECRET") {
 			t.Fatalf("bounded turn = %#v", turn)
 		}
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{
-			{Role: wittypes.TextRoleSystem, Text: "policy"},
-			{Role: wittypes.TextRoleUser, Text: "context"},
+		*output.(*[]wittypes.Message) = []wittypes.Message{
+			textOnlyMessage(wittypes.TextRoleSystem, "policy"),
+			textOnlyMessage(wittypes.TextRoleUser, "context"),
 		}
 		return nil
 	}
@@ -46,16 +48,172 @@ func TestContextSourceMapsOnlyBoundedPlainText(t *testing.T) {
 	messages, err := source.loadBoundedContext(context.Background(), runtime.BoundedTurnMetadata{
 		RunID: "run-1", SessionID: "session-1", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1},
 	})
-	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.System || messages[1].Content != "context" {
+	if err != nil || len(messages) != 2 || messages[0].Role != einoschema.AgenticRoleTypeSystem || agenticMessageText(messages[1]) != "context" {
 		t.Fatalf("LoadContext = %#v, %v", messages, err)
+	}
+}
+
+// TestConvertContentBlockCases is the fake-component-free table test I5/I6
+// asked for: every content-block case convertContentBlock/convertMediaReference
+// can be handed, including MIME classification, an empty/oversized/
+// non-UTF8/disallowed-scheme URI, and both OBSERVATION-only cases
+// (function-call, function-result-text) that a context-source guest must
+// never be allowed to produce.
+func TestConvertContentBlockCases(t *testing.T) {
+	cases := []struct {
+		name    string
+		block   wittypes.ContentBlock
+		wantErr bool
+		check   func(t *testing.T, block *einoschema.ContentBlock)
+	}{
+		{
+			name:  "text",
+			block: wittypes.ContentBlockText("hello"),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputText == nil || block.UserInputText.Text != "hello" {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference image",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/pic.png", MIMEType: "image/png"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputImage == nil || block.UserInputImage.URL != "https://example.com/pic.png" || block.UserInputImage.MIMEType != "image/png" {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference audio",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/clip.mp3", MIMEType: "audio/mpeg"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputAudio == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference video",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/clip.mp4", MIMEType: "video/mp4"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputVideo == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			name:  "media-reference unrecognized MIME becomes an opaque file reference",
+			block: wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/doc.bin", MIMEType: "application/octet-stream"}),
+			check: func(t *testing.T, block *einoschema.ContentBlock) {
+				if block.UserInputFile == nil {
+					t.Fatalf("block = %#v", block)
+				}
+			},
+		},
+		{
+			// Round-two W6 review item 13 / RA I8: the WIT's own doc
+			// comment on media-reference states its uri and mime-type are
+			// BOTH required; the host must enforce this itself (WIT's type
+			// system cannot express "non-empty string"). An empty
+			// mime-type previously fell through silently to a
+			// UserInputFile with MIMEType: "" instead of being rejected.
+			name:    "media-reference empty MIME is rejected (required per the WIT contract)",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/x", MIMEType: ""}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference empty URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "", MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference oversized URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/" + strings.Repeat("a", maxMediaReferenceURIBytes), MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference non-UTF8 URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "https://example.com/\xff\xfe", MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference data scheme rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "data:image/png;base64,AAAA", MIMEType: "image/png"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference file scheme rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "file:///etc/passwd", MIMEType: "text/plain"}),
+			wantErr: true,
+		},
+		{
+			name:    "media-reference relative URI rejected",
+			block:   wittypes.ContentBlockMediaReference(wittypes.MediaReference{URI: "/etc/passwd", MIMEType: "text/plain"}),
+			wantErr: true,
+		},
+		{
+			name:    "function-call rejected (observation-only, not valid for context-source)",
+			block:   wittypes.ContentBlockFunctionCall(wittypes.FunctionCallBlock{CallID: "call-1", Name: "tool", ArgumentsJSON: "{}"}),
+			wantErr: true,
+		},
+		{
+			name:    "function-result-text rejected (observation-only, not valid for context-source)",
+			block:   wittypes.ContentBlockFunctionResultText(wittypes.FunctionResultTextBlock{CallID: "call-1", Text: "result"}),
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			converted, _, err := convertContentBlock(tc.block)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			tc.check(t, converted)
+		})
+	}
+}
+
+// TestLoadContextMetadataRejectsUnauthorizedBlocksBeforeMutation proves the
+// rejection happens through the real loadContextMetadata call path (not
+// just the unit-level convertContentBlock), and before any message is
+// appended: a fake component returning a function-call block must produce
+// zero messages and a contract error, not a partially-built message list.
+func TestLoadContextMetadataRejectsUnauthorizedBlocksBeforeMutation(t *testing.T) {
+	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
+		*output.(*[]wittypes.Message) = []wittypes.Message{
+			textOnlyMessage(wittypes.TextRoleSystem, "before"),
+			{Role: wittypes.TextRoleUser, Blocks: cm.ToList([]wittypes.ContentBlock{wittypes.ContentBlockFunctionCall(wittypes.FunctionCallBlock{CallID: "c1", Name: "n", ArgumentsJSON: "{}"})})},
+		}
+		return nil
+	}}
+	module, err := loadModule(context.Background(), fixtureConfig(t, []byte("context")), contextSourceContract, fakeFactory(component))
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := &loadedContextSource{module: module, component: component}
+	defer func() { _ = source.close() }()
+	messages, err := source.loadBoundedContext(context.Background(), runtime.BoundedTurnMetadata{RunID: "run-1", SessionID: "session-1"})
+	if err == nil {
+		t.Fatalf("expected a rejection, got messages = %#v", messages)
+	}
+	var extensionErr *Error
+	if !errors.As(err, &extensionErr) || extensionErr.Kind != ErrorContract {
+		t.Fatalf("err = %v, want a *Error with Kind == ErrorContract", err)
 	}
 }
 
 func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 	component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{
-			{Role: wittypes.TextRoleUser, Text: "wasm-user"},
-			{Role: wittypes.TextRoleSystem, Text: "wasm-system"},
+		*output.(*[]wittypes.Message) = []wittypes.Message{
+			textOnlyMessage(wittypes.TextRoleUser, "wasm-user"),
+			textOnlyMessage(wittypes.TextRoleSystem, "wasm-system"),
 		}
 		return nil
 	}}
@@ -78,11 +236,16 @@ func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 	}
 	defer func() { _ = storePool.Close() }()
 	var messages []string
-	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+	streamer := wasmScriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 		for _, message := range request.Messages {
-			messages = append(messages, message.Content)
+			messages = append(messages, agenticMessageText(message))
 		}
-		return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		return []*einoschema.AgenticMessage{{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "done"}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}}, nil
 	})
 	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
 	orchestrator, err := runtime.NewStreamingOrchestrator(
@@ -95,13 +258,13 @@ func TestWasmContextSourceReachesProviderInCanonicalOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	admission, err := orchestrator.Start(context.Background(), runtime.Request{
-		SessionID: "session-a", Message: runtime.UserMessage{Content: "base-user"},
+		SessionID: "session-a", Message: runtime.TextUserMessage("base-user"),
 		Config: config.Snapshot{Agent: config.Agent{Name: "agent", Model: selection, Options: map[string]string{}}, Model: selection, Metadata: map[string]string{"workspace_root": t.TempDir()}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result := <-admission.Handle.Done(); result.Error != nil {
+	if result := <-admission.Done(); result.Error != nil {
 		t.Fatal(result.Error)
 	}
 	want := []string{"wasm-system", "base-user", "wasm-user"}
@@ -316,7 +479,7 @@ func TestRegisteredContextSourcesRetainComponentOwnership(t *testing.T) {
 	for _, instanceID := range []string{"context-one", "context-two"} {
 		instanceID := instanceID
 		component := &fakeComponent{call: func(_ context.Context, _ string, _ any, output any) error {
-			*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleUser, Text: instanceID}}
+			*output.(*[]wittypes.Message) = []wittypes.Message{textOnlyMessage(wittypes.TextRoleUser, instanceID)}
 			return nil
 		}}
 		module, err := loadModule(context.Background(), fixtureConfig(t, []byte(instanceID)), contextSourceContract, fakeFactory(component))
@@ -383,7 +546,7 @@ func TestPhaseBContractsAndLoaderClose(t *testing.T) {
 	component := &fakeComponent{call: func(_ context.Context, operation string, _ any, output any) error {
 		switch operation {
 		case "context-source.load-context":
-			*output.(*[]wittypes.TextMessage) = nil
+			*output.(*[]wittypes.Message) = nil
 		case "tool-middleware.before-tool-call", "tool-middleware.after-tool-call":
 			*output.(*wittypes.Replacement) = wittypes.ReplacementUnchanged()
 		}
@@ -548,7 +711,7 @@ func TestRegisteredEventObserverReportsModuleFailure(t *testing.T) {
 func contextSourceFakeComponent() *fakeComponent {
 	return &fakeComponent{call: func(_ context.Context, operation string, _ any, output any) error {
 		if operation == "context-source.load-context" {
-			*output.(*[]wittypes.TextMessage) = nil
+			*output.(*[]wittypes.Message) = nil
 		}
 		return nil
 	}}
@@ -558,7 +721,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	var contextTurn wittypes.TurnMetadata
 	contextComponent := &fakeComponent{call: func(_ context.Context, _ string, input any, output any) error {
 		contextTurn = input.(wittypes.TurnMetadata)
-		*output.(*[]wittypes.TextMessage) = []wittypes.TextMessage{{Role: wittypes.TextRoleUser, Text: "from-wasm"}}
+		*output.(*[]wittypes.Message) = []wittypes.Message{textOnlyMessage(wittypes.TextRoleUser, "from-wasm")}
 		return nil
 	}}
 	contextModule, err := loadModule(context.Background(), fixtureConfig(t, []byte("point-context")), contextSourceContract, fakeFactory(contextComponent))
@@ -593,7 +756,7 @@ func TestPhaseBWrappersUseNativeRuntimePoints(t *testing.T) {
 	}
 	metadata := runtime.BoundedTurnMetadata{RunID: "run", SessionID: "session", EpochID: "epoch", AgentName: "agent", AgentMode: "primary", ProviderID: "provider", ModelID: "model", MessageCount: 1, RoleCounts: runtime.MessageRoleCounts{User: 1}, HasSystemPrompt: true}
 	messages, err := source.loadBoundedContext(context.Background(), metadata)
-	if err != nil || len(messages) != 1 || messages[0].Content != "from-wasm" {
+	if err != nil || len(messages) != 1 || agenticMessageText(messages[0]) != "from-wasm" {
 		t.Fatalf("context messages = %#v, %v", messages, err)
 	}
 	if contextTurn.AgentName != "agent" || contextTurn.AgentMode != "primary" || contextTurn.ProviderID != "provider" || contextTurn.ModelID != "model" || !contextTurn.HasSystemPrompt || contextTurn.RoleCounts.User != 1 {

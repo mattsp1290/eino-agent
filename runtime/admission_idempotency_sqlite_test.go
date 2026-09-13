@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -12,6 +13,38 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
+func TestSQLiteKeyedAdmissionReceiptFailureRollsBackCompleteTurnGraph(t *testing.T) {
+	ctx := t.Context()
+	store, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "receipt-rollback.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = pool.Close() }()
+	if _, err := pool.ExecContext(ctx, `CREATE TRIGGER fail_admission_receipt BEFORE INSERT ON admission_receipts BEGIN SELECT RAISE(FAIL, 'receipt failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	orch := mustConfiguredOrchestrator(
+		WithStore(store), WithModelResolver(&countingResolver{}), WithIDGenerator(&sequenceIDs{}),
+		WithRunPlanProvider(emptyTestRunPlanProvider()),
+	)
+	_, err = orch.Start(ctx, Request{SessionID: "receipt-rollback", AdmissionKey: "rollback-event", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)})
+	if err == nil {
+		t.Fatal("Start error=nil, want injected receipt failure")
+	}
+	for _, table := range []string{"sessions", "runs", "context_epochs", "turns", "messages", "parts", "events", "admission_receipts"} {
+		var count int
+		if scanErr := pool.QueryRowContext(ctx, "SELECT count(*) FROM "+table).Scan(&count); scanErr != nil {
+			t.Fatalf("count %s: %v", table, scanErr)
+		}
+		if count != 0 {
+			t.Fatalf("%s retained %d rows after receipt failure", table, count)
+		}
+	}
+	if _, lookupErr := store.LookupAdmission(ctx, "receipt-rollback", "rollback-event"); !errors.Is(lookupErr, session.ErrNotFound) {
+		t.Fatalf("LookupAdmission error=%v, want ErrNotFound", lookupErr)
+	}
+}
+
 func TestSQLiteKeyedAdmissionSurvivesReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "admission.db")
@@ -20,16 +53,16 @@ func TestSQLiteKeyedAdmissionSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	orch := mustConfiguredOrchestrator(
-		WithStore(store), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) {
-			return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+		WithStore(store), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		})}), WithIDGenerator(&sequenceIDs{}), WithRunPlanProvider(emptyTestRunPlanProvider()),
 	)
-	request := Request{SessionID: "reopened", AdmissionKey: "event-44", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: "reopened", AdmissionKey: "event-44", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)}
 	first, err := orch.Start(ctx, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	<-first.Handle.Done()
+	<-first.Done()
 	if err := pool.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +115,7 @@ func TestSQLiteKeyedAdmissionPreservesRenamedSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = pool.Close() }()
-	request := Request{SessionID: "renamed-keyed", AdmissionKey: "renamed-event", Message: UserMessage{Content: "hello"}, Config: keyedAdmissionConfig(t)}
+	request := Request{SessionID: "renamed-keyed", AdmissionKey: "renamed-event", Message: TextUserMessage("hello"), Config: keyedAdmissionConfig(t)}
 	namedAt := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	if _, err := store.CreateSession(ctx, session.Session{
 		ID: request.SessionID, WorkspaceID: request.Config.Metadata["workspace_id"], Directory: request.Config.Metadata["workspace_root"],
@@ -101,7 +134,7 @@ func TestSQLiteKeyedAdmissionPreservesRenamedSession(t *testing.T) {
 	if admission.Disposition != AdmissionNew || admission.Handle == nil {
 		t.Fatalf("admission=%#v", admission)
 	}
-	<-admission.Handle.Done()
+	<-admission.Done()
 	stored, err := store.GetSession(ctx, request.SessionID)
 	if err != nil || stored.Title != "Host-owned title" || !stored.UpdatedAt.Equal(namedAt) {
 		t.Fatalf("stored session=%#v err=%v", stored, err)

@@ -38,13 +38,19 @@ type admissionTools struct {
 	Disabled    []string              `json:"disabled"`
 	Permissions []admissionPermission `json:"permissions"`
 }
+type admissionFingerprintBlock struct {
+	Kind                session.BlockKind                 `json:"kind"`
+	Text                *session.TextBlock                `json:"text,omitempty"`
+	Media               *session.MediaBlock               `json:"media,omitempty"`
+	MCPApprovalResponse *session.MCPApprovalResponseBlock `json:"mcp_approval_response,omitempty"`
+}
 type admissionFingerprintPayload struct {
-	Message         string             `json:"message"`
-	Agent           admissionAgent     `json:"agent"`
-	Model           admissionSelection `json:"model"`
-	Tools           admissionTools     `json:"tools"`
-	ConfigMetadata  map[string]string  `json:"config_metadata"`
-	RequestMetadata map[string]string  `json:"request_metadata"`
+	Message         []admissionFingerprintBlock `json:"message"`
+	Agent           admissionAgent              `json:"agent"`
+	Model           admissionSelection          `json:"model"`
+	Tools           admissionTools              `json:"tools"`
+	ConfigMetadata  map[string]string           `json:"config_metadata"`
+	RequestMetadata map[string]string           `json:"request_metadata"`
 }
 
 func fingerprintSelection(value model.Selection) admissionSelection {
@@ -69,6 +75,7 @@ func emptySlice(value []string) []string { return append([]string{}, value...) }
 
 var emptyAdmissionPayloadBytes, emptyAdmissionPermissionBytes = func() (int, int) {
 	payload, payloadErr := json.Marshal(admissionFingerprintPayload{
+		Message:        []admissionFingerprintBlock{},
 		Agent:          admissionAgent{Options: map[string]string{}},
 		Tools:          admissionTools{Enabled: []string{}, Disabled: []string{}, Permissions: []admissionPermission{}},
 		ConfigMetadata: map[string]string{}, RequestMetadata: map[string]string{},
@@ -92,10 +99,23 @@ func validateAdmissionInputBudget(request Request) error {
 }
 
 func admissionInputJSONSize(request Request) (int, error) {
-	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil || len(request.Message.Content) > maxAdmissionMessageBytes {
+	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil {
+		return 0, session.ErrAdmissionInvalid
+	}
+	message, messageBytes, err := admissionFingerprintBlocks(request.Message.Blocks)
+	if err != nil || messageBytes > maxAdmissionMessageBytes {
+		return 0, session.ErrAdmissionInvalid
+	}
+	encodedMessage, err := json.Marshal(message)
+	if err != nil {
 		return 0, session.ErrAdmissionInvalid
 	}
 	used := emptyAdmissionPayloadBytes
+	if increment := len(encodedMessage) - 2; increment < 0 || used > maxAdmissionPayloadBytes-increment {
+		return 0, session.ErrAdmissionInvalid
+	} else {
+		used += increment
+	}
 	add := func(value string, emptyBytes int) bool {
 		encoded, valid := encodedJSONStringBytes(value)
 		increment := encoded - emptyBytes
@@ -106,7 +126,7 @@ func admissionInputJSONSize(request Request) (int, error) {
 		return true
 	}
 	values := []string{
-		request.Message.Content, request.Config.Agent.Name, request.Config.Agent.SystemPrompt,
+		request.Config.Agent.Name, request.Config.Agent.SystemPrompt,
 		request.Config.Agent.Mode, string(request.Config.Agent.Model.ProviderID), string(request.Config.Agent.Model.ModelID),
 		request.Config.Agent.Model.Variant, string(request.Config.Model.ProviderID), string(request.Config.Model.ModelID),
 		request.Config.Model.Variant,
@@ -196,11 +216,8 @@ func encodedJSONStringBytes(value string) (int, bool) {
 }
 
 func fingerprintAdmission(request Request) ([32]byte, error) {
-	if err := session.ValidateAdmissionKey(request.AdmissionKey); err != nil {
+	if _, err := admissionInputJSONSize(request); err != nil {
 		return [32]byte{}, err
-	}
-	if len(request.Message.Content) > maxAdmissionMessageBytes || !utf8.ValidString(request.Message.Content) {
-		return [32]byte{}, session.ErrAdmissionInvalid
 	}
 	payload := admissionFingerprintPayloadFor(request)
 	if !validAdmissionPayload(payload) {
@@ -214,8 +231,9 @@ func fingerprintAdmission(request Request) ([32]byte, error) {
 }
 
 func admissionFingerprintPayloadFor(request Request) admissionFingerprintPayload {
+	message, _, _ := admissionFingerprintBlocks(request.Message.Blocks)
 	payload := admissionFingerprintPayload{
-		Message:        request.Message.Content,
+		Message:        message,
 		Agent:          admissionAgent{Name: request.Config.Agent.Name, SystemPrompt: request.Config.Agent.SystemPrompt, Mode: request.Config.Agent.Mode, Model: fingerprintSelection(request.Config.Agent.Model), Options: emptyMap(request.Config.Agent.Options)},
 		Model:          fingerprintSelection(request.Config.Model),
 		Tools:          admissionTools{Enabled: emptySlice(request.Config.Tools.Enabled), Disabled: emptySlice(request.Config.Tools.Disabled), Permissions: []admissionPermission{}},
@@ -227,8 +245,58 @@ func admissionFingerprintPayloadFor(request Request) admissionFingerprintPayload
 	return payload
 }
 
+func admissionFingerprintBlocks(blocks []session.ContentBlock) ([]admissionFingerprintBlock, int, error) {
+	if len(blocks) > session.MaxContentLimits().MaxBlocks {
+		return nil, 0, session.ErrAdmissionInvalid
+	}
+	out := make([]admissionFingerprintBlock, 0, len(blocks))
+	rawBytes := 0
+	add := func(values ...string) bool {
+		for _, value := range values {
+			if !utf8.ValidString(value) || len(value) > maxAdmissionMessageBytes-rawBytes {
+				return false
+			}
+			rawBytes += len(value)
+		}
+		return true
+	}
+	for _, block := range blocks {
+		projected := admissionFingerprintBlock{Kind: block.Kind}
+		switch block.Kind {
+		case session.BlockKindUserInputText:
+			if block.Text == nil || !add(block.Text.Text, block.Text.Refusal) {
+				return nil, 0, session.ErrAdmissionInvalid
+			}
+			text := *block.Text
+			text.Annotations = append([]session.TextAnnotation{}, block.Text.Annotations...)
+			for _, annotation := range text.Annotations {
+				if !add(annotation.Type, annotation.Title, annotation.URL, annotation.FileID, annotation.Filename, annotation.ContainerID, annotation.CitedText, annotation.DocumentTitle) {
+					return nil, 0, session.ErrAdmissionInvalid
+				}
+			}
+			projected.Text = &text
+		case session.BlockKindUserInputImage, session.BlockKindUserInputAudio, session.BlockKindUserInputVideo, session.BlockKindUserInputFile:
+			if block.Media == nil || !add(block.Media.URL, block.Media.Base64Data, block.Media.MIMEType, block.Media.Name, block.Media.Detail) {
+				return nil, 0, session.ErrAdmissionInvalid
+			}
+			media := *block.Media
+			projected.Media = &media
+		case session.BlockKindMCPToolApprovalResponse:
+			if block.MCPApprovalResponse == nil || !add(block.MCPApprovalResponse.ApprovalRequestID, block.MCPApprovalResponse.Reason) {
+				return nil, 0, session.ErrAdmissionInvalid
+			}
+			approval := *block.MCPApprovalResponse
+			projected.MCPApprovalResponse = &approval
+		default:
+			return nil, 0, session.ErrAdmissionInvalid
+		}
+		out = append(out, projected)
+	}
+	return out, rawBytes, nil
+}
+
 func validAdmissionPayload(payload admissionFingerprintPayload) bool {
-	values := []string{payload.Message, payload.Agent.Name, payload.Agent.SystemPrompt, payload.Agent.Mode, payload.Agent.Model.ProviderID, payload.Agent.Model.ModelID, payload.Agent.Model.Variant, payload.Model.ProviderID, payload.Model.ModelID, payload.Model.Variant}
+	values := []string{payload.Agent.Name, payload.Agent.SystemPrompt, payload.Agent.Mode, payload.Agent.Model.ProviderID, payload.Agent.Model.ModelID, payload.Agent.Model.Variant, payload.Model.ProviderID, payload.Model.ModelID, payload.Model.Variant}
 	for _, item := range values {
 		if !utf8.ValidString(item) {
 			return false

@@ -1,6 +1,6 @@
 # eino-agent extension contracts
 
-`eino-agent:extensions@0.1.0` is the current Component Model contract for
+`eino-agent:extensions@0.2.0` is the current Component Model contract for
 eino-agent extensions. The Go interfaces remain the source of truth; these WIT
 worlds define the bounded data that their Wasm-backed implementations may see.
 

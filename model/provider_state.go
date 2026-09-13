@@ -1,6 +1,7 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"unicode/utf8"
@@ -50,7 +51,11 @@ type ProviderStateContract struct {
 
 // ProviderStateItem owns one opaque JSON object exactly as emitted by a provider.
 type ProviderStateItem struct {
-	Data json.RawMessage
+	// BlockID binds this item to the durable content block it belongs to.
+	// "" means the item is message-level rather than bound to a specific
+	// block.
+	BlockID string
+	Data    json.RawMessage
 }
 
 // ProviderMessageState binds ordered provider items to one durable assistant message.
@@ -64,7 +69,14 @@ type ProviderMessageState struct {
 	CodecID          string
 	Version          int
 	CompatibilityKey string
-	Items            []ProviderStateItem
+	// BlockIDs is parallel to the addressed message's content blocks
+	// (BlockIDs[i] names the durable block at ContentBlocks[i]). A
+	// block-bound state-aware streamer uses it to resolve each
+	// ProviderStateItem.BlockID back to a specific content-block index when
+	// restoring. Empty for provider-state paths that only ever restore
+	// message-level items (BlockID "").
+	BlockIDs []string
+	Items    []ProviderStateItem
 }
 
 // ProviderStateCapture is a validated codec capture plus the complete set of
@@ -84,11 +96,12 @@ type ProviderStateCodec interface {
 }
 
 // ProviderStateStreamer is a provider boundary that can safely capture and
-// privately restore provider state.
+// privately restore provider state. It operates on the agentic message
+// boundary; adapters that wrap a classic Eino model translate internally.
 type ProviderStateStreamer interface {
 	Streamer
 	ProviderStateContract() ProviderStateContract
-	CaptureProviderState(*einoschema.Message) (ProviderStateCapture, error)
+	CaptureProviderState(*einoschema.AgenticMessage) (ProviderStateCapture, error)
 }
 
 // ValidateProviderStateContract validates a codec contract against the core ceilings.
@@ -147,6 +160,9 @@ func ValidateProviderStateItems(items []ProviderStateItem, limits ProviderStateL
 		if !isJSONObject(item.Data) {
 			return providerStateError(ErrProviderStateInvalid)
 		}
+		if !validBlockID(item.BlockID) {
+			return providerStateError(ErrProviderStateInvalid)
+		}
 	}
 	return nil
 }
@@ -158,6 +174,7 @@ func cloneProviderState(src []ProviderMessageState) []ProviderMessageState {
 	dst := make([]ProviderMessageState, len(src))
 	for i := range src {
 		dst[i] = src[i]
+		dst[i].BlockIDs = cloneSlice(src[i].BlockIDs)
 		dst[i].Items = cloneProviderStateItems(src[i].Items)
 	}
 	return dst
@@ -169,9 +186,25 @@ func cloneProviderStateItems(src []ProviderStateItem) []ProviderStateItem {
 	}
 	dst := make([]ProviderStateItem, len(src))
 	for i := range src {
+		dst[i].BlockID = src[i].BlockID
 		dst[i].Data = append(json.RawMessage(nil), src[i].Data...)
 	}
 	return dst
+}
+
+// equalProviderStateItems reports whether a and b carry the same ordered
+// BlockID bindings and byte-identical Data payloads. Order matters: items
+// are positional within one ProviderMessageState.
+func equalProviderStateItems(a, b []ProviderStateItem) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].BlockID != b[i].BlockID || !bytes.Equal(a[i].Data, b[i].Data) {
+			return false
+		}
+	}
+	return true
 }
 
 func providerStateError(kind error) error {
@@ -193,4 +226,25 @@ func isJSONObject(raw json.RawMessage) bool {
 
 func validASCIIToken(value string, max int) bool {
 	return providerstatewire.ValidASCIIToken(value, max)
+}
+
+// maxProviderStateBlockIDBytes bounds ProviderStateItem.BlockID. It matches
+// the durable session.ProviderStateEnvelope.BlockID bound.
+const maxProviderStateBlockIDBytes = 128
+
+// validBlockID reports whether id is a valid provider-state block binding:
+// either empty (message-level) or <= 128 bytes of printable ASCII.
+func validBlockID(id string) bool {
+	if id == "" {
+		return true
+	}
+	if len(id) > maxProviderStateBlockIDBytes {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		if id[i] < 0x20 || id[i] > 0x7e {
+			return false
+		}
+	}
+	return true
 }

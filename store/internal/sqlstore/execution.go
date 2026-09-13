@@ -2,6 +2,7 @@ package sqlstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -86,6 +87,94 @@ func (e *executionStore) StartRun(ctx context.Context, startedAt time.Time) (ses
 	return result, err
 }
 
+// RepauseRun implements session.ExecutionStore's compensating-write
+// primitive (round-three reconciliation item 4/SR-4a,c): it reverts this
+// fence's claim back to paused with no live lease. By default it touches no
+// checkpoint row at all -- the run's most recently promoted revision (from
+// whenever it was last durably paused) is already the correct one for a
+// later ResumeRun to resume from. Mirrors PromotePause's run-status
+// mutation exactly (status=paused, lease_until cleared) but without
+// PromotePause's turn/inbox-interruption step, which ReconcileInterruptedTurn
+// (turns.go) handles separately when there is a dangling turn to reconcile
+// first.
+//
+// When request.PromoteRevision is nonzero (round-five reconciliation item
+// 2/TR-I1), it also promotes that already-staged revision as part of this
+// same atomic write -- used when the target turn is already durably
+// interrupted (so PromotePause's own turn-interrupt precondition no longer
+// holds) but a fresh, correctly turn-identified checkpoint still needs
+// promoting.
+func (e *executionStore) RepauseRun(ctx context.Context, request session.RepauseRunRequest) (session.RepauseRunResult, error) {
+	var result session.RepauseRunResult
+	err := e.withFence(ctx, func(store *Store, run session.Run) error {
+		if err := session.ValidateRepauseRun(run, request); err != nil {
+			return err
+		}
+		runKey, err := store.key(ctx, "runs", string(run.ID))
+		if err != nil {
+			return err
+		}
+		if request.PromoteRevision > 0 {
+			checkpointRow, err := store.checkpointRowByRevision(ctx, runKey, request.PromoteRevision)
+			if err != nil {
+				if errors.Is(err, session.ErrNotFound) {
+					return session.ErrConflict
+				}
+				return err
+			}
+			checkpoint, err := decodeCheckpointRow(checkpointRow)
+			if err != nil {
+				return err
+			}
+			if !checkpoint.Promoted {
+				checkpoint.Promoted = true
+				raw, err := json.Marshal(checkpoint)
+				if err != nil {
+					return err
+				}
+				checkpointDB := store.dbFor(ctx).Table(store.tableName("checkpoints")).Where("row_key = ? AND promoted = ?", checkpointRow.RowKey, flagValue(false)).Updates(map[string]any{
+					"promoted": flagValue(true), "record": raw,
+				})
+				if err := store.mapErr(checkpointDB.Error); err != nil {
+					return err
+				}
+				if err := rowsAffected(checkpointDB); err != nil {
+					return err
+				}
+			}
+		}
+		pausedRun := run
+		pausedRun.Status = session.RunPaused
+		runRaw, err := json.Marshal(pausedRun)
+		if err != nil {
+			return err
+		}
+		runDB := store.dbFor(ctx).Table(store.tableName("runs")).Where("row_key = ? AND claim_token = ? AND status IN ?", runKey, []byte(run.ClaimToken), []string{string(session.RunPending), string(session.RunRunning)}).Updates(map[string]any{
+			"status": string(session.RunPaused), "lease_until": 0, "record": runRaw,
+		})
+		if err := store.mapErr(runDB.Error); err != nil {
+			return err
+		}
+		if err := rowsAffected(runDB); err != nil {
+			return err
+		}
+		finalRun, err := store.getRun(ctx, run.ID)
+		if err != nil {
+			return err
+		}
+		event, err := store.appendCanonicalEvent(ctx, request.Event)
+		if err != nil {
+			return err
+		}
+		result = session.RepauseRunResult{Run: finalRun, Event: event}
+		return nil
+	})
+	if err != nil {
+		return session.RepauseRunResult{}, err
+	}
+	return result, nil
+}
+
 func (e *executionStore) RenewRunLease(ctx context.Context, leaseDuration time.Duration) (session.Run, error) {
 	if leaseDuration <= 0 {
 		return session.Run{}, session.ErrConflict
@@ -150,6 +239,29 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 			result = session.RunSettlementResult{Run: current, Event: existing}
 			return nil
 		}
+		// A run settling RunCompleted must never finalize while the session
+		// has any durably queued inbox item: an Enqueue that committed its
+		// item under the still-active run (racing this exact settlement --
+		// see runtime's Enqueue/EnqueueInboxForRun and the terminal-
+		// settlement race rule in the W5 plan) must force this settlement
+		// to divert to a queued-continuation pause instead of silently
+		// completing out from under it. Scoped to RunCompleted only: a run
+		// settling failed/interrupted is a legitimate terminal outcome
+		// regardless of unrelated queued input sitting in the session (that
+		// item simply waits, as designed, for the session's next Start).
+		if request.Settlement.Status == session.RunCompleted {
+			sessionKey, err := store.key(ctx, "sessions", string(current.SessionID))
+			if err != nil {
+				return err
+			}
+			var queuedCount int64
+			if err := store.dbFor(ctx).Table(store.tableName("inbox")).Where("session_key = ? AND state = ?", sessionKey, string(session.InboxQueued)).Count(&queuedCount).Error; err != nil {
+				return store.mapErr(err)
+			}
+			if queuedCount != 0 {
+				return session.ErrRunHasQueuedInput
+			}
+		}
 		canonicalRun, err := session.ApplyRunSettlement(current, request.Settlement)
 		if err != nil {
 			return err
@@ -159,6 +271,16 @@ func (e *executionStore) SettleRun(ctx context.Context, request session.SettleRu
 			return err
 		}
 		if err := store.writeRun(ctx, canonicalRun); err != nil {
+			return err
+		}
+		// This run has just gone terminal for the first time (the
+		// current.Terminal() branch above handles every later replay
+		// without reaching here): force any turn still TurnAdmitted,
+		// TurnRunning, or TurnInterrupted to TurnFailed in this SAME fenced
+		// transaction, so no turn is ever left implying it might still run
+		// again once its run cannot be resumed (round-six reconciliation
+		// item 2's own gap -- see terminalizeResidualTurns).
+		if err := store.terminalizeResidualTurns(ctx, runKey, canonicalRun.FinishedAt); err != nil {
 			return err
 		}
 		canonicalEvent, err = store.appendCanonicalEvent(ctx, canonicalEvent)
@@ -257,7 +379,9 @@ func (e *executionStore) FinalizeAssistantMessage(ctx context.Context, id sessio
 }
 
 func (e *executionStore) AppendPart(ctx context.Context, record session.Part) (session.Part, error) {
-	if record.Kind == session.PartToolCall || record.Kind == session.PartToolResult || record.RunID != e.fence.RunID {
+	if record.Kind == session.PartFunctionToolCall || record.Kind == session.PartFunctionToolResult ||
+		record.Kind == session.PartToolSearchResult || // reserved to settleToolCall's ResultPart
+		record.RunID != e.fence.RunID {
 		return session.Part{}, session.ErrConflict
 	}
 	var result session.Part
@@ -284,8 +408,18 @@ func (e *executionStore) UpdatePart(ctx context.Context, record session.Part) er
 	})
 }
 
+// canonicalOnlyEventKinds are event kinds that only a typed atomic mutation
+// method may persist. Arbitrary AppendEvent callers cannot manufacture a run,
+// turn, or tool lifecycle event of these kinds.
+var canonicalOnlyEventKinds = map[string]bool{
+	session.RunSettlementEventKind: true,
+	session.TurnStartedEventKind:   true,
+	session.TurnCompletedEventKind: true,
+	session.RunPausedEventKind:     true,
+}
+
 func (e *executionStore) AppendEvent(ctx context.Context, record session.EventRecord) (session.EventRecord, error) {
-	if record.RunID != e.fence.RunID || record.Kind == session.RunSettlementEventKind || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
+	if record.RunID != e.fence.RunID || canonicalOnlyEventKinds[record.Kind] || record.ToolTransition != "" || (record.Kind == session.ToolTransitionEventKind && record.ToolCallID != "") {
 		return session.EventRecord{}, session.ErrConflict
 	}
 	var result session.EventRecord

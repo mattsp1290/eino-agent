@@ -7,8 +7,19 @@ import (
 	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 
 	"github.com/mattsp1290/eino-agent/config"
+	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 )
+
+// userMessageText extracts the single user_input_text block's text from a
+// runtime.UserMessage built by terminalTextUserMessage.
+func userMessageText(t *testing.T, message runtime.UserMessage) string {
+	t.Helper()
+	if len(message.Blocks) != 1 || message.Blocks[0].Text == nil {
+		t.Fatalf("message blocks = %#v, want a single user_input_text block", message.Blocks)
+	}
+	return message.Blocks[0].Text.Text
+}
 
 func TestTerminalTextUserMessageAcceptsStringLikeContent(t *testing.T) {
 	t.Parallel()
@@ -27,8 +38,8 @@ func TestTerminalTextUserMessageAcceptsStringLikeContent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("terminalTextUserMessage error = %v", err)
 			}
-			if message.Content != text {
-				t.Fatalf("Content = %q, want %q", message.Content, text)
+			if got := userMessageText(t, message); got != text {
+				t.Fatalf("Content = %q, want %q", got, text)
 			}
 		})
 	}
@@ -52,8 +63,8 @@ func TestStartRequestUsesOnlyTerminalPlainTextUserMessage(t *testing.T) {
 	if request.SessionID != session.ID("session-1") {
 		t.Fatalf("SessionID = %q", request.SessionID)
 	}
-	if request.Message.Content != "  terminal-user\n" {
-		t.Fatalf("Message.Content = %q", request.Message.Content)
+	if got := userMessageText(t, request.Message); got != "  terminal-user\n" {
+		t.Fatalf("Message.Content = %q", got)
 	}
 	if len(request.Metadata) != 1 || request.Metadata["agui_thread_id"] != "thread-1" {
 		t.Fatalf("Metadata = %#v, want only stable thread identity", request.Metadata)

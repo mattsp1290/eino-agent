@@ -5,6 +5,25 @@ set -euo pipefail
 readonly root_module="github.com/mattsp1290/eino-agent"
 readonly nested_module="${root_module}/wasmext/gen"
 readonly nested_version="v0.1.0"
+# The eino-agui bridge (adopted in W7) requires the AG-UI Go SDK fork below.
+# Go replace directives are not transitive, so every consumer of eino-agent
+# -- including this external-consumer check -- must carry this same root
+# replacement itself; it is not satisfied by eino-agent's own go.mod replace.
+readonly aguisdk_replace_path="github.com/ag-ui-protocol/ag-ui/sdks/community/go"
+readonly aguisdk_replace_target="github.com/mattsp1290/ag-ui/sdks/community/go"
+readonly aguisdk_replace_version="v0.0.0-20260909025854-aaa75b54d572"
+# agentic_fixture_test.go imports the real native-provider constructors from
+# github.com/mattsp1290/eino-providers directly. eino-agent's own go.mod does
+# not (and should not: the library is provider-agnostic) require this
+# module, so it is invisible to `go mod tidy` scanning eino-agent's own
+# packages -- testdata/ directories are excluded from that scan the same way
+# they are excluded from `go build ./...`. This consumer module DOES need
+# it, since it is the one that actually combines eino-agent with a concrete
+# native provider. Pin the exact commit verified in
+# docs/dependency-status.md (no release tag exists upstream, so this is a
+# pseudo-version pin) rather than letting a bare `go mod tidy` resolve
+# whatever the module's default branch HEAD happens to be at run time.
+readonly einoproviders_version="v0.0.0-20260912022125-79248358b8e6"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly script_dir
 repository_root="$(cd -- "${script_dir}/../.." && pwd -P)"
@@ -82,6 +101,7 @@ cp -f -- "${script_dir}/session_discovery_fixture_test.go" "${consumer_dir}/sess
 cp -f -- "${script_dir}/session_title_fixture_test.go" "${consumer_dir}/session_title_fixture_test.go"
 cp -f -- "${script_dir}/session_watch_fixture_test.go" "${consumer_dir}/session_watch_fixture_test.go"
 cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"
+cp -f -- "${script_dir}/agentic_fixture_test.go" "${consumer_dir}/agentic_fixture_test.go"
 cp -f -- "${script_dir}/admission_receipt_fixture_test.go" "${consumer_dir}/admission_receipt_fixture_test.go"
 if [[ "${postgres_mode}" == "1" ]]; then
 	cp -f -- "${script_dir}/../../internal/testpostgres/check_output.py" "${temporary_root}/check_output.py"
@@ -108,6 +128,11 @@ fi
 printf 'ROOT_MODULE_REQUESTED=%s@%s\n' "${root_module}" "${required_version}"
 printf 'ROOT_MODULE_SELECTED=%s@%s\n' "${root_module}" "${selected_required_version}"
 "${go_command[@]}" mod edit -require="${root_module}@${selected_required_version}"
+"${go_command[@]}" mod edit -replace="${aguisdk_replace_path}=${aguisdk_replace_target}@${aguisdk_replace_version}"
+# Pin the exact verified eino-providers pseudo-version explicitly (see the
+# comment at this script's top) rather than letting `go mod tidy` resolve
+# whatever version its default branch happens to report right now.
+"${go_command[@]}" mod edit -require="github.com/mattsp1290/eino-providers@${einoproviders_version}"
 
 if [[ "${mode}" == "local" ]]; then
 	"${go_command[@]}" mod edit -replace="${root_module}=${repository_root}"
@@ -123,16 +148,18 @@ if [[ -e "${consumer_dir}/go.work" || -d "${consumer_dir}/vendor" ]]; then
 fi
 
 if [[ "${mode}" == "published" ]]; then
-	if grep -Eq '^[[:space:]]*replace[[:space:](]' go.mod; then
-		printf 'external-consumer: published mode must not contain replacements\n' >&2
+	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 1 ]]; then
+		printf 'external-consumer: published mode requires exactly the ag-ui-protocol host replacement\n' >&2
 		exit 1
 	fi
+	grep -Fqx "replace ${aguisdk_replace_path} => ${aguisdk_replace_target} ${aguisdk_replace_version}" go.mod
 else
-	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 1 ]]; then
-		printf 'external-consumer: local mode requires exactly one root replacement\n' >&2
+	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 2 ]]; then
+		printf 'external-consumer: local mode requires exactly the root and ag-ui-protocol replacements\n' >&2
 		exit 1
 	fi
 	grep -Fqx "replace ${root_module} => ${repository_root}" go.mod
+	grep -Fqx "replace ${aguisdk_replace_path} => ${aguisdk_replace_target} ${aguisdk_replace_version}" go.mod
 fi
 
 "${go_command[@]}" mod tidy
@@ -163,17 +190,18 @@ if [[ "${mode}" == "published" ]]; then
 		printf 'external-consumer: published commit provenance does not match requested pin\n' >&2
 		exit 1
 	fi
-	if grep -Eq '^[[:space:]]*replace[[:space:](]' go.mod; then
-		printf 'external-consumer: tidy introduced a replacement in published mode\n' >&2
+	if [[ "$(grep -Ec '^replace ' go.mod)" -ne 1 ]]; then
+		printf 'external-consumer: tidy changed the expected replacement set in published mode\n' >&2
 		exit 1
 	fi
+	grep -Fqx "replace ${aguisdk_replace_path} => ${aguisdk_replace_target} ${aguisdk_replace_version}" go.mod
 fi
 
 "${go_command[@]}" mod verify
 if [[ "${postgres_mode}" == "1" ]]; then
 	"${go_command[@]}" test -tags postgres_integration -timeout 10m -json ./... | python3 "${temporary_root}/check_output.py" "example.com/eino-agent-external-consumer:TestPostgresConsumer"
 else
-	"${go_command[@]}" test ./...
+	"${go_command[@]}" test -race ./...
 fi
 "${go_command[@]}" build ./...
 

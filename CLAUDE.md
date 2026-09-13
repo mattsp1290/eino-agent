@@ -2,52 +2,50 @@
 
 This file provides instructions and context for AI coding agents working on this project.
 
-<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
-## Beads Issue Tracker
+## Beans issue tracker (`bn`)
 
-This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+This project tracks work with `bn`; no other tracker is authorized, and initializing a second tracker in this repository is prohibited.
 
-### Quick Reference
+Issues live in the hub at `~/.beans/hub/projects/eino-agent/`; `bn` commits and pushes the hub itself on every mutating command, so never commit hub files by hand.
+
+### Quick reference
 
 ```bash
-bd ready              # Find available work
-bd show <id>          # View issue details
-bd update <id> --claim  # Claim work
-bd close <id>         # Complete work
+bn prime
+bn ready
+bn show <id>
+bn update <id> --claim
+bn create "title" -d "why and what" -p 2 -t task -l impl
+bn close <id> -r "reason"
+bn dep add <child> <parent>
+bn remember "insight"
+bn memories <keyword>
+bn status
 ```
 
 ### Rules
 
-- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
-- Run `bd prime` for detailed command reference and session close protocol
-- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+- Use `bn` for all task tracking; do not use TodoWrite, TaskCreate, or markdown TODO lists.
+- Use `bn remember` for persistent knowledge; do not use `MEMORY.md` files.
+- Run `bn` commands serially.
+- Create an issue before writing code and claim it when starting.
+- IDs are `eino-agent-<hash>` and never change; legacy IDs such as `eino-agent-d64.8` remain valid.
 
-## Session Completion
+## Session completion
 
-**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+Work is NOT complete until `git push` succeeds.
 
-**MANDATORY WORKFLOW:**
-
-1. **File issues for remaining work** - Create issues for anything that needs follow-up
-2. **Run quality gates** (if code changed) - Tests, linters, builds
-3. **Update issue status** - Close finished work, update in-progress items
-4. **PUSH TO REMOTE** - This is MANDATORY:
+1. File issues for remaining work with `bn create`.
+2. Run quality gates when code changed (`make check` or the Makefile targets that apply).
+3. Update issue status with `bn close` or `bn update`.
+4. Push this repository:
    ```bash
    git pull --rebase
-   bd dolt push
    git push
    git status  # MUST show "up to date with origin"
    ```
-5. **Clean up** - Clear stashes, prune remote branches
-6. **Verify** - All changes committed AND pushed
-7. **Hand off** - Provide context for next session
-
-**CRITICAL RULES:**
-- Work is NOT complete until `git push` succeeds
-- NEVER stop before pushing - that leaves work stranded locally
-- NEVER say "ready to push when you are" - YOU must push
-- If push fails, resolve and retry until it succeeds
-<!-- END BEADS INTEGRATION -->
+5. Verify the hub is pushed: `bn status` must show `ahead: 0`.
+6. Hand off context in the issue log with `bn note <id> ...`.
 
 
 ## Build & Test

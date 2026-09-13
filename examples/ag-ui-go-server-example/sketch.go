@@ -96,7 +96,7 @@ func terminalTextUserMessage(messages []aguitypes.Message) (runtime.UserMessage,
 	if strings.TrimSpace(content) == "" {
 		return runtime.UserMessage{}, fmt.Errorf("terminal AG-UI user message must not be blank")
 	}
-	return runtime.UserMessage{Content: content}, nil
+	return runtime.TextUserMessage(content), nil
 }
 
 // SessionIDFromThreadID preserves ag-ui-go-server-example's thread identity as

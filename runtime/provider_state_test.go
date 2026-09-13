@@ -118,7 +118,7 @@ func TestLoadProviderHistoryRejectsActiveCorruptionBeforeDispatch(t *testing.T) 
 			fixture := newProviderStateLoadFixture(t)
 			test.edit(t, &fixture)
 			store := providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}
-			_, _, err := loadProviderHistory(context.Background(), store, fixture.sessionRecord, history.Options{}, resolved)
+			_, _, _, err := loadProviderHistory(context.Background(), store, fixture.sessionRecord, history.Options{}, resolved)
 			if err == nil || !errors.Is(err, test.kind) || strings.Contains(err.Error(), "STATE_SENTINEL") {
 				t.Fatalf("error = %v, want %v", err, test.kind)
 			}
@@ -128,22 +128,29 @@ func TestLoadProviderHistoryRejectsActiveCorruptionBeforeDispatch(t *testing.T) 
 
 func TestLoadProviderHistoryIgnoresMalformedInactiveCompactedState(t *testing.T) {
 	now := time.Date(2026, 9, 2, 12, 0, 0, 0, time.UTC)
+	tailParts, err := session.EncodeContentParts(session.Content{
+		Role:   session.RoleUser,
+		Blocks: []session.ContentBlock{{ID: "tail-block", Kind: session.BlockKindUserInputText, Text: &session.TextBlock{Text: "tail"}}},
+	}, func() session.PartID { return "tail-text" }, "tail", "session", "tail-run", now.Add(time.Second), session.DefaultContentLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
 	batch := session.ReplayBatch{
 		Messages: []session.Message{
 			{ID: "old", SessionID: "session", RunID: "old-run", Role: session.RoleAssistant, ModelID: "test", CreatedAt: now},
 			{ID: "tail", SessionID: "session", RunID: "tail-run", Role: session.RoleUser, CreatedAt: now.Add(time.Second)},
 			{ID: "summary", SessionID: "session", RunID: "summary-run", Role: session.RoleSystem, CreatedAt: now.Add(2 * time.Second)},
 		},
-		Parts: []session.Part{
+		Parts: append([]session.Part{
 			{ID: "bad-state", MessageID: "old", SessionID: "session", RunID: "old-run", Kind: session.PartProviderState, Payload: json.RawMessage(`STATE_SENTINEL malformed`)},
-			{ID: "tail-text", MessageID: "tail", SessionID: "session", RunID: "tail-run", Kind: session.PartText, Payload: json.RawMessage(`{"text":"tail"}`)},
-			{ID: "summary-text", MessageID: "summary", SessionID: "session", RunID: "summary-run", Kind: session.PartCompaction, Payload: json.RawMessage(`{"text":"summary","epoch_id":"epoch","redacted":true}`)},
-		},
+		}, append(tailParts,
+			session.Part{ID: "summary-text", MessageID: "summary", SessionID: "session", RunID: "summary-run", Kind: session.PartCompaction, Payload: json.RawMessage(`{"text":"summary","epoch_id":"epoch","redacted":true}`)},
+		)...),
 		PartOwnerMessageIDs: []session.MessageID{"old", "tail", "summary"},
 	}
-	ordinary := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.Message, error) { return nil, nil })}
-	messages, states, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, ordinary)
-	if err != nil || len(states) != 0 || len(messages) != 2 || messages[0].Content != "summary" || messages[1].Content != "tail" {
+	ordinary := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) { return nil, nil })}
+	messages, _, states, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, ordinary)
+	if err != nil || len(states) != 0 || len(messages) != 2 || agenticMessageText(messages[0]) != "summary" || agenticMessageText(messages[1]) != "tail" {
 		t.Fatalf("messages/states/error = %#v/%#v/%v", messages, states, err)
 	}
 }
@@ -167,7 +174,7 @@ func TestLoadProviderHistoryRejectsOwnerMismatchBeforeInactiveFiltering(t *testi
 		PartOwnerMessageIDs: []session.MessageID{"old", "summary"},
 	}
 	resolved := providerStateResolvedForTest(t)
-	_, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, resolved)
+	_, _, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: batch}, session.Session{ID: "session"}, history.Options{Epoch: &session.ContextEpoch{SummaryMessageID: "summary", TailStartID: "tail"}}, resolved)
 	if !errors.Is(err, model.ErrProviderStateMismatch) {
 		t.Fatalf("error = %v, want provider-state mismatch", err)
 	}
@@ -177,16 +184,16 @@ func TestProviderStateStreamerCallbackPanicsAreContentFree(t *testing.T) {
 	fixture := newProviderStateLoadFixture(t)
 	contractPanic := &panicRuntimeProviderStateStreamer{panicContract: true}
 	resolved := model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: contractPanic}
-	_, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}, fixture.sessionRecord, history.Options{}, resolved)
+	_, _, _, err := loadProviderHistory(context.Background(), providerStateLoadStore{batch: fixture.batch, runs: fixture.runs}, fixture.sessionRecord, history.Options{}, resolved)
 	if !errors.Is(err, model.ErrProviderStateInvalid) || strings.Contains(err.Error(), "STATE_SENTINEL") {
 		t.Fatalf("contract panic error = %v", err)
 	}
 
 	capturePanic := &panicRuntimeProviderStateStreamer{contract: runtimeProviderStateContract(), panicCapture: true}
 	snapshot := TurnSnapshot{SessionID: "session", RunID: "run", Model: model.Resolved{Provider: model.Provider{ID: "fake"}, Model: model.Descriptor{ID: "test", ProviderID: "fake"}, Streamer: capturePanic}}
-	message := einoschema.AssistantMessage("answer", nil)
+	message := agenticAssistantText("answer")
 	message.Extra = map[string]any{providerStateExtraKey: []json.RawMessage{providerStateRawItems[0]}}
-	_, err = captureAssistantProviderState(snapshot, "assistant", message)
+	_, _, err = captureAssistantProviderState(snapshot, "assistant", message, nil)
 	if !errors.Is(err, model.ErrProviderStateInvalid) || strings.Contains(err.Error(), "STATE_SENTINEL") {
 		t.Fatalf("capture panic error = %v", err)
 	}
@@ -209,7 +216,7 @@ func (s *panicRuntimeProviderStateStreamer) ProviderStateContract() model.Provid
 	return s.contract
 }
 
-func (s *panicRuntimeProviderStateStreamer) CaptureProviderState(*einoschema.Message) (model.ProviderStateCapture, error) {
+func (s *panicRuntimeProviderStateStreamer) CaptureProviderState(*einoschema.AgenticMessage) (model.ProviderStateCapture, error) {
 	if s.panicCapture {
 		panic("STATE_SENTINEL")
 	}
@@ -222,7 +229,7 @@ func providerStateResolvedForTest(t *testing.T) model.Resolved {
 	if err != nil {
 		t.Fatal(err)
 	}
-	streamer, err := model.NewEinoStreamerWithProviderState(&runtimeProviderStateModel{}, codec)
+	streamer, err := model.NewClassicStreamerWithProviderState(&runtimeProviderStateModel{}, codec)
 	if err != nil {
 		t.Fatal(err)
 	}

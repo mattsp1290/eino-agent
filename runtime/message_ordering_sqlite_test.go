@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -29,24 +30,26 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		}
 	}()
 	frozenAt := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	// The scripted provider CallID ("call-frozen") is preserved separately
+	// as ProviderCallID; the durable session.ToolCall.ID is always a fresh
+	// mint now, so capture the id the executor actually observed.
+	var executedCall ToolCall
 	toolRegistry := staticToolRegistry{tools: []Tool{{
 		Name: "echo", Retention: RetentionPolicy{MaxInlineBytes: 4096},
-		Executor: orchestratorToolExecutorFunc(func(context.Context, ToolCall) (ToolResult, error) {
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executedCall = call
 			return ToolResult{Output: "echoed"}, nil
 		}),
 	}}}
 	orchestrator := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 			for _, message := range request.Messages {
-				if message.Role == einoschema.Tool {
-					return []*einoschema.Message{einoschema.AssistantMessage("done", nil)}, nil
+				if message.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(message) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 				}
 			}
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID: "call-frozen", Type: "function",
-				Function: einoschema.FunctionCall{Name: "echo", Arguments: `{"text":"hi"}`},
-			}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-frozen", "echo", `{"text":"hi"}`))}, nil
 		})}),
 		WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(toolRegistry)}),
 		WithIDGenerator(&reverseAdmissionIDs{}),
@@ -54,11 +57,11 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		WithOwnerID("sqlite-tool-order-test"),
 	)
 	const sessionID session.ID = "frozen-tool-session"
-	admission, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: UserMessage{Content: "hello"}, Config: orchestratorConfig()})
+	admission, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result := <-admission.Handle.Done(); result.Error != nil || result.Status != session.RunCompleted {
+	if result := <-admission.Done(); result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
 	if err := storePool.Close(); err != nil {
@@ -88,7 +91,7 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		cursor = page.Next
 	}
 	wantIDs := []session.MessageID{"z-user-1", "a-assistant-1", "z-user-2", "a-assistant-2"}
-	wantRoles := []session.Role{session.RoleUser, session.RoleAssistant, session.RoleTool, session.RoleAssistant}
+	wantRoles := []session.Role{session.RoleUser, session.RoleAssistant, session.RoleUser, session.RoleAssistant}
 	if len(rawMessages) != len(wantIDs) {
 		t.Fatalf("raw messages = %#v", rawMessages)
 	}
@@ -103,7 +106,7 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 	if rawMessages[1].ParentID != rawMessages[0].ID || rawMessages[2].ParentID != rawMessages[1].ID || rawMessages[3].ParentID != rawMessages[1].ID {
 		t.Fatalf("message parentage changed: %#v", rawMessages)
 	}
-	toolCall, err := reopened.GetToolCall(ctx, "call-frozen")
+	toolCall, err := reopened.GetToolCall(ctx, executedCall.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +115,7 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 	}
 	var resultPart session.Part
 	for _, part := range rawParts {
-		if part.Kind == session.PartToolResult {
+		if part.Kind == session.PartFunctionToolResult {
 			resultPart = part
 		}
 	}
@@ -120,14 +123,19 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		t.Fatalf("tool result part = %+v, tool message = %+v", resultPart, rawMessages[2])
 	}
 
-	providerHistory, err := LoadHistory(ctx, reopened, sessionID, history.Options{})
+	projection, err := history.LoadAgentic(ctx, reopened, sessionID, history.Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(providerHistory) != 4 || providerHistory[0].Role != einoschema.User || providerHistory[0].Content != "hello" ||
-		providerHistory[1].Role != einoschema.Assistant || len(providerHistory[1].ToolCalls) != 1 || providerHistory[1].ToolCalls[0].ID != "call-frozen" ||
-		providerHistory[2].Role != einoschema.Tool || providerHistory[2].Content != "echoed" ||
-		providerHistory[3].Role != einoschema.Assistant || providerHistory[3].Content != "done" {
+	providerHistory := projection.Messages
+	var toolResultOutput ToolOutput
+	if len(providerHistory) > 2 {
+		_ = json.Unmarshal([]byte(agenticFunctionResultText(providerHistory[2])), &toolResultOutput)
+	}
+	if len(providerHistory) != 4 || providerHistory[0].Role != einoschema.AgenticRoleTypeUser || agenticMessageText(providerHistory[0]) != "hello" ||
+		providerHistory[1].Role != einoschema.AgenticRoleTypeAssistant || len(agenticToolCallsOf(providerHistory[1])) != 1 || agenticToolCallsOf(providerHistory[1])[0].CallID != string(executedCall.ID) ||
+		providerHistory[2].Role != einoschema.AgenticRoleTypeUser || !isFunctionToolResultMessage(providerHistory[2]) || toolResultOutput.Content != "echoed" ||
+		providerHistory[3].Role != einoschema.AgenticRoleTypeAssistant || agenticMessageText(providerHistory[3]) != "done" {
 		t.Fatalf("provider history = %#v", providerHistory)
 	}
 }

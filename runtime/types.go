@@ -14,10 +14,26 @@ import (
 
 // UserMessage is the one current user submission admitted by Start.
 //
-// Runtime owns its durable message and part identities. Callers must not copy
-// transcript history into this value.
+// Runtime owns its durable message, part, and content-block identities.
+// Callers must not copy transcript history into this value. Block IDs must
+// be left empty: Start rejects any caller-supplied ContentBlock.ID and mints
+// every block's durable ID itself from the orchestrator's IDGenerator before
+// validating and admitting the message. Durable Part IDs are minted
+// independently of block IDs, so callers must not assume the two coincide.
 type UserMessage struct {
-	Content string
+	Blocks []session.ContentBlock
+}
+
+// TextUserMessage builds a UserMessage carrying a single user_input_text
+// block with the given text. The block's durable ID is left empty; Start
+// fills it in during admission.
+func TextUserMessage(text string) UserMessage {
+	return UserMessage{
+		Blocks: []session.ContentBlock{{
+			Kind: session.BlockKindUserInputText,
+			Text: &session.TextBlock{Text: text},
+		}},
+	}
 }
 
 // Request admits a user-visible run. Implementations persist the run before
@@ -36,8 +52,18 @@ type Request struct {
 // Handle describes an admitted run and its live control surface.
 type Handle interface {
 	RunID() session.RunID
+	// Done reports this Start/ResumeRun call's outcome: either a terminal
+	// Result or a Result whose Status is session.RunPaused. AwaitPause
+	// delivers additional pause-only detail (PauseInfo) for the same event
+	// when the outcome is a pause; it is closed without a value otherwise.
 	Done() <-chan Result
 	Interrupt(ctx context.Context, reason string) error
+	// AwaitPause reports the durably promoted pause this run reaches (see
+	// PauseInfo), or is closed without a value if the run instead settles
+	// terminally.
+	AwaitPause() <-chan PauseInfo
+	// Status returns the run's current durable status.
+	Status(ctx context.Context) (session.Run, error)
 }
 
 // Result is the terminal outcome of a run.
@@ -66,16 +92,42 @@ type Orchestrator interface {
 
 // TurnSnapshot is the immutable state used for one provider request.
 type TurnSnapshot struct {
-	RunID         session.RunID
-	SessionID     session.ID
-	EpochID       session.EpochID
-	Config        config.Snapshot
-	Model         model.Resolved
-	Messages      []*einoschema.Message
-	providerState []model.ProviderMessageState
-	Tools         []Tool
-	SystemPrompt  string
-	CreatedAt     time.Time
+	RunID     session.RunID
+	SessionID session.ID
+	EpochID   session.EpochID
+	// TurnID is the durable turn this snapshot was frozen for (see
+	// FreezeTurnSnapshot). Every session.Message/session.ToolCall.
+	// ResultMessage this turn appends is stamped with it.
+	TurnID session.TurnID
+	// AgentPath is the joined RunPath of the (sub)agent driving this turn,
+	// mirrored onto every session.Message this turn produces. Always ""
+	// today: subagent nesting is not yet wired end to end (see
+	// adkEngine.agentPath).
+	AgentPath string
+	Config    config.Snapshot
+	Model     model.Resolved
+	Messages  []*einoschema.AgenticMessage
+	// MessageSourceIDs is Messages' durable-message-ID parallel, one entry
+	// per Messages index ("" for an entry with no durable backing, e.g.
+	// content an extension transform injected -- see
+	// contextAssemblePoint/materializeContextAssemblyWithMapping). Shorter
+	// than Messages, or nil, degrades safely to "no durable id for any
+	// message beyond what is present" (see paddedMessageSourceIDs) rather
+	// than panicking; a construction path that never populates it (e.g. a
+	// direct FreezeTurnSnapshot call outside this package's own admission/
+	// resume paths) simply means summarization can correlate nothing for
+	// this snapshot's own prefix, not a hard failure -- see
+	// adkEngine.buildDurableBaseline and summarizationFinalize (round-two
+	// W6 review item 8).
+	MessageSourceIDs []session.MessageID
+	providerState    []model.ProviderMessageState
+	Tools            []Tool
+	SystemPrompt     string
+	CreatedAt        time.Time
+	// ToolSearch configures the runtime-implemented tool-search tool for
+	// this turn's plan, or nil when not enabled (see runtime/tool_search.go
+	// and RunPlan.ToolSearch).
+	ToolSearch *ToolSearchConfig
 }
 
 // Tool describes one runtime-materialized tool available to a turn.
@@ -90,6 +142,18 @@ type Tool struct {
 	Pattern           PermissionPatternResolver
 	Retention         RetentionPolicy
 	Metadata          map[string]string
+	// Aliases are additional model-visible names that resolve to this tool.
+	Aliases []string
+	// ArgumentAliases maps a canonical parameter name to alternate argument
+	// names a model may use for it.
+	ArgumentAliases map[string][]string
+	// Deferred marks the tool as advertised only through tool search rather
+	// than eagerly bound to every provider request.
+	Deferred bool
+	// InterruptPolicy, when set, lets this tool pause via a durable ADK
+	// checkpoint before its first execution attempt (see
+	// runtime.ToolInterruptPolicy in adk_execution.go).
+	InterruptPolicy ToolInterruptPolicy
 }
 
 // ToolScopeContext is the data-only input used while selecting and scoping
@@ -136,12 +200,31 @@ type ToolCall struct {
 	ResultMessageID session.MessageID
 	ResultPartID    session.PartID
 	Name            string
-	Scope           ToolScope
-	Pattern         string
-	Input           json.RawMessage
-	Approval        ApprovalRequester
-	SessionTitle    SessionTitleWriter `json:"-"`
-	Context         ToolContext
+	// RequestedName is the model-facing tool name as the model actually
+	// called it (equal to Name unless the model used a registered alias).
+	RequestedName string
+	// ProviderCallID carries the provider's own tool-call id (block.CallID
+	// as received) from prepareToolCalls through to the durable
+	// session.ToolCall record -- see session.ToolCall.ProviderCallID. ID is
+	// always the freshly runtime-minted, store-unique identity. ID, not
+	// ProviderCallID, is what a later dispatch shows the provider back when
+	// ProviderCallID is empty (the provider omitted its own id, or sent one
+	// that failed validation) or when sending it would be ambiguous in
+	// that outgoing request (an earlier call already sends that exact
+	// string, or it equals the durable id of any call in the request) --
+	// see runtime.publicizeToolCallIDs's doc comment for exactly which
+	// case applies.
+	ProviderCallID string
+	Scope          ToolScope
+	Pattern        string
+	Input          json.RawMessage
+	Approval       ApprovalRequester
+	SessionTitle   SessionTitleWriter `json:"-"`
+	Context        ToolContext
+	// ResumeDecision carries the host-supplied resume payload for a call
+	// whose Tool.InterruptPolicy paused it via a durable ADK checkpoint,
+	// once the targeted resume has delivered it. Empty on every other call.
+	ResumeDecision string
 }
 
 // ToolScope describes the authority scope for a tool.
@@ -181,6 +264,40 @@ type ToolResult struct {
 	Structured  json.RawMessage
 	Attachments []Attachment
 	Metadata    map[string]string
+	// Parts, when non-empty, is the authoritative enhanced-tool result and
+	// Output/Structured must be empty. It mirrors schema.ToolResult.Parts.
+	Parts []ToolResultPart
+}
+
+// ToolResultPartType identifies which field of a ToolResultPart is populated.
+type ToolResultPartType string
+
+const (
+	ToolResultPartText       ToolResultPartType = "text"
+	ToolResultPartImage      ToolResultPartType = "image"
+	ToolResultPartAudio      ToolResultPartType = "audio"
+	ToolResultPartVideo      ToolResultPartType = "video"
+	ToolResultPartFile       ToolResultPartType = "file"
+	ToolResultPartToolSearch ToolResultPartType = "tool_search"
+)
+
+// ToolResultMedia is one non-text payload inside a ToolResultPart. Exactly
+// one of URL or Base64Data should be set.
+type ToolResultMedia struct {
+	URL        string
+	Base64Data string
+	MIMEType   string
+	Name       string
+}
+
+// ToolResultPart is one ordered unit of an enhanced tool result.
+type ToolResultPart struct {
+	Type  ToolResultPartType
+	Text  string
+	Media *ToolResultMedia
+	// ToolSearch carries the raw schema.ToolSearchResult JSON for a
+	// tool_search part.
+	ToolSearch json.RawMessage
 }
 
 // Attachment is a durable reference to non-text tool output.

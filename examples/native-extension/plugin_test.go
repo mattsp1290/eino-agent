@@ -3,6 +3,7 @@ package nativeextension
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -112,13 +113,13 @@ func TestNativeContextContributionReachesProviderBeforeHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	admission, err := orchestrator.Start(context.Background(), runtime.Request{
-		SessionID: "session-a", Message: runtime.UserMessage{Content: "base-user"},
+		SessionID: "session-a", Message: runtime.TextUserMessage("base-user"),
 		Config: config.Snapshot{Agent: config.Agent{Name: "agent", Model: selection, Options: map[string]string{}}, Model: selection, Metadata: map[string]string{"workspace_root": t.TempDir()}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result := <-admission.Handle.Done(); result.Error != nil {
+	if result := <-admission.Done(); result.Error != nil {
 		t.Fatal(result.Error)
 	}
 	streamer.mu.Lock()
@@ -142,15 +143,46 @@ type capturingStreamer struct {
 func (s *capturingStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	s.mu.Lock()
 	for _, message := range request.Messages {
-		s.messages = append(s.messages, message.Content)
+		s.messages = append(s.messages, agenticMessageText(message))
 	}
 	s.mu.Unlock()
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	go func() {
 		defer writer.Close()
-		writer.Send(model.StreamDelta{Message: einoschema.AssistantMessage("done", nil)}, nil)
+		writer.Send(model.StreamDelta{Message: &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "done"}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}}, nil)
 	}()
 	return reader, nil
+}
+
+// agenticMessageText concatenates every text-bearing content block on an
+// agentic message (user_input_text or assistant_gen_text) for test
+// assertions.
+func agenticMessageText(message *einoschema.AgenticMessage) string {
+	if message == nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, block := range message.ContentBlocks {
+		if block == nil {
+			continue
+		}
+		switch block.Type {
+		case einoschema.ContentBlockTypeUserInputText:
+			if block.UserInputText != nil {
+				sb.WriteString(block.UserInputText.Text)
+			}
+		case einoschema.ContentBlockTypeAssistantGenText:
+			if block.AssistantGenText != nil {
+				sb.WriteString(block.AssistantGenText.Text)
+			}
+		}
+	}
+	return sb.String()
 }
 
 type testIDs struct{ next atomic.Int64 }
@@ -162,3 +194,6 @@ func (i *testIDs) NewPartID() session.PartID         { return session.PartID(i.i
 func (i *testIDs) NewToolCallID() session.ToolCallID { return session.ToolCallID(i.id("tool-call")) }
 func (i *testIDs) NewEventID() session.EventID       { return session.EventID(i.id("event")) }
 func (i *testIDs) NewEpochID() session.EpochID       { return session.EpochID(i.id("epoch")) }
+func (i *testIDs) NewTurnID() session.TurnID         { return session.TurnID(i.id("turn")) }
+func (i *testIDs) NewInboxID() session.InboxID       { return session.InboxID(i.id("inbox")) }
+func (i *testIDs) NewInvocationID() string           { return i.id("invocation") }

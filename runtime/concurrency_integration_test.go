@@ -34,20 +34,13 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 	})}}}
 	orch := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(_ context.Context, request model.Request) ([]*einoschema.AgenticMessage, error) {
 			for _, msg := range request.Messages {
-				if msg.Role == einoschema.Tool {
-					return []*einoschema.Message{einoschema.AssistantMessage("ok:"+request.Identity.SessionID, nil)}, nil
+				if msg.Role == einoschema.AgenticRoleTypeUser && isFunctionToolResultMessage(msg) {
+					return []*einoschema.AgenticMessage{agenticAssistantText("ok:" + request.Identity.SessionID)}, nil
 				}
 			}
-			return []*einoschema.Message{einoschema.AssistantMessage("", []einoschema.ToolCall{{
-				ID:   "call-" + request.Identity.SessionID,
-				Type: "function",
-				Function: einoschema.FunctionCall{
-					Name:      "echo",
-					Arguments: `{}`,
-				},
-			}})}, nil
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-"+request.Identity.SessionID, "echo", `{}`))}, nil
 		})}),
 		WithClock(func() time.Time { return time.Date(2026, 6, 28, 15, 0, 0, 0, time.UTC) }),
 		WithOwnerID("owner"),
@@ -65,14 +58,14 @@ func TestConcurrentSessionsCompleteWithSQLiteStore(t *testing.T) {
 			sessionID := session.ID("concurrent-session-" + string(rune('a'+i)))
 			admission, err := orch.Start(ctx, Request{
 				SessionID: sessionID,
-				Message:   UserMessage{Content: "hello"},
+				Message:   TextUserMessage("hello"),
 				Config:    orchestratorConfig(),
 			})
 			if err != nil {
 				errs <- err
 				return
 			}
-			result := <-admission.Handle.Done()
+			result := <-admission.Done()
 			if result.Error != nil || result.Status != session.RunCompleted {
 				errs <- fmt.Errorf("session %s result = %+v", sessionID, result)
 				return
@@ -108,7 +101,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	started := make(chan struct{}, 16)
 	orch := mustConfiguredOrchestrator(
 		WithStore(store),
-		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.Message, error) {
+		WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(ctx context.Context, _ model.Request) ([]*einoschema.AgenticMessage, error) {
 			started <- struct{}{}
 			<-ctx.Done()
 			return nil, ctx.Err()
@@ -122,7 +115,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	for i := range sessions {
 		admission, err := orch.Start(ctx, Request{
 			SessionID: session.ID("interrupt-session-" + string(rune('a'+i))),
-			Message:   UserMessage{Content: "hello"},
+			Message:   TextUserMessage("hello"),
 			Config:    orchestratorConfig(),
 		})
 		if err != nil {
@@ -139,7 +132,7 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 	}
 	if _, err := orch.Start(ctx, Request{
 		SessionID: "interrupt-session-a",
-		Message:   UserMessage{Content: "stale contender"},
+		Message:   TextUserMessage("stale contender"),
 		Config:    orchestratorConfig(),
 	}); !errors.Is(err, session.ErrSessionBusy) {
 		t.Fatalf("contending Start error = %v, want ErrSessionBusy", err)
@@ -182,8 +175,12 @@ func TestConcurrentInterruptsSettleDurableRuns(t *testing.T) {
 			t.Fatalf("active run err = %v, want ErrNotFound", err)
 		}
 		batch, err := store.ListMessages(ctx, run.SessionID, session.ReplayCursor{Limit: 10})
-		if err != nil || len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant || len(batch.Parts) != 1 || string(batch.Parts[0].Payload) != `{"text":"hello"}` {
+		if err != nil || len(batch.Messages) != 2 || batch.Messages[0].Role != session.RoleUser || batch.Messages[1].Role != session.RoleAssistant || len(batch.Parts) != 1 {
 			t.Fatalf("interrupted history = %#v, %v; want admitted user/assistant pair", batch, err)
+		}
+		decodedUserContent, err := session.DecodeContentParts(session.RoleUser, batch.Parts, session.DefaultContentLimits())
+		if err != nil || len(decodedUserContent.Blocks) != 1 || decodedUserContent.Blocks[0].Text == nil || decodedUserContent.Blocks[0].Text.Text != "hello" {
+			t.Fatalf("interrupted user content = %#v, %v; want admitted \"hello\" text", decodedUserContent, err)
 		}
 	}
 }

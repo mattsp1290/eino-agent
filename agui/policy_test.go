@@ -65,6 +65,41 @@ func TestRulesFamiliesAreUnique(t *testing.T) {
 	}
 }
 
+// TestRulesPersistImpliesSessionPart pins the invariant that a rule claiming
+// DispositionPersist (durable session facts) must name the durable
+// SessionPart that backs it. Without this, a family can drift into declaring
+// durability it does not provide -- exactly what happened to
+// EventStateSnapshot and EventStep, whose SessionPart was always "" (nothing
+// backs them yet) while Persist claimed DispositionPersist.
+//
+// This intentionally does not require Replay == DispositionReplay to imply a
+// single SessionPart: EventMessagesSnapshot legitimately replays by
+// projecting the full durable message/part history rather than one part
+// kind, so it has no single SessionPart despite being genuinely replayable.
+func TestRulesPersistImpliesSessionPart(t *testing.T) {
+	t.Parallel()
+
+	for _, rule := range Rules() {
+		if rule.Persist == DispositionPersist && rule.SessionPart == "" {
+			t.Fatalf("%s: Persist = DispositionPersist but SessionPart is empty (no durable backing)", rule.Family)
+		}
+	}
+
+	// EventStateSnapshot and EventStep are the two families with no durable
+	// backing today; pin that they are honest about it (DispositionOmit, not
+	// an aspirational DispositionPersist/DispositionReplay).
+	rules := byFamily(Rules())
+	for _, family := range []EventFamily{EventStateSnapshot, EventStep} {
+		rule := rules[family]
+		if rule.SessionPart != "" {
+			t.Fatalf("%s: SessionPart = %q, want empty -- update this test if a PartKind now backs it", family, rule.SessionPart)
+		}
+		if rule.Persist != DispositionOmit || rule.Replay != DispositionOmit {
+			t.Fatalf("%s: Persist=%s Replay=%s, want Omit/Omit while SessionPart is empty", family, rule.Persist, rule.Replay)
+		}
+	}
+}
+
 func TestRulesRedactionIsExplicit(t *testing.T) {
 	t.Parallel()
 

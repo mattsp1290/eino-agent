@@ -153,7 +153,7 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	selection := model.Selection{ProviderID: "fake", ModelID: "test"}
 	admission, err := orchestrator.Start(ctx, runtime.Request{
 		SessionID: "catalog-runtime",
-		Message:   runtime.UserMessage{Content: "read the fixture"},
+		Message:   runtime.TextUserMessage("read the fixture"),
 		Config: config.Snapshot{
 			Agent: config.Agent{Name: "agent", Model: selection}, Model: selection,
 			Metadata: map[string]string{"workspace_id": "workspace", "workspace_root": root},
@@ -162,7 +162,7 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	result := <-admission.Handle.Done()
+	result := <-admission.Done()
 	if result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("runtime result = %+v", result)
 	}
@@ -172,7 +172,14 @@ func TestMountStandardRunsThroughOrchestratorAndDurableSettlement(t *testing.T) 
 	if permissionRequest.Permission != "workspace.read" || permissionRequest.Pattern != "hello.txt" || permissionRequest.ToolName != "file_read" {
 		t.Fatalf("permission request = %+v", permissionRequest)
 	}
-	call, err := store.GetToolCall(ctx, "catalog-call")
+	// The scripted streamer's tool call carried CallID "catalog-call", but
+	// runtime.prepareToolCalls always mints a fresh, durable, store-unique
+	// ToolCall.ID regardless of what the provider sent (see
+	// session.ToolCall.ProviderCallID) -- so the durable row's primary key
+	// is not "catalog-call". permissionRequest.ToolCallID (captured above,
+	// from the SAME dispatched call) is the minted id to look the row up
+	// by.
+	call, err := store.GetToolCall(ctx, session.ToolCallID(permissionRequest.ToolCallID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,22 +475,31 @@ type catalogRuntimeStreamer struct {
 
 func (s *catalogRuntimeStreamer) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
 	s.turn++
-	var response *einoschema.Message
+	var response *einoschema.AgenticMessage
 	if s.turn == 1 {
-		got := make([]string, len(request.Tools))
-		for index := range request.Tools {
-			got[index] = request.Tools[index].Name
+		got := make([]string, len(request.Controls.Tools))
+		for index := range request.Controls.Tools {
+			got[index] = request.Controls.Tools[index].Name
 		}
 		if !reflect.DeepEqual(got, s.wantOrder) {
 			s.err = fmt.Errorf("provider tool order = %#v, want %#v", got, s.wantOrder)
 			return nil, s.err
 		}
-		response = einoschema.AssistantMessage("", []einoschema.ToolCall{{
-			ID: "catalog-call", Type: "function",
-			Function: einoschema.FunctionCall{Name: "file_read", Arguments: `{"path":"dir/../hello.txt"}`},
-		}})
+		response = &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.FunctionToolCall{
+					CallID: "catalog-call", Name: "file_read", Arguments: `{"path":"dir/../hello.txt"}`,
+				}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}
 	} else {
-		response = einoschema.AssistantMessage("done", nil)
+		response = &einoschema.AgenticMessage{
+			Role: einoschema.AgenticRoleTypeAssistant,
+			ContentBlocks: []*einoschema.ContentBlock{
+				einoschema.NewContentBlockChunk(&einoschema.AssistantGenText{Text: "done"}, &einoschema.StreamingMeta{Index: 0}),
+			},
+		}
 	}
 	reader, writer := einoschema.Pipe[model.StreamDelta](1)
 	_ = writer.Send(model.StreamDelta{Message: response}, nil)
@@ -513,3 +529,6 @@ func (s *catalogSequenceIDs) NewToolCallID() session.ToolCallID {
 }
 func (s *catalogSequenceIDs) NewEventID() session.EventID { return session.EventID(s.next("event")) }
 func (s *catalogSequenceIDs) NewEpochID() session.EpochID { return session.EpochID(s.next("epoch")) }
+func (s *catalogSequenceIDs) NewTurnID() session.TurnID   { return session.TurnID(s.next("turn")) }
+func (s *catalogSequenceIDs) NewInboxID() session.InboxID { return session.InboxID(s.next("inbox")) }
+func (s *catalogSequenceIDs) NewInvocationID() string     { return s.next("invocation") }

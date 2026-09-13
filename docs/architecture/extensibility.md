@@ -36,7 +36,7 @@ plan, and clock.
 | Models/providers | `model.Resolver`, normally `model.AdapterResolver` | none | Native only by design |
 | Durable IDs | `runtime.IDGenerator` | none | Native only by design |
 
-The current pre-release WIT package is `eino-agent:extensions@0.1.0`; see
+The current pre-release WIT package is `eino-agent:extensions@0.2.0`; see
 `wit/README.md` for regeneration rules. Generated bindings are committed under
 `wasmext/gen` and reproduced with `make wit`.
 
@@ -54,7 +54,7 @@ fallback so its durable failure can settle without masking the original error.
 `runtime.ToolResultTransformPoint` runs after execution and before encoding or
 settlement. Transforms run in registration order, and each receives the value
 returned by its predecessor. The final result
-is used by durable output, the settled event, `PartToolResult`, and the next
+is used by durable output, the settled event, `PartFunctionToolResult`, and the next
 model-visible tool message. The executor error is informational and cannot be
 removed; a middleware error can turn a success into failure but cannot turn an
 executor failure into success.

@@ -30,6 +30,11 @@ type ToolPlanIdentity struct {
 	Scope                    extension.Scope
 	SchemaHash, ExecutorHash string
 	Order                    int
+	// Aliases and Deferred are part of this identity so the sealed plan
+	// fingerprint changes whenever a tool's aliases or deferred status
+	// change, even if nothing else about it did.
+	Aliases  []string
+	Deferred bool
 }
 
 type PromptPlanIdentity struct {
@@ -49,16 +54,51 @@ type RestrictionPlanIdentity struct {
 	Scope                     extension.Scope
 }
 
+// AgentHandlerPlanIdentity is the durable identity of one host-registered
+// typed ADK agent middleware (composition.Registrar.Handler). Unlike
+// RegistrationIdentity (which identifies a generic extension-point
+// hook/transform/gate/around/notification registration), this identifies a
+// composition-level factory that builds an adk.TypedChatModelAgentMiddleware
+// for a run's agent. Kind names the upstream recipe (e.g. "agentsmd",
+// "skill", "filesystem", "plantask", "patchtoolcalls", "reduction",
+// "summarization", "toolsearch"); Version is the registration's declared
+// config-schema version; ConfigHash is the canonical hash of the
+// registration's bounded, closed-schema Config. The factory closure itself is
+// never part of this identity or the sealed fingerprint -- only what it was
+// declared to be.
+type AgentHandlerPlanIdentity struct {
+	ID, Kind, Version, ConfigHash string
+	Order                         int
+	Scope                         extension.Scope
+	// Tools is the sealed, discovered set of tools this handler contributes
+	// (name + schema hash), frozen into the plan at compile time -- see
+	// runtime.discoverHandlerTools. A tool a handler tries to add at real
+	// per-turn execution time that is not in this sealed set fails the turn
+	// as a construction error (the frozen tool universe never expands at
+	// runtime).
+	Tools []HandlerToolIdentity
+}
+
+// HandlerToolIdentity is the sealed identity of one tool an agent-handler
+// contributes: its model-visible name and a hash of its full schema
+// (parameters, description), so a handler that changes its own tool's
+// schema between runs (an upstream version bump, a config change) changes
+// the sealed plan fingerprint.
+type HandlerToolIdentity struct {
+	Name, SchemaHash string
+}
+
 // ComponentPlan is the complete durable behavior identity owned by one
 // extension component.
 type ComponentPlan struct {
-	InstanceID   string
-	Artifact     extension.Artifact
-	Handlers     []RegistrationIdentity
-	Tools        []ToolPlanIdentity
-	Prompts      []PromptPlanIdentity
-	Guards       []GuardPlanIdentity
-	Restrictions []RestrictionPlanIdentity
+	InstanceID    string
+	Artifact      extension.Artifact
+	Handlers      []RegistrationIdentity
+	Tools         []ToolPlanIdentity
+	Prompts       []PromptPlanIdentity
+	Guards        []GuardPlanIdentity
+	Restrictions  []RestrictionPlanIdentity
+	AgentHandlers []AgentHandlerPlanIdentity
 }
 
 // ExtensionPlanDescriptor is the complete current durable identity of one
@@ -66,7 +106,16 @@ type ComponentPlan struct {
 // capability collections.
 type ExtensionPlanDescriptor struct {
 	Fingerprint string
-	Components  []ComponentPlan
+	// ToolSearch is the configured tool-search tool's model-visible name
+	// for this plan, or empty when tool search is not enabled. Unlike the
+	// rest of runtime.ToolSearchConfig (its description carries no
+	// execution authority), the name is sealed into the fingerprint so
+	// that a resume whose tool-search registration was renamed or removed
+	// between the original run and the resume is rejected with the
+	// standard plan-mismatch error instead of failing deep inside resume
+	// with "tool_search unavailable" (composition-search-reviewer I3).
+	ToolSearch string
+	Components []ComponentPlan
 }
 
 // SealedExtensionPlan is a validated, canonical extension-plan identity. The
@@ -98,9 +147,16 @@ func (d ExtensionPlanDescriptor) Clone() ExtensionPlanDescriptor {
 	for index, component := range d.Components {
 		component.Handlers = append([]RegistrationIdentity(nil), component.Handlers...)
 		component.Tools = append([]ToolPlanIdentity(nil), component.Tools...)
+		for i := range component.Tools {
+			component.Tools[i].Aliases = append([]string(nil), component.Tools[i].Aliases...)
+		}
 		component.Prompts = append([]PromptPlanIdentity(nil), component.Prompts...)
 		component.Guards = append([]GuardPlanIdentity(nil), component.Guards...)
 		component.Restrictions = append([]RestrictionPlanIdentity(nil), component.Restrictions...)
+		component.AgentHandlers = append([]AgentHandlerPlanIdentity(nil), component.AgentHandlers...)
+		for i := range component.AgentHandlers {
+			component.AgentHandlers[i].Tools = append([]HandlerToolIdentity(nil), component.AgentHandlers[i].Tools...)
+		}
 		next.Components[index] = component
 	}
 	return next
@@ -124,7 +180,7 @@ func validateComponentPlan(sessionID ID, component ComponentPlan, seen map[strin
 		return errors.New("duplicate extension component identity")
 	}
 	seen[component.InstanceID] = true
-	if len(component.Handlers)+len(component.Tools)+len(component.Prompts)+len(component.Guards)+len(component.Restrictions) == 0 {
+	if len(component.Handlers)+len(component.Tools)+len(component.Prompts)+len(component.Guards)+len(component.Restrictions)+len(component.AgentHandlers) == 0 {
 		return errors.New("extension component plan has no behavior")
 	}
 	if err := validateHandlerIdentities(sessionID, component.Handlers); err != nil {
@@ -139,7 +195,10 @@ func validateComponentPlan(sessionID ID, component ComponentPlan, seen map[strin
 	if err := validateGuardIdentities(sessionID, component.Guards); err != nil {
 		return err
 	}
-	return validateRestrictionIdentities(sessionID, component.Restrictions)
+	if err := validateRestrictionIdentities(sessionID, component.Restrictions); err != nil {
+		return err
+	}
+	return validateAgentHandlerIdentities(sessionID, component.AgentHandlers)
 }
 
 func validatePlanScope(sessionID ID, scope extension.Scope) error {
@@ -222,6 +281,30 @@ func validateRestrictionIdentities(sessionID ID, values []RestrictionPlanIdentit
 	return nil
 }
 
+func validateAgentHandlerIdentities(sessionID ID, values []AgentHandlerPlanIdentity) error {
+	seen := make(map[agentHandlerIdentityKey]bool, len(values))
+	for _, value := range values {
+		if extension.ValidateIdentifier(value.ID) != nil || strings.TrimSpace(value.Kind) == "" || strings.TrimSpace(value.Version) == "" || strings.TrimSpace(value.ConfigHash) == "" {
+			return errors.New("invalid agent handler plan identity")
+		}
+		key := agentHandlerIdentityKey{ID: value.ID, Scope: value.Scope}
+		if err := validateUniqueScope(sessionID, value.Scope, seen, key); err != nil {
+			return err
+		}
+		seenTools := make(map[string]bool, len(value.Tools))
+		for _, toolIdentity := range value.Tools {
+			if extension.ValidateIdentifier(toolIdentity.Name) != nil || strings.TrimSpace(toolIdentity.SchemaHash) == "" {
+				return errors.New("invalid agent handler tool identity")
+			}
+			if seenTools[toolIdentity.Name] {
+				return errors.New("duplicate agent handler tool identity")
+			}
+			seenTools[toolIdentity.Name] = true
+		}
+	}
+	return nil
+}
+
 func validateUniqueScope[K comparable](sessionID ID, scope extension.Scope, seen map[K]bool, key K) error {
 	if err := validatePlanScope(sessionID, scope); err != nil {
 		return err
@@ -266,6 +349,11 @@ type guardIdentityKey struct {
 type restrictionIdentityKey struct {
 	RegistrationID string
 	Scope          extension.Scope
+}
+
+type agentHandlerIdentityKey struct {
+	ID    string
+	Scope extension.Scope
 }
 
 // SealExtensionPlanForSession validates and seals one newly reconstructed,
@@ -321,11 +409,28 @@ func canonicalExtensionPlan(sessionID ID, descriptor ExtensionPlanDescriptor) (E
 		sort.Slice(component.Handlers, func(i, j int) bool {
 			return compareRegistrationIdentity(component.Handlers[i], component.Handlers[j]) < 0
 		})
+		for i := range component.Tools {
+			sort.Strings(component.Tools[i].Aliases)
+			if len(component.Tools[i].Aliases) == 0 {
+				component.Tools[i].Aliases = nil
+			}
+		}
 		sort.Slice(component.Tools, func(i, j int) bool { return compareToolPlanIdentity(component.Tools[i], component.Tools[j]) < 0 })
 		sort.Slice(component.Prompts, func(i, j int) bool { return comparePromptPlanIdentity(component.Prompts[i], component.Prompts[j]) < 0 })
 		sort.Slice(component.Guards, func(i, j int) bool { return compareGuardPlanIdentity(component.Guards[i], component.Guards[j]) < 0 })
 		sort.Slice(component.Restrictions, func(i, j int) bool {
 			return compareRestrictionPlanIdentity(component.Restrictions[i], component.Restrictions[j]) < 0
+		})
+		for i := range component.AgentHandlers {
+			sort.Slice(component.AgentHandlers[i].Tools, func(x, y int) bool {
+				return component.AgentHandlers[i].Tools[x].Name < component.AgentHandlers[i].Tools[y].Name
+			})
+			if len(component.AgentHandlers[i].Tools) == 0 {
+				component.AgentHandlers[i].Tools = nil
+			}
+		}
+		sort.Slice(component.AgentHandlers, func(i, j int) bool {
+			return compareAgentHandlerPlanIdentity(component.AgentHandlers[i], component.AgentHandlers[j]) < 0
 		})
 		normalizeEmptyComponentSlices(component)
 	}
@@ -355,6 +460,9 @@ func normalizeEmptyComponentSlices(component *ComponentPlan) {
 	}
 	if len(component.Restrictions) == 0 {
 		component.Restrictions = nil
+	}
+	if len(component.AgentHandlers) == 0 {
+		component.AgentHandlers = nil
 	}
 }
 
@@ -412,6 +520,25 @@ func compareRestrictionPlanIdentity(left, right RestrictionPlanIdentity) int {
 		return result
 	}
 	return cmp.Compare(left.RulesHash, right.RulesHash)
+}
+
+func compareAgentHandlerPlanIdentity(left, right AgentHandlerPlanIdentity) int {
+	if result := cmp.Compare(left.Order, right.Order); result != 0 {
+		return result
+	}
+	if result := cmp.Compare(left.ID, right.ID); result != 0 {
+		return result
+	}
+	if result := compareScope(left.Scope, right.Scope); result != 0 {
+		return result
+	}
+	if result := cmp.Compare(left.Kind, right.Kind); result != 0 {
+		return result
+	}
+	if result := cmp.Compare(left.Version, right.Version); result != 0 {
+		return result
+	}
+	return cmp.Compare(left.ConfigHash, right.ConfigHash)
 }
 
 func compareComponentIdentity(leftID string, left extension.Artifact, rightID string, right extension.Artifact) int {

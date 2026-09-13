@@ -33,7 +33,7 @@ func TestObservationLimitsPrivacyAndIndex(t *testing.T) {
 	secret := strings.Repeat("HIDDEN_SENTINEL", 10000)
 	appendPart("provider", session.PartProviderState, fmt.Sprintf("%q", secret))
 	appendPart("reasoning", session.PartReasoning, fmt.Sprintf("%q", secret))
-	appendPart("text", session.PartText, `{"text":"hi","private":"HIDDEN_SENTINEL"}`)
+	appendPart("text", session.PartUserInputText, `{"text":{"text":"hi"},"private":"HIDDEN_SENTINEL"}`)
 	snap, err := st.ReadObservationSnapshot(ctx, "session-tool", l)
 	if err != nil {
 		t.Fatal(err)
@@ -48,18 +48,18 @@ func TestObservationLimitsPrivacyAndIndex(t *testing.T) {
 	}
 	l = observationLimits()
 	l.MaxParts = 1
-	appendPart("empty", session.PartText, `{"text":""}`)
+	appendPart("empty", session.PartUserInputText, `{"text":{"text":""}}`)
 	if _, err = st.ReadObservationSnapshot(ctx, "session-tool", l); !errors.Is(err, session.ErrObservationTooLarge) {
 		t.Fatal(err)
 	}
 	l = observationLimits()
-	appendPart("bad", session.PartText, `{"text":42}`)
+	appendPart("bad", session.PartUserInputText, `{"text":{"text":42}}`)
 	if _, err = st.ReadObservationSnapshot(ctx, "session-tool", l); !errors.Is(err, session.ErrObservationInvalid) {
 		t.Fatal(err)
 	}
 	for _, query := range []string{
 		"EXPLAIN QUERY PLAN SELECT id FROM messages WHERE session_key = (SELECT row_key FROM sessions WHERE id = x'73657373696f6e2d746f6f6c') AND role IN ('user','assistant') ORDER BY created_at DESC,id DESC LIMIT 2",
-		"EXPLAIN QUERY PLAN SELECT id FROM parts WHERE session_key = (SELECT row_key FROM sessions WHERE id = x'73657373696f6e2d746f6f6c') AND message_key = (SELECT row_key FROM messages WHERE id = x'6d73672d746f6f6c') AND kind = 'text' ORDER BY ordinal,id LIMIT 2",
+		"EXPLAIN QUERY PLAN SELECT id FROM parts WHERE session_key = (SELECT row_key FROM sessions WHERE id = x'73657373696f6e2d746f6f6c') AND message_key = (SELECT row_key FROM messages WHERE id = x'6d73672d746f6f6c') AND kind = 'user_input_text' ORDER BY ordinal,id LIMIT 2",
 	} {
 		rows, err := st.db.QueryContext(ctx, query)
 		if err != nil {
@@ -187,7 +187,7 @@ func TestObservationConcurrentCommittedSnapshot(t *testing.T) {
 			done := make(chan error, 1)
 			go func() {
 				done <- ex.WithinTx(ctx, func(ctx context.Context, tx session.ExecutionStore) error {
-					if _, err := tx.AppendPart(ctx, session.Part{ID: "p", MessageID: "m", SessionID: "s", RunID: "r", Kind: session.PartText, Payload: []byte(`{"text":"atomic"}`)}); err != nil {
+					if _, err := tx.AppendPart(ctx, session.Part{ID: "p", MessageID: "m", SessionID: "s", RunID: "r", Kind: session.PartUserInputText, Payload: []byte(`{"text":{"text":"atomic"}}`)}); err != nil {
 						return err
 					}
 					if err := tx.FinalizeAssistantMessage(ctx, "m"); err != nil {
@@ -232,7 +232,7 @@ func TestObservationWindowCumulativeLimitsAndExcludedPopulations(t *testing.T) {
 		if _, err := ex.AppendMessage(ctx, session.Message{ID: session.MessageID(id), SessionID: "session-tool", RunID: "run-tool", Role: session.RoleUser, CreatedAt: now}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := ex.AppendPart(ctx, session.Part{ID: session.PartID(id), MessageID: session.MessageID(id), SessionID: "session-tool", RunID: "run-tool", Kind: session.PartText, Payload: []byte(`{"text":"é"}`)}); err != nil {
+		if _, err := ex.AppendPart(ctx, session.Part{ID: session.PartID(id), MessageID: session.MessageID(id), SessionID: "session-tool", RunID: "run-tool", Kind: session.PartUserInputText, Payload: []byte(`{"text":{"text":"é"}}`)}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -289,7 +289,7 @@ func TestObservationForeignOwnershipAndScalarUTF8(t *testing.T) {
 	st, ex, _, _ := setupToolTransitionTest(t)
 	defer func() { _ = st.db.Close() }()
 	ctx := t.Context()
-	if _, err := ex.AppendPart(ctx, session.Part{ID: "p", MessageID: "msg-tool", SessionID: "session-tool", RunID: "run-tool", Kind: session.PartText, Payload: []byte(`{"text":"safe"}`)}); err != nil {
+	if _, err := ex.AppendPart(ctx, session.Part{ID: "p", MessageID: "msg-tool", SessionID: "session-tool", RunID: "run-tool", Kind: session.PartUserInputText, Payload: []byte(`{"text":{"text":"safe"}}`)}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.CreateSession(ctx, session.Session{ID: "foreign-session"}); err != nil {
@@ -319,10 +319,10 @@ func TestObservationAssistantToolFinalizationAtomic(t *testing.T) {
 	defer func() { _ = st.db.Close() }()
 	ctx := t.Context()
 	call.RequestPartID = "request"
-	request := session.CreateToolCallRequest{Call: call, RequestPart: session.Part{ID: call.RequestPartID, MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartToolCall, Payload: []byte(`{"id":"call-tool","name":"tool","arguments":{"ok":true}}`)}, Event: session.ToolTransitionEvent{ID: "pending", CreatedAt: now}}
+	request := sqliteCreateRequest(call, "pending", now)
 	rollback := errors.New("rollback")
 	write := func(ctx context.Context, tx session.ExecutionStore) error {
-		if _, err := tx.AppendPart(ctx, session.Part{ID: "text", MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartText, Payload: []byte(`{"text":"atomic"}`)}); err != nil {
+		if _, err := tx.AppendPart(ctx, session.Part{ID: "text", MessageID: call.MessageID, SessionID: call.SessionID, RunID: call.RunID, Kind: session.PartUserInputText, Payload: []byte(`{"text":{"text":"atomic"}}`)}); err != nil {
 			return err
 		}
 		if _, err := tx.CreateToolCall(ctx, request); err != nil {
