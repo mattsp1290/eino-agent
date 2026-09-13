@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
@@ -92,97 +93,15 @@ type Bridge struct {
 	// during the replay window (never in this set) instead of forwarding
 	// it.
 	projectedMessages map[session.MessageID]bool
-	// nativeStreamed records every message ID for which this Bridge has
-	// actually emitted at least one native TEXT_MESSAGE_*/REASONING_* AG-UI
-	// event via emitMessageDelta on THIS connection. (Tool-call natives are
-	// tracked separately, per CALL rather than per message -- see
-	// toolCallNativeSuppressed/toolCallResultSent below; a tool_call_updated
-	// record's MessageID is the owning ASSISTANT message, which commits
-	// before any of its own tool transitions publish, so a per-message flag
-	// here cannot distinguish "this message's text streamed live" from
-	// "this message's tool call did", the W7 fifth fix-pass review's P0-1
-	// finding.) emitLiveMessageCommitted consults nativeStreamed (not a
-	// connection-phase flag -- see the fourth W7 fix-pass review's P0-1
-	// finding, reviews/w7-fixes3-2026-09-12/) to decide whether a
-	// session.MessageCommittedEventKind notification for a message still
-	// needs a native representation or can be a custom-only supplement:
-	// the earlier "are we still in replay()'s durable sweep" phase test
-	// assumed a message's live deltas are necessarily unseen during that
-	// sweep and necessarily already seen once the sweep ends, but
-	// Reconnect subscribes to the live tail BEFORE calling replay() (see
-	// Reconnect's doc comment), so a delta for a message replay()'s own
-	// sweep already found fully committed can still be sitting in that
-	// buffered channel, to be drained by the live loop AFTER the sweep
-	// already delivered that message's native content. A phase flag can't
-	// tell that apart; per-message "did native content actually reach
-	// this connection for THIS message" can. See also emitMessageDelta's
-	// own messageProjected guard, which handles the mirror case (a stale
-	// delta arriving for a message already delivered via the
-	// committed-projection path) -- emitToolCallUpdated does NOT share that
-	// guard; see its own doc comment for why.
+	// nativeStreamed records messages with successful live text or reasoning
+	// content writes; it decides whether a later committed projection needs
+	// native content or only its custom supplement.
 	nativeStreamed map[session.MessageID]bool
-	// toolCallNativeSuppressed records every tool call ID whose native
-	// TOOL_CALL_START/TOOL_CALL_ARGS/TOOL_CALL_END lifecycle has already
-	// been delivered to this connection through the OWNING ASSISTANT
-	// message's own committed-projection emission (see
-	// emitLiveMessageCommitted's recordNativeToolDelivery call) -- always
-	// strictly BEFORE any live tool_call_updated event for that call
-	// reaches this Bridge, by construction: runtime.publishMessageCommitted
-	// for an assistant message always precedes that same call's own
-	// tool-transition publishes (runtime/tool_preparation.go). emitToolCallUpdated
-	// consults this, keyed on the CALL, to decide whether to (re-)emit that
-	// native lifecycle -- see its own doc comment.
-	//
-	// This replaces the message-level Bridge.projectedMessages guard the W7
-	// fifth fix-pass review found (P0-1) silently dropped EVERY live
-	// tool-call event on the ordinary streaming-turn-with-a-tool-call path:
-	// session/tool_transition.go stamps a tool_call_updated record's
-	// MessageID with the owning ASSISTANT message's id for every phase
-	// (pending/running/terminal), and that assistant message is *always*
-	// already committed (and thus already in projectedMessages) by the time
-	// the first such event reaches Emit -- so keying suppression on message
-	// identity suppressed every tool-call transition on every turn that
-	// called a tool, not just the genuinely-stale-duplicate case the guard
-	// was meant for. A tool call's natural dedup key is the call itself,
-	// not the message that happened to introduce it.
+	// nativeFrames is the connection-local ownership ledger. Direct writes
+	// enter through deliverNative; successful projections register exactly
+	// the representable keys after the SDK emitter returns success.
 	nativeFrames       map[nativeFrameKey]bool
 	nativeDeltaOrdinal uint64
-	// toolCallLiveStartSent records every tool call ID for which
-	// emitToolCallUpdated has already emitted a native TOOL_CALL_START/ARGS
-	// pair on the LIVE path itself, independent of
-	// toolCallNativeSuppressed. A durable tool_call_updated record repeats
-	// the call's Name/Arguments at EVERY phase (session/tool_transition.go's
-	// ToolTransitionRecord marshals them from the call's current state,
-	// which does not change across pending/running/terminal), so without
-	// this a call claimed and later settled -- the ordinary two- or
-	// three-event lifecycle -- would emit TOOL_CALL_START/ARGS once per
-	// phase event instead of once total. This does NOT gate TOOL_CALL_END:
-	// unlike toolCallNativeSuppressed (which means a committed projection
-	// already sent the FULL Start+Args+End triple atomically, so End must
-	// be suppressed too), a call whose Start/Args the LIVE path itself
-	// already sent still needs its OWN End on the terminal event -- nothing
-	// else will ever send it.
-	// toolCallResultSent records every tool call ID whose native
-	// TOOL_CALL_RESULT has already reached this connection -- either from
-	// emitToolCallUpdated's own terminal branch (the common case on a live
-	// connection: the terminal tool_call_updated transition always reaches
-	// this Bridge strictly BEFORE the separate result message's own
-	// session.MessageCommittedEventKind notification, per
-	// runtime/tool_execution.go's persistToolSettlement, which publishes
-	// the transition event before publishing that commit) or from an
-	// earlier committed-projection emission of that result message's
-	// function_tool_result block (the reconnect-after-completion case,
-	// where no live terminal event ever reaches this connection).
-	// emitLiveMessageCommitted consults this for a message whose entire
-	// content is already-delivered tool results, to avoid re-emitting a
-	// second native TOOL_CALL_RESULT for the same call -- see
-	// blocksAlreadyDeliveredNatively's doc comment. This is the per-call
-	// counterpart of nativeStreamed for exactly one content kind: eino-agui's
-	// EmitCommittedProjection has no per-block DeliveryMode (W7 fifth
-	// fix-pass review P1-4), only a per-MESSAGE one, so this bridge can only
-	// avoid a duplicate by downgrading a result message's WHOLE mode, and
-	// only when every block in it is already covered -- see
-	// blocksAlreadyDeliveredNatively.
 	// terminated is true once this Bridge has written a terminal frame --
 	// either Emit's runtime.EventRunFinished case (a durable
 	// RUN_FINISHED/RUN_ERROR) or a Terminate call -- for the life of this
@@ -302,6 +221,10 @@ func (b *Bridge) deliverNative(key nativeFrameKey, emitter *aguiemitter.Emitter,
 func (b *Bridge) nextDeltaKey(kind aguievents.EventType, messageID session.MessageID) nativeFrameKey {
 	b.nativeDeltaOrdinal++
 	return nativeFrameKey{kind: kind, ownerID: string(messageID), ordinal: b.nativeDeltaOrdinal}
+}
+
+func (b *Bridge) nativeDelivered(key nativeFrameKey) bool {
+	return b != nil && b.nativeFrames[key]
 }
 
 // BenignCommitMisses returns the number of session.MessageCommittedEventKind
@@ -577,31 +500,52 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	// reconnecting client (W7 fix-pass review finding P1-D/I3).
 	if b.includeReasoning && payload.Reasoning != "" {
 		if b.textOpen[messageID] {
-			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}, b.emit, aguievents.NewTextMessageEndEvent(string(messageID)))
+			textEnd := nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}
+			if !b.nativeDelivered(textEnd) && !b.deliverNative(textEnd, b.emit, aguievents.NewTextMessageEndEvent(string(messageID))) {
+				return
+			}
 			delete(b.textOpen, messageID)
 		}
 		reasoningID := b.reasoning[messageID]
 		if reasoningID == "" {
 			reasoningID = string(messageID)
+			reasoningStart := nativeFrameKey{kind: aguievents.EventTypeReasoningStart, ownerID: reasoningID}
+			if !b.nativeDelivered(reasoningStart) && !b.deliverNative(reasoningStart, b.emit, aguievents.NewReasoningStartEvent(reasoningID)) {
+				return
+			}
+			reasoningMessageStart := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageStart, ownerID: reasoningID}
+			if !b.nativeDelivered(reasoningMessageStart) && !b.deliverNative(reasoningMessageStart, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning")) {
+				return
+			}
 			b.reasoning[messageID] = reasoningID
-			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningStart, ownerID: reasoningID}, b.emit, aguievents.NewReasoningStartEvent(reasoningID))
-			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningMessageStart, ownerID: reasoningID}, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning"))
 		}
-		b.deliverNative(b.nextDeltaKey(aguievents.EventTypeReasoningMessageContent, messageID), b.emit, aguievents.NewReasoningMessageContentEvent(reasoningID, payload.Reasoning))
-		b.markNativeStreamed(messageID)
+		if b.deliverNative(b.nextDeltaKey(aguievents.EventTypeReasoningMessageContent, messageID), b.emit, aguievents.NewReasoningMessageContentEvent(reasoningID, payload.Reasoning)) {
+			b.markNativeStreamed(messageID)
+		}
 	}
 	if payload.Content != "" {
 		if b.reasoning[messageID] != "" {
-			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: b.reasoning[messageID]}, b.emit, aguievents.NewReasoningMessageEndEvent(b.reasoning[messageID]))
-			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: b.reasoning[messageID]}, b.emit, aguievents.NewReasoningEndEvent(b.reasoning[messageID]))
+			reasoningID := b.reasoning[messageID]
+			messageEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}
+			if !b.nativeDelivered(messageEnd) && !b.deliverNative(messageEnd, b.emit, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
+				return
+			}
+			reasoningEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}
+			if !b.nativeDelivered(reasoningEnd) && !b.deliverNative(reasoningEnd, b.emit, aguievents.NewReasoningEndEvent(reasoningID)) {
+				return
+			}
 			delete(b.reasoning, messageID)
 		}
 		if !b.textOpen[messageID] {
-			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(messageID)}, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant")))
+			textStart := nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(messageID)}
+			if !b.nativeDelivered(textStart) && !b.deliverNative(textStart, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant"))) {
+				return
+			}
 			b.textOpen[messageID] = true
 		}
-		b.deliverNative(b.nextDeltaKey(aguievents.EventTypeTextMessageContent, messageID), b.emit, aguievents.NewTextMessageContentEvent(string(messageID), payload.Content))
-		b.markNativeStreamed(messageID)
+		if b.deliverNative(b.nextDeltaKey(aguievents.EventTypeTextMessageContent, messageID), b.emit, aguievents.NewTextMessageContentEvent(string(messageID), payload.Content)) {
+			b.markNativeStreamed(messageID)
+		}
 	}
 }
 
@@ -618,18 +562,9 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 // suppress every tool-call event on every turn that called a tool, not just
 // a genuine duplicate.
 //
-// The real dedup key is the CALL, not the message: toolCallNativeSuppressed
-// (set by emitLiveMessageCommitted, from the assistant message's own
-// committed-projection emission of this call's function_tool_call block)
-// tells this function its native START/ARGS/END lifecycle already reached
-// this connection, toolCallLiveStartSent tracks the SAME question for
-// START/ARGS specifically when THIS function was the one that sent them
-// (a durable tool_call_updated record repeats the call's Name/Arguments at
-// every phase -- pending/running/terminal -- so without this a claimed and
-// settled call would emit a second native START/ARGS pair on its terminal
-// event), and toolCallResultSent guards the terminal RESULT symmetrically
-// against the result message's own later commit. See all three fields' doc
-// comments.
+// The native-frame ledger keys each lifecycle phase by tool call ID. Thus a
+// projection-owned start/args/end and a later durable transition share the
+// same authority without suppressing a distinct terminal result.
 func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 	payload := toolPayload{}
 	if err := json.Unmarshal(event.Payload, &payload); err != nil {
@@ -655,8 +590,16 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 		return
 	}
 	b.closeOpen(b.emit)
+	startKey := nativeFrameKey{kind: aguievents.EventTypeToolCallStart, ownerID: string(toolCallID)}
 	if payload.Name != "" {
-		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeToolCallStart, ownerID: string(toolCallID)}, b.emit, aguievents.NewToolCallStartEvent(string(toolCallID), payload.Name, aguievents.WithParentMessageID(string(event.MessageID))))
+		if !b.nativeDelivered(startKey) && !b.deliverNative(startKey, b.emit, aguievents.NewToolCallStartEvent(string(toolCallID), payload.Name, aguievents.WithParentMessageID(string(event.MessageID)))) {
+			return
+		}
+	}
+	if !b.nativeDelivered(startKey) {
+		b.recordLiveErr(fmt.Errorf("agui: tool_call_updated payload for call %s has no delivered start", toolCallID))
+		b.emitTerminalError()
+		return
 	}
 	if payload.Arguments != "" {
 		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeToolCallArgs, ownerID: string(toolCallID)}, b.emit, aguievents.NewToolCallArgsEvent(string(toolCallID), payload.Arguments.String()))
@@ -676,12 +619,21 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 // encode failure Terminate's own fallback emitter exists to work around.
 func (b *Bridge) closeOpen(e *aguiemitter.Emitter) {
 	for messageID := range b.textOpen {
-		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}, e, aguievents.NewTextMessageEndEvent(string(messageID)))
+		key := nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}
+		if !b.nativeDelivered(key) && !b.deliverNative(key, e, aguievents.NewTextMessageEndEvent(string(messageID))) {
+			continue
+		}
 		delete(b.textOpen, messageID)
 	}
 	for messageID, reasoningID := range b.reasoning {
-		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}, e, aguievents.NewReasoningMessageEndEvent(reasoningID))
-		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}, e, aguievents.NewReasoningEndEvent(reasoningID))
+		messageEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}
+		if !b.nativeDelivered(messageEnd) && !b.deliverNative(messageEnd, e, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
+			continue
+		}
+		reasoningEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}
+		if !b.nativeDelivered(reasoningEnd) && !b.deliverNative(reasoningEnd, e, aguievents.NewReasoningEndEvent(reasoningID)) {
+			continue
+		}
 		delete(b.reasoning, messageID)
 	}
 }
@@ -804,20 +756,9 @@ func (b *Bridge) recordProjectedNativeFrames(keys []nativeFrameKey) {
 //     native content for this message already reached this same
 //     connection via emitMessageDelta before the message committed, so
 //     this must not duplicate it as a second native event.
-//   - blocksAlreadyDeliveredNatively covers the same "already delivered"
-//     question at per-BLOCK granularity for exactly the one content kind
-//     nativeStreamed cannot see coming: a function_tool_result message's
-//     own native TOOL_CALL_RESULT, when emitToolCallUpdated's live terminal
-//     branch already sent it for that call (W7 fifth fix-pass review P1-4 --
-//     eino-agui's EmitCommittedProjection has no per-block DeliveryMode, so
-//     this can only downgrade the WHOLE message's mode, and only when every
-//     block in it is already covered; see that function's doc comment).
-//     On successful emission with a natives-including mode,
-//     recordNativeToolDelivery marks every function_tool_call block's call
-//     ID as toolCallNativeSuppressed, which is the SAME mechanism working
-//     in the other direction: it tells emitToolCallUpdated the assistant
-//     message's own commit already delivered that call's native
-//     START/ARGS/END lifecycle, so the live path must not repeat it.
+//   - EmitCommittedProjection independently derives all representable native
+//     frame keys, selects LiveContinuation only when every key is already in
+//     nativeFrames, and records keys only after the SDK projection succeeds.
 //
 // It reprojects the WHOLE session's durable history rather than loading just
 // this one message: session.Store exposes no by-ID single-message read
@@ -947,9 +888,10 @@ func (p toolPayload) ResultContent() string {
 	if len(output) > 0 && !bytes.Equal(output, []byte("null")) {
 		var text string
 		if json.Unmarshal(output, &text) == nil {
-			return text
-		}
-		if json.Valid(output) {
+			if strings.TrimSpace(text) != "" {
+				return text
+			}
+		} else if json.Valid(output) {
 			var compact bytes.Buffer
 			if json.Compact(&compact, output) == nil {
 				return compact.String()

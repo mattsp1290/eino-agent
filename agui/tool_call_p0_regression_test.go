@@ -12,6 +12,7 @@ import (
 
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
+	sqlite "github.com/mattsp1290/eino-agent/store/sqlite"
 )
 
 // toolCallTurnFixture is a fully durable, fully settled "assistant streams
@@ -372,6 +373,50 @@ func TestReplaySettledToolCallEmitsEachNativeFrameOnce(t *testing.T) {
 			if frame["toolCallId"] != string(fx.callID) || !strings.Contains(content, "3 results found") {
 				t.Fatalf("replayed result = %#v, want call %q with persisted output", frame, fx.callID)
 			}
+		}
+	}
+}
+
+func TestReconnectTailOverlapDoesNotRepeatSettledToolLifecycle(t *testing.T) {
+	t.Parallel()
+
+	fx := buildToolCallTurnFixture(t, "session-reconnect-tool-overlap", "run-reconnect-tool-overlap")
+	rawStore, ok := fx.store.(*sqlite.Store)
+	if !ok {
+		t.Fatalf("fixture store type = %T, want *sqlite.Store", fx.store)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &replaySweepDoneStore{Store: rawStore, sessionID: fx.sessionID, done: make(chan struct{})}
+	tail := newReplayTail()
+	sink := newSSESink()
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(fx.sessionID), string(fx.runID), nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := Reconnect(ctx, bridge, store, tail, fx.sessionID, session.EventCursor{Limit: 100}, session.ContentLimits{}, false)
+		done <- err
+	}()
+	<-tail.subscribed
+	select {
+	case <-store.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("replay sweep did not finish")
+	}
+	overlap := fx.settleEvent
+	overlap.ID = "tail-overlap-terminal"
+	tail.events <- overlap
+	close(tail.events)
+	if err := <-done; err != nil {
+		t.Fatalf("Reconnect() error = %v", err)
+	}
+	frames := frameData(t, sink.Bytes())
+	counts := map[string]int{}
+	for _, frame := range frames {
+		counts[frame["type"].(string)]++
+	}
+	for _, kind := range []string{"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"} {
+		if counts[kind] != 1 {
+			t.Fatalf("%s count = %d, want one across replay/tail overlap", kind, counts[kind])
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -15,6 +16,7 @@ import (
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
+	"github.com/mattsp1290/eino-agui/convert"
 	aguiemitter "github.com/mattsp1290/eino-agui/emitter"
 
 	"github.com/mattsp1290/eino-agent/runtime"
@@ -85,6 +87,7 @@ func TestToolPayloadResultContentUsesDurableOutputContract(t *testing.T) {
 		{name: "array", payload: toolPayload{Output: json.RawMessage(`[1,2]`)}, want: `[1,2]`},
 		{name: "number", payload: toolPayload{Output: json.RawMessage(`3`)}, want: "3"},
 		{name: "null fallback", payload: toolPayload{Output: json.RawMessage(`null`), Error: "failed", Status: "failed"}, want: `{"error":"failed","status":"failed"}`},
+		{name: "whitespace string fallback", payload: toolPayload{Output: json.RawMessage(`"   "`), Error: "failed", Status: "failed"}, want: `{"error":"failed","status":"failed"}`},
 		{name: "absent error fallback", payload: toolPayload{Error: "failed", Status: "failed"}, want: `{"error":"failed","status":"failed"}`},
 		{name: "absent status", payload: toolPayload{Status: "completed"}, want: `{"status":"completed"}`},
 	} {
@@ -93,6 +96,96 @@ func TestToolPayloadResultContentUsesDurableOutputContract(t *testing.T) {
 				t.Fatalf("ResultContent() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestToolTransitionRecordOutputConversion(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 9, 13, 0, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name   string
+		output json.RawMessage
+		error  string
+		want   string
+	}{
+		{name: "string", output: json.RawMessage(`"result"`), want: "result"},
+		{name: "object", output: json.RawMessage(`{"n":1}`), want: `{"n":1}`},
+		{name: "null fallback", output: json.RawMessage(`null`), error: "failed", want: `{"error":"failed","status":"failed"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			record, err := session.ToolTransitionRecord(session.ToolCall{
+				ID: "call-1", SessionID: "session-1", RunID: "run-1", MessageID: "assistant-1", Name: "search",
+				Status: session.ToolCallFailed, ClaimedBy: "worker", ClaimToken: "claim", CompletedAt: now,
+				Output: test.output, Error: test.error,
+			}, session.ToolTransitionEvent{ID: "event-1", CreatedAt: now})
+			if err != nil {
+				t.Fatalf("ToolTransitionRecord() error = %v", err)
+			}
+			var payload toolPayload
+			if err := json.Unmarshal(record.Payload, &payload); err != nil {
+				t.Fatalf("unmarshal durable payload: %v", err)
+			}
+			if got := payload.ResultContent(); got != test.want {
+				t.Fatalf("ResultContent() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+type alwaysFailWriter struct{}
+
+func (alwaysFailWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func TestBridgeRetriesNativeSpanAfterFailedWrite(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	sink := newSSESink()
+	bridge := NewBridge(ctx, nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	event := session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"retry me"}`)}
+	bridge.Emit(ctx, event)
+	if bridge.textOpen[event.MessageID] || bridge.nativeAlreadyStreamed(event.MessageID) {
+		t.Fatalf("failed start advanced bridge state: textOpen=%v nativeStreamed=%v", bridge.textOpen, bridge.nativeAlreadyStreamed(event.MessageID))
+	}
+	if bridge.nativeDelivered(nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(event.MessageID)}) {
+		t.Fatal("failed start was registered in native ledger")
+	}
+
+	bridge.emit = aguiemitter.NewEmitter(ctx, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge.Emit(ctx, event)
+	frames := frameData(t, sink.Bytes())
+	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT" {
+		t.Fatalf("retry frames = %s, want complete start/content span", got)
+	}
+	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge.closeOpen(bridge.emit)
+	if !bridge.textOpen[event.MessageID] {
+		t.Fatal("failed close discarded open text span")
+	}
+	bridge.emit = aguiemitter.NewEmitter(ctx, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge.closeOpen(bridge.emit)
+	frames = frameData(t, sink.Bytes())
+	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END" {
+		t.Fatalf("retry close frames = %s, want complete span", got)
+	}
+}
+
+func TestProjectedNativeFrameKeysExcludeMultipartToolResult(t *testing.T) {
+	t.Parallel()
+
+	bridge := &Bridge{}
+	projection := &convert.AgenticProjection{Public: &convert.PublicAgenticMessage{ContentBlocks: []convert.PublicContentBlock{{
+		Type:     einoschema.ContentBlockTypeFunctionToolResult,
+		Identity: convert.AgenticIdentityV1{MessageID: "result-1", CallID: "call-1"},
+		FunctionToolResult: &convert.PublicFunctionToolResult{CallID: "call-1", Name: "search", Content: []convert.PublicFunctionResultPart{
+			{Type: einoschema.FunctionToolResultContentBlockTypeText, Text: "text"},
+			{Type: einoschema.FunctionToolResultContentBlockTypeImage, Media: &convert.PublicMedia{URL: "https://example.test/result.png"}},
+		}},
+	}}}}
+	if keys := bridge.projectedNativeFrameKeys(projection); len(keys) != 0 {
+		t.Fatalf("multipart result registered native keys %#v, want none", keys)
 	}
 }
 
