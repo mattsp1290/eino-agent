@@ -53,6 +53,13 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, contentLimits, includeReasoning); err != nil {
 		return cursor, nil, err
 	}
+	// bridge.inReplaySweep brackets only this durable ListEvents sweep --
+	// never emitMessageSnapshot above (which always uses
+	// DeliveryModeReplay directly) and never the live tail loop below in
+	// Reconnect. See Bridge.inReplaySweep's doc comment for why
+	// emitLiveMessageCommitted needs to tell the two phases apart.
+	bridge.beginReplaySweep()
+	defer bridge.endReplaySweep()
 	next := cursor
 	seen := map[session.EventID]bool{}
 	for {

@@ -16,7 +16,12 @@ import (
 	"github.com/mattsp1290/eino-agent/session"
 )
 
-// Bridge adapts runtime events and durable snapshots to typed AG-UI SSE events.
+// Bridge adapts runtime events and durable snapshots to typed AG-UI SSE
+// events. One Bridge serves exactly one connection: replay() (its own
+// ListEvents sweep) and then Reconnect's live tail loop call Emit
+// sequentially from a single goroutine at a time, never concurrently, so
+// the unexported fields below (including inReplaySweep) need no locking.
+// Bridge is not safe for concurrent Emit calls from multiple goroutines.
 type Bridge struct {
 	emit      *aguiemitter.Emitter
 	textOpen  map[session.MessageID]bool
@@ -66,6 +71,21 @@ type Bridge struct {
 	// during the replay window (never in this set) instead of forwarding
 	// it.
 	projectedMessages map[session.MessageID]bool
+	// inReplaySweep is true only while replay()'s own ListEvents loop
+	// (agui/replay.go) is forwarding a connection's initial catch-up sweep
+	// of durable events, and false everywhere else, including while
+	// Reconnect's live tail loop runs after replay() has returned. A
+	// session.MessageCommittedEventKind event observed while this is true
+	// names a message whose EventMessageDelta records were LiveOnly and
+	// were therefore SKIPPED by replay() (see replay()'s doc comment):
+	// this connection never saw that message's live deltas, so
+	// emitLiveMessageCommitted must include native events, not just the
+	// eino.agentic.v1 supplement. Once inReplaySweep is false, a
+	// message_committed can only arrive after this connection's own live
+	// tail already streamed that message's content natively via
+	// emitMessageDelta/emitToolCallUpdated, so a custom-only supplement is
+	// correct there and does not duplicate content already delivered.
+	inReplaySweep bool
 }
 
 // NewBridge binds an AG-UI emitter to the SDK's concrete SSE writer pair.
@@ -126,6 +146,24 @@ func (b *Bridge) markMessageProjected(id session.MessageID) {
 		b.projectedMessages = map[session.MessageID]bool{}
 	}
 	b.projectedMessages[id] = true
+}
+
+// beginReplaySweep and endReplaySweep bracket replay()'s own ListEvents
+// loop (see Bridge.inReplaySweep's doc comment). Callers must always pair
+// beginReplaySweep with a deferred endReplaySweep so the flag cannot leak
+// true into Reconnect's live tail loop on any return path.
+func (b *Bridge) beginReplaySweep() {
+	if b == nil {
+		return
+	}
+	b.inReplaySweep = true
+}
+
+func (b *Bridge) endReplaySweep() {
+	if b == nil {
+		return
+	}
+	b.inReplaySweep = false
 }
 
 // EncErr returns the first event validation/encoding error.
@@ -320,11 +358,22 @@ func (b *Bridge) EmitCommittedProjection(projection *convert.AgenticProjection, 
 // emitLiveMessageCommitted reacts to a durable session.MessageCommittedEventKind
 // notification (see that constant's doc comment) by reloading and
 // reprojecting event.MessageID's session and emitting it through the
-// agentic committed path with DeliveryModeLiveContinuation (custom
-// eino.agentic.v1 supplements only: any representable native content --
-// text, tool calls -- already reached the client as transient deltas during
-// the live phase, via emitMessageDelta/emitToolCallUpdated, so this must not
-// duplicate it as a second native event).
+// agentic committed path. The delivery mode depends on which phase of the
+// connection observed the notification -- see Bridge.inReplaySweep's doc
+// comment for why:
+//
+//   - While replay()'s own durable ListEvents sweep is running
+//     (b.inReplaySweep true), this uses DeliveryModeCommittedOnly, which
+//     includes a native AG-UI representation (TEXT_MESSAGE_*/TOOL_CALL_*/...)
+//     alongside the eino.agentic.v1 custom supplement, because this
+//     connection's live deltas for the message were LiveOnly records that
+//     replay() skips (see replay()'s doc comment) -- it never saw them.
+//   - Once replay() has returned and Reconnect's live tail loop is running
+//     (b.inReplaySweep false), this uses DeliveryModeLiveContinuation
+//     (custom supplement only): any representable native content already
+//     reached this same connection as transient deltas via
+//     emitMessageDelta/emitToolCallUpdated before the message committed, so
+//     this must not duplicate it as a second native event.
 //
 // It reprojects the WHOLE session's durable history rather than loading just
 // this one message: session.Store exposes no by-ID single-message read
@@ -357,6 +406,10 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 		b.recordLiveErr(fmt.Errorf("agui: live committed-projection reload failed for session %s message %s: %w", event.SessionID, event.MessageID, err))
 		return
 	}
+	mode := aguiemitter.DeliveryModeLiveContinuation
+	if b.inReplaySweep {
+		mode = aguiemitter.DeliveryModeCommittedOnly
+	}
 	for _, p := range projections {
 		if p.MessageID != event.MessageID {
 			continue
@@ -368,12 +421,37 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 		// remember in projectedMessages, so a transient failure here
 		// still allows a later retry of the same messageID to attempt
 		// the projection again instead of being permanently skipped.
-		if b.EmitCommittedProjection(p.Projection, p.Receipt, aguiemitter.DeliveryModeLiveContinuation) {
+		if b.EmitCommittedProjection(p.Projection, p.Receipt, mode) {
 			b.markMessageProjected(p.MessageID)
 		}
 		return
 	}
-	b.recordLiveErr(fmt.Errorf("agui: message_committed named message %s not found in session %s's current projections", event.MessageID, event.SessionID))
+	// The named message is simply not (yet) present in this reload's
+	// projections. Unlike the reload failure above, this is a BENIGN miss,
+	// not a hard failure, and must not be latched into liveErr: W7
+	// fix-pass review finding P0-2 traced this to
+	// runtime.publishMessageCommitted's own documented best-effort
+	// choreography, which appends and publishes this notification in a
+	// separate call strictly AFTER the message's content transaction
+	// commits, read back here through b.store -- possibly a different
+	// session.Store handle than the one the content committed through
+	// (a read replica, a long-held repeatable-read snapshot, ...). Any
+	// such handle that can observe the notification before the content it
+	// names produces exactly this branch. (The only other durable route a
+	// prior pass suspected -- session.RoleTool always projecting empty --
+	// is unreachable: nothing in this module ever constructs a
+	// RoleTool message; runtime's two publishMessageCommitted call sites
+	// use RoleUser/RoleAssistant, both of which always project at least
+	// one AgenticMessage.) Deliberately do NOT call recordLiveErr: since
+	// publishMessageCommitted is at-least-once, a later message_committed
+	// for the same messageID -- once its content is actually visible to a
+	// reload -- can still succeed, and turning this transient,
+	// self-healing miss into a fatal LiveErr() would abort Reconnect over
+	// a benign read-your-writes gap, exactly the class of stream-kill this
+	// bridge exists to avoid (see also emitLiveMessageCommitted's
+	// projectedMessages paragraph above, for the sibling P0-A case). The
+	// message is left out of projectedMessages so a later retry is not
+	// mistaken for already-delivered.
 }
 
 // recordLiveErr is first-error-wins, matching the underlying emitter's own
