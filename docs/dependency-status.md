@@ -106,6 +106,18 @@ GOWORK=off GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
   testdata/external-consumer/check.sh
 ```
 
+The last command above (published-mode `check.sh` at
+`EINO_AGENT_CONSUMER_VERSION=cec27e5eb734b78a8e6dbe49c07bb8dd1cbac12e`) is a
+historical record, not a currently reproducible result: `check.sh` now
+unconditionally copies `agentic_fixture_test.go` into the generated consumer
+module regardless of mode, and that fixture requires
+`model.NewAgenticStreamerWithProviderState` and imports `eino-providers/claude`
+— neither exists at this published pin (`git grep -c NewAgenticStreamer` at
+this commit returns zero). Re-running that exact command today fails to
+compile. It was true on 2026-09-10 and predates W8's agentic-fixture addition
+to `check.sh`; it cannot be re-executed until a post-agentic commit is
+published (see `docs/consumer-guide.md`'s Installation section).
+
 Ryuk was disabled for this host's Docker environment; fixtures still explicitly
 close host pools and terminate disposable containers. CI uses normal Ryuk
 settings. Both PostgreSQL suites and both consumer modes reported required
