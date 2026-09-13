@@ -230,7 +230,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	handle, err := s.runtime.Start(context.WithoutCancel(r.Context()), runtime.Request{
+	admission, err := s.runtime.Start(context.WithoutCancel(r.Context()), runtime.Request{
 		SessionID: sessionID,
 		Message:   message,
 		Config:    s.config,
@@ -244,11 +244,13 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 		http.Error(w, err.Error(), status)
 		return
 	}
-	s.remember(handle)
+	if admission.Handle != nil {
+		s.remember(admission.Handle)
+	}
 
 	writeJSON(w, http.StatusAccepted, map[string]string{
 		"session_id": string(sessionID),
-		"run_id":     string(handle.RunID()),
+		"run_id":     string(admission.Receipt.RunID),
 		"events":     fmt.Sprintf("/sessions/%s/events", sessionID),
 	})
 }

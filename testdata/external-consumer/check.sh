@@ -102,6 +102,7 @@ cp -f -- "${script_dir}/session_title_fixture_test.go" "${consumer_dir}/session_
 cp -f -- "${script_dir}/session_watch_fixture_test.go" "${consumer_dir}/session_watch_fixture_test.go"
 cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"
 cp -f -- "${script_dir}/agentic_fixture_test.go" "${consumer_dir}/agentic_fixture_test.go"
+cp -f -- "${script_dir}/admission_receipt_fixture_test.go" "${consumer_dir}/admission_receipt_fixture_test.go"
 if [[ "${postgres_mode}" == "1" ]]; then
 	cp -f -- "${script_dir}/../../internal/testpostgres/check_output.py" "${temporary_root}/check_output.py"
 	cp -f -- "${script_dir}/postgres_store_fixture_test.go" "${consumer_dir}/postgres_store_fixture_test.go"

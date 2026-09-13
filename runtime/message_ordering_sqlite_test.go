@@ -57,11 +57,11 @@ func TestFrozenToolLoopHistoryRemainsOrderedAfterSQLiteReopen(t *testing.T) {
 		WithOwnerID("sqlite-tool-order-test"),
 	)
 	const sessionID session.ID = "frozen-tool-session"
-	handle, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	admission, err := orchestrator.Start(ctx, Request{SessionID: sessionID, Message: TextUserMessage("hello"), Config: orchestratorConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result := <-handle.Done(); result.Error != nil || result.Status != session.RunCompleted {
+	if result := <-admission.Done(); result.Error != nil || result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}
 	if err := storePool.Close(); err != nil {

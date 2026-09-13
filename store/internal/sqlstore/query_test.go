@@ -86,6 +86,8 @@ func (d queryDialect) Read(ctx context.Context, db *sql.DB, fn func(SQLReader) e
 	return fn(conn)
 }
 
+func (queryDialect) ValidateAdmissionReader(context.Context, SQLReader) error { return nil }
+
 func (queryDialect) ClockSQL() string                  { return "CURRENT_TIMESTAMP" }
 func (queryDialect) LockRows(db *gorm.DB) *gorm.DB     { return db }
 func (queryDialect) MapError(err error) error          { return err }

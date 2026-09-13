@@ -21,6 +21,7 @@ type Transaction interface {
 type Dialect interface {
 	Begin(context.Context, *sql.DB) (Transaction, error)
 	Read(context.Context, *sql.DB, func(SQLReader) error) error
+	ValidateAdmissionReader(context.Context, SQLReader) error
 	ClockSQL() string
 	// LockRows locks rows from the query's current table. Joined queries must
 	// not accidentally lock the joined relation as well.

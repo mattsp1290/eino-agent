@@ -212,6 +212,28 @@ func TestAdmitPersistsResolvedWorkspaceAcrossSymlinkRetarget(t *testing.T) {
 	}
 }
 
+func TestKeyedAdmitPreservesCleanAbsoluteWorkspaceSymlink(t *testing.T) {
+	parent := t.TempDir()
+	target := filepath.Join(parent, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "workspace")
+	if err := os.Symlink(target, alias); err != nil {
+		t.Fatal(err)
+	}
+	request := testRunAdmission()
+	request.AdmissionKey = "symlink-key"
+	request.Config.Metadata["workspace_root"] = alias
+	admitted, err := (admitter{Store: newAdmissionStore()}).admit(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admitted.Run.Config["workspace_root"] != alias || admitted.Snapshot.Config.Metadata["workspace_root"] != alias || admitted.Session.Directory != alias {
+		t.Fatalf("keyed workspace changed: session=%q run=%q snapshot=%q want=%q", admitted.Session.Directory, admitted.Run.Config["workspace_root"], admitted.Snapshot.Config.Metadata["workspace_root"], alias)
+	}
+}
+
 func TestAdmitRejectsNonexistentWorkspace(t *testing.T) {
 	request := testRunAdmission()
 	request.Config.Metadata["workspace_root"] = filepath.Join(t.TempDir(), "missing")
@@ -317,6 +339,22 @@ func TestAdmitRollsBackDurableRecordsWhenTransactionalAdmissionFails(t *testing.
 	}
 	if len(batch.Messages) != 0 || len(batch.Parts) != 0 || len(store.sessions) != 0 || len(store.epochs) != 0 || len(store.events) != 0 {
 		t.Fatalf("admission leaked after rollback: messages=%#v parts=%#v sessions=%d epochs=%d events=%d", batch.Messages, batch.Parts, len(store.sessions), len(store.epochs), len(store.events))
+	}
+}
+
+func TestKeyedAdmitRollsBackCompleteTurnGraphWhenReceiptWriteFails(t *testing.T) {
+	t.Parallel()
+
+	store := newAdmissionStore()
+	store.recordAdmissionErr = errors.New("record admission failed")
+	request := testRunAdmission()
+	request.AdmissionKey = "rollback-key"
+	_, err := (admitter{Store: store}).admit(context.Background(), request)
+	if !errors.Is(err, store.recordAdmissionErr) {
+		t.Fatalf("Admit error = %v, want receipt failure", err)
+	}
+	if len(store.sessions) != 0 || len(store.runs) != 0 || len(store.messages) != 0 || len(store.parts) != 0 || len(store.events) != 0 || len(store.epochs) != 0 || len(store.turns) != 0 || len(store.admissions) != 0 {
+		t.Fatalf("receipt failure leaked graph: sessions=%d runs=%d messages=%d parts=%d events=%d epochs=%d turns=%d admissions=%d", len(store.sessions), len(store.runs), len(store.messages), len(store.parts), len(store.events), len(store.epochs), len(store.turns), len(store.admissions))
 	}
 }
 

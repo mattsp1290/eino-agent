@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-agent/session"
+	storepkg "github.com/mattsp1290/eino-agent/store"
 )
 
 type transactionState struct {
@@ -56,7 +57,11 @@ func (s *Store) WithinTx(ctx context.Context, fn func(context.Context, session.S
 			err = errors.Join(err, tx.Rollback(cleanup))
 			cancel()
 		}
-		err = errors.Join(err, tx.Close())
+		closeErr := tx.Close()
+		if committed && closeErr != nil {
+			closeErr = storepkg.MarkTransactionOutcomeUnknown(closeErr)
+		}
+		err = errors.Join(err, closeErr)
 	}()
 	if err = fn(ctx, child); err != nil {
 		return err

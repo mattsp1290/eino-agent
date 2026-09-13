@@ -46,6 +46,8 @@ type admissionRequest struct {
 	Metadata      map[string]string
 	ExtensionPlan session.ExtensionPlanDescriptor
 	ContentLimits session.ContentLimits
+	AdmissionKey  string
+	Fingerprint   [32]byte
 }
 
 type admittedRun struct {
@@ -67,6 +69,8 @@ type admittedRun struct {
 	// own ReAct cycles) stays consistent with what Snapshot/baseMessageCount
 	// were actually computed against.
 	HistoryOptions history.Options
+	Receipt        session.AdmissionReceipt
+	Existing       bool
 }
 
 type admitter struct {
@@ -120,7 +124,30 @@ func (a admitter) now() time.Time {
 }
 
 func admitDurable(ctx context.Context, store session.Store, request admissionRequest, now time.Time) (admittedRun, error) {
-	sessionRecord, err := getOrCreateAdmissionSession(ctx, store, request, now)
+	var sessionRecord session.Session
+	var err error
+	if request.AdmissionKey != "" {
+		sessionRecord, err = store.LockAdmissionSession(ctx, admissionSession(request, now))
+		if err != nil {
+			return admittedRun{}, err
+		}
+		existing, getErr := store.GetAdmission(ctx, sessionRecord.ID, request.AdmissionKey)
+		if getErr == nil {
+			result, err := admissionResultForExisting(existing, request.Fingerprint)
+			if err != nil {
+				return admittedRun{}, err
+			}
+			return admittedRun{Existing: true, Receipt: result.Receipt}, nil
+		}
+		if !errors.Is(getErr, session.ErrNotFound) {
+			return admittedRun{}, getErr
+		}
+		if !sameAdmissionSessionIdentity(sessionRecord, admissionSession(request, now)) {
+			return admittedRun{}, session.ErrConflict
+		}
+	} else {
+		sessionRecord, err = getOrCreateAdmissionSession(ctx, store, request, now)
+	}
 	if err != nil {
 		return admittedRun{}, err
 	}
@@ -215,6 +242,13 @@ func admitDurable(ctx context.Context, store session.Store, request admissionReq
 	result := buildAdmission(sessionRecord, runRecord, userMessage, userParts, assistantMessage, committedEvent, snapshot, now)
 	result.Turn = admitted.Turn
 	result.HistoryOptions = resolvedHistory
+	result.Receipt = session.AdmissionReceipt{SessionID: sessionRecord.ID, Key: request.AdmissionKey, RunID: runRecord.ID, UserMessageID: userMessage.ID, AssistantMessageID: assistantMessage.ID, CreatedAt: now}
+	if request.AdmissionKey != "" {
+		record := session.AdmissionRecord{Receipt: result.Receipt, FingerprintVersion: session.AdmissionFingerprintVersion, Fingerprint: request.Fingerprint, RunStatus: session.RunPending}
+		if err := executionStore.RecordAdmission(ctx, record); err != nil {
+			return admittedRun{}, err
+		}
+	}
 	return result, nil
 }
 
@@ -280,15 +314,17 @@ func buildAdmission(sessionRecord session.Session, runRecord session.Run, userMe
 
 func freezeAdmission(request admissionRequest) (admissionRequest, error) {
 	request.Config = request.Config.Clone()
-	root, err := canonicalAdmissionWorkspace(request.Config.Metadata["workspace_root"])
-	if err != nil {
-		return admissionRequest{}, err
-	}
-	if request.Config.Metadata == nil && root != "" {
-		request.Config.Metadata = make(map[string]string)
-	}
-	if root != "" {
-		request.Config.Metadata["workspace_root"] = root
+	if request.AdmissionKey == "" {
+		root, err := canonicalAdmissionWorkspace(request.Config.Metadata["workspace_root"])
+		if err != nil {
+			return admissionRequest{}, err
+		}
+		if request.Config.Metadata == nil && root != "" {
+			request.Config.Metadata = make(map[string]string)
+		}
+		if root != "" {
+			request.Config.Metadata["workspace_root"] = root
+		}
 	}
 	request.Model = cloneResolved(request.Model)
 	request.History = cloneHistoryOptions(request.History)

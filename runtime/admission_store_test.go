@@ -57,24 +57,26 @@ type admissionStore struct {
 	// appendMessageLocked, the only place these are mutated), so
 	// ListUnfinishedToolCalls can sort by (message, block position) --
 	// declared order -- instead of creation order.
-	messageSeq        map[session.MessageID]int64
-	messageSeqNext    int64
-	epochs            map[session.EpochID]session.ContextEpoch
-	modelRequests     map[session.ModelRequestID]session.ModelRequestRecord
-	turns             map[session.TurnID]session.Turn
-	inbox             map[session.InboxID]session.InboxItem
-	checkpoints       map[fakeCheckpointKey]session.Checkpoint
-	appendEventErr    error
-	appendPartErrAt   int
-	appendPartCalls   int
-	settleToolCallErr error
-	toolTransitionErr error
-	createToolErrAt   int
-	createToolCalls   int
-	normalizeEvent    func(session.EventRecord) session.EventRecord
-	listMessagesHook  func(*admissionStore, session.ID)
-	listMessagesCalls atomic.Int32
-	getRunCalls       atomic.Int32
+	messageSeq         map[session.MessageID]int64
+	messageSeqNext     int64
+	epochs             map[session.EpochID]session.ContextEpoch
+	modelRequests      map[session.ModelRequestID]session.ModelRequestRecord
+	turns              map[session.TurnID]session.Turn
+	inbox              map[session.InboxID]session.InboxItem
+	checkpoints        map[fakeCheckpointKey]session.Checkpoint
+	admissions         map[string]session.AdmissionRecord
+	appendEventErr     error
+	appendPartErrAt    int
+	appendPartCalls    int
+	recordAdmissionErr error
+	settleToolCallErr  error
+	toolTransitionErr  error
+	createToolErrAt    int
+	createToolCalls    int
+	normalizeEvent     func(session.EventRecord) session.EventRecord
+	listMessagesHook   func(*admissionStore, session.ID)
+	listMessagesCalls  atomic.Int32
+	getRunCalls        atomic.Int32
 }
 
 func newAdmissionStore() *admissionStore {
@@ -94,6 +96,7 @@ func newAdmissionStore() *admissionStore {
 		turns:         map[session.TurnID]session.Turn{},
 		inbox:         map[session.InboxID]session.InboxItem{},
 		checkpoints:   map[fakeCheckpointKey]session.Checkpoint{},
+		admissions:    map[string]session.AdmissionRecord{},
 	}
 }
 
@@ -131,6 +134,7 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 	s.turns = tx.turns
 	s.inbox = tx.inbox
 	s.checkpoints = tx.checkpoints
+	s.admissions = tx.admissions
 	return nil
 }
 
@@ -138,34 +142,72 @@ func (s *admissionStore) WithinTx(ctx context.Context, fn func(context.Context, 
 // caller); it never locks itself.
 func (s *admissionStore) clone() *admissionStore {
 	return &admissionStore{
-		sessions:          cloneMap(s.sessions),
-		runs:              cloneMap(s.runs),
-		messages:          cloneMap(s.messages),
-		finalized:         cloneMap(s.finalized),
-		parts:             cloneMap(s.parts),
-		events:            cloneMap(s.events),
-		eventSeq:          s.eventSeq,
-		eventOrder:        cloneMap(s.eventOrder),
-		toolCalls:         cloneMap(s.toolCalls),
-		toolCallSeq:       cloneMap(s.toolCallSeq),
-		toolCallSeqNext:   s.toolCallSeqNext,
-		messageSeq:        cloneMap(s.messageSeq),
-		messageSeqNext:    s.messageSeqNext,
-		epochs:            cloneMap(s.epochs),
-		modelRequests:     cloneMap(s.modelRequests),
-		turns:             cloneMap(s.turns),
-		inbox:             cloneMap(s.inbox),
-		checkpoints:       cloneMap(s.checkpoints),
-		appendEventErr:    s.appendEventErr,
-		appendPartErrAt:   s.appendPartErrAt,
-		appendPartCalls:   s.appendPartCalls,
-		settleToolCallErr: s.settleToolCallErr,
-		toolTransitionErr: s.toolTransitionErr,
-		createToolErrAt:   s.createToolErrAt,
-		createToolCalls:   s.createToolCalls,
-		normalizeEvent:    s.normalizeEvent,
-		listMessagesHook:  s.listMessagesHook,
+		sessions:           cloneMap(s.sessions),
+		runs:               cloneMap(s.runs),
+		messages:           cloneMap(s.messages),
+		finalized:          cloneMap(s.finalized),
+		parts:              cloneMap(s.parts),
+		events:             cloneMap(s.events),
+		eventSeq:           s.eventSeq,
+		eventOrder:         cloneMap(s.eventOrder),
+		toolCalls:          cloneMap(s.toolCalls),
+		toolCallSeq:        cloneMap(s.toolCallSeq),
+		toolCallSeqNext:    s.toolCallSeqNext,
+		messageSeq:         cloneMap(s.messageSeq),
+		messageSeqNext:     s.messageSeqNext,
+		epochs:             cloneMap(s.epochs),
+		modelRequests:      cloneMap(s.modelRequests),
+		turns:              cloneMap(s.turns),
+		inbox:              cloneMap(s.inbox),
+		checkpoints:        cloneMap(s.checkpoints),
+		admissions:         cloneMap(s.admissions),
+		appendEventErr:     s.appendEventErr,
+		appendPartErrAt:    s.appendPartErrAt,
+		appendPartCalls:    s.appendPartCalls,
+		recordAdmissionErr: s.recordAdmissionErr,
+		settleToolCallErr:  s.settleToolCallErr,
+		toolTransitionErr:  s.toolTransitionErr,
+		createToolErrAt:    s.createToolErrAt,
+		createToolCalls:    s.createToolCalls,
+		normalizeEvent:     s.normalizeEvent,
+		listMessagesHook:   s.listMessagesHook,
 	}
+}
+
+func admissionStoreKey(id session.ID, key string) string { return string(id) + "\x00" + key }
+
+func (s *admissionStore) LookupAdmission(_ context.Context, id session.ID, key string) (session.AdmissionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lookupAdmissionLocked(id, key)
+}
+
+func (s *admissionStore) lookupAdmissionLocked(id session.ID, key string) (session.AdmissionRecord, error) {
+	if err := session.ValidateAdmissionKey(key); err != nil {
+		return session.AdmissionRecord{}, err
+	}
+	record, ok := s.admissions[admissionStoreKey(id, key)]
+	if !ok {
+		return session.AdmissionRecord{}, session.ErrNotFound
+	}
+	record.RunStatus = s.runs[record.Receipt.RunID].Status
+	return record, nil
+}
+
+func (s *admissionStore) GetAdmission(ctx context.Context, id session.ID, key string) (session.AdmissionRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lookupAdmissionLocked(id, key)
+}
+
+func (s *admissionStore) LockAdmissionSession(_ context.Context, candidate session.Session) (session.Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.sessions[candidate.ID]; ok {
+		return existing, nil
+	}
+	s.sessions[candidate.ID] = candidate
+	return candidate, nil
 }
 
 func (s *admissionStore) CreateSession(_ context.Context, record session.Session) (session.Session, error) {
@@ -697,6 +739,7 @@ func (s *fakeExecutionStore) WithinTx(ctx context.Context, fn func(context.Conte
 	s.turns = tx.turns
 	s.inbox = tx.inbox
 	s.checkpoints = tx.checkpoints
+	s.admissions = tx.admissions
 	return nil
 }
 
@@ -725,6 +768,30 @@ func (s *fakeExecutionStore) StartRun(_ context.Context, startedAt time.Time) (s
 	run.StartedAt = startedAt
 	s.runs[run.ID] = run
 	return run, nil
+}
+
+func (s *fakeExecutionStore) RecordAdmission(_ context.Context, record session.AdmissionRecord) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.recordAdmissionErr != nil {
+		return s.recordAdmissionErr
+	}
+	if !s.valid() || session.ValidateAdmissionRecord(record) != nil {
+		return session.ErrAdmissionInvalid
+	}
+	r := record.Receipt
+	run, runOK := s.runs[r.RunID]
+	user, userOK := s.messages[r.UserMessageID]
+	assistant, assistantOK := s.messages[r.AssistantMessageID]
+	if !runOK || !userOK || !assistantOK || r.SessionID != run.SessionID || r.RunID != s.fence.RunID || user.SessionID != r.SessionID || user.RunID != r.RunID || user.Role != session.RoleUser || assistant.SessionID != r.SessionID || assistant.RunID != r.RunID || assistant.Role != session.RoleAssistant {
+		return session.ErrAdmissionInvalid
+	}
+	key := admissionStoreKey(r.SessionID, r.Key)
+	if _, exists := s.admissions[key]; exists {
+		return session.AdmissionConflictError{}
+	}
+	s.admissions[key] = record
+	return nil
 }
 
 func (s *fakeExecutionStore) RenewRunLease(_ context.Context, duration time.Duration) (session.Run, error) {

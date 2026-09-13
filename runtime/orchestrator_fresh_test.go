@@ -140,8 +140,8 @@ func TestConcurrentStartsWithSameIDsAdmitAndDispatchOnce(t *testing.T) {
 		go func(orchestrator *StreamingOrchestrator) {
 			defer wait.Done()
 			<-ready
-			handle, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
-			results <- startResult{handle: handle, err: err}
+			admission, err := orchestrator.Start(context.Background(), Request{SessionID: "same-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+			results <- startResult{handle: admission.Handle, err: err}
 		}(orchestrator)
 	}
 	close(ready)
@@ -175,7 +175,7 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	orch := newTestOrchestrator(store, scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
 		return []*einoschema.AgenticMessage{agenticTextChunk(0, "hel"), agenticTextChunk(0, "lo")}, nil
 	}))
-	handle, err := orch.Start(context.Background(), Request{
+	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
@@ -183,7 +183,7 @@ func TestStreamingOrchestratorCompletesSuccessfulTurn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunCompleted || result.Error != nil {
 		t.Fatalf("result = %+v", result)
 	}

@@ -52,6 +52,22 @@ CREATE TABLE messages (
 CREATE INDEX messages_replay_idx ON messages(session_key, created_at, id);
 CREATE INDEX messages_run_key_idx ON messages(run_key);
 
+CREATE TABLE admission_receipts (
+  row_key INTEGER PRIMARY KEY,
+  session_key INTEGER NOT NULL REFERENCES sessions(row_key),
+  admission_key BLOB NOT NULL CHECK (typeof(admission_key) = 'blob' AND length(admission_key) BETWEEN 1 AND 256),
+  run_key INTEGER NOT NULL UNIQUE REFERENCES runs(row_key),
+  user_message_key INTEGER NOT NULL REFERENCES messages(row_key),
+  assistant_message_key INTEGER NOT NULL REFERENCES messages(row_key),
+  fingerprint_version INTEGER NOT NULL CHECK (fingerprint_version = 1),
+  fingerprint BLOB NOT NULL CHECK (typeof(fingerprint) = 'blob' AND length(fingerprint) = 32),
+  created_at TEXT NOT NULL COLLATE BINARY CHECK (typeof(created_at) = 'text'),
+  UNIQUE(session_key, admission_key)
+);
+CREATE INDEX admission_receipts_run_key_idx ON admission_receipts(run_key);
+CREATE INDEX admission_receipts_user_message_key_idx ON admission_receipts(user_message_key);
+CREATE INDEX admission_receipts_assistant_message_key_idx ON admission_receipts(assistant_message_key);
+
 CREATE TABLE parts (
   row_key INTEGER PRIMARY KEY,
   id BLOB NOT NULL UNIQUE CHECK (typeof(id) = 'blob'),

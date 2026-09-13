@@ -34,6 +34,11 @@ storetest.Run(t, func(t testing.TB) storetest.Subject {
 
 Stores persist these durable facts:
 
+- `session.AdmissionReceipt`: immutable keyed admission identities. The
+  `admission_receipts` relation is unique on session/key and run, stores only
+  the opaque v1 fingerprint, and is committed in the same transaction as its
+  run, user message, assistant placeholder, epoch, and admission event.
+
 - `session.Session`: conversation/session metadata.
 - `session.Run`: admitted execution attempts and their terminal state.
 - `session.Message`: replayable conversation envelopes.
@@ -71,6 +76,19 @@ Required behavior:
   whether the submitted record is identical.
 - Exactly one nonterminal run may own a session.
 - A second nonterminal admission returns `session.ErrSessionBusy`.
+
+Keyed admission checks a fresh committed receipt before resolver construction,
+then checks it again while holding the session lock before ordinary identity and
+busy checks. `Store.LookupAdmission` is a root-store committed read and is
+model-free; transaction-bound lookup is rejected. Receipt rows never expire or
+mutate when their runs settle or are reclaimed. A lost commit acknowledgement
+is not execution permission: callers must resolve the original key and must
+not regenerate a run from apparent absence.
+
+The version-1 SQLite and PostgreSQL baselines include `admission_receipts`.
+Earlier baseline databases are unsupported and must be preserved and replaced
+by an explicitly selected fresh development database; stores never erase or
+silently adopt an old database.
 - Terminal statuses are `RunInterrupted`, `RunFailed`, and `RunCompleted`.
 - After scoped `SettleRun` records terminal state and its durable event, the next
   run may be admitted.

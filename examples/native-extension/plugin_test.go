@@ -112,14 +112,14 @@ func TestNativeContextContributionReachesProviderBeforeHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	handle, err := orchestrator.Start(context.Background(), runtime.Request{
+	admission, err := orchestrator.Start(context.Background(), runtime.Request{
 		SessionID: "session-a", Message: runtime.TextUserMessage("base-user"),
 		Config: config.Snapshot{Agent: config.Agent{Name: "agent", Model: selection, Options: map[string]string{}}, Model: selection, Metadata: map[string]string{"workspace_root": t.TempDir()}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result := <-handle.Done(); result.Error != nil {
+	if result := <-admission.Done(); result.Error != nil {
 		t.Fatal(result.Error)
 	}
 	streamer.mu.Lock()

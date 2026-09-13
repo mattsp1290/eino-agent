@@ -209,5 +209,11 @@ func testWideLifecycle(t *testing.T, server *testpostgres.Server) {
   FROM public.sessions s, public.turns t WHERE s.id=$2 AND t.id='wide-turn'`, pgTime, []byte(ids.session))
 	mustExec(t, f.db, `INSERT INTO public.checkpoints(run_key,revision,promoted,bytes,record,created_at)
   SELECT r.row_key, 1, 0, 'bytes'::bytea, '{}'::bytea, $1 FROM public.runs r WHERE r.id=$2`, pgTime, []byte(ids.run))
+	mustExec(t, f.db, `INSERT INTO public.admission_receipts(session_key,admission_key,run_key,user_message_key,assistant_message_key,fingerprint_version,fingerprint,created_at)
+ SELECT s.row_key,$1,r.row_key,m.row_key,m.row_key,1,$2,$3
+FROM public.sessions s
+JOIN public.runs r ON r.session_key=s.row_key
+ JOIN public.messages m ON m.run_key=r.row_key
+ WHERE s.id=$4 AND r.id=$5 AND m.id=$6`, []byte("wide-admission"), make([]byte, 32), pgTime, []byte(createdSession.ID), []byte(run.ID), []byte(message.ID))
 	assertPGIndexFootprints(t, f.db)
 }

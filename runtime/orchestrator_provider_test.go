@@ -69,7 +69,7 @@ func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}))
-	handle, err := orch.Start(context.Background(), Request{
+	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
@@ -78,10 +78,10 @@ func TestStreamingOrchestratorMarksCanceledRunsInterrupted(t *testing.T) {
 		t.Fatalf("Start error = %v", err)
 	}
 	<-started
-	if err := handle.Interrupt(context.Background(), "test"); err != nil {
+	if err := admission.Interrupt(context.Background(), "test"); err != nil {
 		t.Fatalf("Interrupt error = %v", err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunInterrupted || !result.Interrupted {
 		t.Fatalf("result = %+v", result)
 	}
@@ -108,7 +108,7 @@ func TestStreamingOrchestratorCompletesWithBlockedInfrastructureSink(t *testing.
 		}
 	})
 	orch.queueSize = 1
-	handle, err := orch.Start(context.Background(), Request{
+	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		Message:   TextUserMessage("hello"),
 		Config:    orchestratorConfig(),
@@ -116,7 +116,7 @@ func TestStreamingOrchestratorCompletesWithBlockedInfrastructureSink(t *testing.
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunCompleted {
 		t.Fatalf("result = %+v", result)
 	}

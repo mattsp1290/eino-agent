@@ -123,7 +123,7 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 		return nil, ctx.Err()
 	}))
 	orch.observer = observer
-	handle, err := orch.Start(context.Background(), Request{
+	admission, err := orch.Start(context.Background(), Request{
 		SessionID: "session-1",
 		Message:   TextUserMessage("SECRET prompt"),
 		Config:    orchestratorConfig(),
@@ -131,10 +131,10 @@ func TestStreamingOrchestratorRecordsInterrupt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start error = %v", err)
 	}
-	if err := handle.Interrupt(context.Background(), "disconnect"); err != nil {
+	if err := admission.Interrupt(context.Background(), "disconnect"); err != nil {
 		t.Fatalf("Interrupt error = %v", err)
 	}
-	result := <-handle.Done()
+	result := <-admission.Done()
 	if result.Status != session.RunInterrupted {
 		t.Fatalf("result = %+v", result)
 	}

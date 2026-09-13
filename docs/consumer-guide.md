@@ -236,12 +236,13 @@ When admitting a run, the host supplies durable session identity, user input,
 and an immutable `config.Snapshot`:
 
 ```go
-handle, err := orchestrator.Start(ctx, runtime.Request{
+admission, err := orchestrator.Start(ctx, runtime.Request{
     SessionID: session.ID("tenant-123/thread-456"),
     Message:   runtime.TextUserMessage(submittedText),
     Config:    snapshot,
     Metadata:  map[string]string{"workspace_id": "workspace-1"},
 })
+handle := admission.Handle // non-nil for an unkeyed/new admission
 ```
 
 The returned `runtime.Handle` is the live control surface for that admitted
@@ -280,6 +281,18 @@ and retires its checkpoints, freeing the session for a fresh `Start`. It
 applies only when this process has no live loop for the run (a genuinely
 paused run, not one it is actively driving) and reports
 `runtime.ErrInvalidOrchestrator` otherwise.
+
+For retried ingress, set `AdmissionKey` from the host's frozen event identity.
+The caller that commits the receipt receives `AdmissionNew` and its handle.
+Other concurrent contenders may finish setup before observing that receipt,
+but a matching retry ultimately receives `AdmissionExisting`, the same
+immutable receipt, and no handle; use
+`LookupAdmission` or the store/watch APIs to observe the original run. A retry
+with different message or included configuration receives
+`session.ErrAdmissionConflict`. Keep credentials out of included metadata.
+Receipts remain available after completion, failure, interruption, and later
+runs. A duplicate never resumes an unfinished run; recovery is an explicit
+`Resume` decision by the host.
 
 ## Durable Provider-Private State
 
