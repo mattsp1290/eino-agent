@@ -227,6 +227,12 @@ func (b *Bridge) nativeDelivered(key nativeFrameKey) bool {
 	return b != nil && b.nativeFrames[key]
 }
 
+// ensureNative preserves lifecycle retry semantics: a prior successful write
+// is enough, otherwise the key is recorded only if this write succeeds.
+func (b *Bridge) ensureNative(key nativeFrameKey, emitter *aguiemitter.Emitter, event aguievents.Event) bool {
+	return b.nativeDelivered(key) || b.deliverNative(key, emitter, event)
+}
+
 // BenignCommitMisses returns the number of session.MessageCommittedEventKind
 // notifications this Bridge has observed naming a message not (yet) visible
 // to a live reload -- see emitLiveMessageCommitted's benign-miss doc
@@ -501,7 +507,7 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	if b.includeReasoning && payload.Reasoning != "" {
 		if b.textOpen[messageID] {
 			textEnd := nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}
-			if !b.nativeDelivered(textEnd) && !b.deliverNative(textEnd, b.emit, aguievents.NewTextMessageEndEvent(string(messageID))) {
+			if !b.ensureNative(textEnd, b.emit, aguievents.NewTextMessageEndEvent(string(messageID))) {
 				return
 			}
 			delete(b.textOpen, messageID)
@@ -510,11 +516,11 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 		if reasoningID == "" {
 			reasoningID = string(messageID)
 			reasoningStart := nativeFrameKey{kind: aguievents.EventTypeReasoningStart, ownerID: reasoningID}
-			if !b.nativeDelivered(reasoningStart) && !b.deliverNative(reasoningStart, b.emit, aguievents.NewReasoningStartEvent(reasoningID)) {
+			if !b.ensureNative(reasoningStart, b.emit, aguievents.NewReasoningStartEvent(reasoningID)) {
 				return
 			}
 			reasoningMessageStart := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageStart, ownerID: reasoningID}
-			if !b.nativeDelivered(reasoningMessageStart) && !b.deliverNative(reasoningMessageStart, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning")) {
+			if !b.ensureNative(reasoningMessageStart, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning")) {
 				return
 			}
 			b.reasoning[messageID] = reasoningID
@@ -527,18 +533,18 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 		if b.reasoning[messageID] != "" {
 			reasoningID := b.reasoning[messageID]
 			messageEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}
-			if !b.nativeDelivered(messageEnd) && !b.deliverNative(messageEnd, b.emit, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
+			if !b.ensureNative(messageEnd, b.emit, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
 				return
 			}
 			reasoningEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}
-			if !b.nativeDelivered(reasoningEnd) && !b.deliverNative(reasoningEnd, b.emit, aguievents.NewReasoningEndEvent(reasoningID)) {
+			if !b.ensureNative(reasoningEnd, b.emit, aguievents.NewReasoningEndEvent(reasoningID)) {
 				return
 			}
 			delete(b.reasoning, messageID)
 		}
 		if !b.textOpen[messageID] {
 			textStart := nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(messageID)}
-			if !b.nativeDelivered(textStart) && !b.deliverNative(textStart, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant"))) {
+			if !b.ensureNative(textStart, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant"))) {
 				return
 			}
 			b.textOpen[messageID] = true
@@ -592,7 +598,7 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 	b.closeOpen(b.emit)
 	startKey := nativeFrameKey{kind: aguievents.EventTypeToolCallStart, ownerID: string(toolCallID)}
 	if payload.Name != "" {
-		if !b.nativeDelivered(startKey) && !b.deliverNative(startKey, b.emit, aguievents.NewToolCallStartEvent(string(toolCallID), payload.Name, aguievents.WithParentMessageID(string(event.MessageID)))) {
+		if !b.ensureNative(startKey, b.emit, aguievents.NewToolCallStartEvent(string(toolCallID), payload.Name, aguievents.WithParentMessageID(string(event.MessageID)))) {
 			return
 		}
 	}
@@ -620,18 +626,18 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 func (b *Bridge) closeOpen(e *aguiemitter.Emitter) {
 	for messageID := range b.textOpen {
 		key := nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}
-		if !b.nativeDelivered(key) && !b.deliverNative(key, e, aguievents.NewTextMessageEndEvent(string(messageID))) {
+		if !b.ensureNative(key, e, aguievents.NewTextMessageEndEvent(string(messageID))) {
 			continue
 		}
 		delete(b.textOpen, messageID)
 	}
 	for messageID, reasoningID := range b.reasoning {
 		messageEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}
-		if !b.nativeDelivered(messageEnd) && !b.deliverNative(messageEnd, e, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
+		if !b.ensureNative(messageEnd, e, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
 			continue
 		}
 		reasoningEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}
-		if !b.nativeDelivered(reasoningEnd) && !b.deliverNative(reasoningEnd, e, aguievents.NewReasoningEndEvent(reasoningID)) {
+		if !b.ensureNative(reasoningEnd, e, aguievents.NewReasoningEndEvent(reasoningID)) {
 			continue
 		}
 		delete(b.reasoning, messageID)
