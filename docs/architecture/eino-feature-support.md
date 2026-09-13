@@ -2737,6 +2737,18 @@ proxy) are gates the coordinator runs.
   map[string]any{interruptID: "approve"}})` against the reopened store
   completes the run, commits the durable `mcp_tool_approval_response`
   block, and the public `session.Run` record carries no private material.
+- **Enhanced (multi-part) streamed tool results survive reopen**
+  (`TestPublicEnhancedToolResultPartsSurviveReopen`): a tool's
+  `Definition.ExecuteRich` returns a `tools.RichResult` with a text part and
+  an image part (`runtime.ToolResultPart`/`ToolResultMedia`); after a real
+  turn and SQLite reopen, the durable `function_tool_result` block's
+  `Content` carries both items in order, distinct from the classic
+  single-text-part shape a scalar `Execute` result would produce. Also
+  documents, by construction, that the zero-value `runtime.RetentionPolicy`
+  (`MaxInlineBytes: 0`) degrades every part to an omission record --
+  `Retention: runtime.RetentionPolicy{MaxInlineBytes: 4096}` is required for
+  a rich result's parts to actually retain content, a real fail-closed
+  default a host must configure per tool, not a fixture bug.
 - **Typed ADK summarization middleware writes a durable `ContextEpoch`,
   surviving reopen**
   (`TestPublicSummarizationMiddlewareWritesDurableContextEpochSurvivingReopen`):
@@ -2852,3 +2864,14 @@ this fixture file itself exercises. This W8 pass does not claim either.
 - The `nativeResponseIdentityStripper` gap and the `errADKUnsupportedBlock`
   server/MCP-as-model-output gap (both documented above) are real,
   reproduced findings from this pass, not resolved by it.
+- "Composed agentic graph nodes" (the plan's phrase for
+  `01-feature-inventory.md` row 8/9, classified "Upstream through
+  composition") is not given a NEW `testdata/external-consumer/` fixture by
+  this pass. That classification's own acceptance bar is "the real public
+  Eino API in a runnable consumer example" -- already satisfied by
+  `examples/agentic-graph` (a real `compose.Graph` built from
+  `AddAgenticChatTemplateNode`/`AddAgenticModelNode`/`AddAgenticToolsNode`
+  over `tools.WrapEnhanced`, landed and tested in W4). This is a scope
+  decision (the bar is already met by an existing public example, not a
+  gap this pass introduces), stated explicitly rather than silently
+  assumed covered.

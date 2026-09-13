@@ -1140,6 +1140,123 @@ func mountEchoNoteTool(t *testing.T) (*composition.Registry, *composition.Mount)
 	return registry, mount
 }
 
+// --- 8. Enhanced (multi-part) streamed tool results survive a real SQLite
+//        reopen ------------------------------------------------------------
+
+type enhancedToolScript struct{ calls atomic.Int32 }
+
+func (s *enhancedToolScript) StreamProvider(_ context.Context, request model.Request) (*einoschema.StreamReader[model.StreamDelta], error) {
+	reader, writer := einoschema.Pipe[model.StreamDelta](1)
+	if s.calls.Add(1) == 1 {
+		writer.Send(model.StreamDelta{Message: agenticAssistantToolCalls(agenticToolCall("call-enhanced-1", "describe_chart", `{}`))}, nil)
+	} else {
+		writer.Send(model.StreamDelta{Message: agenticAssistantText("described")}, nil)
+	}
+	writer.Close()
+	return reader, nil
+}
+
+// TestPublicEnhancedToolResultPartsSurviveReopen registers a tool whose
+// Definition.ExecuteRich returns a multi-part tools.RichResult (text plus an
+// image part), the enhanced-result path
+// docs/architecture/eino-feature-support.md's W4 section describes
+// (runtime.ToolResultPart, preferred over the classic scalar Execute output
+// whenever both are set). It drives one real turn and asserts, after
+// closing and reopening the SQLite file, that the durable
+// function_tool_result block carries both content items, in order, with
+// their real content -- not the classic single-text-part shape a scalar
+// Execute result would have produced.
+func TestPublicEnhancedToolResultPartsSurviveReopen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	path := filepath.Join(t.TempDir(), "enhanced-tool.db")
+	st, pool, err := openTestSQLite(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry, err := composition.NewRegistry(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount, err := registry.Mount(ctx, extension.Component{
+		InstanceID: "enhanced-tool-fixture", Artifact: extension.Artifact{
+			Name: "enhanced-tool-fixture", Version: "1", Hash: "enhanced-tool-fixture-v1", ConfigHash: "default", SourceKind: extension.SourceNative,
+		},
+	}, composition.InstallerFunc(func(_ context.Context, r *composition.Registrar) error {
+		return r.Tool(composition.ToolRegistration{ID: "describe-chart", Scope: extension.GlobalScope(), Definition: tools.Definition{
+			Name: "describe_chart", Description: "Returns a multi-part enhanced result for the fixture.",
+			Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{}),
+			// The zero-value RetentionPolicy allows zero inline bytes (fail
+			// closed), which would degrade every part to an omission
+			// record; a real host configures this per tool.
+			Retention: runtime.RetentionPolicy{MaxInlineBytes: 4096},
+			ExecuteRich: func(context.Context, tools.Execution) (tools.RichResult, error) {
+				return tools.RichResult{Parts: []runtime.ToolResultPart{
+					{Type: runtime.ToolResultPartText, Text: "quarterly revenue chart"},
+					{Type: runtime.ToolResultPartImage, Media: &runtime.ToolResultMedia{URL: "https://example.test/chart.png", MIMEType: "image/png"}},
+				}}, nil
+			},
+		}})
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { mount.Deactivate(); _ = mount.Close(context.Background()) }()
+	script := &enhancedToolScript{}
+	orchestrator, err := runtime.NewStreamingOrchestrator(
+		runtime.WithStore(st), runtime.WithIDGenerator(discoveryIDs{}),
+		runtime.WithModelResolver(discoveryResolver{script}), runtime.WithRunPlanProvider(registry),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := model.Selection{ProviderID: "discovery", ModelID: "deterministic"}
+	handle, err := orchestrator.Start(ctx, runtime.Request{
+		SessionID: "enhanced-tool", Message: runtime.TextUserMessage("describe the chart"),
+		Config: config.Snapshot{Agent: config.Agent{Name: "enhanced-tool-consumer", Model: selection}, Model: selection, Metadata: map[string]string{"workspace_id": "A"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := <-handle.Done()
+	if result.Status != session.RunCompleted || result.Error != nil {
+		t.Fatalf("result = %+v", result)
+	}
+	if err := pool.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, reopenedPool, err := reopenTestSQLite(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reopenedPool.Close() }()
+
+	projection, err := history.LoadAgentic(ctx, reopened, "enhanced-tool", history.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *einoschema.FunctionToolResult
+	for _, msg := range projection.Messages {
+		for _, block := range msg.ContentBlocks {
+			if block != nil && block.Type == einoschema.ContentBlockTypeFunctionToolResult && block.FunctionToolResult != nil && block.FunctionToolResult.Name == "describe_chart" {
+				found = block.FunctionToolResult
+			}
+		}
+	}
+	if found == nil {
+		t.Fatal("no durable function_tool_result block for describe_chart")
+	}
+	if len(found.Content) != 2 {
+		t.Fatalf("enhanced result content items = %d, want 2 (classic scalar results always carry exactly 1): %#v", len(found.Content), found.Content)
+	}
+	if found.Content[0].Type != einoschema.FunctionToolResultContentBlockTypeText || found.Content[0].Text == nil || found.Content[0].Text.Text != "quarterly revenue chart" {
+		t.Fatalf("enhanced result part[0] after reopen = %#v", found.Content[0])
+	}
+	if found.Content[1].Type != einoschema.FunctionToolResultContentBlockTypeImage || found.Content[1].Image == nil || found.Content[1].Image.URL != "https://example.test/chart.png" {
+		t.Fatalf("enhanced result part[1] after reopen = %#v", found.Content[1])
+	}
+}
+
 // --- helpers shared by this file only --------------------------------------
 
 // mustNoPrivateSentinel fails the test if raw contains any "PRIVATE_"
