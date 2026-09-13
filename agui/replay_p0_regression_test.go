@@ -549,3 +549,124 @@ func TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWi
 		t.Fatalf("frame[1] delta = %q, want LATE-TEXT (the sweep's own native projection of the durably committed content)", delta)
 	}
 }
+
+// TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder proves
+// the W7 fifth fix-pass review's P0-2 finding: a mid-stream reconnect must
+// not drop the entire in-flight assistant turn it reconnected to watch.
+//
+// runtime/adk_model.go appends the assistant message ROW before the model
+// streams a single token (currentMessageID is called from begin(), and
+// content parts are only written later, at persistAssistantTurn) --
+// store/internal/sqlstore/messages.go's ListMessages/loadReplayMessages has
+// no "finalized" predicate, so this in-flight, zero-part row is exactly
+// what a reconnecting client's own emitMessageSnapshot reload sees for the
+// message it is reconnecting to watch. Before this fix,
+// loadCommittedProjections projected that placeholder anyway (producing a
+// zero-block AgenticMessage that emitted no frames) and the caller
+// (emitMessageSnapshot) still called markMessageProjected on it -- so every
+// live EventMessageDelta this SAME connection then received for that exact
+// message id was immediately dropped by emitMessageDelta's messageProjected
+// guard as "necessarily stale", even though nothing had actually reached
+// the client yet. The fix applies the same lesson
+// runtime.dropUnfinalizedAssistantPlaceholders already encodes on the
+// model-input side (runtime/adk_model.go): loadCommittedProjections now
+// excludes a zero-content-block assistant row from what it returns, so
+// emitMessageSnapshot never marks it projected, and the live delta below
+// reaches the wire normally.
+func TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	storeCtx := context.Background()
+	store, storePool, err := openTestSQLite(storeCtx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = storePool.Close() })
+
+	const sessionID session.ID = "session-unfinalized-placeholder"
+	now := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(storeCtx, session.Session{ID: sessionID, CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(storeCtx, session.Run{ID: "run-unfinalized-placeholder", SessionID: sessionID, OwnerID: "owner", ClaimToken: "claim-unfinalized-placeholder", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	// The unfinalized placeholder: a row exists (visible to ListMessages),
+	// but it carries zero content parts and store/internal/sqlstore never
+	// received a FinalizeAssistantMessage call for it -- exactly the shape
+	// the real runtime produces between begin() and persistAssistantTurn.
+	const messageID session.MessageID = "assistant-inflight"
+	if _, err := execution.AppendMessage(ctx, session.Message{
+		ID: messageID, SessionID: sessionID, RunID: run.ID, Role: session.RoleAssistant, TurnID: "turn-inflight", CreatedAt: now, UpdatedAt: now,
+	}); err != nil {
+		t.Fatalf("append message: %v", err)
+	}
+
+	tail := newReplayTail()
+	sink := newSSESink()
+	bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(sessionID), string(run.ID), nil)
+	done := make(chan error, 1)
+	go func() {
+		_, err := Reconnect(ctx, bridge, store, tail, sessionID, session.EventCursor{Limit: 10}, session.ContentLimits{}, false)
+		done <- err
+	}()
+	<-tail.subscribed
+
+	const timeout = 5 * time.Second
+	sendOrTimeout := func(event session.EventRecord) {
+		t.Helper()
+		select {
+		case tail.events <- event:
+		case err := <-done:
+			t.Fatalf("Reconnect returned (err = %v) before the test finished delivering live events", err)
+		case <-time.After(timeout):
+			t.Fatalf("timed out sending event %s to the live tail", event.ID)
+		}
+	}
+	// The turn's own streaming text, arriving live -- exactly what a real
+	// reconnecting client is waiting to see for the message it reconnected
+	// mid-stream to watch.
+	sendOrTimeout(session.EventRecord{
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
+		Payload: []byte(`{"content":"HELLO-LIVE","reasoning":""}`),
+	})
+	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-inflight-finished", SessionID: sessionID, MessageID: messageID})
+	close(tail.events)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Reconnect err = %v, want nil", err)
+		}
+	case <-time.After(timeout):
+		t.Fatalf("Reconnect did not return after the live tail closed")
+	}
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("EncErr = %v, want nil", err)
+	}
+	if err := bridge.LiveErr(); err != nil {
+		t.Fatalf("LiveErr = %v, want nil", err)
+	}
+	frames := frameData(t, sink.Bytes())
+	got := typesFromFrames(frames)
+	// The snapshot emits NOTHING for the unfinalized placeholder (zero
+	// content blocks to project), so the very first frames on the wire are
+	// the live delta's own native text (closed by Emit's own closeOpen
+	// ahead of the terminal frame), followed by RUN_FINISHED. Before this
+	// fix, "FINAL types: []" -- not one frame reached the wire for the
+	// whole turn.
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_FINISHED"
+	if stringsJoined(got) != want {
+		t.Fatalf("event types = %#v, want %s (a live delta for an in-flight, unfinalized assistant message must reach the client, not be dropped as stale)", got, want)
+	}
+	if messageID, _ := frames[0]["messageId"].(string); messageID != "assistant-inflight" {
+		t.Fatalf("frame[0] messageId = %q, want assistant-inflight", messageID)
+	}
+	if delta, _ := frames[1]["delta"].(string); delta != "HELLO-LIVE" {
+		t.Fatalf("frame[1] delta = %q, want HELLO-LIVE", delta)
+	}
+}

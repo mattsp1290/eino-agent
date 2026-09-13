@@ -197,6 +197,27 @@ func loadCommittedProjections(ctx context.Context, store session.Store, sessionI
 	limits := projectionLimits(contentLimits)
 	out := make([]committedMessageProjection, 0, len(projected.Messages))
 	for i, agentic := range projected.Messages {
+		if agentic != nil && agentic.Role == einoschema.AgenticRoleTypeAssistant && len(agentic.ContentBlocks) == 0 {
+			// Unfinalized assistant placeholder row (W7 fifth fix-pass review
+			// P0-2): runtime/adk_model.go appends the assistant message row
+			// at begin() time, before the model streams a single token, and
+			// store/internal/sqlstore/messages.go's ListMessages (via
+			// history.LoadBatch) returns it -- content parts are only
+			// written at persistAssistantTurn, strictly later. Projecting
+			// this shape here would mint a receipt for content that has not
+			// committed yet, emit zero frames (nothing to project), and --
+			// worse -- markMessageProjected it in the caller
+			// (emitMessageSnapshot/emitLiveMessageCommitted), which
+			// permanently blocks every subsequent live delta and tool-call
+			// event this connection would otherwise correctly deliver for
+			// the SAME message id once the turn actually finishes streaming
+			// (Bridge.messageProjected's guard in emitMessageDelta). This is
+			// the exact shape runtime.dropUnfinalizedAssistantPlaceholders
+			// already excludes from provider-facing history
+			// (runtime/adk_model.go); this is the identical lesson applied
+			// on the projection/replay side.
+			continue
+		}
 		source, ok := byID[projected.SourceMessageIDs[i]]
 		if !ok {
 			continue

@@ -70,17 +70,25 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 		SessionID: "session-replay",
 		MessageID: "assistant-1",
 	}
-	// Deliberately a DIFFERENT messageID than the snapshot's "assistant-1":
-	// Bridge.projectedMessages already marks "assistant-1" delivered (via
-	// the snapshot above), and emitMessageDelta now drops any further
-	// delta naming an already-projected message as stale (W7 fourth
-	// fix-pass review P0-1) -- this test's purpose is to prove the live
-	// loop keeps forwarding NEW events after RUN_FINISHED, not to exercise
-	// that dedup, so it uses a message the snapshot never covered.
+	// Deliberately the SAME messageID the snapshot above already delivered
+	// in full ("assistant-1"): Bridge.projectedMessages marks it delivered,
+	// and emitMessageDelta correctly drops any FURTHER delta naming an
+	// already-projected, genuinely-finalized message as stale (this is the
+	// legitimate case emitMessageDelta's guard exists for -- see its doc
+	// comment; contrast with the unfinalized-placeholder case a dedicated
+	// regression test covers, TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder
+	// in replay_p0_regression_test.go, where the SAME guard must NOT fire).
+	// An earlier version of this test routed around this exact behaviour by
+	// using a different, never-covered message id ("assistant-2") instead
+	// of proving it -- reverted per the W7 fifth fix-pass review's P0-2
+	// action item: the point of this test is that the live loop keeps
+	// EVALUATING events after RUN_FINISHED (it does not exit or hang), and
+	// correctly discards one that is genuinely stale rather than
+	// forwarding it a second time.
 	tail.events <- session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
 		SessionID: "session-replay",
-		MessageID: "assistant-2",
+		MessageID: "assistant-1",
 		Payload:   []byte(`{"content":"live","reasoning":""}`),
 		LiveOnly:  true,
 	}
@@ -90,9 +98,12 @@ func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {
 	}
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,RUN_STARTED,RUN_FINISHED,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT"
+	// No extra frames after RUN_FINISHED: the live delta for "assistant-1"
+	// is correctly dropped as stale (already delivered in full by the
+	// snapshot above), not forwarded a second time.
+	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,RUN_STARTED,RUN_FINISHED"
 	if stringsJoined(got) != want {
-		t.Fatalf("event types = %#v, want %s", got, want)
+		t.Fatalf("event types = %#v, want %s (a live delta for an already-fully-delivered message must be dropped, not re-forwarded)", got, want)
 	}
 }
 
