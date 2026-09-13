@@ -25,6 +25,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -180,8 +182,11 @@ func TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation(t *tes
 	var chunks []*einoschema.AgenticMessage
 	for {
 		chunk, recvErr := stream.Recv()
-		if recvErr != nil {
+		if errors.Is(recvErr, io.EOF) {
 			break
+		}
+		if recvErr != nil {
+			t.Fatalf("Recv error = %v", recvErr)
 		}
 		chunks = append(chunks, chunk)
 	}
