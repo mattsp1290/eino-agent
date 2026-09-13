@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1129,31 +1130,119 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 		t.Fatalf("replay stream leaked private material: %s", stream)
 	}
 
-	// eino-agent-doj: emitMessageSnapshot's replay path natively delivers a
-	// tool call's whole lifecycle via DeliveryModeReplay but never marks it
-	// as delivered (recordNativeToolDelivery/markToolCallResultSent), so
-	// replay() then re-forwards the same durable tool_call_updated records
-	// a second time. Assert the ACTUAL current behavior -- the call's
-	// arguments string appears more than once in one full replay -- rather
-	// than a single-emission contract that does not hold today.
-	occurrences := strings.Count(stream, "echo_note")
-	if occurrences < 2 {
-		t.Fatalf("expected eino-agent-doj's known duplicate tool-call lifecycle emission (>=2 occurrences of the tool name), got %d in: %s", occurrences, stream)
+	// Both tripwires below decode the actual wire events instead of
+	// substring-matching the raw SSE bytes: the tool result reaches the wire
+	// as a JSON string INSIDE a JSON field ("content"), so it is
+	// double-escaped, and a naive `strings.Contains(stream, `"echoed"`)`
+	// check for the unescaped form can never match -- see the review that
+	// caught this (fixture-integrity-reviewer, C1) proving it stays green
+	// even when the real output genuinely reaches the wire.
+	events := decodeSSEEvents(t, stream)
+	var toolCallStarts, toolCallResults []sseFrame
+	for _, ev := range events {
+		switch ev.Type {
+		case "TOOL_CALL_START":
+			toolCallStarts = append(toolCallStarts, ev)
+		case "TOOL_CALL_RESULT":
+			toolCallResults = append(toolCallResults, ev)
+		}
 	}
 
-	// eino-agent-6wj: agui/bridge.go's toolPayload decodes content/
-	// structured, but the durable tool_transition wire payload carries
-	// output/error/metadata, so ResultContent() falls back to a synthesized
-	// status stub instead of the real tool result. Assert the stub is what
-	// actually reaches the wire, not the real recorded output
-	// (`{"echoed":"hello from agui"}`), and note this bug explicitly rather
-	// than silently accepting a weaker contract.
-	if strings.Contains(stream, `"echoed"`) {
+	// eino-agent-doj: emitMessageSnapshot's replay path natively delivers a
+	// tool call's whole lifecycle once (the pre-RUN_STARTED snapshot), then
+	// replay()'s raw catch-up sweep re-forwards the SAME durable
+	// tool_call_updated record a second time (the post-RUN_STARTED
+	// duplicate) because nothing marks the call as already natively
+	// delivered. Assert the exact count of native TOOL_CALL_START/RESULT
+	// events for this one call -- not a >= floor, which a non-duplicated
+	// stream also satisfies (the non-duplicated snapshot alone contributes
+	// 3 occurrences of the tool name, already >= 2) -- so this fails,
+	// dropping to 1 of each, the moment eino-agent-doj stops re-forwarding.
+	if len(toolCallStarts) != 2 {
+		t.Fatalf("expected eino-agent-doj's known duplicate tool-call lifecycle emission (exactly 2 TOOL_CALL_START events), got %d in: %s", len(toolCallStarts), stream)
+	}
+	if len(toolCallResults) != 2 {
+		t.Fatalf("expected eino-agent-doj's known duplicate tool-call lifecycle emission (exactly 2 TOOL_CALL_RESULT events), got %d in: %s", len(toolCallResults), stream)
+	}
+
+	// The FIRST (pre-RUN_STARTED) TOOL_CALL_RESULT is built directly from
+	// the durable function_tool_result content block (runtime.ToolOutput),
+	// not from agui/bridge.go's toolPayload, so it is unaffected by
+	// eino-agent-6wj. echo_note's Retention policy (mountEchoNoteTool)
+	// allows its 56-byte output to inline instead of degrading to an
+	// omission record, so assert the real output actually reached the
+	// wire here -- proving this fixture exercises genuine durable content
+	// rather than over-determining the eino-agent-6wj narrative below with
+	// a result that would be an omission record regardless of that bug
+	// (fixture-integrity-reviewer, C3; contrast fixture 8's identical
+	// concern at mountEchoNoteTool's Retention comment).
+	snapshotResult := decodeJSONObject(t, toolCallResults[0].Content)
+	if snapshotResult["truncated"] == true {
+		t.Fatalf("expected echo_note's real output to durably inline under its Retention policy, got an omission record in: %s", stream)
+	}
+	structured, _ := snapshotResult["structured"].(map[string]any)
+	if structured["echoed"] != "hello from agui" {
+		t.Fatalf("expected the snapshot-projected tool result to carry the real durable output, got %v in: %s", snapshotResult, stream)
+	}
+
+	// eino-agent-6wj: the SECOND (post-RUN_STARTED, doj-duplicated)
+	// TOOL_CALL_RESULT is built from agui/bridge.go's toolPayload, which
+	// decodes content/structured, but the durable tool_transition wire
+	// payload carries output/error/metadata instead, so ResultContent()
+	// falls back to a synthesized status stub instead of the real tool
+	// result. Decode that event's content (itself JSON) and assert it is
+	// EXACTLY the three-key stub -- not merely that it contains "status"
+	// (which the legitimate snapshot result above also contains) -- so
+	// this fails the moment toolPayload decodes the real output instead.
+	liveForwardedResult := decodeJSONObject(t, toolCallResults[1].Content)
+	if _, ok := liveForwardedResult["echoed"]; ok {
 		t.Fatalf("tool result carried real output; eino-agent-6wj is apparently fixed, update this fixture: %s", stream)
 	}
-	if !strings.Contains(stream, `\"status\"`) && !strings.Contains(stream, `"status"`) {
-		t.Fatalf("expected eino-agent-6wj's synthesized status stub in the replayed tool result, got: %s", stream)
+	wantStub := map[string]any{"status": "completed", "truncated": false, "redacted": false}
+	if !reflect.DeepEqual(liveForwardedResult, wantStub) {
+		t.Fatalf("expected eino-agent-6wj's exact synthesized status stub %v in the live-forwarded tool result, got %v in: %s", wantStub, liveForwardedResult, stream)
 	}
+}
+
+// sseFrame is the minimal shape shared by every AG-UI SSE event this fixture
+// file decodes: enough to discriminate event type, and to reach the raw
+// (still-JSON-encoded) tool result content a TOOL_CALL_RESULT event carries.
+type sseFrame struct {
+	Type    string `json:"type"`
+	Content string `json:"content"`
+}
+
+// decodeSSEEvents parses raw's "data: {...}" lines (frames are separated by a
+// blank line, per the SSE wire format sse.NewSSEWriter produces) into
+// sseFrame values, in wire order.
+func decodeSSEEvents(t *testing.T, raw string) []sseFrame {
+	t.Helper()
+	var events []sseFrame
+	for _, frame := range strings.Split(raw, "\n\n") {
+		for _, line := range strings.Split(frame, "\n") {
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			var ev sseFrame
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &ev); err != nil {
+				t.Fatalf("decode SSE frame %q: %v", line, err)
+			}
+			events = append(events, ev)
+		}
+	}
+	return events
+}
+
+// decodeJSONObject decodes a TOOL_CALL_RESULT event's "content" string --
+// itself a JSON object, double-escaped on the wire inside the outer event's
+// JSON -- into a map for exact assertions.
+func decodeJSONObject(t *testing.T, raw string) map[string]any {
+	t.Helper()
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(raw), &obj); err != nil {
+		t.Fatalf("decode tool result content %q: %v", raw, err)
+	}
+	return obj
 }
 
 func mountEchoNoteTool(t *testing.T) (*composition.Registry, *composition.Mount) {
@@ -1170,6 +1259,15 @@ func mountEchoNoteTool(t *testing.T) (*composition.Registry, *composition.Mount)
 		return r.Tool(composition.ToolRegistration{ID: "echo-note", Scope: extension.GlobalScope(), Definition: tools.Definition{
 			Name: "echo_note", Description: "Echoes a note back for the fixture.",
 			Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"note": {Type: einoschema.String, Required: true}}),
+			// Without an explicit Retention policy the zero-value
+			// RetentionPolicy allows zero inline bytes (fail closed), which
+			// degrades every result to an omission record regardless of
+			// eino-agent-6wj and over-determines that narrative (see
+			// fixture 8's identical comment and fixture-integrity-reviewer
+			// C3). This tool's 56-byte output fits comfortably under 4096,
+			// so the snapshot-projection assertion above genuinely proves
+			// the real output durably reached the wire.
+			Retention: runtime.RetentionPolicy{MaxInlineBytes: 4096},
 			Execute: func(_ context.Context, e tools.Execution) (json.RawMessage, error) {
 				var input struct {
 					Note string `json:"note"`
