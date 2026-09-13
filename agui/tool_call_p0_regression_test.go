@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -261,6 +262,9 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 	if id, _ := frames[resultIdx]["toolCallId"].(string); id != string(fx.callID) {
 		t.Fatalf("TOOL_CALL_RESULT toolCallId = %q, want %q", id, fx.callID)
 	}
+	if content, _ := frames[resultIdx]["content"].(string); !strings.Contains(content, "3 results found") {
+		t.Fatalf("TOOL_CALL_RESULT content = %q, want persisted output", content)
+	}
 }
 
 // TestBridgeDeliversToolCallTurnWithNoPrecedingTextDelta proves the OTHER
@@ -329,5 +333,45 @@ func TestBridgeDeliversToolCallTurnWithNoPrecedingTextDelta(t *testing.T) {
 	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,CUSTOM,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (exactly one native TOOL_CALL_START/ARGS/END triple, from the committed projection, plus exactly one TOOL_CALL_RESULT, from the live path)", got, want)
+	}
+	if content, _ := frames[8]["content"].(string); !strings.Contains(content, "3 results found") {
+		t.Fatalf("TOOL_CALL_RESULT content = %q, want persisted output", content)
+	}
+}
+
+// TestReplaySettledToolCallEmitsEachNativeFrameOnce exercises the real
+// SQLite durable sweep: snapshots first project both settled messages, then
+// the same durable transition records are forwarded through Bridge.Emit.
+func TestReplaySettledToolCallEmitsEachNativeFrameOnce(t *testing.T) {
+	t.Parallel()
+
+	fx := buildToolCallTurnFixture(t, "session-replay-settled-tool", "run-replay-settled-tool")
+	ctx := context.Background()
+	sink := newSSESink()
+	bridge := NewBridge(ctx, fx.store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(fx.sessionID), string(fx.runID), nil)
+	if _, err := Replay(ctx, bridge, fx.store, fx.sessionID, session.EventCursor{Limit: 100}, session.ContentLimits{}, false); err != nil {
+		t.Fatalf("Replay() error = %v", err)
+	}
+	if bridge.Err() != nil || bridge.EncErr() != nil || bridge.LiveErr() != nil {
+		t.Fatalf("bridge errors: transport=%v encoding=%v live=%v", bridge.Err(), bridge.EncErr(), bridge.LiveErr())
+	}
+
+	frames := frameData(t, sink.Bytes())
+	counts := map[string]int{}
+	for _, frame := range frames {
+		counts[frame["type"].(string)]++
+	}
+	for _, kind := range []string{"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"} {
+		if counts[kind] != 1 {
+			t.Fatalf("%s count = %d, want 1; frames = %#v", kind, counts[kind], typesFromFrames(frames))
+		}
+	}
+	for _, frame := range frames {
+		if frame["type"] == "TOOL_CALL_RESULT" {
+			content, _ := frame["content"].(string)
+			if frame["toolCallId"] != string(fx.callID) || !strings.Contains(content, "3 results found") {
+				t.Fatalf("replayed result = %#v, want call %q with persisted output", frame, fx.callID)
+			}
+		}
 	}
 }

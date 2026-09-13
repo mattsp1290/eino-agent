@@ -69,6 +69,27 @@ func TestEmitToolCallUpdatedMalformedPayloadEmitsExactlyOneRedactedTerminalFrame
 	}
 }
 
+func TestEmitToolCallUpdatedMissingIdentityEmitsExactlyOneRedactedTerminalFrame(t *testing.T) {
+	t.Parallel()
+
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge.Emit(context.Background(), session.EventRecord{
+		Kind: runtime.EventToolCallUpdated, MessageID: "assistant-1",
+		Payload: []byte(`{"name":"search","arguments":{"q":"eino"},"status":"completed"}`),
+	})
+	if bridge.LiveErr() == nil {
+		t.Fatal("LiveErr() = nil, want missing tool call ID error")
+	}
+	frames := frameData(t, sink.Bytes())
+	if got := stringsJoined(typesFromFrames(frames)); got != "RUN_ERROR" {
+		t.Fatalf("event types = %s, want RUN_ERROR", got)
+	}
+	if len(bridge.nativeFrames) != 0 {
+		t.Fatalf("missing identity recorded native frames: %#v", bridge.nativeFrames)
+	}
+}
+
 // TestBridgeErrorEnforcesTerminatedInvariant proves the exported Bridge.Error
 // method -- dead in-repo (transport/http.go calls Terminate instead) but
 // still exported for a host embedding Bridge directly -- is now

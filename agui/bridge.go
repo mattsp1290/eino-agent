@@ -2,6 +2,7 @@ package agui
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -144,7 +145,8 @@ type Bridge struct {
 	// called a tool, not just the genuinely-stale-duplicate case the guard
 	// was meant for. A tool call's natural dedup key is the call itself,
 	// not the message that happened to introduce it.
-	toolCallNativeSuppressed map[session.ToolCallID]bool
+	nativeFrames       map[nativeFrameKey]bool
+	nativeDeltaOrdinal uint64
 	// toolCallLiveStartSent records every tool call ID for which
 	// emitToolCallUpdated has already emitted a native TOOL_CALL_START/ARGS
 	// pair on the LIVE path itself, independent of
@@ -160,7 +162,6 @@ type Bridge struct {
 	// be suppressed too), a call whose Start/Args the LIVE path itself
 	// already sent still needs its OWN End on the terminal event -- nothing
 	// else will ever send it.
-	toolCallLiveStartSent map[session.ToolCallID]bool
 	// toolCallResultSent records every tool call ID whose native
 	// TOOL_CALL_RESULT has already reached this connection -- either from
 	// emitToolCallUpdated's own terminal branch (the common case on a live
@@ -182,7 +183,6 @@ type Bridge struct {
 	// avoid a duplicate by downgrading a result message's WHOLE mode, and
 	// only when every block in it is already covered -- see
 	// blocksAlreadyDeliveredNatively.
-	toolCallResultSent map[session.ToolCallID]bool
 	// terminated is true once this Bridge has written a terminal frame --
 	// either Emit's runtime.EventRunFinished case (a durable
 	// RUN_FINISHED/RUN_ERROR) or a Terminate call -- for the life of this
@@ -279,74 +279,29 @@ func (b *Bridge) markNativeStreamed(id session.MessageID) {
 	b.nativeStreamed[id] = true
 }
 
-// toolCallNativeAlreadySuppressed reports whether this call's native
-// TOOL_CALL_START/ARGS/END lifecycle was already delivered to this
-// connection through the owning assistant message's committed projection
-// (see Bridge.toolCallNativeSuppressed's doc comment).
-func (b *Bridge) toolCallNativeAlreadySuppressed(id session.ToolCallID) bool {
-	if b == nil {
+type nativeFrameKey struct {
+	kind    aguievents.EventType
+	ownerID string
+	ordinal uint64
+}
+
+func (b *Bridge) deliverNative(key nativeFrameKey, emitter *aguiemitter.Emitter, event aguievents.Event) bool {
+	if b == nil || emitter == nil || event == nil || b.nativeFrames[key] || emitter.Err() != nil || emitter.EncErr() != nil {
 		return false
 	}
-	return b.toolCallNativeSuppressed[id]
-}
-
-// markToolCallNativeSuppressed records id's native TOOL_CALL_START/ARGS/END
-// lifecycle as already delivered (see Bridge.toolCallNativeSuppressed's doc
-// comment). Callers must only call this after a projection that actually
-// included that call's native lifecycle succeeded.
-func (b *Bridge) markToolCallNativeSuppressed(id session.ToolCallID) {
-	if b == nil || id == "" {
-		return
-	}
-	if b.toolCallNativeSuppressed == nil {
-		b.toolCallNativeSuppressed = map[session.ToolCallID]bool{}
-	}
-	b.toolCallNativeSuppressed[id] = true
-}
-
-// toolCallLiveStartAlreadySent reports whether emitToolCallUpdated has
-// already emitted this call's native TOOL_CALL_START/ARGS pair on the live
-// path itself (see Bridge.toolCallLiveStartSent's doc comment).
-func (b *Bridge) toolCallLiveStartAlreadySent(id session.ToolCallID) bool {
-	if b == nil {
+	if !emitter.Emit(event) {
 		return false
 	}
-	return b.toolCallLiveStartSent[id]
+	if b.nativeFrames == nil {
+		b.nativeFrames = map[nativeFrameKey]bool{}
+	}
+	b.nativeFrames[key] = true
+	return true
 }
 
-// markToolCallLiveStartSent records id's native TOOL_CALL_START/ARGS as
-// already sent on the live path (see Bridge.toolCallLiveStartSent's doc
-// comment).
-func (b *Bridge) markToolCallLiveStartSent(id session.ToolCallID) {
-	if b == nil || id == "" {
-		return
-	}
-	if b.toolCallLiveStartSent == nil {
-		b.toolCallLiveStartSent = map[session.ToolCallID]bool{}
-	}
-	b.toolCallLiveStartSent[id] = true
-}
-
-// toolCallResultAlreadySent reports whether this call's native
-// TOOL_CALL_RESULT has already reached this connection (see
-// Bridge.toolCallResultSent's doc comment).
-func (b *Bridge) toolCallResultAlreadySent(id session.ToolCallID) bool {
-	if b == nil {
-		return false
-	}
-	return b.toolCallResultSent[id]
-}
-
-// markToolCallResultSent records id's native TOOL_CALL_RESULT as already
-// delivered (see Bridge.toolCallResultSent's doc comment).
-func (b *Bridge) markToolCallResultSent(id session.ToolCallID) {
-	if b == nil || id == "" {
-		return
-	}
-	if b.toolCallResultSent == nil {
-		b.toolCallResultSent = map[session.ToolCallID]bool{}
-	}
-	b.toolCallResultSent[id] = true
+func (b *Bridge) nextDeltaKey(kind aguievents.EventType, messageID session.MessageID) nativeFrameKey {
+	b.nativeDeltaOrdinal++
+	return nativeFrameKey{kind: kind, ownerID: string(messageID), ordinal: b.nativeDeltaOrdinal}
 }
 
 // BenignCommitMisses returns the number of session.MessageCommittedEventKind
@@ -622,30 +577,30 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	// reconnecting client (W7 fix-pass review finding P1-D/I3).
 	if b.includeReasoning && payload.Reasoning != "" {
 		if b.textOpen[messageID] {
-			b.emit.TextEnd(string(messageID))
+			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}, b.emit, aguievents.NewTextMessageEndEvent(string(messageID)))
 			delete(b.textOpen, messageID)
 		}
 		reasoningID := b.reasoning[messageID]
 		if reasoningID == "" {
 			reasoningID = string(messageID)
 			b.reasoning[messageID] = reasoningID
-			b.emit.ReasoningStart(reasoningID)
-			b.emit.ReasoningMessageStart(reasoningID)
+			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningStart, ownerID: reasoningID}, b.emit, aguievents.NewReasoningStartEvent(reasoningID))
+			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningMessageStart, ownerID: reasoningID}, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning"))
 		}
-		b.emit.ReasoningContent(reasoningID, payload.Reasoning)
+		b.deliverNative(b.nextDeltaKey(aguievents.EventTypeReasoningMessageContent, messageID), b.emit, aguievents.NewReasoningMessageContentEvent(reasoningID, payload.Reasoning))
 		b.markNativeStreamed(messageID)
 	}
 	if payload.Content != "" {
 		if b.reasoning[messageID] != "" {
-			b.emit.ReasoningMessageEnd(b.reasoning[messageID])
-			b.emit.ReasoningEnd(b.reasoning[messageID])
+			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: b.reasoning[messageID]}, b.emit, aguievents.NewReasoningMessageEndEvent(b.reasoning[messageID]))
+			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: b.reasoning[messageID]}, b.emit, aguievents.NewReasoningEndEvent(b.reasoning[messageID]))
 			delete(b.reasoning, messageID)
 		}
 		if !b.textOpen[messageID] {
-			b.emit.TextStart(string(messageID))
+			b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(messageID)}, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant")))
 			b.textOpen[messageID] = true
 		}
-		b.emit.TextContent(string(messageID), payload.Content)
+		b.deliverNative(b.nextDeltaKey(aguievents.EventTypeTextMessageContent, messageID), b.emit, aguievents.NewTextMessageContentEvent(string(messageID), payload.Content))
 		b.markNativeStreamed(messageID)
 	}
 }
@@ -694,30 +649,22 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 	if toolCallID == "" {
 		toolCallID = session.ToolCallID(payload.ID)
 	}
+	if toolCallID == "" {
+		b.recordLiveErr(fmt.Errorf("agui: tool_call_updated payload for message %s has no tool call ID", event.MessageID))
+		b.emitTerminalError()
+		return
+	}
 	b.closeOpen(b.emit)
-	if !b.toolCallNativeAlreadySuppressed(toolCallID) && !b.toolCallLiveStartAlreadySent(toolCallID) {
-		sentStart := false
-		if payload.Name != "" {
-			b.emit.ToolStart(string(toolCallID), payload.Name, string(event.MessageID))
-			sentStart = true
-		}
-		if payload.Arguments != "" {
-			b.emit.ToolArgs(string(toolCallID), payload.Arguments.String())
-			sentStart = true
-		}
-		if sentStart {
-			b.markToolCallLiveStartSent(toolCallID)
-		}
+	if payload.Name != "" {
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeToolCallStart, ownerID: string(toolCallID)}, b.emit, aguievents.NewToolCallStartEvent(string(toolCallID), payload.Name, aguievents.WithParentMessageID(string(event.MessageID))))
+	}
+	if payload.Arguments != "" {
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeToolCallArgs, ownerID: string(toolCallID)}, b.emit, aguievents.NewToolCallArgsEvent(string(toolCallID), payload.Arguments.String()))
 	}
 	switch payload.Status {
 	case string(session.ToolCallCompleted), string(session.ToolCallFailed), string(session.ToolCallInterrupted):
-		if !b.toolCallNativeAlreadySuppressed(toolCallID) {
-			b.emit.ToolEnd(string(toolCallID))
-		}
-		if !b.toolCallResultAlreadySent(toolCallID) {
-			b.emit.ToolResult(string(event.MessageID), string(toolCallID), payload.ResultContent())
-			b.markToolCallResultSent(toolCallID)
-		}
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeToolCallEnd, ownerID: string(toolCallID)}, b.emit, aguievents.NewToolCallEndEvent(string(toolCallID)))
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeToolCallResult, ownerID: string(toolCallID)}, b.emit, aguievents.NewToolCallResultEvent(string(event.MessageID), string(toolCallID), payload.ResultContent()))
 	}
 }
 
@@ -729,12 +676,12 @@ func (b *Bridge) emitToolCallUpdated(event session.EventRecord) {
 // encode failure Terminate's own fallback emitter exists to work around.
 func (b *Bridge) closeOpen(e *aguiemitter.Emitter) {
 	for messageID := range b.textOpen {
-		e.TextEnd(string(messageID))
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}, e, aguievents.NewTextMessageEndEvent(string(messageID)))
 		delete(b.textOpen, messageID)
 	}
 	for messageID, reasoningID := range b.reasoning {
-		e.ReasoningMessageEnd(reasoningID)
-		e.ReasoningEnd(reasoningID)
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}, e, aguievents.NewReasoningMessageEndEvent(reasoningID))
+		b.deliverNative(nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}, e, aguievents.NewReasoningEndEvent(reasoningID))
 		delete(b.reasoning, messageID)
 	}
 }
@@ -749,58 +696,89 @@ func (b *Bridge) EmitCommittedProjection(projection *convert.AgenticProjection, 
 	if b == nil || b.emit == nil {
 		return false
 	}
-	return b.emit.EmitCommittedProjection(projection, receipt, mode)
-}
-
-// blocksAlreadyDeliveredNatively reports whether EVERY content block in
-// projection has already reached this connection natively under a
-// different identity than the message itself -- today, exactly a
-// function_tool_result block whose call's result already reached this
-// connection through emitToolCallUpdated's own terminal branch (see
-// Bridge.toolCallResultSent's doc comment). eino-agui's
-// EmitCommittedProjection chooses one DeliveryMode for an entire message
-// (no per-block mode exists -- W7 fifth fix-pass review P1-4), so this
-// bridge can only avoid a native TOOL_CALL_RESULT duplicate for a message
-// by downgrading that message's WHOLE mode to DeliveryModeLiveContinuation,
-// and it is only safe to do that when every block in the message is
-// already covered -- downgrading a message that mixes an
-// already-delivered block with a genuinely new one would silently drop the
-// new one's native representation, which is the exact defect class this
-// whole fix pass exists to close. A message with any block this function
-// does not recognize as already-delivered (including an empty block list)
-// therefore returns false, accepting the documented, narrower limitation
-// (a duplicate native TOOL_CALL_RESULT in the rare mixed case) rather than
-// silently dropping content.
-func (b *Bridge) blocksAlreadyDeliveredNatively(projection *convert.AgenticProjection) bool {
-	if b == nil || projection == nil || projection.Public == nil || len(projection.Public.ContentBlocks) == 0 {
+	keys := b.projectedNativeFrameKeys(projection)
+	if mode != aguiemitter.DeliveryModeLiveContinuation && len(keys) > 0 && b.projectionNativesAlreadyDelivered(keys) {
+		mode = aguiemitter.DeliveryModeLiveContinuation
+	}
+	if !b.emit.EmitCommittedProjection(projection, receipt, mode) {
 		return false
 	}
+	if mode != aguiemitter.DeliveryModeLiveContinuation {
+		b.recordProjectedNativeFrames(keys)
+	}
+	return true
+}
+
+func (b *Bridge) projectedNativeFrameKeys(projection *convert.AgenticProjection) []nativeFrameKey {
+	if projection == nil || projection.Public == nil {
+		return nil
+	}
+	keys := make([]nativeFrameKey, 0)
 	for _, block := range projection.Public.ContentBlocks {
-		if block.Type != einoschema.ContentBlockTypeFunctionToolResult || block.FunctionToolResult == nil {
-			return false
+		events, err := convert.CommittedNativeEvents(block)
+		if err != nil {
+			return nil
 		}
-		if !b.toolCallResultAlreadySent(session.ToolCallID(block.FunctionToolResult.CallID)) {
+		for _, event := range events {
+			if key, ok := nativeKeyForEvent(event); ok {
+				keys = append(keys, key)
+			}
+		}
+	}
+	return keys
+}
+
+func nativeKeyForEvent(event aguievents.Event) (nativeFrameKey, bool) {
+	switch e := event.(type) {
+	case *aguievents.ToolCallStartEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.ToolCallID}, e.ToolCallID != ""
+	case *aguievents.ToolCallArgsEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.ToolCallID}, e.ToolCallID != ""
+	case *aguievents.ToolCallEndEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.ToolCallID}, e.ToolCallID != ""
+	case *aguievents.ToolCallResultEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.ToolCallID}, e.ToolCallID != ""
+	case *aguievents.TextMessageStartEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.TextMessageContentEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.TextMessageEndEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.ReasoningStartEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.ReasoningMessageStartEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.ReasoningMessageContentEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.ReasoningMessageEndEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	case *aguievents.ReasoningEndEvent:
+		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
+	}
+	return nativeFrameKey{}, false
+}
+
+func (b *Bridge) projectionNativesAlreadyDelivered(keys []nativeFrameKey) bool {
+	if len(keys) == 0 {
+		return false
+	}
+	for _, key := range keys {
+		if !b.nativeFrames[key] {
 			return false
 		}
 	}
 	return true
 }
 
-// recordNativeToolDelivery marks every function_tool_call block's call ID
-// in a just-emitted, natives-including committed projection as
-// toolCallNativeSuppressed, so emitToolCallUpdated knows not to re-emit
-// that call's native START/ARGS/END lifecycle on the live path -- see
-// Bridge.toolCallNativeSuppressed's doc comment. Callers must only call
-// this after EmitCommittedProjection actually succeeded with a mode that
-// included natives (never DeliveryModeLiveContinuation).
-func (b *Bridge) recordNativeToolDelivery(projection *convert.AgenticProjection) {
-	if b == nil || projection == nil || projection.Public == nil {
+func (b *Bridge) recordProjectedNativeFrames(keys []nativeFrameKey) {
+	if len(keys) == 0 {
 		return
 	}
-	for _, block := range projection.Public.ContentBlocks {
-		if block.Type == einoschema.ContentBlockTypeFunctionToolCall && block.FunctionToolCall != nil {
-			b.markToolCallNativeSuppressed(session.ToolCallID(block.FunctionToolCall.CallID))
-		}
+	if b.nativeFrames == nil {
+		b.nativeFrames = map[nativeFrameKey]bool{}
+	}
+	for _, key := range keys {
+		b.nativeFrames[key] = true
 	}
 }
 
@@ -877,7 +855,7 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 			continue
 		}
 		mode := aguiemitter.DeliveryModeLiveContinuation
-		if !b.nativeAlreadyStreamed(event.MessageID) && !b.blocksAlreadyDeliveredNatively(p.Projection) {
+		if !b.nativeAlreadyStreamed(event.MessageID) {
 			mode = aguiemitter.DeliveryModeCommittedOnly
 		}
 		// EmitCommittedProjection's own bool return IS consulted here
@@ -889,9 +867,6 @@ func (b *Bridge) emitLiveMessageCommitted(ctx context.Context, event session.Eve
 		// the projection again instead of being permanently skipped.
 		if b.EmitCommittedProjection(p.Projection, p.Receipt, mode) {
 			b.markMessageProjected(p.MessageID)
-			if mode != aguiemitter.DeliveryModeLiveContinuation {
-				b.recordNativeToolDelivery(p.Projection)
-			}
 		}
 		return
 	}
@@ -958,28 +933,41 @@ type runFinishedPayload struct {
 }
 
 type toolPayload struct {
-	ID         string         `json:"id"`
-	Name       string         `json:"name"`
-	Arguments  rawJSONString  `json:"arguments"`
-	Status     string         `json:"status"`
-	Content    string         `json:"content"`
-	Structured map[string]any `json:"structured"`
-	Truncated  bool           `json:"truncated"`
-	Redacted   bool           `json:"redacted"`
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Arguments rawJSONString     `json:"arguments"`
+	Output    json.RawMessage   `json:"output"`
+	Status    string            `json:"status"`
+	Error     string            `json:"error"`
+	Metadata  map[string]string `json:"metadata"`
 }
 
 func (p toolPayload) ResultContent() string {
-	if p.Content != "" {
-		return p.Content
-	}
-	if len(p.Structured) > 0 {
-		raw, err := json.Marshal(p.Structured)
-		if err == nil {
-			return string(raw)
+	output := bytes.TrimSpace(p.Output)
+	if len(output) > 0 && !bytes.Equal(output, []byte("null")) {
+		var text string
+		if json.Unmarshal(output, &text) == nil {
+			return text
+		}
+		if json.Valid(output) {
+			var compact bytes.Buffer
+			if json.Compact(&compact, output) == nil {
+				return compact.String()
+			}
 		}
 	}
+	if p.Error != "" {
+		raw, _ := json.Marshal(struct {
+			Error  string `json:"error"`
+			Status string `json:"status"`
+		}{p.Error, p.Status})
+		return string(raw)
+	}
 	if p.Status != "" {
-		return fmt.Sprintf(`{"status":%q,"truncated":%t,"redacted":%t}`, p.Status, p.Truncated, p.Redacted)
+		raw, _ := json.Marshal(struct {
+			Status string `json:"status"`
+		}{p.Status})
+		return string(raw)
 	}
 	return ""
 }

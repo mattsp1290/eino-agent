@@ -40,7 +40,7 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 		Kind:       runtime.EventToolCallUpdated,
 		MessageID:  "tool-message-1",
 		ToolCallID: "tool-1",
-		Payload:    []byte(`{"name":"search","arguments":{"q":"eino"},"status":"completed","content":"result"}`),
+		Payload:    []byte(`{"name":"search","arguments":{"q":"eino"},"status":"completed","output":"result"}`),
 	})
 	bridge.StateSnapshot(map[string]any{"status": "working"})
 	bridge.StateDelta([]aguievents.JSONPatchOperation{{Op: "replace", Path: "/status", Value: "done"}})
@@ -69,6 +69,29 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	}
 	if bridge.Err() != nil || bridge.EncErr() != nil {
 		t.Fatalf("bridge errors: transport=%v encoding=%v", bridge.Err(), bridge.EncErr())
+	}
+}
+
+func TestToolPayloadResultContentUsesDurableOutputContract(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name    string
+		payload toolPayload
+		want    string
+	}{
+		{name: "string", payload: toolPayload{Output: json.RawMessage(`"result"`)}, want: "result"},
+		{name: "object", payload: toolPayload{Output: json.RawMessage(` { "n" : 1 } `)}, want: `{"n":1}`},
+		{name: "array", payload: toolPayload{Output: json.RawMessage(`[1,2]`)}, want: `[1,2]`},
+		{name: "number", payload: toolPayload{Output: json.RawMessage(`3`)}, want: "3"},
+		{name: "null fallback", payload: toolPayload{Output: json.RawMessage(`null`), Error: "failed", Status: "failed"}, want: `{"error":"failed","status":"failed"}`},
+		{name: "absent status", payload: toolPayload{Status: "completed"}, want: `{"status":"completed"}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := test.payload.ResultContent(); got != test.want {
+				t.Fatalf("ResultContent() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
