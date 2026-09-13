@@ -4,6 +4,64 @@ This document is the maintained capability and verification matrix for the
 CloudWeGo Eino dependency. It replaces the planning inventory that produced the
 v0.9.19 adoption and is updated whenever a package of that adoption lands.
 
+## Row-by-row capability matrix (`01-feature-inventory.md`)
+
+`.agents/plans/eino-v0-9-19/08-execution-handoff.md`'s Definition of done item
+1 requires: "Every capability row in `01` has concrete passing tests or the
+specified direct-upstream example; no unclassified changed public file
+remains. No row may silently become deferred work." The narrative sections
+below (W1-W8) answer that question, but item 1 asks it row-by-row against
+`01-feature-inventory.md`'s 27 data rows, and nothing before this table
+answered it in that shape -- some rows conceded out of scope mid-narrative
+(the W5 section, `:1732-1735`/`:1761` in an earlier revision) were invisible
+to anyone checking item 1 from here. This table is that direct answer, built
+from a full row-by-row audit (2026-09-13). **COVERED** means a named test (or
+the specified upstream example) asserts what the row's acceptance text
+claims. **PARTIAL** names the specific unmet clause. **NOT COVERED** gives the
+reason and, where one exists, the tracking bead. A row is never marked
+COVERED by a test that does not assert what the row claims.
+
+| # | Capability delta | Status | Evidence / gap |
+| --- | --- | --- | --- |
+| 1 | AgenticMessage/AgenticModel and typed roles | COVERED | `TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation` (`testdata/external-consumer/agentic_fixture_test.go`) and `TestNativeAgenticProviderStateReasoningSignatureRestoresAcrossReopenWithoutLeakage` (`runtime/native_provider_state_test.go`): real native adapter I/O and SQL reopen with no flattening. |
+| 2 | All 20 content block kinds and structured function results | PARTIAL | SQL boundary: all 20 kinds proven per-kind (`Makefile`'s `POSTGRES_STORE_CONTENT_KIND_SUITE`, `TestPostgresStore/contract/durable_rich_content`). Model boundary: only 6 kinds (+1 conditional) cross `runtime/adk_model.go`'s assistant-output allowlist; 5 kinds fail the turn closed via `errADKUnsupportedBlock`. Transport boundary: no per-kind matrix exists yet (bead `eino-agent-nsv`). |
+| 3 | OpenAI reasoning/refusal/citations/response state, Claude citations/stop, Gemini grounding | PARTIAL | Typed public/private fixtures exist for all three providers (`session/content_test.go`, `TestContentPrivateSplitNeverLeaks`). Native continuation after reopen is proven only for Claude (`TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation`); OpenAI/Gemini native continuation is unverified. |
+| 4 | Generic BaseModel and typed ADK agent/input/output/event/message variants | PARTIAL | Real `TypedChatModelAgent`, runner and durable IDs covered (`runtime/adk_approval_production_test.go`). Child-agent calls: not started (see W5 section). |
+| 5 | Agentic tool choice, forced/allowed function/MCP/server selectors | COVERED | `TestAgenticCallOptionsExactSetAndOrder` and `TestAgenticStreamerValidationFailsBeforeDispatch` (`model/agentic_streamer_test.go`): exact call-time option set/order and validation failing before dispatch. |
+| 6 | Deferred tools, tool-search tool, ToolSearchResult serialization | COVERED | `TestPublicToolSearchDiscoversDeferredToolThenAliasExecutes` (`testdata/external-consumer/agentic_fixture_test.go`), corrected by this fix pass to actually assert deferral (call 1 does not offer the tool; call 2, after discovery, does) rather than only naming it. |
+| 7 | ToolsNode name/argument aliases; dynamic list overrides | PARTIAL | Canonicalization, collision validation and settlement identity covered (`runtime/w4_acceptance_test.go`). Upstream's per-invocation `compose.WithToolList` dynamic override has zero occurrences; only this runtime's own alias logic is tested. |
+| 8 | AgenticToolsNode and new graph/workflow/chain/branch/parallel nodes | PARTIAL | Branch/parallel proven through a real `compose.Graph` (`examples/agentic-graph`: `TestBuildBranchExampleCompilesAndRoutesThroughRegisteredBranch`, `TestBuildParallelExampleCompilesAndFansOutToBothRegisteredMembers`). The `compose/workflow.go` `Workflow` variant (`AddAgenticChatTemplateNode`/`AddAgenticModelNode`/`AddAgenticToolsNode` on `compose.Workflow`) has zero occurrences anywhere in the module. |
+| 9 | AgenticChatTemplate/FromAgenticMessages/placeholders | PARTIAL | Real API used (`examples/agentic-graph/graph.go`'s `chatTemplate`). No placeholder-substitution test and no "invalid placeholder fails" test. |
+| 10 | Typed callbacks for model/prompt/agent/tools-node | NOT COVERED | Not implemented by this pass -- see the W7 "Not implemented by this pass" list. Bead `eino-agent-sm0`. |
+| 11 | Agent cancellation modes, recursive cancel, timeout, handles | PARTIAL | Immediate/graceful covered (`runtime/acceptance_matrix_test.go`). Recursive cancel and timeout escalation remain out of scope (see W5 section). |
+| 12 | TurnLoop Push/preempt/stop/idle/graceful behavior | PARTIAL | Documented out of scope in the W5 section: preempt (specifically, a late preempt targeting only the captured turn) and idle exit specifically. |
+| 13 | Typed/stateful/composite interrupt and LastCheckpoint | PARTIAL | Mechanics well tested (`runtime/w5_round4_acceptance_test.go`, `runtime/orchestrator_resume_test.go`) via the classic, non-generic `compose.StatefulInterrupt` (`runtime/adk_execution.go`, `runtime/adk_approval.go`). None of `TypedInterrupt`/`TypedStatefulInterrupt`/`TypedCompositeInterrupt`/`LastCheckpoint` is used. |
+| 14 | Runner checkpoint deletion | PARTIAL | Only `Set` failure is covered; checkpoint promotion-failure and terminal-delete-failure specifically are untested (see W5 section). |
+| 15 | Retry context/decision/reject reason and model failover | PARTIAL | Bounded attempts and selected identity proven (`runtime/tool_call_id_publicize_test.go`: `TestDefaultShouldRetryAndShouldFailoverRefuseUnresolvedToolCallID`, `TestRunRetriesTransientToolCallIDLookupFailureAndCompletes`, `TestRunFailsClosedOnceOnDeterministicToolCallIDLookupFailure`). Partial-stream isolation and charged usage were not independently reverified in this audit. |
+| 16 | Typed DeepAgent/AgentTool and prebuilt/workflow behavior changes | NOT COVERED | Out of scope, not started (see W5 section). Zero occurrences of `DeepAgent`/`Supervisor`/`PlanExecute`/`deterministic_transfer`/`NewTypedAgentTool`. Bead `eino-agent-bpj`. |
+| 17 | Typed handlers, AfterAgent, tool-call context, after-tool hook | PARTIAL | Middleware handler-chain covered (`runtime/adk_middleware_e2e_test.go`). `AfterAgent`/`ToolCallsContext`/`WithAfterToolCallsHook` all have zero occurrences. |
+| 18 | Message ID helpers and event sender wrappers | PARTIAL (known defect) | Durable/ADK identity mapping is stable, but "no duplicate model/tool events" is currently violated: `eino-agent-doj` causes AG-UI replay to re-emit a tool call's whole lifecycle a second time on reconnect. `testdata/external-consumer/agentic_fixture_test.go`'s AG-UI fixture asserts this known defect explicitly (exactly 2 native `TOOL_CALL_START`/`TOOL_CALL_RESULT` events for one call, dropping to 1 once `eino-agent-doj` is fixed) rather than hiding it. |
+| 19 | agentsmd middleware | COVERED | `runtime/w6_round4_correlation_test.go`, `runtime/w6_round3_test.go`, `runtime/adk_middleware_e2e_test.go`, `composition/registry_handler_test.go`, `examples/agentic-middleware/composed_test.go`. |
+| 20 | Typed skill middleware, agent/model hubs | PARTIAL | Skill activation/resume covered (`runtime/adk_middleware_e2e_test.go`). `TypedAgentHub`/`TypedModelHub`/`TypedSubAgentInput`/`TypedSubAgentOutput` all have zero occurrences. |
+| 21 | Multimodal filesystem reader and typed filesystem middleware | PARTIAL | Media read covered (`runtime/adk_middleware_e2e_test.go`) against an in-memory fake store (`runtime/admission_store_test.go`); the "and reopen" clause against a real store is not exercised. |
+| 22 | Typed plantask, patchtoolcalls | COVERED | `runtime/patchtoolcalls_settlement_test.go`, `runtime/w6_round4_correlation_test.go`, `runtime/adk_middleware_discovery_test.go`, `runtime/adk_middleware_e2e_test.go`. |
+| 23 | Typed reduction and summarization, explicit Summarize/finalizers/retry/failover | COVERED (see P1-8 note) | `TestPublicSummarizationMiddlewareWritesDurableContextEpochSurvivingReopen` (`testdata/external-consumer/agentic_fixture_test.go`), `runtime/adk_middleware_e2e_test.go`, `runtime/w6_round3_test.go`, `runtime/w6_round2_group_a_test.go`. The storage primitives are also PostgreSQL-tagged; the summarization-middleware-triggered path specifically is proven only under SQLite (see this section's `POSTGRES_REQUIRED_SUITES` note below). |
+| 24 | ToolInfo JSON/Gob encoding, ParamsOneOf nil/empty distinctions | PARTIAL | `ParamsOneOf`/schema definitions are exercised widely (`tools/definition.go`, `tools/einotools/einotools.go`, `runtime/tool_search.go`, `runtime/ledger.go` and their tests), but no test in the module exercises `schema.ToolInfo`'s Gob encode/decode round trip directly (zero matches for `GobEncode`/`GobDecode` in any `_test.go` file). |
+| 25 | Stream WithOnEOF and copy/concat/cleanup changes | NOT COVERED | Zero occurrences of `WithOnEOF` anywhere in the module. `model/agentic_streamer.go`'s `einoschema.StreamReaderWithConvert` call is the natural integration point but does not pass it. This is real runtime behavior (the row is "Runtime", requiring implementation and integration acceptance, not just an upstream-API demonstration), so implementing it honestly needs its own implementation and review pass rather than a doc-only fix. Bead `eino-agent-5r8`. |
+| 26 | Indexer WithIndex | COVERED (added by this fix pass) | `TestIndexerWithIndexOptionReachesStore` and `TestIndexerWithoutIndexOptionLeavesIndexNil` (`examples/indexer-option/indexer_option_test.go`): a small test indexer reads the real upstream `indexer.WithIndex` call option through `indexer.GetCommonOptions`; no new indexing service. |
+| 27 | Graph scheduling/checkpoint/panic/stream fixes, Jinja formatting and other changed existing behavior | NOT COVERED | No section of this document addresses this row, and there are zero occurrences of "Jinja" (case-insensitive) anywhere in the module. Needs a semantic-diff re-read of `compose/graph.go`/`compose/checkpoint.go`/`compose/stream_concat.go` plus fixtures proving graph panic/cancel/checkpoint behavior, and either a Jinja-formatting regression fixture or an explicit note that this codebase has no Jinja-formatting surface to regress. Bead `eino-agent-2wi`. |
+
+**Changed-public-source ledger** (`01-feature-inventory.md`'s appendix): of the
+paths with no mention anywhere in this document, `components/indexer` is now
+addressed by row 26 above; `schema/stream.go` by row 25's bead
+(`eino-agent-5r8`); `compose/workflow.go` by row 8's partial note;
+`adk/prebuilt/supervisor`, `adk/prebuilt/planexecute` and
+`adk/deterministic_transfer` by row 16's bead (`eino-agent-bpj`);
+`compose/stream_concat` by row 27's bead (`eino-agent-2wi`); and
+`utils/callbacks/template` by row 10's bead (`eino-agent-sm0`).
+`schema/serialization.go` adds no exported name (an inherited-behavior-only
+change per the ledger) and is not separately tracked.
+
 ## Pin
 
 | Field | Value |
