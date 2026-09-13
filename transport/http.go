@@ -61,11 +61,13 @@ type SSEConfig struct {
 	ContentLimits session.ContentLimits
 	// IncludeReasoning is the host's attestation that
 	// agui.GateProviderReasoningStorage is satisfied for every session this
-	// handler serves: only when true does the initial message snapshot and
-	// live commit reprojection include durable reasoning content blocks.
-	// Defaults to false (matching the pre-W7 classic history pipeline's
-	// default), so a host must opt in explicitly rather than durable
-	// reasoning silently streaming to every reconnecting client.
+	// handler serves: only when true do the initial message snapshot, live
+	// commit reprojection, AND the live EventMessageDelta reasoning-delta
+	// stream (the REASONING_* events Bridge.emitMessageDelta emits while a
+	// turn is streaming) include durable/live reasoning content. Defaults
+	// to false (matching the pre-W7 classic history pipeline's default), so
+	// a host must opt in explicitly rather than durable or live reasoning
+	// silently streaming to every reconnecting client.
 	IncludeReasoning bool
 	OnComplete       func(session.EventCursor, error)
 }
@@ -123,6 +125,18 @@ func SSEHandler(config SSEConfig) http.Handler {
 				config.OnComplete(next, err)
 			}
 			return
+		}
+		if err != nil {
+			// Reconnect failed after already writing at least one byte: the
+			// response is already a 200 SSE stream, so http.Error's non-200
+			// status is no longer available to signal the failure (W7
+			// fix-pass review finding P0-3). Emit a terminal RUN_ERROR frame
+			// instead, so a client can tell a truncated stream from a
+			// completed one rather than the connection just stopping with
+			// no signal at all. Bridge.Error is a no-op once the emitter's
+			// own transport error is already latched (Emitter.Emit checks
+			// e.err first), so this is safe to call unconditionally here.
+			bridge.Error(err.Error())
 		}
 		_ = writer.Flush()
 		if flusher != nil {
