@@ -105,11 +105,18 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	}
 	// No live TurnSnapshot exists on this crash-reconciliation path (it
 	// settles a tool call that never rejoined a live turn loop), and
-	// session.Store exposes no by-ID message read to recover the calling
-	// message's already-durable TurnID/AgentPath here: this interrupted
-	// result message is stamped with an empty turn identity rather than
-	// paying for a full ListMessages page scan on a rare, already-degraded
-	// settlement path.
+	// session.Store's ExecutionStore/Store interfaces expose no by-ID
+	// message read to recover the calling message's already-durable
+	// TurnID/AgentPath here (only ListMessages -- a concrete store's own
+	// unexported GetMessage helper is not part of that interface, so it is
+	// not reachable from this call site): this interrupted result message
+	// is stamped with an empty turn identity rather than paying for a full
+	// ListMessages page scan on a rare, already-degraded settlement path.
+	// The cost of that empty identity is bounded by
+	// agui.agenticIdentity's synthetic-turn-id fallback (W7 review finding
+	// A1): a message with an empty TurnID still replays correctly, it just
+	// gets a deterministic synthetic turn id instead of the calling
+	// message's real one.
 	settlement, _, err := buildTerminalToolEnvelope(terminalToolEnvelopeInput{
 		Claimed: claimed, Status: session.ToolCallInterrupted, Output: raw, OutputRecord: output, Error: errText,
 		Metadata: metadata, ModelID: run.ModelID, CompletedAt: completedAt, MessageAt: messageAt,

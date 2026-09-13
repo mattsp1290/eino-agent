@@ -438,6 +438,43 @@ func TestCommitSummaryEpochIsAtomicAcrossFailure(t *testing.T) {
 	}
 }
 
+// TestCommitSummaryEpochStampsTurnIdentityFromCapability proves the W7
+// review's P0 finding (durable-identity-reviewer item 3): commitSummaryEpoch
+// must stamp the boundary message with the calling turn's durable
+// TurnID/AgentPath (contextEpochCapability.turnID/agentPath, populated from
+// adkEngine.snapshot.TurnID/AgentPath at construction -- see
+// buildAgentHandlers), not leave it empty. Before this fix, the boundary
+// message always carried an empty TurnID, forcing agui.agenticIdentity to
+// fall back to a synthetic turn id on every replay of every compacted
+// session -- not just pre-fix data.
+func TestCommitSummaryEpochStampsTurnIdentityFromCapability(t *testing.T) {
+	store := newAdmissionStore()
+	sessionID := session.ID("turn-stamp-session")
+	execution := testFencedExecutionStore(t, store, sessionID)
+	ids := &sequenceIDs{}
+	now := func() time.Time { return time.Unix(4000, 0).UTC() }
+	epochCap := contextEpochCapability{
+		sessionID: sessionID, runID: "run-1", store: store, execution: execution, ids: ids, now: now,
+		turnID: "turn-that-triggered-compaction", agentPath: "root",
+	}
+
+	epoch := session.ContextEpoch{
+		ID: ids.NewEpochID(), SessionID: sessionID, SummarizedFromID: "seed-from", SummarizedToID: "seed-to",
+		Trigger: "summarization", Reason: "context_budget", NextAction: session.EpochNextAutoContinue, CreatedAt: now(),
+	}
+	boundaryIDs := compaction.BoundaryIDs{MessageID: ids.NewMessageID(), PartID: ids.NewPartID()}
+	_, boundary, err := epochCap.commitSummaryEpoch(context.Background(), epoch, boundaryIDs, "a summary")
+	if err != nil {
+		t.Fatalf("commitSummaryEpoch error = %v", err)
+	}
+	if boundary.Message.TurnID != "turn-that-triggered-compaction" {
+		t.Fatalf("boundary.Message.TurnID = %q, want %q", boundary.Message.TurnID, "turn-that-triggered-compaction")
+	}
+	if boundary.Message.AgentPath != "root" {
+		t.Fatalf("boundary.Message.AgentPath = %q, want %q", boundary.Message.AgentPath, "root")
+	}
+}
+
 // TestSummarizationFinalizeFailsClosedOnLengthMismatch is now (round-two W6
 // review item 8) actually proving the no-source-correlation-capability
 // case: a HandlerBuildContext with no sourceMessageID at all (the shape a
