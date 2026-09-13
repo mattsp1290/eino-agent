@@ -85,6 +85,7 @@ func TestToolPayloadResultContentUsesDurableOutputContract(t *testing.T) {
 		{name: "array", payload: toolPayload{Output: json.RawMessage(`[1,2]`)}, want: `[1,2]`},
 		{name: "number", payload: toolPayload{Output: json.RawMessage(`3`)}, want: "3"},
 		{name: "null fallback", payload: toolPayload{Output: json.RawMessage(`null`), Error: "failed", Status: "failed"}, want: `{"error":"failed","status":"failed"}`},
+		{name: "absent error fallback", payload: toolPayload{Error: "failed", Status: "failed"}, want: `{"error":"failed","status":"failed"}`},
 		{name: "absent status", payload: toolPayload{Status: "completed"}, want: `{"status":"completed"}`},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -92,6 +93,33 @@ func TestToolPayloadResultContentUsesDurableOutputContract(t *testing.T) {
 				t.Fatalf("ResultContent() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestBridgeNativeLedgerKeepsDistinctDeltasAndCalls(t *testing.T) {
+	t.Parallel()
+
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	for range 2 {
+		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"same"}`)})
+	}
+	for _, id := range []string{"call-1", "call-2"} {
+		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventToolCallUpdated, MessageID: "assistant-1", ToolCallID: session.ToolCallID(id), Payload: []byte(`{"name":"search","arguments":{"q":"eino"},"status":"completed","output":"ok"}`)})
+	}
+
+	frames := frameData(t, sink.Bytes())
+	counts := map[string]int{}
+	for _, frame := range frames {
+		counts[frame["type"].(string)]++
+	}
+	if counts["TEXT_MESSAGE_CONTENT"] != 2 {
+		t.Fatalf("TEXT_MESSAGE_CONTENT count = %d, want 2", counts["TEXT_MESSAGE_CONTENT"])
+	}
+	for _, kind := range []string{"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"} {
+		if counts[kind] != 2 {
+			t.Fatalf("%s count = %d, want 2", kind, counts[kind])
+		}
 	}
 }
 
