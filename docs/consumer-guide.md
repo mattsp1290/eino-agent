@@ -418,6 +418,16 @@ Live-tail overflow means the subscriber fell behind a bounded queue, so the
 client should reconnect and resync from durable replay rather than assuming it
 received every live event.
 
+**Known bridge defects on reconnect** (tracked as `eino-agent-doj` and
+`eino-agent-6wj`, disclosed in full in
+`docs/architecture/agui-events.md`'s "Not yet implemented" section): on every
+reconnect, AG-UI replay currently re-emits a tool call's entire lifecycle a
+second time (a client sees two `TOOL_CALL_START`/`TOOL_CALL_RESULT` pairs for
+one call), and the replayed tool result carries a synthesized
+`{"status":...}` stub instead of the tool's real output. A host wiring
+`transport.SSEHandler` for tool-using conversations should account for both
+until they are fixed.
+
 ## Durable Versus Live-Only
 
 The durable source of truth is:
