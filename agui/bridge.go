@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	aguievents "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/events"
+	aguitypes "github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/mattsp1290/eino-agui/convert"
@@ -201,6 +202,7 @@ func (b *Bridge) markNativeStreamed(id session.MessageID) {
 type nativeFrameKey struct {
 	kind    aguievents.EventType
 	ownerID string
+	blockID string
 	ordinal uint64
 }
 
@@ -280,13 +282,20 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		}
 		b.terminated = true
 		b.closeOpen(b.emit)
-		if event.Error.Message != "" {
+		payload := runFinishedPayload{}
+		_ = json.Unmarshal(event.Payload, &payload)
+		if payload.Interrupted || payload.Status == string(session.RunInterrupted) {
+			// AG-UI requires an interrupt outcome to name at least one
+			// interrupt. The durable run settlement records cancellation, not a
+			// resumable prompt, so represent it with the stable run-scoped
+			// cancellation interrupt rather than attempting to forward the
+			// (possibly sensitive) settlement error.
+			b.emit.RunFinishedInterrupt([]aguitypes.Interrupt{{
+				ID:     b.runID + ":interrupted",
+				Reason: "run_interrupted",
+			}})
+		} else if event.Error.Message != "" {
 			b.emit.RunError(event.Error.Message)
-			payload := runFinishedPayload{}
-			_ = json.Unmarshal(event.Payload, &payload)
-			if payload.Interrupted || payload.Status == string(session.RunInterrupted) {
-				b.emit.RunFinishedInterrupt(nil)
-			}
 		} else {
 			b.emit.RunFinishedSuccess()
 		}
@@ -678,7 +687,7 @@ func (b *Bridge) projectedNativeFrameKeys(projection *convert.AgenticProjection)
 			return nil
 		}
 		for _, event := range events {
-			if key, ok := nativeKeyForEvent(event); ok {
+			if key, ok := nativeKeyForProjectedEvent(event, block.Identity.BlockID); ok {
 				keys = append(keys, key)
 			}
 		}
@@ -714,6 +723,20 @@ func nativeKeyForEvent(event aguievents.Event) (nativeFrameKey, bool) {
 		return nativeFrameKey{kind: e.Type(), ownerID: e.MessageID}, e.MessageID != ""
 	}
 	return nativeFrameKey{}, false
+}
+
+func nativeKeyForProjectedEvent(event aguievents.Event, blockID string) (nativeFrameKey, bool) {
+	key, ok := nativeKeyForEvent(event)
+	if !ok {
+		return nativeFrameKey{}, false
+	}
+	switch key.kind {
+	case aguievents.EventTypeTextMessageStart, aguievents.EventTypeTextMessageContent, aguievents.EventTypeTextMessageEnd,
+		aguievents.EventTypeReasoningStart, aguievents.EventTypeReasoningMessageStart, aguievents.EventTypeReasoningMessageContent,
+		aguievents.EventTypeReasoningMessageEnd, aguievents.EventTypeReasoningEnd:
+		key.blockID = blockID
+	}
+	return key, true
 }
 
 func (b *Bridge) projectionNativesAlreadyDelivered(keys []nativeFrameKey) bool {

@@ -189,6 +189,27 @@ func TestProjectedNativeFrameKeysExcludeMultipartToolResult(t *testing.T) {
 	}
 }
 
+func TestProjectedNativeFrameKeysKeepDistinctBlockIDs(t *testing.T) {
+	t.Parallel()
+
+	first, second := "first", "second"
+	projection := &convert.AgenticProjection{Public: &convert.PublicAgenticMessage{ContentBlocks: []convert.PublicContentBlock{
+		{Type: einoschema.ContentBlockTypeAssistantGenText, Identity: convert.AgenticIdentityV1{MessageID: "assistant-1", BlockID: "block-1"}, Text: &first},
+		{Type: einoschema.ContentBlockTypeAssistantGenText, Identity: convert.AgenticIdentityV1{MessageID: "assistant-1", BlockID: "block-2"}, Text: &second},
+	}}}
+	keys := (&Bridge{}).projectedNativeFrameKeys(projection)
+	if len(keys) != 6 {
+		t.Fatalf("projected native keys = %d, want 6", len(keys))
+	}
+	unique := map[nativeFrameKey]bool{}
+	for _, key := range keys {
+		unique[key] = true
+	}
+	if len(unique) != len(keys) {
+		t.Fatalf("projection collapsed block-identical frames: %#v", keys)
+	}
+}
+
 func TestBridgeNativeLedgerKeepsDistinctDeltasAndCalls(t *testing.T) {
 	t.Parallel()
 

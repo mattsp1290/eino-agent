@@ -120,6 +120,34 @@ func TestBridgeErrorEnforcesTerminatedInvariant(t *testing.T) {
 	}
 }
 
+func TestBridgeInterruptedRunWithErrorEmitsOnlyInterruptedFinished(t *testing.T) {
+	t.Parallel()
+
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	bridge.Emit(context.Background(), session.EventRecord{
+		Kind:    runtime.EventRunFinished,
+		Error:   session.EventError{Message: "interrupted diagnostic"},
+		Payload: []byte(`{"status":"interrupted","interrupted":true}`),
+	})
+	frames := frameData(t, sink.Bytes())
+	if got := stringsJoined(typesFromFrames(frames)); got != "RUN_FINISHED" {
+		t.Fatalf("event types = %s, want only RUN_FINISHED", got)
+	}
+	outcome, ok := frames[0]["outcome"].(map[string]any)
+	if !ok {
+		t.Fatalf("RUN_FINISHED outcome = %#v, want interrupt outcome", frames[0]["outcome"])
+	}
+	interrupts, ok := outcome["interrupts"].([]any)
+	if !ok || outcome["type"] != "interrupt" || len(interrupts) != 1 {
+		t.Fatalf("interrupted outcome = %#v, want one valid run interruption", outcome)
+	}
+	interrupt, ok := interrupts[0].(map[string]any)
+	if !ok || interrupt["id"] != "run-1:interrupted" || interrupt["reason"] != "run_interrupted" {
+		t.Fatalf("interrupted outcome = %#v, want stable run interruption", outcome)
+	}
+}
+
 // TestTerminateClosesOpenSpansThroughFallbackEmitter proves the W7 fifth
 // fix-pass review's I1 finding: Terminate must close any open
 // TEXT_MESSAGE/REASONING span before writing its terminal frame, through
