@@ -24,7 +24,11 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	t.Parallel()
 
 	sink := newSSESink()
-	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+	// includeReasoning is true here specifically so this "full surface"
+	// golden still exercises REASONING_* frames on the live delta path
+	// (see TestEmitMessageDeltaGatesReasoningOnIncludeReasoning for the
+	// includeReasoning=false direction, which this golden does not cover).
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, true, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted})
 	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:      runtime.EventMessageDelta,
@@ -126,6 +130,40 @@ func TestBridgeSurfacesLiveCommittedProjectionFailures(t *testing.T) {
 	}
 	if len(sink.Bytes()) != 0 {
 		t.Fatalf("expected no output for the failed reprojection, got: %s", sink.Bytes())
+	}
+}
+
+// TestEmitMessageDeltaGatesReasoningOnIncludeReasoning proves the W7
+// fix-pass review's P1-D finding (fix-verification-reviewer I3): the live
+// EventMessageDelta path (emitMessageDelta) must honor includeReasoning
+// exactly like the durable committed-projection path already does
+// (emitMessageSnapshot/emitLiveMessageCommitted), not stream live
+// reasoning deltas to a host that has never attested
+// agui.GateProviderReasoningStorage is satisfied. Before this fix,
+// emitMessageDelta emitted REASONING_START/REASONING_MESSAGE_START/
+// REASONING_MESSAGE_CONTENT/REASONING_MESSAGE_END/REASONING_END
+// unconditionally, so SSEConfig{IncludeReasoning: false} still leaked live
+// reasoning over the exact same handler that correctly withheld it from
+// replay.
+func TestEmitMessageDeltaGatesReasoningOnIncludeReasoning(t *testing.T) {
+	t.Parallel()
+
+	emit := func(includeReasoning bool) []byte {
+		sink := newSSESink()
+		bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, includeReasoning, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
+		bridge.Emit(context.Background(), session.EventRecord{
+			Kind:      runtime.EventMessageDelta,
+			MessageID: "assistant-1",
+			Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
+		})
+		return sink.Bytes()
+	}
+
+	if raw := emit(false); strings.Contains(string(raw), "REASONING") || strings.Contains(string(raw), "thinking") {
+		t.Fatalf("live reasoning delta leaked with includeReasoning=false: %s", raw)
+	}
+	if raw := emit(true); !strings.Contains(string(raw), "thinking") {
+		t.Fatalf("live reasoning delta missing with includeReasoning=true: %s", raw)
 	}
 }
 

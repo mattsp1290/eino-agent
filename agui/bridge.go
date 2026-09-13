@@ -233,7 +233,14 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	payload := messageDeltaPayload{}
 	_ = json.Unmarshal(event.Payload, &payload)
 	messageID := event.MessageID
-	if payload.Reasoning != "" {
+	// includeReasoning gates this live delta path exactly like it gates
+	// the durable committed-projection path (emitLiveMessageCommitted,
+	// emitMessageSnapshot): a host that has not attested
+	// GateProviderReasoningStorage is satisfied (agui/policy.go) must
+	// never see live reasoning deltas either, or the gate is closed on
+	// one path of this bridge and open on the other for the same
+	// reconnecting client (W7 fix-pass review finding P1-D/I3).
+	if b.includeReasoning && payload.Reasoning != "" {
 		if b.textOpen[messageID] {
 			b.emit.TextEnd(string(messageID))
 			delete(b.textOpen, messageID)
