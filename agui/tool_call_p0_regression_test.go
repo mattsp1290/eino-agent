@@ -232,11 +232,11 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 	// emitToolCallUpdated's own closeOpen, on the first tool_call_updated
 	// event to reach Emit. TOOL_CALL_START/ARGS: from the pending
 	// transition (Name+Arguments present); the running transition repeats
-	// them but toolCallLiveStartSent suppresses the duplicate.
+	// them but the connection-local nativeFrames ledger suppresses the duplicate.
 	// TOOL_CALL_END,TOOL_CALL_RESULT: the terminal transition. Final CUSTOM:
 	// the result message's own committed-projection supplement -- also
-	// DeliveryModeLiveContinuation, because blocksAlreadyDeliveredNatively
-	// recognizes its one function_tool_result block's call already got its
+	// DeliveryModeLiveContinuation, because nativeFrames recognizes its one
+	// function_tool_result block's call already got its
 	// native TOOL_CALL_RESULT from the live path above, so no duplicate
 	// native TOOL_CALL_RESULT here.
 	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,CUSTOM,CUSTOM,TEXT_MESSAGE_END,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
@@ -276,12 +276,11 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 // (convert.CommittedNativeEvents, called for every block when mode !=
 // DeliveryModeLiveContinuation). The live tool_call_updated events that
 // follow must NOT repeat that triple -- this is what
-// Bridge.toolCallNativeSuppressed (set by recordNativeToolDelivery) exists
-// to prevent -- while the terminal TOOL_CALL_RESULT, which the committed
+// Bridge.nativeFrames exists to prevent -- while the terminal TOOL_CALL_RESULT, which the committed
 // projection never sends for a function_tool_call block, must still reach
 // the wire exactly once from the live path.
 //
-// This is the regression test for the "delete toolCallNativeSuppressed"
+// This is the regression test for deleting the native-frame ledger's
 // mutation: without it, this test would see TOOL_CALL_START/ARGS/END
 // TWICE (once native from the commit, once from the live path).
 func TestBridgeDeliversToolCallTurnWithNoPrecedingTextDelta(t *testing.T) {
@@ -325,11 +324,11 @@ func TestBridgeDeliversToolCallTurnWithNoPrecedingTextDelta(t *testing.T) {
 	// delivered fully natively by the SAME committed-projection emission --
 	// this is the one native TOOL_CALL_START/ARGS/END triple in this
 	// sequence; the three live tool_call_updated events that follow
-	// contribute nothing to it (toolCallNativeSuppressed). TOOL_CALL_RESULT,
+	// contribute nothing to it (nativeFrames). TOOL_CALL_RESULT,
 	// CUSTOM: the live terminal transition's own result (never sent by the
 	// assistant's own projection) followed by the result message's
 	// committed-projection supplement (DeliveryModeLiveContinuation, since
-	// blocksAlreadyDeliveredNatively recognizes the result was already sent
+	// nativeFrames recognizes the result was already sent
 	// live).
 	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,CUSTOM,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,CUSTOM,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
 	if stringsJoined(got) != want {
@@ -367,14 +366,7 @@ func TestReplaySettledToolCallEmitsEachNativeFrameOnce(t *testing.T) {
 			t.Fatalf("%s count = %d, want 1; frames = %#v", kind, counts[kind], typesFromFrames(frames))
 		}
 	}
-	for _, frame := range frames {
-		if frame["type"] == "TOOL_CALL_RESULT" {
-			content, _ := frame["content"].(string)
-			if frame["toolCallId"] != string(fx.callID) || !strings.Contains(content, "3 results found") {
-				t.Fatalf("replayed result = %#v, want call %q with persisted output", frame, fx.callID)
-			}
-		}
-	}
+	assertFixtureToolLifecycle(t, frames, fx)
 }
 
 func TestReconnectTailOverlapDoesNotRepeatSettledToolLifecycle(t *testing.T) {
@@ -418,5 +410,31 @@ func TestReconnectTailOverlapDoesNotRepeatSettledToolLifecycle(t *testing.T) {
 		if counts[kind] != 1 {
 			t.Fatalf("%s count = %d, want one across replay/tail overlap", kind, counts[kind])
 		}
+	}
+	assertFixtureToolLifecycle(t, frames, fx)
+}
+
+func assertFixtureToolLifecycle(t *testing.T, frames []map[string]any, fx toolCallTurnFixture) {
+	t.Helper()
+	matching := map[string][]map[string]any{}
+	for _, frame := range frames {
+		kind, _ := frame["type"].(string)
+		if frame["toolCallId"] == string(fx.callID) {
+			matching[kind] = append(matching[kind], frame)
+		}
+	}
+	for _, kind := range []string{"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"} {
+		if got := len(matching[kind]); got != 1 {
+			t.Fatalf("%s frames for fixture call = %d, want 1; frames = %#v", kind, got, frames)
+		}
+	}
+	if name, _ := matching["TOOL_CALL_START"][0]["toolCallName"].(string); name != "search" {
+		t.Fatalf("TOOL_CALL_START toolCallName = %q, want search", name)
+	}
+	if delta, _ := matching["TOOL_CALL_ARGS"][0]["delta"].(string); delta != `{"q":"eino"}` {
+		t.Fatalf("TOOL_CALL_ARGS delta = %q, want fixture input", delta)
+	}
+	if content, _ := matching["TOOL_CALL_RESULT"][0]["content"].(string); !strings.Contains(content, "3 results found") {
+		t.Fatalf("TOOL_CALL_RESULT content = %q, want persisted output", content)
 	}
 }

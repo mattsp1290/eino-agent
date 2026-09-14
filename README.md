@@ -171,11 +171,9 @@ the active live tail.
 See `docs/architecture/agui-events.md` and `docs/architecture/storage.md` for
 the detailed rules.
 
-**Known bridge defects:** on reconnect, AG-UI replay currently duplicates a
-tool call's entire lifecycle (`eino-agent-doj`) and replaces the replayed
-tool result with a synthesized stub instead of the real output
-(`eino-agent-6wj`). See `docs/architecture/agui-events.md`'s "Not yet
-implemented" section for the exact symptoms.
+AG-UI replay deduplicates native tool lifecycle frames per connection and
+delivers persisted tool-result output. See `docs/architecture/agui-events.md`
+for the durable replay contract.
 
 ## Integration Guides
 

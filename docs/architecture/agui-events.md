@@ -50,8 +50,8 @@ and never replayed.
 | Plain reasoning | `session.Part{Kind: PartReasoning}` only when provider and host policy allow storage. | Replay as reasoning content only from durable reasoning parts. | Emit `REASONING_*` live while allowed. | Provider-private or policy-denied reasoning. |
 | Encrypted reasoning | Never persisted. | Never replayed. | Not emitted by `eino-agent`; scrub from snapshots. | All encrypted reasoning payloads. |
 | Provider-private state | Never persisted as an AG-UI event; runtime may retain a private `PartProviderState`. | Never replayed or decoded by AG-UI. | Never emitted. | All raw bytes, base64, digests, codec diagnostics, and source bindings. |
-| Tool calls | `session.ToolCall` plus one canonical `EventRecord` for each pending, running, and terminal phase; state and event commit atomically. | Replay call state from durable tool-call records, parts, and correlated phase events. **Today**, `emitMessageSnapshot`'s replay path re-emits a call's whole lifecycle a second time on every reconnect (`eino-agent-doj`, a client sees two `TOOL_CALL_START`/`TOOL_CALL_RESULT` pairs for one call) — see "Not yet implemented" below. | After commit, publish the exact persisted event best-effort when the bridge enables `eino-agui/stream.WithLiveToolCallEvents`. | Duplicate post-turn proposals when live tool calls were already emitted (does not cover the `eino-agent-doj` reconnect duplication above). |
-| Tool results | `PartFunctionToolResult` plus settled `session.ToolCall` output/error. | Replay bounded model-facing tool result from durable part. **Today**, replay instead delivers `agui/bridge.go`'s synthesized `{"status":...,"truncated":...,"redacted":...}` stub in place of the real tool output (`eino-agent-6wj`, because `toolPayload` decodes `content`/`structured` while the durable wire payload carries `output`/`error`/`metadata`) — see "Not yet implemented" below. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
+| Tool calls | `session.ToolCall` plus one canonical `EventRecord` for each pending, running, and terminal phase; state and event commit atomically. | Replay projects and forwards durable state as exactly one native `TOOL_CALL_START`, `TOOL_CALL_ARGS`, and `TOOL_CALL_END` per call for a connection. | After commit, publish the exact persisted event best-effort when the bridge enables `eino-agui/stream.WithLiveToolCallEvents`. | Duplicate post-turn proposals already delivered to this connection. |
+| Tool results | `PartFunctionToolResult` plus settled `session.ToolCall` output/error. | Replay delivers exactly one native `TOOL_CALL_RESULT` per call for a connection, using persisted, retention-bounded result content. | Emit live result through `eino-agui/emitter.ToolResult`. | Oversized raw output beyond retention policy. |
 | State snapshots | No durable `PartKind` today (would be host-visible app state, distinct from the W2 model-content block kinds); only when host marks snapshot replay-safe. | Replay latest replay-safe snapshot or host-projected state, once implemented. | Emit live snapshot when state changes. | Sensitive or non-replay-safe host state. |
 | State deltas | Optional `EventRecord` audit. | Do not replay raw deltas; replay starts from snapshot. | Emit live deltas. | Deltas superseded by snapshot. |
 | Messages snapshots | Not stored as raw AG-UI frames. | `agui.Replay`/`agui.Reconnect` (the built-in Bridge) do **not** emit one -- see "Replay Projection" below. `agui.WatchBridge.Initial` does, reconstructed from durable messages/parts using `eino-agui/convert`. | May emit live snapshot for UI synchronization. | Raw snapshot frame payload. |
@@ -465,20 +465,12 @@ Both the durable replay path and the live path build an eino-agui
   case -- reaching the wire as a bare `TOOL_CALL_RESULT` for a call the
   client never saw opened, with no `TOOL_CALL_START`/`ARGS`/`END` and no
   `TEXT_MESSAGE_END`. The real dedup key for a tool call is the call
-  itself: `Bridge.toolCallNativeSuppressed` (set by
-  `emitLiveMessageCommitted`'s `recordNativeToolDelivery`, from the
-  assistant message's own committed-projection emission of that call's
-  `function_tool_call` block, when that emission's `DeliveryMode` actually
-  included natives) and `Bridge.toolCallLiveStartSent` (set by
-  `emitToolCallUpdated` itself, since a durable `tool_call_updated` record
-  repeats the call's Name/Arguments at every phase -- pending/running/
-  terminal -- so the live path must dedupe its OWN repeated Start/Args
-  too) together decide whether to (re-)emit that call's native
-  `TOOL_CALL_START`/`ARGS`/`END`; `Bridge.toolCallResultSent` is the
-  symmetric guard for the terminal `TOOL_CALL_RESULT`, since a tool
-  call's separate *result* message commits (and can independently trigger
-  a native `TOOL_CALL_RESULT` from its own `function_tool_result` block)
-  strictly *after* the live terminal transition that already sent one.
+  itself. `Bridge.nativeFrames` is a connection-local ledger keyed by the
+  native frame kind and its call or block identity. A committed projection
+  records keys only after successful emission; later durable
+  `tool_call_updated` phases share those keys, so they may fill an absent
+  lifecycle frame but cannot repeat a delivered start, args, end, or result.
+  The terminal result takes its content from the persisted durable payload.
 
   A `message_committed` naming a message not (yet) present in a reload's
   projections (a benign miss -- see `publishMessageCommitted`'s
@@ -510,24 +502,6 @@ already delivered.
 
 ### Not yet implemented (deferred, not silently dropped)
 
-- **Known defects, not features, but disclosed here because they change the
-  wire behavior a host observes:**
-  - **`eino-agent-doj`** — AG-UI replay re-emits a tool call's whole
-    lifecycle a second time on every reconnect: `emitMessageSnapshot`'s
-    replay path never calls `recordNativeToolDelivery`/
-    `markToolCallResultSent` the way the live path does. A client sees two
-    `TOOL_CALL_START`/`TOOL_CALL_RESULT` pairs for the same call.
-    `testdata/external-consumer/agentic_fixture_test.go` pins this exact
-    behavior (asserts the tool name occurs at least twice in one full
-    replay) so a fix is caught, not silently re-validated against a fixture
-    written to expect the bug forever.
-  - **`eino-agent-6wj`** — the replayed tool result carries a synthesized
-    `{"status":...,"truncated":...,"redacted":...}` stub instead of the
-    tool's real output, because `agui/bridge.go`'s `toolPayload` decodes
-    `content`/`structured` while the durable wire payload carries
-    `output`/`error`/`metadata`. The same fixture asserts the stub and
-    explicitly fails itself (naming the bead) if real tool output ever
-    appears instead.
 - Full lifecycle mapping: `run_paused` with `InterruptTargetV1` built from
   validated durable approval/interrupt records, `run_resumed`,
   `attempt_replaced`, and subagent events. The runtime does not emit

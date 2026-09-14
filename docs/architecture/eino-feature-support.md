@@ -40,7 +40,7 @@ COVERED by a test that does not assert what the row claims.
 | 15 | Retry context/decision/reject reason and model failover | PARTIAL | Bounded attempts and selected identity proven (`runtime/tool_call_id_publicize_test.go`: `TestDefaultShouldRetryAndShouldFailoverRefuseUnresolvedToolCallID`, `TestRunRetriesTransientToolCallIDLookupFailureAndCompletes`, `TestRunFailsClosedOnceOnDeterministicToolCallIDLookupFailure`). Partial-stream isolation and charged usage were not independently reverified in this audit. |
 | 16 | Typed DeepAgent/AgentTool and prebuilt/workflow behavior changes | NOT COVERED | Out of scope, not started (see W5 section). Zero occurrences of `DeepAgent`/`Supervisor`/`PlanExecute`/`deterministic_transfer`/`NewTypedAgentTool`. Bead `eino-agent-bpj`. |
 | 17 | Typed handlers, AfterAgent, tool-call context, after-tool hook | PARTIAL | Middleware handler-chain covered (`runtime/adk_middleware_e2e_test.go`). `AfterAgent`/`ToolCallsContext`/`WithAfterToolCallsHook` all have zero occurrences. |
-| 18 | Message ID helpers and event sender wrappers | PARTIAL (known defect) | Durable/ADK identity mapping is stable, but "no duplicate model/tool events" is currently violated: `eino-agent-doj` causes AG-UI replay to re-emit a tool call's whole lifecycle a second time on reconnect. `testdata/external-consumer/agentic_fixture_test.go`'s AG-UI fixture asserts this known defect explicitly (exactly 2 native `TOOL_CALL_START`/`TOOL_CALL_RESULT` events for one call, dropping to 1 once `eino-agent-doj` is fixed) rather than hiding it. |
+| 18 | Message ID helpers and event sender wrappers | COVERED | Durable/ADK identity mapping and single native tool lifecycle delivery are covered by `TestReplaySettledToolCallEmitsEachNativeFrameOnce`, `TestReconnectTailOverlapDoesNotRepeatSettledToolLifecycle`, and the parsed-frame external-consumer AG-UI fixture. Each proves one start, args, end, and result for the fixture call, with persisted output present. |
 | 19 | agentsmd middleware | COVERED | `runtime/w6_round4_correlation_test.go`, `runtime/w6_round3_test.go`, `runtime/adk_middleware_e2e_test.go`, `composition/registry_handler_test.go`, `examples/agentic-middleware/composed_test.go`. |
 | 20 | Typed skill middleware, agent/model hubs | PARTIAL | Skill activation/resume covered (`runtime/adk_middleware_e2e_test.go`). `TypedAgentHub`/`TypedModelHub`/`TypedSubAgentInput`/`TypedSubAgentOutput` all have zero occurrences. |
 | 21 | Multimodal filesystem reader and typed filesystem middleware | PARTIAL | Media read covered (`runtime/adk_middleware_e2e_test.go`) against an in-memory fake store (`runtime/admission_store_test.go`); the "and reopen" clause against a real store is not exercised. |
@@ -2645,14 +2645,11 @@ flagged rather than silently ignored.
   `Bridge.projectedMessages` by the time the first such event reaches
   `Emit` -- a prior fix pass that added the same guard there suppressed
   EVERY live tool-call event on every tool-calling turn, the common case,
-  not an edge case. Tool-call native dedup is keyed on the CALL instead:
-  `Bridge.toolCallNativeSuppressed` (set when the assistant message's own
-  committed-projection emission already included that call's native
-  `function_tool_call` representation), `Bridge.toolCallLiveStartSent` (the
-  live path's own dedup, since a durable `tool_call_updated` record repeats
-  Name/Arguments at every phase), and `Bridge.toolCallResultSent` (dedup
-  for the terminal `TOOL_CALL_RESULT` against the separate result
-  message's own later commit). See `docs/architecture/agui-events.md`'s
+  not an edge case. Tool-call native dedup is keyed on the call and frame
+  identity in the connection-local `Bridge.nativeFrames` ledger. Successful
+  committed projections register their emitted native keys there; later
+  durable phases use the same keys and therefore fill only frames not already
+  delivered. The terminal result is derived from persisted output. See `docs/architecture/agui-events.md`'s
   "Committed-projection emission" section for the full mechanism. A miss --
   the named message not (yet)
   present in a reload -- is a benign, non-fatal skip (`Bridge.liveErr` is
@@ -2845,8 +2842,7 @@ postgres_integration`) does not yet pass `-race` and is unchanged here.
   `SummaryMessageID`; the epoch (same ID and `SummaryMessageID`) is still
   present after closing and reopening the SQLite file.
 - **AG-UI decode of native input, plus real Bridge/Replay projection of
-  committed content -- eino-agent-doj and eino-agent-6wj documented, not
-  hidden** (`TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent`):
+  committed content** (`TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent`):
   `transport.DecodeUserMessage` decodes a real `types.InputContent` JSON
   body into a `runtime.UserMessage`, admitted through `orchestrator.Start`;
   the same real `agui.NewBridge`/`agui.Replay` entry points
@@ -2854,19 +2850,10 @@ postgres_integration`) does not yet pass `-race` and is unchanged here.
   the session into a buffer. The fixture asserts:
   - the final assistant text reaches the replayed stream, and no
     `PRIVATE_` sentinel does;
-  - **eino-agent-doj** (AG-UI replay re-emits a tool call's whole lifecycle
-    a second time on reconnect, since `emitMessageSnapshot`'s replay path
-    never calls `recordNativeToolDelivery`/`markToolCallResultSent` the way
-    the live path does): the fixture asserts the tool name occurs **at
-    least twice** in one full replay -- the actual current (buggy)
-    behavior -- rather than a single-emission contract that does not hold;
-  - **eino-agent-6wj** (`agui/bridge.go`'s `toolPayload` decodes
-    `content`/`structured`, but the durable wire payload carries
-    `output`/`error`/`metadata`): the fixture asserts the replayed tool
-    result carries the synthesized `{"status":...}` stub, and explicitly
-    fails itself (naming the bead) if the real tool output ever appears
-    instead, so a future fix is caught rather than silently re-validated
-    against a fixture written to expect the bug forever.
+  - parsed native frames contain exactly one `TOOL_CALL_START` and one
+    `TOOL_CALL_RESULT` for its durable call; and
+  - the result carries the persisted structured output rather than a
+    synthesized status-only fallback.
 
 ### Publication validation (exact evidence)
 
