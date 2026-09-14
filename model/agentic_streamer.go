@@ -57,6 +57,7 @@ func streamAgentic(ctx context.Context, client einomodel.AgenticModel, req Reque
 	if upstream == nil {
 		return nil, Error{Code: "nil_provider_stream", Message: "Eino agentic model returned nil stream"}
 	}
+	var retainedMarker string
 	return einoschema.StreamReaderWithConvert(upstream, func(message *einoschema.AgenticMessage) (StreamDelta, error) {
 		if message == nil {
 			return StreamDelta{}, Error{Code: "malformed_provider_stream", Message: "Eino agentic model returned a nil chunk", Cause: ErrProviderRejected}
@@ -64,6 +65,21 @@ func streamAgentic(ctx context.Context, client einomodel.AgenticModel, req Reque
 		normalized, err := normalizeResponseMetaExtension(message, retainResponseMetaState)
 		if err != nil {
 			return StreamDelta{}, providerStateError(ErrProviderStateInvalid)
+		}
+		if retainResponseMetaState && normalized.ResponseMeta != nil {
+			if marker, ok := normalized.ResponseMeta.Extension.(string); ok {
+				if retainedMarker == "" {
+					retainedMarker = marker
+				} else {
+					if marker != retainedMarker {
+						return StreamDelta{}, providerStateError(ErrProviderStateInvalid)
+					}
+					clone, meta := *normalized, *normalized.ResponseMeta
+					meta.Extension = nil
+					clone.ResponseMeta = &meta
+					normalized = &clone
+				}
+			}
 		}
 		return StreamDelta{Message: normalized, Usage: UsageFromAgenticMessage(normalized)}, nil
 	}), nil
