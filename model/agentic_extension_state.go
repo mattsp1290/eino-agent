@@ -47,6 +47,37 @@ func responseMetaStateMarkerRaw(value string) (json.RawMessage, bool) {
 	return raw, err == nil
 }
 
+func responseMetaStateRawFromExtension(extension any) (json.RawMessage, bool) {
+	switch marker := extension.(type) {
+	case string:
+		return responseMetaStateMarkerRaw(marker)
+	case map[string]any:
+		identity, ok := marker["identity"].(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		provider, pOK := identity["provider"].(string)
+		protocol, qOK := identity["protocol"].(string)
+		if !pOK || !qOK {
+			return nil, false
+		}
+		envelope := agenticResponseMetaStateEnvelope{Kind: agenticResponseMetaStateKind, Version: agenticResponseMetaStateVersion, Identity: agenticResponseMetaStateIdentity{Provider: provider, Protocol: protocol}}
+		if v, ok := identity["requested_model"].(string); ok {
+			envelope.Identity.RequestedModel = v
+		}
+		if v, ok := identity["returned_model"].(string); ok {
+			envelope.Identity.ReturnedModel = v
+		}
+		if v, ok := identity["correlation_id"].(string); ok {
+			envelope.Identity.CorrelationID = v
+		}
+		raw, err := json.Marshal(envelope)
+		return raw, err == nil
+	default:
+		return nil, false
+	}
+}
+
 type agenticResponseMetaStateEnvelope struct {
 	Kind     string                           `json:"kind"`
 	Version  int                              `json:"version"`

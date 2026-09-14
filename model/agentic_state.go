@@ -99,40 +99,8 @@ func (c *typedExtensionStateCodec) Capture(msg *einoschema.AgenticMessage, block
 	input := msg
 	var identityItem *ProviderStateItem
 	if msg.ResponseMeta != nil && msg.ResponseMeta.Extension != nil {
-		var raw json.RawMessage
-		switch marker := msg.ResponseMeta.Extension.(type) {
-		case string:
-			var ok bool
-			raw, ok = responseMetaStateMarkerRaw(marker)
-			if !ok {
-				return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
-			}
-		case map[string]any:
-			identity, ok := marker["identity"].(map[string]any)
-			if !ok {
-				return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
-			}
-			provider, pOK := identity["provider"].(string)
-			protocol, qOK := identity["protocol"].(string)
-			if !pOK || !qOK {
-				return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
-			}
-			envelope := agenticResponseMetaStateEnvelope{Kind: agenticResponseMetaStateKind, Version: agenticResponseMetaStateVersion, Identity: agenticResponseMetaStateIdentity{Provider: provider, Protocol: protocol}}
-			if v, ok := identity["requested_model"].(string); ok {
-				envelope.Identity.RequestedModel = v
-			}
-			if v, ok := identity["returned_model"].(string); ok {
-				envelope.Identity.ReturnedModel = v
-			}
-			if v, ok := identity["correlation_id"].(string); ok {
-				envelope.Identity.CorrelationID = v
-			}
-			var e error
-			raw, e = json.Marshal(envelope)
-			if e != nil {
-				return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
-			}
-		default:
+		raw, ok := responseMetaStateRawFromExtension(msg.ResponseMeta.Extension)
+		if !ok {
 			return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
 		}
 		if _, err := parseAgenticResponseMetaState(raw); err != nil {
