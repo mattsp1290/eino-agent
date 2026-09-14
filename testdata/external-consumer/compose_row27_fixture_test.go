@@ -18,8 +18,9 @@ import (
 // row27CheckpointStore is deliberately small: the fixture needs to prove the
 // public compose checkpoint boundary, not an eino-agent persistence adapter.
 type row27CheckpointStore struct {
-	mu sync.Mutex
-	m  map[string][]byte
+	mu       sync.Mutex
+	m        map[string][]byte
+	setCalls atomic.Int32
 }
 
 func newRow27CheckpointStore() *row27CheckpointStore {
@@ -37,7 +38,13 @@ func (s *row27CheckpointStore) Set(_ context.Context, id string, value []byte) e
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.m[id] = append([]byte(nil), value...)
+	s.setCalls.Add(1)
 	return nil
+}
+
+type row27InvokeResult struct {
+	output string
+	err    error
 }
 
 func row27Graph(t *testing.T, node *compose.Lambda) compose.Runnable[string, string] {
@@ -83,6 +90,8 @@ func TestComposeRow27OrdinaryContextCancellation(t *testing.T) {
 	release := make(chan struct{})
 	finished := make(chan struct{})
 	var once sync.Once
+	var releaseOnce sync.Once
+	releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
 	r := row27Graph(t, compose.InvokableLambda(func(ctx context.Context, _ string) (string, error) {
 		once.Do(func() { close(started) })
 		defer close(finished)
@@ -95,8 +104,28 @@ func TestComposeRow27OrdinaryContextCancellation(t *testing.T) {
 	}))
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	result := make(chan error, 1)
-	go func() { _, err := r.Invoke(ctx, "input"); result <- err }()
+	result := make(chan row27InvokeResult, 1)
+	resultRead := false
+	t.Cleanup(func() {
+		releaseWorker()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Errorf("controlled cancellation node did not finish during cleanup")
+			return
+		}
+		if !resultRead {
+			select {
+			case <-result:
+			case <-time.After(2 * time.Second):
+				t.Errorf("controlled cancellation Invoke did not return during cleanup")
+			}
+		}
+	})
+	go func() {
+		output, err := r.Invoke(ctx, "input")
+		result <- row27InvokeResult{output: output, err: err}
+	}()
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
@@ -104,9 +133,10 @@ func TestComposeRow27OrdinaryContextCancellation(t *testing.T) {
 	}
 	cancel()
 	select {
-	case err := <-result:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("Invoke error = %v, want context.Canceled", err)
+	case got := <-result:
+		resultRead = true
+		if !errors.Is(got.err, context.Canceled) || got.output != "" {
+			t.Fatalf("Invoke = (%q, %v), want empty output and context.Canceled", got.output, got.err)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("canceled Invoke did not return")
@@ -116,7 +146,7 @@ func TestComposeRow27OrdinaryContextCancellation(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("canceled node did not finish")
 	}
-	close(release)
+	releaseWorker()
 }
 
 func TestComposeRow27NestedGraphInterruptCheckpointResume(t *testing.T) {
@@ -125,6 +155,8 @@ func TestComposeRow27NestedGraphInterruptCheckpointResume(t *testing.T) {
 	release := make(chan struct{})
 	finished := make(chan struct{})
 	var starts atomic.Int32
+	var releaseOnce sync.Once
+	releaseWorker := func() { releaseOnce.Do(func() { close(release) }) }
 
 	inner := compose.NewGraph[string, string]()
 	if err := inner.AddLambdaNode("inner", compose.InvokableLambda(func(_ context.Context, input string) (string, error) {
@@ -159,8 +191,28 @@ func TestComposeRow27NestedGraphInterruptCheckpointResume(t *testing.T) {
 	}
 
 	interruptCtx, interrupt := compose.WithGraphInterrupt(t.Context())
-	result := make(chan error, 1)
-	go func() { _, err := r.Invoke(interruptCtx, "input", compose.WithCheckPointID("nested")); result <- err }()
+	result := make(chan row27InvokeResult, 1)
+	resultRead := false
+	t.Cleanup(func() {
+		releaseWorker()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Errorf("controlled interrupted node did not finish during cleanup")
+			return
+		}
+		if !resultRead {
+			select {
+			case <-result:
+			case <-time.After(2 * time.Second):
+				t.Errorf("controlled interrupted Invoke did not return during cleanup")
+			}
+		}
+	})
+	go func() {
+		output, err := r.Invoke(interruptCtx, "input", compose.WithCheckPointID("nested"))
+		result <- row27InvokeResult{output: output, err: err}
+	}()
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
@@ -168,15 +220,22 @@ func TestComposeRow27NestedGraphInterruptCheckpointResume(t *testing.T) {
 	}
 	interrupt(compose.WithGraphInterruptTimeout(0))
 	select {
-	case err := <-result:
-		info, ok := compose.ExtractInterruptInfo(err)
+	case got := <-result:
+		resultRead = true
+		if got.output != "" {
+			t.Fatalf("interrupted Invoke output = %q, want empty", got.output)
+		}
+		info, ok := compose.ExtractInterruptInfo(got.err)
 		if !ok || info == nil || info.SubGraphs["child"] == nil {
-			t.Fatalf("interrupt = %v, info = %#v; want parent-visible child checkpoint", err, info)
+			t.Fatalf("interrupt = %v, info = %#v; want parent-visible child checkpoint", got.err, info)
+		}
+		if store.setCalls.Load() == 0 {
+			t.Fatal("graph interrupt did not write a checkpoint")
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("graph interrupt did not return")
 	}
-	close(release)
+	releaseWorker()
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
