@@ -50,6 +50,17 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 	if store == nil {
 		return cursor, nil, session.ErrNotFound
 	}
+	// ResumedV1 is deliberately stateful: the protocol emitter rejects it
+	// unless the paired pause was committed on this connection. A cursor may
+	// begin after that pause, so replay the earlier durable pause facts first.
+	// This is connection hydration, not an inferred checkpoint projection:
+	// Bridge.Emit still validates the immutable payload and skips historical
+	// empty pause records.
+	if cursor.AfterEventID != "" {
+		if err := hydratePausesBeforeCursor(ctx, bridge, store, sessionID, cursor.AfterEventID); err != nil {
+			return cursor, nil, err
+		}
+	}
 	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, contentLimits, includeReasoning); err != nil {
 		return cursor, nil, err
 	}
@@ -92,6 +103,34 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 			return next, seen, nil
 		}
 		next = batch.Next
+	}
+}
+
+func hydratePausesBeforeCursor(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, through session.EventID) error {
+	cursor := session.EventCursor{Limit: 100}
+	for {
+		batch, err := store.ListEvents(ctx, sessionID, cursor)
+		if err != nil {
+			return err
+		}
+		for _, record := range batch.Events {
+			if record.Kind == session.RunPausedEventKind && !record.LiveOnly {
+				bridge.Emit(ctx, record)
+				if err := bridge.LiveErr(); err != nil {
+					return err
+				}
+				if err := bridge.EncErr(); err != nil {
+					return err
+				}
+			}
+			if record.ID == through {
+				return nil
+			}
+		}
+		if batch.Next.AfterEventID == "" {
+			return nil
+		}
+		cursor = batch.Next
 	}
 }
 

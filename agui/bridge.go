@@ -270,6 +270,8 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		b.emitResumed(event)
 	case session.AttemptReplacedEventKind:
 		b.emitAttemptReplaced(event)
+	case session.SubagentStartedEventKind, session.SubagentFinishedEventKind, session.SubagentErrorEventKind:
+		b.emitSubagentLifecycle(event)
 	case runtime.EventRunFinished:
 		// terminated guards against writing a second terminal frame: a
 		// durable RUN_FINISHED/RUN_ERROR reaching Emit twice (a redundant
@@ -411,6 +413,59 @@ func (b *Bridge) emitResumed(event session.EventRecord) {
 	}
 	if !b.emit.Resumed(resumed, convert.CommitReceiptV1{Revision: lifecycle.EventRevision, Domain: "lifecycle", Kind: convert.EnvelopeResumed, Identity: identity, Digest: digest}) && b.EncErr() != nil {
 		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle emission: %w", b.EncErr()))
+	}
+}
+
+// emitSubagentLifecycle is intentionally dormant until runtime persists child
+// records. It accepts only a complete, nested durable identity; root-only or
+// partial future records cannot manufacture a subagent protocol frame.
+func (b *Bridge) emitSubagentLifecycle(event session.EventRecord) {
+	parts := strings.Split(event.AgentPath, "/")
+	if event.ID == "" || event.SessionID == "" || event.RunID == "" || event.MessageID == "" || event.TurnID == "" || event.Correlation == "" || len(parts) < 2 {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable subagent lifecycle"))
+		b.emitTerminalError()
+		return
+	}
+	path := make([]convert.AgentPathSegment, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			b.recordLiveErr(fmt.Errorf("agui: invalid durable subagent path"))
+			b.emitTerminalError()
+			return
+		}
+		path[i] = convert.AgentPathSegment{Name: part, RunID: string(event.RunID)}
+	}
+	identity := convert.AgenticIdentityV1{SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: string(event.TurnID), MessageID: string(event.MessageID), AttemptID: event.Correlation, AgentPath: path}
+	kind := convert.EnvelopeSubagentStarted
+	if event.Kind == session.SubagentFinishedEventKind {
+		kind = convert.EnvelopeSubagentFinished
+	}
+	if event.Kind == session.SubagentErrorEventKind {
+		kind = convert.EnvelopeSubagentError
+	}
+	fact := convert.LifecycleFactV1{}
+	if kind == convert.EnvelopeSubagentError {
+		fact.Detail = "subagent failed"
+	}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: kind, Identity: identity, Lifecycle: &fact}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: subagent lifecycle digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	receipt := convert.CommitReceiptV1{Revision: string(event.ID), Domain: "lifecycle", Kind: kind, Identity: identity, Digest: digest}
+	var emitted bool
+	switch event.Kind {
+	case session.SubagentStartedEventKind:
+		emitted = b.emit.SubagentStartedCommitted(fact, receipt)
+	case session.SubagentFinishedEventKind:
+		emitted = b.emit.SubagentFinishedCommitted(fact, receipt)
+	default:
+		emitted = b.emit.SubagentErrorCommitted(fact, receipt)
+	}
+	if !emitted && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: subagent lifecycle emission: %w", b.EncErr()))
 	}
 }
 
