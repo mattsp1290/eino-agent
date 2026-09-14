@@ -219,7 +219,7 @@ func TestReconnectDeliversRealisticUserTextToolCallTurn(t *testing.T) {
 		}
 	}
 	sendOrTimeout(session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: assistantID,
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: assistantID, Correlation: string(assistantID),
 		Payload: []byte(`{"content":"let me check the weather","reasoning":""}`),
 	})
 	sendOrTimeout(session.EventRecord{

@@ -160,7 +160,7 @@ func TestTerminateClosesOpenSpansThroughFallbackEmitter(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(context.Background(), session.EventRecord{
-		Kind: runtime.EventMessageDelta, MessageID: "assistant-1",
+		Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Correlation: "assistant-1",
 		Payload: []byte(`{"content":"still streaming","reasoning":""}`),
 	})
 	if ok := bridge.Terminate(context.Background(), errors.New("host deadline")); !ok {

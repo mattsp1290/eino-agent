@@ -237,7 +237,9 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 	})
 	if err != nil {
 		status := http.StatusConflict
-		if !errors.Is(err, session.ErrSessionBusy) {
+		if errors.Is(err, runtime.ErrInvalidOrchestrator) {
+			status = http.StatusBadRequest
+		} else if !errors.Is(err, session.ErrSessionBusy) {
 			status = http.StatusBadGateway
 		}
 		http.Error(w, err.Error(), status)

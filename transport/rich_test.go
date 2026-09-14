@@ -59,6 +59,7 @@ func TestDecodeUserMessageRejectsEmptyAndOversizedInput(t *testing.T) {
 	for _, body := range []string{
 		`{"content":[{"type":"text","text":"hi"}],"unknown":true}`,
 		`{"content":[{"type":"text","text":"hi","unknown":true}]}`,
+		`{"content":[{"type":"image","source":{"type":"url","value":"https://example.test/a.png","unknown":true}}]}`,
 		`{"content":[{"type":"text","text":"hi"}]}{}`,
 	} {
 		if _, err := DecodeUserMessage(httptest.NewRequest(http.MethodPost, "/messages", strings.NewReader(body))); err == nil {

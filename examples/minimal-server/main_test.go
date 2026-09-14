@@ -140,6 +140,29 @@ func TestMinimalServerRejectsInvalidRunMessage(t *testing.T) {
 	}
 }
 
+func TestMinimalServerMapsRuntimeContentValidationToBadRequest(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
+	if err != nil {
+		t.Fatalf("NewServer error = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	for name, body := range map[string]string{
+		"invalid base64": `{"content":[{"type":"image","source":{"type":"data","value":"%%%","mimeType":"image/png"}}]}`,
+		"invalid MIME":   `{"content":[{"type":"image","source":{"type":"data","value":"aGVsbG8=","mimeType":"not a MIME type"}}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/sessions/invalid/runs", strings.NewReader(body))
+			resp := httptest.NewRecorder()
+			server.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
 func TestMinimalServerAdmitsRichAGUIContent(t *testing.T) {
 	t.Parallel()
 

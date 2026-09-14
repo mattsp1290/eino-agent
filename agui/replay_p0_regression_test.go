@@ -517,7 +517,7 @@ func TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWi
 	// one), so agui/replay.go's seen[event.ID] guard cannot suppress it --
 	// only Bridge.projectedMessages (emitMessageDelta's new guard) can.
 	sendOrTimeout(session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: "assistant-late",
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: "assistant-late", Correlation: "assistant-late",
 		Payload: []byte(`{"content":"LATE-TEXT","reasoning":""}`),
 	})
 	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-late-finished", SessionID: sessionID, MessageID: "assistant-late"})
@@ -638,7 +638,7 @@ func TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder(t *testing
 	// reconnecting client is waiting to see for the message it reconnected
 	// mid-stream to watch.
 	sendOrTimeout(session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID, Correlation: string(messageID),
 		Payload: []byte(`{"content":"HELLO-LIVE","reasoning":""}`),
 	})
 	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-inflight-finished", SessionID: sessionID, MessageID: messageID})

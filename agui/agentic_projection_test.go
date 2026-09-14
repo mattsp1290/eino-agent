@@ -80,8 +80,14 @@ func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 	// would be empty and the commit below would correctly (per
 	// emitLiveMessageCommitted's doc comment) use DeliveryModeCommittedOnly
 	// instead, defeating this test's purpose.
+	// A legacy uncorrelated delta is deliberately a safe no-op: it cannot
+	// fabricate an attempt identity that would poison the committed projection.
 	bridge.Emit(ctx, session.EventRecord{
 		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
+		Payload: []byte(`{"content":"uncorrelated preview","reasoning":""}`),
+	})
+	bridge.Emit(ctx, session.EventRecord{
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID, Correlation: string(messageID),
 		Payload: []byte(`{"content":"streaming preview","reasoning":""}`),
 	})
 	bridge.Emit(ctx, session.EventRecord{

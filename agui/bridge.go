@@ -203,7 +203,6 @@ type nativeFrameKey struct {
 	kind    aguievents.EventType
 	ownerID string
 	blockID string
-	ordinal uint64
 }
 
 func (b *Bridge) deliverNative(key nativeFrameKey, emitter *aguiemitter.Emitter, event aguievents.Event) bool {
@@ -218,11 +217,6 @@ func (b *Bridge) deliverNative(key nativeFrameKey, emitter *aguiemitter.Emitter,
 	}
 	b.nativeFrames[key] = true
 	return true
-}
-
-func (b *Bridge) nextDeltaKey(kind aguievents.EventType, messageID session.MessageID) nativeFrameKey {
-	b.nativeDeltaOrdinal++
-	return nativeFrameKey{kind: kind, ownerID: string(messageID), ordinal: b.nativeDeltaOrdinal}
 }
 
 func (b *Bridge) nativeDelivered(key nativeFrameKey) bool {
@@ -517,10 +511,14 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 }
 
 // emitTransientBlock emits one self-contained live native chunk via the
-// accepted convert contract. Live event records carry the durable invocation
-// ID in Correlation; old hand-built records get a deterministic message-ID
-// fallback solely so legacy EventSink callers remain representable.
+// accepted convert contract. A transient chunk must carry the same durable
+// invocation identity as its eventual committed projection; an uncorrelated
+// legacy event is therefore intentionally dropped rather than poisoning the
+// emitter's per-message attempt state with a fabricated identity.
 func (b *Bridge) emitTransientBlock(event session.EventRecord, kind einoschema.ContentBlockType, text string, call *convert.PublicFunctionToolCall) {
+	if event.Correlation == "" {
+		return
+	}
 	b.nativeDeltaOrdinal++
 	messageID := string(event.MessageID)
 	turnID := string(event.TurnID)
@@ -536,9 +534,6 @@ func (b *Bridge) emitTransientBlock(event session.EventRecord, kind einoschema.C
 		sessionID = b.threadID
 	}
 	attemptID := event.Correlation
-	if attemptID == "" {
-		attemptID = messageID
-	}
 	pathName := event.AgentPath
 	if pathName == "" {
 		pathName = rootAgentPathName

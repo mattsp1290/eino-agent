@@ -192,7 +192,7 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 	// own commit notification (runtime/tool_execution.go's
 	// persistToolSettlement).
 	bridge.Emit(ctx, session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: fx.sessionID, RunID: fx.runID, MessageID: fx.assistantID,
+		Kind: runtime.EventMessageDelta, SessionID: fx.sessionID, RunID: fx.runID, MessageID: fx.assistantID, Correlation: string(fx.assistantID),
 		Payload: []byte(`{"content":"let me check that","reasoning":""}`),
 	})
 	bridge.Emit(ctx, session.EventRecord{

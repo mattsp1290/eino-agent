@@ -34,9 +34,10 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, true, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted})
 	bridge.Emit(context.Background(), session.EventRecord{
-		Kind:      runtime.EventMessageDelta,
-		MessageID: "assistant-1",
-		Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
+		Kind:        runtime.EventMessageDelta,
+		MessageID:   "assistant-1",
+		Correlation: "assistant-1",
+		Payload:     []byte(`{"reasoning":"thinking","content":"hello"}`),
 	})
 	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:       runtime.EventToolCallUpdated,
@@ -144,7 +145,7 @@ func TestBridgeRetriesNativeSpanAfterFailedWrite(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(ctx, nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	event := session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"retry me"}`)}
+	event := session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Correlation: "assistant-1", Payload: []byte(`{"content":"retry me"}`)}
 	bridge.Emit(ctx, event)
 	if bridge.nativeAlreadyStreamed(event.MessageID) {
 		t.Fatalf("failed transient write advanced bridge state: nativeStreamed=%v", bridge.nativeAlreadyStreamed(event.MessageID))
@@ -208,7 +209,7 @@ func TestBridgeNativeLedgerKeepsDistinctDeltasAndCalls(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	for range 2 {
-		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"same"}`)})
+		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Correlation: "assistant-1", Payload: []byte(`{"content":"same"}`)})
 	}
 	for _, id := range []string{"call-1", "call-2"} {
 		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventToolCallUpdated, MessageID: "assistant-1", ToolCallID: session.ToolCallID(id), Payload: []byte(`{"name":"search","arguments":{"q":"eino"},"status":"completed","output":"ok"}`)})
@@ -434,9 +435,10 @@ func TestEmitMessageDeltaGatesReasoningOnIncludeReasoning(t *testing.T) {
 		sink := newSSESink()
 		bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, includeReasoning, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 		bridge.Emit(context.Background(), session.EventRecord{
-			Kind:      runtime.EventMessageDelta,
-			MessageID: "assistant-1",
-			Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
+			Kind:        runtime.EventMessageDelta,
+			MessageID:   "assistant-1",
+			Correlation: "assistant-1",
+			Payload:     []byte(`{"reasoning":"thinking","content":"hello"}`),
 		})
 		return sink.Bytes()
 	}
