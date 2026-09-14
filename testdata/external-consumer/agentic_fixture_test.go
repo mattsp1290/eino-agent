@@ -10,15 +10,9 @@ package consumer
 // translation. check.sh must copy this file alongside the other fixtures for
 // it to run from a genuine external module boundary.
 //
-// Known, accepted defects this file documents rather than hides (see the
-// coordinator's grounding notes): eino-agent-doj (AG-UI replay re-emits a
-// tool call's lifecycle a second time on reconnect) and eino-agent-6wj
-// (agui/bridge.go's toolPayload decodes content/structured, but the wire
-// carries output, so a live/replayed tool result shows a synthesized status
-// stub instead of the real output).
 // TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent below
-// asserts the ACTUAL current behavior for both, with a comment citing each
-// bead, rather than asserting a stronger contract that does not hold.
+// asserts the public replay contract with parsed SSE frames: one native tool
+// lifecycle/result and the persisted tool output for the durable call.
 
 import (
 	"bufio"
@@ -1000,8 +994,7 @@ func TestPublicSummarizationMiddlewareWritesDurableContextEpochSurvivingReopen(t
 }
 
 // --- 7. AG-UI decode of a native input message, plus real Bridge/Replay
-//        projection of committed content -- documenting eino-agent-doj and
-//        eino-agent-6wj rather than hiding them --------------------------
+//        projection of committed content ----------------------------------
 
 type aguiToolTurnScript struct{ calls atomic.Int32 }
 
@@ -1110,17 +1103,14 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 		t.Fatalf("expected exactly 1 TOOL_CALL_RESULT event, got %d in: %s", len(toolCallResults), stream)
 	}
 
-	// The FIRST (pre-RUN_STARTED) TOOL_CALL_RESULT is built directly from
-	// the durable function_tool_result content block (runtime.ToolOutput),
-	// not from agui/bridge.go's toolPayload, so it is unaffected by
-	// eino-agent-6wj. echo_note's Retention policy (mountEchoNoteTool)
+	// The TOOL_CALL_RESULT is built directly from the durable
+	// function_tool_result content block (runtime.ToolOutput). echo_note's
+	// Retention policy (mountEchoNoteTool)
 	// allows its 56-byte output to inline instead of degrading to an
 	// omission record, so assert the real output actually reached the
 	// wire here -- proving this fixture exercises genuine durable content
-	// rather than over-determining the eino-agent-6wj narrative below with
-	// a result that would be an omission record regardless of that bug
-	// (fixture-integrity-reviewer, C3; contrast fixture 8's identical
-	// concern at mountEchoNoteTool's Retention comment).
+	// rather than a result that would be an omission record regardless of
+	// replay correctness.
 	snapshotResult := decodeJSONObject(t, toolCallResults[0].Content)
 	// Belt-and-braces, not the primary assertion: on the happy path the
 	// decoded snapshot result has no "truncated" key at all (it only
@@ -1200,10 +1190,8 @@ func mountEchoNoteTool(t *testing.T) (*composition.Registry, *composition.Mount)
 			Parameters: einoschema.NewParamsOneOfByParams(map[string]*einoschema.ParameterInfo{"note": {Type: einoschema.String, Required: true}}),
 			// Without an explicit Retention policy the zero-value
 			// RetentionPolicy allows zero inline bytes (fail closed), which
-			// degrades every result to an omission record regardless of
-			// eino-agent-6wj and over-determines that narrative (see
-			// fixture 8's identical comment and fixture-integrity-reviewer
-			// C3). This tool's 56-byte output fits comfortably under 4096,
+			// degrades every result to an omission record. This tool's 56-byte
+			// output fits comfortably under 4096,
 			// so the snapshot-projection assertion above genuinely proves
 			// the real output durably reached the wire.
 			Retention: runtime.RetentionPolicy{MaxInlineBytes: 4096},
