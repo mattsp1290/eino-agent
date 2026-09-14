@@ -2,6 +2,7 @@ package agui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -108,22 +109,40 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 
 func hydratePausesBeforeCursor(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, through session.EventID) error {
 	cursor := session.EventCursor{Limit: 100}
+	// Keep only pauses that remain unresolved at the cursor. Emitting every
+	// historical pause would leave stale pause state visible after its paired
+	// resume and can poison a later lifecycle transition on this connection.
+	pending := make([]session.EventRecord, 0)
+	resolved := make(map[string]bool)
 	for {
 		batch, err := store.ListEvents(ctx, sessionID, cursor)
 		if err != nil {
 			return err
 		}
 		for _, record := range batch.Events {
-			if record.Kind == session.RunPausedEventKind && !record.LiveOnly {
-				bridge.Emit(ctx, record)
-				if err := bridge.LiveErr(); err != nil {
-					return err
-				}
-				if err := bridge.EncErr(); err != nil {
-					return err
+			if !record.LiveOnly && record.Kind == session.RunPausedEventKind {
+				pending = append(pending, record)
+			}
+			if !record.LiveOnly && record.Kind == session.RunResumedEventKind {
+				var lifecycle session.PauseLifecycleV1
+				if json.Unmarshal(record.Payload, &lifecycle) == nil && session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) == nil {
+					resolved[lifecycle.ResumedPauseID] = true
 				}
 			}
 			if record.ID == through {
+				for _, pause := range pending {
+					var lifecycle session.PauseLifecycleV1
+					if json.Unmarshal(pause.Payload, &lifecycle) != nil || resolved[lifecycle.PauseID] {
+						continue
+					}
+					bridge.Emit(ctx, pause)
+					if err := bridge.LiveErr(); err != nil {
+						return err
+					}
+					if err := bridge.EncErr(); err != nil {
+						return err
+					}
+				}
 				return nil
 			}
 		}

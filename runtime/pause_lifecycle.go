@@ -33,9 +33,13 @@ func loadPauseLifecycle(ctx context.Context, store session.Store, sessionID sess
 			return nil, err
 		}
 		for _, event := range batch.Events {
-			if event.RunID != runID || event.Kind != session.RunPausedEventKind || len(event.Payload) == 0 {
+			if event.RunID != runID || event.Kind != session.RunPausedEventKind {
 				continue
 			}
+			// A later repause is the authoritative generation even when it is
+			// a historical empty record. Never resurrect an older fact sharing
+			// a promoted checkpoint revision.
+			matched = nil
 			var value session.PauseLifecycleV1
 			if json.Unmarshal(event.Payload, &value) != nil || session.ValidatePauseLifecycle(session.RunPausedEventKind, value) != nil {
 				continue // historical/non-lifecycle pause records remain resumable
@@ -69,6 +73,11 @@ func loadPauseLifecycle(ctx context.Context, store session.Store, sessionID sess
 		allTargets := len(known) == len(ids)
 		for _, id := range ids {
 			allTargets = allTargets && known[id]
+		}
+		for _, id := range ids {
+			if !known[id] {
+				return nil, fmt.Errorf("%w: resume target %q is not in current pause generation", ErrInvalidOrchestrator, id)
+			}
 		}
 		if allTargets {
 			mode = session.ResumeModeFull
