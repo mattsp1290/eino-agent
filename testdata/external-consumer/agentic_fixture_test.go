@@ -1102,21 +1102,13 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 		}
 	}
 
-	// eino-agent-doj: emitMessageSnapshot's replay path natively delivers a
-	// tool call's whole lifecycle once (the pre-RUN_STARTED snapshot), then
-	// replay()'s raw catch-up sweep re-forwards the SAME durable
-	// tool_call_updated record a second time (the post-RUN_STARTED
-	// duplicate) because nothing marks the call as already natively
-	// delivered. Assert the exact count of native TOOL_CALL_START/RESULT
-	// events for this one call -- not a >= floor, which a non-duplicated
-	// stream also satisfies (the non-duplicated snapshot alone contributes
-	// 3 occurrences of the tool name, already >= 2) -- so this fails,
-	// dropping to 1 of each, the moment eino-agent-doj stops re-forwarding.
-	if len(toolCallStarts) != 2 {
-		t.Fatalf("expected eino-agent-doj's known duplicate tool-call lifecycle emission (exactly 2 TOOL_CALL_START events), got %d in: %s", len(toolCallStarts), stream)
+	// Replay emits one native lifecycle for the one durable call. This guards
+	// against reconnect duplication without relying on raw SSE substrings.
+	if len(toolCallStarts) != 1 {
+		t.Fatalf("expected exactly 1 TOOL_CALL_START event, got %d in: %s", len(toolCallStarts), stream)
 	}
-	if len(toolCallResults) != 2 {
-		t.Fatalf("expected eino-agent-doj's known duplicate tool-call lifecycle emission (exactly 2 TOOL_CALL_RESULT events), got %d in: %s", len(toolCallResults), stream)
+	if len(toolCallResults) != 1 {
+		t.Fatalf("expected exactly 1 TOOL_CALL_RESULT event, got %d in: %s", len(toolCallResults), stream)
 	}
 
 	// The FIRST (pre-RUN_STARTED) TOOL_CALL_RESULT is built directly from
@@ -1146,29 +1138,6 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 		t.Fatalf("expected the snapshot-projected tool result to carry the real durable output, got %v in: %s", snapshotResult, stream)
 	}
 
-	// eino-agent-6wj: the SECOND (post-RUN_STARTED, doj-duplicated)
-	// TOOL_CALL_RESULT is built from agui/bridge.go's toolPayload, which
-	// decodes content/structured, but the durable tool_transition wire
-	// payload carries output/error/metadata instead, so ResultContent()
-	// falls back to a synthesized status stub instead of the real tool
-	// result. Decode that event's content (itself JSON) and assert it is
-	// EXACTLY the three-key stub -- not merely that it contains "status"
-	// (which the legitimate snapshot result above also contains) -- so
-	// this fails the moment toolPayload decodes the real output instead.
-	liveForwardedResult := decodeJSONObject(t, toolCallResults[1].Content)
-	// Belt-and-braces, not the definitive assertion: "echoed" lives nested
-	// under a "structured" sub-object on a real result, never as a
-	// top-level key, so this guard only catches a fix shape that returns
-	// the structured sub-object directly at the top level. The
-	// reflect.DeepEqual below against the exact three-key stub is what
-	// actually fails the moment toolPayload decodes real output instead.
-	if _, ok := liveForwardedResult["echoed"]; ok {
-		t.Fatalf("tool result carried real output; eino-agent-6wj is apparently fixed, update this fixture: %s", stream)
-	}
-	wantStub := map[string]any{"status": "completed", "truncated": false, "redacted": false}
-	if !reflect.DeepEqual(liveForwardedResult, wantStub) {
-		t.Fatalf("expected eino-agent-6wj's exact synthesized status stub %v in the live-forwarded tool result, got %v in: %s", wantStub, liveForwardedResult, stream)
-	}
 }
 
 // sseFrame is the minimal shape shared by every AG-UI SSE event this fixture
