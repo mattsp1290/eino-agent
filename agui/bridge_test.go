@@ -457,6 +457,24 @@ func TestBridgeImplementsRuntimeEventSink(t *testing.T) {
 	var _ runtime.EventSink = (*Bridge)(nil)
 }
 
+func TestBridgeProjectsValidatedDurablePause(t *testing.T) {
+	t.Parallel()
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-1", "run-1", nil)
+	payload, err := json.Marshal(session.PauseLifecycleV1{Version: session.PauseLifecycleVersion, PauseID: "pause-1", CheckpointRevision: 1, Generation: 1, AgentPath: "root", MessageID: "pause:run-1", AttemptID: "pause:run-1", EventRevision: "event-1", Targets: []session.PauseInterruptTarget{{ID: "target-1", Address: "agent:root"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.Emit(context.Background(), session.EventRecord{ID: "event-1", SessionID: "session-1", RunID: "run-1", Kind: session.RunPausedEventKind, Payload: payload})
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("pause encoding error = %v", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, `"kind":"paused"`) || !strings.Contains(raw, `"pauseId":"pause-1"`) {
+		t.Fatalf("paused lifecycle missing from SSE: %s", raw)
+	}
+}
+
 type sseSink struct {
 	buffer bytes.Buffer
 	writer *bufio.Writer

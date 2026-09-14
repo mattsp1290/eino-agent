@@ -264,6 +264,8 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		b.emitToolCallUpdated(event)
 	case session.MessageCommittedEventKind:
 		b.emitLiveMessageCommitted(ctx, event)
+	case session.RunPausedEventKind:
+		b.emitPaused(event)
 	case runtime.EventRunFinished:
 		// terminated guards against writing a second terminal frame: a
 		// durable RUN_FINISHED/RUN_ERROR reaching Emit twice (a redundant
@@ -293,6 +295,47 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		} else {
 			b.emit.RunFinishedSuccess()
 		}
+	}
+}
+
+// emitPaused projects only a validated immutable PauseLifecycleV1 payload.
+// Historical empty pause records remain audit-only; fabricating AG-UI targets
+// from a live checkpoint would make reconnect semantics unsound.
+func (b *Bridge) emitPaused(event session.EventRecord) {
+	var lifecycle session.PauseLifecycleV1
+	if len(event.Payload) == 0 || json.Unmarshal(event.Payload, &lifecycle) != nil {
+		return
+	}
+	if err := session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle); err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable pause lifecycle: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	identity := convert.AgenticIdentityV1{
+		SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: string(event.TurnID),
+		MessageID: string(lifecycle.MessageID), AttemptID: lifecycle.AttemptID,
+		AgentPath: []convert.AgentPathSegment{{Name: lifecycle.AgentPath, RunID: string(event.RunID)}},
+	}
+	if identity.TurnID == "" {
+		identity.TurnID = "pause:" + string(event.RunID)
+	}
+	targets := make([]convert.InterruptTargetV1, len(lifecycle.Targets))
+	for i, target := range lifecycle.Targets {
+		targets[i] = convert.InterruptTargetV1{ID: target.ID, Address: target.Address}
+	}
+	paused := convert.PausedV1{PauseID: lifecycle.PauseID, Targets: targets}
+	if lifecycle.Approval != nil {
+		paused.Correlation = &convert.ApprovalInterruptCorrelation{ApprovalRequestID: lifecycle.Approval.RequestID, InterruptTargetID: lifecycle.Approval.TargetID, InterruptAddress: lifecycle.Approval.Address}
+	}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: convert.EnvelopePaused, Identity: identity, Paused: &paused}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: pause lifecycle digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	if !b.emit.Paused(paused, convert.CommitReceiptV1{Revision: lifecycle.EventRevision, Domain: "lifecycle", Kind: convert.EnvelopePaused, Identity: identity, Digest: digest}) && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: pause lifecycle emission: %w", b.EncErr()))
 	}
 }
 
