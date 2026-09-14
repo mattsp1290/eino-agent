@@ -219,7 +219,7 @@ func TestReconnectDeliversRealisticUserTextToolCallTurn(t *testing.T) {
 		}
 	}
 	sendOrTimeout(session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: assistantID,
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: assistantID, Correlation: string(assistantID),
 		Payload: []byte(`{"content":"let me check the weather","reasoning":""}`),
 	})
 	sendOrTimeout(session.EventRecord{
@@ -272,7 +272,7 @@ func TestReconnectDeliversRealisticUserTextToolCallTurn(t *testing.T) {
 	// user turn (via the custom envelope), the assistant's text streaming
 	// in, then a tool call opening, receiving arguments, closing, and
 	// producing a result -- exactly the shape a chat UI expects.
-	want := "CUSTOM,TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,CUSTOM,CUSTOM,TEXT_MESSAGE_END,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
+	want := "CUSTOM,TEXT_MESSAGE_CHUNK,CUSTOM,CUSTOM,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s", got, want)
 	}

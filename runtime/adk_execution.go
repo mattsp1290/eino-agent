@@ -39,6 +39,10 @@ type adkEngine struct {
 	plan      *RunPlan
 	snapshot  TurnSnapshot
 	turn      session.Turn
+	// resumeLifecycle is set by a resumed turnLoopCoordinator. Its first
+	// physical dispatch appends the paired RunResumed fact after this turn's
+	// successor invocation ID is durable.
+	resumeLifecycle *resumeLifecycleFact
 	// agentPath is the joined adk.RunPath of the (sub)agent this engine's
 	// adapters report against. Empty for the root agent.
 	agentPath string

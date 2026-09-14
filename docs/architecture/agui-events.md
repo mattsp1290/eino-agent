@@ -45,7 +45,7 @@ and never replayed.
 
 | Family | Persisted durable fact | Replay behavior | Live-tail behavior | Omitted |
 | --- | --- | --- | --- | --- |
-| Run lifecycle | `session.EventRecord` audit with run status metadata. | `replay()` forwards every durable, non-`LiveOnly` run lifecycle record (`run_started`, run settlement) to `bridge.Emit` like any other durable event, and `Bridge.Emit` maps them to raw `RUN_STARTED`/`RUN_FINISHED`/`RUN_ERROR` -- see `agui/replay_test.go`'s `TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas`, which asserts exactly this sequence. | Emit live through `eino-agui/emitter`. | None, except transport-only write failures. |
+| Run lifecycle | `session.EventRecord` audit with run status metadata. Interactive pause boundaries additionally carry immutable, redacted `PauseLifecycleV1` targets and identity; post-redrive resumes name the real successor turn and invocation. | `replay()` forwards durable lifecycle records to `bridge.Emit`. A cursored replay hydrates earlier validated pauses before a later resume, because `Emitter.Resumed` requires the paired pause state on that connection. Historical empty pause/resume records remain audit-only. | Emit live through `eino-agui/emitter`. | Decision values, checkpoint bytes, and malformed lifecycle records. |
 | Text | Settled `session.Part{Kind: PartAssistantGenText}` on assistant message. | Replay as AG-UI assistant message content projected from durable parts. | Emit `TEXT_MESSAGE_*` deltas live. | Empty deltas. |
 | Plain reasoning | `session.Part{Kind: PartReasoning}` only when provider and host policy allow storage. | Replay as reasoning content only from durable reasoning parts. | Emit `REASONING_*` live while allowed. | Provider-private or policy-denied reasoning. |
 | Encrypted reasoning | Never persisted. | Never replayed. | Not emitted by `eino-agent`; scrub from snapshots. | All encrypted reasoning payloads. |
@@ -508,18 +508,24 @@ already delivered.
   `session.SubagentStartedEventKind`/`SubagentFinishedEventKind`/
   `SubagentErrorEventKind` anywhere yet (subagent nesting is not wired), so
   there is nothing for a bridge mapping to consume for that family today.
-- Transient per-block live deltas via `convert.TransientEventForBlock` (the
-  live path today still uses the classic `TextStart`/`TextContent`/
-  `ToolStart`/... emitter methods for in-flight deltas; only the *committed*
-  projection at commit time uses the agentic path).
-- `transport.DecodeUserMessage` (rich AG-UI input decode into
-  `runtime.UserMessage` blocks) exists and is tested but is not yet wired as
-  the default ingress path in `SSEHandler`/`examples/minimal-server`, which
-  decode their own request bodies inline. The classic `transport.DecodeMessages`
-  decoder this bullet previously named as "the default for existing callers"
-  had zero callers anywhere in the module and was removed in W8's
-  unused-classic-public-entrypoint cleanup (see
-  `docs/architecture/eino-feature-support.md`'s W8 section).
 - Watch (`watch/`) bounded public block state and a block-indexed live
   overlay, and the observability typed-callback adapters with a single
   accounting source, are untouched by W7.
+
+### Live blocks and example ingress
+
+Live assistant text and, only when `IncludeReasoning` is enabled, reasoning
+are emitted as self-contained native `*_MESSAGE_CHUNK` frames produced by
+`convert.TransientEventForBlock`. They are connection-local: they are never
+persisted or replayed, and a later durable committed projection supplies the
+recoverable record without duplicating native content on that connection.
+Durable tool-call start/arguments/end/result transitions remain their own
+native lifecycle frames because the converter has no transient result or
+lifecycle representation.
+
+`examples/minimal-server` uses `transport.DecodeUserMessage` for its
+`POST /sessions/{id}/runs` body. It accepts the bounded native AG-UI
+`content` array (text, image, audio, video, document) with strict single
+object/unknown-field validation and passes its blocks directly to `Start`.
+`transport.SSEHandler` remains GET reconnect egress; it does not decode
+inbound user content.

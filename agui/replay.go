@@ -2,6 +2,7 @@ package agui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -50,6 +51,17 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 	if store == nil {
 		return cursor, nil, session.ErrNotFound
 	}
+	// ResumedV1 is deliberately stateful: the protocol emitter rejects it
+	// unless the paired pause was committed on this connection. A cursor may
+	// begin after that pause, so replay the earlier durable pause facts first.
+	// This is connection hydration, not an inferred checkpoint projection:
+	// Bridge.Emit still validates the immutable payload and skips historical
+	// empty pause records.
+	if cursor.AfterEventID != "" {
+		if err := hydratePausesBeforeCursor(ctx, bridge, store, sessionID, cursor.AfterEventID); err != nil {
+			return cursor, nil, err
+		}
+	}
 	if err := emitMessageSnapshot(ctx, bridge, store, sessionID, contentLimits, includeReasoning); err != nil {
 		return cursor, nil, err
 	}
@@ -92,6 +104,52 @@ func replay(ctx context.Context, bridge *Bridge, store session.Store, sessionID 
 			return next, seen, nil
 		}
 		next = batch.Next
+	}
+}
+
+func hydratePausesBeforeCursor(ctx context.Context, bridge *Bridge, store session.Store, sessionID session.ID, through session.EventID) error {
+	cursor := session.EventCursor{Limit: 100}
+	// Keep only pauses that remain unresolved at the cursor. Emitting every
+	// historical pause would leave stale pause state visible after its paired
+	// resume and can poison a later lifecycle transition on this connection.
+	pending := make([]session.EventRecord, 0)
+	resolved := make(map[string]bool)
+	for {
+		batch, err := store.ListEvents(ctx, sessionID, cursor)
+		if err != nil {
+			return err
+		}
+		for _, record := range batch.Events {
+			if !record.LiveOnly && record.Kind == session.RunPausedEventKind {
+				pending = append(pending, record)
+			}
+			if !record.LiveOnly && record.Kind == session.RunResumedEventKind {
+				var lifecycle session.PauseLifecycleV1
+				if json.Unmarshal(record.Payload, &lifecycle) == nil && session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) == nil {
+					resolved[lifecycle.ResumedPauseID] = true
+				}
+			}
+			if record.ID == through {
+				for _, pause := range pending {
+					var lifecycle session.PauseLifecycleV1
+					if json.Unmarshal(pause.Payload, &lifecycle) != nil || resolved[lifecycle.PauseID] {
+						continue
+					}
+					bridge.Emit(ctx, pause)
+					if err := bridge.LiveErr(); err != nil {
+						return err
+					}
+					if err := bridge.EncErr(); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+		}
+		if batch.Next.AfterEventID == "" {
+			return nil
+		}
+		cursor = batch.Next
 	}
 }
 

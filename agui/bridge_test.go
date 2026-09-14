@@ -34,9 +34,10 @@ func TestBridgeEmitsFullSurfaceGolden(t *testing.T) {
 	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, true, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventRunStarted})
 	bridge.Emit(context.Background(), session.EventRecord{
-		Kind:      runtime.EventMessageDelta,
-		MessageID: "assistant-1",
-		Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
+		Kind:        runtime.EventMessageDelta,
+		MessageID:   "assistant-1",
+		Correlation: "assistant-1",
+		Payload:     []byte(`{"reasoning":"thinking","content":"hello"}`),
 	})
 	bridge.Emit(context.Background(), session.EventRecord{
 		Kind:       runtime.EventToolCallUpdated,
@@ -144,31 +145,23 @@ func TestBridgeRetriesNativeSpanAfterFailedWrite(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(ctx, nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	event := session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"retry me"}`)}
+	event := session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Correlation: "assistant-1", Payload: []byte(`{"content":"retry me"}`)}
 	bridge.Emit(ctx, event)
-	if bridge.textOpen[event.MessageID] || bridge.nativeAlreadyStreamed(event.MessageID) {
-		t.Fatalf("failed start advanced bridge state: textOpen=%v nativeStreamed=%v", bridge.textOpen, bridge.nativeAlreadyStreamed(event.MessageID))
-	}
-	if bridge.nativeDelivered(nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(event.MessageID)}) {
-		t.Fatal("failed start was registered in native ledger")
+	if bridge.nativeAlreadyStreamed(event.MessageID) {
+		t.Fatalf("failed transient write advanced bridge state: nativeStreamed=%v", bridge.nativeAlreadyStreamed(event.MessageID))
 	}
 
 	bridge.emit = aguiemitter.NewEmitter(ctx, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(ctx, event)
 	frames := frameData(t, sink.Bytes())
-	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT" {
-		t.Fatalf("retry frames = %s, want complete start/content span", got)
-	}
-	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	bridge.closeOpen(bridge.emit)
-	if !bridge.textOpen[event.MessageID] {
-		t.Fatal("failed close discarded open text span")
+	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_CHUNK" {
+		t.Fatalf("retry frames = %s, want transient chunk", got)
 	}
 	bridge.emit = aguiemitter.NewEmitter(ctx, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.closeOpen(bridge.emit)
 	frames = frameData(t, sink.Bytes())
-	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END" {
-		t.Fatalf("retry close frames = %s, want complete span", got)
+	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_CHUNK" {
+		t.Fatalf("retry close frames = %s, transient chunks have no open span", got)
 	}
 }
 
@@ -216,7 +209,7 @@ func TestBridgeNativeLedgerKeepsDistinctDeltasAndCalls(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	for range 2 {
-		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"same"}`)})
+		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Correlation: "assistant-1", Payload: []byte(`{"content":"same"}`)})
 	}
 	for _, id := range []string{"call-1", "call-2"} {
 		bridge.Emit(context.Background(), session.EventRecord{Kind: runtime.EventToolCallUpdated, MessageID: "assistant-1", ToolCallID: session.ToolCallID(id), Payload: []byte(`{"name":"search","arguments":{"q":"eino"},"status":"completed","output":"ok"}`)})
@@ -227,8 +220,8 @@ func TestBridgeNativeLedgerKeepsDistinctDeltasAndCalls(t *testing.T) {
 	for _, frame := range frames {
 		counts[frame["type"].(string)]++
 	}
-	if counts["TEXT_MESSAGE_CONTENT"] != 2 {
-		t.Fatalf("TEXT_MESSAGE_CONTENT count = %d, want 2", counts["TEXT_MESSAGE_CONTENT"])
+	if counts["TEXT_MESSAGE_CHUNK"] != 2 {
+		t.Fatalf("TEXT_MESSAGE_CHUNK count = %d, want 2", counts["TEXT_MESSAGE_CHUNK"])
 	}
 	for _, kind := range []string{"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"} {
 		if counts[kind] != 2 {
@@ -442,9 +435,10 @@ func TestEmitMessageDeltaGatesReasoningOnIncludeReasoning(t *testing.T) {
 		sink := newSSESink()
 		bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, includeReasoning, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 		bridge.Emit(context.Background(), session.EventRecord{
-			Kind:      runtime.EventMessageDelta,
-			MessageID: "assistant-1",
-			Payload:   []byte(`{"reasoning":"thinking","content":"hello"}`),
+			Kind:        runtime.EventMessageDelta,
+			MessageID:   "assistant-1",
+			Correlation: "assistant-1",
+			Payload:     []byte(`{"reasoning":"thinking","content":"hello"}`),
 		})
 		return sink.Bytes()
 	}
@@ -461,6 +455,72 @@ func TestBridgeImplementsRuntimeEventSink(t *testing.T) {
 	t.Parallel()
 
 	var _ runtime.EventSink = (*Bridge)(nil)
+}
+
+func TestBridgeProjectsValidatedDurablePause(t *testing.T) {
+	t.Parallel()
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-1", "run-1", nil)
+	payload, err := json.Marshal(session.PauseLifecycleV1{Version: session.PauseLifecycleVersion, PauseID: "pause-1", CheckpointRevision: 1, Generation: 1, AgentPath: "root", MessageID: "pause:run-1", AttemptID: "pause:run-1", EventRevision: "event-1", Targets: []session.PauseInterruptTarget{{ID: "target-1", Address: "agent:root"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.Emit(context.Background(), session.EventRecord{ID: "event-1", SessionID: "session-1", RunID: "run-1", Kind: session.RunPausedEventKind, Payload: payload})
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("pause encoding error = %v", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, `"kind":"paused"`) || !strings.Contains(raw, `"pauseId":"pause-1"`) {
+		t.Fatalf("paused lifecycle missing from SSE: %s", raw)
+	}
+}
+
+func TestBridgeProjectsDurableResumeAfterPause(t *testing.T) {
+	t.Parallel()
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-1", "run-1", nil)
+	pause := session.PauseLifecycleV1{Version: session.PauseLifecycleVersion, PauseID: "pause-1", CheckpointRevision: 1, Generation: 1, AgentPath: "root", MessageID: "pause:run-1", AttemptID: "pause:run-1", EventRevision: "event-1", Targets: []session.PauseInterruptTarget{{ID: "target-1", Address: "agent:root"}}}
+	pausePayload, err := json.Marshal(pause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.Emit(context.Background(), session.EventRecord{ID: "event-1", SessionID: "session-1", RunID: "run-1", Kind: session.RunPausedEventKind, Payload: pausePayload})
+	resume := pause
+	resume.EventRevision = "event-2"
+	resume.ResumedPauseID = pause.PauseID
+	resume.ResumeMode = session.ResumeModeFull
+	resume.NewTurnID = "turn-1"
+	resume.NewAttemptID = "attempt-1"
+	resume.ResumePhase = session.ResumePhaseFact
+	resumePayload, err := json.Marshal(resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.Emit(context.Background(), session.EventRecord{ID: "event-2", SessionID: "session-1", RunID: "run-1", Kind: session.RunResumedEventKind, Payload: resumePayload})
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("resume encoding error = %v", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, `"kind":"resumed"`) || !strings.Contains(raw, `"newTurnId":"turn-1"`) || !strings.Contains(raw, `"newAttemptId":"attempt-1"`) {
+		t.Fatalf("resumed lifecycle missing from SSE: %s", raw)
+	}
+}
+
+func TestBridgeProjectsDurableAttemptReplacement(t *testing.T) {
+	t.Parallel()
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-1", "run-1", nil)
+	bridge.Emit(context.Background(), session.EventRecord{
+		ID: "event-2", SessionID: "session-1", RunID: "run-1", MessageID: "message-1", TurnID: "turn-1", AgentPath: "root",
+		Kind: session.AttemptReplacedEventKind, Payload: []byte(`{"old_invocation_id":"attempt-1","new_invocation_id":"attempt-2"}`),
+	})
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("attempt replacement encoding error = %v", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, `"type":"CUSTOM"`) || !strings.Contains(raw, `"kind":"attempt_replaced"`) || !strings.Contains(raw, `"oldAttemptId":"attempt-1"`) || !strings.Contains(raw, `"newAttemptId":"attempt-2"`) {
+		t.Fatalf("attempt replacement lifecycle missing from SSE: %s", raw)
+	}
 }
 
 type sseSink struct {

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 )
@@ -102,6 +103,15 @@ func ValidatePromotePause(run Run, request PromotePauseRequest) error {
 	if request.Revision <= 0 || request.Event.ID == "" || request.Event.Kind != RunPausedEventKind ||
 		request.Event.RunID != run.ID || request.Event.SessionID != run.SessionID {
 		return ErrConflict
+	}
+	if len(request.Event.Payload) != 0 {
+		var lifecycle PauseLifecycleV1
+		if err := json.Unmarshal(request.Event.Payload, &lifecycle); err != nil || ValidatePauseLifecycle(RunPausedEventKind, lifecycle) != nil {
+			return ErrConflict
+		}
+		if lifecycle.CheckpointRevision != request.Revision || lifecycle.PauseID != string(request.Event.ID) {
+			return ErrConflict
+		}
 	}
 	return nil
 }

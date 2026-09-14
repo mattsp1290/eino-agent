@@ -203,7 +203,6 @@ type nativeFrameKey struct {
 	kind    aguievents.EventType
 	ownerID string
 	blockID string
-	ordinal uint64
 }
 
 func (b *Bridge) deliverNative(key nativeFrameKey, emitter *aguiemitter.Emitter, event aguievents.Event) bool {
@@ -218,11 +217,6 @@ func (b *Bridge) deliverNative(key nativeFrameKey, emitter *aguiemitter.Emitter,
 	}
 	b.nativeFrames[key] = true
 	return true
-}
-
-func (b *Bridge) nextDeltaKey(kind aguievents.EventType, messageID session.MessageID) nativeFrameKey {
-	b.nativeDeltaOrdinal++
-	return nativeFrameKey{kind: kind, ownerID: string(messageID), ordinal: b.nativeDeltaOrdinal}
 }
 
 func (b *Bridge) nativeDelivered(key nativeFrameKey) bool {
@@ -270,6 +264,14 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		b.emitToolCallUpdated(event)
 	case session.MessageCommittedEventKind:
 		b.emitLiveMessageCommitted(ctx, event)
+	case session.RunPausedEventKind:
+		b.emitPaused(event)
+	case session.RunResumedEventKind:
+		b.emitResumed(event)
+	case session.AttemptReplacedEventKind:
+		b.emitAttemptReplaced(event)
+	case session.SubagentStartedEventKind, session.SubagentFinishedEventKind, session.SubagentErrorEventKind:
+		b.emitSubagentLifecycle(event)
 	case runtime.EventRunFinished:
 		// terminated guards against writing a second terminal frame: a
 		// durable RUN_FINISHED/RUN_ERROR reaching Emit twice (a redundant
@@ -299,6 +301,171 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		} else {
 			b.emit.RunFinishedSuccess()
 		}
+	}
+}
+
+func (b *Bridge) emitAttemptReplaced(event session.EventRecord) {
+	var payload struct {
+		Old string `json:"old_invocation_id"`
+		New string `json:"new_invocation_id"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.Old == "" || payload.New == "" || payload.Old == payload.New {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable attempt replacement"))
+		b.emitTerminalError()
+		return
+	}
+	turnID := string(event.TurnID)
+	if turnID == "" {
+		turnID = syntheticTurnID(event.MessageID)
+	}
+	path := event.AgentPath
+	if path == "" {
+		path = rootAgentPathName
+	}
+	identity := convert.AgenticIdentityV1{SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: turnID, MessageID: string(event.MessageID), AttemptID: payload.Old, AgentPath: []convert.AgentPathSegment{{Name: path, RunID: string(event.RunID)}}}
+	replacement := convert.AttemptReplacedV1{OldAttemptID: payload.Old, NewAttemptID: payload.New, Cause: "retry", Semantics: "replace"}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: convert.EnvelopeAttemptReplaced, Identity: identity, AttemptReplaced: &replacement}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: attempt replacement digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	if !b.emit.AttemptReplaced(replacement, convert.CommitReceiptV1{Revision: string(event.ID), Domain: "lifecycle", Kind: convert.EnvelopeAttemptReplaced, Identity: identity, Digest: digest}) && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: attempt replacement emission: %w", b.EncErr()))
+	}
+}
+
+// emitPaused projects only a validated immutable PauseLifecycleV1 payload.
+// Historical empty pause records remain audit-only; fabricating AG-UI targets
+// from a live checkpoint would make reconnect semantics unsound.
+func (b *Bridge) emitPaused(event session.EventRecord) {
+	var lifecycle session.PauseLifecycleV1
+	if len(event.Payload) == 0 || json.Unmarshal(event.Payload, &lifecycle) != nil {
+		return
+	}
+	if err := session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle); err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable pause lifecycle: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	identity := convert.AgenticIdentityV1{
+		SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: "pause:" + string(event.RunID),
+		MessageID: string(lifecycle.MessageID), AttemptID: lifecycle.AttemptID,
+		AgentPath: []convert.AgentPathSegment{{Name: lifecycle.AgentPath, RunID: string(event.RunID)}},
+	}
+	targets := make([]convert.InterruptTargetV1, len(lifecycle.Targets))
+	for i, target := range lifecycle.Targets {
+		targets[i] = convert.InterruptTargetV1{ID: target.ID, Address: target.Address}
+	}
+	paused := convert.PausedV1{PauseID: lifecycle.PauseID, Targets: targets}
+	if lifecycle.Approval != nil {
+		paused.Correlation = &convert.ApprovalInterruptCorrelation{ApprovalRequestID: lifecycle.Approval.RequestID, InterruptTargetID: lifecycle.Approval.TargetID, InterruptAddress: lifecycle.Approval.Address}
+	}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: convert.EnvelopePaused, Identity: identity, Paused: &paused}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: pause lifecycle digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	if !b.emit.Paused(paused, convert.CommitReceiptV1{Revision: lifecycle.EventRevision, Domain: "lifecycle", Kind: convert.EnvelopePaused, Identity: identity, Digest: digest}) && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: pause lifecycle emission: %w", b.EncErr()))
+	}
+}
+
+func (b *Bridge) emitResumed(event session.EventRecord) {
+	var lifecycle session.PauseLifecycleV1
+	if len(event.Payload) == 0 {
+		return // historical observability-only resume
+	}
+	if err := json.Unmarshal(event.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) != nil {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable resumed lifecycle"))
+		b.emitTerminalError()
+		return
+	}
+	identity := convert.AgenticIdentityV1{SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: "pause:" + string(event.RunID), MessageID: string(lifecycle.MessageID), AttemptID: lifecycle.AttemptID, AgentPath: []convert.AgentPathSegment{{Name: lifecycle.AgentPath, RunID: string(event.RunID)}}}
+	selected := make(map[string]bool, len(lifecycle.ResumedTargetIDs))
+	for _, id := range lifecycle.ResumedTargetIDs {
+		selected[id] = true
+	}
+	targets := make([]convert.InterruptTargetV1, 0, len(lifecycle.Targets))
+	for _, target := range lifecycle.Targets {
+		if lifecycle.ResumeMode == session.ResumeModeFull || selected[target.ID] {
+			targets = append(targets, convert.InterruptTargetV1{ID: target.ID, Address: target.Address})
+		}
+	}
+	if lifecycle.ResumeMode == session.ResumeModeTargeted && len(targets) != len(selected) {
+		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle selects unknown pause target"))
+		b.emitTerminalError()
+		return
+	}
+	resumed := convert.ResumedV1{PauseID: lifecycle.ResumedPauseID, Targets: targets, Full: lifecycle.ResumeMode == session.ResumeModeFull, NewTurnID: string(lifecycle.NewTurnID), NewAttemptID: lifecycle.NewAttemptID}
+	if lifecycle.Approval != nil && (resumed.Full || selected[lifecycle.Approval.TargetID]) {
+		resumed.Correlation = &convert.ApprovalInterruptCorrelation{ApprovalRequestID: lifecycle.Approval.RequestID, InterruptTargetID: lifecycle.Approval.TargetID, InterruptAddress: lifecycle.Approval.Address}
+	}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: convert.EnvelopeResumed, Identity: identity, Resumed: &resumed}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	if !b.emit.Resumed(resumed, convert.CommitReceiptV1{Revision: lifecycle.EventRevision, Domain: "lifecycle", Kind: convert.EnvelopeResumed, Identity: identity, Digest: digest}) && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle emission: %w", b.EncErr()))
+	}
+}
+
+// emitSubagentLifecycle is intentionally dormant until runtime persists child
+// records. It accepts only a complete, nested durable identity; root-only or
+// partial future records cannot manufacture a subagent protocol frame.
+func (b *Bridge) emitSubagentLifecycle(event session.EventRecord) {
+	parts := strings.Split(event.AgentPath, "/")
+	if event.ID == "" || event.SessionID == "" || event.RunID == "" || event.MessageID == "" || event.TurnID == "" || event.Correlation == "" || len(parts) < 2 {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable subagent lifecycle"))
+		b.emitTerminalError()
+		return
+	}
+	path := make([]convert.AgentPathSegment, len(parts))
+	for i, part := range parts {
+		if part == "" {
+			b.recordLiveErr(fmt.Errorf("agui: invalid durable subagent path"))
+			b.emitTerminalError()
+			return
+		}
+		path[i] = convert.AgentPathSegment{Name: part, RunID: string(event.RunID)}
+	}
+	identity := convert.AgenticIdentityV1{SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: string(event.TurnID), MessageID: string(event.MessageID), AttemptID: event.Correlation, AgentPath: path}
+	kind := convert.EnvelopeSubagentStarted
+	if event.Kind == session.SubagentFinishedEventKind {
+		kind = convert.EnvelopeSubagentFinished
+	}
+	if event.Kind == session.SubagentErrorEventKind {
+		kind = convert.EnvelopeSubagentError
+	}
+	fact := convert.LifecycleFactV1{}
+	if kind == convert.EnvelopeSubagentError {
+		fact.Detail = "subagent failed"
+	}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: kind, Identity: identity, Lifecycle: &fact}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: subagent lifecycle digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	receipt := convert.CommitReceiptV1{Revision: string(event.ID), Domain: "lifecycle", Kind: kind, Identity: identity, Digest: digest}
+	var emitted bool
+	switch event.Kind {
+	case session.SubagentStartedEventKind:
+		emitted = b.emit.SubagentStartedCommitted(fact, receipt)
+	case session.SubagentFinishedEventKind:
+		emitted = b.emit.SubagentFinishedCommitted(fact, receipt)
+	default:
+		emitted = b.emit.SubagentErrorCommitted(fact, receipt)
+	}
+	if !emitted && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: subagent lifecycle emission: %w", b.EncErr()))
 	}
 }
 
@@ -506,62 +673,72 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	}
 	payload := messageDeltaPayload{}
 	_ = json.Unmarshal(event.Payload, &payload)
-	// includeReasoning gates this live delta path exactly like it gates
-	// the durable committed-projection path (emitLiveMessageCommitted,
-	// emitMessageSnapshot): a host that has not attested
-	// GateProviderReasoningStorage is satisfied (agui/policy.go) must
-	// never see live reasoning deltas either, or the gate is closed on
-	// one path of this bridge and open on the other for the same
-	// reconnecting client (W7 fix-pass review finding P1-D/I3).
+	// includeReasoning gates this live delta path exactly like it gates the
+	// durable committed-projection path.
 	if b.includeReasoning && payload.Reasoning != "" {
-		if b.textOpen[messageID] {
-			textEnd := nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}
-			if !b.ensureNative(textEnd, b.emit, aguievents.NewTextMessageEndEvent(string(messageID))) {
-				return
-			}
-			delete(b.textOpen, messageID)
-		}
-		reasoningID := b.reasoning[messageID]
-		if reasoningID == "" {
-			reasoningID = string(messageID)
-			reasoningStart := nativeFrameKey{kind: aguievents.EventTypeReasoningStart, ownerID: reasoningID}
-			if !b.ensureNative(reasoningStart, b.emit, aguievents.NewReasoningStartEvent(reasoningID)) {
-				return
-			}
-			reasoningMessageStart := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageStart, ownerID: reasoningID}
-			if !b.ensureNative(reasoningMessageStart, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning")) {
-				return
-			}
-			b.reasoning[messageID] = reasoningID
-		}
-		if b.deliverNative(b.nextDeltaKey(aguievents.EventTypeReasoningMessageContent, messageID), b.emit, aguievents.NewReasoningMessageContentEvent(reasoningID, payload.Reasoning)) {
-			b.markNativeStreamed(messageID)
-		}
+		b.emitTransientBlock(event, einoschema.ContentBlockTypeReasoning, payload.Reasoning, nil)
 	}
 	if payload.Content != "" {
-		if b.reasoning[messageID] != "" {
-			reasoningID := b.reasoning[messageID]
-			messageEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}
-			if !b.ensureNative(messageEnd, b.emit, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
-				return
-			}
-			reasoningEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}
-			if !b.ensureNative(reasoningEnd, b.emit, aguievents.NewReasoningEndEvent(reasoningID)) {
-				return
-			}
-			delete(b.reasoning, messageID)
-		}
-		if !b.textOpen[messageID] {
-			textStart := nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(messageID)}
-			if !b.ensureNative(textStart, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant"))) {
-				return
-			}
-			b.textOpen[messageID] = true
-		}
-		if b.deliverNative(b.nextDeltaKey(aguievents.EventTypeTextMessageContent, messageID), b.emit, aguievents.NewTextMessageContentEvent(string(messageID), payload.Content)) {
-			b.markNativeStreamed(messageID)
-		}
+		b.emitTransientBlock(event, einoschema.ContentBlockTypeAssistantGenText, payload.Content, nil)
 	}
+}
+
+// emitTransientBlock emits one self-contained live native chunk via the
+// accepted convert contract. A transient chunk must carry the same durable
+// invocation identity as its eventual committed projection; an uncorrelated
+// legacy event is therefore intentionally dropped rather than poisoning the
+// emitter's per-message attempt state with a fabricated identity.
+func (b *Bridge) emitTransientBlock(event session.EventRecord, kind einoschema.ContentBlockType, text string, call *convert.PublicFunctionToolCall) {
+	if event.Correlation == "" {
+		return
+	}
+	b.nativeDeltaOrdinal++
+	messageID := string(event.MessageID)
+	turnID := string(event.TurnID)
+	if turnID == "" {
+		turnID = syntheticTurnID(event.MessageID)
+	}
+	runID := string(event.RunID)
+	if runID == "" {
+		runID = b.runID
+	}
+	sessionID := string(event.SessionID)
+	if sessionID == "" {
+		sessionID = b.threadID
+	}
+	attemptID := event.Correlation
+	pathName := event.AgentPath
+	if pathName == "" {
+		pathName = rootAgentPathName
+	}
+	identity := convert.AgenticIdentityV1{
+		SessionID: sessionID, ThreadID: sessionID, RunID: runID, TurnID: turnID,
+		MessageID: messageID, AttemptID: attemptID,
+		BlockID:   fmt.Sprintf("live:%s:%d", messageID, b.nativeDeltaOrdinal),
+		AgentPath: []convert.AgentPathSegment{{Name: pathName, RunID: runID}},
+	}
+	block := convert.PublicContentBlock{Type: kind, Identity: identity, FunctionToolCall: call}
+	if text != "" {
+		block.Text = &text
+	}
+	transient, err := convert.TransientEventForBlock(block)
+	if errors.Is(err, convert.ErrNoTransientNativeEvent) {
+		return
+	}
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: transient block conversion failed: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	key := nativeFrameKey{kind: transient.Event.Type(), ownerID: messageID, blockID: identity.BlockID}
+	if b.nativeDelivered(key) || !b.emit.EmitTransientBlock(transient) {
+		return
+	}
+	if b.nativeFrames == nil {
+		b.nativeFrames = map[nativeFrameKey]bool{}
+	}
+	b.nativeFrames[key] = true
+	b.markNativeStreamed(event.MessageID)
 }
 
 // emitToolCallUpdated is deliberately NOT guarded by Bridge.messageProjected

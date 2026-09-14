@@ -517,7 +517,7 @@ func TestReconnectDoesNotDuplicateNativeContentForMessageCommittedDuringReplayWi
 	// one), so agui/replay.go's seen[event.ID] guard cannot suppress it --
 	// only Bridge.projectedMessages (emitMessageDelta's new guard) can.
 	sendOrTimeout(session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: "assistant-late",
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: "assistant-late", Correlation: "assistant-late",
 		Payload: []byte(`{"content":"LATE-TEXT","reasoning":""}`),
 	})
 	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-late-finished", SessionID: sessionID, MessageID: "assistant-late"})
@@ -638,7 +638,7 @@ func TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder(t *testing
 	// reconnecting client is waiting to see for the message it reconnected
 	// mid-stream to watch.
 	sendOrTimeout(session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID, Correlation: string(messageID),
 		Payload: []byte(`{"content":"HELLO-LIVE","reasoning":""}`),
 	})
 	sendOrTimeout(session.EventRecord{Kind: runtime.EventRunFinished, ID: "evt-inflight-finished", SessionID: sessionID, MessageID: messageID})
@@ -666,14 +666,14 @@ func TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder(t *testing
 	// ahead of the terminal frame), followed by RUN_FINISHED. Before this
 	// fix, "FINAL types: []" -- not one frame reached the wire for the
 	// whole turn.
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_FINISHED"
+	want := "TEXT_MESSAGE_CHUNK,RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (a live delta for an in-flight, unfinalized assistant message must reach the client, not be dropped as stale)", got, want)
 	}
 	if messageID, _ := frames[0]["messageId"].(string); messageID != "assistant-inflight" {
 		t.Fatalf("frame[0] messageId = %q, want assistant-inflight", messageID)
 	}
-	if delta, _ := frames[1]["delta"].(string); delta != "HELLO-LIVE" {
-		t.Fatalf("frame[1] delta = %q, want HELLO-LIVE", delta)
+	if delta, _ := frames[0]["delta"].(string); delta != "HELLO-LIVE" {
+		t.Fatalf("frame[0] delta = %q, want HELLO-LIVE", delta)
 	}
 }

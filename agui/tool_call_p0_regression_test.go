@@ -192,7 +192,7 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 	// own commit notification (runtime/tool_execution.go's
 	// persistToolSettlement).
 	bridge.Emit(ctx, session.EventRecord{
-		Kind: runtime.EventMessageDelta, SessionID: fx.sessionID, RunID: fx.runID, MessageID: fx.assistantID,
+		Kind: runtime.EventMessageDelta, SessionID: fx.sessionID, RunID: fx.runID, MessageID: fx.assistantID, Correlation: string(fx.assistantID),
 		Payload: []byte(`{"content":"let me check that","reasoning":""}`),
 	})
 	bridge.Emit(ctx, session.EventRecord{
@@ -239,7 +239,7 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 	// function_tool_result block's call already got its
 	// native TOOL_CALL_RESULT from the live path above, so no duplicate
 	// native TOOL_CALL_RESULT here.
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,CUSTOM,CUSTOM,TEXT_MESSAGE_END,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
+	want := "TEXT_MESSAGE_CHUNK,CUSTOM,CUSTOM,TOOL_CALL_START,TOOL_CALL_ARGS,TOOL_CALL_END,TOOL_CALL_RESULT,CUSTOM,RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s", got, want)
 	}
@@ -247,7 +247,7 @@ func TestBridgeDeliversFullStreamingTextThenToolCallTurn(t *testing.T) {
 	// The TOOL_CALL_START/ARGS/END/RESULT frames must all name the same
 	// call, and TOOL_CALL_RESULT must be for a call the client actually saw
 	// opened -- the exact protocol-validity property P0-1 restores.
-	startIdx, argsIdx, endIdx, resultIdx := 5, 6, 7, 8
+	startIdx, argsIdx, endIdx, resultIdx := 3, 4, 5, 6
 	if id, _ := frames[startIdx]["toolCallId"].(string); id != string(fx.callID) {
 		t.Fatalf("TOOL_CALL_START toolCallId = %q, want %q", id, fx.callID)
 	}

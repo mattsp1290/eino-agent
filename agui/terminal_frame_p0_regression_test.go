@@ -160,7 +160,7 @@ func TestTerminateClosesOpenSpansThroughFallbackEmitter(t *testing.T) {
 	sink := newSSESink()
 	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(context.Background(), session.EventRecord{
-		Kind: runtime.EventMessageDelta, MessageID: "assistant-1",
+		Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Correlation: "assistant-1",
 		Payload: []byte(`{"content":"still streaming","reasoning":""}`),
 	})
 	if ok := bridge.Terminate(context.Background(), errors.New("host deadline")); !ok {
@@ -169,7 +169,7 @@ func TestTerminateClosesOpenSpansThroughFallbackEmitter(t *testing.T) {
 
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_ERROR"
+	want := "TEXT_MESSAGE_CHUNK,RUN_ERROR"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (Terminate must close the open text span before its terminal frame)", got, want)
 	}

@@ -80,8 +80,14 @@ func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 	// would be empty and the commit below would correctly (per
 	// emitLiveMessageCommitted's doc comment) use DeliveryModeCommittedOnly
 	// instead, defeating this test's purpose.
+	// A legacy uncorrelated delta is deliberately a safe no-op: it cannot
+	// fabricate an attempt identity that would poison the committed projection.
 	bridge.Emit(ctx, session.EventRecord{
 		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID,
+		Payload: []byte(`{"content":"uncorrelated preview","reasoning":""}`),
+	})
+	bridge.Emit(ctx, session.EventRecord{
+		Kind: runtime.EventMessageDelta, SessionID: sessionID, RunID: run.ID, MessageID: messageID, Correlation: string(messageID),
 		Payload: []byte(`{"content":"streaming preview","reasoning":""}`),
 	})
 	bridge.Emit(ctx, session.EventRecord{
@@ -97,7 +103,7 @@ func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,CUSTOM"
+	want := "TEXT_MESSAGE_CHUNK,CUSTOM"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (the delta's own native frames, then a single CUSTOM content-block supplement for the commit -- no duplicate native events on the live path)", got, want)
 	}

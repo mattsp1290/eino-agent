@@ -548,6 +548,15 @@ func (o *StreamingOrchestrator) reconcileCrashedRun(ctx context.Context, executi
 		}
 		request.PromoteRevision = checkpoints.lastStaged
 	}
+	revision := promoted.Revision
+	if request.PromoteRevision != 0 {
+		revision = request.PromoteRevision
+	}
+	payload, err := pauseLifecyclePayload(event, revision, "root", nil)
+	if err != nil {
+		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
+	}
+	request.Event.Payload = payload
 	if _, err := execution.store.RepauseRun(ctx, request); err != nil {
 		return Result{RunID: run.ID, Status: session.RunFailed, Error: err}
 	}

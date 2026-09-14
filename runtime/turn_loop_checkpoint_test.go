@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -71,6 +72,27 @@ func TestTurnLoopChecksPointsAndResumesInterruptedTool(t *testing.T) {
 	if err != nil || run.Status != session.RunPaused {
 		t.Fatalf("run = %+v, err=%v", run, err)
 	}
+	events, err := store.ListEvents(context.Background(), "session-1", session.EventCursor{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListEvents error = %v", err)
+	}
+	var paused session.EventRecord
+	for _, event := range events.Events {
+		if event.Kind == session.RunPausedEventKind {
+			paused = event
+			break
+		}
+	}
+	if paused.ID == "" {
+		t.Fatal("durable run_paused event missing")
+	}
+	var lifecycle session.PauseLifecycleV1
+	if err := json.Unmarshal(paused.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle) != nil {
+		t.Fatalf("invalid durable pause lifecycle: %#v err=%v", lifecycle, err)
+	}
+	if lifecycle.PauseID != string(paused.ID) || lifecycle.Targets[0].ID != pause.InterruptContexts[0].ID {
+		t.Fatalf("pause lifecycle mismatch: %#v", lifecycle)
+	}
 
 	resumeHandle, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{
 		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
@@ -84,6 +106,27 @@ func TestTurnLoopChecksPointsAndResumesInterruptedTool(t *testing.T) {
 	}
 	if executions != 1 {
 		t.Fatalf("tool executions after resume = %d, want 1", executions)
+	}
+	events, err = store.ListEvents(context.Background(), "session-1", session.EventCursor{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListEvents after resume error = %v", err)
+	}
+	var resumedEvent session.EventRecord
+	for _, event := range events.Events {
+		if event.Kind == session.RunResumedEventKind {
+			resumedEvent = event
+			break
+		}
+	}
+	if resumedEvent.ID == "" {
+		t.Fatal("durable post-redrive run_resumed event missing")
+	}
+	var resumedLifecycle session.PauseLifecycleV1
+	if err := json.Unmarshal(resumedEvent.Payload, &resumedLifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, resumedLifecycle) != nil {
+		t.Fatalf("invalid durable resumed lifecycle: %#v err=%v", resumedLifecycle, err)
+	}
+	if resumedLifecycle.ResumedPauseID != lifecycle.PauseID || resumedLifecycle.NewTurnID == "" || resumedLifecycle.NewAttemptID == "" || resumedLifecycle.ResumeMode != session.ResumeModeFull || len(resumedLifecycle.ResumedTargetIDs) != 1 || resumedLifecycle.ResumedTargetIDs[0] != pause.InterruptContexts[0].ID {
+		t.Fatalf("resumed lifecycle mismatch: %#v", resumedLifecycle)
 	}
 	finalRun, err := store.GetRun(context.Background(), result.RunID)
 	if err != nil || finalRun.Status != session.RunCompleted {

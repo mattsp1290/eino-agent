@@ -8,7 +8,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -225,7 +224,7 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 		methodNotAllowed(w, http.MethodPost)
 		return
 	}
-	message, err := decodeRunMessage(r)
+	message, err := transport.DecodeUserMessage(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -238,7 +237,9 @@ func (s *Server) startRun(w http.ResponseWriter, r *http.Request, sessionID sess
 	})
 	if err != nil {
 		status := http.StatusConflict
-		if !errors.Is(err, session.ErrSessionBusy) {
+		if errors.Is(err, runtime.ErrInvalidOrchestrator) {
+			status = http.StatusBadRequest
+		} else if !errors.Is(err, session.ErrSessionBusy) {
 			status = http.StatusBadGateway
 		}
 		http.Error(w, err.Error(), status)
@@ -318,27 +319,6 @@ func minimalConfig() config.Snapshot {
 			"workspace_root": cwd,
 		},
 	}
-}
-
-func decodeRunMessage(r *http.Request) (runtime.UserMessage, error) {
-	var payload struct {
-		Message string `json:"message"`
-	}
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&payload); err != nil {
-		return runtime.UserMessage{}, err
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = fmt.Errorf("exactly one JSON object required")
-		}
-		return runtime.UserMessage{}, err
-	}
-	if strings.TrimSpace(payload.Message) == "" {
-		return runtime.UserMessage{}, fmt.Errorf("message required")
-	}
-	return runtime.TextUserMessage(payload.Message), nil
 }
 
 func parseSessionRoute(path string) (session.ID, string, bool) {

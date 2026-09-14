@@ -2522,11 +2522,12 @@ verified below -- it is not a complete account of the W7 plan
 (`.agents/plans/eino-v0-9-19/07-transport-and-observability.md`). Durable
 identity, `message_committed`, and the agentic committed-projection
 emission path (replay and live) are implemented and tested. Rich AG-UI
-transport ingress (decode plus two new handlers) is implemented and tested
-but not yet wired as the default path. Full AG-UI lifecycle mapping
-(`run_paused`/`attempt_replaced`/subagent events), transient per-block live
-deltas, watch bounded block state, and the observability typed-callback
-adapters are **not implemented** by this pass -- see
+transport ingress is implemented, tested, and used by the minimal server's
+POST run-admission route. Transient assistant-text and enabled-reasoning
+chunks use the agentic converter. Full AG-UI lifecycle mapping
+(`run_paused`/`run_resumed`/`attempt_replaced`/subagent events), watch bounded
+block state, and the observability typed-callback adapters are **not
+implemented** by this pass -- see
 `docs/architecture/agui-events.md`'s "W7" section for the exact boundary.
 Verified: `go build ./...`; `go vet ./...` and `-tags postgres_integration`;
 `gofmt`/`goimports` clean; `golangci-lint` 0 issues; `go test ./... -count=1`;
@@ -2700,9 +2701,9 @@ flagged rather than silently ignored.
   in-bounds target id or idempotency key never substitutes for a failed
   auth call. `ResumeTargetedHandler` bounds target count (256) and per-id
   length (512 bytes); `EnqueueHandler` requires a bounded `Idempotency-Key`
-  header. Not yet wired as the default ingress path in `SSEHandler` or
-  `examples/minimal-server`, which decodes its own request body inline
-  (`examples/minimal-server/main.go`). The classic `transport.DecodeMessages`
+  header. `examples/minimal-server` uses this decoder as its default
+  `POST /sessions/{id}/runs` ingress; `SSEHandler` remains egress-only.
+  The classic `transport.DecodeMessages`
   this paragraph previously described as "the default for existing callers"
   had zero callers anywhere in the module (its own declaration and doc
   comment were the only two matches) and has been removed as part of W8's
@@ -2711,9 +2712,7 @@ flagged rather than silently ignored.
   `run_paused`/`InterruptTargetV1` construction from durable approval
   records, `run_resumed`, `attempt_replaced`, and subagent lifecycle
   mapping (the runtime does not emit any `Subagent*EventKind` anywhere yet,
-  so there is nothing for a mapping to consume); transient per-block live
-  deltas via `convert.TransientEventForBlock` (today's live path still uses
-  the classic per-delta emitter methods); `watch/`'s bounded public block
+  so there is nothing for a mapping to consume); `watch/`'s bounded public block
   state and block-indexed live overlay; the observability typed-callback
   adapters and single accounting source. Each of these touches a
   deeply concurrent or correctness-sensitive existing subsystem (interrupt/
