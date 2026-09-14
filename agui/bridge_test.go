@@ -475,6 +475,23 @@ func TestBridgeProjectsValidatedDurablePause(t *testing.T) {
 	}
 }
 
+func TestBridgeProjectsDurableAttemptReplacement(t *testing.T) {
+	t.Parallel()
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-1", "run-1", nil)
+	bridge.Emit(context.Background(), session.EventRecord{
+		ID: "event-2", SessionID: "session-1", RunID: "run-1", MessageID: "message-1", TurnID: "turn-1", AgentPath: "root",
+		Kind: session.AttemptReplacedEventKind, Payload: []byte(`{"old_invocation_id":"attempt-1","new_invocation_id":"attempt-2"}`),
+	})
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("attempt replacement encoding error = %v", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, `"type":"CUSTOM"`) || !strings.Contains(raw, `"kind":"attempt_replaced"`) || !strings.Contains(raw, `"oldAttemptId":"attempt-1"`) || !strings.Contains(raw, `"newAttemptId":"attempt-2"`) {
+		t.Fatalf("attempt replacement lifecycle missing from SSE: %s", raw)
+	}
+}
+
 type sseSink struct {
 	buffer bytes.Buffer
 	writer *bufio.Writer

@@ -266,6 +266,8 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		b.emitLiveMessageCommitted(ctx, event)
 	case session.RunPausedEventKind:
 		b.emitPaused(event)
+	case session.AttemptReplacedEventKind:
+		b.emitAttemptReplaced(event)
 	case runtime.EventRunFinished:
 		// terminated guards against writing a second terminal frame: a
 		// durable RUN_FINISHED/RUN_ERROR reaching Emit twice (a redundant
@@ -295,6 +297,38 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		} else {
 			b.emit.RunFinishedSuccess()
 		}
+	}
+}
+
+func (b *Bridge) emitAttemptReplaced(event session.EventRecord) {
+	var payload struct {
+		Old string `json:"old_invocation_id"`
+		New string `json:"new_invocation_id"`
+	}
+	if err := json.Unmarshal(event.Payload, &payload); err != nil || payload.Old == "" || payload.New == "" || payload.Old == payload.New {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable attempt replacement"))
+		b.emitTerminalError()
+		return
+	}
+	turnID := string(event.TurnID)
+	if turnID == "" {
+		turnID = syntheticTurnID(event.MessageID)
+	}
+	path := event.AgentPath
+	if path == "" {
+		path = rootAgentPathName
+	}
+	identity := convert.AgenticIdentityV1{SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: turnID, MessageID: string(event.MessageID), AttemptID: payload.Old, AgentPath: []convert.AgentPathSegment{{Name: path, RunID: string(event.RunID)}}}
+	replacement := convert.AttemptReplacedV1{OldAttemptID: payload.Old, NewAttemptID: payload.New, Cause: "retry", Semantics: "replace"}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: convert.EnvelopeAttemptReplaced, Identity: identity, AttemptReplaced: &replacement}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: attempt replacement digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	if !b.emit.AttemptReplaced(replacement, convert.CommitReceiptV1{Revision: string(event.ID), Domain: "lifecycle", Kind: convert.EnvelopeAttemptReplaced, Identity: identity, Digest: digest}) && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: attempt replacement emission: %w", b.EncErr()))
 	}
 }
 
