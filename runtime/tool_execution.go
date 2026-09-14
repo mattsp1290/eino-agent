@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"time"
 
 	"github.com/mattsp1290/eino-agent/extension"
+	"github.com/mattsp1290/eino-agent/internal/jsonvalue"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -91,7 +91,7 @@ func (e *runExecution) settleInterruptedTool(ctx context.Context, run session.Ru
 	var output ToolOutput
 	// SQL stores decode an unsettled call's absent output as JSON null rather
 	// than an empty payload; both mean no output was recorded.
-	if len(raw) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+	if jsonvalue.IsAbsent(raw) {
 		raw, output, _, _ = encodeToolOutput(claimed.ID, ToolResult{Output: "tool execution interrupted"}, tool.Retention, ToolInterrupted, nil)
 		metadata = toolSettlementMetadata(metadata, output)
 		result.Output = output.Content

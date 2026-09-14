@@ -2,6 +2,7 @@ package agui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -47,6 +48,99 @@ func TestReplayEmitsDurableEventsAndOmitsLiveOnlyDeltas(t *testing.T) {
 	if strings.Contains(string(sink.Bytes()), "AGUI_PROVIDER_STATE_SENTINEL") || strings.Contains(string(sink.Bytes()), "provider_state") {
 		t.Fatalf("provider state leaked to replay: %s", sink.Bytes())
 	}
+}
+
+func TestReplayTreatsCorrelatedEmptyRepauseAsAuditOnly(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	store, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("open sqlite store: %v", err)
+	}
+	t.Cleanup(func() { _ = pool.Close() })
+	now := time.Date(2026, 6, 28, 13, 0, 0, 0, time.UTC)
+	if _, err := store.CreateSession(ctx, session.Session{ID: "session-pause-replay", CreatedAt: now, UpdatedAt: now}); err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	run, err := store.AdmitRun(ctx, session.Run{ID: "run-pause-replay", SessionID: "session-pause-replay", OwnerID: "owner", ClaimToken: "claim", Status: session.RunPending, CreatedAt: now}, time.Minute)
+	if err != nil {
+		t.Fatalf("admit run: %v", err)
+	}
+	execution := store.Execution(session.RunFence{RunID: run.ID, ClaimToken: run.ClaimToken})
+	pause := session.PauseLifecycleV1{
+		Version: session.PauseLifecycleVersion, PauseID: "evt-pause", CheckpointRevision: 1, Generation: 1,
+		AgentPath: "root", MessageID: "pause:run-pause-replay", AttemptID: "pause:run-pause-replay", EventRevision: "evt-pause",
+		Targets: []session.PauseInterruptTarget{{ID: "target-1", Address: "root,tool"}},
+	}
+	pausePayload, err := json.Marshal(pause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := execution.RepauseRun(ctx, session.RepauseRunRequest{Event: session.EventRecord{ID: "evt-pause", SessionID: run.SessionID, RunID: run.ID, Kind: session.RunPausedEventKind, Payload: pausePayload, CreatedAt: now}}); err != nil {
+		t.Fatalf("append original pause: %v", err)
+	}
+	claimed, err := store.ClaimRun(ctx, session.RunClaim{RunID: run.ID, OwnerID: "owner", ClaimToken: "claim-compensation", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatalf("claim for compensation: %v", err)
+	}
+	execution = store.Execution(session.RunFence{RunID: claimed.ID, ClaimToken: claimed.ClaimToken})
+	if _, err := execution.RepauseRun(ctx, session.RepauseRunRequest{Event: session.EventRecord{ID: "evt-compensation", SessionID: run.SessionID, RunID: run.ID, Kind: session.RunPausedEventKind, Correlation: pause.EventRevision, CreatedAt: now.Add(time.Second)}}); err != nil {
+		t.Fatalf("append compensation pause: %v", err)
+	}
+
+	assertReplay := func(t *testing.T, cursor session.EventCursor, wantPaused, wantResumed int) {
+		t.Helper()
+		sink := newSSESink()
+		bridge := NewBridge(ctx, store, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), string(run.SessionID), string(run.ID), nil)
+		if _, err := Replay(ctx, bridge, store, run.SessionID, cursor, session.ContentLimits{}, false); err != nil {
+			t.Fatalf("Replay error = %v", err)
+		}
+		if err := bridge.EncErr(); err != nil {
+			t.Fatalf("EncErr = %v", err)
+		}
+		raw := string(sink.Bytes())
+		if got := strings.Count(raw, `"kind":"paused"`); got != wantPaused {
+			t.Fatalf("paused projections = %d, want %d; stream=%s", got, wantPaused, raw)
+		}
+		if got := strings.Count(raw, `"kind":"resumed"`); got != wantResumed {
+			t.Fatalf("resumed projections = %d, want %d; stream=%s", got, wantResumed, raw)
+		}
+		if strings.Contains(raw, `"type":"RUN_ERROR"`) {
+			t.Fatalf("replay emitted RUN_ERROR: %s", raw)
+		}
+	}
+
+	// Full replay sees the original lifecycle and treats the correlated,
+	// payload-less compensation record as audit-only.
+	assertReplay(t, session.EventCursor{Limit: 10}, 1, 0)
+	// A cursor after the original pause hydrates that unresolved lifecycle,
+	// then skips the compensation record without duplicating it.
+	assertReplay(t, session.EventCursor{AfterEventID: "evt-pause", Limit: 10}, 1, 0)
+
+	resume := pause
+	resume.EventRevision = "evt-resumed"
+	resume.ResumedPauseID = pause.PauseID
+	resume.ResumedTargetIDs = []string{"target-1"}
+	resume.ResumeMode = session.ResumeModeFull
+	resume.NewTurnID = "turn-2"
+	resume.NewAttemptID = "attempt-2"
+	resume.ResumePhase = session.ResumePhaseFact
+	resumePayload, err := json.Marshal(resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err = store.ClaimRun(ctx, session.RunClaim{RunID: run.ID, OwnerID: "owner", ClaimToken: "claim-resumed", LeaseDuration: time.Minute})
+	if err != nil {
+		t.Fatalf("claim for resumed lifecycle: %v", err)
+	}
+	execution = store.Execution(session.RunFence{RunID: claimed.ID, ClaimToken: claimed.ClaimToken})
+	if _, err := execution.AppendEvent(ctx, session.EventRecord{ID: "evt-resumed", SessionID: run.SessionID, RunID: run.ID, Kind: session.RunResumedEventKind, Correlation: pause.EventRevision, Payload: resumePayload, CreatedAt: now.Add(2 * time.Second)}); err != nil {
+		t.Fatalf("append resumed lifecycle: %v", err)
+	}
+	// Hydration through the compensation restores the original once, allowing
+	// the subsequent resumed fact to resolve that same pause identity.
+	assertReplay(t, session.EventCursor{AfterEventID: "evt-compensation", Limit: 10}, 1, 1)
 }
 
 func TestReconnectReplaysThenTailsLiveEventsUntilDisconnect(t *testing.T) {

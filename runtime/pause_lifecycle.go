@@ -9,6 +9,7 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 
+	"github.com/mattsp1290/eino-agent/internal/jsonvalue"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -36,9 +37,22 @@ func loadPauseLifecycle(ctx context.Context, store session.Store, sessionID sess
 			if event.RunID != runID || event.Kind != session.RunPausedEventKind {
 				continue
 			}
+			// A post-claim StartRun failure is compensated by a payload-less
+			// audit record correlated to the unresolved lifecycle pause. It did
+			// not promote a new checkpoint or create a new pause generation, so
+			// retain that exact currently matched lifecycle. Correlation only
+			// preserves a match when it names the match's durable event revision;
+			// every other payload-less pause remains authoritative and clears it.
+			if jsonvalue.IsAbsent(event.Payload) {
+				if matched != nil && event.Correlation != "" && event.Correlation == matched.EventRevision {
+					continue
+				}
+				matched = nil
+				continue
+			}
 			// A later repause is the authoritative generation even when it is
-			// a historical empty record. Never resurrect an older fact sharing
-			// a promoted checkpoint revision.
+			// malformed. Never resurrect an older fact sharing a promoted
+			// checkpoint revision.
 			matched = nil
 			var value session.PauseLifecycleV1
 			if json.Unmarshal(event.Payload, &value) != nil || session.ValidatePauseLifecycle(session.RunPausedEventKind, value) != nil {

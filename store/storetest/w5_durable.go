@@ -36,7 +36,10 @@ func turnCompletedEvent(id session.EventID, r session.Run, turnID session.TurnID
 }
 
 func runPausedEvent(id session.EventID, r session.Run, at time.Time) session.EventRecord {
-	return session.EventRecord{ID: id, SessionID: r.SessionID, RunID: r.ID, Kind: session.RunPausedEventKind, Payload: []byte(`{}`), CreatedAt: at}
+	// These store contracts exercise an operational pause, not an interactive
+	// pause lifecycle fact. Leave Payload absent so ValidatePromotePause does
+	// not interpret a placeholder object as a malformed lifecycle record.
+	return session.EventRecord{ID: id, SessionID: r.SessionID, RunID: r.ID, Kind: session.RunPausedEventKind, CreatedAt: at}
 }
 
 func stagedCheckpoint(r session.Run, revision int64, id string, kind session.CheckpointKind, bytes []byte, at time.Time) session.Checkpoint {

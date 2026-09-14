@@ -1788,10 +1788,9 @@ type ResumeRequest struct {
 // such check has passed does it claim the fence, rebuild the run's engine,
 // and drive a fresh TurnLoop seeded from the promoted checkpoint bytes. One
 // fenced write still happens after the claim (StartRun, in the returned
-// handle's driving goroutine): its failure is deliberately not compensated
-// with a re-pause and instead left for lease-expiry recovery, matching
-// finishTurnLoop's checkpoint-Set-failure posture -- see that goroutine's
-// own doc comment for why.
+// handle's driving goroutine). If it fails, the runtime compensates the claim
+// back to paused while retaining the unresolved promoted checkpoint and pause
+// lifecycle; see that goroutine's comment for the failure protocol.
 func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.RunID, request ResumeRequest) (Handle, error) {
 	if err := o.validateConfigured(); err != nil {
 		return nil, err
@@ -1996,7 +1995,7 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		// can simply try again.
 		started, err := execution.store.StartRun(runCtx, o.now())
 		if err != nil {
-			o.resumeStartFailureRepause(runCtx, execution, runID, claimed.SessionID, claimed.ContextEpoch, checkpoint.Revision, handle, err)
+			o.resumeStartFailureRepause(runCtx, execution, runID, claimed.SessionID, claimed.ContextEpoch, resumeLifecycle, handle, err)
 			return
 		}
 		_ = started
@@ -2015,15 +2014,15 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 // expiry recovery -- the same conservative posture finishTurnLoop's
 // checkpoint-Set-failure branch already takes when it cannot safely
 // compensate either.
-func (o *StreamingOrchestrator) resumeStartFailureRepause(ctx context.Context, execution *runExecution, runID session.RunID, sessionID session.ID, epochID session.EpochID, checkpointRevision int64, handle *turnLoopHandle, cause error) {
+func (o *StreamingOrchestrator) resumeStartFailureRepause(ctx context.Context, execution *runExecution, runID session.RunID, sessionID session.ID, epochID session.EpochID, resumeLifecycle *resumeLifecycleFact, handle *turnLoopHandle, cause error) {
 	o.unregisterLoop(runID)
 	repauseCtx := context.WithoutCancel(ctx)
 	event := session.EventRecord{
 		ID: o.ids.NewEventID(), SessionID: sessionID, RunID: runID, EpochID: epochID,
 		Kind: session.RunPausedEventKind, CreatedAt: o.now(),
 	}
-	if payload, err := pauseLifecyclePayload(event, checkpointRevision, "root", nil); err == nil {
-		event.Payload = payload
+	if resumeLifecycle != nil {
+		event.Correlation = resumeLifecycle.paused.EventRevision
 	}
 	status := session.RunPaused
 	resultErr := cause
