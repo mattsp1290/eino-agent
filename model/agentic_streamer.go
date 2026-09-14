@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"io"
 
 	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
@@ -57,6 +58,16 @@ func streamAgentic(ctx context.Context, client einomodel.AgenticModel, req Reque
 	if upstream == nil {
 		return nil, Error{Code: "nil_provider_stream", Message: "Eino agentic model returned nil stream"}
 	}
+	return streamAgenticReader(upstream, retainResponseMetaState, func() (any, error) {
+		return nil, io.EOF
+	}), nil
+}
+
+// streamAgenticReader converts one native agentic stream. onEOF is deliberately
+// kept private: production uses it only to make clean EOF explicit, while tests
+// exercise Eino's injected terminal-value and terminal-error semantics through
+// this exact adapter boundary.
+func streamAgenticReader(upstream *einoschema.StreamReader[*einoschema.AgenticMessage], retainResponseMetaState bool, onEOF func() (any, error)) *einoschema.StreamReader[StreamDelta] {
 	var retainedMarker string
 	return einoschema.StreamReaderWithConvert(upstream, func(message *einoschema.AgenticMessage) (StreamDelta, error) {
 		if message == nil {
@@ -82,7 +93,7 @@ func streamAgentic(ctx context.Context, client einomodel.AgenticModel, req Reque
 			}
 		}
 		return StreamDelta{Message: normalized, Usage: UsageFromAgenticMessage(normalized)}, nil
-	}), nil
+	}, einoschema.WithOnEOF(onEOF))
 }
 
 // normalizeResponseMetaExtension clones only the message/meta shells. A

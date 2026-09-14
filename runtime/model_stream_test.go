@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 
 	"github.com/mattsp1290/eino-agent/model"
@@ -19,6 +20,30 @@ type testModelStreamReader struct {
 	panicValue any
 	closePanic bool
 	closes     int
+}
+
+// nativeAdapterStreamModel provides native Eino streams so these tests cross
+// model.NewAgenticStreamer rather than testing receiveModelStream with a
+// hand-written model.StreamReader.
+type nativeAdapterStreamModel struct {
+	chunks    []*einoschema.AgenticMessage
+	streamErr error
+}
+
+func (m *nativeAdapterStreamModel) Generate(context.Context, []*einoschema.AgenticMessage, ...einomodel.Option) (*einoschema.AgenticMessage, error) {
+	return nil, errors.New("unused")
+}
+
+func (m *nativeAdapterStreamModel) Stream(context.Context, []*einoschema.AgenticMessage, ...einomodel.Option) (*einoschema.StreamReader[*einoschema.AgenticMessage], error) {
+	if m.streamErr == nil {
+		return einoschema.StreamReaderFromArray(m.chunks), nil
+	}
+	reader, writer := einoschema.Pipe[*einoschema.AgenticMessage](1)
+	go func() {
+		defer writer.Close()
+		writer.Send(nil, m.streamErr)
+	}()
+	return reader, nil
 }
 
 func (r *testModelStreamReader) Recv() (model.StreamDelta, error) {
@@ -132,6 +157,37 @@ func TestReceiveModelStreamRejectsNilChunk(t *testing.T) {
 	if reader.closes != 1 {
 		t.Fatalf("closes = %d, want 1", reader.closes)
 	}
+}
+
+func TestReceiveModelStreamWithNativeAgenticAdapterCompletesAndPropagatesSourceCancellation(t *testing.T) {
+	t.Run("clean completion", func(t *testing.T) {
+		client := &nativeAdapterStreamModel{chunks: []*einoschema.AgenticMessage{agenticAssistantText("done")}}
+		reader, err := model.NewAgenticStreamer(client).StreamProvider(context.Background(), model.Request{Identity: model.Identity{ProviderID: "fake", ModelID: "m1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result modelStreamResult
+		receiveModelStream(context.Background(), reader, defaultStreamLimits(), &result, nil)
+		if result.err != nil || result.message == nil || agenticMessageText(result.message) != "done" {
+			t.Fatalf("result = %#v", result)
+		}
+		if !result.receivedDelta {
+			t.Fatal("clean adapter stream did not produce a real delta")
+		}
+	})
+
+	t.Run("source-reported cancellation", func(t *testing.T) {
+		client := &nativeAdapterStreamModel{streamErr: context.Canceled}
+		reader, err := model.NewAgenticStreamer(client).StreamProvider(context.Background(), model.Request{Identity: model.Identity{ProviderID: "fake", ModelID: "m1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result modelStreamResult
+		receiveModelStream(context.Background(), reader, defaultStreamLimits(), &result, nil)
+		if !errors.Is(result.err, context.Canceled) || result.receivedDelta || result.message != nil {
+			t.Fatalf("result = %#v, want source context.Canceled without a final delta", result)
+		}
+	})
 }
 
 func TestReceiveModelStreamEnforcesMaxChunks(t *testing.T) {
