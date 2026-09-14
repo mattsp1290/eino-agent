@@ -74,7 +74,10 @@ func ValidatePauseLifecycle(kind string, value PauseLifecycleV1) error {
 	}
 	switch kind {
 	case RunPausedEventKind:
-		if value.CheckpointRevision <= 0 || len(value.Targets) == 0 || value.ResumedPauseID != "" {
+		// Operational pauses (for example a stop/recovery boundary) have no
+		// interactive target. Approval pauses must have one through the
+		// validated Approval link above.
+		if value.CheckpointRevision <= 0 || value.ResumedPauseID != "" {
 			return errors.New("invalid paused lifecycle fact")
 		}
 	case RunResumedEventKind:

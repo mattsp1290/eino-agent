@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -70,6 +71,27 @@ func TestTurnLoopChecksPointsAndResumesInterruptedTool(t *testing.T) {
 	run, err := store.GetRun(context.Background(), result.RunID)
 	if err != nil || run.Status != session.RunPaused {
 		t.Fatalf("run = %+v, err=%v", run, err)
+	}
+	events, err := store.ListEvents(context.Background(), "session-1", session.EventCursor{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListEvents error = %v", err)
+	}
+	var paused session.EventRecord
+	for _, event := range events.Events {
+		if event.Kind == session.RunPausedEventKind {
+			paused = event
+			break
+		}
+	}
+	if paused.ID == "" {
+		t.Fatal("durable run_paused event missing")
+	}
+	var lifecycle session.PauseLifecycleV1
+	if err := json.Unmarshal(paused.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle) != nil {
+		t.Fatalf("invalid durable pause lifecycle: %#v err=%v", lifecycle, err)
+	}
+	if lifecycle.PauseID != string(paused.ID) || lifecycle.Targets[0].ID != pause.InterruptContexts[0].ID {
+		t.Fatalf("pause lifecycle mismatch: %#v", lifecycle)
 	}
 
 	resumeHandle, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{

@@ -1130,6 +1130,20 @@ func (o *StreamingOrchestrator) finishTurnLoop(ctx context.Context, c *turnLoopC
 			ID: o.ids.NewEventID(), SessionID: c.sessionID, RunID: c.runID, EpochID: c.epochID, TurnID: engine.turn.ID,
 			Kind: session.RunPausedEventKind, CreatedAt: o.now(),
 		}
+		var interruptErr *adk.InterruptError
+		var cancelErr *adk.CancelError
+		var targets []*adk.InterruptCtx
+		if errors.As(state.ExitReason, &interruptErr) {
+			targets = interruptErr.InterruptContexts
+		} else if errors.As(state.ExitReason, &cancelErr) {
+			targets = cancelErr.InterruptContexts
+		}
+		payload, payloadErr := pauseLifecyclePayload(event, checkpoints.lastStaged, engine.agentPath, targets)
+		if payloadErr != nil {
+			_ = c.execution.stopLease()
+			return Result{RunID: c.runID, Status: session.RunInterrupted, Interrupted: true, Error: errors.Join(state.ExitReason, payloadErr)}
+		}
+		event.Payload = payload
 		_, err := c.execution.store.PromotePause(settleCtx, session.PromotePauseRequest{
 			Revision: checkpoints.lastStaged, TurnID: engine.turn.ID, InboxIDs: inboxIDs, Event: event,
 		})
