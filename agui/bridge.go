@@ -16,6 +16,7 @@ import (
 	"github.com/mattsp1290/eino-agui/convert"
 	aguiemitter "github.com/mattsp1290/eino-agui/emitter"
 
+	"github.com/mattsp1290/eino-agent/internal/jsonvalue"
 	"github.com/mattsp1290/eino-agent/runtime"
 	"github.com/mattsp1290/eino-agent/session"
 )
@@ -341,7 +342,7 @@ func (b *Bridge) emitAttemptReplaced(event session.EventRecord) {
 // from a live checkpoint would make reconnect semantics unsound.
 func (b *Bridge) emitPaused(event session.EventRecord) {
 	var lifecycle session.PauseLifecycleV1
-	if len(event.Payload) == 0 || bytes.Equal(bytes.TrimSpace(event.Payload), []byte("null")) || json.Unmarshal(event.Payload, &lifecycle) != nil {
+	if jsonvalue.IsAbsent(event.Payload) || json.Unmarshal(event.Payload, &lifecycle) != nil {
 		return
 	}
 	if err := session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle); err != nil {

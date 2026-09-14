@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/cloudwego/eino/adk"
 
+	"github.com/mattsp1290/eino-agent/internal/jsonvalue"
 	"github.com/mattsp1290/eino-agent/session"
 )
 
@@ -43,7 +43,7 @@ func loadPauseLifecycle(ctx context.Context, store session.Store, sessionID sess
 			// retain that exact currently matched lifecycle. Correlation only
 			// preserves a match when it names the match's durable event revision;
 			// every other payload-less pause remains authoritative and clears it.
-			if len(event.Payload) == 0 || bytes.Equal(bytes.TrimSpace(event.Payload), []byte("null")) {
+			if jsonvalue.IsAbsent(event.Payload) {
 				if matched != nil && event.Correlation != "" && event.Correlation == matched.EventRevision {
 					continue
 				}
