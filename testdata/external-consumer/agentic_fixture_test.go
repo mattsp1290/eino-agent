@@ -1084,23 +1084,50 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 	// caught this (fixture-integrity-reviewer, C1) proving it stays green
 	// even when the real output genuinely reaches the wire.
 	events := decodeSSEEvents(t, stream)
-	var toolCallStarts, toolCallResults []sseFrame
+	var toolCallStarts, toolCallArgs, toolCallEnds, toolCallResults []sseFrame
 	for _, ev := range events {
 		switch ev.Type {
 		case "TOOL_CALL_START":
 			toolCallStarts = append(toolCallStarts, ev)
+		case "TOOL_CALL_ARGS":
+			toolCallArgs = append(toolCallArgs, ev)
+		case "TOOL_CALL_END":
+			toolCallEnds = append(toolCallEnds, ev)
 		case "TOOL_CALL_RESULT":
 			toolCallResults = append(toolCallResults, ev)
 		}
 	}
 
-	// Replay emits one native lifecycle for the one durable call. This guards
-	// against reconnect duplication without relying on raw SSE substrings.
-	if len(toolCallStarts) != 1 {
-		t.Fatalf("expected exactly 1 TOOL_CALL_START event, got %d in: %s", len(toolCallStarts), stream)
+	// Replay emits one complete native lifecycle for the one durable call. This
+	// guards against reconnect duplication without relying on raw SSE substrings.
+	for kind, frames := range map[string][]sseFrame{
+		"TOOL_CALL_START":  toolCallStarts,
+		"TOOL_CALL_ARGS":   toolCallArgs,
+		"TOOL_CALL_END":    toolCallEnds,
+		"TOOL_CALL_RESULT": toolCallResults,
+	} {
+		if len(frames) != 1 {
+			t.Fatalf("expected exactly 1 %s event, got %d in: %s", kind, len(frames), stream)
+		}
 	}
-	if len(toolCallResults) != 1 {
-		t.Fatalf("expected exactly 1 TOOL_CALL_RESULT event, got %d in: %s", len(toolCallResults), stream)
+	toolCallID := toolCallStarts[0].ToolCallID
+	if toolCallID == "" {
+		t.Fatal("TOOL_CALL_START omitted toolCallId")
+	}
+	for kind, frame := range map[string]sseFrame{
+		"TOOL_CALL_ARGS":   toolCallArgs[0],
+		"TOOL_CALL_END":    toolCallEnds[0],
+		"TOOL_CALL_RESULT": toolCallResults[0],
+	} {
+		if frame.ToolCallID != toolCallID {
+			t.Fatalf("%s toolCallId = %q, want correlated call %q", kind, frame.ToolCallID, toolCallID)
+		}
+	}
+	if toolCallStarts[0].ToolCallName != "echo_note" {
+		t.Fatalf("TOOL_CALL_START toolCallName = %q, want echo_note", toolCallStarts[0].ToolCallName)
+	}
+	if toolCallArgs[0].Delta != `{"note":"hello from agui"}` {
+		t.Fatalf("TOOL_CALL_ARGS delta = %q, want durable input", toolCallArgs[0].Delta)
 	}
 
 	// The TOOL_CALL_RESULT is built directly from the durable
@@ -1133,8 +1160,11 @@ func TestPublicAGUIDecodesNativeInputAndReplayProjectsCommittedContent(t *testin
 // file decodes: enough to discriminate event type, and to reach the raw
 // (still-JSON-encoded) tool result content a TOOL_CALL_RESULT event carries.
 type sseFrame struct {
-	Type    string `json:"type"`
-	Content string `json:"content"`
+	Type         string `json:"type"`
+	ToolCallID   string `json:"toolCallId"`
+	ToolCallName string `json:"toolCallName"`
+	Delta        string `json:"delta"`
+	Content      string `json:"content"`
 }
 
 // decodeSSEEvents parses raw's "data: {...}" lines (frames are separated by a
