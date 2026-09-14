@@ -341,7 +341,7 @@ func (b *Bridge) emitAttemptReplaced(event session.EventRecord) {
 // from a live checkpoint would make reconnect semantics unsound.
 func (b *Bridge) emitPaused(event session.EventRecord) {
 	var lifecycle session.PauseLifecycleV1
-	if len(event.Payload) == 0 || json.Unmarshal(event.Payload, &lifecycle) != nil {
+	if len(event.Payload) == 0 || bytes.Equal(bytes.TrimSpace(event.Payload), []byte("null")) || json.Unmarshal(event.Payload, &lifecycle) != nil {
 		return
 	}
 	if err := session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle); err != nil {

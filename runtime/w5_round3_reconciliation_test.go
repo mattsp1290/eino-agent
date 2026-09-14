@@ -2,9 +2,12 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -60,14 +63,18 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 	}
 	defer func() { _ = pool.Close() }()
 
+	var executions int
+	var executedDecision string
 	gate := Tool{
 		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"},
 		InterruptPolicy: pausingInterruptPolicy{},
 		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			executions++
+			executedDecision = call.ResumeDecision
 			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
 		}),
 	}
-	var calls int
+	var modelDispatches int
 	// orch and failingOrch (below) are two independent StreamingOrchestrator
 	// instances sharing this same underlying sqlite store. A plain
 	// &sequenceIDs{} per instance restarts its counter at 1, risking a
@@ -77,8 +84,8 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 	// in w5_round2_test.go); give each instance a distinct namespace.
 	orch, err := NewStreamingOrchestrator(
 		WithStore(sqliteStore), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
-			calls++
-			if calls == 1 {
+			modelDispatches++
+			if modelDispatches == 1 {
 				return []*einoschema.AgenticMessage{agenticAssistantToolCalls(agenticToolCall("call-1", "gate", `{}`))}, nil
 			}
 			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
@@ -104,9 +111,26 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 	if !ok || len(pause.InterruptContexts) != 1 {
 		t.Fatalf("pause = %+v, ok=%v", pause, ok)
 	}
+	initialEvents := listEvents(t, ctx, orch, "sqlite-repause-session")
+	var originalPauseEvent session.EventRecord
+	var originalLifecycle session.PauseLifecycleV1
+	for _, event := range initialEvents {
+		if event.RunID != result.RunID || event.Kind != session.RunPausedEventKind {
+			continue
+		}
+		var lifecycle session.PauseLifecycleV1
+		if err := json.Unmarshal(event.Payload, &lifecycle); err == nil && session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle) == nil {
+			originalPauseEvent = event
+			originalLifecycle = lifecycle
+		}
+	}
+	if originalPauseEvent.ID == "" || len(originalLifecycle.Targets) != 1 || originalLifecycle.Targets[0].ID != pause.InterruptContexts[0].ID {
+		t.Fatalf("original pause lifecycle = %#v event=%#v, want target %q", originalLifecycle, originalPauseEvent, pause.InterruptContexts[0].ID)
+	}
 
 	failingOrch, err := NewStreamingOrchestrator(
 		WithStore(&startRunFailOnceStore{Store: sqliteStore}), WithModelResolver(resolvedModel{streamer: scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+			modelDispatches++
 			return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
 		})}),
 		WithIDGenerator(&namespacedSequenceIDs{namespace: "b"}), WithClock(func() time.Time { return time.Date(2026, 6, 27, 12, 0, 1, 0, time.UTC) }),
@@ -144,8 +168,27 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 	if err != nil || stranded.Status != session.RunPaused {
 		t.Fatalf("run after injected failure = %+v, err=%v, want status=paused", stranded, err)
 	}
-	if stranded.LeaseUntil.After(time.Now().UTC()) {
-		t.Fatalf("run after injected failure retains a live lease: %v", stranded.LeaseUntil)
+	if stranded.LeaseUntil.UnixMicro() != 0 {
+		t.Fatalf("run after injected failure retains a lease: %v", stranded.LeaseUntil)
+	}
+	afterFailureEvents := listEvents(t, ctx, orch, "sqlite-repause-session")
+	var compensation session.EventRecord
+	for _, event := range afterFailureEvents {
+		if event.RunID == result.RunID && event.Kind == session.RunPausedEventKind && event.ID != originalPauseEvent.ID {
+			compensation = event
+		}
+		if event.RunID == result.RunID && event.Kind == session.RunResumedEventKind {
+			t.Fatalf("run_resumed emitted before a physical successor dispatch: %#v", event)
+		}
+		if strings.Contains(string(event.Payload), "approve") {
+			t.Fatalf("resume decision leaked into durable lifecycle payload: %s", event.Payload)
+		}
+	}
+	if compensation.ID == "" || (len(compensation.Payload) != 0 && string(compensation.Payload) != "null") || compensation.Correlation != originalLifecycle.EventRevision {
+		t.Fatalf("compensation event = %#v, want distinct payload-less event correlated to %q", compensation, originalLifecycle.EventRevision)
+	}
+	if modelDispatches != 1 || executions != 0 {
+		t.Fatalf("failed resume performed work: model dispatches=%d tool executions=%d, want 1 and 0", modelDispatches, executions)
 	}
 	secondResumeHandle, err := orch.ResumeRun(ctx, result.RunID, ResumeRequest{
 		Targets: map[string]any{pause.InterruptContexts[0].ID: "approve"},
@@ -156,6 +199,207 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 	final := <-secondResumeHandle.Done()
 	if final.Status != session.RunCompleted || final.Error != nil {
 		t.Fatalf("final resumed result = %+v", final)
+	}
+	if modelDispatches != 2 || executions != 1 || executedDecision != "approve" {
+		t.Fatalf("successful retry work: model dispatches=%d tool executions=%d decision=%q, want 2, 1, approve", modelDispatches, executions, executedDecision)
+	}
+	finalEvents := listEvents(t, ctx, orch, "sqlite-repause-session")
+	var resumedLifecycles []session.PauseLifecycleV1
+	for _, event := range finalEvents {
+		if event.RunID != result.RunID || event.Kind != session.RunResumedEventKind {
+			continue
+		}
+		var lifecycle session.PauseLifecycleV1
+		if err := json.Unmarshal(event.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) != nil {
+			t.Fatalf("invalid resumed lifecycle event %#v: %v", event, err)
+		}
+		resumedLifecycles = append(resumedLifecycles, lifecycle)
+	}
+	if len(resumedLifecycles) != 1 {
+		t.Fatalf("resumed lifecycle count = %d, want 1", len(resumedLifecycles))
+	}
+	resumedLifecycle := resumedLifecycles[0]
+	if resumedLifecycle.ResumedPauseID != originalLifecycle.PauseID || resumedLifecycle.ResumeMode != session.ResumeModeFull || len(resumedLifecycle.ResumedTargetIDs) != 1 || resumedLifecycle.ResumedTargetIDs[0] != pause.InterruptContexts[0].ID || resumedLifecycle.NewTurnID == "" || resumedLifecycle.NewAttemptID == "" {
+		t.Fatalf("resumed lifecycle = %#v, want original pause identity and one full target", resumedLifecycle)
+	}
+}
+
+// TestResumeRunStartFailureRepausePreservesAllTargets proves that a failed
+// strict-subset resume does not narrow the unresolved pause generation. A
+// retry may select a different target from the original complete target set;
+// only the genuine partial-resume repause establishes a new generation.
+func TestResumeRunStartFailureRepausePreservesAllTargets(t *testing.T) {
+	ctx := context.Background()
+	sqliteStore, pool, err := openTestSQLite(ctx, filepath.Join(t.TempDir(), "store.db"))
+	if err != nil {
+		t.Fatalf("openTestSQLite: %v", err)
+	}
+	defer func() { _ = pool.Close() }()
+
+	var mu sync.Mutex
+	executed := map[string]int{}
+	modelDispatches := 0
+	ids := &namespacedSequenceIDs{namespace: "multi"}
+	gate := Tool{
+		Name: "gate", Info: &einoschema.ToolInfo{Name: "gate", Desc: "needs approval"}, InterruptPolicy: pausingInterruptPolicy{},
+		Executor: orchestratorToolExecutorFunc(func(_ context.Context, call ToolCall) (ToolResult, error) {
+			mu.Lock()
+			executed[call.ProviderCallID]++
+			mu.Unlock()
+			return ToolResult{Output: "decision:" + call.ResumeDecision}, nil
+		}),
+	}
+	streamer := scriptedStreamer(func(context.Context, model.Request) ([]*einoschema.AgenticMessage, error) {
+		mu.Lock()
+		modelDispatches++
+		dispatch := modelDispatches
+		mu.Unlock()
+		if dispatch == 1 {
+			return []*einoschema.AgenticMessage{agenticAssistantToolCalls(
+				agenticToolCall("call-leaf-1", "gate", `{}`),
+				agenticToolCall("call-leaf-2", "gate", `{}`),
+			)}, nil
+		}
+		return []*einoschema.AgenticMessage{agenticAssistantText("done")}, nil
+	})
+	newOrchestrator := func(t *testing.T, store session.Store) *StreamingOrchestrator {
+		t.Helper()
+		orch, err := NewStreamingOrchestrator(
+			WithStore(store), WithModelResolver(resolvedModel{streamer: streamer}),
+			WithIDGenerator(ids),
+			WithClock(func() time.Time { return time.Date(2026, 6, 27, 13, 0, 0, 0, time.UTC) }),
+			WithOwnerID("sqlite-owner-multi-repause"), WithQueueSize(2),
+			WithRunPlanProvider(staticRunPlanProvider{plan: newTestToolPlan(staticToolRegistry{})}),
+		)
+		if err != nil {
+			t.Fatalf("NewStreamingOrchestrator: %v", err)
+		}
+		configureTestTools(orch, staticToolRegistry{tools: []Tool{gate}})
+		return orch
+	}
+
+	orch := newOrchestrator(t, sqliteStore)
+	handle, err := orch.Start(ctx, Request{SessionID: "sqlite-multi-repause-session", Message: TextUserMessage("hello"), Config: orchestratorConfig()})
+	if err != nil {
+		t.Fatalf("Start error = %v", err)
+	}
+	result := <-handle.Done()
+	pause, ok := <-handle.AwaitPause()
+	if result.Status != session.RunPaused || !ok || len(pause.InterruptContexts) != 2 {
+		t.Fatalf("initial result=%+v pause=%+v ok=%v, want two-target pause", result, pause, ok)
+	}
+	originalA := pause.InterruptContexts[0].ID
+	originalB := pause.InterruptContexts[1].ID
+	var originalLifecycle session.PauseLifecycleV1
+	for _, event := range listEvents(t, ctx, orch, "sqlite-multi-repause-session") {
+		if event.RunID != result.RunID || event.Kind != session.RunPausedEventKind {
+			continue
+		}
+		var lifecycle session.PauseLifecycleV1
+		if json.Unmarshal(event.Payload, &lifecycle) == nil && session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle) == nil {
+			originalLifecycle = lifecycle
+		}
+	}
+	if len(originalLifecycle.Targets) != 2 {
+		t.Fatalf("original lifecycle = %#v, want two targets", originalLifecycle)
+	}
+
+	failingOrch := newOrchestrator(t, &startRunFailOnceStore{Store: sqliteStore})
+	failedHandle, err := failingOrch.ResumeRun(ctx, result.RunID, ResumeRequest{Targets: map[string]any{originalA: "approve-a"}})
+	if err != nil {
+		t.Fatalf("failed-attempt ResumeRun error = %v", err)
+	}
+	failed := <-failedHandle.Done()
+	if failed.Status != session.RunPaused {
+		t.Fatalf("failed-attempt result = %+v, want paused", failed)
+	}
+	if _, ok := <-failedHandle.AwaitPause(); !ok {
+		t.Fatal("failed-attempt AwaitPause closed without value")
+	}
+	mu.Lock()
+	failedDispatches := modelDispatches
+	failedExecutions := executed["call-leaf-1"] + executed["call-leaf-2"]
+	mu.Unlock()
+	if failedDispatches != 1 || failedExecutions != 0 {
+		t.Fatalf("failed attempt performed work: dispatches=%d executions=%d", failedDispatches, failedExecutions)
+	}
+	var compensation session.EventRecord
+	for _, event := range listEvents(t, ctx, orch, "sqlite-multi-repause-session") {
+		if event.RunID == result.RunID && event.Kind == session.RunPausedEventKind && event.ID != session.EventID(originalLifecycle.EventRevision) {
+			compensation = event
+		}
+	}
+	if compensation.ID == "" || (len(compensation.Payload) != 0 && string(compensation.Payload) != "null") || compensation.Correlation != originalLifecycle.EventRevision {
+		t.Fatalf("compensation = %#v, want payload-less correlation to %q", compensation, originalLifecycle.EventRevision)
+	}
+
+	// Select B, which the failed strict-subset request did not select. This
+	// is accepted only if the compensation retained the full original fact.
+	partialHandle, err := orch.ResumeRun(ctx, result.RunID, ResumeRequest{Targets: map[string]any{originalB: "approve-b"}})
+	if err != nil {
+		t.Fatalf("different-target retry ResumeRun error = %v", err)
+	}
+	partial := <-partialHandle.Done()
+	newPause, ok := <-partialHandle.AwaitPause()
+	if partial.Status != session.RunPaused || !ok || len(newPause.InterruptContexts) != 1 {
+		t.Fatalf("partial retry result=%+v pause=%+v ok=%v, want one-target genuine repause", partial, newPause, ok)
+	}
+	mu.Lock()
+	partialDispatches := modelDispatches
+	partialExecutions := executed["call-leaf-1"] + executed["call-leaf-2"]
+	mu.Unlock()
+	if partialDispatches != 1 || partialExecutions != 1 {
+		t.Fatalf("partial retry work: dispatches=%d executions=%d, want 1 and 1", partialDispatches, partialExecutions)
+	}
+
+	var genuineLifecycle session.PauseLifecycleV1
+	resumedBeforeFinal := 0
+	for _, event := range listEvents(t, ctx, orch, "sqlite-multi-repause-session") {
+		if event.RunID != result.RunID {
+			continue
+		}
+		if event.Kind == session.RunResumedEventKind {
+			resumedBeforeFinal++
+		}
+		if event.Kind == session.RunPausedEventKind {
+			var lifecycle session.PauseLifecycleV1
+			if json.Unmarshal(event.Payload, &lifecycle) == nil && session.ValidatePauseLifecycle(session.RunPausedEventKind, lifecycle) == nil && lifecycle.PauseID != originalLifecycle.PauseID {
+				genuineLifecycle = lifecycle
+			}
+		}
+	}
+	if resumedBeforeFinal != 0 || genuineLifecycle.PauseID == "" || len(genuineLifecycle.Targets) != 1 {
+		t.Fatalf("before final dispatch: resumed facts=%d genuine lifecycle=%#v", resumedBeforeFinal, genuineLifecycle)
+	}
+
+	finalHandle, err := orch.ResumeRun(ctx, result.RunID, ResumeRequest{Targets: map[string]any{newPause.InterruptContexts[0].ID: "approve-a"}})
+	if err != nil {
+		t.Fatalf("final ResumeRun error = %v", err)
+	}
+	final := <-finalHandle.Done()
+	if final.Status != session.RunCompleted || final.Error != nil {
+		t.Fatalf("final result = %+v, want completed", final)
+	}
+	mu.Lock()
+	finalDispatches := modelDispatches
+	leaf1, leaf2 := executed["call-leaf-1"], executed["call-leaf-2"]
+	mu.Unlock()
+	if finalDispatches != 2 || leaf1 != 1 || leaf2 != 1 {
+		t.Fatalf("final work: dispatches=%d leaf1=%d leaf2=%d, want 2, 1, 1", finalDispatches, leaf1, leaf2)
+	}
+	var resumedLifecycles []session.PauseLifecycleV1
+	for _, event := range listEvents(t, ctx, orch, "sqlite-multi-repause-session") {
+		if event.RunID != result.RunID || event.Kind != session.RunResumedEventKind {
+			continue
+		}
+		var lifecycle session.PauseLifecycleV1
+		if err := json.Unmarshal(event.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) != nil {
+			t.Fatalf("invalid resumed lifecycle %#v: %v", event, err)
+		}
+		resumedLifecycles = append(resumedLifecycles, lifecycle)
+	}
+	if len(resumedLifecycles) != 1 || resumedLifecycles[0].ResumedPauseID != genuineLifecycle.PauseID {
+		t.Fatalf("resumed lifecycles = %#v, want one resolving genuine pause %q", resumedLifecycles, genuineLifecycle.PauseID)
 	}
 }
 

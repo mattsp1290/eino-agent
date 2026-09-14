@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strconv"
 	"sync"
@@ -420,6 +421,20 @@ func TestTargetedMultiLeafResumeLeavesUntargetedLeafPaused(t *testing.T) {
 	repause, ok := <-resumeHandle.AwaitPause()
 	if !ok || len(repause.InterruptContexts) != 1 {
 		t.Fatalf("repause = %+v, ok=%v, want exactly the one still-untargeted leaf", repause, ok)
+	}
+
+	// The genuine repause above promoted a new pause generation. The first
+	// target belongs to the original generation and must be rejected before
+	// a claim; preserving a correlated compensation must not weaken this
+	// ordinary stale-generation boundary.
+	if _, err := orch.ResumeRun(context.Background(), result.RunID, ResumeRequest{
+		Targets: map[string]any{firstTarget: "stale-approval"},
+	}); !errors.Is(err, ErrInvalidOrchestrator) {
+		t.Fatalf("stale-generation ResumeRun error = %v, want ErrInvalidOrchestrator", err)
+	}
+	stillPaused, err := orch.store.GetRun(context.Background(), result.RunID)
+	if err != nil || stillPaused.Status != session.RunPaused || stillPaused.LeaseUntil.UnixMicro() != 0 {
+		t.Fatalf("run after stale target rejection = %+v, err=%v, want paused with zero lease", stillPaused, err)
 	}
 
 	// Now target the SECOND (originally untargeted) leaf, by its

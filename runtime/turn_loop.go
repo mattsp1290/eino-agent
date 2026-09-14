@@ -1996,7 +1996,7 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		// can simply try again.
 		started, err := execution.store.StartRun(runCtx, o.now())
 		if err != nil {
-			o.resumeStartFailureRepause(runCtx, execution, runID, claimed.SessionID, claimed.ContextEpoch, checkpoint.Revision, handle, err)
+			o.resumeStartFailureRepause(runCtx, execution, runID, claimed.SessionID, claimed.ContextEpoch, resumeLifecycle, handle, err)
 			return
 		}
 		_ = started
@@ -2015,15 +2015,15 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 // expiry recovery -- the same conservative posture finishTurnLoop's
 // checkpoint-Set-failure branch already takes when it cannot safely
 // compensate either.
-func (o *StreamingOrchestrator) resumeStartFailureRepause(ctx context.Context, execution *runExecution, runID session.RunID, sessionID session.ID, epochID session.EpochID, checkpointRevision int64, handle *turnLoopHandle, cause error) {
+func (o *StreamingOrchestrator) resumeStartFailureRepause(ctx context.Context, execution *runExecution, runID session.RunID, sessionID session.ID, epochID session.EpochID, resumeLifecycle *resumeLifecycleFact, handle *turnLoopHandle, cause error) {
 	o.unregisterLoop(runID)
 	repauseCtx := context.WithoutCancel(ctx)
 	event := session.EventRecord{
 		ID: o.ids.NewEventID(), SessionID: sessionID, RunID: runID, EpochID: epochID,
 		Kind: session.RunPausedEventKind, CreatedAt: o.now(),
 	}
-	if payload, err := pauseLifecyclePayload(event, checkpointRevision, "root", nil); err == nil {
-		event.Payload = payload
+	if resumeLifecycle != nil {
+		event.Correlation = resumeLifecycle.paused.EventRevision
 	}
 	status := session.RunPaused
 	resultErr := cause
