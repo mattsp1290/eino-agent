@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,12 +281,23 @@ func TestAgenticStreamerCleanEOFDoesNotYieldNilDelta(t *testing.T) {
 	}
 }
 
+func TestAgenticStreamerEmptyCleanEOFDoesNotYieldNilDelta(t *testing.T) {
+	reader, err := NewAgenticStreamer(&scriptedAgenticModel{}).StreamProvider(context.Background(), Request{Identity: Identity{ProviderID: "fake", ModelID: "m1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if delta, err := reader.Recv(); !errors.Is(err, io.EOF) || delta.Message != nil {
+		t.Fatalf("Recv = %#v, %v; want EOF without a delta", delta, err)
+	}
+}
+
 func TestStreamAgenticReaderInjectsFinalValueOnce(t *testing.T) {
 	upstream := einoschema.StreamReaderFromArray([]*einoschema.AgenticMessage{agenticTestMessage("source")})
 	final := StreamDelta{Message: agenticTestMessage("final")}
-	calls := 0
+	var calls atomic.Int32
 	reader := streamAgenticReader(upstream, false, func() (any, error) {
-		calls++
+		calls.Add(1)
 		return final, nil
 	})
 	defer reader.Close()
@@ -300,17 +312,17 @@ func TestStreamAgenticReaderInjectsFinalValueOnce(t *testing.T) {
 			t.Fatalf("EOF Recv %d = %v, want EOF", i, err)
 		}
 	}
-	if calls != 1 {
-		t.Fatalf("EOF callback calls = %d, want 1", calls)
+	if calls.Load() != 1 {
+		t.Fatalf("EOF callback calls = %d, want 1", calls.Load())
 	}
 }
 
 func TestStreamAgenticReaderInjectsFinalErrorOnce(t *testing.T) {
 	boom := errors.New("final boom")
 	upstream := einoschema.StreamReaderFromArray([]*einoschema.AgenticMessage{agenticTestMessage("source")})
-	calls := 0
+	var calls atomic.Int32
 	reader := streamAgenticReader(upstream, false, func() (any, error) {
-		calls++
+		calls.Add(1)
 		return nil, boom
 	})
 	defer reader.Close()
@@ -325,8 +337,8 @@ func TestStreamAgenticReaderInjectsFinalErrorOnce(t *testing.T) {
 			t.Fatalf("EOF Recv %d = %v, want EOF", i, err)
 		}
 	}
-	if calls != 1 {
-		t.Fatalf("EOF callback calls = %d, want 1", calls)
+	if calls.Load() != 1 {
+		t.Fatalf("EOF callback calls = %d, want 1", calls.Load())
 	}
 }
 
@@ -337,17 +349,17 @@ func TestStreamAgenticReaderDoesNotCallEOFHookForSourceError(t *testing.T) {
 		t.Fatal("writer unexpectedly closed")
 	}
 	writer.Close()
-	calls := 0
+	var calls atomic.Int32
 	reader := streamAgenticReader(upstream, false, func() (any, error) {
-		calls++
+		calls.Add(1)
 		return nil, io.EOF
 	})
 	defer reader.Close()
 	if _, err := reader.Recv(); !errors.Is(err, boom) {
 		t.Fatalf("Recv = %v, want source error", err)
 	}
-	if calls != 0 {
-		t.Fatalf("EOF callback calls = %d, want 0", calls)
+	if calls.Load() != 0 {
+		t.Fatalf("EOF callback calls = %d, want 0", calls.Load())
 	}
 }
 
@@ -358,9 +370,9 @@ func TestStreamAgenticReaderCloseUnblocksUpstreamWithoutEOFHook(t *testing.T) {
 		defer close(writerObservedClose)
 		writer.Send(agenticTestMessage("blocked"), nil)
 	}()
-	calls := 0
+	var calls atomic.Int32
 	reader := streamAgenticReader(upstream, false, func() (any, error) {
-		calls++
+		calls.Add(1)
 		return nil, io.EOF
 	})
 	reader.Close()
@@ -369,8 +381,8 @@ func TestStreamAgenticReaderCloseUnblocksUpstreamWithoutEOFHook(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("upstream writer did not observe reader closure")
 	}
-	if calls != 0 {
-		t.Fatalf("EOF callback calls = %d, want 0", calls)
+	if calls.Load() != 0 {
+		t.Fatalf("EOF callback calls = %d, want 0", calls.Load())
 	}
 }
 
