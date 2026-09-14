@@ -210,8 +210,11 @@ func TestResumeRunStartFailureRepauses(t *testing.T) {
 			continue
 		}
 		var lifecycle session.PauseLifecycleV1
-		if err := json.Unmarshal(event.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) != nil {
-			t.Fatalf("invalid resumed lifecycle event %#v: %v", event, err)
+		if err := json.Unmarshal(event.Payload, &lifecycle); err != nil {
+			t.Fatalf("decode resumed lifecycle event %#v: %v", event, err)
+		}
+		if err := session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle); err != nil {
+			t.Fatalf("validate resumed lifecycle event %#v: %v", event, err)
 		}
 		resumedLifecycles = append(resumedLifecycles, lifecycle)
 	}
@@ -393,8 +396,11 @@ func TestResumeRunStartFailureRepausePreservesAllTargets(t *testing.T) {
 			continue
 		}
 		var lifecycle session.PauseLifecycleV1
-		if err := json.Unmarshal(event.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) != nil {
-			t.Fatalf("invalid resumed lifecycle %#v: %v", event, err)
+		if err := json.Unmarshal(event.Payload, &lifecycle); err != nil {
+			t.Fatalf("decode resumed lifecycle %#v: %v", event, err)
+		}
+		if err := session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle); err != nil {
+			t.Fatalf("validate resumed lifecycle %#v: %v", event, err)
 		}
 		resumedLifecycles = append(resumedLifecycles, lifecycle)
 	}
