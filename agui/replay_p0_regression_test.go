@@ -666,14 +666,14 @@ func TestReconnectDeliversLiveDeltaForUnfinalizedAssistantPlaceholder(t *testing
 	// ahead of the terminal frame), followed by RUN_FINISHED. Before this
 	// fix, "FINAL types: []" -- not one frame reached the wire for the
 	// whole turn.
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_FINISHED"
+	want := "TEXT_MESSAGE_CHUNK,RUN_FINISHED"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (a live delta for an in-flight, unfinalized assistant message must reach the client, not be dropped as stale)", got, want)
 	}
 	if messageID, _ := frames[0]["messageId"].(string); messageID != "assistant-inflight" {
 		t.Fatalf("frame[0] messageId = %q, want assistant-inflight", messageID)
 	}
-	if delta, _ := frames[1]["delta"].(string); delta != "HELLO-LIVE" {
-		t.Fatalf("frame[1] delta = %q, want HELLO-LIVE", delta)
+	if delta, _ := frames[0]["delta"].(string); delta != "HELLO-LIVE" {
+		t.Fatalf("frame[0] delta = %q, want HELLO-LIVE", delta)
 	}
 }

@@ -31,9 +31,11 @@ External pins for the agentic adoption:
   propagate. Adopted in W7: `agui/bridge.go` and `agui/replay.go` use
   `convert.ToAgenticProjection`/`emitter.Emitter.EmitCommittedProjection` for
   both the durable replay snapshot and live `message_committed` emission
-  (see `docs/architecture/agui-events.md`); the full lifecycle mapping
-  (`run_paused`/`attempt_replaced`/subagent events) and transient per-delta
-  emission via `TransientEventForBlock` are not yet wired.
+  (see `docs/architecture/agui-events.md`). Live assistant text and enabled
+  reasoning use `convert.TransientEventForBlock`; durable tool transitions
+  retain their native lifecycle frames. Full lifecycle mapping
+  (`run_paused`/`run_resumed`/`attempt_replaced`/subagent events) remains
+  deferred pending an approved durable pause/replay identity contract.
 - `github.com/mattsp1290/eino-providers`: the native `AgenticModel` contract
   was answered on 2026-09-11 (response document
   `2026-09-10-eino-v0-9-19-agentic-models.md`) and that work is merged to the

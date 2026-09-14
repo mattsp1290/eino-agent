@@ -13,10 +13,12 @@ Attach before or during a run. In another terminal:
 
 ```bash
 curl -sS -X POST http://localhost:8080/sessions/minimal/runs \
-  -H 'Content-Type: application/json' -d '{"message":"hello from curl"}'
+  -H 'Content-Type: application/json' -d '{"content":[{"type":"text","text":"hello from curl"}]}'
 ```
 
-Submit only new user text. Runtime loads prior durable history. The script
+Submit only new AG-UI user content. The route accepts bounded text, image,
+audio, video, and document parts and preserves them as durable user blocks.
+Runtime loads prior durable history. The script
 emits a partial assistant response, invokes its local echo tool, and emits a
 final response. Tools perform no network or filesystem operation.
 

@@ -506,62 +506,71 @@ func (b *Bridge) emitMessageDelta(event session.EventRecord) {
 	}
 	payload := messageDeltaPayload{}
 	_ = json.Unmarshal(event.Payload, &payload)
-	// includeReasoning gates this live delta path exactly like it gates
-	// the durable committed-projection path (emitLiveMessageCommitted,
-	// emitMessageSnapshot): a host that has not attested
-	// GateProviderReasoningStorage is satisfied (agui/policy.go) must
-	// never see live reasoning deltas either, or the gate is closed on
-	// one path of this bridge and open on the other for the same
-	// reconnecting client (W7 fix-pass review finding P1-D/I3).
+	// includeReasoning gates this live delta path exactly like it gates the
+	// durable committed-projection path.
 	if b.includeReasoning && payload.Reasoning != "" {
-		if b.textOpen[messageID] {
-			textEnd := nativeFrameKey{kind: aguievents.EventTypeTextMessageEnd, ownerID: string(messageID)}
-			if !b.ensureNative(textEnd, b.emit, aguievents.NewTextMessageEndEvent(string(messageID))) {
-				return
-			}
-			delete(b.textOpen, messageID)
-		}
-		reasoningID := b.reasoning[messageID]
-		if reasoningID == "" {
-			reasoningID = string(messageID)
-			reasoningStart := nativeFrameKey{kind: aguievents.EventTypeReasoningStart, ownerID: reasoningID}
-			if !b.ensureNative(reasoningStart, b.emit, aguievents.NewReasoningStartEvent(reasoningID)) {
-				return
-			}
-			reasoningMessageStart := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageStart, ownerID: reasoningID}
-			if !b.ensureNative(reasoningMessageStart, b.emit, aguievents.NewReasoningMessageStartEvent(reasoningID, "reasoning")) {
-				return
-			}
-			b.reasoning[messageID] = reasoningID
-		}
-		if b.deliverNative(b.nextDeltaKey(aguievents.EventTypeReasoningMessageContent, messageID), b.emit, aguievents.NewReasoningMessageContentEvent(reasoningID, payload.Reasoning)) {
-			b.markNativeStreamed(messageID)
-		}
+		b.emitTransientBlock(event, einoschema.ContentBlockTypeReasoning, payload.Reasoning, nil)
 	}
 	if payload.Content != "" {
-		if b.reasoning[messageID] != "" {
-			reasoningID := b.reasoning[messageID]
-			messageEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningMessageEnd, ownerID: reasoningID}
-			if !b.ensureNative(messageEnd, b.emit, aguievents.NewReasoningMessageEndEvent(reasoningID)) {
-				return
-			}
-			reasoningEnd := nativeFrameKey{kind: aguievents.EventTypeReasoningEnd, ownerID: reasoningID}
-			if !b.ensureNative(reasoningEnd, b.emit, aguievents.NewReasoningEndEvent(reasoningID)) {
-				return
-			}
-			delete(b.reasoning, messageID)
-		}
-		if !b.textOpen[messageID] {
-			textStart := nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(messageID)}
-			if !b.ensureNative(textStart, b.emit, aguievents.NewTextMessageStartEvent(string(messageID), aguievents.WithRole("assistant"))) {
-				return
-			}
-			b.textOpen[messageID] = true
-		}
-		if b.deliverNative(b.nextDeltaKey(aguievents.EventTypeTextMessageContent, messageID), b.emit, aguievents.NewTextMessageContentEvent(string(messageID), payload.Content)) {
-			b.markNativeStreamed(messageID)
-		}
+		b.emitTransientBlock(event, einoschema.ContentBlockTypeAssistantGenText, payload.Content, nil)
 	}
+}
+
+// emitTransientBlock emits one self-contained live native chunk via the
+// accepted convert contract. Live event records carry the durable invocation
+// ID in Correlation; old hand-built records get a deterministic message-ID
+// fallback solely so legacy EventSink callers remain representable.
+func (b *Bridge) emitTransientBlock(event session.EventRecord, kind einoschema.ContentBlockType, text string, call *convert.PublicFunctionToolCall) {
+	b.nativeDeltaOrdinal++
+	messageID := string(event.MessageID)
+	turnID := string(event.TurnID)
+	if turnID == "" {
+		turnID = syntheticTurnID(event.MessageID)
+	}
+	runID := string(event.RunID)
+	if runID == "" {
+		runID = b.runID
+	}
+	sessionID := string(event.SessionID)
+	if sessionID == "" {
+		sessionID = b.threadID
+	}
+	attemptID := event.Correlation
+	if attemptID == "" {
+		attemptID = messageID
+	}
+	pathName := event.AgentPath
+	if pathName == "" {
+		pathName = rootAgentPathName
+	}
+	identity := convert.AgenticIdentityV1{
+		SessionID: sessionID, ThreadID: sessionID, RunID: runID, TurnID: turnID,
+		MessageID: messageID, AttemptID: attemptID,
+		BlockID:   fmt.Sprintf("live:%s:%d", messageID, b.nativeDeltaOrdinal),
+		AgentPath: []convert.AgentPathSegment{{Name: pathName, RunID: runID}},
+	}
+	block := convert.PublicContentBlock{Type: kind, Identity: identity, FunctionToolCall: call}
+	if text != "" {
+		block.Text = &text
+	}
+	transient, err := convert.TransientEventForBlock(block)
+	if errors.Is(err, convert.ErrNoTransientNativeEvent) {
+		return
+	}
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: transient block conversion failed: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	key := nativeFrameKey{kind: transient.Event.Type(), ownerID: messageID, blockID: identity.BlockID}
+	if b.nativeDelivered(key) || !b.emit.EmitTransientBlock(transient) {
+		return
+	}
+	if b.nativeFrames == nil {
+		b.nativeFrames = map[nativeFrameKey]bool{}
+	}
+	b.nativeFrames[key] = true
+	b.markNativeStreamed(event.MessageID)
 }
 
 // emitToolCallUpdated is deliberately NOT guarded by Bridge.messageProjected

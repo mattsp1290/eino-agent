@@ -146,29 +146,21 @@ func TestBridgeRetriesNativeSpanAfterFailedWrite(t *testing.T) {
 	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	event := session.EventRecord{Kind: runtime.EventMessageDelta, MessageID: "assistant-1", Payload: []byte(`{"content":"retry me"}`)}
 	bridge.Emit(ctx, event)
-	if bridge.textOpen[event.MessageID] || bridge.nativeAlreadyStreamed(event.MessageID) {
-		t.Fatalf("failed start advanced bridge state: textOpen=%v nativeStreamed=%v", bridge.textOpen, bridge.nativeAlreadyStreamed(event.MessageID))
-	}
-	if bridge.nativeDelivered(nativeFrameKey{kind: aguievents.EventTypeTextMessageStart, ownerID: string(event.MessageID)}) {
-		t.Fatal("failed start was registered in native ledger")
+	if bridge.nativeAlreadyStreamed(event.MessageID) {
+		t.Fatalf("failed transient write advanced bridge state: nativeStreamed=%v", bridge.nativeAlreadyStreamed(event.MessageID))
 	}
 
 	bridge.emit = aguiemitter.NewEmitter(ctx, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.Emit(ctx, event)
 	frames := frameData(t, sink.Bytes())
-	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT" {
-		t.Fatalf("retry frames = %s, want complete start/content span", got)
-	}
-	bridge.emit = aguiemitter.NewEmitter(ctx, bufio.NewWriter(alwaysFailWriter{}), sse.NewSSEWriter(), "thread-1", "run-1", nil)
-	bridge.closeOpen(bridge.emit)
-	if !bridge.textOpen[event.MessageID] {
-		t.Fatal("failed close discarded open text span")
+	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_CHUNK" {
+		t.Fatalf("retry frames = %s, want transient chunk", got)
 	}
 	bridge.emit = aguiemitter.NewEmitter(ctx, sink.Writer(), sse.NewSSEWriter(), "thread-1", "run-1", nil)
 	bridge.closeOpen(bridge.emit)
 	frames = frameData(t, sink.Bytes())
-	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END" {
-		t.Fatalf("retry close frames = %s, want complete span", got)
+	if got := stringsJoined(typesFromFrames(frames)); got != "TEXT_MESSAGE_CHUNK" {
+		t.Fatalf("retry close frames = %s, transient chunks have no open span", got)
 	}
 }
 
@@ -227,8 +219,8 @@ func TestBridgeNativeLedgerKeepsDistinctDeltasAndCalls(t *testing.T) {
 	for _, frame := range frames {
 		counts[frame["type"].(string)]++
 	}
-	if counts["TEXT_MESSAGE_CONTENT"] != 2 {
-		t.Fatalf("TEXT_MESSAGE_CONTENT count = %d, want 2", counts["TEXT_MESSAGE_CONTENT"])
+	if counts["TEXT_MESSAGE_CHUNK"] != 2 {
+		t.Fatalf("TEXT_MESSAGE_CHUNK count = %d, want 2", counts["TEXT_MESSAGE_CHUNK"])
 	}
 	for _, kind := range []string{"TOOL_CALL_START", "TOOL_CALL_ARGS", "TOOL_CALL_END", "TOOL_CALL_RESULT"} {
 		if counts[kind] != 2 {

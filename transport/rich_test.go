@@ -56,6 +56,15 @@ func TestDecodeUserMessageRejectsEmptyAndOversizedInput(t *testing.T) {
 	if _, err := DecodeUserMessage(httptest.NewRequest(http.MethodPost, "/messages", strings.NewReader(`{"content":[{"type":"image"}]}`))); err == nil {
 		t.Fatal("media content with no source accepted")
 	}
+	for _, body := range []string{
+		`{"content":[{"type":"text","text":"hi"}],"unknown":true}`,
+		`{"content":[{"type":"text","text":"hi","unknown":true}]}`,
+		`{"content":[{"type":"text","text":"hi"}]}{}`,
+	} {
+		if _, err := DecodeUserMessage(httptest.NewRequest(http.MethodPost, "/messages", strings.NewReader(body))); err == nil {
+			t.Fatalf("invalid strict JSON accepted: %s", body)
+		}
+	}
 	oversized := bytes.Repeat([]byte("a"), maxRichRequestBytes+1)
 	if _, err := DecodeUserMessage(httptest.NewRequest(http.MethodPost, "/messages", bytes.NewReader(oversized))); err == nil {
 		t.Fatal("oversized body accepted")

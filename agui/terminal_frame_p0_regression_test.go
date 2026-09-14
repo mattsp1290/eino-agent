@@ -169,7 +169,7 @@ func TestTerminateClosesOpenSpansThroughFallbackEmitter(t *testing.T) {
 
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,TEXT_MESSAGE_END,RUN_ERROR"
+	want := "TEXT_MESSAGE_CHUNK,RUN_ERROR"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (Terminate must close the open text span before its terminal frame)", got, want)
 	}

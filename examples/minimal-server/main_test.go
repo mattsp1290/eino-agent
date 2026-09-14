@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -115,11 +116,11 @@ func TestMinimalServerRejectsInvalidRunMessage(t *testing.T) {
 	t.Parallel()
 
 	tests := map[string]string{
-		"blank":             `{"message":"  \n"}`,
+		"blank":             `{"content":[{"type":"text","text":""}]}`,
 		"missing":           `{}`,
 		"caller transcript": `{"messages":[{"role":"user","content":"old"}]}`,
-		"unknown field":     `{"message":"hello","extra":true}`,
-		"trailing value":    `{"message":"hello"}{}`,
+		"unknown field":     `{"content":[{"type":"text","text":"hello"}],"extra":true}`,
+		"trailing value":    `{"content":[{"type":"text","text":"hello"}]}{}`,
 	}
 	for name, body := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -136,6 +137,64 @@ func TestMinimalServerRejectsInvalidRunMessage(t *testing.T) {
 				t.Fatalf("status = %d body=%s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestMinimalServerAdmitsRichAGUIContent(t *testing.T) {
+	t.Parallel()
+
+	server, err := NewServer(context.Background(), filepath.Join(t.TempDir(), "minimal.db"))
+	if err != nil {
+		t.Fatalf("NewServer error = %v", err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+
+	body := `{"content":[
+		{"type":"text","text":"hello"},
+		{"type":"image","source":{"type":"url","value":"https://example.test/pic.png","mimeType":"image/png"}},
+		{"type":"audio","source":{"type":"data","value":"YXVkaW8=","mimeType":"audio/mpeg"}},
+		{"type":"video","source":{"type":"url","value":"https://example.test/clip.mp4","mimeType":"video/mp4"}},
+		{"type":"document","source":{"type":"data","value":"ZmlsZQ==","mimeType":"application/pdf"},"filename":"report.pdf"}
+	]}`
+	req := httptest.NewRequest(http.MethodPost, "/sessions/rich/runs", strings.NewReader(body))
+	resp := httptest.NewRecorder()
+	server.ServeHTTP(resp, req)
+	if resp.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", resp.Code, resp.Body.String())
+	}
+
+	batch, err := server.store.ListMessages(context.Background(), "rich", session.ReplayCursor{Limit: 10})
+	if err != nil {
+		t.Fatalf("ListMessages error = %v", err)
+	}
+	var userID session.MessageID
+	for _, message := range batch.Messages {
+		if message.Role == session.RoleUser {
+			userID = message.ID
+			break
+		}
+	}
+	if userID == "" {
+		t.Fatal("admitted user message not found")
+	}
+	parts := make([]session.Part, 0, 5)
+	for _, part := range batch.Parts {
+		if part.MessageID == userID {
+			parts = append(parts, part)
+		}
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Ordinal < parts[j].Ordinal })
+	decoded, err := session.DecodeContentParts(session.RoleUser, parts, session.DefaultContentLimits())
+	if err != nil {
+		t.Fatalf("DecodeContentParts error = %v", err)
+	}
+	if len(decoded.Blocks) != 5 ||
+		decoded.Blocks[0].Kind != session.BlockKindUserInputText || decoded.Blocks[0].Text.Text != "hello" ||
+		decoded.Blocks[1].Kind != session.BlockKindUserInputImage || decoded.Blocks[1].Media.URL != "https://example.test/pic.png" || decoded.Blocks[1].Media.MIMEType != "image/png" ||
+		decoded.Blocks[2].Kind != session.BlockKindUserInputAudio || decoded.Blocks[2].Media.Base64Data != "YXVkaW8=" || decoded.Blocks[2].Media.MIMEType != "audio/mpeg" ||
+		decoded.Blocks[3].Kind != session.BlockKindUserInputVideo || decoded.Blocks[3].Media.URL != "https://example.test/clip.mp4" || decoded.Blocks[3].Media.MIMEType != "video/mp4" ||
+		decoded.Blocks[4].Kind != session.BlockKindUserInputFile || decoded.Blocks[4].Media.Base64Data != "ZmlsZQ==" || decoded.Blocks[4].Media.MIMEType != "application/pdf" || decoded.Blocks[4].Media.Name != "report.pdf" {
+		t.Fatalf("decoded rich content = %#v", decoded.Blocks)
 	}
 }
 
@@ -241,7 +300,7 @@ func TestMinimalServerCloseInterruptsActiveRunsBeforeClosingStore(t *testing.T) 
 
 func startRun(t *testing.T, baseURL string, sessionID session.ID, message string) session.RunID {
 	t.Helper()
-	body, err := json.Marshal(map[string]string{"message": message})
+	body, err := json.Marshal(map[string]any{"content": []map[string]string{{"type": "text", "text": message}}})
 	if err != nil {
 		t.Fatalf("marshal body: %v", err)
 	}

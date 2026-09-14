@@ -382,7 +382,12 @@ func (m *adkModel) Stream(ctx context.Context, input []*einoschema.AgenticMessag
 		m.execution.eventSink().Emit(ctx, session.EventRecord{
 			Kind: EventMessageDelta, SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID,
 			MessageID: dispatch.messageID, EpochID: m.engine.snapshot.EpochID, TurnID: m.engine.turn.ID, AgentPath: m.engine.agentPath,
-			ProviderID: string(m.activeModel().Provider.ID), ModelID: string(m.activeModel().Model.ID),
+			// Correlation carries the durable model-request invocation identity
+			// needed by transient AG-UI block projection. Unlike the live
+			// event itself, that ID is committed before dispatch and remains
+			// stable across every chunk of this physical attempt.
+			Correlation: dispatch.record.InvocationID,
+			ProviderID:  string(m.activeModel().Provider.ID), ModelID: string(m.activeModel().Model.ID),
 			Payload: mustJSON(map[string]string{"content": content, "reasoning": reasoning}), LiveOnly: true, CreatedAt: m.host.now(),
 		})
 	})

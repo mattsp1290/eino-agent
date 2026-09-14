@@ -97,7 +97,7 @@ func TestBridgeEmitLiveMessageCommittedProjectsDurableContent(t *testing.T) {
 
 	frames := frameData(t, sink.Bytes())
 	got := typesFromFrames(frames)
-	want := "TEXT_MESSAGE_START,TEXT_MESSAGE_CONTENT,CUSTOM"
+	want := "TEXT_MESSAGE_CHUNK,CUSTOM"
 	if stringsJoined(got) != want {
 		t.Fatalf("event types = %#v, want %s (the delta's own native frames, then a single CUSTOM content-block supplement for the commit -- no duplicate native events on the live path)", got, want)
 	}

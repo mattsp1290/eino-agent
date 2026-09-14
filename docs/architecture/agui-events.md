@@ -508,18 +508,24 @@ already delivered.
   `session.SubagentStartedEventKind`/`SubagentFinishedEventKind`/
   `SubagentErrorEventKind` anywhere yet (subagent nesting is not wired), so
   there is nothing for a bridge mapping to consume for that family today.
-- Transient per-block live deltas via `convert.TransientEventForBlock` (the
-  live path today still uses the classic `TextStart`/`TextContent`/
-  `ToolStart`/... emitter methods for in-flight deltas; only the *committed*
-  projection at commit time uses the agentic path).
-- `transport.DecodeUserMessage` (rich AG-UI input decode into
-  `runtime.UserMessage` blocks) exists and is tested but is not yet wired as
-  the default ingress path in `SSEHandler`/`examples/minimal-server`, which
-  decode their own request bodies inline. The classic `transport.DecodeMessages`
-  decoder this bullet previously named as "the default for existing callers"
-  had zero callers anywhere in the module and was removed in W8's
-  unused-classic-public-entrypoint cleanup (see
-  `docs/architecture/eino-feature-support.md`'s W8 section).
 - Watch (`watch/`) bounded public block state and a block-indexed live
   overlay, and the observability typed-callback adapters with a single
   accounting source, are untouched by W7.
+
+### Live blocks and example ingress
+
+Live assistant text and, only when `IncludeReasoning` is enabled, reasoning
+are emitted as self-contained native `*_MESSAGE_CHUNK` frames produced by
+`convert.TransientEventForBlock`. They are connection-local: they are never
+persisted or replayed, and a later durable committed projection supplies the
+recoverable record without duplicating native content on that connection.
+Durable tool-call start/arguments/end/result transitions remain their own
+native lifecycle frames because the converter has no transient result or
+lifecycle representation.
+
+`examples/minimal-server` uses `transport.DecodeUserMessage` for its
+`POST /sessions/{id}/runs` body. It accepts the bounded native AG-UI
+`content` array (text, image, audio, video, document) with strict single
+object/unknown-field validation and passes its blocks directly to `Start`.
+`transport.SSEHandler` remains GET reconnect egress; it does not decode
+inbound user content.

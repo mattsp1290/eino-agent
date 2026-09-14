@@ -13,9 +13,9 @@ The `transport` package contains small adapters for common HTTP glue:
 - `ResumeHandler` adapts an application resume endpoint to a runtime resume
   call and returns the resumed run ID in a response header.
 - `DecodeUserMessage` decodes a rich AG-UI user-message request body into a
-  `runtime.UserMessage` (`transport/rich.go`). It exists and is tested but is
-  not yet wired as the default ingress path in `SSEHandler`/
-  `examples/minimal-server`, which decode their own request bodies inline.
+  `runtime.UserMessage` (`transport/rich.go`). `examples/minimal-server`
+  uses it for its POST run-admission route; `SSEHandler` is GET egress only
+  and does not decode request bodies.
   The classic `DecodeMessages` JSON decoder this bullet previously described
   was removed in W8: it had zero callers anywhere in the module.
 

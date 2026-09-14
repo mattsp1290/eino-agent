@@ -1,8 +1,10 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -49,6 +51,22 @@ func DecodeUserMessage(r *http.Request) (runtime.UserMessage, error) {
 	if len(raw) > maxRichRequestBytes {
 		return runtime.UserMessage{}, fmt.Errorf("request body exceeds %d bytes", maxRichRequestBytes)
 	}
+	// InputContent implements json.Unmarshaler for compatibility aliases and
+	// consequently bypasses Decoder.DisallowUnknownFields for nested parts.
+	// Validate the accepted wire shape first, then decode the SDK type used by
+	// the mapper below.
+	var strict strictRichPayload
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&strict); err != nil {
+		return runtime.UserMessage{}, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = fmt.Errorf("exactly one JSON object required")
+		}
+		return runtime.UserMessage{}, err
+	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return runtime.UserMessage{}, err
 	}
@@ -67,6 +85,31 @@ func DecodeUserMessage(r *http.Request) (runtime.UserMessage, error) {
 		blocks = append(blocks, block)
 	}
 	return runtime.UserMessage{Blocks: blocks}, nil
+}
+
+type strictRichPayload struct {
+	Content []strictInputContent `json:"content"`
+}
+
+// strictInputContent mirrors the supported SDK request surface solely for
+// strict JSON validation. Metadata deliberately remains raw JSON because its
+// schema is application-defined and is not persisted by this adapter.
+type strictInputContent struct {
+	Type     string                    `json:"type"`
+	Text     string                    `json:"text,omitempty"`
+	MimeType string                    `json:"mimeType,omitempty"`
+	ID       string                    `json:"id,omitempty"`
+	URL      string                    `json:"url,omitempty"`
+	Data     string                    `json:"data,omitempty"`
+	Filename string                    `json:"filename,omitempty"`
+	Source   *strictInputContentSource `json:"source,omitempty"`
+	Metadata json.RawMessage           `json:"metadata,omitempty"`
+}
+
+type strictInputContentSource struct {
+	Type     string `json:"type"`
+	Value    string `json:"value"`
+	MimeType string `json:"mimeType,omitempty"`
 }
 
 func contentBlockFromInput(part types.InputContent) (session.ContentBlock, error) {
