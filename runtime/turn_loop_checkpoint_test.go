@@ -107,6 +107,27 @@ func TestTurnLoopChecksPointsAndResumesInterruptedTool(t *testing.T) {
 	if executions != 1 {
 		t.Fatalf("tool executions after resume = %d, want 1", executions)
 	}
+	events, err = store.ListEvents(context.Background(), "session-1", session.EventCursor{Limit: 100})
+	if err != nil {
+		t.Fatalf("ListEvents after resume error = %v", err)
+	}
+	var resumedEvent session.EventRecord
+	for _, event := range events.Events {
+		if event.Kind == session.RunResumedEventKind {
+			resumedEvent = event
+			break
+		}
+	}
+	if resumedEvent.ID == "" {
+		t.Fatal("durable post-redrive run_resumed event missing")
+	}
+	var resumedLifecycle session.PauseLifecycleV1
+	if err := json.Unmarshal(resumedEvent.Payload, &resumedLifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, resumedLifecycle) != nil {
+		t.Fatalf("invalid durable resumed lifecycle: %#v err=%v", resumedLifecycle, err)
+	}
+	if resumedLifecycle.ResumedPauseID != lifecycle.PauseID || resumedLifecycle.NewTurnID == "" || resumedLifecycle.NewAttemptID == "" || resumedLifecycle.ResumeMode != session.ResumeModeFull || len(resumedLifecycle.ResumedTargetIDs) != 1 || resumedLifecycle.ResumedTargetIDs[0] != pause.InterruptContexts[0].ID {
+		t.Fatalf("resumed lifecycle mismatch: %#v", resumedLifecycle)
+	}
 	finalRun, err := store.GetRun(context.Background(), result.RunID)
 	if err != nil || finalRun.Status != session.RunCompleted {
 		t.Fatalf("final run = %+v, err=%v", finalRun, err)

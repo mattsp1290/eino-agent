@@ -266,6 +266,8 @@ func (b *Bridge) Emit(ctx context.Context, event session.EventRecord) {
 		b.emitLiveMessageCommitted(ctx, event)
 	case session.RunPausedEventKind:
 		b.emitPaused(event)
+	case session.RunResumedEventKind:
+		b.emitResumed(event)
 	case session.AttemptReplacedEventKind:
 		b.emitAttemptReplaced(event)
 	case runtime.EventRunFinished:
@@ -367,6 +369,48 @@ func (b *Bridge) emitPaused(event session.EventRecord) {
 	}
 	if !b.emit.Paused(paused, convert.CommitReceiptV1{Revision: lifecycle.EventRevision, Domain: "lifecycle", Kind: convert.EnvelopePaused, Identity: identity, Digest: digest}) && b.EncErr() != nil {
 		b.recordLiveErr(fmt.Errorf("agui: pause lifecycle emission: %w", b.EncErr()))
+	}
+}
+
+func (b *Bridge) emitResumed(event session.EventRecord) {
+	var lifecycle session.PauseLifecycleV1
+	if len(event.Payload) == 0 {
+		return // historical observability-only resume
+	}
+	if err := json.Unmarshal(event.Payload, &lifecycle); err != nil || session.ValidatePauseLifecycle(session.RunResumedEventKind, lifecycle) != nil {
+		b.recordLiveErr(fmt.Errorf("agui: invalid durable resumed lifecycle"))
+		b.emitTerminalError()
+		return
+	}
+	identity := convert.AgenticIdentityV1{SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: "pause:" + string(event.RunID), MessageID: string(lifecycle.MessageID), AttemptID: lifecycle.AttemptID, AgentPath: []convert.AgentPathSegment{{Name: lifecycle.AgentPath, RunID: string(event.RunID)}}}
+	selected := make(map[string]bool, len(lifecycle.ResumedTargetIDs))
+	for _, id := range lifecycle.ResumedTargetIDs {
+		selected[id] = true
+	}
+	targets := make([]convert.InterruptTargetV1, 0, len(lifecycle.Targets))
+	for _, target := range lifecycle.Targets {
+		if lifecycle.ResumeMode == session.ResumeModeFull || selected[target.ID] {
+			targets = append(targets, convert.InterruptTargetV1{ID: target.ID, Address: target.Address})
+		}
+	}
+	if lifecycle.ResumeMode == session.ResumeModeTargeted && len(targets) != len(selected) {
+		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle selects unknown pause target"))
+		b.emitTerminalError()
+		return
+	}
+	resumed := convert.ResumedV1{PauseID: lifecycle.ResumedPauseID, Targets: targets, Full: lifecycle.ResumeMode == session.ResumeModeFull, NewTurnID: string(lifecycle.NewTurnID), NewAttemptID: lifecycle.NewAttemptID}
+	if lifecycle.Approval != nil && (resumed.Full || selected[lifecycle.Approval.TargetID]) {
+		resumed.Correlation = &convert.ApprovalInterruptCorrelation{ApprovalRequestID: lifecycle.Approval.RequestID, InterruptTargetID: lifecycle.Approval.TargetID, InterruptAddress: lifecycle.Approval.Address}
+	}
+	envelope := convert.AgenticEnvelopeV1{Version: convert.AgenticSchemaVersion, Kind: convert.EnvelopeResumed, Identity: identity, Resumed: &resumed}
+	digest, err := convert.LifecycleDigestV1(&envelope)
+	if err != nil {
+		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle digest: %w", err))
+		b.emitTerminalError()
+		return
+	}
+	if !b.emit.Resumed(resumed, convert.CommitReceiptV1{Revision: lifecycle.EventRevision, Domain: "lifecycle", Kind: convert.EnvelopeResumed, Identity: identity, Digest: digest}) && b.EncErr() != nil {
+		b.recordLiveErr(fmt.Errorf("agui: resumed lifecycle emission: %w", b.EncErr()))
 	}
 }
 

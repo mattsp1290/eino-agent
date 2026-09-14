@@ -215,6 +215,14 @@ func (m *adkModel) begin(ctx context.Context, input []*einoschema.AgenticMessage
 		_ = updateModelRequest(ctx, m.execution.store, &record, session.ModelRequestFailed, err, m.host.now())
 		return nil, err
 	}
+	// A RunResumed lifecycle fact must name a successor that is already
+	// durable. This is the first point at which both the resumed turn and
+	// invocation ID satisfy that constraint; emitting it at ResumeRun claim
+	// time would fabricate a successor if redrive never reaches a dispatch.
+	if err := m.engine.resumeLifecycle.emit(ctx, m.engine, messageID, record.InvocationID); err != nil {
+		_ = updateModelRequest(ctx, m.execution.store, &record, session.ModelRequestFailed, err, m.host.now())
+		return nil, err
+	}
 	extension.Notify(m.execution.dispatch(), ctx, ModelRequestedPoint, ModelRequestedNotice{
 		SessionID: m.engine.snapshot.SessionID, RunID: m.engine.snapshot.RunID, MessageID: messageID,
 		Attempt: record.Attempt, Step: record.Step, ProviderID: string(request.Identity.ProviderID), ModelID: string(request.Identity.ModelID),

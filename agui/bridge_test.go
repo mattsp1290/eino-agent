@@ -475,6 +475,37 @@ func TestBridgeProjectsValidatedDurablePause(t *testing.T) {
 	}
 }
 
+func TestBridgeProjectsDurableResumeAfterPause(t *testing.T) {
+	t.Parallel()
+	sink := newSSESink()
+	bridge := NewBridge(context.Background(), nil, session.ContentLimits{}, false, sink.Writer(), sse.NewSSEWriter(), "session-1", "run-1", nil)
+	pause := session.PauseLifecycleV1{Version: session.PauseLifecycleVersion, PauseID: "pause-1", CheckpointRevision: 1, Generation: 1, AgentPath: "root", MessageID: "pause:run-1", AttemptID: "pause:run-1", EventRevision: "event-1", Targets: []session.PauseInterruptTarget{{ID: "target-1", Address: "agent:root"}}}
+	pausePayload, err := json.Marshal(pause)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.Emit(context.Background(), session.EventRecord{ID: "event-1", SessionID: "session-1", RunID: "run-1", Kind: session.RunPausedEventKind, Payload: pausePayload})
+	resume := pause
+	resume.EventRevision = "event-2"
+	resume.ResumedPauseID = pause.PauseID
+	resume.ResumeMode = session.ResumeModeFull
+	resume.NewTurnID = "turn-1"
+	resume.NewAttemptID = "attempt-1"
+	resume.ResumePhase = session.ResumePhaseFact
+	resumePayload, err := json.Marshal(resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bridge.Emit(context.Background(), session.EventRecord{ID: "event-2", SessionID: "session-1", RunID: "run-1", Kind: session.RunResumedEventKind, Payload: resumePayload})
+	if err := bridge.EncErr(); err != nil {
+		t.Fatalf("resume encoding error = %v", err)
+	}
+	raw := string(sink.Bytes())
+	if !strings.Contains(raw, `"kind":"resumed"`) || !strings.Contains(raw, `"newTurnId":"turn-1"`) || !strings.Contains(raw, `"newAttemptId":"attempt-1"`) {
+		t.Fatalf("resumed lifecycle missing from SSE: %s", raw)
+	}
+}
+
 func TestBridgeProjectsDurableAttemptReplacement(t *testing.T) {
 	t.Parallel()
 	sink := newSSESink()

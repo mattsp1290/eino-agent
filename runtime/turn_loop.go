@@ -67,6 +67,7 @@ type turnLoopCoordinator struct {
 	ordinal           int64
 	engine            *adkEngine
 	resumeTargets     map[string]any
+	resumeLifecycle   *resumeLifecycleFact
 	firstTurnEngine   *adkEngine
 	firstTurnConsumed bool
 	// admittedItems is every durable inbox ID this coordinator has already
@@ -195,6 +196,9 @@ func (c *turnLoopCoordinator) setEngine(e *adkEngine) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.engine = e
+	if e != nil {
+		e.resumeLifecycle = c.resumeLifecycle
+	}
 	// Keep the checkpoint store's currentTurnID in sync with whichever
 	// turn's engine is now live: every Set call upstream ADK makes from
 	// here on -- a periodic tool-boundary checkpoint or a genuine
@@ -1815,6 +1819,10 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 	if !ok {
 		return nil, fmt.Errorf("%w: run %s has no promoted checkpoint", ErrInvalidOrchestrator, runID)
 	}
+	resumeLifecycle, err := loadPauseLifecycle(ctx, o.store, run.SessionID, runID, checkpoint.Revision, request.Targets)
+	if err != nil {
+		return nil, err
+	}
 	fingerprint := planFingerprint(plan)
 	if checkpoint.AgentFingerprint != fingerprint || checkpoint.EinoVersion != EinoPinnedVersion || checkpoint.CodecVersion != adkCheckpointCodecVersion {
 		return nil, ErrCheckpointFingerprintMismatch
@@ -1940,20 +1948,9 @@ func (o *StreamingOrchestrator) ResumeRun(ctx context.Context, runID session.Run
 		floor = latestMessageAt
 	}
 	execution.seedDurableMessageFloor(floor)
-	// Best-effort: this is an observability record of the resume, not a
-	// correctness dependency of it. The claim above has already committed;
-	// failing ResumeRun here would strand the run running with no driver
-	// for a much lower-value guarantee than the checks already performed
-	// before the claim.
-	if committed, err := execution.store.AppendEvent(ctx, session.EventRecord{
-		ID: o.ids.NewEventID(), SessionID: claimed.SessionID, RunID: claimed.ID, EpochID: claimed.ContextEpoch,
-		Kind: session.RunResumedEventKind, CreatedAt: o.now(),
-	}); err == nil {
-		execution.publishPersisted(ctx, committed)
-	}
 	coordinator := &turnLoopCoordinator{
 		host: o, execution: execution, plan: plan, sessionID: claimed.SessionID, runID: claimed.ID,
-		config: cfg, resolved: resolved, historyOptions: o.history, epochID: claimed.ContextEpoch, ordinal: maxOrdinal,
+		config: cfg, resolved: resolved, historyOptions: o.history, epochID: claimed.ContextEpoch, ordinal: maxOrdinal, resumeLifecycle: resumeLifecycle,
 	}
 	coordinator.setResumeTargets(request.Targets)
 	checkpoints := newAdkCheckpointStore(o, execution, plan, runID)
