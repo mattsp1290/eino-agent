@@ -21,6 +21,59 @@ func typedContract() ProviderStateContract {
 	}
 }
 
+type responseMetaStateFixture struct{ raw json.RawMessage }
+
+func (f responseMetaStateFixture) EinoAgentResponseMetaState() (json.RawMessage, error) {
+	return f.raw, nil
+}
+
+func TestTypedExtensionStateCodecCapturesDeclaredResponseMetaIdentity(t *testing.T) {
+	codec, err := NewTypedExtensionStateCodec(typedContract())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := json.RawMessage(`{"kind":"eino-agent.response-meta-identity","version":1,"identity":{"provider":"fixture","protocol":"native","correlation_id":"correlation"}}`)
+	message := &einoschema.AgenticMessage{Role: einoschema.AgenticRoleTypeAssistant, ResponseMeta: &einoschema.AgenticResponseMeta{Extension: responseMetaStateMarker(raw)}}
+	capture, public, err := codec.Capture(message, func(int) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.ResponseMeta.Extension == nil || public.ResponseMeta.Extension != nil {
+		t.Fatalf("capture mutated source or leaked marker: source=%#v public=%#v", message.ResponseMeta.Extension, public.ResponseMeta.Extension)
+	}
+	if len(capture.Items) != 1 || string(capture.Items[0].Data) != string(raw) {
+		t.Fatalf("captured items = %#v", capture.Items)
+	}
+	restored, err := codec.Restore(public, capture.Items, func(int) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := restored.ResponseMeta.Extension.(map[string]any)
+	if !ok || got["identity"].(map[string]any)["correlation_id"] != "correlation" {
+		t.Fatalf("restored extension = %#v", restored.ResponseMeta.Extension)
+	}
+}
+
+func TestNormalizeResponseMetaExtensionRejectsUnknownAndStrictlyValidatesMarker(t *testing.T) {
+	good := json.RawMessage(`{"kind":"eino-agent.response-meta-identity","version":1,"identity":{"provider":"fixture","protocol":"native"}}`)
+	message := &einoschema.AgenticMessage{ResponseMeta: &einoschema.AgenticResponseMeta{Extension: responseMetaStateFixture{raw: good}}}
+	plain, err := normalizeResponseMetaExtension(message, false)
+	if err != nil || plain.ResponseMeta.Extension != nil || message.ResponseMeta.Extension == nil {
+		t.Fatalf("plain normalization = %#v, %v", plain, err)
+	}
+	stateful, err := normalizeResponseMetaExtension(message, true)
+	if err != nil || stateful.ResponseMeta.Extension == nil {
+		t.Fatalf("stateful normalization = %#v, %v", stateful, err)
+	}
+	if _, err := normalizeResponseMetaExtension(&einoschema.AgenticMessage{ResponseMeta: &einoschema.AgenticResponseMeta{Extension: struct{}{}}}, false); err == nil {
+		t.Fatal("unknown extension accepted")
+	}
+	duplicate := json.RawMessage(`{"kind":"eino-agent.response-meta-identity","kind":"eino-agent.response-meta-identity","version":1,"identity":{"provider":"fixture","protocol":"native"}}`)
+	if _, err := normalizeResponseMetaExtension(&einoschema.AgenticMessage{ResponseMeta: &einoschema.AgenticResponseMeta{Extension: responseMetaStateFixture{raw: duplicate}}}, false); err == nil {
+		t.Fatal("duplicate marker key accepted")
+	}
+}
+
 // scriptedAgenticModel already defined in agentic_streamer_test.go is reused
 // below via a fresh instance per test.
 

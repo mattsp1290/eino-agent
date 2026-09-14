@@ -23,7 +23,7 @@ readonly aguisdk_replace_version="v0.0.0-20260909025854-aaa75b54d572"
 # docs/dependency-status.md (no release tag exists upstream, so this is a
 # pseudo-version pin) rather than letting a bare `go mod tidy` resolve
 # whatever the module's default branch HEAD happens to be at run time.
-readonly einoproviders_version="v0.0.0-20260912022125-79248358b8e6"
+readonly einoproviders_version="v0.0.0-20260914001852-8ff8a67b377e"
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly script_dir
 repository_root="$(cd -- "${script_dir}/../.." && pwd -P)"

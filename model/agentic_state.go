@@ -94,7 +94,30 @@ func (c *typedExtensionStateCodec) Capture(msg *einoschema.AgenticMessage, block
 	if msg == nil || blockID == nil {
 		return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
 	}
-	cloned, err := cloneAgenticMessages([]*einoschema.AgenticMessage{msg})
+	// The state marker must be removed before cloneAgenticMessages performs
+	// JSON cloning: it intentionally has no public JSON representation.
+	input := msg
+	var identityItem *ProviderStateItem
+	if msg.ResponseMeta != nil && msg.ResponseMeta.Extension != nil {
+		marker, ok := msg.ResponseMeta.Extension.(string)
+		if !ok {
+			return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
+		}
+		raw, ok := responseMetaStateMarkerRaw(marker)
+		if !ok {
+			return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
+		}
+		if _, err := parseAgenticResponseMetaState(raw); err != nil {
+			return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
+		}
+		inputClone := *msg
+		metaClone := *msg.ResponseMeta
+		metaClone.Extension = nil
+		inputClone.ResponseMeta = &metaClone
+		input = &inputClone
+		identityItem = &ProviderStateItem{Data: append(json.RawMessage(nil), raw...)}
+	}
+	cloned, err := cloneAgenticMessages([]*einoschema.AgenticMessage{input})
 	if err != nil || len(cloned) != 1 || cloned[0] == nil {
 		return ProviderStateCapture{}, nil, providerStateError(ErrProviderStateInvalid)
 	}
@@ -104,6 +127,9 @@ func (c *typedExtensionStateCodec) Capture(msg *einoschema.AgenticMessage, block
 	}
 
 	var items []ProviderStateItem
+	if identityItem != nil {
+		items = append(items, *identityItem)
+	}
 	for index, block := range out.ContentBlocks {
 		if block == nil {
 			continue
@@ -310,11 +336,54 @@ func (c *typedExtensionStateCodec) Restore(public *einoschema.AgenticMessage, it
 		if out.ResponseMeta == nil {
 			return nil, providerStateError(ErrProviderStateMismatch)
 		}
-		if err := restoreResponseMetaPrivate(out.ResponseMeta, messageItems); err != nil {
+		identity, privateItems, err := restoreAgenticResponseMetaState(messageItems)
+		if err != nil {
 			return nil, err
+		}
+		if err := restoreResponseMetaPrivate(out.ResponseMeta, privateItems); err != nil {
+			return nil, err
+		}
+		if identity != nil {
+			out.ResponseMeta.Extension = map[string]any{"identity": map[string]any{
+				"provider": identity.Provider, "protocol": identity.Protocol,
+			}}
+			if identity.RequestedModel != "" {
+				out.ResponseMeta.Extension.(map[string]any)["identity"].(map[string]any)["requested_model"] = identity.RequestedModel
+			}
+			if identity.ReturnedModel != "" {
+				out.ResponseMeta.Extension.(map[string]any)["identity"].(map[string]any)["returned_model"] = identity.ReturnedModel
+			}
+			if identity.CorrelationID != "" {
+				out.ResponseMeta.Extension.(map[string]any)["identity"].(map[string]any)["correlation_id"] = identity.CorrelationID
+			}
 		}
 	}
 	return out, nil
+}
+
+// restoreAgenticResponseMetaState separates the one marker item from legacy
+// response-meta private items. A payload that claims the marker discriminator
+// but fails strict decoding is never allowed to fall through as legacy data.
+func restoreAgenticResponseMetaState(items []ProviderStateItem) (*agenticResponseMetaStateIdentity, []ProviderStateItem, error) {
+	var identity *agenticResponseMetaStateIdentity
+	privateItems := make([]ProviderStateItem, 0, len(items))
+	for _, item := range items {
+		var probe map[string]json.RawMessage
+		if err := json.Unmarshal(item.Data, &probe); err != nil {
+			return nil, nil, providerStateError(ErrProviderStateInvalid)
+		}
+		if _, claimsMarker := probe["kind"]; claimsMarker {
+			envelope, err := parseAgenticResponseMetaState(item.Data)
+			if err != nil || identity != nil {
+				return nil, nil, providerStateError(ErrProviderStateInvalid)
+			}
+			value := envelope.Identity
+			identity = &value
+			continue
+		}
+		privateItems = append(privateItems, item)
+	}
+	return identity, privateItems, nil
 }
 
 func restoreClaudeEncryptedIndexes(t *einoschema.AssistantGenText, payload privateEncryptedIndexes) error {
@@ -536,5 +605,5 @@ func (s *agenticProviderStateStreamer) StreamProvider(ctx context.Context, reque
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return streamAgentic(ctx, s.client, req)
+	return streamAgentic(ctx, s.client, req, true)
 }

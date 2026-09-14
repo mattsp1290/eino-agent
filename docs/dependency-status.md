@@ -68,10 +68,8 @@ External pins for the agentic adoption:
   passed with this pin selected, unreplaced, and `go mod verify` reporting
   all modules verified. See
   [architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
-  W8 section for the fixtures this pin backs and two discovered
-  eino-agent/eino-providers integration gaps (a required
-  `ResponseMeta.Extension` host-side normalization, and the current
-  typed-ADK adapter's rejection of model-emitted server/MCP-call content
+  W8 section for the fixtures this pin backs and the remaining typed-ADK
+  adapter rejection of model-emitted server/MCP-call content
   blocks). `eino-agent-td8`'s two remaining deliverables (the per-cell
   capability matrix, native-byte fixture evidence beyond this file) and a
   merged immutable release tag are unaffected by this update and remain

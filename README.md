@@ -51,13 +51,12 @@ and observability remain provider-neutral.
   (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/OpenCode) adds it directly and
   wraps the constructed client with `model.NewAgenticStreamer`/
   `NewAgenticStreamerWithProviderState`. Verified pin:
-  `v0.0.0-20260912022125-79248358b8e6` at commit
-  `79248358b8e6324bbdb1f014526629f82e6bce90` (no release tag exists
+  `v0.0.0-20260914001852-8ff8a67b377e` at commit
+  `8ff8a67b377ec1cae25454a0c54f13de03e20dcc` (no release tag exists
   upstream, so this is a pseudo-version pin), no `replace` required. See
   [docs/architecture/eino-feature-support.md](docs/architecture/eino-feature-support.md)'s
-  W8 section for the exact publication evidence and two discovered
-  integration caveats (a `ResponseMeta.Extension` normalization a host must
-  supply, and the current typed-ADK adapter's rejection of model-emitted
+  W8 section for the exact publication evidence and the remaining typed-ADK
+  adapter rejection of model-emitted
   server/MCP-call content blocks).
 
 See `docs/dependency-status.md` for prerequisite evidence,

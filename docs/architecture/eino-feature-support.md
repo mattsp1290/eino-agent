@@ -2763,23 +2763,10 @@ postgres_integration`) does not yet pass `-race` and is unchanged here.
   `model.NewAgenticStreamerWithProviderState` plus
   `model.NewTypedExtensionStateCodec` to capture that same signature as
   private block state.
-  - **Discovered integration gap, worked around and documented in-line, not
-    hidden**: every `eino-providers` native adapter populates
-    `ResponseMeta.Extension` with `einoproviders.AgenticResponseIdentity` on
-    every completed response. `session.responseMetaFromEino` fails closed
-    with `ErrContentUnsupported` on any non-nil generic `ResponseMeta.Extension`,
-    and `model.NewTypedExtensionStateCodec` -- the only `AgenticStateCodec`
-    eino-agent ships -- also rejects a non-nil `Extension`. Pairing a
-    real `eino-providers` client directly with `model.NewAgenticStreamer`/
-    `NewAgenticStreamerWithProviderState` therefore fails the very first
-    completed turn today. The fixture's `nativeResponseIdentityStripper`
-    decorator (wraps `einomodel.AgenticModel`, clears `ResponseMeta.Extension`
-    after the real client returns) is the minimum a host must supply until
-    either side adds a typed seam for this identity sidecar. This is left
-    OUT of scope for W8 itself (it is a finding, not a requested capability)
-    and is not one of the two `eino-agent-td8` deliverables (the per-cell
-    capability matrix and native-byte fixture evidence) that remain
-    incomplete on the provider's own side.
+  - **Response-meta identity state**: a provider-declared marker is removed
+    by the plain streamer and captured as bounded private state by the
+    state-aware streamer. Its arbitrary native sidecar is never serialized;
+    a restored request receives only the nested JSON identity map.
 - **Ordered media/citations, function call, and server/MCP records survive a
   real SQLite reopen**
   (`TestPublicOrderedContentCitationsServerAndMCPRecordsSurviveReopen`):
@@ -2965,9 +2952,8 @@ this fixture file itself exercises. This W8 pass does not claim either.
 - The two `eino-agent-td8` deliverables (provider-side per-cell capability
   matrix, native-byte fixture evidence beyond this file) and a merged
   immutable release tag remain open on `eino-providers`' side.
-- The `nativeResponseIdentityStripper` gap and the `errADKUnsupportedBlock`
-  server/MCP-as-model-output gap (both documented above) are real,
-  reproduced findings from this pass, not resolved by it.
+- The `errADKUnsupportedBlock` server/MCP-as-model-output gap remains a real,
+  reproduced finding from this pass.
 - "Composed agentic graph nodes" (the plan's phrase for
   `01-feature-inventory.md` row 8/9, classified "Upstream through
   composition") is not given a NEW `testdata/external-consumer/` fixture by

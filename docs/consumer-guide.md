@@ -67,24 +67,15 @@ wants a real native provider (Claude/OpenAI/Gemini/Ollama/OpenAI-Codex/
 OpenCode Messages/Responses/Chat-Completions protocols) adds
 `github.com/mattsp1290/eino-providers` to its OWN `go.mod` directly; no
 `replace` directive is required for it (unlike the AG-UI fork above).
-Verified pin: `v0.0.0-20260912022125-79248358b8e6` at commit
-`79248358b8e6324bbdb1f014526629f82e6bce90` -- see
+Verified pin: `v0.0.0-20260914001852-8ff8a67b377e` at commit
+`8ff8a67b377ec1cae25454a0c54f13de03e20dcc` -- see
 [dependency-status.md](dependency-status.md) and
 [architecture/eino-feature-support.md](architecture/eino-feature-support.md)'s
 W8 section for the exact `go mod download -json` evidence.
 
-Two integration caveats a host must account for today, both discovered and
-reproduced while building `testdata/external-consumer/agentic_fixture_test.go`:
+The remaining integration caveat is reproduced in
+`testdata/external-consumer/agentic_fixture_test.go`:
 
-- Every `eino-providers` native adapter stamps
-  `ResponseMeta.Extension = einoproviders.AgenticResponseIdentity{...}` on
-  every completed response. `eino-agent`'s content pipeline rejects any
-  non-nil generic `ResponseMeta.Extension` (`ErrContentUnsupported`), and
-  `model.NewTypedExtensionStateCodec` does not capture it either. A host
-  must wrap the native client with a thin decorator that clears
-  `ResponseMeta.Extension` after the real call returns (see
-  `nativeResponseIdentityStripper` in the fixture) before handing it to
-  `model.NewAgenticStreamer`.
 - The current typed-ADK runtime adapter accepts only
   text/reasoning/media/function-tool-call blocks (plus
   `mcp_tool_approval_request` when an approval binding is configured) as

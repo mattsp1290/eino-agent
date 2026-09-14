@@ -38,7 +38,6 @@ import (
 
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/core/types"
 	"github.com/ag-ui-protocol/ag-ui/sdks/community/go/pkg/encoding/sse"
-	einomodel "github.com/cloudwego/eino/components/model"
 	einoschema "github.com/cloudwego/eino/schema"
 	"github.com/cloudwego/eino/schema/claude"
 
@@ -56,44 +55,6 @@ import (
 	"github.com/mattsp1290/eino-agent/tools"
 	"github.com/mattsp1290/eino-agent/transport"
 )
-
-// nativeResponseIdentityStripper wraps a real einomodel.AgenticModel client
-// and clears ResponseMeta.Extension before a result reaches eino-agent's own
-// durable content pipeline. See its construction site below for why this is
-// necessary today (a discovered cross-library integration gap, not a design
-// choice this fixture endorses).
-type nativeResponseIdentityStripper struct {
-	client einomodel.AgenticModel
-}
-
-func stripResponseIdentity(msg *einoschema.AgenticMessage) *einoschema.AgenticMessage {
-	if msg == nil || msg.ResponseMeta == nil || msg.ResponseMeta.Extension == nil {
-		return msg
-	}
-	clone := *msg
-	metaClone := *msg.ResponseMeta
-	metaClone.Extension = nil
-	clone.ResponseMeta = &metaClone
-	return &clone
-}
-
-func (s nativeResponseIdentityStripper) Generate(ctx context.Context, input []*einoschema.AgenticMessage, opts ...einomodel.Option) (*einoschema.AgenticMessage, error) {
-	msg, err := s.client.Generate(ctx, input, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return stripResponseIdentity(msg), nil
-}
-
-func (s nativeResponseIdentityStripper) Stream(ctx context.Context, input []*einoschema.AgenticMessage, opts ...einomodel.Option) (*einoschema.StreamReader[*einoschema.AgenticMessage], error) {
-	upstream, err := s.client.Stream(ctx, input, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return einoschema.StreamReaderWithConvert(upstream, func(msg *einoschema.AgenticMessage) (*einoschema.AgenticMessage, error) {
-		return stripResponseIdentity(msg), nil
-	}), nil
-}
 
 // --- 1. Native AgenticModel: generate/stream equivalence, continuation, and
 //        durable runtime dispatch -------------------------------------------
@@ -231,19 +192,6 @@ func TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation(t *tes
 	// the production model.NewAgenticStreamer adapter, drives one real turn
 	// against a real SQLite store.
 	//
-	// Discovered integration gap (documented here, not hidden): eino-agent's
-	// own content pipeline (session.responseMetaFromEino) fails closed with
-	// ErrContentUnsupported on ANY non-nil generic ResponseMeta.Extension,
-	// but every github.com/mattsp1290/eino-providers native adapter
-	// populates exactly that field with einoproviders.AgenticResponseIdentity
-	// on every completed response. model.NewTypedExtensionStateCodec (the
-	// only AgenticStateCodec eino-agent ships) explicitly rejects a non-nil
-	// Extension too, so no existing eino-agent provider-state codec can
-	// capture/restore it. A host pairing this native provider with the
-	// durable runtime must supply its own normalization -- exactly the
-	// nativeResponseIdentityStripper decorator below -- until eino-agent
-	// grows a codec for this shape (or eino-providers moves this identity
-	// into a typed *Extension field responseMetaFromEino already handles).
 	// The native response carries a private reasoning signature, so the
 	// runtime requires a state-aware streamer (the plain NewAgenticStreamer
 	// fails closed on provider-private content by design). The typed
@@ -256,7 +204,7 @@ func TestPublicNativeAgenticModelGenerateStreamEquivalenceAndContinuation(t *tes
 	if err != nil {
 		t.Fatalf("NewTypedExtensionStateCodec error = %v", err)
 	}
-	streamer, err := model.NewAgenticStreamerWithProviderState(nativeResponseIdentityStripper{client: client}, codec)
+	streamer, err := model.NewAgenticStreamerWithProviderState(client, codec)
 	if err != nil {
 		t.Fatalf("NewAgenticStreamerWithProviderState error = %v", err)
 	}
