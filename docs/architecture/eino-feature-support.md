@@ -49,9 +49,9 @@ COVERED by a test that does not assert what the row claims.
 | 24 | ToolInfo JSON/Gob encoding, ParamsOneOf nil/empty distinctions | PARTIAL | `ParamsOneOf`/schema definitions are exercised widely (`tools/definition.go`, `tools/einotools/einotools.go`, `runtime/tool_search.go`, `runtime/ledger.go` and their tests), but no test in the module exercises `schema.ToolInfo`'s Gob encode/decode round trip directly (zero matches for `GobEncode`/`GobDecode` in any `_test.go` file). |
 | 25 | Stream WithOnEOF and copy/concat/cleanup changes | PARTIAL | `model/agentic_streamer.go` uses `WithOnEOF` at the native agentic adapter boundary with an explicit clean-EOF callback. `TestAgenticStreamerCleanEOFDoesNotYieldNilDelta`, `TestStreamAgenticReaderInjectsFinalValueOnce`, `TestStreamAgenticReaderInjectsFinalErrorOnce`, `TestStreamAgenticReaderDoesNotCallEOFHookForSourceError`, and `TestStreamAgenticReaderCloseUnblocksUpstreamWithoutEOFHook` (`model/agentic_streamer_test.go`) establish clean EOF without a nil success delta, one injected final value/error then EOF, source-error exclusion, and explicit early-close cleanup. `TestReceiveModelStreamWithNativeAgenticAdapterCompletesAndPropagatesSourceCancellation` (`runtime/model_stream_test.go`) establishes normal runtime completion and a source-reported cancellation error without a fabricated final delta. This covers `WithOnEOF` and native-agentic cleanup only; the row's separate Eino stream copy/concat changes remain unassessed. Bead `eino-agent-5r8`. |
 | 26 | Indexer WithIndex | COVERED (added by this fix pass) | `TestIndexerWithIndexOptionReachesStore` and `TestIndexerWithoutIndexOptionLeavesIndexNil` (`examples/indexer-option/indexer_option_test.go`): a small test indexer reads the real upstream `indexer.WithIndex` call option through `indexer.GetCommonOptions`; no new indexing service. |
-| 27 | Graph scheduling/checkpoint/panic/stream fixes, Jinja formatting and other changed existing behavior | NOT COVERED | No section of this document addresses this row, and there are zero occurrences of "Jinja" (case-insensitive) anywhere in the module. Needs a semantic-diff re-read of `compose/graph.go`/`compose/checkpoint.go`/`compose/stream_concat.go` plus fixtures proving graph panic/cancel/checkpoint behavior, and either a Jinja-formatting regression fixture or an explicit note that this codebase has no Jinja-formatting surface to regress. Bead `eino-agent-2wi`. |
+| 27 | Graph scheduling/checkpoint/panic/stream fixes, Jinja formatting and other changed existing behavior | PARTIAL | Downstream public compose behavior is covered by `TestComposeRow27NodePanicReturnsErrorAndRunnableIsReusable`, `TestComposeRow27OrdinaryContextCancellation`, `TestComposeRow27NestedGraphInterruptCheckpointResume`, and `TestComposeRow27NestedStreamReinterruptResumeConcats` (`testdata/external-consumer/compose_row27_fixture_test.go`). The exact private/unreachable remainder is recorded in Row 27 below: typed-nil checkpoint bytes, absent converter branches, and `runner.runCtx` re-panic have no exported trigger; no local Jinja surface exists. Bead `eino-agent-2wi`. |
 
-Of the 27 rows above: **7 COVERED, 17 PARTIAL, 3 NOT COVERED.** The adoption
+Of the 27 rows above: **7 COVERED, 18 PARTIAL, 2 NOT COVERED.** The adoption
 proves its core agentic path end to end; most rows have a specific named
 unmet clause rather than full coverage, and every gap is named rather than
 hidden.
@@ -66,6 +66,57 @@ addressed by row 26 above; `schema/stream.go` by row 25's bead
 `utils/callbacks/template` by row 10's bead (`eino-agent-sm0`).
 `schema/serialization.go` adds no exported name (an inherited-behavior-only
 change per the ledger) and is not separately tracked.
+
+## Row 27: compose graph scheduling, checkpoints, panic, streams and Jinja
+
+The Row 27 audit compares `github.com/cloudwego/eino` `v0.8.13` with the
+exact pinned `v0.9.19`. The source ledger inspected `compose/graph.go`,
+`compose/checkpoint.go`, `compose/stream_concat.go`,
+`compose/graph_call_options.go`, `compose/graph_manager.go`,
+`compose/graph_run.go`, and `schema/message.go`. The downstream proof is run
+from a generated consumer module by `testdata/external-consumer/check.sh`, so
+it exercises the resolved public compose API rather than this repository's
+own package visibility.
+
+- `TestComposeRow27NodePanicReturnsErrorAndRunnableIsReusable` proves a task
+  node panic becomes an `Invoke` error and a later invocation of the same
+  compiled graph succeeds. It deliberately does not claim coverage for the
+  private `runner.runCtx` exact-value re-panic branch: no exported API can
+  invoke that private state-runner path.
+- `TestComposeRow27OrdinaryContextCancellation` proves a cooperating node
+  receives `context.Canceled`, returns once, and does not yield a success
+  result. `TestComposeRow27NestedGraphInterruptCheckpointResume` separately
+  proves `WithGraphInterrupt`, immediate timeout-zero scheduling, parent
+  visible nested interrupt information, stored checkpoint handoff, release of
+  the original task, and one resumed completion. Together these cover the
+  public graph-interrupt, cancellation-race, subgraph-settlement, rerun and
+  state-copy consequences in `graph_call_options.go`, `graph_manager.go`, and
+  `graph_run.go` that a consumer can observe.
+- `TestComposeRow27NestedStreamReinterruptResumeConcats` drives an exported
+  nested stream through initial interrupt, resume/reinterrupt, and final
+  drain. It asserts the final value, exactly EOF after it, and one side
+  effect; this covers checkpoint interrupt publication/materialization and
+  `stream_concat.go`'s recognized-interrupt filtering without treating the
+  stored interrupt as a stream-concat failure. The fixture's regular
+  graph/stream boundary also exercises the corrected START/END conversion
+  pairing for this supported string stream.
+- `compose/graph.go`'s agentic-node registration remains separately covered
+  by `examples/agentic-graph`'s graph, branch, and parallel tests. Typed-nil
+  checkpoint normalization and the missing stream-converter error are not
+  classified as covered: they require inspecting private checkpoint contents
+  or constructing an unsupported private conversion pair, neither of which a
+  downstream consumer can do without coupling to internals.
+- The required `rg -n -i 'jinja' --glob '*.go' --glob '*.md' .` search was
+  rerun for this audit (excluding ignored local plan artifacts) and found no
+  local Go or Markdown Jinja construction. The graph example chooses
+  `schema.FString`. Therefore `schema/message.go`'s Gonja `file` and
+  `fileset` filter disablement has no local caller to regress, and a Jinja
+  fixture would be artificial rather than downstream evidence.
+
+Existing ADK/store checkpoint suites cover this project's durable runtime;
+they are not cited as proof of compose graph-runner behavior. Row 27 remains
+PARTIAL only for the explicitly private/unreachable branches above, not for
+an unclassified public behavior.
 
 ## Pin
 

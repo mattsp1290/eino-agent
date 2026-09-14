@@ -103,6 +103,7 @@ cp -f -- "${script_dir}/session_watch_fixture_test.go" "${consumer_dir}/session_
 cp -f -- "${script_dir}/delegated_web_search_fixture_test.go" "${consumer_dir}/delegated_web_search_fixture_test.go"
 cp -f -- "${script_dir}/agentic_fixture_test.go" "${consumer_dir}/agentic_fixture_test.go"
 cp -f -- "${script_dir}/admission_receipt_fixture_test.go" "${consumer_dir}/admission_receipt_fixture_test.go"
+cp -f -- "${script_dir}/compose_row27_fixture_test.go" "${consumer_dir}/compose_row27_fixture_test.go"
 if [[ "${postgres_mode}" == "1" ]]; then
 	cp -f -- "${script_dir}/../../internal/testpostgres/check_output.py" "${temporary_root}/check_output.py"
 	cp -f -- "${script_dir}/postgres_store_fixture_test.go" "${consumer_dir}/postgres_store_fixture_test.go"
@@ -201,6 +202,9 @@ fi
 if [[ "${postgres_mode}" == "1" ]]; then
 	"${go_command[@]}" test -tags postgres_integration -timeout 10m -json ./... | python3 "${temporary_root}/check_output.py" "example.com/eino-agent-external-consumer:TestPostgresConsumer"
 else
+	# Keep the Row 27 compose audit visibly discoverable in both local and
+	# published consumer modes; the full race suite below remains the broad gate.
+	"${go_command[@]}" test -race -run '^TestComposeRow27' -v .
 	"${go_command[@]}" test -race ./...
 fi
 "${go_command[@]}" build ./...
