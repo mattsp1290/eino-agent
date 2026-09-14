@@ -312,12 +312,9 @@ func (b *Bridge) emitPaused(event session.EventRecord) {
 		return
 	}
 	identity := convert.AgenticIdentityV1{
-		SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: string(event.TurnID),
+		SessionID: string(event.SessionID), ThreadID: string(event.SessionID), RunID: string(event.RunID), TurnID: "pause:" + string(event.RunID),
 		MessageID: string(lifecycle.MessageID), AttemptID: lifecycle.AttemptID,
 		AgentPath: []convert.AgentPathSegment{{Name: lifecycle.AgentPath, RunID: string(event.RunID)}},
-	}
-	if identity.TurnID == "" {
-		identity.TurnID = "pause:" + string(event.RunID)
 	}
 	targets := make([]convert.InterruptTargetV1, len(lifecycle.Targets))
 	for i, target := range lifecycle.Targets {
